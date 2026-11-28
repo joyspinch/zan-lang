@@ -66,19 +66,53 @@ public partial class DataTable {
         }
 
         int k = repRow.Count;
-        // 给（少量）不同槽位按组顺序排名；插入排序即可。
+        // 给不同槽位按组顺序排名：小基数走插入排序，大基数（如高基数列分组）
+        // 走 O(K log K) 稳定自底向上归并排序，避免 O(K^2) 退化。
         List<int> slotOrder = new List<int>();
         for (int s = 0; s < k; s = s + 1) { slotOrder.Add(s); }
-        int a = 1;
-        while (a < k) {
-            int cur = slotOrder[a];
-            int b = a - 1;
-            while (b >= 0 && DataTable.CmpGroupCol(gcol, src, repRow[slotOrder[b]], repRow[cur], kd, col) > 0) {
-                slotOrder[b + 1] = slotOrder[b];
-                b = b - 1;
+        if (k <= 32) {
+            int a = 1;
+            while (a < k) {
+                int cur = slotOrder[a];
+                int b = a - 1;
+                while (b >= 0 && DataTable.CmpGroupCol(gcol, src, repRow[slotOrder[b]], repRow[cur], kd, col) > 0) {
+                    slotOrder[b + 1] = slotOrder[b];
+                    b = b - 1;
+                }
+                slotOrder[b + 1] = cur;
+                a = a + 1;
             }
-            slotOrder[b + 1] = cur;
-            a = a + 1;
+        } else {
+            List<int> tmpSlot = new List<int>();
+            for (int z = 0; z < k; z = z + 1) { tmpSlot.Add(0); }
+            int w = 1;
+            while (w < k) {
+                int lo = 0;
+                while (lo < k) {
+                    int mid = lo + w;
+                    if (mid > k) { mid = k; }
+                    int hi = lo + w * 2;
+                    if (hi > k) { hi = k; }
+                    if (mid < hi) {
+                        int li = lo;
+                        int ri = mid;
+                        int wi = lo;
+                        while (li < mid && ri < hi) {
+                            if (DataTable.CmpGroupCol(gcol, src, repRow[slotOrder[li]], repRow[slotOrder[ri]], kd, col) <= 0) {
+                                tmpSlot[wi] = slotOrder[li]; li = li + 1;
+                            } else {
+                                tmpSlot[wi] = slotOrder[ri]; ri = ri + 1;
+                            }
+                            wi = wi + 1;
+                        }
+                        while (li < mid) { tmpSlot[wi] = slotOrder[li]; li = li + 1; wi = wi + 1; }
+                        while (ri < hi) { tmpSlot[wi] = slotOrder[ri]; ri = ri + 1; wi = wi + 1; }
+                        for (int cp = lo; cp < hi; cp = cp + 1) { slotOrder[cp] = tmpSlot[cp]; }
+                    }
+                    lo = lo + w * 2;
+                }
+                w = w * 2;
+            }
         }
         List<int> rank = new List<int>();
         for (int r0 = 0; r0 < k; r0 = r0 + 1) { rank.Add(0); }
@@ -100,14 +134,40 @@ public partial class DataTable {
         st.order = outp;
     }
 
-    // 分组排序入口：单分组列且无组内排序时走 O(N) 桶排序
-    // 快路径，否则按 CmpGroupRow 做稳定归并排序。
+    // 分组排序入口：单非公式分组列且无组内排序时走 O(N) 桶排序快路径，
+    // 其余情况用多趟稳定装饰归并排序（O(N × K) 读源 + 纯标量比较），
+    // 替代 O(N log N × K) 的逐比较读源/重算公式。
     public static void SortOrderGrouped(DataTableState st, List<DataColumn> cols, DataSource src) {
         int n = st.order.Count;
         if (n < 2) { return; }
-        // O(N) 快路径：单分组列，无需保留组内排序。
-        if (st.groupCols.Count == 1 && st.sortKeys.Count == 0) {
+        // O(N) 快路径：单非公式分组列，无需保留组内排序。
+        if (st.groupCols.Count == 1 && st.sortKeys.Count == 0
+            && !DataTable.IsFormula(cols, st.groupCols[0])) {
             DataTable.SortOrderGroupBucket(st, cols, src);
+            return;
+        }
+        bool allValid = true;
+        for (int g = 0; g < st.groupCols.Count; g = g + 1) {
+            int gc = st.groupCols[g];
+            if (gc < 0 || gc >= cols.Count) { allValid = false; break; }
+        }
+        if (allValid) {
+            // 先按组内多列排序键（低优先级 → 高优先级）稳定排序
+            for (int k = st.sortKeys.Count - 1; k >= 0; k = k - 1) {
+                SortKey sk = st.sortKeys[k];
+                DataTable.SortOrderByCol(st, cols, src, sk.col, sk.dir);
+            }
+            // 再按分组列（内层 → 外层）稳定装饰排序，与 CmpGroupRow 字典序完全等价
+            for (int g = st.groupCols.Count - 1; g >= 0; g = g - 1) {
+                int gc = st.groupCols[g];
+                DataColumn gcol = cols[gc];
+                if (gcol.isDate && gcol.dateGroup == 4) {
+                    DataTable.SortOrderByCol(st, cols, src, gc, 1);
+                    DataTable.SortOrderByWeekday(st, cols, src, gc);
+                } else {
+                    DataTable.SortOrderByCol(st, cols, src, gc, 1);
+                }
+            }
             return;
         }
         List<int> tmp = new List<int>();
@@ -144,6 +204,8 @@ public partial class DataTable {
             if (m == 0 || m == 6) { col = col + 1; continue; }
             int dec = cols[col].decimals;
             bool fcol = cols[col].formula.Length > 0;
+            FormulaExpr fexpr = fcol ? DataTable.FormulaExprOf(cols, col) : null;
+            List<double> fstack = fcol ? new List<double>() : null;
             double s = 0.0;
             double mn = 0.0;
             double mx = 0.0;
@@ -152,7 +214,7 @@ public partial class DataTable {
             while (k < hi && k < st.order.Count) {
                 double v = 0.0;
                 if (fcol) {
-                    if (!DataTable.FormulaTryReal(cols, src, st.order[k], col, out v)) { v = 0.0; }
+                    if (fexpr == null || !DataTable.FormulaEvalScratch(fexpr, src, st.order[k], fstack, out v)) { v = 0.0; }
                 }
                 else if (dec > 0) { v = src.CellReal(st.order[k], col); }
                 else { v = (double)src.CellNum(st.order[k], col); }
@@ -299,6 +361,11 @@ public partial class DataTable {
             return;
         }
         int N = st.order.Count;
+        // 预先将折叠键集合哈希化：组数达数万时避免每组 O(C) 线性查找导致 O(G*C)。
+        Dict<string, bool> collapsedSet = new Dict<string, bool>();
+        for (int ci = 0; ci < st.collapsedKeys.Count; ci = ci + 1) {
+            collapsedSet[st.collapsedKeys[ci]] = true;
+        }
         // 总计累加器在此播种，由 FillGroupAgg 在
         // 最外层分组上折叠，页脚因此无需自行扫描。
         DataTable.ResetGrandAgg(st, cols.Count);
@@ -370,7 +437,7 @@ public partial class DataTable {
                 int gi = st.groups.Count;
                 GroupRow newGrp = new GroupRow(
                     cols[gc[nl]].title + ": " + DataTable.GroupValue(cols, src, rowIdx, gc[nl]),
-                    nl, 0, key, DataTable.IsCollapsed(st, key));
+                    nl, 0, key, collapsedSet.ContainsKey(key));
                 st.groups.Add(newGrp);
                 curGrp[nl] = newGrp;
                 grpStart[nl] = p;
@@ -441,6 +508,7 @@ public partial class DataTable {
         // 但筛选后 order 已是权威次序；两者取交集即可）。
         // roots 本身已按 order 次序收集。
         DataTable.TreeReserve(st, src);
+        Dict<int, bool> visited = new Dict<int, bool>();
         List<int> stRow = new List<int>();
         List<int> stDepth = new List<int>();
         for (int i = roots.Count - 1; i >= 0; i = i - 1) {
@@ -454,6 +522,8 @@ public partial class DataTable {
             int depth = stDepth[last];
             stRow.RemoveAt(last);
             stDepth.RemoveAt(last);
+            if (visited.ContainsKey(row)) { continue; }
+            visited[row] = true;
             dataNo = dataNo + 1;
             DispRow d = new DispRow(0, row, dataNo);
             d.depth = depth;
@@ -465,8 +535,53 @@ public partial class DataTable {
             if (childRows == null) { continue; }
             // 反向入栈使第一个子行先弹出。
             for (int k = childRows.Count - 1; k >= 0; k = k - 1) {
-                stRow.Add(childRows[k]);
-                stDepth.Add(depth + 1);
+                if (!visited.ContainsKey(childRows[k])) {
+                    stRow.Add(childRows[k]);
+                    stDepth.Add(depth + 1);
+                }
+            }
+        }
+        // 环状父子孤岛保护：若存在纯环连通分量（每个节点的父节点都在 order 中），
+        // roots 不会包含它们；此处仅对未访问且未被折叠祖先遮蔽的纯环节点破环发出，
+        // 既避免死循环又避免环中数据静默消失。
+        for (int i = 0; i < st.order.Count; i = i + 1) {
+            int row = st.order[i];
+            if (visited.ContainsKey(row)) { continue; }
+            // 仅当沿 ParentOf 向上回溯确实构成环（而非因祖先折叠未展开）时才破环。
+            Dict<int, bool> chain = new Dict<int, bool>();
+            int cur = row;
+            bool inCycle = false;
+            while (cur >= 0 && orderPos.ContainsKey(cur) && !visited.ContainsKey(cur)) {
+                if (chain.ContainsKey(cur)) { inCycle = true; break; }
+                chain[cur] = true;
+                cur = st.treeAdapter.ParentOf(src, cur);
+            }
+            if (!inCycle) { continue; }
+            stRow.Add(row);
+            stDepth.Add(0);
+            while (stRow.Count > 0) {
+                int last = stRow.Count - 1;
+                int crow = stRow[last];
+                int depth = stDepth[last];
+                stRow.RemoveAt(last);
+                stDepth.RemoveAt(last);
+                if (visited.ContainsKey(crow)) { continue; }
+                visited[crow] = true;
+                dataNo = dataNo + 1;
+                DispRow d = new DispRow(0, crow, dataNo);
+                d.depth = depth;
+                st.dispRows.Add(d);
+                DataTable.EmitDetail(st, src, crow);
+                if (!DataTable.IsTreeExpanded(st, src, crow)) { continue; }
+                List<int> childRows = null;
+                if (kids.ContainsKey(crow)) { childRows = kids[crow]; }
+                if (childRows == null) { continue; }
+                for (int k = childRows.Count - 1; k >= 0; k = k - 1) {
+                    if (!visited.ContainsKey(childRows[k])) {
+                        stRow.Add(childRows[k]);
+                        stDepth.Add(depth + 1);
+                    }
+                }
             }
         }
     }

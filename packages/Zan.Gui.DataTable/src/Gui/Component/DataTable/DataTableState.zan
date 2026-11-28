@@ -40,9 +40,11 @@ public class DataTableState {
     int resizeStartX;
     int resizeStartW;
     bool dirty;
+    bool dispDirty;
 
     RowKeyProvider keyProvider;
     List<RowKey> rowKeys;
+    Dict<string, int> rowKeyIndex;
     int rowKeysRevision;
     List<TableDiagnostic> diagnostics;
     int dataRevision;
@@ -96,6 +98,7 @@ public class DataTableState {
     // = 该行在此列过滤集合中的名次（0 起，值相同并列按先见者高）。
     // 与 min/max 同周期重建（Recompute -> ComputeColStats）。
     List<int> cfRank;
+    List<int> cfRankOffsets;
     // 行源索引 -> st.order 显示序，仅当存在 Top/Bottom 规则列时
     // 维护（ComputeColStats 同周期重建）。渲染的命中判定 O(1)
     // 查表，替代对 st.order 的逐格线性查找。
@@ -137,6 +140,11 @@ public class DataTableState {
     // ---- 选择与交互 ----
     int selAnchor;  // Shift 范围选行的顺序索引锚点（-1 无）
     int selAnchorCol;  // Shift 范围选单元格的列锚点（-1 无，与 selAnchor 成对）
+    int hdrSelCacheQueryRev;  // 表头全选态缓存：上次计算时的 queryRevision
+    int hdrSelCacheOrderCount;  // 表头全选态缓存：上次计算时的 st.order.Count
+    int hdrSelCacheModelVer;  // 表头全选态缓存：上次计算时的 SelectionModel.Version()
+    bool hdrSelCacheAll;  // 表头全选态缓存：是否全选
+    bool hdrSelCacheAny;  // 表头全选态缓存：是否至少有一行选中
     int multiAnchor;  // Ctrl 多区域锚点区域（活动区域 r1<0 占位）
     int rangeR0;  // 单元格范围起始行（顺序索引，-1 = 无范围）
     int rangeC0;  // 单元格范围起始列
@@ -167,6 +175,7 @@ public class DataTableState {
     bool rowSelDrag;  // 正在行号列上拖动多选行
     public RichMenu ctxRetainedMenu;
     public RichMenu hdrRetainedMenu;
+    public RichMenu sumRetainedMenu;
     bool ctxOpen;  // 右键上下文菜单已打开
     bool externalRowMenu;  // 行右键交给外部菜单处理
     int ctxX;  // 上下文菜单锚点 X
@@ -176,6 +185,15 @@ public class DataTableState {
     int ctxCol;  // 最近一次行右键命中的数据列索引（-1 = 序号列/选择列/空白处）
     ContextMenuFunc contextMenuFunc;  // 业务行右键菜单自定义构建插槽
     List<TableContextMenuItem> activeCustomMenuItems; // 当前菜单打开时生成的自定义项集合
+    HeaderMenuFunc headerMenuFunc;  // 业务列头上下文菜单自定义构建插槽
+    List<TableContextMenuItem> activeCustomHdrMenuItems; // 当前列头菜单打开时生成的自定义项集合
+    HeaderPanelFunc headerPanelFunc;  // 业务表头点击展开自定义面板动态提供委托
+    List<HeaderPanelTab> headerPanels;  // 业务静态注册的表头展开自定义面板列表
+    string openMenuTabKey;  // 程序化打开表头面板时指定的默认激活页签 key（一次性消费）
+    bool sumCtxOpen;  // 页脚汇总聚合菜单已打开
+    int sumCtxCol;  // 页脚汇总菜单针对的列
+    int sumCtxX;  // 页脚汇总菜单锚点 X
+    int sumCtxY;  // 页脚汇总菜单锚点 Y
     RowStyleFunc rowStyleFunc;  // 业务整行样式条件回调 (AG Grid getRowStyle / DevExpress RowStyle)
     List<bool> colHidden;  // 逐列可见性（true = 隐藏）
     List<int> colFreeze;  // 逐列冻结：0 无，1 左边缘，2 右边缘
@@ -375,6 +393,8 @@ public class DataTableState {
     UiEvent RowInserted;  // 添加了一行（读取 HitRow 获取其索引）
     UiEvent RowDeleted;  // 移除了一行（读取 HitRow 获取其索引）
     UiEvent BandToggled;  // 表头带被折叠或展开
+    UiEvent AddColumn;  // 点击表头尾部新增列按钮
+    UiEvent ChoiceCreated;  // 单元格下拉/多选编辑器中快速新增选项（读取 CreatedChoiceCol/CreatedChoiceText）
     int hitRow;  // 最近一次行/单元格交互的数据行索引
     int hitOrder;  // 该行（排序/过滤后）的顺序位置
     int hitCol;  // 最近一次表头/单元格交互的列索引
@@ -415,6 +435,7 @@ public class DataTableState {
     // ---- 现代单元格体系（Renderer / Editor / Slot 模板对齐） ----
     CellRenderer cellRenderer;  // 全局单元格享元画笔
     CellEditor cellEditor;      // 全局单元格悬浮编辑器
+    CellEditor activeEditor;    // 当前激活的编辑器实例（列级优先于全局）
     Control activeEditorWidget; // 当前处于激活态的单例悬浮控件
     CellSpanProvider spanProvider; // 动态单元格跨行与跨列提供器（对标 DevExpress CellMerge / AG Grid colSpan & rowSpan）
     CustomSummaryProvider customSummaryProvider; // 全局自定义汇总计算器（对标 DevExpress CustomSummaryCalculate）
@@ -440,7 +461,18 @@ public class DataTableState {
 
     // ---- 行添加/删除 + 撤销 ----
     bool allowAddRow;  // 在最后一行下方显示新行占位符
+    bool allowAddColumn;  // 在表头尾部显示新增列占位按钮
+    string addColumnLabel;  // 表头尾部新增列按钮文案（"" 默认 "+"）
+    string edNewChoiceBuf;  // 下拉/多选弹层内快速新增选项的输入缓冲
+    int lastCreatedChoiceCol;  // 最近一次快速新增选项所在的列索引
+    string lastCreatedChoiceText;  // 最近一次快速新增选项的文案
     public DataTableUndoState undoState;
+    // 帧内热路径复用的临时缓冲（按需懒初始化，消除每格/每行堆分配）。
+    internal List<double> formulaScratch;
+    internal List<int> sparkXs;
+    internal List<int> sparkYs;
+    internal List<int> sparkNx;
+    internal List<int> sparkNy;
     public List<RowEdit> undoLog { get { return undoState.undoLog; } set { undoState.undoLog = value; } }
     public List<RowEdit> redoLog { get { return undoState.redoLog; } set { undoState.redoLog = value; } }
     public int undoLimit { get { return undoState.undoLimit; } set { undoState.undoLimit = value; } }
@@ -490,12 +522,14 @@ public class DataTableState {
         this.resizeStartX = 0;
         this.resizeStartW = 0;
         this.dirty = true;
+        this.dispDirty = true;
         this.cellRanges = new List<TableCellRange>();
         this.multiActive = false;
         this.keyProvider = null;
         this.cellWidgets = null;
         this.cellRenderer = null;
         this.cellEditor = null;
+        this.activeEditor = null;
         this.activeEditorWidget = null;
         this.spanProvider = null;
         this.customSummaryProvider = null;
@@ -503,6 +537,7 @@ public class DataTableState {
         this.loadingWidget = null;
         this.groupFormatter = null;
         this.rowKeys = new List<RowKey>();
+        this.rowKeyIndex = new Dict<string, int>();
         this.rowKeysRevision = -1;
         this.diagnostics = new List<TableDiagnostic>();
         this.activeDetails = new List<Control>();
@@ -542,6 +577,7 @@ public class DataTableState {
         this.cfMinR = new List<double>();
         this.cfMaxR = new List<double>();
         this.cfRank = new List<int>();
+        this.cfRankOffsets = new List<int>();
         this.cfOrderPos = null;
         this.formulaSeen = null;
         this.cfRules = new List<ColumnCfRule>();
@@ -555,6 +591,11 @@ public class DataTableState {
         this.lastPageSync = 1;
         this.selAnchor = -1;
         this.selAnchorCol = -1;
+        this.hdrSelCacheQueryRev = -1;
+        this.hdrSelCacheOrderCount = -1;
+        this.hdrSelCacheModelVer = -1;
+        this.hdrSelCacheAll = false;
+        this.hdrSelCacheAny = false;
         this.rangeR0 = -1;
         this.rangeC0 = -1;
         this.rangeR1 = -1;
@@ -583,6 +624,15 @@ public class DataTableState {
         this.ctxCol = -1;
         this.contextMenuFunc = null;
         this.activeCustomMenuItems = new List<TableContextMenuItem>();
+        this.headerMenuFunc = null;
+        this.activeCustomHdrMenuItems = new List<TableContextMenuItem>();
+        this.headerPanelFunc = null;
+        this.headerPanels = new List<HeaderPanelTab>();
+        this.openMenuTabKey = "";
+        this.sumCtxOpen = false;
+        this.sumCtxCol = -1;
+        this.sumCtxX = 0;
+        this.sumCtxY = 0;
         this.rowStyleFunc = null;
         this.colHidden = new List<bool>();
         this.colFreeze = new List<int>();
@@ -652,6 +702,8 @@ public class DataTableState {
         this.RowInserted = new UiEvent();
         this.RowDeleted = new UiEvent();
         this.BandToggled = new UiEvent();
+        this.AddColumn = new UiEvent();
+        this.ChoiceCreated = new UiEvent();
         this.groupCols = new List<int>();
         this.collapsedKeys = new List<string>();
         this.treeAdapter = null;
@@ -693,6 +745,11 @@ public class DataTableState {
         this.expandedKeys = new List<RowKey>();
         this.expandedByKey = false;
         this.allowAddRow = false;
+        this.allowAddColumn = false;
+        this.addColumnLabel = "";
+        this.edNewChoiceBuf = "";
+        this.lastCreatedChoiceCol = -1;
+        this.lastCreatedChoiceText = "";
         this.undoState = new DataTableUndoState();
         this.fillState = new DataTableFillState();
         this.emptyText = "";
@@ -723,6 +780,8 @@ public class DataTableState {
     public int EditRow() { return editRow; }
     public int EditCol() { return editCol; }
     public string EditValue() { return editVal; }
+    public int CreatedChoiceCol() { return lastCreatedChoiceCol; }
+    public string CreatedChoiceText() { return lastCreatedChoiceText; }
 
     // 返回当前全部选中行的源行索引，顺序与数据源索引一致。
     // 业务侧可在 RowContext 处理器中读取多选对象。

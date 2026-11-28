@@ -154,6 +154,7 @@ public class SparseServerPage {
     int total;
     int generation;
     int state;  // 0 empty, 1 loading, 2 ready, 3 error
+    int lastAccessSeq;  // LRU 淘汰访问序号
     List<DataRow> rows;
 
     // 构造空页（state=0），total 未知。
@@ -163,6 +164,7 @@ public class SparseServerPage {
         this.total = -1;
         this.generation = gen;
         this.state = 0;
+        this.lastAccessSeq = 0;
         this.rows = new List<DataRow>();
     }
 
@@ -195,11 +197,14 @@ public class DataTableExportProgress {
     virtual bool Cancelled() { return false; }
 }
 
-// 导出行集快照：UI 线程上一次性冻结的列区间与行序。
+// 导出行集快照：UI 线程上一次性冻结的列区间、视觉可见列序与行序。
 public class DataTableExportSnapshot {
     public List<int> rows;
     public int c0;
     public int c1;
+    // 视觉可见列索引（遵循 VisibleOrder 并已过滤 hidden 列）。
+    // 为 null 时由 ExportCols 按 c0..c1 动态补齐以兼容历史直接构造快照。
+    public List<int> visCols;
     public CellSpanProvider spanProvider;
 }
 
@@ -230,54 +235,78 @@ public class DataTableExportUi {
 public class DataTableUiExportProgress : DataTableExportProgress {
     // 当前弹层状态（包装入口 Bind；Cancelled 在后台线程读取）。
     public static DataTableExportUi ui;
+    static nint sLock;
     static int sDone;
     static int sTotal;
     static bool sOk;
     static string sMsg;
     static bool sFinished;
 
-    // 包装入口在启动导出前登记状态对象并复位暂存。
+    private static void EnsureLock() {
+        if (DataTableUiExportProgress.sLock == 0) {
+            DataTableUiExportProgress.sLock = Mutex.Create();
+        }
+    }
+
+    // 包装入口在启动导出前登记状态对象并复位暂存（在 UI 线程、写盘线程启动前调用）。
     public static void Bind(DataTableExportUi target) {
+        DataTableUiExportProgress.EnsureLock();
+        Mutex.Lock(DataTableUiExportProgress.sLock);
         DataTableUiExportProgress.ui = target;
         DataTableUiExportProgress.sDone = 0;
         DataTableUiExportProgress.sTotal = 0;
         DataTableUiExportProgress.sOk = false;
         DataTableUiExportProgress.sMsg = "";
         DataTableUiExportProgress.sFinished = false;
+        Mutex.Unlock(DataTableUiExportProgress.sLock);
     }
 
     public override void OnStart(int totalRows) {
+        if (DataTableUiExportProgress.sLock != 0) { Mutex.Lock(DataTableUiExportProgress.sLock); }
         DataTableUiExportProgress.sDone = 0;
         DataTableUiExportProgress.sTotal = totalRows;
+        if (DataTableUiExportProgress.sLock != 0) { Mutex.Unlock(DataTableUiExportProgress.sLock); }
     }
 
     public override void OnProgress(int doneRows, int totalRows) {
+        if (DataTableUiExportProgress.sLock != 0) { Mutex.Lock(DataTableUiExportProgress.sLock); }
         DataTableUiExportProgress.sDone = doneRows;
         DataTableUiExportProgress.sTotal = totalRows;
+        if (DataTableUiExportProgress.sLock != 0) { Mutex.Unlock(DataTableUiExportProgress.sLock); }
     }
 
     public override void OnDone(bool ok, string error) {
+        if (DataTableUiExportProgress.sLock != 0) { Mutex.Lock(DataTableUiExportProgress.sLock); }
         DataTableUiExportProgress.sOk = ok;
         DataTableUiExportProgress.sMsg = error;
         DataTableUiExportProgress.sFinished = true;
+        if (DataTableUiExportProgress.sLock != 0) { Mutex.Unlock(DataTableUiExportProgress.sLock); }
     }
 
     public override bool Cancelled() {
-        return DataTableUiExportProgress.ui != null
-            && DataTableUiExportProgress.ui.cancel.Load() != 0;
+        DataTableExportUi u = DataTableUiExportProgress.ui;
+        return u != null && u.cancel.Load() != 0;
     }
 
     // UI 线程：渲染弹层前把后台暂存拉取进弹层状态。完成态只在
     // 首次到达时提交（message/ok 不被后续帧改写）。
     public static void SyncUi() {
+        if (DataTableUiExportProgress.sLock == 0) { return; }
+        Mutex.Lock(DataTableUiExportProgress.sLock);
         DataTableExportUi u = DataTableUiExportProgress.ui;
+        int done = DataTableUiExportProgress.sDone;
+        int total = DataTableUiExportProgress.sTotal;
+        bool finished = DataTableUiExportProgress.sFinished;
+        bool ok = DataTableUiExportProgress.sOk;
+        string msg = DataTableUiExportProgress.sMsg;
+        Mutex.Unlock(DataTableUiExportProgress.sLock);
         if (u == null) { return; }
-        u.done = DataTableUiExportProgress.sDone;
-        u.total = DataTableUiExportProgress.sTotal;
-        if (DataTableUiExportProgress.sFinished && !u.finished) {
+        u.done = done;
+        u.total = total;
+        if (finished && !u.finished) {
             u.finished = true;
-            u.ok = DataTableUiExportProgress.sOk;
-            u.message = DataTableUiExportProgress.sMsg;
+            u.ok = ok;
+            u.message = msg;
         }
     }
 }
@@ -471,8 +500,9 @@ public class DataTableRowSource : XlsxRowSource {
     override int RowCount() { return this.snap.rows.Count + this.GetHeaderRows(); }
 
     public void FillHeaderRow(int index, List<XlsxCell> row) {
-        int hRows = this.GetHeaderRows();
-        for (int cc = this.snap.c0; cc <= this.snap.c1 && cc < this.cols.Count; cc = cc + 1) {
+        List<int> ecols = DataTable.ExportCols(this.snap, this.cols);
+        for (int pos = 0; pos < ecols.Count; pos = pos + 1) {
+            int cc = ecols[pos];
             DataColumn col = this.cols[cc];
             string path = col.band;
             int d = DataTable.BandDepth(path);
@@ -486,8 +516,8 @@ public class DataTableRowSource : XlsxRowSource {
                 if (index < d) {
                     string pCur = DataTable.BandPrefix(path, index + 1);
                     bool isSecondary = false;
-                    if (cc > this.snap.c0) {
-                        string pPrev = DataTable.BandPrefix(this.cols[cc - 1].band, index + 1);
+                    if (pos > 0) {
+                        string pPrev = DataTable.BandPrefix(this.cols[ecols[pos - 1]].band, index + 1);
                         if (pCur == pPrev && pCur != "") {
                             isSecondary = true;
                         }
@@ -516,7 +546,9 @@ public class DataTableRowSource : XlsxRowSource {
             return true;
         }
         int ri = this.snap.rows[index - hRows];
-        for (int cc = this.snap.c0; cc <= this.snap.c1 && cc < this.cols.Count; cc = cc + 1) {
+        List<int> ecols = DataTable.ExportCols(this.snap, this.cols);
+        for (int pos = 0; pos < ecols.Count; pos = pos + 1) {
+            int cc = ecols[pos];
             row.Add(DataTableXlsx.ExportCell(cc, this.cols, this.cols[cc], this.src, ri));
         }
         return true;
@@ -539,7 +571,9 @@ public class DataTableRowSource : XlsxRowSource {
 public class DataTableStyleSnapshot {
     public StyleBox surface;
     public StyleBox header;
+    public StyleBox headerHover;
     public StyleBox icon;
+    public StyleBox iconHover;
     public StyleBox iconSel;
     public StyleBox bandHdr;
     public StyleBox accent;
@@ -551,16 +585,45 @@ public class DataTableStyleSnapshot {
     public StyleBox detail;
     public StyleBox hint;
     public StyleBox cellBox;
+    public StyleBox cellSecondary;
+    public StyleBox cellLink;
+    public StyleBox markOn;
+    public StyleBox markOff;
+    public StyleBox progressTrack;
+    public StyleBox progressFill;
+    public StyleBox progressFillDone;
+    public StyleBox tag;
+    public StyleBox sparkNeg;
+    public StyleBox footer;
+    public StyleBox scrollbar;
+    public StyleBox scrollbarHover;
     public StyleBox grid;
     public StyleBox toast;
+    public int tagColorDefault;
+    public int tagColorPrimary;
+    public int tagColorInfo;
+    public int tagColorSuccess;
+    public int tagColorWarning;
+    public int tagColorError;
 
     public DataTableStyleSnapshot() { }
+
+    public int TagTypeColor(int type) {
+        if (type == 1) { return this.tagColorPrimary; }
+        if (type == 2) { return this.tagColorInfo; }
+        if (type == 3) { return this.tagColorSuccess; }
+        if (type == 4) { return this.tagColorWarning; }
+        if (type == 5) { return this.tagColorError; }
+        return this.tagColorDefault;
+    }
 
     public static DataTableStyleSnapshot Create(App app) {
         DataTableStyleSnapshot ss = new DataTableStyleSnapshot();
         ss.surface = Style.Full(app, "datatable", "", "", Style.SNormal());
         ss.header = Style.Part(app, "datatable", "header", "", "", "", Style.SNormal());
+        ss.headerHover = Style.Part(app, "datatable", "header", "", "", "", Style.SHover());
         ss.icon = Style.Part(app, "datatable", "icon", "", "", "", Style.SNormal());
+        ss.iconHover = Style.Part(app, "datatable", "icon", "", "", "", Style.SHover());
         ss.iconSel = Style.Part(app, "datatable", "icon", "", "", "", Style.SSelected());
         ss.bandHdr = Style.Part(app, "datatable", "band", "", "", "", Style.SNormal());
         ss.accent = Style.Part(app, "datatable", "accent", "", "", "", Style.SNormal());
@@ -572,8 +635,26 @@ public class DataTableStyleSnapshot {
         ss.detail = Style.Part(app, "datatable", "detail", "", "", "", Style.SNormal());
         ss.hint = Style.Part(app, "datatable", "hint", "", "", "", Style.SNormal());
         ss.cellBox = Style.Part(app, "datatable", "cell", "", "", "", Style.SNormal());
+        ss.cellSecondary = Style.Part(app, "datatable", "cell", "", "secondary", "", Style.SNormal());
+        ss.cellLink = Style.Part(app, "datatable", "cell", "", "link", "", Style.SNormal());
+        ss.markOn = Style.Part(app, "datatable", "mark", "", "", "", Style.SNormal());
+        ss.markOff = Style.Part(app, "datatable", "mark", "", "off", "", Style.SNormal());
+        ss.progressTrack = Style.Part(app, "datatable", "progress-track", "", "", "", Style.SNormal());
+        ss.progressFill = Style.Part(app, "datatable", "progress-fill", "", "", "", Style.SNormal());
+        ss.progressFillDone = Style.Part(app, "datatable", "progress-fill", "", "done", "", Style.SNormal());
+        ss.tag = Style.Part(app, "datatable", "tag", "", "", "", Style.SNormal());
+        ss.sparkNeg = Style.Part(app, "datatable", "spark-neg", "", "", "", Style.SNormal());
+        ss.footer = Style.Part(app, "datatable", "footer", "", "", "", Style.SNormal());
+        ss.scrollbar = Style.Part(app, "datatable", "scrollbar", "", "", "", Style.SNormal());
+        ss.scrollbarHover = Style.Part(app, "datatable", "scrollbar", "", "", "", Style.SHover());
         ss.grid = Style.Part(app, "datatable", "grid", "", "", "", Style.SNormal());
         ss.toast = Style.Part(app, "datatable", "toast", "", "", "", Style.SNormal());
+        ss.tagColorDefault = ss.tag.FgOr(0);
+        ss.tagColorPrimary = Style.Part(app, "datatable", "tag", "", "primary", "", Style.SNormal()).FgOr(0);
+        ss.tagColorInfo = Style.Part(app, "datatable", "tag", "", "info", "", Style.SNormal()).FgOr(0);
+        ss.tagColorSuccess = Style.Part(app, "datatable", "tag", "", "success", "", Style.SNormal()).FgOr(0);
+        ss.tagColorWarning = Style.Part(app, "datatable", "tag", "", "warning", "", Style.SNormal()).FgOr(0);
+        ss.tagColorError = Style.Part(app, "datatable", "tag", "", "error", "", Style.SNormal()).FgOr(0);
         return ss;
     }
 }

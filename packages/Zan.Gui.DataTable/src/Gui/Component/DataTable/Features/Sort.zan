@@ -266,10 +266,12 @@ public partial class DataTable {
         int n = st.order.Count;
         if (n < 2) { return; }
         if (sc < 0 || sc >= cols.Count) { return; }
-        // 键类型：0 字符串、1 int、2 实数（小数数值列）。日期
+        // 键类型：0 字符串、1 int、2 实数（小数数值列或计算列）。日期
         // 列按天数做键，因此走 int 路径。
+        bool fcol = DataTable.IsFormula(cols, sc);
         int kind = 0;
-        if (cols[sc].isDate || cols[sc].isBool) { kind = 1; }
+        if (fcol) { kind = 2; }
+        else if (cols[sc].isDate || cols[sc].isBool) { kind = 1; }
         else if (cols[sc].numeric) { if (cols[sc].decimals > 0) { kind = 2; } else { kind = 1; } }
 
         // 装饰：为每个可见行提取一次排序键（O(n)），
@@ -278,27 +280,23 @@ public partial class DataTable {
         List<int> nkey = new List<int>();
         List<string> skey = new List<string>();
         List<double> rkey = new List<double>();
-        // 计算列：按公式实数值排序，与该列 decimals>0 的
-        // 实数路径一致。公式列逐行可能求值失败（显示空），
-        // 失败行键取 0，保持稳定归并的行序不变。
-        bool fcol = DataTable.IsFormula(cols, sc);
+        // 计算列：预取编译表达式并复用求值栈，消除 O(n) 锁竞争与堆分配。
+        FormulaExpr fexpr = fcol ? DataTable.FormulaExprOf(cols, sc) : null;
+        List<double> fstack = fcol ? new List<double>() : null;
         for (int q = 0; q < n; q = q + 1) {
-            if (cols[sc].isDate) { nkey.Add(src.CellDay(st.order[q], sc, cols[sc].dateOrder)); }
+            if (fcol) {
+                double fv = 0.0;
+                if (fexpr == null || !DataTable.FormulaEvalScratch(fexpr, src, st.order[q], fstack, out fv)) { fv = 0.0; }
+                rkey.Add(fv);
+            }
+            else if (cols[sc].isDate) { nkey.Add(src.CellDay(st.order[q], sc, cols[sc].dateOrder)); }
             else if (cols[sc].isBool) {
                 int bv = 0;
                 if (src.CellBool(st.order[q], sc)) { bv = 1; }
                 nkey.Add(bv);
             }
             else if (kind == 1) { nkey.Add(src.CellNum(st.order[q], sc)); }
-            else if (kind == 2) {
-                if (fcol) {
-                    double fv;
-                    if (!DataTable.FormulaTryReal(cols, src, st.order[q], sc, out fv)) { fv = 0.0; }
-                    rkey.Add(fv);
-                } else {
-                    rkey.Add(src.CellReal(st.order[q], sc));
-                }
-            }
+            else if (kind == 2) { rkey.Add(src.CellReal(st.order[q], sc)); }
             else { skey.Add(src.CellText(st.order[q], sc)); }
         }
 
@@ -322,6 +320,38 @@ public partial class DataTable {
                 int hi = lo + width * 2;
                 if (hi > n) { hi = n; }
                 if (mid < hi) { DataTable.MergeKeyed(kind, dir, st.order, nkey, skey, rkey, lo, mid, hi, otmp, ntmp, stmp, rtmp); }
+                lo = lo + width * 2;
+            }
+            width = width * 2;
+        }
+    }
+
+    // 按日期列的星期桶（WeekdayOf）做稳定装饰归并排序，供多级分组排序复用。
+    public static void SortOrderByWeekday(DataTableState st, List<DataColumn> cols, DataSource src, int sc) {
+        int n = st.order.Count;
+        if (n < 2 || sc < 0 || sc >= cols.Count) { return; }
+        int dateOrder = cols[sc].dateOrder;
+        List<int> nkey = new List<int>();
+        List<string> skey = new List<string>();
+        List<double> rkey = new List<double>();
+        List<int> otmp = new List<int>();
+        List<int> ntmp = new List<int>();
+        List<string> stmp = new List<string>();
+        List<double> rtmp = new List<double>();
+        for (int q = 0; q < n; q = q + 1) {
+            nkey.Add(DataTable.WeekdayOf(src.CellDay(st.order[q], sc, dateOrder)));
+            otmp.Add(0);
+            ntmp.Add(0);
+        }
+        int width = 1;
+        while (width < n) {
+            int lo = 0;
+            while (lo < n) {
+                int mid = lo + width;
+                if (mid > n) { mid = n; }
+                int hi = lo + width * 2;
+                if (hi > n) { hi = n; }
+                if (mid < hi) { DataTable.MergeKeyed(1, 1, st.order, nkey, skey, rkey, lo, mid, hi, otmp, ntmp, stmp, rtmp); }
                 lo = lo + width * 2;
             }
             width = width * 2;
@@ -425,16 +455,17 @@ public partial class DataTable {
         List<int> slots = new List<int>();
         int cap = DataTable.DistinctCapacity(nrows);
         for (; i < cap; i = i + 1) { slots.Add(-1); }
-        // 计算列：去重集合取公式文本（与显示一致）；
+        // 计算列：去重集合取公式文本（与显示一致）；循环外预取表达式并复用求值栈。
         // 求值失败的行显示空，不为集合筛选提供候选。
         bool fcol = DataTable.IsFormula(cols, col);
+        FormulaExpr fExpr = fcol ? DataTable.FormulaExprOf(cols, col) : null;
+        List<double> fStack = fcol ? new List<double>() : null;
         i = 0;
         while (i < nrows) {
             int row = st.order[i];
             string v;
             if (fcol) {
-                v = DataTable.FormulaText(cols, src, row, col);
-                if (v == null) { v = ""; }
+                v = DataTable.FormulaTextScratch(fExpr, cols[col], src, row, fStack);
             } else {
                 v = src.CellText(row, col);
             }

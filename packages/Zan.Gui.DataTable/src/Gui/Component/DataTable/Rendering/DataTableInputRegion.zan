@@ -33,17 +33,40 @@ internal class DataTableInputRegion : Control {
 }
 
 internal partial class DataTableVisualTree {
+    internal void BeginRegionsFrame(DataTableState st) {
+        if (st == null) { return; }
+        if (st.inputControls == null) { st.inputControls = new DataTableInputControls(); }
+        DataTableInputControls controls = st.inputControls;
+        controls.priorRegionMap = controls.regionMap;
+        controls.regionMap = new Dict<string, DataTableInputRegion>();
+        controls.regions.Clear();
+        controls.editorButtons.Clear();
+    }
+
+    internal void EndRegionsFrame(DataTableState st) {
+        if (st == null || st.inputControls == null) { return; }
+        st.inputControls.priorRegionMap = null;
+    }
+
     private DataTableInputRegion Region(App app, DataTableState st, string key, int action,
     int row, int column, int x, int y, int w, int h) {
         if (w <= 0 || h <= 0) { return null; }
         DataTableInputControls controls = st.inputControls;
         DataTableInputRegion region = null;
-        for (int i = 0; i < controls.regions.Count; i = i + 1) {
-            if (controls.regions[i].key == key) { region = controls.regions[i]; break; }
+        bool alreadyInFrame = false;
+        if (controls.regionMap.ContainsKey(key)) {
+            region = controls.regionMap[key];
+            alreadyInFrame = true;
+        } else if (controls.priorRegionMap != null && controls.priorRegionMap.ContainsKey(key)) {
+            region = controls.priorRegionMap[key];
         }
         if (region == null) {
             region = new DataTableInputRegion(); region.key = key;
+        }
+        if (!alreadyInFrame) {
+            controls.regionMap[key] = region;
             controls.regions.Add(region);
+            if (action >= 26 && action <= 28) { controls.editorButtons.Add(region); }
         }
         region.tree = this; region.state = st; region.action = action; region.row = row; region.column = column;
         region.a11yLabel = action == 1 ? "select-all" : action == 13 ? "select-row" : "";
@@ -96,7 +119,7 @@ internal partial class DataTableVisualTree {
             cw - grip - f.menuIconW, height);
             if (title != null) { title.a11yLabel = col.title; }
             this.Region(app, st, "grip:" + key, 3, -1, cc, column.x, top, grip, height);
-            if (col.filterable || col.sortable) {
+            if (DataTable.HasHeaderPanel(st, col)) {
                 this.Region(app, st, "filter:" + key, 4, -1, cc,
                 column.x + cw - f.menuIconW - app.Scale(1), top, f.menuIconW, height);
             }
@@ -104,6 +127,19 @@ internal partial class DataTableVisualTree {
                 int resizeW = app.Scale(6);
                 this.Region(app, st, "resize:" + key, 5, -1, cc,
                 column.x + cw - resizeW / 2, top, resizeW, height);
+            }
+        }
+        if (st.allowAddColumn && f.addColW > 0) {
+            int addL = f.BandClipLeft(1);
+            int addR = f.BandClipRight(1);
+            if (f.addColX + f.addColW > addL && f.addColX < addR) {
+                DataTableVisualTree.SetVisibleClip(st, addL, f.y, addR - addL, f.headerH);
+                DataTableInputRegion addColReg = this.Region(app, st, "addcol", 30, -1, -1,
+                f.addColX, f.titleTop, f.addColW, f.titleRowH);
+                if (addColReg != null) {
+                    addColReg.a11yLabel = st.addColumnLabel != null && st.addColumnLabel.Length > 0
+                    ? st.addColumnLabel : DataTable.T("Add Column", "新增列");
+                }
             }
         }
         for (int level = 0; level < f.bandLevels; level = level + 1) {
@@ -181,6 +217,19 @@ internal partial class DataTableVisualTree {
             this.Region(app, st, "add", 18, -1, -1, x,
             lay.bodyTop + (lay.total - lay.start) * f.rowH, w, f.rowH);
         }
+        if (st.showSummary && lay.summaryH > 0) {
+            int sumY = lay.bodyTop + lay.bodyH + lay.bottomPinnedH;
+            for (int i = 0; i < f.viewportColumns.Count; i = i + 1) {
+                FrameColumn column = f.viewportColumns[i]; int cc = column.column;
+                int left = f.BandClipLeft(column.band);
+                int right = f.BandClipRight(column.band);
+                DataTableVisualTree.SetVisibleClip(st, left, sumY, right - left, lay.summaryH);
+                DataTableInputRegion sumReg = this.Region(app, st, "summary:" + Convert.ToString(cc), 31,
+                -1, cc, column.x, sumY, st.dispW[cc], lay.summaryH);
+                if (sumReg != null) { sumReg.a11yLabel = DataTable.T("Summary", "汇总") + ": " + cols[cc].title; }
+            }
+            DataTableVisualTree.SetVisibleClip(st, x, host.by, w, host.bh);
+        }
         this.PrepareFooterChips(app, st, cols, src, lay);
         if (!st.paged && lay.total > lay.visRows) {
             int size = app.Scale(8);
@@ -205,8 +254,17 @@ internal partial class DataTableVisualTree {
         string text = DataTable.T("Rows", "行数:") + " " + Convert.ToString(st.order.Count);
         if (st.order.Count != total) { text = text + " / " + Convert.ToString(total); }
         int selected = 0;
-        if (st.selectionModel != null && st.selectionModel.AllSelected()) { selected = st.order.Count; }
-        else {
+        if (st.selectionModelAuthoritative && st.selectionModel != null) {
+            if (st.selectionModel.AllSelected()) {
+                selected = st.order.Count - st.selectionModel.ExcludedCount();
+                if (selected < 0) { selected = 0; }
+            } else {
+                selected = st.selectionModel.ExplicitCount();
+            }
+        } else if (st.selectionModel != null && st.selectionModel.AllSelected()) {
+            selected = st.order.Count - st.selectionModel.ExcludedCount();
+            if (selected < 0) { selected = 0; }
+        } else {
             for (int i = 0; i < st.selected.Count; i = i + 1) {
                 if (st.selected[i]) { selected = selected + 1; }
             }
@@ -293,18 +351,18 @@ internal partial class DataTableVisualTree {
                 }
             }
             if (action == 10 && st.dragVbar) {
-                int thumb = region.bh * lay.visRows / lay.total;
+                int thumb = (int)((long)region.bh * (long)lay.visRows / (long)lay.total);
                 if (thumb < app.Scale(24)) { thumb = app.Scale(24); }
                 int denominator = region.bh - thumb; if (denominator < 1) { denominator = 1; }
-                int value = (e.y - region.by - thumb / 2) * (lay.total - lay.visRows) / denominator;
+                int value = (int)((long)(e.y - region.by - thumb / 2) * (long)(lay.total - lay.visRows) / (long)denominator);
                 value = VirtualScrollHost.ClampStartRow(value, lay.total, lay.visRows);
                 if (value != st.scrollRow) { st.scrollRow = value; st.ScrollChanged.Raise(st.host); }
             }
             if (action == 11 && st.dragHbar) {
-                int thumb = region.bw * f.bandW / f.bandNatW;
+                int thumb = (int)((long)region.bw * (long)f.bandW / (long)f.bandNatW);
                 if (thumb < app.Scale(24)) { thumb = app.Scale(24); }
                 int denominator = region.bw - thumb; if (denominator < 1) { denominator = 1; }
-                int value = (e.x - region.bx - thumb / 2) * f.maxScrollX / denominator;
+                int value = (int)((long)(e.x - region.bx - thumb / 2) * (long)f.maxScrollX / (long)denominator);
                 if (value < 0) { value = 0; } if (value > f.maxScrollX) { value = f.maxScrollX; }
                 st.scrollX = value;
             }
@@ -328,6 +386,19 @@ internal partial class DataTableVisualTree {
                     int before = st.dropVis < f.columns.Count ? f.columns[st.dropVis].column : -1;
                     if (before != col) {
                         st.hitCol = col;
+                        // 拖入不同冻结区时同步更新该列冻结态，使跨带拖拽可直觉冻结/解冻。
+                        int targetBand = 1;
+                        if (st.dropVis < f.columns.Count) {
+                            targetBand = f.columns[st.dropVis].band;
+                        } else if (f.columns.Count > 0) {
+                            targetBand = f.columns[f.columns.Count - 1].band;
+                        }
+                        int targetFreeze = targetBand == 0 ? 1 : (targetBand == 2 ? 2 : 0);
+                        while (st.colFreeze.Count <= col) { st.colFreeze.Add(0); }
+                        if (st.colFreeze[col] != targetFreeze) {
+                            st.colFreeze[col] = targetFreeze;
+                            DataTable.InvalidateView(st);
+                        }
                         DataTable.MoveColumn(st, col, before);
                         st.ColumnReorder.Raise(st.host);
                     }
@@ -384,6 +455,11 @@ internal partial class DataTableVisualTree {
                 st.editBuf = DataTable.StepValue(context.columns[st.editCol], st.editBuf, action == 26 ? 1 : -1);
                 st.editCur = st.editBuf.Length; st.editError = "";
             } else if (action == 28) { st.edPopOpen = !st.edPopOpen; }
+            else if (action == 30) { st.AddColumn.Raise(st.host); }
+            else if (action == 31) {
+                DataTable.OpenSummaryMenu(st, col, region.bx, region.by);
+                this.PrepareInputMenus(app);
+            }
             else if (action == 18) {
                 int row = DataTable.AppendRow(st, context.columns, context.source);
                 if (row >= 0 && context.Current()) {
@@ -405,7 +481,11 @@ internal partial class DataTableVisualTree {
             }
         }
         if (name == "PointerDown" || name == "Click") { e.Handle(); }
-        if (context.Current() && e.GestureRouteCurrent()) { this.InputChanged(); }
-        app.RequestRedraw();
+        bool idleMove = name == "PointerMove" && st.resizeCol < 0 && st.dragCol < 0
+        && st.dragChip < 0 && !st.dragVbar && !st.dragHbar && !st.rowGripDrag;
+        if (!idleMove) {
+            if (context.Current() && e.GestureRouteCurrent()) { this.InputChanged(); }
+            app.RequestRedraw();
+        }
     }
 }

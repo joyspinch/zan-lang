@@ -150,6 +150,23 @@ public partial class DataTable {
         int edH = 0;
         bool edVis = false;
 
+        // 帧级公式表达式快照：有计算列时仅锁表查一次缓存，复用 st.formulaScratch。
+        List<FormulaExpr> frameFormulaExprs = null;
+        if (cols != null) {
+            for (int fci = 0; fci < cols.Count; fci = fci + 1) {
+                if (cols[fci].formula.Length > 0) {
+                    if (frameFormulaExprs == null) {
+                        frameFormulaExprs = new List<FormulaExpr>();
+                        for (int k = 0; k < cols.Count; k = k + 1) {
+                            frameFormulaExprs.Add(cols[k].formula.Length > 0 ? DataTable.FormulaExprOf(cols, k) : null);
+                        }
+                        if (st.formulaScratch == null) { st.formulaScratch = new List<double>(); }
+                    }
+                    break;
+                }
+            }
+        }
+
         // ---------------- 置顶固定行 (Pinned Top Rows) ----------------
         if (st.pinnedTopRows != null && st.pinnedTopRows.Count > 0) {
             for (int pti = 0; pti < st.pinnedTopRows.Count; pti = pti + 1) {
@@ -157,7 +174,7 @@ public partial class DataTable {
                 DataTable.RenderPinnedRow(app, x, pty, viewW, rowH, numW, selW, cols,
                 st.pinnedTopRows[pti], st, viewportColumns,
                 firstDataX, bandX, bandW, rightX, pinnedW, pinnedRW,
-                clipRight, gridColor, "📌");
+                clipRight, gridColor, "📌", ss);
                 if (!DataTableVisualTree.IsCurrentRender(st)) { return; }
             }
         }
@@ -443,9 +460,10 @@ public partial class DataTable {
                         }
                         string cellText = src.CellText(rowIdx, cc);
                         if (!DataTableVisualTree.IsCurrentRender(st)) { return; }
-                        string fText = DataTable.FormulaText(cols, src, rowIdx, cc);
-                        if (!DataTableVisualTree.IsCurrentRender(st)) { return; }
-                        if (fText != null) { cellText = fText; }
+                        if (frameFormulaExprs != null && cc < frameFormulaExprs.Count && cols[cc].formula.Length > 0) {
+                            cellText = DataTable.FormulaTextScratch(frameFormulaExprs[cc], cols[cc], src, rowIdx, st.formulaScratch);
+                            if (!DataTableVisualTree.IsCurrentRender(st)) { return; }
+                        }
                         int mu = 0;
                         int md = 0;
                         if (cols[cc].mergeSame && cols[cc].cellType < 6
@@ -513,11 +531,17 @@ public partial class DataTable {
                             if (cTop < bodyTop) { cTop = bodyTop; }
                             int cBot = mTop + mH;
                             if (cBot > bodyTop + bodyH) { cBot = bodyTop + bodyH; }
+                            int mBandL = f.BandClipLeft(cBand);
+                            int mBandR = f.BandClipRight(cBand);
+                            int mClipL = ccl > mBandL ? ccl : mBandL;
+                            int mClipR = ccl + cw < mBandR ? ccl + cw : mBandR;
                             c.PopClip();
-                            c.PushClip(ccl, cTop, cw, cBot - cTop);
-                            c.DrawText(mTx, mTop + (mH - fs) / 2, mShown,
-                            mFg, fs);
-                            c.PopClip();
+                            if (mClipR > mClipL && cBot > cTop) {
+                                c.PushClip(mClipL, cTop, mClipR - mClipL, cBot - cTop);
+                                c.DrawText(mTx, mTop + (mH - fs) / 2, mShown,
+                                mFg, fs);
+                                c.PopClip();
+                            }
                             DataTable.PushBandClip(c, cBand, firstDataX, bandX, bandW,
                             rightX, pinnedW, pinnedRW, ry, rowH,
                             clipRight);
@@ -540,12 +564,12 @@ public partial class DataTable {
                                 DataTable.DrawCellIndented(app, cols[cc], cellText,
                                 ccl, ry, cw, rowH, cfLo, cfHi,
                                 foreground,
-                                depth, true, false, false);
+                                depth, true, false, false, ss);
                             } else {
                                 DataTable.DrawCellIndented(app, cols[cc], cellText,
                                 ccl, ry, cw, rowH, cfLo, cfHi,
                                 foreground,
-                                depth, true, canExp, isExp);
+                                depth, true, canExp, isExp, ss);
                             }
                         } else {
                             int foreground = DataTable.CellForeground(st, src, rowIdx, cc);
@@ -553,7 +577,7 @@ public partial class DataTable {
                             if (foreground == 0 && rStyle != null && rStyle.fg != 0) { foreground = rStyle.fg; }
                             DataTable.DrawCellRangeCtx(app, cols[cc], cellText, ccl, ry, drawCw, drawRowH,
                             cfLo, cfHi, foreground,
-                            rowIdx, cc, st, src);
+                            rowIdx, cc, st, src, ss);
                             if (!DataTableVisualTree.IsCurrentRender(st)) { return; }
                         }
                     }
@@ -656,13 +680,18 @@ public partial class DataTable {
                 int hy = bodyTop + (hr1 - start + 1) * rowH;
                 for (int fh = 0; fh < frameColumns.Count; fh = fh + 1) {
                     if (frameColumns[fh].column == hc1) {
+                        int fhBand = frameColumns[fh].band;
+                        int fhClipL = f.BandClipLeft(fhBand);
+                        int fhClipR = f.BandClipRight(fhBand);
                         int hx = frameColumns[fh].x + st.dispW[hc1];
                         int hsz = app.Scale(7);
-                        c.FillRect(hx - hsz, hy - hsz, hsz, hsz, sAccent.BgOr(0));
-                        c.DrawRect(hx - hsz, hy - hsz, hsz, hsz, sRow.BgOr(0), 1);
-
-                        int grabPad = app.Scale(3);
-
+                        if (hx > fhClipL && hx - hsz < fhClipR && fhClipR > fhClipL) {
+                            c.PushClip(fhClipL, bodyTop, fhClipR - fhClipL, bodyH);
+                            c.FillRect(hx - hsz, hy - hsz, hsz, hsz, sAccent.BgOr(0));
+                            c.DrawRect(hx - hsz, hy - hsz, hsz, hsz, sRow.BgOr(0), 1);
+                            c.PopClip();
+                        }
+                        break;
                     }
                 }
             }
@@ -733,11 +762,31 @@ public partial class DataTable {
         // The editor was mounted and arranged during preparation.
         if (st.inputControls != null && st.inputControls.editor != null) {
             st.inputControls.editor.RenderTree(app);
-            for (int i = 0; i < st.inputControls.regions.Count; i = i + 1) {
-                DataTableInputRegion button = st.inputControls.regions[i];
-                if (button.action >= 26 && button.action <= 28 && st.activeDetails.Contains(button)) {
+            for (int i = 0; i < st.inputControls.editorButtons.Count; i = i + 1) {
+                DataTableInputRegion button = st.inputControls.editorButtons[i];
+                if (st.activeDetails.Contains(button)) {
                     button.RenderTree(app);
                 }
+            }
+        }
+        // 编辑校验失败提示气泡（紧贴激活编辑格下方，越界时折到上方）。
+        if (st.editing && st.editError != null && st.editError.Length > 0) {
+            Rect edRect = DataTable.EditorRect(f, lay, cols, st);
+            if (edRect != null) {
+                int errFs = Style.FontFallback(app, "small");
+                int padH = app.Scale(8);
+                int padV = app.Scale(4);
+                int errW = Canvas.MeasureText(st.editError, errFs) + padH * 2;
+                int errH = errFs + padV * 2;
+                int errX = edRect.x;
+                if (errX + errW > x + viewW - app.Scale(4)) { errX = x + viewW - app.Scale(4) - errW; }
+                if (errX < x + app.Scale(4)) { errX = x + app.Scale(4); }
+                int errY = edRect.y + edRect.height + app.Scale(2);
+                if (errY + errH > bodyTop + bodyH) { errY = edRect.y - errH - app.Scale(2); }
+                int errBg = t.error != 0 ? t.error : (0xFF << 24 | 0xD13438);
+                int errFg = (0xFF << 24) | 0xFFFFFF;
+                c.FillRoundRect(errX, errY, errW, errH, t.borderRadiusSmall, errBg);
+                c.DrawText(errX + padH, errY + padV, st.editError, errFg, errFs);
             }
         }
     }

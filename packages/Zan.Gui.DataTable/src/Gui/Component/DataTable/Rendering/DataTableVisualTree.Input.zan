@@ -7,7 +7,53 @@ namespace Gui.Component.DataTable;
 internal partial class DataTableVisualTree {
     internal void RouteBody(RoutedEventArgs e) {
         Control host = this.owner;
-        if (host == null || e.originalSource != host) { return; }
+        if (host == null) { return; }
+        if (e.originalSource != host) {
+            // 自定义悬浮编辑器子控件冒泡的 KeyDown：先交由 CellEditor.OnKeyDown，
+            // 未消费的 Enter/Tab/Esc 驱动提交与取消，避免键盘完全失灵。
+            if (e.eventName == "KeyDown") {
+                DataTableInputContext edCtx = this.InputContext();
+                if (edCtx != null && host.App != null && edCtx.state != null
+                && edCtx.state.editing && edCtx.state.activeEditorWidget != null) {
+                    Control cur = e.originalSource;
+                    bool fromEditor = false;
+                    while (cur != null && cur != host) {
+                        if (cur == edCtx.state.activeEditorWidget) { fromEditor = true; break; }
+                        cur = cur.parent;
+                    }
+                    if (fromEditor) {
+                        DataTableState est = edCtx.state;
+                        CellEditor ed = est.activeEditor != null ? est.activeEditor : est.cellEditor;
+                        if (ed != null && ed.OnKeyDown(est.activeEditorWidget, e.keyCode, est)) {
+                            e.Handle();
+                            this.InputChanged();
+                            host.App.RequestRedraw();
+                            return;
+                        }
+                        if (e.keyCode == 27) {
+                            DataTable.CancelEdit(est);
+                            host.Focus();
+                            e.Handle();
+                            this.InputChanged();
+                            host.App.RequestRedraw();
+                            return;
+                        }
+                        if (e.keyCode == 13 || e.keyCode == 9) {
+                            DataTable.CommitEditAndAdvance(est, edCtx.columns, edCtx.source,
+                                edCtx.frame.columns, edCtx.body.visRows,
+                                edCtx.frame.dataViewW, edCtx.frame.pinnedW,
+                                Modifiers.HasShift(e.modifiers), e.keyCode == 9);
+                            if (!est.editing) { host.Focus(); }
+                            e.Handle();
+                            this.InputChanged();
+                            host.App.RequestRedraw();
+                            return;
+                        }
+                    }
+                }
+            }
+            return;
+        }
         if (e.eventName == "PointerCancel") {
             DataTableState retired = this.preparedState;
             if (retired != null) {
@@ -64,7 +110,11 @@ internal partial class DataTableVisualTree {
                 app.ReleasePointerCapture();
             } else if (name == "KeyDown" || name == "TextInput" || name == "Click") { e.Handle(); }
         }
-        if (context.Current() && e.GestureRouteCurrent()) { this.InputChanged(); }
-        app.RequestRedraw();
+        bool idleMove = name == "PointerMove"
+        && !st.fillDrag && !st.rangeDrag && !st.rowSelDrag && st.dragRow < 0;
+        if (!idleMove) {
+            if (context.Current() && e.GestureRouteCurrent()) { this.InputChanged(); }
+            app.RequestRedraw();
+        }
     }
 }

@@ -39,6 +39,10 @@ public class HttpTableSource : ServerDataSource {
     string token;
     string lastError;
 
+    // 磁盘块缓存有界淘汰（UI 线程维护访问序，<= 0 表示不限制）。
+    int maxCacheFiles;
+    List<string> cachedPaths;
+
     // 在途身份（UI 线程写；单源同一时刻至多一个在途块，基类已合并）。
     int fetchNonce;
     int activeNonce;
@@ -49,6 +53,10 @@ public class HttpTableSource : ServerDataSource {
     // ---- 全局单工拉取通道（Mutex 保护；worker 写 / UI Poll 消费）----
     static nint lockHandle;
     static List<HttpTableSource> queue;
+    static List<int> queueStarts;
+    static List<int> queueCounts;
+    static List<string> queuePaths;
+    static List<int> queueNonces;
     static bool workerUp;
     // 完成队列：完成结果按源排队交付——旧实现是单个静态槽位（doneSrc
     // 等四个字段），两个源并发在途时后完成者覆盖先完成者，先完成源的
@@ -70,6 +78,8 @@ public class HttpTableSource : ServerDataSource {
         s.useTls = false;
         s.token = "";
         s.lastError = "";
+        s.maxCacheFiles = 128;
+        s.cachedPaths = new List<string>();
         return s;
     }
 
@@ -87,6 +97,58 @@ public class HttpTableSource : ServerDataSource {
 
     // 最近一次网络失败的说明；成功后清空。缓存命中不改动它。
     string LastError() { return lastError; }
+
+    // 设置本源保留的磁盘缓存块数上限（默认 128；<= 0 表示不限制）。
+    public void SetMaxCacheFiles(int maxFiles) {
+        this.maxCacheFiles = maxFiles;
+        this.EvictCacheOverflow();
+    }
+
+    public int MaxCacheFiles() { return this.maxCacheFiles; }
+
+    public int TrackedCacheCount() {
+        return this.cachedPaths != null ? this.cachedPaths.Count : 0;
+    }
+
+    // 主动清理本源已追踪的磁盘缓存文件。
+    public void ClearDiskCache() {
+        if (this.cachedPaths == null) { return; }
+        for (int i = 0; i < this.cachedPaths.Count; i = i + 1) {
+            try {
+                if (File.Exists(this.cachedPaths[i])) {
+                    File.Delete(this.cachedPaths[i]);
+                }
+            } catch (Exception) { }
+        }
+        this.cachedPaths.Clear();
+    }
+
+    // LRU 记账并淘汰超出上限的最早缓存文件（仅在 UI 线程调用）。
+    public void RecordCacheFile(string path) {
+        if (path == null || path.Length == 0) { return; }
+        if (this.cachedPaths == null) { this.cachedPaths = new List<string>(); }
+        for (int i = 0; i < this.cachedPaths.Count; i = i + 1) {
+            if (this.cachedPaths[i] == path) {
+                this.cachedPaths.RemoveAt(i);
+                break;
+            }
+        }
+        this.cachedPaths.Add(path);
+        this.EvictCacheOverflow();
+    }
+
+    private void EvictCacheOverflow() {
+        if (this.maxCacheFiles <= 0 || this.cachedPaths == null) { return; }
+        while (this.cachedPaths.Count > this.maxCacheFiles) {
+            string oldest = this.cachedPaths[0];
+            this.cachedPaths.RemoveAt(0);
+            try {
+                if (File.Exists(oldest)) {
+                    File.Delete(oldest);
+                }
+            } catch (Exception) { }
+        }
+    }
 
     // 块 (start,count) 的缓存文件路径（键=主机端口路径的净化串，
     // 无哈希折叠——路径可读可手工排查）。
@@ -114,14 +176,25 @@ public class HttpTableSource : ServerDataSource {
             return;
         }
         this.fetchNonce = this.fetchNonce + 1;
-        this.activeNonce = this.fetchNonce;
+        int jobNonce = this.fetchNonce;
+        this.activeNonce = jobNonce;
         this.pendStart = start;
         this.pendCount = count;
         this.pendPath = path;
         if (lockHandle == 0) { lockHandle = Mutex.Create(); }
         Mutex.Lock(lockHandle);
-        if (queue == null) { queue = new List<HttpTableSource>(); }
+        if (queue == null) {
+            queue = new List<HttpTableSource>();
+            queueStarts = new List<int>();
+            queueCounts = new List<int>();
+            queuePaths = new List<string>();
+            queueNonces = new List<int>();
+        }
         queue.Add(this);
+        queueStarts.Add(start);
+        queueCounts.Add(count);
+        queuePaths.Add(path);
+        queueNonces.Add(jobNonce);
         bool need = !workerUp;
         workerUp = true;
         Mutex.Unlock(lockHandle);
@@ -141,26 +214,37 @@ public class HttpTableSource : ServerDataSource {
         Socket.Initialize();
         while (true) {
             HttpTableSource src = null;
+            int qStart = 0;
+            int qCount = 0;
+            string qPath = "";
+            int qNonce = 0;
             Mutex.Lock(lockHandle);
             if (queue != null && queue.Count > 0) {
                 src = queue[0];
+                qStart = queueStarts[0];
+                qCount = queueCounts[0];
+                qPath = queuePaths[0];
+                qNonce = queueNonces[0];
                 queue.RemoveAt(0);
+                queueStarts.RemoveAt(0);
+                queueCounts.RemoveAt(0);
+                queuePaths.RemoveAt(0);
+                queueNonces.RemoveAt(0);
             } else {
                 workerUp = false;
                 Mutex.Unlock(lockHandle);
                 return;
             }
             Mutex.Unlock(lockHandle);
-            await HttpTableSource.FetchOne(src);
+            await HttpTableSource.FetchOne(src, qStart, qCount, qPath, qNonce);
         }
     }
 
     // 取数一个块：传输里任何一处抛出都必须变成一条错误结果——不接住
     // 的话 worker 静静死掉，网格永远停在加载占位上（ImageHttp 同戒）。
     // 落盘是尽力而为：写失败不吞数据，正文照常经完成队列交付。
-    // useTls 源走 HttpClient.CreateHttps——此前无视 useTls 恒发明文，
-    // CreateTls 建的源对 https 服务端发的全是明文 GET。
-    static async int FetchOne(HttpTableSource src) {
+    // 参数均为入队时快照，避免与 UI 线程改写 pendStart/activeNonce 产生竞态。
+    static async int FetchOne(HttpTableSource src, int start, int count, string cachePath, int nonce) {
         string err = "";
         string body = "";
         try {
@@ -171,8 +255,8 @@ public class HttpTableSource : ServerDataSource {
                 client = new HttpClient(src.host, src.port);
             }
             string sep = src.basePath.IndexOf("?") >= 0 ? "&" : "?";
-            string url = src.basePath + sep + "start=" + Convert.ToString(src.pendStart)
-                + "&count=" + Convert.ToString(src.pendCount);
+            string url = src.basePath + sep + "start=" + Convert.ToString(start)
+                + "&count=" + Convert.ToString(count);
             if (src.token != "") { url = url + "&token=" + src.token; }
             HttpResponse resp = await client.SendBytesAsync("GET", url, "");
             if (resp.statusCode != 200) {
@@ -185,7 +269,7 @@ public class HttpTableSource : ServerDataSource {
         }
         if (err == "" && body != "") {
             try {
-                File.WriteAllText(src.pendPath, body);
+                File.WriteAllText(cachePath, body);
             } catch (Exception ex) {
                 Console.WriteLine("HttpTableSource: cache write failed: "
                     + ex.Message);
@@ -199,7 +283,7 @@ public class HttpTableSource : ServerDataSource {
             doneBodies = new List<string>();
         }
         doneSrcs.Add(src);
-        doneNonces.Add(src.activeNonce);
+        doneNonces.Add(nonce);
         doneErrs.Add(err);
         doneBodies.Add(body);
         Mutex.Unlock(lockHandle);
@@ -232,6 +316,7 @@ public class HttpTableSource : ServerDataSource {
                 if (this.loading && nonce == this.activeNonce) {
                     if (err == "") {
                         this.lastError = "";
+                        if (body != "") { this.RecordCacheFile(this.pendPath); }
                         List<DataRow> rows = new List<DataRow>();
                         if (this.ParsePage(body, rows)) {
                             this.FinishBlock(rows, rows.Count);
@@ -250,6 +335,7 @@ public class HttpTableSource : ServerDataSource {
 
     // 从缓存页文件读出块并交付（UI 线程）。
     public void ServeFile(string path) {
+        this.RecordCacheFile(path);
         List<DataRow> rows = new List<DataRow>();
         string body = "";
         try {

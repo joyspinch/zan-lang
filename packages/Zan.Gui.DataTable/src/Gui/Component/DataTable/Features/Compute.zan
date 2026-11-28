@@ -139,7 +139,15 @@ public partial class DataTable {
     // 列统计 -> 显示模型 -> 页脚。服务端控制源跳过全部本地筛选与
     // 排序阶段（服务端行集即权威全集）。
     public static void Recompute(DataTableState st, List<DataColumn> cols, DataSource src) {
-        if (!st.dirty) { return; }
+        if (!st.dirty && !st.dispDirty) { return; }
+        if (!st.dirty && st.dispDirty) {
+            DataTable.BuildDisplay(st, cols, src);
+            int maxDispScroll = DataTable.DispCount(st) - 1;
+            if (st.scrollRow > maxDispScroll) { st.scrollRow = maxDispScroll; }
+            if (st.scrollRow < 0) { st.scrollRow = 0; }
+            st.dispDirty = false;
+            return;
+        }
         st.order.Clear();
         int nrows = src.RowCount();
 
@@ -162,10 +170,11 @@ public partial class DataTable {
         bool server = src.ServerControlled();
         if (server) { af.Clear(); sf.Clear(); }
 
-        // 仅在用到相对预设时读取时钟，
+        // 仅在用到相对预设或组合筛选树时读取时钟，
         // 没有日期规则的网格不论日期如何都得到相同结果。
+        bool hasTree = st.filterTree != null && !server && !st.pivotView && DataTable.HasFilterTree(st);
         int today = 0;
-        if (anyPreset) { today = DataTable.Today(); }
+        if (anyPreset || hasTree) { today = DataTable.Today(); }
         int i = 0;
         if (af.Count == 0) {
             while (i < nrows) { st.order.Add(i); i = i + 1; }
@@ -175,8 +184,33 @@ public partial class DataTable {
                 i = i + 1;
             }
         }
-        // Top-N / 高于平均值阶段需要幸存集合，因此
-        // 在逐单元格扫描完成后运行一次。
+        // 在 Top-N / 排序之前先执行筛选行与组合筛选树：
+        // 1) 保证 Top-N / 高于平均值在真实过滤后的幸存集上排名；
+        // 2) 避免对即将被滤除的百万行做无用排序。
+        if (st.showFilterRow && !server) {
+            bool frAny = false;
+            for (int fri = 0; fri < st.filterRowText.Count; fri = fri + 1) {
+                if (st.filterRowText[fri].Length > 0) { frAny = true; break; }
+            }
+            if (frAny) {
+                List<int> kept = new List<int>();
+                for (int fro = 0; fro < st.order.Count; fro = fro + 1) {
+                    if (DataTable.RowPassesFilterRow(st, cols, src, st.order[fro])) { kept.Add(st.order[fro]); }
+                }
+                st.order = kept;
+            }
+        }
+        if (hasTree) {
+            List<int> treeKept = new List<int>();
+            for (int trow = 0; trow < st.order.Count; trow = trow + 1) {
+                if (DataTable.RowPassesFilterTree(st, cols, src, st.order[trow], today)) {
+                    treeKept.Add(st.order[trow]);
+                }
+            }
+            st.order = treeKept;
+        }
+        // Top-N / 高于平均值阶段需要全部逐行筛选后的幸存集合，
+        // 因此在逐列、筛选行、筛选树完成后运行一次。
         for (int si = 0; si < sf.Count; si = si + 1) {
             DataTable.ApplySetPass(st, cols, src, sf[si]);
         }
@@ -187,37 +221,6 @@ public partial class DataTable {
             DataTable.SortOrder(st, cols, src);
         } else if (st.sortKeys.Count > 1 && !server) {
             DataTable.SortOrderMulti(st, cols, src);
-        }
-        // 在 ColFilter 结果之上二次应用筛选行快速筛选。
-        // 使其与弹出筛选正交，两者可以共存。
-        if (st.showFilterRow && !server) {
-            bool frAny = false;
-            for (int fri = 0; fri < st.filterRowText.Count; fri = fri + 1) {
-                if (st.filterRowText[fri].Length > 0) { frAny = true; }
-            }
-            if (frAny) {
-                List<int> kept = new List<int>();
-                for (int fro = 0; fro < st.order.Count; fro = fro + 1) {
-                    if (DataTable.RowPassesFilterRow(st, cols, src, st.order[fro])) { kept.Add(st.order[fro]); }
-                }
-                st.order = kept;
-            }
-        }
-        // 组合筛选树（Filter Builder）最后整体求值：与逐列
-        // 筛选、筛选行三者正交共存；服务端控制的源不在本地
-        // 过滤（服务器已下发的行集是权威全集）。透视视图下
-        // 组合树已在物化时作用于原始列，生成列没有原始
-        // field 名——再求值会整表拒绝，跳过。
-        if (st.filterTree != null && !server && !st.pivotView) {
-            if (DataTable.HasFilterTree(st)) {
-                List<int> treeKept = new List<int>();
-                for (int trow = 0; trow < st.order.Count; trow = trow + 1) {
-                    if (DataTable.RowPassesFilterTree(st, cols, src, st.order[trow], today)) {
-                        treeKept.Add(st.order[trow]);
-                    }
-                }
-                st.order = treeKept;
-            }
         }
         DataTable.ComputeColStats(st, cols, src);
         // BuildDisplay 在页脚之前运行，分组表可复用其
@@ -236,6 +239,7 @@ public partial class DataTable {
         if (st.scrollRow > maxScroll) { st.scrollRow = maxScroll; }
         if (st.scrollRow < 0) { st.scrollRow = 0; }
         st.dirty = false;
+        st.dispDirty = false;
     }
 
     // summary==6 列的派生聚合，由其他列
@@ -283,13 +287,13 @@ public partial class DataTable {
         foreach (GroupRow g in st.groups) {
             if (st.collapsedKeys.IndexOf(g.key) < 0) { st.collapsedKeys.Add(g.key); }
         }
-        DataTable.InvalidateView(st);
+        DataTable.InvalidateDisplay(st);
     }
 
     // 展开全部分组（清空折叠键集合）。
     public static void ExpandAll(DataTableState st) {
         st.collapsedKeys.Clear();
-        DataTable.InvalidateView(st);
+        DataTable.InvalidateDisplay(st);
     }
 
     // 追加一个分组列（追加到最内层）；重复分组或 col<0 为空操作。
@@ -367,7 +371,7 @@ public partial class DataTable {
         int idx = st.collapsedKeys.IndexOf(key);
         if (idx >= 0) { st.collapsedKeys.RemoveAt(idx); }
         else { st.collapsedKeys.Add(key); }
-        DataTable.InvalidateView(st);
+        DataTable.InvalidateDisplay(st);
     }
 
     // BuildDisplay 关组时物化叶子组的成员源行（st.order 的
@@ -389,12 +393,26 @@ public partial class DataTable {
     // 已构建的后代，按未选处理（重新展开后状态即恢复，
     // 选择本身存在 st.selected / selectionModel 里）。
     public static int GroupCheckState(DataTableState st, GroupRow grp, DataSource src) {
+        if (st.selectionModelAuthoritative && st.selectionModel != null) {
+            if (!st.selectionModel.AllSelected() && st.selectionModel.ExplicitCount() == 0) {
+                return 0;
+            }
+            if (st.selectionModel.AllSelected() && st.selectionModel.ExcludedCount() == 0) {
+                if (grp.members.Count > 0) { return 1; }
+                for (int g0 = 0; g0 < st.groups.Count; g0 = g0 + 1) {
+                    GroupRow leaf0 = st.groups[g0];
+                    if (leaf0.members.Count > 0 && leaf0.key.StartsWith(grp.key)) { return 1; }
+                }
+                return 0;
+            }
+        }
         int n = 0;
         int sel = 0;
         if (grp.members.Count > 0) {
             for (int i = 0; i < grp.members.Count; i = i + 1) {
                 n = n + 1;
                 if (DataTable.IsSelected(st, src, grp.members[i])) { sel = sel + 1; }
+                if (sel > 0 && sel < n) { return 2; }
             }
         } else {
             for (int g = 0; g < st.groups.Count; g = g + 1) {
@@ -405,6 +423,7 @@ public partial class DataTable {
                 for (int i = 0; i < leaf.members.Count; i = i + 1) {
                     n = n + 1;
                     if (DataTable.IsSelected(st, src, leaf.members[i])) { sel = sel + 1; }
+                    if (sel > 0 && sel < n) { return 2; }
                 }
             }
         }

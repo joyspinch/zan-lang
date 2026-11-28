@@ -53,51 +53,79 @@ public partial class DataTable {
         SelectionSummary res = stats.summary;
         if (!DataTable.HasRange(st) && !DataTable.HasMulti(st)) { return; }
         int nRanges = DataTable.RangeCount(st);
-        bool firstNum = true;
-
+        // 预先解包所有选区边界，避免在最多 50,000 格的内层循环里反复调用 RangeAt。
+        List<int> r0s = new List<int>();
+        List<int> c0s = new List<int>();
+        List<int> r1s = new List<int>();
+        List<int> c1s = new List<int>();
         for (int qi = 0; qi < nRanges; qi = qi + 1) {
             int qr0 = -1; int qc0 = -1; int qr1 = -1; int qc1 = -1;
-            if (!DataTable.RangeAt(st, qi, out qr0, out qc0, out qr1, out qc1)) { continue; }
+            if (DataTable.RangeAt(st, qi, out qr0, out qc0, out qr1, out qc1)) {
+                r0s.Add(qr0);
+                c0s.Add(qc0);
+                r1s.Add(qr1);
+                c1s.Add(qc1);
+            }
+        }
+        int validRanges = r0s.Count;
+        if (validRanges == 0) { return; }
+
+        int dispCount = DataTable.DispCount(st);
+        bool firstNum = true;
+        int visited = 0;
+        int scanCap = 50000;
+
+        for (int qi = 0; qi < validRanges && visited < scanCap; qi = qi + 1) {
+            int qr0 = r0s[qi];
+            int qc0 = c0s[qi];
+            int qr1 = r1s[qi];
+            int qc1 = c1s[qi];
             int rri = qr0;
-            while (rri <= qr1 && rri < DataTable.DispCount(st)) {
+            while (rri <= qr1 && rri < dispCount && visited < scanCap) {
                 if (DataTable.DispKind(st, rri) == 0) {
                     int drow = DataTable.DispRowOf(st, rri);
                     int rci = qc0;
-                    while (rci <= qc1 && rci < cols.Count) {
+                    while (rci <= qc1 && rci < cols.Count && visited < scanCap) {
+                        if (st.colHidden != null && rci < st.colHidden.Count && st.colHidden[rci]) {
+                            rci = rci + 1;
+                            continue;
+                        }
                         bool dup = false;
-                        for (int qj = 0; qj < qi && !dup; qj = qj + 1) {
-                            int jr0 = -1; int jc0 = -1; int jr1 = -1; int jc1 = -1;
-                            if (DataTable.RangeAt(st, qj, out jr0, out jc0, out jr1, out jc1)
-                            && rri >= jr0 && rri <= jr1 && rci >= jc0 && rci <= jc1) {
+                        for (int qj = 0; qj < qi; qj = qj + 1) {
+                            if (rri >= r0s[qj] && rri <= r1s[qj] && rci >= c0s[qj] && rci <= c1s[qj]) {
                                 dup = true;
+                                break;
                             }
                         }
-                        if (!dup && footer && cols[rci].numeric) {
-                            double frv = 0.0;
-                            if (cols[rci].formula.Length > 0
-                            && DataTable.FormulaTryReal(cols, src, drow, rci, out frv)) {
-                                stats.footerSum = stats.footerSum + (int)frv;
-                            } else {
-                                stats.footerSum = stats.footerSum + src.CellNum(drow, rci);
-                            }
-                            stats.footerCount = stats.footerCount + 1;
-                        }
-                        if (!dup && textSummary) {
-                            res.cellCount = res.cellCount + 1;
-                            string val = src.CellText(drow, rci);
-                            string trimmed = DataTable.TrimSpace(val);
-                            if (trimmed.Length > 0 && DataTable.IsNumericStr(trimmed)) {
-                                double d = DataTable.ParseReal(trimmed);
-                                res.numericCount = res.numericCount + 1;
-                                res.sum = res.sum + d;
-                                if (firstNum) {
-                                    res.min = d;
-                                    res.max = d;
-                                    firstNum = false;
-                                    res.hasNumeric = true;
+                        if (!dup) {
+                            visited = visited + 1;
+                            if (footer && cols[rci].numeric) {
+                                double frv = 0.0;
+                                if (cols[rci].formula.Length > 0
+                                && DataTable.FormulaTryReal(cols, src, drow, rci, out frv)) {
+                                    stats.footerSum = stats.footerSum + (int)frv;
                                 } else {
-                                    if (d < res.min) { res.min = d; }
-                                    if (d > res.max) { res.max = d; }
+                                    stats.footerSum = stats.footerSum + src.CellNum(drow, rci);
+                                }
+                                stats.footerCount = stats.footerCount + 1;
+                            }
+                            if (textSummary) {
+                                res.cellCount = res.cellCount + 1;
+                                string val = src.CellText(drow, rci);
+                                string trimmed = DataTable.TrimSpace(val);
+                                if (trimmed.Length > 0 && DataTable.IsNumericStr(trimmed)) {
+                                    double d = DataTable.ParseReal(trimmed);
+                                    res.numericCount = res.numericCount + 1;
+                                    res.sum = res.sum + d;
+                                    if (firstNum) {
+                                        res.min = d;
+                                        res.max = d;
+                                        firstNum = false;
+                                        res.hasNumeric = true;
+                                    } else {
+                                        if (d < res.min) { res.min = d; }
+                                        if (d > res.max) { res.max = d; }
+                                    }
                                 }
                             }
                         }

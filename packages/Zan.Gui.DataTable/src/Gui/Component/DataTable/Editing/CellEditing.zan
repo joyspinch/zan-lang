@@ -264,6 +264,18 @@ public class RowEdit {
         e.group = 0;
         return e;
     }
+
+    public static RowEdit MoveOrder(int from, int to) {
+        RowEdit e = new RowEdit();
+        e.kind = 3;
+        e.row = from;
+        e.col = to;
+        e.before = "";
+        e.after = "";
+        e.cells = new List<string>();
+        e.group = 0;
+        return e;
+    }
 }
 
 // DataTable 模块：单元格内编辑——开始/提交/取消、日历与
@@ -277,7 +289,7 @@ public partial class DataTable {
     public static void BeginEdit(DataTableState st, List<DataColumn> cols,
     DataSource src, int rowIdx, int col) {
         if (col < 0 || col >= cols.Count) { return; }
-        if (!cols[col].editable) { return; }
+        if (!cols[col].editable || cols[col].formula.Length > 0) { return; }
         if (rowIdx < 0 || rowIdx >= src.RowCount()) { return; }
         DataColumn c = cols[col];
         st.editing = true;
@@ -291,8 +303,10 @@ public partial class DataTable {
 
         CellEditor ed = c.editor;
         if (ed == null) { ed = st.cellEditor; }
+        st.activeEditor = ed;
         if (ed != null) {
-            Control ctl = ed.CreateWidget(null, st, c);
+            App editorApp = st.ownerControl != null ? st.ownerControl.App : null;
+            Control ctl = ed.CreateWidget(editorApp, st, c);
             st.activeEditorWidget = ctl;
             ed.BeginEdit(ctl, st.editBuf, c);
         }
@@ -303,17 +317,18 @@ public partial class DataTable {
         st.edPopSel = -1;
         st.edPopScroll = 0;
         st.edPopItems = new List<int>();
-        if (c.editorKind == 1) {
+        st.edNewChoiceBuf = "";
+        if (c.editorKind == 1 || c.editorKind == 4) {
             st.edPopOpen = true;
             st.edPopItems = DataTable.FilterChoices(c, "");
-            st.edPopSel = DataTable.IndexOfChoice(c, st.editBuf);
+            if (c.editorKind == 1) { st.edPopSel = DataTable.IndexOfChoice(c, st.editBuf); }
         } else if (c.editorKind == 2) {
             st.edPopOpen = true;
             int day = DataTable.ParseDate(st.editBuf, c.dateOrder);
             // 无法解析或为空的日期单元格定位到当前月，
             // 使选择器仍可用于填入空白。
             if (day == DataTable.NoDate()) { day = DataTable.Today(); }
-            DateTime dt = DateTime.FromUnixSeconds(day * 86400);
+            DateTime dt = DateTime.FromUnixSeconds((long)day * 86400L);
             st.edCalMonth = DataTable.YearMonth(dt.Year(), dt.Month());
             st.edPopSel = day;
         }
@@ -327,7 +342,7 @@ public partial class DataTable {
         if (d == DataTable.NoDate() || d == -1) { d = DataTable.Today(); }
         else { d = d + days; }
         st.edPopSel = d;
-        DateTime dt = DateTime.FromUnixSeconds(d * 86400);
+        DateTime dt = DateTime.FromUnixSeconds((long)d * 86400L);
         st.edCalMonth = DataTable.YearMonth(dt.Year(), dt.Month());
         st.editBuf = DataTable.FormatDate(d, DataTable.DateStoreFormat(c));
         st.editCur = st.editBuf.Length;
@@ -341,6 +356,53 @@ public partial class DataTable {
             if (DataTable.EqCI(c.choices[i], q)) { return i; }
         }
         return -1;
+    }
+
+    // 查找选项对应的自定义颜色（0 表示未配置，回退主题色）。
+    public static int ChoiceColorOf(DataColumn c, string v) {
+        if (c == null || c.choiceColors == null || c.choiceColors.Count == 0) { return 0; }
+        int idx = DataTable.IndexOfChoice(c, v);
+        if (idx >= 0 && idx < c.choiceColors.Count) { return c.choiceColors[idx]; }
+        return 0;
+    }
+
+    // 将逗号分隔的多选单元格文本拆分为去空后的标签列表。
+    public static List<string> SplitMultiChoice(string val) {
+        List<string> res = new List<string>();
+        if (val == null || val.Length == 0) { return res; }
+        List<string> parts = val.Split(",");
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            string tok = DataTable.TrimSpace(parts[i]);
+            if (tok.Length > 0) { res.Add(tok); }
+        }
+        return res;
+    }
+
+    // 判断多选文本中是否已包含指定选项（不区分大小写）。
+    public static bool MultiChoiceHas(string val, string item) {
+        List<string> toks = DataTable.SplitMultiChoice(val);
+        for (int i = 0; i < toks.Count; i = i + 1) {
+            if (DataTable.EqCI(toks[i], item)) { return true; }
+        }
+        return false;
+    }
+
+    // 在多选文本中切换指定选项的选中状态，返回标准化后的逗号分隔串。
+    public static string MultiChoiceToggle(string val, string item) {
+        List<string> toks = DataTable.SplitMultiChoice(val);
+        List<string> next = new List<string>();
+        bool found = false;
+        for (int i = 0; i < toks.Count; i = i + 1) {
+            if (DataTable.EqCI(toks[i], item)) { found = true; }
+            else { next.Add(toks[i]); }
+        }
+        if (!found && item != null && item.Length > 0) { next.Add(item); }
+        string joined = "";
+        for (int i = 0; i < next.Count; i = i + 1) {
+            if (i > 0) { joined = joined + ", "; }
+            joined = joined + next[i];
+        }
+        return joined;
     }
 
     // 按键后重新筛选下拉列表，高亮保持在
@@ -374,9 +436,11 @@ public partial class DataTable {
     // 清空错误与拒绝标记。
     public static void CancelEdit(DataTableState st) {
         if (st.activeEditorWidget != null) {
-            if (st.cellEditor != null) { st.cellEditor.EndEdit(st.activeEditorWidget); }
+            CellEditor ed = st.activeEditor != null ? st.activeEditor : st.cellEditor;
+            if (ed != null) { ed.EndEdit(st.activeEditorWidget); }
             st.activeEditorWidget = null;
         }
+        st.activeEditor = null;
         st.editing = false;
         st.editRow = -1;
         st.editCol = -1;
@@ -462,6 +526,7 @@ public partial class DataTable {
             ed.EndEdit(st.activeEditorWidget);
             st.activeEditorWidget = null;
         }
+        st.activeEditor = null;
         st.editing = false;
         st.editRow = -1;
         st.editCol = -1;

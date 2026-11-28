@@ -55,7 +55,7 @@ public partial class DataTable {
     // 逐行流式写出，内存占用与行数无关；路径打不开返回 false。
     public static bool ExportToCsv(DataTableState st, List<DataColumn> cols,
                             DataSource src, string path, bool selectionOnly) {
-        DataTableExportSnapshot snap = DataTable.ExportSnapshot(st, cols.Count, src, selectionOnly);
+        DataTableExportSnapshot snap = DataTable.ExportSnapshot(st, cols, src, selectionOnly);
         if (snap == null) { return false; }
         try {
             return DataTable.ExportCsvSnapshot(snap, cols, src, path, null);
@@ -70,7 +70,7 @@ public partial class DataTable {
                                  DataSource src, string path, bool selectionOnly,
                                  DataTableExportProgress progress) {
         DataTableExportSnapshot snap = DataTable.ExportBegin(selectionOnly,
-            st, cols.Count, src, progress);
+            st, cols, src, progress);
         if (snap == null) { return false; }
         ExportJob job = new ExportJob();
         job.kind = 2;
@@ -89,8 +89,22 @@ public partial class DataTable {
         return true;
     }
 
-    // 异步导出的公共前置：忙标志占位 + 当前线程冻结快照。失败
-    // 时负责把忙标志放回去。返回 null = 拒绝启动。
+    // 异步导出的公共前置（完整列定义版，遵循视觉列序并跳过隐藏列）。
+    public static DataTableExportSnapshot ExportBegin(bool selectionOnly, DataTableState st,
+                                               List<DataColumn> cols, DataSource src,
+                                               DataTableExportProgress progress) {
+        if (DataTable.sExportBusy.CompareExchange(0, 1) != 0) {
+            if (progress != null) { progress.OnDone(false, DataTable.T("An export is already running", "已有导出在运行")); }
+            return null;
+        }
+        DataTableExportSnapshot snap = DataTable.ExportSnapshot(st, cols, src, selectionOnly);
+        if (snap == null) {
+            DataTable.sExportBusy.Store(0);
+        }
+        return snap;
+    }
+
+    // 异步导出的公共前置（兼容旧签名：按列数冻结视觉列序）。
     public static DataTableExportSnapshot ExportBegin(bool selectionOnly, DataTableState st,
                                                int colCount, DataSource src,
                                                DataTableExportProgress progress) {
@@ -107,15 +121,59 @@ public partial class DataTable {
 
     // ---------- 内部：快照与写盘核心 ----------
 
-    // 在调用线程（通常是 UI 线程）冻结导出行集：列区间与行序一次
+    // 解析快照对应的最终导出列序列（优先使用快照冻结的视觉可见列；未预构建时回退 c0..c1）。
+    public static List<int> ExportCols(DataTableExportSnapshot snap, List<DataColumn> cols) {
+        List<int> outCols = new List<int>();
+        if (snap == null || cols == null) { return outCols; }
+        if (snap.visCols != null && snap.visCols.Count > 0) {
+            for (int i = 0; i < snap.visCols.Count; i = i + 1) {
+                int c = snap.visCols[i];
+                if (c >= 0 && c < cols.Count) {
+                    outCols.Add(c);
+                }
+            }
+            return outCols;
+        }
+        for (int cc = snap.c0; cc <= snap.c1 && cc < cols.Count; cc = cc + 1) {
+            if (cc >= 0) {
+                outCols.Add(cc);
+            }
+        }
+        return outCols;
+    }
+
+    // 冻结导出行集与视觉可见列序（遵循 VisibleOrder 并跳过隐藏列）。
+    public static DataTableExportSnapshot ExportSnapshot(DataTableState st, List<DataColumn> cols,
+                                                  DataSource src, bool selectionOnly) {
+        if (cols == null || cols.Count <= 0) { return null; }
+        DataTableExportSnapshot snap = DataTable.ExportSnapshot(st, cols.Count, src, selectionOnly);
+        if (snap == null) { return null; }
+        if (st != null && st.colHidden != null && st.colHidden.Count >= cols.Count) {
+            bool hasRange = selectionOnly && DataTable.HasRange(st);
+            List<int> vorder = DataTable.VisibleOrder(st, cols);
+            List<int> filtered = new List<int>();
+            for (int i = 0; i < vorder.Count; i = i + 1) {
+                int c = vorder[i];
+                if (!hasRange || (c >= snap.c0 && c <= snap.c1)) {
+                    filtered.Add(c);
+                }
+            }
+            if (filtered.Count == 0) { return null; }
+            snap.visCols = filtered;
+        }
+        return snap;
+    }
+
+    // 在调用线程（通常是 UI 线程）冻结导出行集：列区间、视觉列序与行序一次
     // 取走，之后表格再排序/过滤/勾选都不影响本次导出。无可导内容
     // 返回 null。
     public static DataTableExportSnapshot ExportSnapshot(DataTableState st, int colCount,
                                                   DataSource src, bool selectionOnly) {
         int c0 = 0;
         int c1 = colCount - 1;
+        bool hasRange = selectionOnly && DataTable.HasRange(st);
         List<int> rowsOut = new List<int>();
-        if (selectionOnly && DataTable.HasRange(st)) {
+        if (hasRange) {
             c0 = DataTable.MaxI(0, DataTable.MinI(st.rangeC0, st.rangeC1));
             c1 = DataTable.MinI(colCount - 1,
                 DataTable.MaxI(st.rangeC0, st.rangeC1));
@@ -136,10 +194,22 @@ public partial class DataTable {
             }
         }
         if (c1 < c0 || rowsOut.Count == 0) { return null; }
+        List<int> visCols = new List<int>();
+        bool hasOrder = st != null && st.colOrder != null && st.colOrder.Count == colCount;
+        bool hasHidden = st != null && st.colHidden != null && st.colHidden.Count >= colCount;
+        for (int i = 0; i < colCount; i = i + 1) {
+            int c = hasOrder ? st.colOrder[i] : i;
+            if (c < 0 || c >= colCount) { continue; }
+            if (hasHidden && st.colHidden[c]) { continue; }
+            if (hasRange && (c < c0 || c > c1)) { continue; }
+            visCols.Add(c);
+        }
+        if (visCols.Count == 0) { return null; }
         DataTableExportSnapshot snap = new DataTableExportSnapshot();
         snap.rows = rowsOut;
         snap.c0 = c0;
         snap.c1 = c1;
+        snap.visCols = visCols;
         snap.spanProvider = st.spanProvider;
         return snap;
     }
@@ -149,6 +219,11 @@ public partial class DataTable {
     public static bool ExportCsvSnapshot(DataTableExportSnapshot snap, List<DataColumn> cols,
                                   DataSource src, string path,
                                   DataTableExportProgress progress) {
+        List<int> ecols = DataTable.ExportCols(snap, cols);
+        if (ecols.Count == 0) {
+            if (progress != null) { progress.OnDone(false, DataTable.T("No visible columns to export", "没有可导出的可见列")); }
+            return false;
+        }
         int total = snap.rows.Count + 1;
         if (progress != null) { progress.OnStart(total); }
         StreamWriter w = new StreamWriter(path);
@@ -157,8 +232,9 @@ public partial class DataTable {
             // 页猜编码，中文必乱码。
             w.Write(Encoding.Utf8FromCodePoint(65279));
             StringBuilder sb = new StringBuilder();
-            for (int cc = snap.c0; cc <= snap.c1; cc = cc + 1) {
-                if (cc > snap.c0) { sb.Append(","); }
+            for (int pos = 0; pos < ecols.Count; pos = pos + 1) {
+                int cc = ecols[pos];
+                if (pos > 0) { sb.Append(","); }
                 sb.Append(DataTable.CsvField(cols[cc].title));
             }
             sb.Append("\r\n");
@@ -172,8 +248,9 @@ public partial class DataTable {
                 }
                 int ri = snap.rows[k];
                 sb = new StringBuilder();
-                for (int cc = snap.c0; cc <= snap.c1; cc = cc + 1) {
-                    if (cc > snap.c0) { sb.Append(","); }
+                for (int pos = 0; pos < ecols.Count; pos = pos + 1) {
+                    int cc = ecols[pos];
+                    if (pos > 0) { sb.Append(","); }
                     sb.Append(DataTable.CsvField(DataTable.CellTextRouted(cols, src, ri, cc)));
                 }
                 sb.Append("\r\n");

@@ -45,7 +45,8 @@ public partial class DataTable {
     public static void RebuildRowKeys(DataTableState st, DataSource src) {
         st.rowKeys.Clear();
         st.diagnostics.Clear();
-        Dict<string, bool> seen = new Dict<string, bool>();
+        if (st.rowKeyIndex == null) { st.rowKeyIndex = new Dict<string, int>(); }
+        st.rowKeyIndex.Clear();
         int n = src.RowCount();
         for (int row = 0; row < n; row = row + 1) {
             RowKey key = null;
@@ -53,10 +54,10 @@ public partial class DataTable {
             else { key = src.GetRowKey(row); }
             if (key == null) { key = RowKey.Legacy(row); }
             string canonical = key.Canonical();
-            if (seen.ContainsKey(canonical)) {
+            if (st.rowKeyIndex.ContainsKey(canonical)) {
                 st.diagnostics.Add(DataTable.DuplicateKeyDiagnostic(canonical, row));
             } else {
-                seen[canonical] = true;
+                st.rowKeyIndex[canonical] = row;
             }
             st.rowKeys.Add(key);
         }
@@ -78,12 +79,12 @@ public partial class DataTable {
     public static int RowIndexOfKey(DataTableState st, DataSource src, RowKey key) {
         if (key == null) { return -1; }
         if (st.rowKeysRevision != st.dataRevision
-            || st.rowKeys.Count != src.RowCount()) {
+            || st.rowKeys.Count != src.RowCount()
+            || st.rowKeyIndex == null) {
             DataTable.RebuildRowKeys(st, src);
         }
-        for (int row = 0; row < st.rowKeys.Count; row = row + 1) {
-            if (st.rowKeys[row].Same(key)) { return row; }
-        }
+        int found = -1;
+        if (st.rowKeyIndex.TryGetValue(key.Canonical(), out found)) { return found; }
         return -1;
     }
 
@@ -213,5 +214,58 @@ public partial class DataTable {
             return;
         }
         st.selected[row] = value;
+    }
+
+    // 计算表头全选复选框状态（全选 / 部分选中 / 未选）：
+    // 权威 SelectionModel 路径借助 (queryRevision, order.Count, model.Version)
+    // 做帧间 O(1) 缓存，避免 RenderHeader 与 PrepareInputControls 在部分选中时
+    // 每帧重复扫描百万行。
+    public static void ResolveHeaderSelectState(DataTableState st, DataSource src,
+                                                out bool allChecked, out bool anyChecked) {
+        allChecked = false;
+        anyChecked = false;
+        if (st == null || st.order == null || st.order.Count == 0) { return; }
+        if (st.selectionModelAuthoritative && st.selectionModel != null) {
+            if (!st.selectionModel.AllSelected() && st.selectionModel.ExplicitCount() == 0) {
+                return;
+            }
+            if (st.selectionModel.AllSelected() && st.selectionModel.ExcludedCount() == 0) {
+                allChecked = true;
+                anyChecked = true;
+                return;
+            }
+            int modelVer = st.selectionModel.Version();
+            if (st.hdrSelCacheQueryRev == st.queryRevision
+                && st.hdrSelCacheOrderCount == st.order.Count
+                && st.hdrSelCacheModelVer == modelVer) {
+                allChecked = st.hdrSelCacheAll;
+                anyChecked = st.hdrSelCacheAny;
+                return;
+            }
+            bool all = true;
+            bool any = false;
+            for (int oi = 0; oi < st.order.Count; oi = oi + 1) {
+                if (DataTable.IsSelected(st, src, st.order[oi])) { any = true; }
+                else { all = false; }
+                if (any && !all) { break; }
+            }
+            st.hdrSelCacheQueryRev = st.queryRevision;
+            st.hdrSelCacheOrderCount = st.order.Count;
+            st.hdrSelCacheModelVer = modelVer;
+            st.hdrSelCacheAll = all;
+            st.hdrSelCacheAny = any;
+            allChecked = all;
+            anyChecked = any;
+            return;
+        }
+        bool allLegacy = true;
+        bool anyLegacy = false;
+        for (int oi = 0; oi < st.order.Count; oi = oi + 1) {
+            if (DataTable.IsSelected(st, src, st.order[oi])) { anyLegacy = true; }
+            else { allLegacy = false; }
+            if (anyLegacy && !allLegacy) { break; }
+        }
+        allChecked = allLegacy;
+        anyChecked = anyLegacy;
     }
 }
