@@ -1,0 +1,338 @@
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+using Game.Animation;
+using Game.Combat3D;
+
+// 3D 战术射击核心管线契约测试（纯无头跨平台，零 GUI 依赖，客户端与权威专用服同源运行）：
+//   1. Transform3D.FromColumnMajorMatrix（含平移/旋转/非均匀缩放/镜像负行列式还原）与 Skeleton.SetBindInverse；
+//   2. TwoBoneIk 根骨与中骨联合旋转（验证子骨局部平移零脱臼、骨长守恒、末端命中目标）；
+//   3. LayeredAnimator3D（BoneMask 子树上下半身分离覆盖、Additive 枪械后坐力增量层、Spine AimOffset 脊柱均摊）；
+//   4. StaticMeshBvh3D（8-Bin SAH 建树、射线最近命中、多材质穿墙弹道能量衰减截停、胶囊体连续扫掠与嵌入推开）；
+//   5. KinematicCapsuleController3D（90 度墙角折痕滑行、陡坡防冲浪阻挡、三段式自动上台阶、下坡贴地吸附、管道内松蹲防穿顶）；
+//   6. LagCompensatedHitboxWorld3D（全身多胶囊受击盒、服务端环形快照亚帧插值回溯爆头、掩体遮挡截断、反作弊最大回溯窗钳制、抬手挡脸爆头优先）。
+public class FpsCombat3DTests {
+    private static int failures = 0;
+
+    private static void Check(string name, bool ok) {
+        if (!ok) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL: " + name);
+        }
+    }
+
+    private static bool Near(float a, float b, float eps) {
+        float d = a - b;
+        if (d < 0.0f) { d = -d; }
+        return d <= eps;
+    }
+
+    private static void TestMatrixDecomposeAndBindInverse() {
+        // 构造绕 Z 轴逆时针转 90°、缩放 (2, 3, 4)、平移 (10, -5, 7) 的列主序 4x4 矩阵
+        // X 列 = (0, 2, 0, 0), Y 列 = (-3, 0, 0, 0), Z 列 = (0, 0, 4, 0), W 列 = (10, -5, 7, 1)
+        float[] colMajor = new float[16];
+        colMajor[0] = 0.0f;  colMajor[1] = 2.0f;  colMajor[2] = 0.0f;  colMajor[3] = 0.0f;
+        colMajor[4] = -3.0f; colMajor[5] = 0.0f;  colMajor[6] = 0.0f;  colMajor[7] = 0.0f;
+        colMajor[8] = 0.0f;  colMajor[9] = 0.0f;  colMajor[10] = 4.0f; colMajor[11] = 0.0f;
+        colMajor[12] = 10.0f; colMajor[13] = -5.0f; colMajor[14] = 7.0f; colMajor[15] = 1.0f;
+
+        Transform3D trs = Transform3D.FromColumnMajorMatrix(colMajor, 0);
+        Check("mat.pos", Near(trs.Position.X, 10.0f, 0.001f) && Near(trs.Position.Y, -5.0f, 0.001f) && Near(trs.Position.Z, 7.0f, 0.001f));
+        Check("mat.scale", Near(trs.Scale.X, 2.0f, 0.001f) && Near(trs.Scale.Y, 3.0f, 0.001f) && Near(trs.Scale.Z, 4.0f, 0.001f));
+
+        Vector3 testPt = trs.TransformPoint(new Vector3(1.0f, 2.0f, 1.0f));
+        // 期望: X = 10 + (0*1 + (-3)*2) = 4, Y = -5 + (2*1 + 0*2) = -3, Z = 7 + 4*1 = 11
+        Check("mat.transform_pt", Near(testPt.X, 4.0f, 0.002f) && Near(testPt.Y, -3.0f, 0.002f) && Near(testPt.Z, 11.0f, 0.002f));
+
+        // 验证 Skeleton.SetBindInverse 在 RefreshBind 时不被覆盖
+        Skeleton sk = new Skeleton();
+        sk.AddBone("root", -1, Transform3D.Identity);
+        Transform3D customInv = new Transform3D(new Vector3(0.0f, -1.5f, 0.0f), Quaternion.Identity, Vector3.One);
+        sk.SetBindInverse(0, customInv);
+        sk.RefreshBind();
+        Check("skel.explicit_bind_inv", Near(sk.BindInverse(0).Position.Y, -1.5f, 0.0005f));
+    }
+
+    private static void TestTwoBoneIkNoDislocationAndLayeredAnim() {
+        Skeleton sk = new Skeleton();
+        sk.AddBone("pelvis", -1, new Transform3D(new Vector3(0.0f, 1.0f, 0.0f), Quaternion.Identity, Vector3.One));
+        sk.AddBone("spine", 0, new Transform3D(new Vector3(0.0f, 0.4f, 0.0f), Quaternion.Identity, Vector3.One));
+        sk.AddBone("upper_arm", 1, new Transform3D(new Vector3(0.2f, 0.3f, 0.0f), Quaternion.Identity, Vector3.One));
+        sk.AddBone("forearm", 2, new Transform3D(new Vector3(0.0f, 0.30f, 0.0f), Quaternion.Identity, Vector3.One));
+        sk.AddBone("hand", 3, new Transform3D(new Vector3(0.0f, 0.28f, 0.0f), Quaternion.Identity, Vector3.One));
+        sk.AddBone("thigh_l", 0, new Transform3D(new Vector3(-0.15f, -0.1f, 0.0f), Quaternion.Identity, Vector3.One));
+        sk.RefreshBind();
+
+        // 1. 验证分层动画：下半身跑步 + 上半身遮罩覆盖 + Additive 开火后坐力 + 脊柱瞄准俯仰
+        AnimationClip baseRun = new AnimationClip("run", 1.0f);
+        baseRun.AddRotationKey("thigh_l", 0.0f, Quaternion.FromAxisAngle(new Vector3(1.0f, 0.0f, 0.0f), 0.6f));
+        baseRun.AddRotationKey("thigh_l", 1.0f, Quaternion.FromAxisAngle(new Vector3(1.0f, 0.0f, 0.0f), 0.6f));
+
+        AnimationClip upperAim = new AnimationClip("aim", 1.0f);
+        upperAim.AddRotationKey("upper_arm", 0.0f, Quaternion.FromAxisAngle(new Vector3(1.0f, 0.0f, 0.0f), -1.2f));
+        upperAim.AddRotationKey("upper_arm", 1.0f, Quaternion.FromAxisAngle(new Vector3(1.0f, 0.0f, 0.0f), -1.2f));
+        // 故意在 upperAim 给大腿放一个不同旋转，验证下半身权重为 0 时不被污染
+        upperAim.AddRotationKey("thigh_l", 0.0f, Quaternion.FromAxisAngle(new Vector3(1.0f, 0.0f, 0.0f), -0.9f));
+        upperAim.AddRotationKey("thigh_l", 1.0f, Quaternion.FromAxisAngle(new Vector3(1.0f, 0.0f, 0.0f), -0.9f));
+
+        AnimationClip recoilAdd = new AnimationClip("recoil", 0.2f);
+        recoilAdd.AddPositionKey("hand", 0.0f, new Vector3(0.0f, 0.28f, -0.06f));
+        recoilAdd.AddPositionKey("hand", 0.2f, new Vector3(0.0f, 0.28f, 0.0f));
+
+        BoneMask upperMask = BoneMask.FromSubtree(sk, "spine", 1.0f);
+        Check("mask.upper_spine", Near(upperMask.WeightAt(1), 1.0f, 0.0001f) && Near(upperMask.WeightAt(4), 1.0f, 0.0001f));
+        Check("mask.lower_excluded", Near(upperMask.WeightAt(5), 0.0f, 0.0001f));
+
+        LayeredAnimator3D anim = new LayeredAnimator3D(sk);
+        anim.SetBaseClip(baseRun, 0.2f);
+        anim.ApplyOverrideLayer(upperAim, 0.2f, upperMask, 1.0f);
+        anim.ApplyAdditiveLayer(recoilAdd, 0.0f, null, 0.0f, upperMask, 0.5f);
+        int[] spines = new int[1];
+        spines[0] = 1;
+        anim.ApplySpineAimOffset(spines, 0.30f, 0.20f, 1.0f);
+        anim.CommitToSkeleton();
+
+        // 下半身大腿旋转保持 baseRun 的 +0.6 rad，未被 upperAim 污染
+        Quaternion expectThigh = Quaternion.FromAxisAngle(new Vector3(1.0f, 0.0f, 0.0f), 0.6f);
+        float thighDot = Quaternion.Dot(sk.LocalPose(5).Rotation, expectThigh);
+        if (thighDot < 0.0f) { thighDot = -thighDot; }
+        Check("layered.lower_preserved", thighDot > 0.999f);
+        // 手部叠加了 50% 后坐力局部平移增量 (-0.03m Z)
+        Check("layered.additive_recoil", Near(sk.LocalPose(4).Position.Z, -0.03f, 0.001f));
+
+        // 2. 验证 TwoBoneIk 解算左手握持护木时，forearm 局部平移绝不脱臼，且末端精确落到目标
+        sk.ResetToBindPose();
+        sk.ComputeWorldPoses();
+        Vector3 bindForearmLocalPos = sk.LocalPose(3).Position;
+        Vector3 shoulderPos = sk.WorldPosition(2);
+        Vector3 ikTarget = Vector3.Add(shoulderPos, new Vector3(0.10f, 0.22f, 0.36f));
+        Vector3 ikPole = Vector3.Add(shoulderPos, new Vector3(0.35f, -0.20f, -0.20f));
+        bool solved = TwoBoneIk.Solve(sk, 2, 3, 4, ikTarget, ikPole);
+        sk.ComputeWorldPoses();
+        Check("ik.solved", solved);
+        Check("ik.tip_reached", Vector3.Distance(sk.WorldPosition(4), ikTarget) < 0.003f);
+        Check("ik.no_joint_dislocation", Vector3.Distance(sk.LocalPose(3).Position, bindForearmLocalPos) < 0.002f);
+    }
+
+    private static void TestBvhRaycastPenetrationAndSweep() {
+        StaticMeshBvh3D bvh = new StaticMeshBvh3D();
+        // 构建大型地面 + 多道不同材质靶墙（玻璃 -> 木板 -> 厚混凝土）+ 散落立柱触发多级 SAH 分裂
+        bvh.AddSolidBox(new Vector3(-30.0f, -1.0f, -30.0f), new Vector3(30.0f, 0.0f, 30.0f), SurfaceMaterial3D.Concrete);
+        bvh.AddSolidBox(new Vector3(-2.0f, 0.0f, 4.0f), new Vector3(2.0f, 3.0f, 4.05f), SurfaceMaterial3D.Glass);
+        bvh.AddSolidBox(new Vector3(-2.0f, 0.0f, 7.0f), new Vector3(2.0f, 3.0f, 7.15f), SurfaceMaterial3D.Wood);
+        bvh.AddSolidBox(new Vector3(-2.0f, 0.0f, 11.0f), new Vector3(2.0f, 3.0f, 12.0f), SurfaceMaterial3D.Concrete);
+        for (int gx = -3; gx <= 3; gx = gx + 1) {
+            for (int gz = -3; gz <= 3; gz = gz + 1) {
+                if (gx == 0) { continue; }
+                float px = (float)gx * 5.0f;
+                float pz = (float)gz * 5.0f;
+                bvh.AddSolidBox(new Vector3(px - 0.4f, 0.0f, pz - 0.4f), new Vector3(px + 0.4f, 3.0f, pz + 0.4f), SurfaceMaterial3D.Metal);
+            }
+        }
+        bvh.Build();
+        Check("bvh.built_hierarchy", bvh.IsBuilt() && bvh.NodeCount() > 20);
+
+        // 1. 射线最近命中：应命中 z=4.0 的玻璃前表面
+        MeshRayHit3D rHit;
+        bool okRay = bvh.Raycast(new Vector3(0.0f, 1.5f, 0.0f), new Vector3(0.0f, 0.0f, 1.0f), 50.0f, out rHit);
+        Check("bvh.ray_hit", okRay && rHit.MaterialId == SurfaceMaterial3D.Glass && Near(rHit.Distance, 4.0f, 0.002f) && Near(rHit.Normal.Z, -1.0f, 0.001f));
+
+        // 2. 穿墙弹道：初始能量 100，玻璃每面耗 10（前后两面共 20 -> 剩 80），木板每面耗 25（前后两面共 50 -> 剩 30），混凝土耗 90（打在 z=11.0 前表面能量归零截停！）
+        float[] costs = new float[8];
+        costs[SurfaceMaterial3D.Default] = 100.0f;
+        costs[SurfaceMaterial3D.Concrete] = 90.0f;
+        costs[SurfaceMaterial3D.Metal] = 120.0f;
+        costs[SurfaceMaterial3D.Wood] = 25.0f;
+        costs[SurfaceMaterial3D.Glass] = 10.0f;
+        List<BallisticImpact3D> impacts = new List<BallisticImpact3D>();
+        float remEnergy = bvh.TraceBallisticPenetration(
+            new Vector3(0.0f, 1.5f, 0.0f), new Vector3(0.0f, 0.0f, 1.0f), 50.0f, 100.0f, costs, impacts);
+        Check("bvh.penetration_stopped_at_concrete", Near(remEnergy, 0.0f, 0.001f) && impacts.Count == 5);
+        if (impacts.Count == 5) {
+            Check("bvh.penetration_last_wall", impacts[4].MaterialId == SurfaceMaterial3D.Concrete && Near(impacts[4].Distance, 11.0f, 0.02f) && Near(impacts[4].EnergyBefore, 30.0f, 0.01f));
+        }
+
+        // 3. 胶囊体连续扫掠：半径 0.4 的胶囊从 z=2.0 向 +Z 移动 5.0m，中心应在 z = 4.0 - 0.4 = 3.6m（移动 1.6m，fraction = 0.32）精确停住
+        SweepHit3D sHit;
+        bool okSweep = bvh.SweepCapsule(new Vector3(0.0f, 0.8f, 2.0f), new Vector3(0.0f, 1.6f, 2.0f), 0.4f, new Vector3(0.0f, 0.0f, 5.0f), out sHit);
+        Check("bvh.capsule_sweep_toi", okSweep && Near(sHit.Distance, 1.6f, 0.005f) && Near(sHit.Fraction, 0.32f, 0.002f) && Near(sHit.Normal.Z, -1.0f, 0.005f));
+
+        // 4. 静态嵌入推开（Depenetration）：胶囊嵌入地面 0.12m，应被向上 (+Y) 推出约 0.12m
+        Vector3 push;
+        bool depen = bvh.OverlapCapsuleDepenetrate(new Vector3(0.0f, 0.28f, -3.0f), new Vector3(0.0f, 1.28f, -3.0f), 0.40f, null, out push);
+        Check("bvh.depenetrate_up", depen && push.Y > 0.115f && push.Y < 0.135f);
+    }
+
+    private static void TestKinematicControllerMechanics() {
+        StaticMeshBvh3D map = new StaticMeshBvh3D();
+        // 平坦主地面 y=0
+        map.AddSolidBox(new Vector3(-40.0f, -1.0f, -40.0f), new Vector3(40.0f, 0.0f, 40.0f), SurfaceMaterial3D.Concrete);
+        // 1) 45° 斜向墙面与 X=3 墙组成的角落折痕（用于测试斜撞墙滑行）
+        map.AddSolidBox(new Vector3(3.0f, 0.0f, -10.0f), new Vector3(4.0f, 4.0f, 10.0f), SurfaceMaterial3D.Concrete);
+        // 2) 连续 3 级楼梯（每级高 0.30m < MaxStepHeight 0.38m，深 0.80m，位于 z = [5..7.4], x = [-3..-1]）
+        map.AddSolidBox(new Vector3(-3.0f, 0.0f, 5.0f), new Vector3(-1.0f, 0.30f, 5.8f), SurfaceMaterial3D.Concrete);
+        map.AddSolidBox(new Vector3(-3.0f, 0.0f, 5.8f), new Vector3(-1.0f, 0.60f, 6.6f), SurfaceMaterial3D.Concrete);
+        map.AddSolidBox(new Vector3(-3.0f, 0.0f, 6.6f), new Vector3(-1.0f, 0.90f, 9.5f), SurfaceMaterial3D.Concrete);
+        // 3) 20° 可行走缓坡（从 z=9.5, y=0.90 顺滑降到 z=13.5, y=0.0，验证下坡 Ground Snap 全程不离地）
+        map.AddQuad(
+            new Vector3(-3.0f, 0.90f, 9.5f),
+            new Vector3(-3.0f, 0.0f, 13.5f),
+            new Vector3(-1.0f, 0.0f, 13.5f),
+            new Vector3(-1.0f, 0.90f, 9.5f),
+            SurfaceMaterial3D.Metal);
+        // 4) 65° 不可行走陡崖（cos 65° ≈ 0.422 < 0.695，位于 x = [-8..-6], z = [4..6]，验证不会蹭上悬崖）
+        map.AddQuad(
+            new Vector3(-8.0f, 0.0f, 4.0f),
+            new Vector3(-6.0f, 0.0f, 4.0f),
+            new Vector3(-6.0f, 3.0f, 5.4f),
+            new Vector3(-8.0f, 3.0f, 5.4f),
+            SurfaceMaterial3D.Concrete);
+        // 5) 低矮通风管道（顶盖底面高度 y = 1.30m：下蹲高 1.10m 可钻过，站立高 1.80m 会撞头；z = [-8..-4], x = [-2..1]）
+        map.AddSolidBox(new Vector3(-2.0f, 1.30f, -8.0f), new Vector3(1.0f, 2.50f, -4.0f), SurfaceMaterial3D.Metal);
+        map.Build();
+
+        float dt = 1.0f / 60.0f;
+
+        // A. 斜向撞 X=3 墙面滑行：往 (+1, 0, +1) 推 45 帧，X 被拦在 ~2.65m，而 Z 顺畅向前滑行超过 2.0m
+        KinematicCapsuleController3D cc = new KinematicCapsuleController3D();
+        cc.Position = new Vector3(1.8f, 0.0f, 0.0f);
+        cc.IsGrounded = true;
+        CharacterMoveInput3D slideIn = new CharacterMoveInput3D();
+        slideIn.WishDirection = new Vector3(1.0f, 0.0f, 1.0f);
+        for (int f = 0; f < 45; f = f + 1) {
+            cc.Simulate(map, slideIn, dt);
+        }
+        Check("cc.wall_slide_blocked_x", cc.Position.X < 2.66f && cc.Position.X > 2.60f);
+        Check("cc.wall_slide_glided_z", cc.Position.Z > 2.2f);
+
+        // B. 自动登阶 + 下坡贴地吸附：从 (-2, 0, 4.0) 沿 +Z 跑上 3 级台阶到达 y=0.90 平台，再跑下缓坡全程 IsGrounded 为真
+        cc.Position = new Vector3(-2.0f, 0.0f, 4.0f);
+        cc.Velocity = Vector3.Zero;
+        cc.IsGrounded = true;
+        CharacterMoveInput3D runFwd = new CharacterMoveInput3D();
+        runFwd.WishDirection = new Vector3(0.0f, 0.0f, 1.0f);
+        bool reachedTop = false;
+        bool everLostGroundDownhill = false;
+        for (int f = 0; f < 110; f = f + 1) {
+            cc.Simulate(map, runFwd, dt);
+            if (cc.Position.Z > 7.2f && cc.Position.Z < 9.2f && Near(cc.Position.Y, 0.90f, 0.03f)) {
+                reachedTop = true;
+            }
+            if (reachedTop && cc.Position.Z > 9.7f && cc.Position.Z < 13.0f && !cc.IsGrounded) {
+                everLostGroundDownhill = true;
+            }
+        }
+        Check("cc.stair_step_up", reachedTop);
+        Check("cc.downhill_ground_snap", !everLostGroundDownhill && cc.Position.Z > 11.5f);
+
+        // C. 65° 陡崖防冲浪：向 +Z 猛冲 60 帧，绝不能爬上悬崖（高度保持接近 0）
+        cc.Position = new Vector3(-7.0f, 0.0f, 3.0f);
+        cc.Velocity = Vector3.Zero;
+        cc.IsGrounded = true;
+        runFwd.SprintHeld = true;
+        for (int f = 0; f < 60; f = f + 1) {
+            cc.Simulate(map, runFwd, dt);
+        }
+        Check("cc.steep_cliff_blocked", cc.Position.Y < 0.08f);
+
+        // D. 战术下蹲钻通风管道 + 管内松开蹲键保持下蹲防卡头 + 出管道自动站起
+        cc.Position = new Vector3(-0.5f, 0.0f, -3.2f);
+        cc.Velocity = Vector3.Zero;
+        cc.IsGrounded = true;
+        CharacterMoveInput3D crouchIn = new CharacterMoveInput3D();
+        crouchIn.WishDirection = new Vector3(0.0f, 0.0f, -1.0f);
+        crouchIn.CrouchHeld = true;
+        for (int f = 0; f < 60; f = f + 1) {
+            cc.Simulate(map, crouchIn, dt);
+        }
+        Check("cc.entered_vent_crouched", cc.Position.Z < -5.0f && cc.IsCrouching);
+
+        // 在管道正下方 (z ≈ -5.5) 松开蹲键继续往 -Z 走：在管道内时必须保持 IsCrouching=true，走出 z < -8.4 后自动恢复站立！
+        crouchIn.CrouchHeld = false;
+        cc.Simulate(map, crouchIn, dt);
+        bool stayedCrouchedUnderCeiling = cc.IsCrouching && Near(cc.CurrentHeight, cc.CrouchHeight, 0.01f);
+        for (int f = 0; f < 120; f = f + 1) {
+            cc.Simulate(map, crouchIn, dt);
+        }
+        Check("cc.headroom_prevented_clip", stayedCrouchedUnderCeiling);
+        Check("cc.stood_up_after_vent", cc.Position.Z < -8.5f && !cc.IsCrouching && Near(cc.CurrentHeight, cc.StandingHeight, 0.01f));
+    }
+
+    private static void TestLagCompensatedHitboxes() {
+        Skeleton sk = new Skeleton();
+        sk.AddBone("pelvis", -1, new Transform3D(new Vector3(0.0f, 0.95f, 0.0f), Quaternion.Identity, Vector3.One));
+        sk.AddBone("chest", 0, new Transform3D(new Vector3(0.0f, 0.35f, 0.0f), Quaternion.Identity, Vector3.One));
+        sk.AddBone("head", 1, new Transform3D(new Vector3(0.0f, 0.35f, 0.0f), Quaternion.Identity, Vector3.One));
+        sk.AddBone("forearm_r", 1, new Transform3D(new Vector3(0.0f, 0.33f, -0.15f), Quaternion.Identity, Vector3.One));
+        sk.RefreshBind();
+        sk.ComputeWorldPoses();
+
+        SkeletalHitboxRig3D rig = new SkeletalHitboxRig3D();
+        rig.AddCapsuleByBoneName(sk, "chest", HitboxRegion3D.Chest, new Vector3(0.0f, -0.15f, 0.0f), new Vector3(0.0f, 0.15f, 0.0f), 0.18f, 1.0f);
+        rig.AddCapsuleByBoneName(sk, "head", HitboxRegion3D.Head, new Vector3(0.0f, -0.04f, 0.0f), new Vector3(0.0f, 0.08f, 0.0f), 0.12f, 4.0f);
+        // 右前臂横在脸部正前方 15cm 处（测试同角色躯体穿透高倍率爆头优先）
+        rig.AddCapsuleByBoneName(sk, "forearm_r", HitboxRegion3D.Forearm, new Vector3(-0.12f, 0.0f, 0.0f), new Vector3(0.12f, 0.0f, 0.0f), 0.07f, 0.75f);
+
+        LagCompensatedHitboxWorld3D hitWorld = new LagCompensatedHitboxWorld3D(32);
+        hitWorld.MaxRewindSeconds = 0.25;
+        hitWorld.RegisterActor(101, 2, rig); // 敌方 Actor 101, Team 2
+
+        // 模拟敌方以 10 m/s 沿 +X 横向疾跑，从 t = 1.00s (x=0) 到 t = 1.20s (x=2.0)，每 0.05s 记录一帧快照
+        for (int i = 0; i <= 4; i = i + 1) {
+            double t = 1.00 + (double)i * 0.05;
+            float x = (float)i * 0.50f; // 10 m/s * 0.05s = 0.5m/tick
+            Transform3D actorTf = new Transform3D(new Vector3(x, 0.0f, 10.0f), Quaternion.Identity, Vector3.One);
+            hitWorld.RecordSnapshot(101, t, actorTf, sk);
+        }
+
+        // 1. 当前时刻 t=1.20s 敌方已在 x=2.0m；客户端延迟 125ms，上报开火视野时刻 t=1.075s（恰在 t=1.05 [x=0.5] 与 t=1.10 [x=1.0] 正中间亚帧 x=0.75m！）
+        // 玩家瞄准 (0.75, 1.67, 10.0) 开火：即便右前臂挡在脸前 15cm，也应精准亚帧回溯命中并判为 Head (4.0x)！
+        HitboxRayHit3D hHit;
+        bool gotRewindHead = hitWorld.RaycastLagCompensated(
+            new Vector3(0.75f, 1.67f, 0.0f), new Vector3(0.0f, 0.0f, 1.0f), 50.0f,
+            1, 1, true, 1.20, 1.075, null, out hHit);
+        Check("lagcomp.subtick_headshot", gotRewindHead && hHit.ActorId == 101 && hHit.RegionId == HitboxRegion3D.Head && Near(hHit.DamageMultiplier, 4.0f, 0.001f));
+
+        // 2. 不回溯（t=1.20s）射击同一条射线 x=0.75m 必定脱靶（证明确实是亚帧回溯命中）
+        HitboxRayHit3D missNow;
+        bool hitWithoutRewind = hitWorld.RaycastLagCompensated(
+            new Vector3(0.75f, 1.67f, 0.0f), new Vector3(0.0f, 0.0f, 1.0f), 50.0f,
+            1, 1, true, 1.20, 1.20, null, out missNow);
+        Check("lagcomp.moved_away_at_present", !hitWithoutRewind);
+
+        // 3. 反作弊回溯上限钳制：外挂谎报 targetTime = 0.20s（试图回溯 1.0 秒前到 x=0 处），被钳制在 1.20 - 0.25 = 0.95s -> 最老有效帧 x=0，而若服务器前进到 t=1.40s 再射 x=0 则被钳制在 1.15s (x=1.5m) 拒绝命中！
+        for (int i = 5; i <= 8; i = i + 1) {
+            double t = 1.00 + (double)i * 0.05;
+            float x = (float)i * 0.50f;
+            hitWorld.RecordSnapshot(101, t, new Transform3D(new Vector3(x, 0.0f, 10.0f), Quaternion.Identity, Vector3.One), sk);
+        }
+        HitboxRayHit3D cheatAttempt;
+        bool cheatHit = hitWorld.RaycastLagCompensated(
+            new Vector3(0.0f, 1.67f, 0.0f), new Vector3(0.0f, 0.0f, 1.0f), 50.0f,
+            1, 1, true, 1.40, 1.00, null, out cheatAttempt);
+        Check("lagcomp.anticheat_clamp", !cheatHit);
+
+        // 4. 静态掩体墙壁遮挡截断：在 z=5.0m 立一堵实心墙，即便瞄准 t=1.40s 敌方真实所在位置 x=4.0m 也被墙体挡住不判命中
+        StaticMeshBvh3D cover = new StaticMeshBvh3D();
+        cover.AddSolidBox(new Vector3(2.0f, 0.0f, 5.0f), new Vector3(6.0f, 3.0f, 5.3f), SurfaceMaterial3D.Concrete);
+        cover.Build();
+        HitboxRayHit3D blockedHit;
+        bool hitThroughCover = hitWorld.RaycastLagCompensated(
+            new Vector3(4.0f, 1.30f, 0.0f), new Vector3(0.0f, 0.0f, 1.0f), 50.0f,
+            1, 1, true, 1.40, 1.40, cover, out blockedHit);
+        Check("lagcomp.wall_occluded", !hitThroughCover);
+    }
+
+    public static void Main() {
+        TestMatrixDecomposeAndBindInverse();
+        TestTwoBoneIkNoDislocationAndLayeredAnim();
+        TestBvhRaycastPenetrationAndSweep();
+        TestKinematicControllerMechanics();
+        TestLagCompensatedHitboxes();
+        if (failures == 0) {
+            Console.WriteLine("ALL FPS COMBAT 3D TESTS PASSED");
+        } else {
+            Console.WriteLine("TOTAL FAILURES: " + failures.ToString());
+        }
+    }
+}

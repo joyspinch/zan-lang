@@ -1,0 +1,559 @@
+using System;
+using System.Numerics;
+
+namespace Game.Combat3D;
+
+// 3D 射击角色单帧输入意图（值类型，支持客户端预测重放与服务端权威 Tick 共用同一份结构）。
+public struct CharacterMoveInput3D {
+    // 期望水平移动方向（世界空间 XZ，无需预归一化，长度 [0..1] 可表达手柄模拟摇杆推幅）
+    public Vector3 WishDirection;
+    public bool JumpPressed;
+    public bool CrouchHeld;
+    public bool SprintHeld;
+}
+
+// 工业级 FPS/TPS 运动学胶囊体角色控制器（对标 Quake PM_StepSlideMove / Source / Jolt CharacterVirtual）：
+// - 坐标约定：Position 为胶囊体脚底中心 (x, footY, z)
+// - 多平面折痕速度裁剪（Multi-Plane Crease Slide）：锐角墙角丝滑滑出、三面死角零抖动归零
+// - 陡坡防冲浪（Steep Wall Flatten）：不可行走陡坡水平投影阻挡，杜绝蹭上悬崖
+// - 三段式自动登阶（Up -> Forward -> Down）与可行走坡度校验
+// - 下坡/下楼梯贴地吸附（Ground Snap），消除斜坡微弹跳
+// - 战术下蹲高度切换 + 顶盖净空扫掠防穿模（管道内松开蹲键保持下蹲，出管道自动起身）
+// - 内置土狼时间（Coyote Time）与跳跃预输入缓冲（Jump Buffer）
+public class KinematicCapsuleController3D {
+    // 几何与物理参数
+    public float Radius;
+    public float StandingHeight;
+    public float CrouchHeight;
+    public float SkinWidth;
+    public float MaxStepHeight;
+    public float GroundSnapDistance;
+    public float MinWalkableNormalY; // cos(maxSlopeAngle)，默认 cos(46°) ≈ 0.695
+
+    // 机动性参数
+    public float WalkSpeed;
+    public float SprintSpeed;
+    public float CrouchSpeed;
+    public float GroundAcceleration;
+    public float AirAcceleration;
+    public float GroundFriction;
+    public float Gravity;
+    public float JumpSpeed;
+    public float CoyoteTimeWindow;
+    public float JumpBufferWindow;
+
+    // 实时运动状态（支持网络快照读写回滚）
+    public Vector3 Position;
+    public Vector3 Velocity;
+    public bool IsGrounded;
+    public bool IsCrouching;
+    public Vector3 GroundNormal;
+    public int GroundMaterialId;
+    public float CurrentHeight;
+    public float CurrentEyeHeight;
+
+    private float timeSinceGrounded;
+    private float jumpBufferTimer;
+
+    // 预分配碰撞平面缓冲与 BVH 遍历工作栈（全程零 GC 分配）
+    private Vector3[] clipPlanes;
+    private BvhQueryScratch queryScratch;
+
+    public KinematicCapsuleController3D() {
+        this.Radius = 0.35f;
+        this.StandingHeight = 1.80f;
+        this.CrouchHeight = 1.10f;
+        this.SkinWidth = 0.004f;
+        this.MaxStepHeight = 0.38f;
+        this.GroundSnapDistance = 0.32f;
+        this.MinWalkableNormalY = 0.695f;
+
+        this.WalkSpeed = 6.0f;
+        this.SprintSpeed = 8.6f;
+        this.CrouchSpeed = 3.2f;
+        this.GroundAcceleration = 55.0f;
+        this.AirAcceleration = 14.0f;
+        this.GroundFriction = 9.5f;
+        this.Gravity = 22.0f;
+        this.JumpSpeed = 7.4f;
+        this.CoyoteTimeWindow = 0.10f;
+        this.JumpBufferWindow = 0.10f;
+
+        this.Position = Vector3.Zero;
+        this.Velocity = Vector3.Zero;
+        this.IsGrounded = false;
+        this.IsCrouching = false;
+        this.GroundNormal = new Vector3(0.0f, 1.0f, 0.0f);
+        this.GroundMaterialId = SurfaceMaterial3D.Default;
+        this.CurrentHeight = this.StandingHeight;
+        this.CurrentEyeHeight = this.StandingHeight * 0.90f;
+
+        this.timeSinceGrounded = 99.0f;
+        this.jumpBufferTimer = 0.0f;
+        this.clipPlanes = new Vector3[6];
+        this.queryScratch = new BvhQueryScratch();
+    }
+
+    // 获取当前摄像机第一人称眼睛世界坐标（含平滑蹲起过渡）。
+    public Vector3 EyePosition() {
+        return new Vector3(this.Position.X, this.Position.Y + this.CurrentEyeHeight, this.Position.Z);
+    }
+
+    // 计算给定脚底位置与胶囊总高度对应的上下球心线段端点 (p0, p1)。
+    public void GetCapsuleSegmentAt(Vector3 footPos, float height, out Vector3 p0, out Vector3 p1) {
+        float minH = this.Radius * 2.0f + 0.02f;
+        float h = height > minH ? height : minH;
+        p0 = new Vector3(footPos.X, footPos.Y + this.Radius, footPos.Z);
+        p1 = new Vector3(footPos.X, footPos.Y + (h - this.Radius), footPos.Z);
+    }
+
+    // 施加瞬时外部冲量（如火箭跳冲击波、击退、弹射板）：若向上速度超过阈值自动脱离地面吸附。
+    public void AddImpulse(Vector3 velocityDelta) {
+        this.Velocity = Vector3.Add(this.Velocity, velocityDelta);
+        if (this.Velocity.Y > 2.0f) {
+            this.IsGrounded = false;
+            this.timeSinceGrounded = this.CoyoteTimeWindow + 1.0f;
+        }
+    }
+
+    // 检测当前脚底位置能否安全切换为站立高度（向上扫掠头顶半球检测管道/低矮掩体净空）。
+    public bool CanStandUp(StaticMeshBvh3D world) {
+        if (world == null) { return true; }
+        float standH = this.StandingHeight;
+        float crouchH = this.CrouchHeight;
+        if (standH <= crouchH + 0.001f) { return true; }
+
+        Vector3 c0;
+        Vector3 c1;
+        this.GetCapsuleSegmentAt(this.Position, crouchH, out c0, out c1);
+        float grow = standH - crouchH;
+        SweepHit3D hit;
+        // 将顶球从下蹲顶心向上扫掠 grow 距离，检验头顶净空
+        if (world.SweepCapsuleEx(c1, c1, this.Radius - this.SkinWidth * 0.5f,
+                                 new Vector3(0.0f, grow, 0.0f), this.queryScratch, out hit)) {
+            return false;
+        }
+        return true;
+    }
+
+    // 完整单 Tick 战术角色运动仿真（输入加速 + 摩擦 + 下蹲净空 + 跳跃缓冲 + 扫掠滑行登阶 + 贴地吸附）。
+    public void Simulate(StaticMeshBvh3D world, CharacterMoveInput3D input, float dt) {
+        if (dt <= 0.0f) { return; }
+        if (dt > 0.1f) { dt = 0.1f; }
+
+        // 1. 下蹲状态与头顶净空状态机
+        if (input.CrouchHeld) {
+            this.IsCrouching = true;
+            this.CurrentHeight = this.CrouchHeight;
+        } else if (this.IsCrouching) {
+            if (this.CanStandUp(world)) {
+                this.IsCrouching = false;
+                this.CurrentHeight = this.StandingHeight;
+            } else {
+                this.IsCrouching = true;
+                this.CurrentHeight = this.CrouchHeight;
+            }
+        } else {
+            this.CurrentHeight = this.StandingHeight;
+        }
+
+        // 2. 土狼时间与跳跃预输入缓冲计时
+        if (this.IsGrounded) {
+            this.timeSinceGrounded = 0.0f;
+        } else {
+            this.timeSinceGrounded = this.timeSinceGrounded + dt;
+        }
+        if (input.JumpPressed) {
+            this.jumpBufferTimer = this.JumpBufferWindow;
+        } else if (this.jumpBufferTimer > 0.0f) {
+            this.jumpBufferTimer = this.jumpBufferTimer - dt;
+            if (this.jumpBufferTimer < 0.0f) { this.jumpBufferTimer = 0.0f; }
+        }
+
+        // 3. 计算水平期望速度并施加地面摩擦/加减速
+        Vector3 wishHoriz = new Vector3(input.WishDirection.X, 0.0f, input.WishDirection.Z);
+        float wishMag = wishHoriz.Length();
+        Vector3 wishDir = Vector3.Zero;
+        if (wishMag > 1e-5f) {
+            wishDir = Vector3.Multiply(wishHoriz, 1.0f / wishMag);
+            if (wishMag > 1.0f) { wishMag = 1.0f; }
+        }
+
+        float targetTopSpeed = this.WalkSpeed;
+        if (this.IsCrouching) {
+            targetTopSpeed = this.CrouchSpeed;
+        } else if (input.SprintHeld) {
+            targetTopSpeed = this.SprintSpeed;
+        }
+        float wishSpeed = targetTopSpeed * wishMag;
+
+        if (this.IsGrounded) {
+            this.ApplyGroundFriction(dt);
+            this.AccelerateHorizontal(wishDir, wishSpeed, this.GroundAcceleration, dt);
+        } else {
+            this.AccelerateHorizontal(wishDir, wishSpeed, this.AirAcceleration, dt);
+        }
+
+        // 4. 触发跳跃（支持土狼时间内起跳与落地瞬间预输入起跳；头顶卡在低矮管道内时禁跳防穿顶）
+        bool canCoyoteJump = this.IsGrounded || (this.timeSinceGrounded <= this.CoyoteTimeWindow);
+        if (this.jumpBufferTimer > 0.0f && canCoyoteJump) {
+            if (!this.IsCrouching || this.CanStandUp(world)) {
+                this.Velocity = new Vector3(this.Velocity.X, this.JumpSpeed, this.Velocity.Z);
+                this.IsGrounded = false;
+                this.timeSinceGrounded = this.CoyoteTimeWindow + 1.0f;
+                this.jumpBufferTimer = 0.0f;
+            }
+        }
+
+        // 5. 重力积分（半隐式欧拉）并执行几何连续碰撞移动
+        if (!this.IsGrounded) {
+            this.Velocity = new Vector3(this.Velocity.X, this.Velocity.Y - this.Gravity * dt, this.Velocity.Z);
+        }
+        this.Move(world, dt);
+
+        // 6. 平滑插值第一人称眼高
+        float targetEye = this.CurrentHeight * 0.90f;
+        float lerpAlpha = 1.0f - (float)Math.Exp((double)(-16.0f * dt));
+        this.CurrentEyeHeight = this.CurrentEyeHeight + (targetEye - this.CurrentEyeHeight) * lerpAlpha;
+    }
+
+    private void ApplyGroundFriction(float dt) {
+        float vx = this.Velocity.X;
+        float vz = this.Velocity.Z;
+        float speed = (float)Math.Sqrt((double)(vx * vx + vz * vz));
+        if (speed <= 0.0005f) {
+            this.Velocity = new Vector3(0.0f, this.Velocity.Y, 0.0f);
+            return;
+        }
+        float control = speed < 1.5f ? 1.5f : speed;
+        float drop = control * this.GroundFriction * dt;
+        float newSpeed = speed - drop;
+        if (newSpeed < 0.0f) { newSpeed = 0.0f; }
+        float ratio = newSpeed / speed;
+        this.Velocity = new Vector3(vx * ratio, this.Velocity.Y, vz * ratio);
+    }
+
+    private void AccelerateHorizontal(Vector3 wishDir, float wishSpeed, float accel, float dt) {
+        if (wishSpeed <= 0.0001f) { return; }
+        float curProj = this.Velocity.X * wishDir.X + this.Velocity.Z * wishDir.Z;
+        float addSpeed = wishSpeed - curProj;
+        if (addSpeed <= 0.0f) { return; }
+        float accelStep = accel * wishSpeed * dt;
+        if (accelStep > addSpeed) { accelStep = addSpeed; }
+        this.Velocity = new Vector3(
+            this.Velocity.X + wishDir.X * accelStep,
+            this.Velocity.Y,
+            this.Velocity.Z + wishDir.Z * accelStep);
+    }
+
+    // 核心连续几何移动解算（可直接供外部自定义物理技能驱动 Velocity 后调用）。
+    public void Move(StaticMeshBvh3D world, float dt) {
+        if (dt <= 0.0f) { return; }
+        if (world == null) {
+            this.Position = Vector3.Add(this.Position, Vector3.Multiply(this.Velocity, dt));
+            this.IsGrounded = false;
+            return;
+        }
+
+        // 0. 穿透自愈保护：若因外部推动或动态生成物轻微嵌入，先推出表面
+        Vector3 seg0;
+        Vector3 seg1;
+        this.GetCapsuleSegmentAt(this.Position, this.CurrentHeight, out seg0, out seg1);
+        Vector3 pushOut;
+        if (world.OverlapCapsuleDepenetrate(seg0, seg1, this.Radius - this.SkinWidth * 0.25f, this.queryScratch, out pushOut)) {
+            this.Position = Vector3.Add(this.Position, pushOut);
+        }
+
+        bool wasGrounded = this.IsGrounded;
+
+        // 地面行走时先将水平速度顺着当前可行走坡面切向投影，保证上坡不减速磕绊
+        Vector3 moveVel = this.Velocity;
+        if (wasGrounded && moveVel.Y <= 0.0f && this.GroundNormal.Y >= this.MinWalkableNormalY && this.GroundNormal.Y < 0.9995f) {
+            float horizMag = (float)Math.Sqrt((double)(moveVel.X * moveVel.X + moveVel.Z * moveVel.Z));
+            if (horizMag > 1e-5f) {
+                Vector3 clippedSlope = KinematicCapsuleController3D.ClipVelocity(moveVel, this.GroundNormal, 1.0f);
+                float cLen = clippedSlope.Length();
+                if (cLen > 1e-5f) {
+                    moveVel = Vector3.Multiply(clippedSlope, horizMag / cLen);
+                }
+            }
+        }
+
+        // 1. 执行常规多平面折痕滑行移动
+        Vector3 slidePos;
+        Vector3 slideVel;
+        bool hitHorizontalObstacle;
+        this.SlideMove(world, this.Position, moveVel, dt, wasGrounded, out slidePos, out slideVel, out hitHorizontalObstacle);
+
+        Vector3 chosenPos = slidePos;
+        Vector3 chosenVel = slideVel;
+
+        // 2. 三段式自动登阶（Step-Up）：贴地或低空下落撞上台阶立面时尝试抬腿跨越
+        float horizIntentSq = this.Velocity.X * this.Velocity.X + this.Velocity.Z * this.Velocity.Z;
+        if (hitHorizontalObstacle && this.MaxStepHeight > 0.01f && horizIntentSq > 1e-4f && (wasGrounded || this.Velocity.Y <= 1.0f)) {
+            Vector3 stepPos;
+            Vector3 stepVel;
+            if (this.TryStepMove(world, this.Position, new Vector3(this.Velocity.X, 0.0f, this.Velocity.Z), dt, out stepPos, out stepVel)) {
+                float slideDistSq = KinematicCapsuleController3D.HorizontalDistanceSq(this.Position, slidePos);
+                float stepDistSq = KinematicCapsuleController3D.HorizontalDistanceSq(this.Position, stepPos);
+                if (stepDistSq > slideDistSq + 0.0001f) {
+                    chosenPos = stepPos;
+                    chosenVel = new Vector3(stepVel.X, 0.0f, stepVel.Z);
+                }
+            }
+        }
+
+        this.Position = chosenPos;
+        this.Velocity = chosenVel;
+
+        // 3. 落地探测与下坡/下楼梯贴地吸附（Ground Snap）
+        this.UpdateGroundStateAndSnap(world, wasGrounded);
+    }
+
+    private static float HorizontalDistanceSq(Vector3 a, Vector3 b) {
+        float dx = b.X - a.X;
+        float dz = b.Z - a.Z;
+        return dx * dx + dz * dz;
+    }
+
+    // 判定胶囊扫掠接触点是否处于可行走支撑面上：
+    // 兼顾胶囊底半球搭在水平踏面 90° 棱边（接触法线外倾、但真实三角面法线平坦）的几何情形，同时严拒真实陡崖面。
+    private bool IsHitWalkable(SweepHit3D hit) {
+        if (hit.Normal.Y >= this.MinWalkableNormalY) { return true; }
+        if (hit.SurfaceNormal.Y >= this.MinWalkableNormalY && hit.Normal.Y > 0.15f) { return true; }
+        return false;
+    }
+
+    // 尝试三段式跨上台阶（Up -> Slide Forward -> Sweep Down 并检验台面坡度可行走）。
+    private bool TryStepMove(StaticMeshBvh3D world, Vector3 startPos, Vector3 horizVel, float dt,
+                             out Vector3 outPos, out Vector3 outVel) {
+        outPos = startPos;
+        outVel = horizVel;
+
+        // Phase A: 向上扫掠抬高 MaxStepHeight
+        Vector3 p0;
+        Vector3 p1;
+        this.GetCapsuleSegmentAt(startPos, this.CurrentHeight, out p0, out p1);
+        SweepHit3D upHit;
+        float upDist = this.MaxStepHeight;
+        if (world.SweepCapsuleEx(p0, p1, this.Radius, new Vector3(0.0f, this.MaxStepHeight, 0.0f), this.queryScratch, out upHit)) {
+            if (upHit.StartedPenetrating) { return false; }
+            upDist = upHit.Distance - this.SkinWidth;
+        }
+        if (upDist <= 0.02f) { return false; }
+
+        Vector3 raisedPos = new Vector3(startPos.X, startPos.Y + upDist, startPos.Z);
+
+        // Phase B: 在抬高高度处水平滑行推进
+        Vector3 fwdPos;
+        Vector3 fwdVel;
+        bool dummyBlocked;
+        this.SlideMove(world, raisedPos, horizVel, dt, true, out fwdPos, out fwdVel, out dummyBlocked);
+
+        if (KinematicCapsuleController3D.HorizontalDistanceSq(raisedPos, fwdPos) <= 1e-6f) {
+            return false;
+        }
+
+        // Phase C: 向下压回台面并验证落脚点必须为可行走平面（防止踏上陡峭刀刃斜面）
+        this.GetCapsuleSegmentAt(fwdPos, this.CurrentHeight, out p0, out p1);
+        float maxDown = upDist + this.SkinWidth * 2.0f;
+        SweepHit3D downHit;
+        if (!world.SweepCapsuleEx(p0, p1, this.Radius, new Vector3(0.0f, -maxDown, 0.0f), this.queryScratch, out downHit)) {
+            return false;
+        }
+        if (downHit.StartedPenetrating || !this.IsHitWalkable(downHit)) {
+            return false;
+        }
+
+        float safeDrop = downHit.Distance - this.SkinWidth;
+        if (safeDrop < 0.0f) { safeDrop = 0.0f; }
+        Vector3 landedPos = new Vector3(fwdPos.X, fwdPos.Y - safeDrop, fwdPos.Z);
+        float netStepUp = landedPos.Y - startPos.Y;
+        if (netStepUp < -0.02f || netStepUp > this.MaxStepHeight + 0.01f) {
+            return false;
+        }
+
+        outPos = landedPos;
+        outVel = fwdVel;
+        return true;
+    }
+
+    // 多平面折痕速度裁剪连续扫掠循环（最多 4 次碰撞反弹投影）。
+    private void SlideMove(StaticMeshBvh3D world, Vector3 startPos, Vector3 initialVel, float dt,
+                           bool preventSteepClimb, out Vector3 endPos, out Vector3 endVel, out bool hitWallOrStep) {
+        Vector3 curPos = startPos;
+        Vector3 vel = initialVel;
+        Vector3 primalVel = initialVel;
+        hitWallOrStep = false;
+
+        float timeLeft = dt;
+        int numPlanes = 0;
+
+        for (int bump = 0; bump < 4; bump = bump + 1) {
+            Vector3 delta = Vector3.Multiply(vel, timeLeft);
+            float moveLen = delta.Length();
+            if (moveLen <= 1e-6f) { break; }
+
+            Vector3 p0;
+            Vector3 p1;
+            this.GetCapsuleSegmentAt(curPos, this.CurrentHeight, out p0, out p1);
+
+            SweepHit3D hit;
+            if (!world.SweepCapsuleEx(p0, p1, this.Radius, delta, this.queryScratch, out hit)) {
+                curPos = Vector3.Add(curPos, delta);
+                break;
+            }
+
+            // 安全推进至表面前 SkinWidth 处
+            if (hit.Distance > this.SkinWidth) {
+                float safeDist = hit.Distance - this.SkinWidth;
+                float safeFrac = safeDist / moveLen;
+                curPos = new Vector3(
+                    curPos.X + delta.X * safeFrac,
+                    curPos.Y + delta.Y * safeFrac,
+                    curPos.Z + delta.Z * safeFrac);
+                timeLeft = timeLeft * (1.0f - safeFrac);
+            } else if (hit.StartedPenetrating) {
+                // 紧贴微穿透退避
+                curPos = Vector3.Add(curPos, Vector3.Multiply(hit.Normal, this.SkinWidth * 0.5f));
+            }
+
+            Vector3 planeNormal = hit.Normal;
+            if (planeNormal.Y < this.MinWalkableNormalY) {
+                hitWallOrStep = true;
+                // 陡坡防冲浪：贴地或未主动高跳时撞上不可行走陡坡，将其法线拍平为水平墙面阻挡，禁止蹭上陡崖
+                if (preventSteepClimb && planeNormal.Y > -0.05f && vel.Y <= 0.5f) {
+                    float hx = planeNormal.X;
+                    float hz = planeNormal.Z;
+                    float hLen = (float)Math.Sqrt((double)(hx * hx + hz * hz));
+                    if (hLen > 1e-5f) {
+                        planeNormal = new Vector3(hx / hLen, 0.0f, hz / hLen);
+                    }
+                }
+            }
+
+            // 撞顶天花板时立即清零向上冲量
+            if (hit.Normal.Y < -0.7f && vel.Y > 0.0f) {
+                vel = new Vector3(vel.X, 0.0f, vel.Z);
+            }
+
+            // 去重近似平行平面
+            bool duplicate = false;
+            for (int i = 0; i < numPlanes; i = i + 1) {
+                if (Vector3.Dot(planeNormal, this.clipPlanes[i]) > 0.99f) {
+                    vel = Vector3.Add(vel, Vector3.Multiply(planeNormal, 0.01f));
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) { continue; }
+
+            if (numPlanes >= this.clipPlanes.Length) {
+                vel = Vector3.Zero;
+                break;
+            }
+            this.clipPlanes[numPlanes] = planeNormal;
+            numPlanes = numPlanes + 1;
+
+            // 多平面折痕投影求解（1 面切向投影 / 2 面交线折痕滑出 / 3 面死角归零）
+            bool resolved = false;
+            for (int i = 0; i < numPlanes; i = i + 1) {
+                if (Vector3.Dot(vel, this.clipPlanes[i]) >= 0.0f) { continue; }
+
+                Vector3 clipped = KinematicCapsuleController3D.ClipVelocity(vel, this.clipPlanes[i], 1.001f);
+                bool entersSecond = false;
+                for (int j = 0; j < numPlanes; j = j + 1) {
+                    if (j == i) { continue; }
+                    if (Vector3.Dot(clipped, this.clipPlanes[j]) < 0.0f) {
+                        entersSecond = true;
+                        // 沿两平面交线（Crease = n_i × n_j）方向投影
+                        Vector3 crease = Vector3.Cross(this.clipPlanes[i], this.clipPlanes[j]);
+                        float cLenSq = crease.LengthSquared();
+                        if (cLenSq <= 1e-8f) {
+                            clipped = Vector3.Zero;
+                            break;
+                        }
+                        crease = Vector3.Multiply(crease, 1.0f / (float)Math.Sqrt((double)cLenSq));
+                        float along = Vector3.Dot(vel, crease);
+                        clipped = Vector3.Multiply(crease, along);
+
+                        // 若仍刺入第三个平面，判定为三面夹角死点，彻底刹停防震荡
+                        for (int k = 0; k < numPlanes; k = k + 1) {
+                            if (k == i || k == j) { continue; }
+                            if (Vector3.Dot(clipped, this.clipPlanes[k]) < 0.0f) {
+                                clipped = Vector3.Zero;
+                                break;
+                            }
+                        }
+                        break;
+                    }
+                }
+                vel = clipped;
+                resolved = true;
+                break;
+            }
+
+            if (!resolved) { continue; }
+
+            // 防止锐角墙缝把玩家反向弹出产生高频抖动
+            float horizDot = vel.X * primalVel.X + vel.Z * primalVel.Z;
+            if (horizDot < -1e-5f) {
+                vel = new Vector3(0.0f, vel.Y, 0.0f);
+            }
+        }
+
+        endPos = curPos;
+        endVel = vel;
+    }
+
+    // 落地检测与下坡贴地吸附：消除斜坡奔跑离地微跳。
+    private void UpdateGroundStateAndSnap(StaticMeshBvh3D world, bool wasGrounded) {
+        // 正在向上起跳阶段不吸附地面
+        if (this.Velocity.Y > 0.5f) {
+            this.IsGrounded = false;
+            return;
+        }
+
+        float probeDist = (wasGrounded && this.GroundSnapDistance > this.SkinWidth * 4.0f)
+            ? this.GroundSnapDistance
+            : (this.SkinWidth * 4.0f + 0.02f);
+
+        Vector3 p0;
+        Vector3 p1;
+        this.GetCapsuleSegmentAt(this.Position, this.CurrentHeight, out p0, out p1);
+
+        SweepHit3D groundHit;
+        if (world.SweepCapsuleEx(p0, p1, this.Radius, new Vector3(0.0f, -probeDist, 0.0f), this.queryScratch, out groundHit)) {
+            if (this.IsHitWalkable(groundHit)) {
+                float snapDrop = groundHit.Distance - this.SkinWidth;
+                if (snapDrop > 0.0f) {
+                    this.Position = new Vector3(this.Position.X, this.Position.Y - snapDrop, this.Position.Z);
+                }
+                this.IsGrounded = true;
+                this.GroundNormal = groundHit.Normal.Y >= this.MinWalkableNormalY ? groundHit.Normal : groundHit.SurfaceNormal;
+                this.GroundMaterialId = groundHit.MaterialId;
+                if (this.Velocity.Y < 0.0f) {
+                    this.Velocity = new Vector3(this.Velocity.X, 0.0f, this.Velocity.Z);
+                }
+                return;
+            }
+        }
+
+        this.IsGrounded = false;
+        this.GroundNormal = new Vector3(0.0f, 1.0f, 0.0f);
+    }
+
+    // Quake 经典平面速度裁剪算子（overbounce >= 1.0 保证浮点舍入后不会残留在平面内侧）。
+    public static Vector3 ClipVelocity(Vector3 vel, Vector3 normal, float overbounce) {
+        float backoff = Vector3.Dot(vel, normal);
+        if (backoff < 0.0f) {
+            backoff = backoff * overbounce;
+        } else {
+            backoff = backoff / overbounce;
+        }
+        return new Vector3(
+            vel.X - normal.X * backoff,
+            vel.Y - normal.Y * backoff,
+            vel.Z - normal.Z * backoff);
+    }
+}

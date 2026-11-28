@@ -1,0 +1,175 @@
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+using System.Text;
+using Gui;
+using Game.Animation;
+using Game.Assets;
+using Game.Combat3D;
+using Game.Render3D;
+
+// glTF 2.0 / GLB 角色蒙皮重映射、逆绑定矩阵与场景层级静态碰撞烘焙契约测试：
+//   1. skin.joints 非拓扑逆序（子关节排在父关节前 [child, root]）时，Skeleton 自动按拓扑建树，
+//      且网格顶点 JOINTS_0 骨骼下标精确重映射至真实 Skeleton 下标（杜绝手腕绑到骨盆的错位）；
+//   2. skin.inverseBindMatrices 4x4 列主序矩阵导入并经 SetBindInverse 持久化；
+//   3. node.matrix 16 浮点列主序矩阵 TRS 分解与 GltfModel.BakeStaticCollision 碰撞树烘焙求交。
+public class GltfRigAndCollisionTests {
+    private static int failures = 0;
+
+    private static void Check(string name, bool ok) {
+        if (!ok) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL: " + name);
+        }
+    }
+
+    private static bool Near(float a, float b, float eps) {
+        float d = a - b;
+        if (d < 0.0f) { d = -d; }
+        return d <= eps;
+    }
+
+    private static void AppendU32(List<byte> buf, uint v) {
+        buf.Add((byte)(v & 0xFFu));
+        buf.Add((byte)((v >> 8) & 0xFFu));
+        buf.Add((byte)((v >> 16) & 0xFFu));
+        buf.Add((byte)((v >> 24) & 0xFFu));
+    }
+
+    private static void AppendU16(List<byte> buf, ushort v) {
+        buf.Add((byte)(v & 0xFF));
+        buf.Add((byte)((v >> 8) & 0xFF));
+    }
+
+    private static void AppendF32(List<byte> buf, float v) {
+        byte[] b = BitConverter.GetBytes(v);
+        buf.Add(b[0]); buf.Add(b[1]); buf.Add(b[2]); buf.Add(b[3]);
+    }
+
+    private static void AppendIdentityWithPos(List<byte> buf, float tx, float ty, float tz) {
+        AppendF32(buf, 1.0f); AppendF32(buf, 0.0f); AppendF32(buf, 0.0f); AppendF32(buf, 0.0f);
+        AppendF32(buf, 0.0f); AppendF32(buf, 1.0f); AppendF32(buf, 0.0f); AppendF32(buf, 0.0f);
+        AppendF32(buf, 0.0f); AppendF32(buf, 0.0f); AppendF32(buf, 1.0f); AppendF32(buf, 0.0f);
+        AppendF32(buf, tx);   AppendF32(buf, ty);   AppendF32(buf, tz);   AppendF32(buf, 1.0f);
+    }
+
+    private static byte[] BuildSyntheticGlb() {
+        List<byte> bin = new List<byte>();
+
+        // BufferView 0: inverseBindMatrices (2 * mat4 = 128 bytes, offset 0)
+        // joint[0] = "child_arm" -> inverseBind Y = -3.5
+        // joint[1] = "root_pelvis" -> inverseBind Y = -1.2
+        AppendIdentityWithPos(bin, 0.0f, -3.5f, 0.0f);
+        AppendIdentityWithPos(bin, 0.0f, -1.2f, 0.0f);
+
+        // BufferView 1: POSITION for 3 vertices (9 floats = 36 bytes, offset 128)
+        AppendF32(bin, -1.0f); AppendF32(bin, 0.0f); AppendF32(bin, 0.0f);
+        AppendF32(bin,  1.0f); AppendF32(bin, 0.0f); AppendF32(bin, 0.0f);
+        AppendF32(bin,  0.0f); AppendF32(bin, 2.0f); AppendF32(bin, 0.0f);
+
+        // BufferView 2: JOINTS_0 (3 * VEC4 ubyte = 12 bytes, offset 164)
+        // 顶点 0 主绑定 glTF joint[0] ("child_arm"), 次绑定 joint[1] ("root_pelvis")
+        bin.Add(0); bin.Add(1); bin.Add(0); bin.Add(0);
+        bin.Add(0); bin.Add(1); bin.Add(0); bin.Add(0);
+        bin.Add(0); bin.Add(1); bin.Add(0); bin.Add(0);
+
+        // BufferView 3: WEIGHTS_0 (3 * VEC4 float = 48 bytes, offset 176)
+        for (int i = 0; i < 3; i = i + 1) {
+            AppendF32(bin, 0.75f); AppendF32(bin, 0.25f); AppendF32(bin, 0.0f); AppendF32(bin, 0.0f);
+        }
+
+        // BufferView 4: INDICES (3 * ushort = 6 bytes + 2 pad = 8 bytes, offset 224)
+        AppendU16(bin, (ushort)0);
+        AppendU16(bin, (ushort)1);
+        AppendU16(bin, (ushort)2);
+        AppendU16(bin, (ushort)0); // 4-byte align -> total 232 bytes
+
+        string json = "{"
+            + "\"asset\":{\"version\":\"2.0\"},"
+            + "\"buffers\":[{\"byteLength\":" + bin.Count.ToString() + "}],"
+            + "\"bufferViews\":["
+            + "{\"buffer\":0,\"byteOffset\":0,\"byteLength\":128},"
+            + "{\"buffer\":0,\"byteOffset\":128,\"byteLength\":36},"
+            + "{\"buffer\":0,\"byteOffset\":164,\"byteLength\":12},"
+            + "{\"buffer\":0,\"byteOffset\":176,\"byteLength\":48},"
+            + "{\"buffer\":0,\"byteOffset\":224,\"byteLength\":6}"
+            + "],"
+            + "\"accessors\":["
+            + "{\"bufferView\":0,\"componentType\":5126,\"count\":2,\"type\":\"MAT4\"},"
+            + "{\"bufferView\":1,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"},"
+            + "{\"bufferView\":2,\"componentType\":5121,\"count\":3,\"type\":\"VEC4\"},"
+            + "{\"bufferView\":3,\"componentType\":5126,\"count\":3,\"type\":\"VEC4\"},"
+            + "{\"bufferView\":4,\"componentType\":5123,\"count\":3,\"type\":\"SCALAR\"}"
+            + "],"
+            + "\"nodes\":["
+            + "{\"name\":\"child_arm\",\"translation\":[0,2,0]},"
+            + "{\"name\":\"root_pelvis\",\"children\":[0],\"translation\":[0,1,0]},"
+            + "{\"name\":\"wall_panel\",\"mesh\":1,\"matrix\":[2,0,0,0, 0,2,0,0, 0,0,1,0, 0,0,6,1]}"
+            + "],"
+            + "\"skins\":[{\"joints\":[0,1],\"inverseBindMatrices\":0}],"
+            + "\"meshes\":["
+            + "{\"name\":\"rigged_tri\",\"primitives\":[{\"attributes\":{\"POSITION\":1,\"JOINTS_0\":2,\"WEIGHTS_0\":3},\"indices\":4}]},"
+            + "{\"name\":\"static_wall\",\"primitives\":[{\"attributes\":{\"POSITION\":1},\"indices\":4}]}"
+            + "]"
+            + "}";
+
+        byte[] jb = Encoding.UTF8.GetBytes(json);
+        int jPad = (4 - (jb.Length % 4)) % 4;
+        int bPad = (4 - (bin.Count % 4)) % 4;
+        uint totalLen = (uint)(12 + 8 + jb.Length + jPad + 8 + bin.Count + bPad);
+
+        List<byte> glb = new List<byte>();
+        AppendU32(glb, 0x46546C67u);
+        AppendU32(glb, 2u);
+        AppendU32(glb, totalLen);
+
+        AppendU32(glb, (uint)(jb.Length + jPad));
+        AppendU32(glb, 0x4E4F534Au);
+        for (int i = 0; i < jb.Length; i = i + 1) { glb.Add(jb[i]); }
+        for (int i = 0; i < jPad; i = i + 1) { glb.Add((byte)0x20); }
+
+        AppendU32(glb, (uint)(bin.Count + bPad));
+        AppendU32(glb, 0x004E4942u);
+        for (int i = 0; i < bin.Count; i = i + 1) { glb.Add(bin[i]); }
+        for (int i = 0; i < bPad; i = i + 1) { glb.Add((byte)0); }
+
+        return glb.ToArray();
+    }
+
+    public static void Main() {
+        byte[] glb = BuildSyntheticGlb();
+        GltfModel model = GltfLoader.LoadGlb(glb);
+        Check("gltf.loaded", model != null && model.Skeleton != null && model.PrimitiveCount == 2);
+        if (model != null && model.Skeleton != null) {
+            // 拓扑建树后：root_pelvis 在 0 号，child_arm 在 1 号
+            Check("gltf.topo_order", model.Skeleton.IndexOf("root_pelvis") == 0 && model.Skeleton.IndexOf("child_arm") == 1);
+            // JointToSkeletonMap 应为 [1, 0]
+            Check("gltf.joint_map", model.JointToSkeletonMap.Length == 2 && model.JointToSkeletonMap[0] == 1 && model.JointToSkeletonMap[1] == 0);
+            // 显式逆绑定矩阵应按重映射后的骨骼槽位写入：bone 1 (child_arm) -> -3.5, bone 0 (root_pelvis) -> -1.2
+            Check("gltf.ibm_child", Near(model.Skeleton.BindInverse(1).Position.Y, -3.5f, 0.001f));
+            Check("gltf.ibm_root", Near(model.Skeleton.BindInverse(0).Position.Y, -1.2f, 0.001f));
+
+            // 蒙皮顶点缓冲 JOINTS_0 (原始 [0, 1]) 必须被重映射为 [1.0f, 0.0f]
+            GltfPrimitive skinPrim = model.Primitives[0];
+            Check("gltf.skinned_prim", skinPrim.IsSkinned && skinPrim.SkinnedMesh != null);
+            if (skinPrim.SkinnedMesh != null) {
+                float[] sv = skinPrim.SkinnedMesh.VertexArray();
+                Check("gltf.vertex_joints_remapped", Near(sv[8], 1.0f, 0.001f) && Near(sv[9], 0.0f, 0.001f));
+            }
+
+            // node.matrix [scale(2,2,1), translate(0,0,6)] 经 BakeStaticCollision 烘焙进 BVH 后，在 z=6.0m 处精确命中三角形
+            StaticMeshBvh3D bvh = new StaticMeshBvh3D();
+            int bakedTris = model.BakeStaticCollision(bvh, Transform3D.Identity, SurfaceMaterial3D.Concrete);
+            bvh.Build();
+            MeshRayHit3D hit;
+            bool okHit = bvh.Raycast(new Vector3(0.0f, 1.5f, 0.0f), new Vector3(0.0f, 0.0f, 1.0f), 20.0f, out hit);
+            Check("gltf.bake_static_collision", bakedTris == 1 && okHit && Near(hit.Distance, 6.0f, 0.002f));
+        }
+
+        if (failures == 0) {
+            Console.WriteLine("ALL GLTF RIG AND COLLISION TESTS PASSED");
+        } else {
+            Console.WriteLine("TOTAL FAILURES: " + failures.ToString());
+        }
+    }
+}

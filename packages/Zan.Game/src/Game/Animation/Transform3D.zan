@@ -108,6 +108,73 @@ public struct Transform3D {
         return Quaternion.Rotate(scaled, this.Rotation);
     }
 
+    // 从列主序 4x4 仿射矩阵（m[offset..offset+15]，glTF / OpenGL 标准列主序）分解平移、旋转与缩放。
+    public static Transform3D FromColumnMajorMatrix(float[] m, int offset) {
+        if (m == null || offset < 0 || offset + 16 > m.Length) {
+            return Transform3D.Identity;
+        }
+        Vector3 pos = new Vector3(m[offset + 12], m[offset + 13], m[offset + 14]);
+
+        float c0x = m[offset + 0]; float c0y = m[offset + 1]; float c0z = m[offset + 2];
+        float c1x = m[offset + 4]; float c1y = m[offset + 5]; float c1z = m[offset + 6];
+        float c2x = m[offset + 8]; float c2y = m[offset + 9]; float c2z = m[offset + 10];
+
+        float sx = AnimMath.Sqrt(c0x * c0x + c0y * c0y + c0z * c0z);
+        float sy = AnimMath.Sqrt(c1x * c1x + c1y * c1y + c1z * c1z);
+        float sz = AnimMath.Sqrt(c2x * c2x + c2y * c2y + c2z * c2z);
+
+        // 检测奇反射（负行列式），将负号归入 X 轴缩放以保证旋转子矩阵为右手正交阵（det = +1）。
+        float det = c0x * (c1y * c2z - c1z * c2y)
+                  - c1x * (c0y * c2z - c0z * c2y)
+                  + c2x * (c0y * c1z - c0z * c1y);
+        if (det < 0.0f) { sx = -sx; }
+
+        float invSx = AnimMath.Abs(sx) > 0.000001f ? (1.0f / sx) : 0.0f;
+        float invSy = sy > 0.000001f ? (1.0f / sy) : 0.0f;
+        float invSz = sz > 0.000001f ? (1.0f / sz) : 0.0f;
+
+        // 归一化旋转矩阵元素 R[row, col]
+        float r00 = c0x * invSx; float r10 = c0y * invSx; float r20 = c0z * invSx;
+        float r01 = c1x * invSy; float r11 = c1y * invSy; float r21 = c1z * invSy;
+        float r02 = c2x * invSz; float r12 = c2y * invSz; float r22 = c2z * invSz;
+
+        Quaternion rot = Quaternion.Identity;
+        if (invSx > 0.0f && invSy > 0.0f && invSz > 0.0f) {
+            float trace = r00 + r11 + r22;
+            if (trace > 0.0f) {
+                float s = AnimMath.Sqrt(trace + 1.0f) * 2.0f;
+                rot = new Quaternion(
+                    (r21 - r12) / s,
+                    (r02 - r20) / s,
+                    (r10 - r01) / s,
+                    0.25f * s);
+            } else if (r00 > r11 && r00 > r22) {
+                float s = AnimMath.Sqrt(1.0f + r00 - r11 - r22) * 2.0f;
+                rot = new Quaternion(
+                    0.25f * s,
+                    (r01 + r10) / s,
+                    (r02 + r20) / s,
+                    (r21 - r12) / s);
+            } else if (r11 > r22) {
+                float s = AnimMath.Sqrt(1.0f + r11 - r00 - r22) * 2.0f;
+                rot = new Quaternion(
+                    (r01 + r10) / s,
+                    0.25f * s,
+                    (r12 + r21) / s,
+                    (r02 - r20) / s);
+            } else {
+                float s = AnimMath.Sqrt(1.0f + r22 - r00 - r11) * 2.0f;
+                rot = new Quaternion(
+                    (r02 + r20) / s,
+                    (r12 + r21) / s,
+                    0.25f * s,
+                    (r10 - r01) / s);
+            }
+            rot = Quaternion.Normalize(rot);
+        }
+        return new Transform3D(pos, rot, new Vector3(sx, sy, sz));
+    }
+
     // 缩放分量为 0 时求逆会得到无穷，这里钳成 1（退化但不炸）。
     private static float SafeReciprocal(float v) {
         if (v == 0.0f) { return 1.0f; }

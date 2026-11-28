@@ -15,6 +15,8 @@ public class Skeleton {
     private List<Transform3D> bindWorlds;
     // 绑定姿势世界变换的逆（蒙皮用；与骨骼表同序）。
     private List<Transform3D> bindInverses;
+    // 某根骨骼是否由外部资产（如 glTF inverseBindMatrices）显式指定了逆绑定变换。
+    private List<bool> explicitBindInv;
     // 世界姿势是否已是最新（姿势写脏时置 false）。
     private bool worldDirty;
     // 绑定姿势缓存是否过期。
@@ -25,6 +27,7 @@ public class Skeleton {
         this.index = new Dictionary<string, int>();
         this.bindWorlds = new List<Transform3D>();
         this.bindInverses = new List<Transform3D>();
+        this.explicitBindInv = new List<bool>();
         this.worldDirty = true;
         this.bindDirty = true;
     }
@@ -69,6 +72,7 @@ public class Skeleton {
         this.bones.Add(b);
         this.bindWorlds.Add(Transform3D.Identity);
         this.bindInverses.Add(Transform3D.Identity);
+        this.explicitBindInv.Add(false);
         this.index.Add(name, this.bones.Count - 1);
         this.worldDirty = true;
         this.bindDirty = true;
@@ -83,11 +87,20 @@ public class Skeleton {
         return b;
     }
 
-    // 设置骨骼绑定姿势并标脏蒙皮缓存。
+    // 设置骨骼绑定姿势并标脏蒙皮缓存（同时清除该骨的外部显式逆绑定覆盖）。
     public void SetBindPose(int boneIndex, Transform3D pose) {
         Bone b = this.RequireBone(boneIndex);
         b.BindPose = pose;
+        this.explicitBindInv[boneIndex] = false;
         this.bindDirty = true;
+    }
+
+    // 显式覆写某根骨骼的逆绑定变换（用于 glTF skin.inverseBindMatrices 精确导入，不被 RefreshBind 冲掉）。
+    public void SetBindInverse(int boneIndex, Transform3D bindInverse) {
+        this.RequireBone(boneIndex);
+        this.bindInverses[boneIndex] = bindInverse;
+        this.bindWorlds[boneIndex] = bindInverse.Inverse();
+        this.explicitBindInv[boneIndex] = true;
     }
 
     // 取绑定姿势（局部，相对父骨骼）。
@@ -159,10 +172,13 @@ public class Skeleton {
         this.worldDirty = true;
     }
 
-    // 重算绑定姿势的世界变换与其逆（蒙皮的分母）。
+    // 重算绑定姿势的世界变换与其逆（蒙皮的分母；保留显式 SetBindInverse 设定的逆绑定矩阵）。
     public void RefreshBind() {
         for (int i = 0; i < this.bones.Count; i = i + 1) {
             Bone b = this.bones[i];
+            if (this.explicitBindInv[i]) {
+                continue;
+            }
             if (b.ParentIndex < 0) {
                 this.bindWorlds[i] = b.BindPose;
             } else {

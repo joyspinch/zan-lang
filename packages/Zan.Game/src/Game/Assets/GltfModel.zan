@@ -1,0 +1,395 @@
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+using Gui;
+using Game.Animation;
+using Game.Combat3D;
+using Game.Graphics;
+using Game.Render3D;
+
+namespace Game.Assets;
+
+// glTF 2.0 材质基础参数（PBR Metallic-Roughness 子集）。
+public class GltfMaterial {
+    public string Name;
+    public float BaseColorR;
+    public float BaseColorG;
+    public float BaseColorB;
+    public float BaseColorA;
+    public float MetallicFactor;
+    public float RoughnessFactor;
+    public float EmissiveR;
+    public float EmissiveG;
+    public float EmissiveB;
+    public string AlphaMode;
+    public float AlphaCutoff;
+    public bool DoubleSided;
+    public int BaseColorTextureIndex;
+    public int NormalTextureIndex;
+    public float NormalScale;
+    public int MetallicRoughnessTextureIndex;
+    public int OcclusionTextureIndex;
+    public float OcclusionStrength;
+    public int EmissiveTextureIndex;
+
+    public GltfMaterial() {
+        this.Name = "";
+        this.BaseColorR = 1.0f;
+        this.BaseColorG = 1.0f;
+        this.BaseColorB = 1.0f;
+        this.BaseColorA = 1.0f;
+        this.MetallicFactor = 0.0f;
+        this.RoughnessFactor = 1.0f;
+        this.EmissiveR = 0.0f;
+        this.EmissiveG = 0.0f;
+        this.EmissiveB = 0.0f;
+        this.AlphaMode = "OPAQUE";
+        this.AlphaCutoff = 0.5f;
+        this.DoubleSided = false;
+        this.BaseColorTextureIndex = -1;
+        this.NormalTextureIndex = -1;
+        this.NormalScale = 1.0f;
+        this.MetallicRoughnessTextureIndex = -1;
+        this.OcclusionTextureIndex = -1;
+        this.OcclusionStrength = 1.0f;
+        this.EmissiveTextureIndex = -1;
+    }
+}
+
+// glTF 2.0 内嵌或外联图像资源（原始 PNG/JPEG 字节流，支持一键注册到 zan_image 纹理缓存）。
+public class GltfImageData {
+    [DllImport("zan_image")]
+    private static extern int zan_image_load_mem_bytes(string key, nint data, int len);
+
+    public string Name;
+    public string MimeType;
+    public byte[] Bytes;
+    public string RegisteredKey;
+
+    public GltfImageData() {
+        this.Name = "";
+        this.MimeType = "";
+        this.Bytes = new byte[0];
+        this.RegisteredKey = "";
+    }
+
+    // 解码并注册到原生纹理缓存（自动补齐 "mem:" 前缀），返回注册后的纹理键；失败返回 ""。
+    // 返回的键可直接传入 Canvas.DrawMesh3DEx / Canvas.DrawMesh3DSkinned 的 texture 参数。
+    public string RegisterAsTexture(string key) {
+        if (this.Bytes == null || this.Bytes.Length == 0) { return ""; }
+        string finalKey = (key == null || key == "") ? "mem:gltf_img" : key;
+        if (!finalKey.StartsWith("mem:")) { finalKey = "mem:" + finalKey; }
+        nint ptr = NativeMemory.Alloc(this.Bytes.Length);
+        Span<byte> dst = new Span<byte>(ptr, this.Bytes.Length);
+        for (int i = 0; i < this.Bytes.Length; i = i + 1) { dst[i] = this.Bytes[i]; }
+        int w = zan_image_load_mem_bytes(finalKey, ptr, this.Bytes.Length);
+        NativeMemory.Free(ptr);
+        if (w <= 0) { return ""; }
+        this.RegisteredKey = finalKey;
+        return finalKey;
+    }
+}
+
+// glTF 2.0 纹理索引项（指向 Images 中的图像索引）。
+public class GltfTextureInfo {
+    public string Name;
+    public int ImageIndex;
+    public int SamplerIndex;
+
+    public GltfTextureInfo() {
+        this.Name = "";
+        this.ImageIndex = -1;
+        this.SamplerIndex = -1;
+    }
+}
+
+// 单个 glTF 图元（静态网格进 Mesh，带 JOINTS_0+WEIGHTS_0 的蒙皮网格进 SkinnedMesh）。
+public class GltfPrimitive {
+    public string MeshName;
+    public int MeshIndex;
+    public int MaterialIndex;
+    public bool IsSkinned;
+    public float BoundsRadius;
+    public Mesh3D Mesh;
+    public SkinnedMesh3D SkinnedMesh;
+
+    public GltfPrimitive() {
+        this.MeshName = "";
+        this.MeshIndex = -1;
+        this.MaterialIndex = -1;
+        this.IsSkinned = false;
+        this.BoundsRadius = 1.0f;
+        this.Mesh = null;
+        this.SkinnedMesh = null;
+    }
+}
+
+// glTF 2.0 场景节点描述（保留父子层级、局部 TRS 与挂载的 Mesh 下标，供渲染树与物理碰撞烘焙共用）。
+public class GltfSceneNode {
+    public string Name;
+    public int ParentIndex;
+    public int MeshIndex;
+    public Transform3D LocalTransform;
+    public List<int> Children;
+
+    public GltfSceneNode() {
+        this.Name = "";
+        this.ParentIndex = -1;
+        this.MeshIndex = -1;
+        this.LocalTransform = Transform3D.Identity;
+        this.Children = new List<int>();
+    }
+}
+
+// glTF 2.0 解析结果：网格图元、材质表、内嵌纹理、场景节点层级、可选骨架与关键帧动画片段（Game.Animation.AnimationClip）。
+public class GltfModel {
+    public List<GltfPrimitive> Primitives;
+    public List<GltfMaterial> Materials;
+    public List<GltfImageData> Images;
+    public List<GltfTextureInfo> Textures;
+    public List<GltfSceneNode> Nodes;
+    public List<AnimationClip> Animations;
+    public Skeleton Skeleton;
+    public int[] JointNodeIndices;
+    public int[] JointToSkeletonMap;
+    public float[] InverseBindMatrices;
+
+    public GltfModel() {
+        this.Primitives = new List<GltfPrimitive>();
+        this.Materials = new List<GltfMaterial>();
+        this.Images = new List<GltfImageData>();
+        this.Textures = new List<GltfTextureInfo>();
+        this.Nodes = new List<GltfSceneNode>();
+        this.Animations = new List<AnimationClip>();
+        this.Skeleton = null;
+        this.JointNodeIndices = new int[0];
+        this.JointToSkeletonMap = new int[0];
+        this.InverseBindMatrices = new float[0];
+    }
+
+    public int PrimitiveCount { get { return this.Primitives.Count; } }
+    public int MaterialCount { get { return this.Materials.Count; } }
+    public int ImageCount { get { return this.Images.Count; } }
+    public int TextureCount { get { return this.Textures.Count; } }
+    public int NodeCount { get { return this.Nodes.Count; } }
+    public int AnimationCount { get { return this.Animations.Count; } }
+
+    // 递推计算指定场景节点的世界变换（含父链 TRS 组合，带防环步数上限）。
+    public Transform3D ComputeNodeWorldTransform(int nodeIndex) {
+        if (nodeIndex < 0 || nodeIndex >= this.Nodes.Count) {
+            return Transform3D.Identity;
+        }
+        Transform3D acc = this.Nodes[nodeIndex].LocalTransform;
+        int p = this.Nodes[nodeIndex].ParentIndex;
+        int guard = 0;
+        while (p >= 0 && p < this.Nodes.Count && guard < this.Nodes.Count) {
+            acc = Transform3D.Compose(this.Nodes[p].LocalTransform, acc);
+            p = this.Nodes[p].ParentIndex;
+            guard = guard + 1;
+        }
+        return acc;
+    }
+
+    // 按名称查找动画片段；未找到返回 null。
+    public AnimationClip FindAnimation(string name) {
+        if (name == null) { return null; }
+        for (int i = 0; i < this.Animations.Count; i = i + 1) {
+            if (this.Animations[i].Name == name) { return this.Animations[i]; }
+        }
+        return null;
+    }
+
+    // 注册指定材质的 baseColorTexture 到 zan_image 纹理缓存，返回 "mem:..." 纹理键；无纹理或解码失败返回 ""。
+    public string RegisterMaterialBaseColorTexture(int materialIndex, string keyPrefix) {
+        if (materialIndex < 0 || materialIndex >= this.Materials.Count) { return ""; }
+        int texIdx = this.Materials[materialIndex].BaseColorTextureIndex;
+        if (texIdx < 0 || texIdx >= this.Textures.Count) { return ""; }
+        int imgIdx = this.Textures[texIdx].ImageIndex;
+        if (imgIdx < 0 || imgIdx >= this.Images.Count) { return ""; }
+        string pfx = (keyPrefix == null || keyPrefix == "") ? "gltf" : keyPrefix;
+        return this.Images[imgIdx].RegisterAsTexture("mem:" + pfx + "_img_" + imgIdx.ToString());
+    }
+
+    // 注册指定材质的 normalTexture 到 zan_image 纹理缓存，返回 "mem:..." 纹理键；无纹理或解码失败返回 ""。
+    public string RegisterMaterialNormalTexture(int materialIndex, string keyPrefix) {
+        if (materialIndex < 0 || materialIndex >= this.Materials.Count) { return ""; }
+        int texIdx = this.Materials[materialIndex].NormalTextureIndex;
+        if (texIdx < 0 || texIdx >= this.Textures.Count) { return ""; }
+        int imgIdx = this.Textures[texIdx].ImageIndex;
+        if (imgIdx < 0 || imgIdx >= this.Images.Count) { return ""; }
+        string pfx = (keyPrefix == null || keyPrefix == "") ? "gltf" : keyPrefix;
+        return this.Images[imgIdx].RegisterAsTexture("mem:" + pfx + "_img_" + imgIdx.ToString());
+    }
+
+    // 注册指定材质的 PBR ORM 复合贴图（优先 metallicRoughnessTexture，缺省回退 occlusionTexture）。
+    public string RegisterMaterialOrmTexture(int materialIndex, string keyPrefix) {
+        if (materialIndex < 0 || materialIndex >= this.Materials.Count) { return ""; }
+        int texIdx = this.Materials[materialIndex].MetallicRoughnessTextureIndex;
+        if (texIdx < 0) { texIdx = this.Materials[materialIndex].OcclusionTextureIndex; }
+        if (texIdx < 0 || texIdx >= this.Textures.Count) { return ""; }
+        int imgIdx = this.Textures[texIdx].ImageIndex;
+        if (imgIdx < 0 || imgIdx >= this.Images.Count) { return ""; }
+        string pfx = (keyPrefix == null || keyPrefix == "") ? "gltf" : keyPrefix;
+        return this.Images[imgIdx].RegisterAsTexture("mem:" + pfx + "_img_" + imgIdx.ToString());
+    }
+
+    // 注册指定材质的 glTF 2.0 自发光贴图（emissiveTexture）；无则返回空串。
+    public string RegisterMaterialEmissiveTexture(int materialIndex, string keyPrefix) {
+        if (materialIndex < 0 || materialIndex >= this.Materials.Count) { return ""; }
+        int texIdx = this.Materials[materialIndex].EmissiveTextureIndex;
+        if (texIdx < 0 || texIdx >= this.Textures.Count) { return ""; }
+        int imgIdx = this.Textures[texIdx].ImageIndex;
+        if (imgIdx < 0 || imgIdx >= this.Images.Count) { return ""; }
+        string pfx = (keyPrefix == null || keyPrefix == "") ? "gltf" : keyPrefix;
+        return this.Images[imgIdx].RegisterAsTexture("mem:" + pfx + "_img_" + imgIdx.ToString());
+    }
+
+    // 一键将 glTF 场景中的全部静态网格按场景节点真实世界变换烘焙进 StaticMeshBvh3D 物理碰撞树。
+    public int BakeStaticCollision(StaticMeshBvh3D bvh, Transform3D rootTransform, int defaultMaterialId) {
+        if (bvh == null) { return 0; }
+        int added = 0;
+        bool hasNodeRef = false;
+        for (int ni = 0; ni < this.Nodes.Count; ni = ni + 1) {
+            int mIdx = this.Nodes[ni].MeshIndex;
+            if (mIdx >= 0) {
+                hasNodeRef = true;
+                Transform3D world = Transform3D.Compose(rootTransform, this.ComputeNodeWorldTransform(ni));
+                for (int pi = 0; pi < this.Primitives.Count; pi = pi + 1) {
+                    GltfPrimitive gp = this.Primitives[pi];
+                    if (gp != null && !gp.IsSkinned && gp.Mesh != null && gp.MeshIndex == mIdx) {
+                        added = added + bvh.AddIndexedTriangles(
+                            gp.Mesh.VertexArray(), gp.Mesh.StrideFloats(), gp.Mesh.VertexCount(),
+                            gp.Mesh.IndexArray(), world, defaultMaterialId);
+                    }
+                }
+            }
+        }
+        if (!hasNodeRef) {
+            for (int pi = 0; pi < this.Primitives.Count; pi = pi + 1) {
+                GltfPrimitive gp = this.Primitives[pi];
+                if (gp != null && !gp.IsSkinned && gp.Mesh != null) {
+                    added = added + bvh.AddIndexedTriangles(
+                        gp.Mesh.VertexArray(), gp.Mesh.StrideFloats(), gp.Mesh.VertexCount(),
+                        gp.Mesh.IndexArray(), rootTransform, defaultMaterialId);
+                }
+            }
+        }
+        return added;
+    }
+
+    // 一键实例化为可直接交给 RenderPlan + Renderer3D 渲染的场景树：
+    // 自动上传静态/蒙皮网格、注册材质内嵌纹理（漫反射 + 法线贴图 + ORM 复合贴图 + 自发光贴图）、映射 MASK 裁切与 BLEND 透明层。
+    public SceneNode InstantiateScene(Canvas canvas, string keyPrefix) {
+        SceneNode root = new SceneNode("gltf_root");
+        if (canvas == null) { return root; }
+        string pfx = (keyPrefix == null || keyPrefix == "") ? "gltf" : keyPrefix;
+        List<string> matTexKeys = new List<string>();
+        List<string> matNormKeys = new List<string>();
+        List<string> matOrmKeys = new List<string>();
+        List<string> matEmissiveKeys = new List<string>();
+        for (int i = 0; i < this.Materials.Count; i = i + 1) {
+            matTexKeys.Add(this.RegisterMaterialBaseColorTexture(i, pfx));
+            matNormKeys.Add(this.RegisterMaterialNormalTexture(i, pfx));
+            matOrmKeys.Add(this.RegisterMaterialOrmTexture(i, pfx));
+            matEmissiveKeys.Add(this.RegisterMaterialEmissiveTexture(i, pfx));
+        }
+        int[] primHandles = new int[this.Primitives.Count];
+        Material[] primMats = new Material[this.Primitives.Count];
+        for (int i = 0; i < this.Primitives.Count; i = i + 1) {
+            GltfPrimitive gp = this.Primitives[i];
+            if (gp == null) { continue; }
+            int handle = gp.IsSkinned
+                ? canvas.MeshUploadSkinned(gp.SkinnedMesh)
+                : canvas.MeshUpload(gp.Mesh);
+            primHandles[i] = handle;
+            Material mat = new Material();
+            if (gp.MaterialIndex >= 0 && gp.MaterialIndex < this.Materials.Count) {
+                GltfMaterial gm = this.Materials[gp.MaterialIndex];
+                mat.Red = gm.BaseColorR;
+                mat.Green = gm.BaseColorG;
+                mat.Blue = gm.BaseColorB;
+                mat.Alpha = gm.BaseColorA;
+                mat.Metallic = gm.MetallicFactor;
+                mat.Roughness = gm.RoughnessFactor;
+                mat.EmissiveRed = gm.EmissiveR;
+                mat.EmissiveGreen = gm.EmissiveG;
+                mat.EmissiveBlue = gm.EmissiveB;
+                mat.TextureKey = matTexKeys[gp.MaterialIndex];
+                mat.NormalMapKey = matNormKeys[gp.MaterialIndex];
+                mat.NormalScale = gm.NormalScale;
+                mat.OrmMapKey = matOrmKeys[gp.MaterialIndex];
+                mat.AoStrength = gm.OcclusionStrength;
+                mat.EmissiveMapKey = matEmissiveKeys[gp.MaterialIndex];
+                mat.CullMode = gm.DoubleSided ? 0 : 1;
+                if (gm.AlphaMode == "MASK") {
+                    mat.AlphaCutoff = gm.AlphaCutoff > 0.0f ? gm.AlphaCutoff : 0.5f;
+                }
+            }
+            primMats[i] = mat;
+        }
+
+        bool anyMeshNode = false;
+        for (int ni = 0; ni < this.Nodes.Count; ni = ni + 1) {
+            if (this.Nodes[ni].MeshIndex >= 0) { anyMeshNode = true; break; }
+        }
+        if (anyMeshNode) {
+            SceneNode[] sceneNodes = new SceneNode[this.Nodes.Count];
+            for (int ni = 0; ni < this.Nodes.Count; ni = ni + 1) {
+                GltfSceneNode gn = this.Nodes[ni];
+                SceneNode sn = new SceneNode(gn.Name != "" ? gn.Name : ("node_" + ni.ToString()));
+                sn.Local = gn.LocalTransform;
+                if (gn.MeshIndex >= 0) {
+                    for (int pi = 0; pi < this.Primitives.Count; pi = pi + 1) {
+                        GltfPrimitive gp = this.Primitives[pi];
+                        if (gp != null && gp.MeshIndex == gn.MeshIndex && primHandles[pi] > 0) {
+                            SceneNode leaf = new SceneNode(gp.MeshName != "" ? gp.MeshName : ("prim_" + pi.ToString()));
+                            leaf.MeshKey = primHandles[pi];
+                            leaf.IsSkinned = gp.IsSkinned;
+                            if (gp.IsSkinned) { leaf.Skeleton = this.Skeleton; }
+                            leaf.BoundsRadius = gp.BoundsRadius > 0.001f ? gp.BoundsRadius : 1.0f;
+                            leaf.Material = primMats[pi];
+                            if (gp.MaterialIndex >= 0 && gp.MaterialIndex < this.Materials.Count) {
+                                GltfMaterial gm = this.Materials[gp.MaterialIndex];
+                                if (gm.AlphaMode == "BLEND" || gm.BaseColorA < 0.99f) {
+                                    leaf.Layer = 1;
+                                    leaf.CastShadow = false;
+                                }
+                            }
+                            sn.AddChild(leaf);
+                        }
+                    }
+                }
+                sceneNodes[ni] = sn;
+            }
+            for (int ni = 0; ni < this.Nodes.Count; ni = ni + 1) {
+                int p = this.Nodes[ni].ParentIndex;
+                if (p >= 0 && p < this.Nodes.Count) {
+                    sceneNodes[p].AddChild(sceneNodes[ni]);
+                } else {
+                    root.AddChild(sceneNodes[ni]);
+                }
+            }
+            return root;
+        }
+
+        for (int i = 0; i < this.Primitives.Count; i = i + 1) {
+            GltfPrimitive gp = this.Primitives[i];
+            if (gp == null || primHandles[i] <= 0) { continue; }
+            SceneNode node = new SceneNode(gp.MeshName != "" ? gp.MeshName : ("prim_" + i.ToString()));
+            node.MeshKey = primHandles[i];
+            node.IsSkinned = gp.IsSkinned;
+            if (gp.IsSkinned) { node.Skeleton = this.Skeleton; }
+            node.BoundsRadius = gp.BoundsRadius > 0.001f ? gp.BoundsRadius : 1.0f;
+            node.Material = primMats[i];
+            if (gp.MaterialIndex >= 0 && gp.MaterialIndex < this.Materials.Count) {
+                GltfMaterial gm = this.Materials[gp.MaterialIndex];
+                if (gm.AlphaMode == "BLEND" || gm.BaseColorA < 0.99f) {
+                    node.Layer = 1;
+                    node.CastShadow = false;
+                }
+            }
+            root.AddChild(node);
+        }
+        return root;
+    }
+}

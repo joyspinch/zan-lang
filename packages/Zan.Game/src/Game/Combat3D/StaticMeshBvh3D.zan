@@ -1,0 +1,1131 @@
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+using Game.Animation;
+
+namespace Game.Combat3D;
+
+// 常见 FPS 表面物理材质枚举常量（用于脚步声切换、弹孔贴花分发与子弹穿透阻力查表）。
+public static class SurfaceMaterial3D {
+    public const int Default = 0;
+    public const int Concrete = 1;
+    public const int Metal = 2;
+    public const int Wood = 3;
+    public const int Glass = 4;
+    public const int Dirt = 5;
+    public const int Flesh = 6;
+}
+
+// 静态三角网格射线求交结果（值类型，零堆分配）。
+public struct MeshRayHit3D {
+    public bool Hit;
+    public float Distance;
+    public Vector3 Point;
+    public Vector3 Normal;
+    public int TriangleIndex;
+    public int MaterialId;
+}
+
+// 胶囊体/球体连续碰撞扫掠（Convex Cast）命中结果（值类型，零堆分配）。
+public struct SweepHit3D {
+    public bool Hit;
+    public float Fraction;
+    public float Distance;
+    public Vector3 Point;
+    public Vector3 Normal;
+    public Vector3 SurfaceNormal;
+    public int TriangleIndex;
+    public int MaterialId;
+    public bool StartedPenetrating;
+}
+
+// 穿墙弹道单次穿透冲击记录。
+public struct BallisticImpact3D {
+    public float Distance;
+    public Vector3 Point;
+    public Vector3 Normal;
+    public int TriangleIndex;
+    public int MaterialId;
+    public float EnergyBefore;
+    public float EnergyAfter;
+}
+
+// 可复用的 BVH 遍历工作栈：高频帧循环或多线程并发查询时每线程持有一份，彻底消除查询期数组分配。
+public class BvhQueryScratch {
+    internal int[] Stack;
+
+    public BvhQueryScratch() {
+        this.Stack = new int[96];
+    }
+}
+
+// 高性能跨平台 3D 静态三角网格 SAH-BVH 空间加速结构（对标 Jolt / Embree 扁平节点设计）：
+// - 全扁平连续数组布局（无逐节点堆对象、零 ARC 追踪负担，左子与右子相邻排列在同一 Cache Line）
+// - 3 轴 8-Bin 表面积启发式（Binned SAH）O(N log N) 建树
+// - 支持 Watertight 射线求交、多材质穿墙弹道衰减追踪、解析最近点保守推进胶囊体连续扫掠与穿透解算
+public class StaticMeshBvh3D {
+    private const int LEAF_MAX_TRIS = 4;
+    private const int SAH_BINS = 8;
+
+    // 三角形原始数据（容量按需倍增）
+    private float[] triVerts;    // 每三角形 9 float: ax,ay,az, bx,by,bz, cx,cy,cz
+    private float[] triNormals;  // 每三角形 3 float: 单位面法线
+    private int[] triMaterials;  // 每三角形 1 int: 物理表面材质 ID
+    private int triCount;
+    private int triCap;
+
+    // 建树后扁平 BVH 节点数据
+    private int[] triIndices;     // 叶子重排后的三角形索引表
+    private float[] nodeBounds;   // 每节点 6 float: minX,minY,minZ, maxX,maxY,maxZ
+    private int[] nodeLeftFirst;  // 内部节点=左子下标（右子固定为 left+1）；叶节点=triIndices 起始偏移
+    private int[] nodeTriCount;   // 0=内部节点；>0=叶节点包含的三角形数量
+    private int nodeCount;
+    private bool built;
+
+    // 默认单线程复用栈（多线程并发查询可使用带 BvhQueryScratch 的重载）
+    private BvhQueryScratch defaultScratch;
+
+    public StaticMeshBvh3D() : this(256) {
+    }
+
+    public StaticMeshBvh3D(int initialTriangleCapacity) {
+        int cap = initialTriangleCapacity > 16 ? initialTriangleCapacity : 16;
+        this.triCap = cap;
+        this.triVerts = new float[cap * 9];
+        this.triNormals = new float[cap * 3];
+        this.triMaterials = new int[cap];
+        this.triCount = 0;
+        this.triIndices = new int[0];
+        this.nodeBounds = new float[0];
+        this.nodeLeftFirst = new int[0];
+        this.nodeTriCount = new int[0];
+        this.nodeCount = 0;
+        this.built = false;
+        this.defaultScratch = new BvhQueryScratch();
+    }
+
+    public int TriangleCount() { return this.triCount; }
+    public int NodeCount() { return this.nodeCount; }
+    public bool IsBuilt() { return this.built; }
+
+    public void Clear() {
+        this.triCount = 0;
+        this.nodeCount = 0;
+        this.built = false;
+    }
+
+    private void EnsureTriangleCapacity(int needed) {
+        if (needed <= this.triCap) { return; }
+        int newCap = this.triCap * 2;
+        while (newCap < needed) { newCap = newCap * 2; }
+
+        float[] nv = new float[newCap * 9];
+        for (int i = 0; i < this.triCount * 9; i = i + 1) { nv[i] = this.triVerts[i]; }
+        this.triVerts = nv;
+
+        float[] nn = new float[newCap * 3];
+        for (int i = 0; i < this.triCount * 3; i = i + 1) { nn[i] = this.triNormals[i]; }
+        this.triNormals = nn;
+
+        int[] nm = new int[newCap];
+        for (int i = 0; i < this.triCount; i = i + 1) { nm[i] = this.triMaterials[i]; }
+        this.triMaterials = nm;
+
+        this.triCap = newCap;
+    }
+
+    // 添加单个世界空间三角形（逆时针 CCW 正面法线；退化零面积三角形自动忽略并返回 -1）。
+    public int AddTriangle(Vector3 a, Vector3 b, Vector3 c, int materialId) {
+        float abx = b.X - a.X; float aby = b.Y - a.Y; float abz = b.Z - a.Z;
+        float acx = c.X - a.X; float acy = c.Y - a.Y; float acz = c.Z - a.Z;
+        float nx = aby * acz - abz * acy;
+        float ny = abz * acx - abx * acz;
+        float nz = abx * acy - aby * acx;
+        float lenSq = nx * nx + ny * ny + nz * nz;
+        if (lenSq <= 1e-12f) { return -1; }
+        float invLen = 1.0f / (float)Math.Sqrt((double)lenSq);
+
+        this.EnsureTriangleCapacity(this.triCount + 1);
+        int id = this.triCount;
+        int vOff = id * 9;
+        this.triVerts[vOff + 0] = a.X; this.triVerts[vOff + 1] = a.Y; this.triVerts[vOff + 2] = a.Z;
+        this.triVerts[vOff + 3] = b.X; this.triVerts[vOff + 4] = b.Y; this.triVerts[vOff + 5] = b.Z;
+        this.triVerts[vOff + 6] = c.X; this.triVerts[vOff + 7] = c.Y; this.triVerts[vOff + 8] = c.Z;
+
+        int nOff = id * 3;
+        this.triNormals[nOff + 0] = nx * invLen;
+        this.triNormals[nOff + 1] = ny * invLen;
+        this.triNormals[nOff + 2] = nz * invLen;
+        this.triMaterials[id] = materialId;
+
+        this.triCount = id + 1;
+        this.built = false;
+        return id;
+    }
+
+    // 便捷：添加共面四边形（拆分为 (a,b,c) 与 (a,c,d)，逆时针朝外）。
+    public void AddQuad(Vector3 a, Vector3 b, Vector3 c, Vector3 d, int materialId) {
+        this.AddTriangle(a, b, c, materialId);
+        this.AddTriangle(a, c, d, materialId);
+    }
+
+    // 便捷：添加静态轴对齐实心长方体（6 面 12 三角形，法线全部朝外，供快速搭建掩体/墙壁/台阶白盒）。
+    public void AddSolidBox(Vector3 minCorner, Vector3 maxCorner, int materialId) {
+        float x0 = minCorner.X; float y0 = minCorner.Y; float z0 = minCorner.Z;
+        float x1 = maxCorner.X; float y1 = maxCorner.Y; float z1 = maxCorner.Z;
+        // +Y 顶面
+        this.AddQuad(new Vector3(x0, y1, z0), new Vector3(x0, y1, z1), new Vector3(x1, y1, z1), new Vector3(x1, y1, z0), materialId);
+        // -Y 底面
+        this.AddQuad(new Vector3(x0, y0, z1), new Vector3(x0, y0, z0), new Vector3(x1, y0, z0), new Vector3(x1, y0, z1), materialId);
+        // +Z 前面
+        this.AddQuad(new Vector3(x0, y0, z1), new Vector3(x1, y0, z1), new Vector3(x1, y1, z1), new Vector3(x0, y1, z1), materialId);
+        // -Z 后面
+        this.AddQuad(new Vector3(x1, y0, z0), new Vector3(x0, y0, z0), new Vector3(x0, y1, z0), new Vector3(x1, y1, z0), materialId);
+        // +X 右面
+        this.AddQuad(new Vector3(x1, y0, z1), new Vector3(x1, y0, z0), new Vector3(x1, y1, z0), new Vector3(x1, y1, z1), materialId);
+        // -X 左面
+        this.AddQuad(new Vector3(x0, y0, z0), new Vector3(x0, y0, z1), new Vector3(x0, y1, z1), new Vector3(x0, y1, z0), materialId);
+    }
+
+    // 将交错顶点缓冲 + 16 位索引缓冲（如 Mesh3D.VertexArray / IndexArray）经世界变换烘焙进碰撞场景。
+    public int AddIndexedTriangles(float[] vertices, int strideFloats, int vertexCount,
+                                   ushort[] indices, Transform3D worldTransform, int materialId) {
+        if (vertices == null || indices == null || strideFloats < 3 || vertexCount <= 0 || indices.Length < 3) {
+            return 0;
+        }
+        int added = 0;
+        for (int t = 0; t + 2 < indices.Length; t = t + 3) {
+            int i0 = (int)indices[t];
+            int i1 = (int)indices[t + 1];
+            int i2 = (int)indices[t + 2];
+            if (i0 >= vertexCount || i1 >= vertexCount || i2 >= vertexCount) { continue; }
+            if ((i2 * strideFloats + 2) >= vertices.Length || (i1 * strideFloats + 2) >= vertices.Length || (i0 * strideFloats + 2) >= vertices.Length) {
+                continue;
+            }
+            Vector3 p0 = worldTransform.TransformPoint(new Vector3(vertices[i0 * strideFloats], vertices[i0 * strideFloats + 1], vertices[i0 * strideFloats + 2]));
+            Vector3 p1 = worldTransform.TransformPoint(new Vector3(vertices[i1 * strideFloats], vertices[i1 * strideFloats + 1], vertices[i1 * strideFloats + 2]));
+            Vector3 p2 = worldTransform.TransformPoint(new Vector3(vertices[i2 * strideFloats], vertices[i2 * strideFloats + 1], vertices[i2 * strideFloats + 2]));
+            if (this.AddTriangle(p0, p1, p2, materialId) >= 0) {
+                added = added + 1;
+            }
+        }
+        return added;
+    }
+
+    // 将交错顶点缓冲 + 32 位索引缓冲（突破 65535 顶点上限的大型 FPS 地图网格）烘焙进碰撞场景。
+    public int AddIndexedTriangles32(float[] vertices, int strideFloats, int vertexCount,
+                                     int[] indices, Transform3D worldTransform, int materialId) {
+        if (vertices == null || indices == null || strideFloats < 3 || vertexCount <= 0 || indices.Length < 3) {
+            return 0;
+        }
+        int added = 0;
+        for (int t = 0; t + 2 < indices.Length; t = t + 3) {
+            int i0 = indices[t];
+            int i1 = indices[t + 1];
+            int i2 = indices[t + 2];
+            if (i0 < 0 || i1 < 0 || i2 < 0 || i0 >= vertexCount || i1 >= vertexCount || i2 >= vertexCount) {
+                continue;
+            }
+            if ((i2 * strideFloats + 2) >= vertices.Length || (i1 * strideFloats + 2) >= vertices.Length || (i0 * strideFloats + 2) >= vertices.Length) {
+                continue;
+            }
+            Vector3 p0 = worldTransform.TransformPoint(new Vector3(vertices[i0 * strideFloats], vertices[i0 * strideFloats + 1], vertices[i0 * strideFloats + 2]));
+            Vector3 p1 = worldTransform.TransformPoint(new Vector3(vertices[i1 * strideFloats], vertices[i1 * strideFloats + 1], vertices[i1 * strideFloats + 2]));
+            Vector3 p2 = worldTransform.TransformPoint(new Vector3(vertices[i2 * strideFloats], vertices[i2 * strideFloats + 1], vertices[i2 * strideFloats + 2]));
+            if (this.AddTriangle(p0, p1, p2, materialId) >= 0) {
+                added = added + 1;
+            }
+        }
+        return added;
+    }
+
+    // 构建扁平 Binned-SAH BVH（所有几何添加完毕后调用一次）。
+    public void Build() {
+        int n = this.triCount;
+        if (n <= 0) {
+            this.nodeCount = 0;
+            this.built = true;
+            return;
+        }
+        this.triIndices = new int[n];
+        float[] triBMin = new float[n * 3];
+        float[] triBMax = new float[n * 3];
+        float[] centroids = new float[n * 3];
+
+        for (int i = 0; i < n; i = i + 1) {
+            this.triIndices[i] = i;
+            int vOff = i * 9;
+            float ax = this.triVerts[vOff + 0]; float ay = this.triVerts[vOff + 1]; float az = this.triVerts[vOff + 2];
+            float bx = this.triVerts[vOff + 3]; float by = this.triVerts[vOff + 4]; float bz = this.triVerts[vOff + 5];
+            float cx = this.triVerts[vOff + 6]; float cy = this.triVerts[vOff + 7]; float cz = this.triVerts[vOff + 8];
+
+            float minX = ax < bx ? (ax < cx ? ax : cx) : (bx < cx ? bx : cx);
+            float minY = ay < by ? (ay < cy ? ay : cy) : (by < cy ? by : cy);
+            float minZ = az < bz ? (az < cz ? az : cz) : (bz < cz ? bz : cz);
+            float maxX = ax > bx ? (ax > cx ? ax : cx) : (bx > cx ? bx : cx);
+            float maxY = ay > by ? (ay > cy ? ay : cy) : (by > cy ? by : cy);
+            float maxZ = az > bz ? (az > cz ? az : cz) : (bz > cz ? bz : cz);
+
+            triBMin[i * 3 + 0] = minX; triBMin[i * 3 + 1] = minY; triBMin[i * 3 + 2] = minZ;
+            triBMax[i * 3 + 0] = maxX; triBMax[i * 3 + 1] = maxY; triBMax[i * 3 + 2] = maxZ;
+            centroids[i * 3 + 0] = (ax + bx + cx) * (1.0f / 3.0f);
+            centroids[i * 3 + 1] = (ay + by + cy) * (1.0f / 3.0f);
+            centroids[i * 3 + 2] = (az + bz + cz) * (1.0f / 3.0f);
+        }
+
+        int maxNodes = n * 2 + 2;
+        this.nodeBounds = new float[maxNodes * 6];
+        this.nodeLeftFirst = new int[maxNodes];
+        this.nodeTriCount = new int[maxNodes];
+        this.nodeCount = 1; // 0 号节点为根
+        this.nodeLeftFirst[0] = 0;
+        this.nodeTriCount[0] = n;
+
+        // 预分配 SAH 分桶工作区（建树全程零递归小数组重复分配）
+        int[] binCounts = new int[SAH_BINS];
+        float[] binBounds = new float[SAH_BINS * 6];
+        float[] leftArea = new float[SAH_BINS - 1];
+        int[] leftCnt = new int[SAH_BINS - 1];
+
+        this.UpdateNodeBounds(0, triBMin, triBMax);
+        this.SubdivideNode(0, triBMin, triBMax, centroids, binCounts, binBounds, leftArea, leftCnt, 0);
+        this.built = true;
+    }
+
+    private void UpdateNodeBounds(int nodeIdx, float[] triBMin, float[] triBMax) {
+        int first = this.nodeLeftFirst[nodeIdx];
+        int count = this.nodeTriCount[nodeIdx];
+        float minX = 1e30f; float minY = 1e30f; float minZ = 1e30f;
+        float maxX = -1e30f; float maxY = -1e30f; float maxZ = -1e30f;
+        for (int i = 0; i < count; i = i + 1) {
+            int t = this.triIndices[first + i] * 3;
+            if (triBMin[t + 0] < minX) { minX = triBMin[t + 0]; }
+            if (triBMin[t + 1] < minY) { minY = triBMin[t + 1]; }
+            if (triBMin[t + 2] < minZ) { minZ = triBMin[t + 2]; }
+            if (triBMax[t + 0] > maxX) { maxX = triBMax[t + 0]; }
+            if (triBMax[t + 1] > maxY) { maxY = triBMax[t + 1]; }
+            if (triBMax[t + 2] > maxZ) { maxZ = triBMax[t + 2]; }
+        }
+        int bOff = nodeIdx * 6;
+        this.nodeBounds[bOff + 0] = minX; this.nodeBounds[bOff + 1] = minY; this.nodeBounds[bOff + 2] = minZ;
+        this.nodeBounds[bOff + 3] = maxX; this.nodeBounds[bOff + 4] = maxY; this.nodeBounds[bOff + 5] = maxZ;
+    }
+
+    private static float HalfBoxArea(float minX, float minY, float minZ, float maxX, float maxY, float maxZ) {
+        float ex = maxX - minX; float ey = maxY - minY; float ez = maxZ - minZ;
+        if (ex < 0.0f || ey < 0.0f || ez < 0.0f) { return 0.0f; }
+        return ex * ey + ey * ez + ez * ex;
+    }
+
+    private void SubdivideNode(int nodeIdx, float[] triBMin, float[] triBMax, float[] centroids,
+                               int[] binCounts, float[] binBounds, float[] leftArea, int[] leftCnt, int depth) {
+        int count = this.nodeTriCount[nodeIdx];
+        if (count <= LEAF_MAX_TRIS || depth >= 40) { return; }
+        int first = this.nodeLeftFirst[nodeIdx];
+
+        int bOff = nodeIdx * 6;
+        float parentArea = StaticMeshBvh3D.HalfBoxArea(
+            this.nodeBounds[bOff + 0], this.nodeBounds[bOff + 1], this.nodeBounds[bOff + 2],
+            this.nodeBounds[bOff + 3], this.nodeBounds[bOff + 4], this.nodeBounds[bOff + 5]);
+        float parentCost = (float)count * (parentArea > 1e-12f ? parentArea : 1.0f);
+
+        int bestAxis = -1;
+        float bestSplitPos = 0.0f;
+        float bestCost = 1e30f;
+
+        // 对 X/Y/Z 三轴评估 8-Bin SAH
+        for (int axis = 0; axis < 3; axis = axis + 1) {
+            float cMin = 1e30f;
+            float cMax = -1e30f;
+            for (int i = 0; i < count; i = i + 1) {
+                float c = centroids[this.triIndices[first + i] * 3 + axis];
+                if (c < cMin) { cMin = c; }
+                if (c > cMax) { cMax = c; }
+            }
+            float extent = cMax - cMin;
+            if (extent <= 1e-6f) { continue; }
+
+            for (int b = 0; b < SAH_BINS; b = b + 1) {
+                binCounts[b] = 0;
+                int bo = b * 6;
+                binBounds[bo + 0] = 1e30f; binBounds[bo + 1] = 1e30f; binBounds[bo + 2] = 1e30f;
+                binBounds[bo + 3] = -1e30f; binBounds[bo + 4] = -1e30f; binBounds[bo + 5] = -1e30f;
+            }
+
+            float scale = (float)SAH_BINS / extent;
+            for (int i = 0; i < count; i = i + 1) {
+                int tri = this.triIndices[first + i];
+                int bi = (int)((centroids[tri * 3 + axis] - cMin) * scale);
+                if (bi < 0) { bi = 0; }
+                if (bi >= SAH_BINS) { bi = SAH_BINS - 1; }
+                binCounts[bi] = binCounts[bi] + 1;
+                int bo = bi * 6;
+                int t3 = tri * 3;
+                if (triBMin[t3 + 0] < binBounds[bo + 0]) { binBounds[bo + 0] = triBMin[t3 + 0]; }
+                if (triBMin[t3 + 1] < binBounds[bo + 1]) { binBounds[bo + 1] = triBMin[t3 + 1]; }
+                if (triBMin[t3 + 2] < binBounds[bo + 2]) { binBounds[bo + 2] = triBMin[t3 + 2]; }
+                if (triBMax[t3 + 0] > binBounds[bo + 3]) { binBounds[bo + 3] = triBMax[t3 + 0]; }
+                if (triBMax[t3 + 1] > binBounds[bo + 4]) { binBounds[bo + 4] = triBMax[t3 + 1]; }
+                if (triBMax[t3 + 2] > binBounds[bo + 5]) { binBounds[bo + 5] = triBMax[t3 + 2]; }
+            }
+
+            float lx0 = 1e30f; float ly0 = 1e30f; float lz0 = 1e30f;
+            float lx1 = -1e30f; float ly1 = -1e30f; float lz1 = -1e30f;
+            int lSum = 0;
+            for (int b = 0; b < SAH_BINS - 1; b = b + 1) {
+                lSum = lSum + binCounts[b];
+                leftCnt[b] = lSum;
+                if (binCounts[b] > 0) {
+                    int bo = b * 6;
+                    if (binBounds[bo + 0] < lx0) { lx0 = binBounds[bo + 0]; }
+                    if (binBounds[bo + 1] < ly0) { ly0 = binBounds[bo + 1]; }
+                    if (binBounds[bo + 2] < lz0) { lz0 = binBounds[bo + 2]; }
+                    if (binBounds[bo + 3] > lx1) { lx1 = binBounds[bo + 3]; }
+                    if (binBounds[bo + 4] > ly1) { ly1 = binBounds[bo + 4]; }
+                    if (binBounds[bo + 5] > lz1) { lz1 = binBounds[bo + 5]; }
+                }
+                leftArea[b] = lSum > 0 ? StaticMeshBvh3D.HalfBoxArea(lx0, ly0, lz0, lx1, ly1, lz1) : 0.0f;
+            }
+
+            float rx0 = 1e30f; float ry0 = 1e30f; float rz0 = 1e30f;
+            float rx1 = -1e30f; float ry1 = -1e30f; float rz1 = -1e30f;
+            int rSum = 0;
+            float step = extent / (float)SAH_BINS;
+            for (int b = SAH_BINS - 1; b >= 1; b = b - 1) {
+                rSum = rSum + binCounts[b];
+                if (binCounts[b] > 0) {
+                    int bo = b * 6;
+                    if (binBounds[bo + 0] < rx0) { rx0 = binBounds[bo + 0]; }
+                    if (binBounds[bo + 1] < ry0) { ry0 = binBounds[bo + 1]; }
+                    if (binBounds[bo + 2] < rz0) { rz0 = binBounds[bo + 2]; }
+                    if (binBounds[bo + 3] > rx1) { rx1 = binBounds[bo + 3]; }
+                    if (binBounds[bo + 4] > ry1) { ry1 = binBounds[bo + 4]; }
+                    if (binBounds[bo + 5] > rz1) { rz1 = binBounds[bo + 5]; }
+                }
+                int lc = leftCnt[b - 1];
+                if (lc > 0 && rSum > 0) {
+                    float rArea = StaticMeshBvh3D.HalfBoxArea(rx0, ry0, rz0, rx1, ry1, rz1);
+                    float cost = (float)lc * leftArea[b - 1] + (float)rSum * rArea;
+                    if (cost < bestCost) {
+                        bestCost = cost;
+                        bestAxis = axis;
+                        bestSplitPos = cMin + step * (float)b;
+                    }
+                }
+            }
+        }
+
+        // 若不值得继续切分且叶子不大，停止分裂
+        if (bestAxis < 0 && count <= 8) { return; }
+        if (bestCost >= parentCost && count <= 8) { return; }
+
+        int leftEnd = first;
+        if (bestAxis >= 0) {
+            int i = first;
+            int j = first + count - 1;
+            while (i <= j) {
+                if (centroids[this.triIndices[i] * 3 + bestAxis] < bestSplitPos) {
+                    i = i + 1;
+                } else {
+                    int tmp = this.triIndices[i];
+                    this.triIndices[i] = this.triIndices[j];
+                    this.triIndices[j] = tmp;
+                    j = j - 1;
+                }
+            }
+            leftEnd = i;
+        }
+
+        int leftCount = leftEnd - first;
+        if (leftCount <= 0 || leftCount >= count) {
+            // 质心重合退化时对半切分，严格保证树深 O(log N)
+            leftCount = count / 2;
+        }
+
+        int leftChild = this.nodeCount;
+        int rightChild = leftChild + 1;
+        if (rightChild >= this.nodeTriCount.Length) { return; }
+        this.nodeCount = this.nodeCount + 2;
+
+        this.nodeLeftFirst[leftChild] = first;
+        this.nodeTriCount[leftChild] = leftCount;
+        this.nodeLeftFirst[rightChild] = first + leftCount;
+        this.nodeTriCount[rightChild] = count - leftCount;
+
+        // 标记当前节点为内部节点（右子节点固定在 leftChild + 1）
+        this.nodeLeftFirst[nodeIdx] = leftChild;
+        this.nodeTriCount[nodeIdx] = 0;
+
+        this.UpdateNodeBounds(leftChild, triBMin, triBMax);
+        this.UpdateNodeBounds(rightChild, triBMin, triBMax);
+
+        this.SubdivideNode(leftChild, triBMin, triBMax, centroids, binCounts, binBounds, leftArea, leftCnt, depth + 1);
+        this.SubdivideNode(rightChild, triBMin, triBMax, centroids, binCounts, binBounds, leftArea, leftCnt, depth + 1);
+    }
+
+    // 射线与节点 AABB 求交距离：不相交返回 1e30f，相交返回进入参数 tNear（起点在盒内返回 0）。
+    private float IntersectNodeRay(int nodeIdx, float ox, float oy, float oz,
+                                   float invDx, float invDy, float invDz, float maxDist) {
+        int b = nodeIdx * 6;
+        float tx1 = (this.nodeBounds[b + 0] - ox) * invDx;
+        float tx2 = (this.nodeBounds[b + 3] - ox) * invDx;
+        float tMin = tx1 < tx2 ? tx1 : tx2;
+        float tMax = tx1 > tx2 ? tx1 : tx2;
+
+        float ty1 = (this.nodeBounds[b + 1] - oy) * invDy;
+        float ty2 = (this.nodeBounds[b + 4] - oy) * invDy;
+        float tyMin = ty1 < ty2 ? ty1 : ty2;
+        float tyMax = ty1 > ty2 ? ty1 : ty2;
+        if (tyMin > tMin) { tMin = tyMin; }
+        if (tyMax < tMax) { tMax = tyMax; }
+
+        float tz1 = (this.nodeBounds[b + 2] - oz) * invDz;
+        float tz2 = (this.nodeBounds[b + 5] - oz) * invDz;
+        float tzMin = tz1 < tz2 ? tz1 : tz2;
+        float tzMax = tz1 > tz2 ? tz1 : tz2;
+        if (tzMin > tMin) { tMin = tzMin; }
+        if (tzMax < tMax) { tMax = tzMax; }
+
+        if (tMax < 0.0f || tMin > tMax || tMin > maxDist) {
+            return 1e30f;
+        }
+        return tMin > 0.0f ? tMin : 0.0f;
+    }
+
+    private static float SafeInvDir(float d) {
+        if (d > -1e-9f && d < 1e-9f) {
+            return d >= 0.0f ? 1e9f : -1e9f;
+        }
+        return 1.0f / d;
+    }
+
+    // Möller–Trumbore 射线-三角形求交（cullBackface=true 时忽略顺时针背面命中）。
+    private bool IntersectTriangleRay(int triId, float ox, float oy, float oz,
+                                      float dx, float dy, float dz,
+                                      float maxDist, bool cullBackface, out float outT) {
+        outT = 0.0f;
+        int v = triId * 9;
+        float ax = this.triVerts[v + 0]; float ay = this.triVerts[v + 1]; float az = this.triVerts[v + 2];
+        float e1x = this.triVerts[v + 3] - ax; float e1y = this.triVerts[v + 4] - ay; float e1z = this.triVerts[v + 5] - az;
+        float e2x = this.triVerts[v + 6] - ax; float e2y = this.triVerts[v + 7] - ay; float e2z = this.triVerts[v + 8] - az;
+
+        float px = dy * e2z - dz * e2y;
+        float py = dz * e2x - dx * e2z;
+        float pz = dx * e2y - dy * e2x;
+        float det = e1x * px + e1y * py + e1z * pz;
+
+        if (cullBackface) {
+            if (det <= 1e-8f) { return false; }
+        } else {
+            if (det > -1e-8f && det < 1e-8f) { return false; }
+        }
+
+        float invDet = 1.0f / det;
+        float tx = ox - ax; float ty = oy - ay; float tz = oz - az;
+        float u = (tx * px + ty * py + tz * pz) * invDet;
+        if (u < 0.0f || u > 1.0f) { return false; }
+
+        float qx = ty * e1z - tz * e1y;
+        float qy = tz * e1x - tx * e1z;
+        float qz = tx * e1y - ty * e1x;
+        float w = (dx * qx + dy * qy + dz * qz) * invDet;
+        if (w < 0.0f || u + w > 1.0f) { return false; }
+
+        float t = (e2x * qx + e2y * qy + e2z * qz) * invDet;
+        if (t < 0.0f || t > maxDist) { return false; }
+        outT = t;
+        return true;
+    }
+
+    // 最近命中射线检测（单线程便捷入口）。
+    public bool Raycast(Vector3 origin, Vector3 direction, float maxDistance, out MeshRayHit3D hit) {
+        return this.RaycastEx(origin, direction, maxDistance, false, this.defaultScratch, out hit);
+    }
+
+    // 最近命中射线检测（支持背面剔除开关与外部多线程 Scratch 栈，近前远后顺序剪枝）。
+    public bool RaycastEx(Vector3 origin, Vector3 direction, float maxDistance,
+                          bool cullBackface, BvhQueryScratch scratch, out MeshRayHit3D hit) {
+        hit = new MeshRayHit3D();
+        hit.Hit = false;
+        hit.TriangleIndex = -1;
+        if (!this.built) { this.Build(); }
+        if (this.nodeCount <= 0 || maxDistance <= 0.0f) { return false; }
+
+        float dLenSq = direction.LengthSquared();
+        if (dLenSq <= 1e-12f) { return false; }
+        float invLen = 1.0f / (float)Math.Sqrt((double)dLenSq);
+        float dx = direction.X * invLen;
+        float dy = direction.Y * invLen;
+        float dz = direction.Z * invLen;
+        float invDx = StaticMeshBvh3D.SafeInvDir(dx);
+        float invDy = StaticMeshBvh3D.SafeInvDir(dy);
+        float invDz = StaticMeshBvh3D.SafeInvDir(dz);
+
+        float bestT = maxDistance;
+        int bestTri = -1;
+
+        if (this.IntersectNodeRay(0, origin.X, origin.Y, origin.Z, invDx, invDy, invDz, bestT) >= 1e29f) {
+            return false;
+        }
+
+        int[] stack = scratch != null ? scratch.Stack : this.defaultScratch.Stack;
+        int sp = 0;
+        stack[sp] = 0;
+        sp = sp + 1;
+
+        while (sp > 0) {
+            sp = sp - 1;
+            int node = stack[sp];
+            int cnt = this.nodeTriCount[node];
+            if (cnt > 0) {
+                int first = this.nodeLeftFirst[node];
+                for (int i = 0; i < cnt; i = i + 1) {
+                    int triId = this.triIndices[first + i];
+                    float t;
+                    if (this.IntersectTriangleRay(triId, origin.X, origin.Y, origin.Z, dx, dy, dz, bestT, cullBackface, out t)) {
+                        bestT = t;
+                        bestTri = triId;
+                    }
+                }
+            } else {
+                int left = this.nodeLeftFirst[node];
+                int right = left + 1;
+                float dLeft = this.IntersectNodeRay(left, origin.X, origin.Y, origin.Z, invDx, invDy, invDz, bestT);
+                float dRight = this.IntersectNodeRay(right, origin.X, origin.Y, origin.Z, invDx, invDy, invDz, bestT);
+
+                // 先压远节点、后压近节点，使栈顶优先弹出最近子节点加速剪枝
+                if (dLeft < dRight) {
+                    if (dRight < 1e29f && sp < stack.Length) { stack[sp] = right; sp = sp + 1; }
+                    if (dLeft < 1e29f && sp < stack.Length) { stack[sp] = left; sp = sp + 1; }
+                } else {
+                    if (dLeft < 1e29f && sp < stack.Length) { stack[sp] = left; sp = sp + 1; }
+                    if (dRight < 1e29f && sp < stack.Length) { stack[sp] = right; sp = sp + 1; }
+                }
+            }
+        }
+
+        if (bestTri < 0) { return false; }
+
+        int nOff = bestTri * 3;
+        float nx = this.triNormals[nOff + 0];
+        float ny = this.triNormals[nOff + 1];
+        float nz = this.triNormals[nOff + 2];
+        // 双面检测时让返回法线始终朝向迎着射线的半球
+        if (!cullBackface && (nx * dx + ny * dy + nz * dz) > 0.0f) {
+            nx = -nx; ny = -ny; nz = -nz;
+        }
+
+        hit.Hit = true;
+        hit.Distance = bestT;
+        hit.Point = new Vector3(origin.X + dx * bestT, origin.Y + dy * bestT, origin.Z + dz * bestT);
+        hit.Normal = new Vector3(nx, ny, nz);
+        hit.TriangleIndex = bestTri;
+        hit.MaterialId = this.triMaterials[bestTri];
+        return true;
+    }
+
+    // 枪战穿墙弹道追踪：沿射线依距离从近到远收集穿透面，每次命中扣减 materialCostTable[matId] 能量，能量耗尽即截停。
+    // 返回穿墙后的剩余动能（>= 0）。
+    public float TraceBallisticPenetration(Vector3 origin, Vector3 direction, float maxRange,
+                                           float initialEnergy, float[] materialCostTable,
+                                           List<BallisticImpact3D> outImpacts) {
+        if (outImpacts != null) { outImpacts.Clear(); }
+        if (initialEnergy <= 0.0f || maxRange <= 0.0f) { return 0.0f; }
+
+        float dLenSq = direction.LengthSquared();
+        if (dLenSq <= 1e-12f) { return initialEnergy; }
+        Vector3 dir = Vector3.Multiply(direction, 1.0f / (float)Math.Sqrt((double)dLenSq));
+
+        float energy = initialEnergy;
+        float traveled = 0.0f;
+        int safetySteps = 0;
+
+        while (energy > 0.0f && traveled < maxRange && safetySteps < 16) {
+            safetySteps = safetySteps + 1;
+            Vector3 curOrigin = Vector3.Add(origin, Vector3.Multiply(dir, traveled));
+            MeshRayHit3D segHit;
+            if (!this.RaycastEx(curOrigin, dir, maxRange - traveled, false, this.defaultScratch, out segHit)) {
+                break;
+            }
+            float totalDist = traveled + segHit.Distance;
+            int matId = segHit.MaterialId;
+            float cost = initialEnergy; // 未知材质默认不可穿透
+            if (materialCostTable != null && matId >= 0 && matId < materialCostTable.Length) {
+                cost = materialCostTable[matId];
+            }
+            float after = energy - cost;
+            if (after < 0.0f) { after = 0.0f; }
+
+            if (outImpacts != null) {
+                BallisticImpact3D imp = new BallisticImpact3D();
+                imp.Distance = totalDist;
+                imp.Point = segHit.Point;
+                imp.Normal = segHit.Normal;
+                imp.TriangleIndex = segHit.TriangleIndex;
+                imp.MaterialId = matId;
+                imp.EnergyBefore = energy;
+                imp.EnergyAfter = after;
+                outImpacts.Add(imp);
+            }
+
+            energy = after;
+            // 向前推进微小步长越过当前表面，继续追踪后续薄板反面或后方掩体
+            traveled = totalDist + 0.002f;
+        }
+        return energy;
+    }
+
+    // ---- 精确解析几何最近点算子（Christer Ericson §5.1.5 / §5.1.9，无迭代误差） ----
+
+    // 点 P 到三角形 ABC 的最近点（Voronoi 特征区域精确判定）。
+    public static Vector3 ClosestPointOnTriangle(Vector3 p, Vector3 a, Vector3 b, Vector3 c) {
+        float abx = b.X - a.X; float aby = b.Y - a.Y; float abz = b.Z - a.Z;
+        float acx = c.X - a.X; float acy = c.Y - a.Y; float acz = c.Z - a.Z;
+        float apx = p.X - a.X; float apy = p.Y - a.Y; float apz = p.Z - a.Z;
+
+        float d1 = abx * apx + aby * apy + abz * apz;
+        float d2 = acx * apx + acy * apy + acz * apz;
+        if (d1 <= 0.0f && d2 <= 0.0f) { return a; }
+
+        float bpx = p.X - b.X; float bpy = p.Y - b.Y; float bpz = p.Z - b.Z;
+        float d3 = abx * bpx + aby * bpy + abz * bpz;
+        float d4 = acx * bpx + acy * bpy + acz * bpz;
+        if (d3 >= 0.0f && d4 <= d3) { return b; }
+
+        float vc = d1 * d4 - d3 * d2;
+        if (vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f) {
+            float v = d1 / (d1 - d3);
+            return new Vector3(a.X + abx * v, a.Y + aby * v, a.Z + abz * v);
+        }
+
+        float cpx = p.X - c.X; float cpy = p.Y - c.Y; float cpz = p.Z - c.Z;
+        float d5 = abx * cpx + aby * cpy + abz * cpz;
+        float d6 = acx * cpx + acy * cpy + acz * cpz;
+        if (d6 >= 0.0f && d5 <= d6) { return c; }
+
+        float vb = d5 * d2 - d1 * d6;
+        if (vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f) {
+            float w = d2 / (d2 - d6);
+            return new Vector3(a.X + acx * w, a.Y + acy * w, a.Z + acz * w);
+        }
+
+        float va = d3 * d6 - d5 * d4;
+        if (va <= 0.0f && (d4 - d3) >= 0.0f && (d5 - d6) >= 0.0f) {
+            float w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+            return new Vector3(b.X + (c.X - b.X) * w, b.Y + (c.Y - b.Y) * w, b.Z + (c.Z - b.Z) * w);
+        }
+
+        float sum = va + vb + vc;
+        if (sum <= 1e-12f) { return a; }
+        float denom = 1.0f / sum;
+        float vIn = vb * denom;
+        float wIn = vc * denom;
+        return new Vector3(a.X + abx * vIn + acx * wIn, a.Y + aby * vIn + acy * wIn, a.Z + abz * vIn + acz * wIn);
+    }
+
+    // 两条三维有限线段 P0-P1 与 Q0-Q1 之间的最近点对（返回距离平方）。
+    public static float ClosestPointsSegmentSegment(Vector3 p0, Vector3 p1, Vector3 q0, Vector3 q1,
+                                                    out Vector3 outSegP, out Vector3 outSegQ) {
+        float d1x = p1.X - p0.X; float d1y = p1.Y - p0.Y; float d1z = p1.Z - p0.Z;
+        float d2x = q1.X - q0.X; float d2y = q1.Y - q0.Y; float d2z = q1.Z - q0.Z;
+        float rx = p0.X - q0.X; float ry = p0.Y - q0.Y; float rz = p0.Z - q0.Z;
+
+        float a = d1x * d1x + d1y * d1y + d1z * d1z;
+        float e = d2x * d2x + d2y * d2y + d2z * d2z;
+        float f = d2x * rx + d2y * ry + d2z * rz;
+
+        float s = 0.0f;
+        float t = 0.0f;
+
+        if (a <= 1e-10f && e <= 1e-10f) {
+            outSegP = p0;
+            outSegQ = q0;
+            return rx * rx + ry * ry + rz * rz;
+        }
+        if (a <= 1e-10f) {
+            t = f / e;
+            if (t < 0.0f) { t = 0.0f; } else if (t > 1.0f) { t = 1.0f; }
+        } else {
+            float c = d1x * rx + d1y * ry + d1z * rz;
+            if (e <= 1e-10f) {
+                s = -c / a;
+                if (s < 0.0f) { s = 0.0f; } else if (s > 1.0f) { s = 1.0f; }
+            } else {
+                float b = d1x * d2x + d1y * d2y + d1z * d2z;
+                float denom = a * e - b * b;
+                if (denom > 1e-10f) {
+                    s = (b * f - c * e) / denom;
+                    if (s < 0.0f) { s = 0.0f; } else if (s > 1.0f) { s = 1.0f; }
+                } else {
+                    s = 0.0f;
+                }
+                t = (b * s + f) / e;
+                if (t < 0.0f) {
+                    t = 0.0f;
+                    s = -c / a;
+                    if (s < 0.0f) { s = 0.0f; } else if (s > 1.0f) { s = 1.0f; }
+                } else if (t > 1.0f) {
+                    t = 1.0f;
+                    s = (b - c) / a;
+                    if (s < 0.0f) { s = 0.0f; } else if (s > 1.0f) { s = 1.0f; }
+                }
+            }
+        }
+
+        outSegP = new Vector3(p0.X + d1x * s, p0.Y + d1y * s, p0.Z + d1z * s);
+        outSegQ = new Vector3(q0.X + d2x * t, q0.Y + d2y * t, q0.Z + d2z * t);
+        float dx = outSegP.X - outSegQ.X;
+        float dy = outSegP.Y - outSegQ.Y;
+        float dz = outSegP.Z - outSegQ.Z;
+        return dx * dx + dy * dy + dz * dz;
+    }
+
+    // 精确计算胶囊轴线段 S0-S1 到三角形 ABC 的最近点对（含穿透三角形内部检测，返回距离平方）。
+    public static float ClosestPointsSegmentTriangle(Vector3 s0, Vector3 s1,
+                                                     Vector3 a, Vector3 b, Vector3 c,
+                                                     out Vector3 bestSegPt, out Vector3 bestTriPt) {
+        // 1. 检测线段是否直接穿过三角形面内部
+        Vector3 segDelta = Vector3.Subtract(s1, s0);
+        float segLen = segDelta.Length();
+        if (segLen > 1e-6f) {
+            float invSeg = 1.0f / segLen;
+            float dx = segDelta.X * invSeg; float dy = segDelta.Y * invSeg; float dz = segDelta.Z * invSeg;
+            float e1x = b.X - a.X; float e1y = b.Y - a.Y; float e1z = b.Z - a.Z;
+            float e2x = c.X - a.X; float e2y = c.Y - a.Y; float e2z = c.Z - a.Z;
+            float px = dy * e2z - dz * e2y;
+            float py = dz * e2x - dx * e2z;
+            float pz = dx * e2y - dy * e2x;
+            float det = e1x * px + e1y * py + e1z * pz;
+            if (det < -1e-8f || det > 1e-8f) {
+                float invDet = 1.0f / det;
+                float tx = s0.X - a.X; float ty = s0.Y - a.Y; float tz = s0.Z - a.Z;
+                float u = (tx * px + ty * py + tz * pz) * invDet;
+                if (u >= 0.0f && u <= 1.0f) {
+                    float qx = ty * e1z - tz * e1y;
+                    float qy = tz * e1x - tx * e1z;
+                    float qz = tx * e1y - ty * e1x;
+                    float w = (dx * qx + dy * qy + dz * qz) * invDet;
+                    if (w >= 0.0f && u + w <= 1.0f) {
+                        float t = (e2x * qx + e2y * qy + e2z * qz) * invDet;
+                        if (t >= 0.0f && t <= segLen) {
+                            Vector3 hitPt = new Vector3(s0.X + dx * t, s0.Y + dy * t, s0.Z + dz * t);
+                            bestSegPt = hitPt;
+                            bestTriPt = hitPt;
+                            return 0.0f;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. 枚举 2 个端点到三角形表面 + 线段到 3 条边，取全局精确极小值
+        Vector3 qA0 = StaticMeshBvh3D.ClosestPointOnTriangle(s0, a, b, c);
+        bestSegPt = s0;
+        bestTriPt = qA0;
+        float bestDistSq = Vector3.DistanceSquared(s0, qA0);
+
+        if (segLen > 1e-6f) {
+            Vector3 qA1 = StaticMeshBvh3D.ClosestPointOnTriangle(s1, a, b, c);
+            float d1 = Vector3.DistanceSquared(s1, qA1);
+            if (d1 < bestDistSq) {
+                bestDistSq = d1; bestSegPt = s1; bestTriPt = qA1;
+            }
+
+            Vector3 sp; Vector3 sq;
+            float dab = StaticMeshBvh3D.ClosestPointsSegmentSegment(s0, s1, a, b, out sp, out sq);
+            if (dab < bestDistSq) { bestDistSq = dab; bestSegPt = sp; bestTriPt = sq; }
+
+            float dbc = StaticMeshBvh3D.ClosestPointsSegmentSegment(s0, s1, b, c, out sp, out sq);
+            if (dbc < bestDistSq) { bestDistSq = dbc; bestSegPt = sp; bestTriPt = sq; }
+
+            float dca = StaticMeshBvh3D.ClosestPointsSegmentSegment(s0, s1, c, a, out sp, out sq);
+            if (dca < bestDistSq) { bestDistSq = dca; bestSegPt = sp; bestTriPt = sq; }
+        }
+        return bestDistSq;
+    }
+
+    private bool BoxOverlapsNode(int nodeIdx, float minX, float minY, float minZ, float maxX, float maxY, float maxZ) {
+        int b = nodeIdx * 6;
+        return maxX >= this.nodeBounds[b + 0] && minX <= this.nodeBounds[b + 3]
+            && maxY >= this.nodeBounds[b + 1] && minY <= this.nodeBounds[b + 4]
+            && maxZ >= this.nodeBounds[b + 2] && minZ <= this.nodeBounds[b + 5];
+    }
+
+    // 单个三角形对胶囊体的保守推进连续碰撞求交（超平面投影法，平面 1 步精确到位，棱角 3~6 步收敛至亚毫米）。
+    private bool SweepCapsuleAgainstTriangle(int triId, Vector3 p0, Vector3 p1, float radius,
+                                             Vector3 delta, float maxFraction,
+                                             out float outFrac, out Vector3 outPoint, out Vector3 outNormal,
+                                             out bool outStartedPenetrating) {
+        outFrac = maxFraction;
+        outPoint = Vector3.Zero;
+        outNormal = new Vector3(0.0f, 1.0f, 0.0f);
+        outStartedPenetrating = false;
+
+        int v = triId * 9;
+        Vector3 a = new Vector3(this.triVerts[v + 0], this.triVerts[v + 1], this.triVerts[v + 2]);
+        Vector3 b = new Vector3(this.triVerts[v + 3], this.triVerts[v + 4], this.triVerts[v + 5]);
+        Vector3 c = new Vector3(this.triVerts[v + 6], this.triVerts[v + 7], this.triVerts[v + 8]);
+
+        int nOff = triId * 3;
+        Vector3 triN = new Vector3(this.triNormals[nOff + 0], this.triNormals[nOff + 1], this.triNormals[nOff + 2]);
+
+        float t = 0.0f;
+        float hitEps = 0.00025f;
+
+        for (int iter = 0; iter < 14; iter = iter + 1) {
+            Vector3 cur0 = new Vector3(p0.X + delta.X * t, p0.Y + delta.Y * t, p0.Z + delta.Z * t);
+            Vector3 cur1 = new Vector3(p1.X + delta.X * t, p1.Y + delta.Y * t, p1.Z + delta.Z * t);
+
+            Vector3 segPt;
+            Vector3 triPt;
+            float distSq = StaticMeshBvh3D.ClosestPointsSegmentTriangle(cur0, cur1, a, b, c, out segPt, out triPt);
+            float dist = distSq > 1e-14f ? (float)Math.Sqrt((double)distSq) : 0.0f;
+
+            Vector3 sepNormal;
+            if (dist > 1e-5f) {
+                float invD = 1.0f / dist;
+                sepNormal = new Vector3((segPt.X - triPt.X) * invD, (segPt.Y - triPt.Y) * invD, (segPt.Z - triPt.Z) * invD);
+            } else {
+                // 线段触面：取迎向运动反方向的三角形法线
+                sepNormal = Vector3.Dot(triN, delta) <= 0.0f ? triN : Vector3.Negate(triN);
+            }
+
+            // 沿着分离法线的逼近速率（>0 表示正在撞向表面，<=0 表示平行滑过或正在脱离）
+            float approach = -(delta.X * sepNormal.X + delta.Y * sepNormal.Y + delta.Z * sepNormal.Z);
+
+            if (dist <= radius + hitEps) {
+                if (t == 0.0f && dist < radius - hitEps) {
+                    // 初始已深度嵌入：仅当继续往表面内挤压时阻挡，允许向外脱离
+                    if (approach > 1e-6f) {
+                        outFrac = 0.0f;
+                        outPoint = triPt;
+                        outNormal = sepNormal;
+                        outStartedPenetrating = true;
+                        return true;
+                    }
+                    return false;
+                }
+                if (approach > 1e-6f) {
+                    outFrac = t;
+                    outPoint = triPt;
+                    outNormal = sepNormal;
+                    return true;
+                }
+                return false;
+            }
+
+            if (approach <= 1e-6f) {
+                // 分隔超平面定理：整段剩余位移不会再拉近距离
+                return false;
+            }
+
+            float dt = (dist - radius) / approach;
+            t = t + dt;
+            if (t > maxFraction) {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    // 胶囊体连续碰撞扫掠检测（单线程便捷入口）。
+    public bool SweepCapsule(Vector3 p0, Vector3 p1, float radius, Vector3 delta, out SweepHit3D hit) {
+        return this.SweepCapsuleEx(p0, p1, radius, delta, this.defaultScratch, out hit);
+    }
+
+    // 胶囊体连续碰撞扫掠检测（支持多线程复用 BvhQueryScratch，动态收缩扫掠包围盒剪枝）。
+    public bool SweepCapsuleEx(Vector3 p0, Vector3 p1, float radius, Vector3 delta,
+                               BvhQueryScratch scratch, out SweepHit3D hit) {
+        hit = new SweepHit3D();
+        hit.Hit = false;
+        hit.Fraction = 1.0f;
+        hit.TriangleIndex = -1;
+        if (!this.built) { this.Build(); }
+        if (this.nodeCount <= 0) { return false; }
+
+        float moveLen = delta.Length();
+        if (moveLen <= 1e-7f) { return false; }
+
+        float bestFrac = 1.0f;
+        int bestTri = -1;
+        Vector3 bestPt = Vector3.Zero;
+        Vector3 bestNormal = new Vector3(0.0f, 1.0f, 0.0f);
+        Vector3 bestSurfNormal = new Vector3(0.0f, 1.0f, 0.0f);
+        bool bestPen = false;
+
+        float pad = radius + 0.002f;
+        int[] stack = scratch != null ? scratch.Stack : this.defaultScratch.Stack;
+        int sp = 0;
+        stack[sp] = 0;
+        sp = sp + 1;
+
+        while (sp > 0) {
+            sp = sp - 1;
+            int node = stack[sp];
+
+            // 用当前已收敛的 [0, bestFrac] 动态收紧扫掠 AABB，剪掉远端分支
+            float e0x = p0.X + delta.X * bestFrac; float e0y = p0.Y + delta.Y * bestFrac; float e0z = p0.Z + delta.Z * bestFrac;
+            float e1x = p1.X + delta.X * bestFrac; float e1y = p1.Y + delta.Y * bestFrac; float e1z = p1.Z + delta.Z * bestFrac;
+
+            float sMinX = (p0.X < p1.X ? p0.X : p1.X);
+            if (e0x < sMinX) { sMinX = e0x; }
+            if (e1x < sMinX) { sMinX = e1x; }
+            float sMaxX = (p0.X > p1.X ? p0.X : p1.X);
+            if (e0x > sMaxX) { sMaxX = e0x; }
+            if (e1x > sMaxX) { sMaxX = e1x; }
+
+            float sMinY = (p0.Y < p1.Y ? p0.Y : p1.Y);
+            if (e0y < sMinY) { sMinY = e0y; }
+            if (e1y < sMinY) { sMinY = e1y; }
+            float sMaxY = (p0.Y > p1.Y ? p0.Y : p1.Y);
+            if (e0y > sMaxY) { sMaxY = e0y; }
+            if (e1y > sMaxY) { sMaxY = e1y; }
+
+            float sMinZ = (p0.Z < p1.Z ? p0.Z : p1.Z);
+            if (e0z < sMinZ) { sMinZ = e0z; }
+            if (e1z < sMinZ) { sMinZ = e1z; }
+            float sMaxZ = (p0.Z > p1.Z ? p0.Z : p1.Z);
+            if (e0z > sMaxZ) { sMaxZ = e0z; }
+            if (e1z > sMaxZ) { sMaxZ = e1z; }
+
+            if (!this.BoxOverlapsNode(node, sMinX - pad, sMinY - pad, sMinZ - pad, sMaxX + pad, sMaxY + pad, sMaxZ + pad)) {
+                continue;
+            }
+
+            int cnt = this.nodeTriCount[node];
+            if (cnt > 0) {
+                int first = this.nodeLeftFirst[node];
+                for (int i = 0; i < cnt; i = i + 1) {
+                    int triId = this.triIndices[first + i];
+                    float frac;
+                    Vector3 pt;
+                    Vector3 nrm;
+                    bool startedPen;
+                    float maxTestFrac = bestFrac + 0.0005f;
+                    if (maxTestFrac > 1.0f) { maxTestFrac = 1.0f; }
+                    if (this.SweepCapsuleAgainstTriangle(triId, p0, p1, radius, delta, maxTestFrac,
+                                                         out frac, out pt, out nrm, out startedPen)) {
+                        int fnOff = triId * 3;
+                        Vector3 surfN = new Vector3(this.triNormals[fnOff + 0], this.triNormals[fnOff + 1], this.triNormals[fnOff + 2]);
+                        bool take = false;
+                        if (bestTri < 0 || frac < bestFrac - 0.0005f) {
+                            take = true;
+                        } else if (frac <= bestFrac + 0.0005f) {
+                            // 共享棱边等距命中（如台阶立面与水平踏面交界线）：优先选取面法线更迎向运动反方向的三角形
+                            if (Vector3.Dot(surfN, delta) < Vector3.Dot(bestSurfNormal, delta)) {
+                                take = true;
+                            }
+                        }
+                        if (take) {
+                            if (frac < bestFrac) { bestFrac = frac; }
+                            bestTri = triId;
+                            bestPt = pt;
+                            bestNormal = nrm;
+                            bestSurfNormal = surfN;
+                            bestPen = startedPen;
+                        }
+                    }
+                }
+            } else {
+                int left = this.nodeLeftFirst[node];
+                if (sp + 1 < stack.Length) {
+                    stack[sp] = left + 1;
+                    stack[sp + 1] = left;
+                    sp = sp + 2;
+                }
+            }
+        }
+
+        if (bestTri < 0) { return false; }
+
+        hit.Hit = true;
+        hit.Fraction = bestFrac;
+        hit.Distance = moveLen * bestFrac;
+        hit.Point = bestPt;
+        hit.Normal = bestNormal;
+        hit.SurfaceNormal = bestSurfNormal;
+        hit.TriangleIndex = bestTri;
+        hit.MaterialId = this.triMaterials[bestTri];
+        hit.StartedPenetrating = bestPen;
+        return true;
+    }
+
+    // 静态胶囊体穿透解算（Depenetration）：若胶囊体嵌入三角网格，计算将其推出表面的最小分离位移向量并返回 true。
+    public bool OverlapCapsuleDepenetrate(Vector3 p0, Vector3 p1, float radius,
+                                          BvhQueryScratch scratch, out Vector3 totalPushOut) {
+        totalPushOut = Vector3.Zero;
+        if (!this.built) { this.Build(); }
+        if (this.nodeCount <= 0) { return false; }
+
+        Vector3 cur0 = p0;
+        Vector3 cur1 = p1;
+        bool anyOverlap = false;
+        int[] stack = scratch != null ? scratch.Stack : this.defaultScratch.Stack;
+
+        // 最多迭代 4 轮松弛处理多面夹角穿透
+        for (int pass = 0; pass < 4; pass = pass + 1) {
+            float minX = (cur0.X < cur1.X ? cur0.X : cur1.X) - radius;
+            float minY = (cur0.Y < cur1.Y ? cur0.Y : cur1.Y) - radius;
+            float minZ = (cur0.Z < cur1.Z ? cur0.Z : cur1.Z) - radius;
+            float maxX = (cur0.X > cur1.X ? cur0.X : cur1.X) + radius;
+            float maxY = (cur0.Y > cur1.Y ? cur0.Y : cur1.Y) + radius;
+            float maxZ = (cur0.Z > cur1.Z ? cur0.Z : cur1.Z) + radius;
+
+            float deepestPen = 0.0f;
+            Vector3 bestPush = Vector3.Zero;
+
+            int sp = 0;
+            stack[sp] = 0;
+            sp = sp + 1;
+            while (sp > 0) {
+                sp = sp - 1;
+                int node = stack[sp];
+                if (!this.BoxOverlapsNode(node, minX, minY, minZ, maxX, maxY, maxZ)) { continue; }
+                int cnt = this.nodeTriCount[node];
+                if (cnt > 0) {
+                    int first = this.nodeLeftFirst[node];
+                    for (int i = 0; i < cnt; i = i + 1) {
+                        int triId = this.triIndices[first + i];
+                        int v = triId * 9;
+                        Vector3 a = new Vector3(this.triVerts[v + 0], this.triVerts[v + 1], this.triVerts[v + 2]);
+                        Vector3 b = new Vector3(this.triVerts[v + 3], this.triVerts[v + 4], this.triVerts[v + 5]);
+                        Vector3 c = new Vector3(this.triVerts[v + 6], this.triVerts[v + 7], this.triVerts[v + 8]);
+                        Vector3 segPt;
+                        Vector3 triPt;
+                        float dSq = StaticMeshBvh3D.ClosestPointsSegmentTriangle(cur0, cur1, a, b, c, out segPt, out triPt);
+                        if (dSq < radius * radius) {
+                            float d = dSq > 1e-12f ? (float)Math.Sqrt((double)dSq) : 0.0f;
+                            float pen = radius - d;
+                            if (pen > deepestPen) {
+                                Vector3 nrm;
+                                if (d > 1e-5f) {
+                                    float invD = 1.0f / d;
+                                    nrm = new Vector3((segPt.X - triPt.X) * invD, (segPt.Y - triPt.Y) * invD, (segPt.Z - triPt.Z) * invD);
+                                } else {
+                                    int nOff = triId * 3;
+                                    nrm = new Vector3(this.triNormals[nOff + 0], this.triNormals[nOff + 1], this.triNormals[nOff + 2]);
+                                }
+                                deepestPen = pen;
+                                bestPush = Vector3.Multiply(nrm, pen + 0.0005f);
+                            }
+                        }
+                    }
+                } else {
+                    int left = this.nodeLeftFirst[node];
+                    if (sp + 1 < stack.Length) {
+                        stack[sp] = left + 1;
+                        stack[sp + 1] = left;
+                        sp = sp + 2;
+                    }
+                }
+            }
+
+            if (deepestPen <= 0.0001f) { break; }
+            anyOverlap = true;
+            cur0 = Vector3.Add(cur0, bestPush);
+            cur1 = Vector3.Add(cur1, bestPush);
+            totalPushOut = Vector3.Add(totalPushOut, bestPush);
+        }
+        return anyOverlap;
+    }
+}
