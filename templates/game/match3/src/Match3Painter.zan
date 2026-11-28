@@ -1,0 +1,585 @@
+using System;
+using Gui;
+
+namespace Match3;
+
+// World art for the board scene, drawn straight onto the canvas: night-sky
+// backdrop, the board tray, jelly, crates, gems (six distinct silhouettes so
+// colour-blind players can tell them apart), special gems and every effect.
+// Design space = the HUD's layout space (CSS dpx); `top` is the title-bar
+// offset and the screen shake is applied to the board layer only.
+public class Match3Painter {
+    static int ox;
+    static int oy;
+
+    public static int GemColor(int kind) {
+        if (kind == 1) { return unchecked((int)0xFFFF4D5E); }
+        if (kind == 2) { return unchecked((int)0xFF3FA2FF); }
+        if (kind == 3) { return unchecked((int)0xFF52D46B); }
+        if (kind == 4) { return unchecked((int)0xFFFFC53D); }
+        if (kind == 5) { return unchecked((int)0xFFA25CF0); }
+        if (kind == 6) { return unchecked((int)0xFFFF8A3D); }
+        return unchecked((int)0xFFFFFFFF);
+    }
+
+    public static int Alpha(int argb, int a) {
+        if (a < 0) { a = 0; }
+        if (a > 255) { a = 255; }
+        return (argb & 0x00FFFFFF) | (a << 24);
+    }
+
+    public static int Shade(int argb, int pct) {
+        int a = (argb >> 24) & 255;
+        int rr = ((argb >> 16) & 255) * (100 - pct) / 100;
+        int gg = ((argb >> 8) & 255) * (100 - pct) / 100;
+        int bb = (argb & 255) * (100 - pct) / 100;
+        return (a << 24) | (rr << 16) | (gg << 8) | bb;
+    }
+
+    public static int Tint(int argb, int pct) {
+        int a = (argb >> 24) & 255;
+        int rr = (argb >> 16) & 255; rr = rr + (255 - rr) * pct / 100;
+        int gg = (argb >> 8) & 255; gg = gg + (255 - gg) * pct / 100;
+        int bb = argb & 255; bb = bb + (255 - bb) * pct / 100;
+        return (a << 24) | (rr << 16) | (gg << 8) | bb;
+    }
+
+    // Radial glow whose centre alpha = colour alpha x inner / 255.
+    public static void Glow(Canvas c, int x, int y, int r, int argb, int inner) {
+        int a = ((argb >> 24) & 255) * inner / 255;
+        if (a <= 0 || r <= 0) { return; }
+        c.FillRadial(x, y, r, argb | unchecked((int)0xFF000000), a);
+    }
+
+    static double Clamp01(double t) { return t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t); }
+
+    static double EaseInOut(double t) {
+        t = Clamp01(t);
+        return t < 0.5 ? 2.0 * t * t : 1.0 - (-2.0 * t + 2.0) * (-2.0 * t + 2.0) / 2.0;
+    }
+
+    // ---- backdrop ----
+
+    // Deep violet night with two nebula glows, twinkling stars and a crystal
+    // ridge along the bottom. Shared by the title, map and board scenes.
+    public static void Backdrop(Canvas c, int top, double clock) {
+        int w = c.Width();
+        int h = c.Height();
+        c.FillVGrad(0, 0, w, h, unchecked((int)0xFF2A1B4F), unchecked((int)0xFF0D0A1C));
+        Match3Painter.Glow(c, w * 3 / 4, top + 150, 420, unchecked((int)0x553F2A8C), 120);
+        Match3Painter.Glow(c, w / 5, top + 620, 380, unchecked((int)0x44136B7A), 110);
+        Match3Painter.Glow(c, w / 2, top + 980, 520, unchecked((int)0x55402060), 140);
+        for (int i = 0; i < 70; i = i + 1) {
+            int sx = (i * 7919 + 131) % (w > 0 ? w : 720);
+            int sy = top + (i * 104729 + 71) % (h > top ? h - top : 900);
+            double tw = 0.5 + 0.5 * Math.Sin(clock * (1.2 + (double)(i % 5) * 0.35) + (double)i);
+            int a = 40 + (int)(tw * 150.0);
+            int r = i % 9 == 0 ? 2 : 1;
+            c.FillCircle(sx, sy, r, Alpha(unchecked((int)0xFFE8E0FF), a));
+            if (i % 9 == 0 && tw > 0.8) {
+                c.FillRect(sx - 4, sy, 9, 1, Alpha(unchecked((int)0xFFFFFFFF), a / 2));
+                c.FillRect(sx, sy - 4, 1, 9, Alpha(unchecked((int)0xFFFFFFFF), a / 2));
+            }
+        }
+        // Crystal ridge silhouettes (two layers for depth).
+        int base0 = h;
+        for (int k = 0; k < 9; k = k + 1) {
+            int cx = k * 96 - 20;
+            int ph = 70 + (k * 37) % 60;
+            Match3Painter.Spike(c, cx, base0, 60, ph, unchecked((int)0xFF1A1236));
+        }
+        for (int k = 0; k < 8; k = k + 1) {
+            int cx = k * 104 + 30;
+            int ph = 36 + (k * 53) % 40;
+            Match3Painter.Spike(c, cx, base0, 44, ph, unchecked((int)0xFF120D26));
+        }
+    }
+
+    static void Spike(Canvas c, int cx, int baseY, int halfW, int height, int color) {
+        for (int y = 0; y < height; y = y + 2) {
+            int half = halfW * (height - y) / height;
+            c.FillRect(cx - half, baseY - y - 2, half * 2, 2, color);
+        }
+        c.FillRect(cx, baseY - height, 2, height, Alpha(Tint(color, 25), 120));
+    }
+
+    // ---- the board ----
+
+    public static void Draw(Canvas c, Match3Game g, int top) {
+        if (c == null || g == null) { return; }
+        Match3Painter.Backdrop(c, top, g.clock);
+        ox = (int)g.fx.shakeX;
+        oy = top + (int)g.fx.shakeY;
+        int T = Match3Game.TileSize;
+        int bx = Match3Game.BoardStartX;
+        int by = Match3Game.BoardStartY;
+        int bw = Match3Game.Cols * T;
+        int bh = Match3Game.Rows * T;
+
+        // Tray: soft drop shadow, gilded rim, deep inner well.
+        c.ShadowRoundRect(ox + bx - 14, oy + by - 10, bw + 28, bh + 28, 24, 26, unchecked((int)0xAA000000));
+        c.FillRoundRect(ox + bx - 14, oy + by - 14, bw + 28, bh + 28, 24, unchecked((int)0xFF6B4E9E));
+        c.FillVGradMask(ox + bx - 11, oy + by - 11, bw + 22, bh + 22, 21, 15, unchecked((int)0xFFE8C77A), unchecked((int)0xFF8E6A2E));
+        c.FillRoundRect(ox + bx - 8, oy + by - 8, bw + 16, bh + 16, 18, unchecked((int)0xFF140F26));
+        c.FillRoundRect(ox + bx - 6, oy + by - 6, bw + 12, bh + 12, 16, unchecked((int)0xFF1C1534));
+
+        int hoverC = -1;
+        int hoverR = -1;
+        if (g.hoverX >= bx && g.hoverY >= by && g.hoverX < bx + bw && g.hoverY < by + bh) {
+            hoverC = (g.hoverX - bx) / T;
+            hoverR = (g.hoverY - by) / T;
+        }
+
+        // Slots + jelly.
+        for (int r = 0; r < Match3Game.Rows; r = r + 1) {
+            for (int col = 0; col < Match3Game.Cols; col = col + 1) {
+                int gx = ox + bx + col * T;
+                int gy = oy + by + r * T;
+                int slot = ((col + r) % 2 == 0) ? unchecked((int)0xFF261E44) : unchecked((int)0xFF2E2550);
+                c.FillRoundRect(gx + 2, gy + 2, T - 4, T - 4, 12, slot);
+                c.FillRect(gx + 8, gy + 3, T - 16, 1, unchecked((int)0x22FFFFFF));
+                int j = g.jelly[r * Match3Game.Cols + col];
+                if (j > 0) {
+                    int jc = j >= 2 ? unchecked((int)0xCCE8479A) : unchecked((int)0x88FF85C0);
+                    c.FillRoundRect(gx + 3, gy + 3, T - 6, T - 6, 14, jc);
+                    c.FillRoundRect(gx + 8, gy + 6, T - 16, 8, 4, unchecked((int)0x55FFFFFF));
+                    if (j >= 2) { c.DrawRoundRect(gx + 5, gy + 5, T - 10, T - 10, 12, unchecked((int)0xCCFFB3D9), 2); }
+                }
+                if (col == hoverC && r == hoverR && g.phase == Match3Game.PhIdle && !g.gameOver) {
+                    c.FillRoundRect(gx + 2, gy + 2, T - 4, T - 4, 12, unchecked((int)0x22FFFFFF));
+                }
+            }
+        }
+
+        // Selection glow sits under the gems.
+        double pulse = 0.5 + 0.5 * Math.Sin(g.clock * 6.0);
+        if (g.hasSelection) {
+            int sx = ox + Match3Game.CellX(g.selectedCol);
+            int sy = oy + Match3Game.CellY(g.selectedRow);
+            int col = Match3Game.MatchColor(g.board.Get(g.selectedCol, g.selectedRow));
+            int glow = col > 0 ? GemColor(col) : unchecked((int)0xFFFFFFFF);
+            Match3Painter.Glow(c, sx, sy, 50 + (int)(pulse * 8.0), Alpha(Tint(glow, 30), 200), 200);
+            c.FillRoundRect(sx - T / 2 + 2, sy - T / 2 + 2, T - 4, T - 4, 12, unchecked((int)0x33FFFFFF));
+        }
+        if (g.hintOn) {
+            for (int k = 0; k < 2; k = k + 1) {
+                int cell = k == 0 ? g.hintA : g.hintB;
+                int hx = ox + Match3Game.CellX(cell % Match3Game.Cols);
+                int hy = oy + Match3Game.CellY(cell / Match3Game.Cols);
+                Match3Painter.Glow(c, hx, hy, 52, unchecked((int)0xFFFFE58F), 120 + (int)(pulse * 120.0));
+                c.FillRoundRect(hx - T / 2 + 2, hy - T / 2 + 2, T - 4, T - 4, 12, Alpha(unchecked((int)0xFFFFE58F), 40 + (int)(pulse * 50.0)));
+                c.DrawRoundRect(hx - T / 2 + 1, hy - T / 2 + 1, T - 2, T - 2, 14, Alpha(unchecked((int)0xFFFFD666), 140 + (int)(pulse * 115.0)), 3);
+            }
+        }
+
+        // Gems, clipped to the tray so refills slide in from under the rim.
+        c.PushClip(ox + bx - 6, oy + by - 6, bw + 12, bh + 12);
+        for (int r = 0; r < Match3Game.Rows; r = r + 1) {
+            for (int col = 0; col < Match3Game.Cols; col = col + 1) {
+                Match3Painter.DrawCell(c, g, col, r, pulse);
+            }
+        }
+        c.PopClip();
+
+        if (g.hasSelection) {
+            int sx = ox + bx + g.selectedCol * T;
+            int sy = oy + by + g.selectedRow * T;
+            c.DrawRoundRect(sx + 1, sy + 1, T - 2, T - 2, 14, Alpha(unchecked((int)0xFFFFFFFF), 170 + (int)(pulse * 85.0)), 3);
+        }
+        if (g.phase == Match3Game.PhSwapBack) {
+            double t = g.phaseT / Match3Game.SwapBackTime;
+            int a = (int)(220.0 * (1.0 - t));
+            for (int k = 0; k < 2; k = k + 1) {
+                int cell = k == 0 ? g.swapA : g.swapB;
+                c.DrawRoundRect(ox + bx + (cell % Match3Game.Cols) * T + 1, oy + by + (cell / Match3Game.Cols) * T + 1,
+                    T - 2, T - 2, 14, Alpha(unchecked((int)0xFFFF4D4F), a), 3);
+            }
+        }
+        Match3Painter.DrawFx(c, g.fx, ox, oy);
+    }
+
+    static void DrawCell(Canvas c, Match3Game g, int col, int r, double pulse) {
+        int T = Match3Game.TileSize;
+        int i = r * Match3Game.Cols + col;
+        double cx = (double)Match3Game.CellX(col);
+        double cy = (double)Match3Game.CellY(r) - g.drop[i];
+        double scale = 1.0;
+        int v = g.board.grid[i];
+        if (g.popping[i]) {
+            v = g.popVal[i];
+            double t = Clamp01(g.phaseT / Match3Game.PopTime);
+            scale = t < 0.35 ? 1.0 + 0.3 * (t / 0.35) : 1.3 * (1.0 - (t - 0.35) / 0.65);
+            if (scale < 0.02) { return; }
+        }
+        if (v == 0) { return; }
+        // Swap slide (valid) and bump-and-return (invalid).
+        if (g.phase == Match3Game.PhSwap || g.phase == Match3Game.PhSwapBack) {
+            int other = -1;
+            if (i == g.swapA) { other = g.swapB; }
+            if (i == g.swapB) { other = g.swapA; }
+            if (other >= 0) {
+                double ocx = (double)Match3Game.CellX(other % Match3Game.Cols);
+                double ocy = (double)Match3Game.CellY(other / Match3Game.Cols);
+                if (g.phase == Match3Game.PhSwap) {
+                    double t = EaseInOut(g.phaseT / Match3Game.SwapTime);
+                    cx = ocx + ((double)Match3Game.CellX(col) - ocx) * t;
+                    cy = ocy + ((double)Match3Game.CellY(r) - ocy) * t;
+                } else {
+                    double t = Clamp01(g.phaseT / Match3Game.SwapBackTime);
+                    double f = t < 0.45 ? EaseInOut(t / 0.45) * 0.55
+                        : 0.55 * (1.0 - EaseInOut((t - 0.45) / 0.55)) - 0.06 * Math.Sin((t - 0.45) / 0.55 * 3.14159);
+                    cx = cx + (ocx - cx) * f;
+                    cy = cy + (ocy - cy) * f;
+                }
+                scale = scale * 1.06;
+            }
+        }
+        if (g.phase == Match3Game.PhShuffle) {
+            double t = Clamp01(g.phaseT / Match3Game.ShuffleTime);
+            scale = Math.Abs(Math.Cos(t * 3.14159));
+            if (scale < 0.15) { scale = 0.15; }
+        }
+        bool selected = g.hasSelection && g.selectedCol == col && g.selectedRow == r;
+        if (selected) {
+            scale = scale * (1.08 + 0.04 * pulse);
+            cy = cy - 2.0 - 2.0 * pulse;
+        }
+        if (g.hintOn && (i == g.hintA || i == g.hintB)) {
+            // Nudge the two hinted gems toward each other, like a tiny swap.
+            int other = i == g.hintA ? g.hintB : g.hintA;
+            double nudge = 6.0 * Math.Abs(Math.Sin(g.clock * 5.0));
+            cx = cx + (double)((other % Match3Game.Cols) - col) * nudge;
+            cy = cy + (double)((other / Match3Game.Cols) - r) * nudge;
+            scale = scale * (1.0 + 0.06 * pulse);
+        }
+        // A landing gem squashes a touch.
+        if (g.vel[i] < 0.0) { scale = scale * 0.97; }
+        int x = ox + (int)cx;
+        int y = oy + (int)cy;
+        int rad = (int)(27.0 * scale);
+        if (Match3Game.IsCrate(v)) {
+            Match3Painter.DrawCrate(c, x, y, (int)((double)(T - 10) * scale), Match3Game.HpOf(v), g.flash[i]);
+        } else {
+            Match3Painter.DrawPiece(c, v, x, y, rad, g.clock + (double)i * 0.37);
+        }
+        if (g.popping[i]) {
+            double t = Clamp01(g.phaseT / Match3Game.PopTime);
+            Match3Painter.Glow(c, x, y, rad + 10, Alpha(unchecked((int)0xFFFFFFFF), (int)(230.0 * (1.0 - t))), 220);
+        } else if (g.flash[i] > 0.0) {
+            Match3Painter.Glow(c, x, y, rad + 14, Alpha(unchecked((int)0xFFFFFFFF), (int)(g.flash[i] * 500.0)), 200);
+        }
+    }
+
+    // A gem of any kind (also used by the HUD goal icons and the title art).
+    public static void DrawPiece(Canvas c, int v, int x, int y, int rad, double t) {
+        int col = Match3Game.ColorOf(v);
+        if (col == Match3Game.Bomb) { Match3Painter.DrawBomb(c, x, y, rad, t); return; }
+        if (col < 1 || col > 6) { return; }
+        int sp = Match3Game.SpecialOf(v);
+        if (sp == Match3Game.SpArea) {
+            double p = 0.5 + 0.5 * Math.Sin(t * 5.0);
+            Match3Painter.Glow(c, x, y, rad + 14 + (int)(p * 6.0), Alpha(Tint(GemColor(col), 40), 210), 220);
+        }
+        Match3Painter.DrawGem(c, col, x, y, rad);
+        if (sp == Match3Game.SpRow || sp == Match3Game.SpCol) {
+            bool row = sp == Match3Game.SpRow;
+            int band = unchecked((int)0xE6FFFFFF);
+            for (int k = -1; k <= 1; k = k + 1) {
+                int off = k * rad * 2 / 5;
+                int len = rad * 13 / 10 - (k == 0 ? 0 : rad / 4);
+                if (row) { c.FillRect(x - len / 2 - len / 4, y + off - 2, len * 3 / 2, 4, band); }
+                else { c.FillRect(x + off - 2, y - len / 2 - len / 4, 4, len * 3 / 2, band); }
+            }
+            double p = 0.5 + 0.5 * Math.Sin(t * 7.0);
+            int tip = Alpha(unchecked((int)0xFFFFFFFF), 120 + (int)(p * 120.0));
+            if (row) {
+                c.FillCircle(x - rad - 4, y, 4, tip);
+                c.FillCircle(x + rad + 4, y, 4, tip);
+            } else {
+                c.FillCircle(x, y - rad - 4, 4, tip);
+                c.FillCircle(x, y + rad + 4, 4, tip);
+            }
+        } else if (sp == Match3Game.SpArea) {
+            c.DrawCircle(x, y, rad + 3, unchecked((int)0xDDFFFFFF), 2);
+            for (int k = 0; k < 8; k = k + 1) {
+                double a = t * 1.6 + (double)k * 0.785398;
+                c.FillCircle(x + (int)(Math.Cos(a) * (double)(rad + 3)), y + (int)(Math.Sin(a) * (double)(rad + 3)),
+                    3, unchecked((int)0xFFFFFFFF));
+            }
+        }
+    }
+
+    static void DrawBomb(Canvas c, int x, int y, int rad, double t) {
+        Match3Painter.Glow(c, x, y, rad + 16, unchecked((int)0x99FFFFFF), 180);
+        c.FillCircle(x + 2, y + 3, rad, unchecked((int)0x66000000));
+        c.FillCircle(x, y, rad, unchecked((int)0xFF3A2752));
+        c.FillCircle(x, y, rad - 3, unchecked((int)0xFF241638));
+        for (int k = 0; k < 12; k = k + 1) {
+            double a = t * 1.3 + (double)k * 0.5236;
+            int rr = (k % 2 == 0) ? rad * 3 / 5 : rad * 3 / 10;
+            c.FillCircle(x + (int)(Math.Cos(a) * (double)rr), y + (int)(Math.Sin(a) * (double)rr),
+                rad / 6 + 1, GemColor(1 + k % 6));
+        }
+        c.FillCircle(x - rad / 3, y - rad / 3, rad / 5, unchecked((int)0xCCFFFFFF));
+        c.DrawCircle(x, y, rad, unchecked((int)0xFFB59CFF), 2);
+    }
+
+    // Gem: drop shadow, dark rim, body, lit facet and a specular dot.
+    public static void DrawGem(Canvas c, int kind, int cx, int cy, int r) {
+        int body = GemColor(kind);
+        int dark = Shade(body, 55);
+        int light = Tint(body, 45);
+        Match3Painter.GemShape(c, kind, cx + 2, cy + 4, r, unchecked((int)0x66000000));
+        Match3Painter.GemShape(c, kind, cx, cy, r, dark);
+        Match3Painter.GemShape(c, kind, cx, cy, r - 3, body);
+        Match3Painter.GemShape(c, kind, cx, cy - r / 6, r * 11 / 20, light);
+        c.FillCircle(cx - r / 3, cy - r / 3, r / 6 + 1, unchecked((int)0xDDFFFFFF));
+        c.FillCircle(cx + r / 4, cy + r / 3, r / 10 + 1, unchecked((int)0x66FFFFFF));
+    }
+
+    // 1 circle / 2 rounded square / 3 diamond / 4 triangle / 5 hexagon / 6 heart
+    static void GemShape(Canvas c, int kind, int cx, int cy, int r, int color) {
+        if (r <= 1) { return; }
+        if (kind == 1) { c.FillCircle(cx, cy, r, color); return; }
+        if (kind == 2) { c.FillRoundRect(cx - r * 9 / 10, cy - r * 9 / 10, r * 9 / 5, r * 9 / 5, r / 3, color); return; }
+        if (kind == 6) {
+            int lobe = r * 11 / 20;
+            c.FillCircle(cx - lobe * 4 / 5, cy - r / 4, lobe, color);
+            c.FillCircle(cx + lobe * 4 / 5, cy - r / 4, lobe, color);
+            Match3Painter.Scan(c, 3, cx, cy + r / 8, r * 17 / 20, color);
+            return;
+        }
+        if (kind == 4) { Match3Painter.Scan(c, 4, cx, cy + r / 8, r * 23 / 20, color); return; }
+        Match3Painter.Scan(c, kind, cx, cy, r, color);
+    }
+
+    // Scanline fill in 2px rows (Canvas has no polygon fill).
+    static void Scan(Canvas c, int kind, int cx, int cy, int r, int color) {
+        for (int dy = -r; dy < r; dy = dy + 2) {
+            int y = dy + 1;
+            int ay = y < 0 ? -y : y;
+            int half = 0;
+            if (kind == 3) {
+                half = r - ay;
+            } else if (kind == 4) {
+                half = (dy + r) * 3 / 5;
+            } else {
+                int edge = r * 86 / 100;
+                if (ay > edge) { continue; }
+                half = r - (ay * 58 / 100);
+            }
+            if (half > 0) { c.FillRect(cx - half, cy + dy, half * 2, 2, color); }
+        }
+    }
+
+    // Wooden crate; hp 2 adds iron straps and rivets. Flashes when hit.
+    public static void DrawCrate(Canvas c, int cx, int cy, int size, int hp, double flash) {
+        if (size < 4) { return; }
+        int h = size / 2;
+        int x = cx - h;
+        int y = cy - h;
+        c.FillRoundRect(x + 2, y + 4, size, size, 8, unchecked((int)0x77000000));
+        c.FillRoundRect(x, y, size, size, 8, unchecked((int)0xFF6E4423));
+        c.FillRoundRect(x + 3, y + 3, size - 6, size - 6, 6, unchecked((int)0xFFB07842));
+        for (int k = 1; k < 3; k = k + 1) {
+            c.FillRect(x + 3, y + 3 + (size - 6) * k / 3, size - 6, 2, unchecked((int)0xFF8A5A2E));
+        }
+        c.DrawLine(x + 6, y + 6, x + size - 6, y + size - 6, unchecked((int)0xFF7A4A24), 4);
+        c.DrawLine(x + size - 6, y + 6, x + 6, y + size - 6, unchecked((int)0xFF7A4A24), 4);
+        c.FillRect(x + 4, y + 4, size - 8, 2, unchecked((int)0x55FFFFFF));
+        if (hp >= 2) {
+            int band = unchecked((int)0xFF8C96A8);
+            c.FillRect(x, y + size / 5, size, 6, band);
+            c.FillRect(x, y + size - size / 5 - 6, size, 6, band);
+            c.FillRect(x, y + size / 5, size, 2, unchecked((int)0xFFD6DDEA));
+            c.FillRect(x, y + size - size / 5 - 6, size, 2, unchecked((int)0xFFD6DDEA));
+            for (int k = 0; k < 2; k = k + 1) {
+                int ry = k == 0 ? y + size / 5 + 3 : y + size - size / 5 - 3;
+                c.FillCircle(x + 6, ry, 2, unchecked((int)0xFF3A3F4A));
+                c.FillCircle(x + size - 6, ry, 2, unchecked((int)0xFF3A3F4A));
+            }
+        }
+        if (flash > 0.0) {
+            c.FillRoundRect(x, y, size, size, 8, Alpha(unchecked((int)0xFFFFFFFF), (int)(flash * 500.0)));
+        }
+    }
+
+    public static void DrawJellyIcon(Canvas c, int cx, int cy, int size) {
+        int h = size / 2;
+        c.FillRoundRect(cx - h, cy - h, size, size, size / 4, unchecked((int)0xFFE8479A));
+        c.FillRoundRect(cx - h + 3, cy - h + 3, size - 6, size - 6, size / 5, unchecked((int)0xFFFF85C0));
+        c.FillRoundRect(cx - h + 6, cy - h + 5, size - 12, size / 5, 3, unchecked((int)0x88FFFFFF));
+    }
+
+    // ---- effects ----
+
+    public static void DrawFx(Canvas c, Match3Fx fx, int dx, int dy) {
+        int bx = dx + Match3Game.BoardStartX;
+        int by = dy + Match3Game.BoardStartY;
+        int bw = Match3Game.Cols * Match3Game.TileSize;
+        int bh = Match3Game.Rows * Match3Game.TileSize;
+        for (int i = 0; i < Match3Fx.MaxBeams; i = i + 1) {
+            double t = fx.beamT[i];
+            if (t <= 0.0) { continue; }
+            double k = t / 0.45;
+            int th = (int)(10.0 + 30.0 * k);
+            int a = (int)(255.0 * k);
+            if (fx.beamDir[i] == 0) {
+                int y = dy + fx.beamPos[i];
+                c.FillRect(bx - 6, y - th, bw + 12, th * 2, Alpha(unchecked((int)0xFF9AD8FF), a / 3));
+                c.FillRect(bx - 6, y - th / 3, bw + 12, th * 2 / 3, Alpha(unchecked((int)0xFFFFFFFF), a));
+            } else {
+                int x = dx + fx.beamPos[i];
+                c.FillRect(x - th, by - 6, th * 2, bh + 12, Alpha(unchecked((int)0xFF9AD8FF), a / 3));
+                c.FillRect(x - th / 3, by - 6, th * 2 / 3, bh + 12, Alpha(unchecked((int)0xFFFFFFFF), a));
+            }
+        }
+        for (int i = 0; i < Match3Fx.MaxRings; i = i + 1) {
+            double t = fx.ringT[i];
+            if (t <= 0.0) { continue; }
+            double k = 1.0 - t / 0.5;
+            int rad = 12 + (int)((double)fx.ringR[i] * (1.0 - (1.0 - k) * (1.0 - k)));
+            int a = (int)(255.0 * (1.0 - k));
+            Match3Painter.Glow(c, dx + fx.ringX[i], dy + fx.ringY[i], rad, Alpha(fx.ringColor[i], a / 2), 40);
+            c.DrawCircle(dx + fx.ringX[i], dy + fx.ringY[i], rad, Alpha(unchecked((int)0xFFFFFFFF), a), 2 + (int)(8.0 * (1.0 - k)));
+        }
+        for (int i = 0; i < Match3Fx.MaxBolts; i = i + 1) {
+            double t = fx.boltT[i];
+            if (t <= 0.0) { continue; }
+            int a = (int)(255.0 * t / 0.4);
+            int x0 = dx + fx.boltX0[i];
+            int y0 = dy + fx.boltY0[i];
+            int x1 = dx + fx.boltX1[i];
+            int y1 = dy + fx.boltY1[i];
+            int px = x0;
+            int py = y0;
+            for (int s = 1; s <= 5; s = s + 1) {
+                int nx = x0 + (x1 - x0) * s / 5;
+                int ny = y0 + (y1 - y0) * s / 5;
+                if (s < 5) {
+                    int j = (int)(Math.Sin(fx.clock * 40.0 + (double)(i * 7 + s * 3)) * 10.0);
+                    nx = nx + j;
+                    ny = ny - j;
+                }
+                c.DrawLine(px, py, nx, ny, Alpha(fx.boltColor[i], a), 4);
+                c.DrawLine(px, py, nx, ny, Alpha(unchecked((int)0xFFFFFFFF), a), 2);
+                px = nx;
+                py = ny;
+            }
+        }
+        Match3Painter.DrawParticles(c, fx, dx, dy);
+        for (int i = 0; i < Match3Fx.MaxTexts; i = i + 1) {
+            double t = fx.textT[i];
+            if (t <= 0.0) { continue; }
+            int a = t > 0.35 ? 255 : (int)(255.0 * t / 0.35);
+            double grow = t > 0.85 ? 0.7 + 0.3 * (1.0 - t) / 0.15 : 1.0;
+            int size = (int)((double)fx.textSize[i] * grow);
+            Match3Painter.OutlinedText(c, fx.textStr[i], dx + (int)fx.textX[i], dy + (int)fx.textY[i] - size / 2,
+                size, Alpha(fx.textColor[i], a), Alpha(unchecked((int)0xFF2A1240), a));
+        }
+        if (fx.comboT > 0.0) {
+            double t = 1.25 - fx.comboT;
+            double s = t < 0.18 ? 0.4 + 0.8 * (t / 0.18) : (t < 0.3 ? 1.2 - 0.2 * (t - 0.18) / 0.12 : 1.0);
+            int a = fx.comboT > 0.3 ? 255 : (int)(255.0 * fx.comboT / 0.3);
+            int size = (int)(58.0 * s);
+            int cy = by + bh / 2 - size / 2 - (int)(t * 18.0);
+            Match3Painter.OutlinedText(c, fx.comboWord, bx + bw / 2, cy, size, Alpha(fx.comboColor, a),
+                Alpha(unchecked((int)0xFF2A1240), a));
+        }
+    }
+
+    public static void DrawParticles(Canvas c, Match3Fx fx, int dx, int dy) {
+        for (int i = 0; i < Match3Fx.MaxParts; i = i + 1) {
+            double life = fx.plife[i];
+            if (life <= 0.0) { continue; }
+            double k = life / fx.pmax[i];
+            int a = (int)(255.0 * (k > 0.5 ? 1.0 : k * 2.0));
+            int x = dx + (int)fx.px[i];
+            int y = dy + (int)fx.py[i];
+            int s = fx.psize[i];
+            int kind = fx.pkind[i];
+            if (kind == 0) {
+                int rr = (int)((double)s * (0.4 + 0.6 * k));
+                if (rr < 1) { rr = 1; }
+                c.FillCircle(x, y, rr, Alpha(fx.pcolor[i], a));
+                c.FillCircle(x, y, rr / 2, Alpha(unchecked((int)0xFFFFFFFF), a));
+            } else if (kind == 1) {
+                int w = (int)((double)s * (0.5 + 0.5 * Math.Abs(Math.Sin(life * 9.0 + (double)i))));
+                c.FillRect(x - w / 2, y - s / 2, w + 1, s, Alpha(fx.pcolor[i], a));
+            } else {
+                int rr = (int)((double)s * k) + 1;
+                c.FillRect(x - rr, y, rr * 2 + 1, 1, Alpha(fx.pcolor[i], a));
+                c.FillRect(x, y - rr, 1, rr * 2 + 1, Alpha(fx.pcolor[i], a));
+                c.FillCircle(x, y, 2, Alpha(fx.pcolor[i], a));
+            }
+        }
+    }
+
+    // Bold text centred on cx with a 2px dark outline.
+    public static void OutlinedText(Canvas c, string s, int cx, int y, int size, int color, int outline) {
+        if (s == null || s.Length == 0 || size < 6) { return; }
+        int w = Canvas.MeasureText(s, size);
+        int x = cx - w / 2;
+        for (int k = 0; k < 8; k = k + 1) {
+            int ddx = k == 0 || k == 3 || k == 5 ? -2 : (k == 2 || k == 4 || k == 7 ? 2 : 0);
+            int ddy = k < 3 ? -2 : (k > 4 ? 2 : 0);
+            c.DrawTextBold(x + ddx, y + ddy + 1, s, outline, size);
+        }
+        c.DrawTextBold(x, y, s, color, size);
+    }
+
+    // ---- stars (results celebration, map pips, HUD meter) ----
+
+    // Five-point star, even-odd scanline fill of the 10-vertex outline.
+    public static void FillStar(Canvas c, int cx, int cy, int r, int color) {
+        if (r < 2) { return; }
+        double[] vx = new double[10];
+        double[] vy = new double[10];
+        for (int k = 0; k < 10; k = k + 1) {
+            double a = -1.5707963 + (double)k * 0.6283185;
+            double rr = k % 2 == 0 ? (double)r : (double)r * 0.45;
+            vx[k] = (double)cx + Math.Cos(a) * rr;
+            vy[k] = (double)cy + Math.Sin(a) * rr;
+        }
+        double[] xs = new double[10];
+        for (int y = cy - r; y <= cy + r; y = y + 1) {
+            double sy = (double)y + 0.5;
+            int n = 0;
+            for (int k = 0; k < 10; k = k + 1) {
+                int k2 = (k + 1) % 10;
+                double y0 = vy[k];
+                double y1 = vy[k2];
+                if ((y0 <= sy && y1 > sy) || (y1 <= sy && y0 > sy)) {
+                    xs[n] = vx[k] + (sy - y0) / (y1 - y0) * (vx[k2] - vx[k]);
+                    n = n + 1;
+                }
+            }
+            for (int a = 1; a < n; a = a + 1) {
+                double key = xs[a];
+                int b = a - 1;
+                while (b >= 0 && xs[b] > key) { xs[b + 1] = xs[b]; b = b - 1; }
+                xs[b + 1] = key;
+            }
+            for (int p = 0; p + 1 < n; p = p + 2) {
+                int x0 = (int)(xs[p] + 0.5);
+                int x1 = (int)(xs[p + 1] + 0.5);
+                if (x1 > x0) { c.FillRect(x0, y, x1 - x0, 1, color); }
+            }
+        }
+    }
+
+    // Gold star with rim + shine; dim socket when not earned.
+    public static void Star(Canvas c, int cx, int cy, int r, bool lit) {
+        if (!lit) {
+            Match3Painter.FillStar(c, cx, cy + 2, r, unchecked((int)0x66000000));
+            Match3Painter.FillStar(c, cx, cy, r, unchecked((int)0xFF3A3058));
+            Match3Painter.FillStar(c, cx, cy, r * 7 / 10, unchecked((int)0xFF4A3F6E));
+            return;
+        }
+        Match3Painter.FillStar(c, cx, cy + 3, r, unchecked((int)0x77000000));
+        Match3Painter.FillStar(c, cx, cy, r, unchecked((int)0xFFB86E00));
+        Match3Painter.FillStar(c, cx, cy, r * 82 / 100, unchecked((int)0xFFFFC53D));
+        Match3Painter.FillStar(c, cx, cy - r / 10, r * 5 / 10, unchecked((int)0xFFFFE58F));
+        c.FillCircle(cx - r / 5, cy - r / 3, r / 9 + 1, unchecked((int)0xEEFFFFFF));
+    }
+}

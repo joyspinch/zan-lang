@@ -3,25 +3,35 @@ using Game.Foundation;
 
 namespace Match3;
 
-// 回放与回归（docs/ZAN_STANDARD.md S26/S27）：三消逻辑包成只认逐帧输入的仿真，
-// 不开窗口。replays/ 下的回放由 `zan-check` 无头重放、逐校验点比对；Bot 是模糊
-// 测试用的机器人。改了规则后回放分叉，就重新录制（见 README）。
+// 回放与回归（docs/ZAN_STANDARD.md S26/S27）：三消规则 + 动画相位机包成只认逐帧
+// 输入的仿真，不开窗口。replays/ 下的回放由 `zan-check` 无头重放、逐校验点比对；
+// Bot 是模糊测试用的机器人。改了规则后回放分叉，就重新录制（见 README）。
 //
 // 输入编码：0 无操作；1 + 格子 * 4 + 方向（0 右、1 下、2 左、3 上）= 先点这一格、再点
-// 相邻那一格（一次交换尝试）；300 = 点一下棋盘外（取消选中 / 结束后重开）。
+// 相邻那一格（一次交换尝试）；300 = 点一下棋盘外（取消选中 / 结束后重玩本关）；
+// 400 + n = 载入第 n 关（0..23，覆盖果冻、木箱、收集与计分各类目标）；
+// 500 + k = 照提示走一步：从第 k 格起找到的第一个合法交换（让机器人真的在下棋，
+// 能攒出条纹 / 区域炸弹 / 彩色炸弹并触发连锁）。
 // 开盘与补子都出自 Match3Game.rng，由回放种子决定。
 public class Match3Sim : IReplaySim {
     Match3Game game;
+    int lastScore;
+    int lastJelly;
+    int lastCrates;
 
-    public void Reset(long seed) { game = new Match3Game(seed); }
+    public void Reset(long seed) {
+        game = new Match3Game(seed, 0);
+        lastScore = 0;
+        lastJelly = game.jellyLeft;
+        lastCrates = game.cratesLeft;
+    }
 
     static void Click(Match3Game g, int col, int row) {
-        g.OnClick(Match3Game.BoardStartX + col * Match3Game.TileSize + Match3Game.TileSize / 2,
-                  Match3Game.BoardStartY + row * Match3Game.TileSize + Match3Game.TileSize / 2);
+        g.OnClick(Match3Game.CellX(col), Match3Game.CellY(row));
     }
 
     public void Step(int frame, int input) {
-        if (input >= 1 && input <= Match3Game.Cols * Match3Game.Rows * 4) {
+        if (input >= 1 && input <= Match3Game.Cells * 4) {
             int cell = (input - 1) / 4;
             int dir = (input - 1) % 4;
             int col = cell % Match3Game.Cols;
@@ -34,45 +44,105 @@ public class Match3Sim : IReplaySim {
             }
         } else if (input == 300) {
             game.OnClick(0, 0);
+        } else if (input >= 400 && input < 400 + Match3Levels.Count) {
+            game.LoadLevel(input - 400);
+        } else if (input >= 500 && input < 500 + Match3Game.Cells) {
+            int m = game.FindMove(input - 500);
+            if (m >= 0) {
+                int a = m / 2;
+                int b = m % 2 == 0 ? a + 1 : a + Match3Game.Cols;
+                Match3Sim.Click(game, a % Match3Game.Cols, a / Match3Game.Cols);
+                Match3Sim.Click(game, b % Match3Game.Cols, b / Match3Game.Cols);
+            }
         }
+        lastScore = game.score;
+        lastJelly = game.jellyLeft;
+        lastCrates = game.cratesLeft;
         game.Update(1.0 / 60.0);
     }
 
     public int StateChecksum() {
         StateHasher h = new StateHasher();
-        h.Int(game.score).Int(game.movesLeft).Bool(game.gameOver).Bool(game.hasSelection)
+        h.Int(game.levelIndex).Int(game.score).Int(game.movesLeft).Bool(game.gameOver).Bool(game.won)
+         .Int(game.phase).Bool(game.hasSelection).Int(game.jellyLeft).Int(game.cratesLeft)
          .Long(game.rng.State());
-        for (int r = 0; r < Match3Game.Rows; r = r + 1) {
-            for (int c = 0; c < Match3Game.Cols; c = c + 1) { h.Int(game.board.Get(c, r)); }
+        for (int i = 0; i < Match3Game.Cells; i = i + 1) {
+            h.Int(game.board.grid[i]).Int(game.jelly[i]);
         }
+        for (int c = 1; c <= 6; c = c + 1) { h.Int(game.collected[c]); }
         return h.Value();
     }
 
     [Invariant]
-    public bool MovesInRange() { return game.movesLeft >= 0 && game.movesLeft <= 25; }
+    public bool MovesInRange() { return game.movesLeft >= 0 && game.movesLeft <= game.level.moves; }
 
     [Invariant]
     public bool ScoreNotNegative() { return game.score >= 0; }
 
-    // 没结束的局面上一定有棋可走（不会卡死）
+    // 分数只增不减（重开 / 换关除外：那一帧分数归零）
     [Invariant]
-    public bool HasMoveWhilePlaying() { return game.gameOver || game.HasAnyMove(); }
+    public bool ScoreMonotonic() { return game.score >= lastScore || game.score == 0; }
 
-    // 棋盘上只有空位（0）和六种宝石
+    // 果冻层与木箱只会被清掉，不会凭空长回来（换关除外）
     [Invariant]
-    public bool GemsValid() {
-        for (int r = 0; r < Match3Game.Rows; r = r + 1) {
-            for (int c = 0; c < Match3Game.Cols; c = c + 1) {
-                int v = game.board.Get(c, r);
-                if (v < 0 || v > 6) { return false; }
+    public bool ObstaclesOnlyShrink() {
+        bool reload = game.score == 0 && game.movesLeft == game.level.moves;
+        return reload || (game.jellyLeft <= lastJelly && game.cratesLeft <= lastCrates);
+    }
+
+    // 静止待操作的盘面上一定有棋可走（死局会自动洗牌），且没有现成的三连
+    [Invariant]
+    public bool PlayableWhenIdle() {
+        if (game.gameOver || game.phase != Match3Game.PhIdle) { return true; }
+        game.ClearMarks();
+        bool lines = game.FindMatches(-1, -1) > 0;
+        game.ClearMarks();
+        return !lines && game.HasAnyMove();
+    }
+
+    // 计数与盘面一致：jellyLeft = 有果冻的格数，cratesLeft = 木箱数
+    [Invariant]
+    public bool CountersMatchBoard() {
+        int j = 0;
+        int k = 0;
+        for (int i = 0; i < Match3Game.Cells; i = i + 1) {
+            if (game.jelly[i] > 0) { j = j + 1; }
+            if (Match3Game.IsCrate(game.board.grid[i])) { k = k + 1; }
+        }
+        return j == game.jellyLeft && (game.phase == Match3Game.PhPop || k == game.cratesLeft);
+    }
+
+    // 格子编码合法：空 / 六色宝石（可带条纹或区域炸弹）/ 木箱（1-2 血）/ 彩色炸弹
+    [Invariant]
+    public bool CellsValid() {
+        for (int i = 0; i < Match3Game.Cells; i = i + 1) {
+            int v = game.board.grid[i];
+            int col = Match3Game.ColorOf(v);
+            int sp = Match3Game.SpecialOf(v);
+            int hp = Match3Game.HpOf(v);
+            if (v == 0) {
+                if (game.phase == Match3Game.PhIdle) { return false; }
+                continue;
+            }
+            if (col >= 1 && col <= 6) {
+                if (sp > 3 || hp != 0) { return false; }
+            } else if (col == Match3Game.Crate) {
+                if (sp != 0 || hp < 1 || hp > 2) { return false; }
+            } else if (col == Match3Game.Bomb) {
+                if (sp != 0 || hp != 0) { return false; }
+            } else {
+                return false;
             }
         }
         return true;
     }
 
-    // 机器人：随机挑一格往随机方向换；偶尔点棋盘外
+    // 机器人：多半随手乱换（含无效交换），常常照提示走一步，偶尔点棋盘外、偶尔换关
     public static int Bot(DeterministicRandom rng, int frame) {
-        if (rng.NextBelow(40) == 0) { return 300; }
-        return 1 + rng.NextBelow(Match3Game.Cols * Match3Game.Rows * 4);
+        int roll = rng.NextBelow(1200);
+        if (roll == 0) { return 400 + rng.NextBelow(Match3Levels.Count); }
+        if (roll < 12) { return 300; }
+        if (roll < 400) { return 500 + rng.NextBelow(Match3Game.Cells); }
+        return 1 + rng.NextBelow(Match3Game.Cells * 4);
     }
 }
