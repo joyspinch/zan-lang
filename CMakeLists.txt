@@ -8982,6 +8982,9 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME cross_platform_matrix_protocol
     COMMAND ${Python3_EXECUTABLE} -I -B ${CMAKE_SOURCE_DIR}/tests/test_cross_platform_matrix.py)
   set_tests_properties(cross_platform_matrix_protocol PROPERTIES TIMEOUT 30)
+  add_test(NAME fuzz_mutate_protocol
+    COMMAND ${Python3_EXECUTABLE} -I -B ${CMAKE_SOURCE_DIR}/tests/test_fuzz_mutate.py)
+  set_tests_properties(fuzz_mutate_protocol PROPERTIES TIMEOUT 30)
   add_test(NAME release_source_manifest_protocol
     COMMAND ${Python3_EXECUTABLE} -I -B ${CMAKE_SOURCE_DIR}/tests/test_release_source_manifest.py
       --gate ${CMAKE_SOURCE_DIR}/scripts/release_quality_gate.cmake

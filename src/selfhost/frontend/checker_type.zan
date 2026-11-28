@@ -90,6 +90,18 @@ public partial class Checker {
             return e.type;
         }
         if (k == AK.CallInit()) { return InferType(e.a); }
+        if (k == AK.TupleExpr()) {
+            if (e.op == 1 || e.kids.Count < 2) { return null; }
+            Node tup = MkType("Tuple");
+            int ti = 0;
+            while (ti < e.kids.Count) {
+                Node et = InferType(e.kids[ti]);
+                if (et == null) { return null; }
+                tup.Add(et);
+                ti = ti + 1;
+            }
+            return tup;
+        }
         if (k == AK.IsExpr()) { return MkType("bool"); }
         if (k == AK.QueryExpr()) {
             Node srcT = InferType(e.a);
@@ -839,9 +851,10 @@ public partial class Checker {
         string tdisp = tnull ? tn + "?" : tn;
         if (valueNull) {
             // null lands in a nullable slot or in a reference type (`string s = null;`
-            // is legal in the host) -- nowhere else
-            if (tcat == 4 || tnull || tcat == 0 || tcat == 7) { return; }
-            diags.Error("cannot convert 'object' to '" + tdisp + "' in " + what
+            // is legal in the host) -- never in a non-nullable value type (primitive,
+            // enum, or user struct).
+            if (tnull || !IsValueType(target)) { return; }
+            diags.Error("[E2024] cannot convert 'object' to '" + tdisp + "' in " + what
                 + ": no implicit conversion", line, col);
             return;
         }
@@ -859,6 +872,38 @@ public partial class Checker {
             diags.Error("cannot convert '" + vdisp + "' to '" + tdisp + "' in " + what
                 + ": no implicit conversion", line, col);
             return;
+        }
+        // Invariant generic / tuple type argument check (B-ID186 Wave 4):
+        // when both sides share the same outer constructor (e.g. List<T>,
+        // Dictionary<K,V>, Tuple<...>), concrete value-type or sealed string
+        // type arguments must match identically (`List<int>` != `List<long>`,
+        // `(int, int)` != `(int, long)`).
+        if (tn == vn && tn != "Func" && tn != "Action" && tn != "Predicate"
+            && tn != "Task" && tn != "ValueTask" && tn != "IEnumerable") {
+            if (tn == "Tuple" && target.kids.Count != valueTy.kids.Count) {
+                diags.Error("[E2024] cannot convert '" + TyDisplay(valueTy) + "' to '" + TyDisplay(target)
+                    + "' in " + what + ": no implicit conversion", line, col);
+                return;
+            }
+            if (target.kids.Count > 0 && target.kids.Count == valueTy.kids.Count) {
+                int gi = 0;
+                while (gi < target.kids.Count) {
+                    Node ta = target.kids[gi];
+                    Node va = valueTy.kids[gi];
+                    if (ta != null && va != null
+                        && ta.sval != "" && va.sval != ""
+                        && ta.sval != "var" && va.sval != "var"
+                        && !binder.IsTypeParam(ta.sval) && !binder.IsTypeParam(va.sval)
+                        && !SameTypeShape(ta, va)
+                        && (IsValueType(ta) || IsValueType(va)
+                            || ta.sval == "string" || va.sval == "string")) {
+                        diags.Error("[E2024] cannot convert '" + TyDisplay(valueTy) + "' to '" + TyDisplay(target)
+                            + "' in " + what + ": no implicit conversion", line, col);
+                        return;
+                    }
+                    gi = gi + 1;
+                }
+            }
         }
         // only a primitive target or an enum target (tcat == 6, A486) is judged:
         // a user target (a class, a struct) is resolved by the host through the
