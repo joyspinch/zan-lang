@@ -717,6 +717,10 @@ An `async` method returning `Task` / `Task<T>` (or `ValueTask` / `ValueTask<T>`,
 - **`[rule:SPEC-ASYNC-03]` Exception propagation & `finally` across `await`:** Each resume arms its exception handler and unarms it on suspension. Unhandled exceptions store the fault on the task and rethrow when awaited; `try`/`catch`/`finally` blocks enclosing an `await` run cleanup deterministically before completing or rethrowing. *(Anchors: `tests/conformance/async_await_exception_finally.zan`, `tests/conformance/async_throw_across_frames.zan`)*
 - **`[rule:SPEC-ASYNC-04]` Cancellation semantics:** The coroutine frame's cancellation flag is loaded with atomic `acquire` at suspension/check points and deferred while executing inside a `finally` or catch-cleanup region so cleanup completes before exiting. `CancellationToken` provides cooperative cancellation via `IsCancellationRequested`, `ThrowIfCancellationRequested()`, and non-blocking multi-waiter `WaitHandle()`. *(Anchors: `tests/conformance/async_cancel.zan`, `tests/conformance/cancellation_token_lifecycle.zan`)*
 
+### 6.7 Cross-Platform Consistency & Fail-Closed Capabilities (S33)
+
+- **`[rule:SPEC-PLAT-01]` Cross-OS byte-identical conformance & link-time capability failure:** Every case in `tests/cross_platform_matrix.txt` (covering all standalone SPEC-anchored conformance tests plus IEEE-754/numeric/LINQ invariants) must produce byte-identical LF-normalized stdout across Windows, Linux, and macOS (verified by `scripts/run_cross_platform_matrix.py` and the CI `cross-platform-parity` join job). When a target platform lacks a required native `[DllImport]` or runtime capability, linking fails closed with a linker/driver error rather than silently degrading at runtime. *(Anchors: `tests/conformance/generic_dual_path_matrix.zan`, `tests/conformance/double_format.zan`, `tests/conformance/float_nan_compare.zan`)*
+
 ---
 
 ## 7. FFI (Foreign Function Interface)

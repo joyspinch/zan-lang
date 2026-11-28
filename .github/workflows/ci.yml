@@ -89,6 +89,22 @@ jobs:
       # 按核数并行；档位见顶部 ZAN_CI_TIER（推送 smoke，夜间 full）。
       run: ctest --test-dir build --build-config ${{ matrix.build_type }} --output-on-failure -j "$(getconf _NPROCESSORS_ONLN)" -L "^${ZAN_CI_TIER}$"
 
+    - name: Cross-platform consistency matrix (S33)
+      if: matrix.build_type == 'Release'
+      run: |
+        python3 -I -B scripts/run_cross_platform_matrix.py --run \
+          --zanc ./build/zanc \
+          --out "xplat-manifest-${{ matrix.os }}.json" \
+          --jobs "$(getconf _NPROCESSORS_ONLN)"
+
+    - name: Upload cross-platform manifest (S33)
+      if: matrix.build_type == 'Release'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      with:
+        name: xplat-manifest-${{ matrix.os }}
+        path: xplat-manifest-${{ matrix.os }}.json
+        retention-days: 7
+
   # Windows uses MSYS2/MinGW, which ships a prebuilt LLVM (with CMake config),
   # clang (used by zanc at link time), CMake and Ninja in one self-contained
   # toolchain — no Visual Studio environment juggling required.
@@ -116,6 +132,7 @@ jobs:
           mingw-w64-x86_64-lld
           mingw-w64-x86_64-cmake
           mingw-w64-x86_64-ninja
+          mingw-w64-x86_64-python
 
     - name: Configure
       run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DLLVM_DIR="/mingw64/lib/cmake/llvm" -DZAN_BUILD_GUI_TESTS=OFF
@@ -139,6 +156,47 @@ jobs:
         export ZAN_LIB_PATH="$(cygpath -m /mingw64/lib);$(cygpath -m /mingw64/x86_64-w64-mingw32/lib);$(cygpath -m "$(dirname "$(gcc -print-libgcc-file-name)")")"
         echo "ZAN_LIB_PATH=$ZAN_LIB_PATH"
         ctest --test-dir build --output-on-failure -E "dap_integration" -j "$(nproc)" -L "^${ZAN_CI_TIER}$"
+
+    - name: Cross-platform consistency matrix (S33)
+      if: matrix.build_type == 'Release'
+      run: |
+        export ZAN_LIB_PATH="$(cygpath -m /mingw64/lib);$(cygpath -m /mingw64/x86_64-w64-mingw32/lib);$(cygpath -m "$(dirname "$(gcc -print-libgcc-file-name)")")"
+        python3 -I -B scripts/run_cross_platform_matrix.py --run \
+          --zanc ./build/zanc.exe \
+          --out xplat-manifest-windows-latest.json \
+          --jobs "$(nproc)"
+
+    - name: Upload cross-platform manifest (S33)
+      if: matrix.build_type == 'Release'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      with:
+        name: xplat-manifest-windows-latest
+        path: xplat-manifest-windows-latest.json
+        retention-days: 7
+
+  # S33 (docs/ZAN_STANDARD.md §7): verify Windows / Linux / macOS Release runners
+  # produce byte-identical LF-normalized stdout for every case in
+  # tests/cross_platform_matrix.txt and reject missing platform capabilities at link time.
+  cross-platform-parity:
+    name: cross-platform-parity (S33)
+    needs: [build-unix, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+    - name: Download OS manifests
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      with:
+        pattern: xplat-manifest-*
+        path: xplat-manifests
+        merge-multiple: true
+    - name: Verify byte-identical cross-OS parity
+      run: |
+        python3 -I -B scripts/run_cross_platform_matrix.py --check-matrix
+        python3 -I -B scripts/run_cross_platform_matrix.py --compare \
+          --require-os linux,macos,windows \
+          xplat-manifests/xplat-manifest-ubuntu-latest.json \
+          xplat-manifests/xplat-manifest-macos-latest.json \
+          xplat-manifests/xplat-manifest-windows-latest.json
 
   lint:
     runs-on: ubuntu-latest
