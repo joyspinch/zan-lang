@@ -1,0 +1,59 @@
+using System;
+using System.Collections.Generic;
+using Game.Net;
+
+class Program {
+    static int Main() {
+        // 1. 竞技击杀播报流：最大条数裁剪、最新优先与 TTL 自动过期
+        NetKillFeedStream feed = new NetKillFeedStream(3, 5000L);
+        feed.PushKill(1, 2, "rifle", false, 0, 1000L);
+        feed.PushKill(3, 4, "sniper", true, 1, 2000L);
+        feed.PushKill(5, 6, "smg", false, 3, 3500L);
+        feed.PushKill(7, 8, "knife", false, 0, 4000L);
+
+        List<KillFeedEntry> snap1 = feed.SnapshotNewestFirst(4500L);
+        bool feedCapOk = snap1.Count == 3 && snap1[0].KillerId == 7 && snap1[2].KillerId == 3 && snap1[2].Headshot;
+
+        List<KillFeedEntry> snap2 = feed.SnapshotNewestFirst(7500L);
+        // 2000 过期，3500(差4000) 和 4000(差3500) 保留
+        bool feedTtlOk = snap2.Count == 2 && snap2[0].KillerId == 7 && snap2[1].KillerId == 5;
+        Console.WriteLine("killfeed_ok=" + ((feedCapOk && feedTtlOk) ? "1" : "0"));
+
+        // 2. 双人防调包安全交易托管器
+        NetPlayerTradeEscrow escrow = new NetPlayerTradeEscrow(101, 202);
+        escrow.SetGoldOffer(101, 500);
+        escrow.SetGoldOffer(202, 1000);
+        escrow.LockOffer(101);
+        escrow.LockOffer(202);
+        bool lockedStage = escrow.Stage == TradeEscrowStage.BothLocked;
+
+        // A 临时把筹码改成 5（经典调包骗局）：必须强制重置双方锁定并拒绝 B 直接成交
+        escrow.SetGoldOffer(101, 5);
+        bool resetOnTamper = escrow.Stage == TradeEscrowStage.Negotiating
+            && !escrow.LockedA && !escrow.LockedB && !escrow.FinalConfirm(202);
+
+        // 双方重新确认报价 -> 锁定 -> 双重最终确认成交
+        escrow.SetGoldOffer(101, 500);
+        escrow.LockOffer(101);
+        escrow.LockOffer(202);
+        bool c1 = escrow.FinalConfirm(101);
+        bool c2 = escrow.FinalConfirm(202);
+        bool completedOk = c1 && c2 && escrow.Stage == TradeEscrowStage.Completed
+            && !escrow.SetGoldOffer(101, 0);
+        Console.WriteLine("trade_escrow_ok=" + ((lockedStage && resetOnTamper && completedOk) ? "1" : "0"));
+
+        // 3. 公会共享成长经验库：日限额防刷、跨日刷新、自动升级与特权解锁
+        NetClanProgressionBank bank = new NetClanProgressionBank(500, 300);
+        int a1 = bank.ContributeXp(11, 250, 1);
+        int a2 = bank.ContributeXp(11, 200, 1); // 当日仅剩 50 额度
+        int a3 = bank.ContributeXp(22, 300, 1); // 总计 600 -> 升至 2 级
+        int a4 = bank.ContributeXp(11, 450, 2); // 跨日刷新上限，当日再记 300 -> 总计 900
+        int a5 = bank.ContributeXp(22, 200, 2); // 总计 1100 -> 升至 3 级
+
+        bool clanOk = a1 == 250 && a2 == 50 && a3 == 300 && a4 == 300 && a5 == 200
+            && bank.TotalXp == 1100 && bank.ClanLevel == 3
+            && bank.IsPerkUnlocked(3) && !bank.IsPerkUnlocked(4);
+        Console.WriteLine("clan_bank_ok=" + (clanOk ? "1" : "0"));
+        return 0;
+    }
+}

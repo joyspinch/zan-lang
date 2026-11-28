@@ -1,0 +1,223 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Game.Graphics;
+using Game.Render3D;
+
+namespace Conf;
+
+class Game3DRainRipplesTiltShiftLodTest {
+    [DllImport("zan_gui")]
+    private static extern int zan_gui_read_pixel(int surfaceId, int x, int y);
+
+    static int AbsInt(int v) { return v < 0 ? -v : v; }
+
+    static int PixelDiffRgb(int a, int b) {
+        int dr = AbsInt(((a >> 16) & 255) - ((b >> 16) & 255));
+        int dg = AbsInt(((a >> 8) & 255) - ((b >> 8) & 255));
+        int db = AbsInt((a & 255) - (b & 255));
+        return dr + dg + db;
+    }
+
+    static void Main() {
+        Canvas.SetBackend(1);
+        Canvas cv = new Canvas(128, 128);
+        int sid = cv.SurfaceId();
+        Renderer3D ren = new Renderer3D(16);
+        ren.UseCpuLighting = false;
+
+        // 1. GPU 世界空间雨滴水洼同心涟漪：水平地面产生涟漪，垂直墙面（N.y=0）不受影响
+        Mesh3D floor = new Mesh3D();
+        floor.Vertex(-4.0f, 0.0f, -4.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f);
+        floor.Vertex( 4.0f, 0.0f, -4.0f, 0.0f, 1.0f, 0.0f, 1.0f, 0.0f);
+        floor.Vertex( 4.0f, 0.0f,  4.0f, 0.0f, 1.0f, 0.0f, 1.0f, 1.0f);
+        floor.Vertex(-4.0f, 0.0f,  4.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f);
+        floor.Triangle(0, 2, 1);
+        floor.Triangle(0, 3, 2);
+        int floorKey = cv.MeshUpload(floor);
+
+        Camera3D topCam = new Camera3D();
+        topCam.Position = new Vector3(0.0f, 4.0f, 0.001f);
+        topCam.Target = new Vector3(0.0f, 0.0f, 0.0f);
+        topCam.AspectRatio = 1.0f;
+        topCam.FieldOfView = 1.05f;
+
+        Material floorMat = Material.Solid(0.0f, 0.0f, 0.0f);
+        floorMat.EmissiveRed = 0.05f;
+        floorMat.EmissiveGreen = 0.05f;
+        floorMat.EmissiveBlue = 0.05f;
+
+        SceneNode floorRoot = new SceneNode("floorRoot");
+        SceneNode floorNode = new SceneNode("floor");
+        floorNode.MeshKey = floorKey;
+        floorNode.BoundsRadius = 10.0f;
+        floorNode.Material = floorMat;
+        floorRoot.AddChild(floorNode);
+
+        RenderPlan floorPlan = new RenderPlan(topCam);
+        cv.Clear(unchecked((int)0xFF000000));
+        floorPlan.Build(floorRoot);
+        ren.Draw(cv, floorPlan);
+
+        List<int> floorBase = new List<int>();
+        for (int py = 36; py <= 92; py = py + 4) {
+            for (int px = 36; px <= 92; px = px + 4) {
+                floorBase.Add(zan_gui_read_pixel(sid, px, py));
+            }
+        }
+
+        floorMat.RainRipplesEnabled = true;
+        floorMat.RainRipplesScale = 2.0f;
+        floorMat.RainRipplesPhase = 0.35f;
+        floorMat.RainRipplesStrength = 0.95f;
+        floorMat.RainRipplesRed = 0.25f;
+        floorMat.RainRipplesGreen = 0.85f;
+        floorMat.RainRipplesBlue = 1.0f;
+
+        cv.Clear(unchecked((int)0xFF000000));
+        floorPlan.Build(floorRoot);
+        ren.Draw(cv, floorPlan);
+
+        int floorMaxDiff = 0;
+        int floorLitSamples = 0;
+        int idx = 0;
+        for (int py = 36; py <= 92; py = py + 4) {
+            for (int px = 36; px <= 92; px = px + 4) {
+                int p = zan_gui_read_pixel(sid, px, py);
+                int d = PixelDiffRgb(p, floorBase[idx]);
+                if (d > floorMaxDiff) { floorMaxDiff = d; }
+                if (d > 12) { floorLitSamples = floorLitSamples + 1; }
+                idx = idx + 1;
+            }
+        }
+
+        // 垂直墙面（N.y=0）开启相同雨滴涟漪参数，必须零增量
+        Mesh3D wall = new Mesh3D();
+        wall.Vertex(-2.0f, -2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        wall.Vertex( 2.0f, -2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+        wall.Vertex( 2.0f,  2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        wall.Vertex(-2.0f,  2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f);
+        wall.Triangle(0, 1, 2);
+        wall.Triangle(0, 2, 3);
+        int wallKey = cv.MeshUpload(wall);
+
+        Camera3D frontCam = new Camera3D();
+        frontCam.Position = new Vector3(0.0f, 0.0f, 3.2f);
+        frontCam.Target = new Vector3(0.0f, 0.0f, 0.0f);
+        frontCam.AspectRatio = 1.0f;
+        frontCam.FieldOfView = 1.1f;
+
+        Material wallMat = Material.Solid(0.0f, 0.0f, 0.0f);
+        wallMat.EmissiveRed = 0.05f;
+        wallMat.EmissiveGreen = 0.05f;
+        wallMat.EmissiveBlue = 0.05f;
+
+        SceneNode wallRoot = new SceneNode("wallRoot");
+        SceneNode wallNode = new SceneNode("wall");
+        wallNode.MeshKey = wallKey;
+        wallNode.BoundsRadius = 6.0f;
+        wallNode.Material = wallMat;
+        wallRoot.AddChild(wallNode);
+
+        RenderPlan wallPlan = new RenderPlan(frontCam);
+        cv.Clear(unchecked((int)0xFF000000));
+        wallPlan.Build(wallRoot);
+        ren.Draw(cv, wallPlan);
+        int wallBasePx = zan_gui_read_pixel(sid, 64, 64);
+
+        wallMat.RainRipplesEnabled = true;
+        wallMat.RainRipplesScale = 2.0f;
+        wallMat.RainRipplesPhase = 0.35f;
+        wallMat.RainRipplesStrength = 0.95f;
+        wallMat.RainRipplesRed = 0.25f;
+        wallMat.RainRipplesGreen = 0.85f;
+        wallMat.RainRipplesBlue = 1.0f;
+
+        cv.Clear(unchecked((int)0xFF000000));
+        wallPlan.Build(wallRoot);
+        ren.Draw(cv, wallPlan);
+        int wallRipplePx = zan_gui_read_pixel(sid, 64, 64);
+        int wallDiff = PixelDiffRgb(wallRipplePx, wallBasePx);
+
+        bool rainOk = floorMaxDiff >= 25 && floorLitSamples >= 4 && wallDiff == 0;
+        Console.WriteLine("rain_ripples_ok=" + Convert.ToString(rainOk ? 1 : 0));
+
+        // 2. GPU 后处理微缩移轴景深模糊（Tilt-Shift）：中心焦带保持锐利零变化，顶部离焦带显著模糊
+        Mesh3D bar = new Mesh3D();
+        bar.Vertex(-0.05f, -3.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        bar.Vertex( 0.05f, -3.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+        bar.Vertex( 0.05f,  3.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        bar.Vertex(-0.05f,  3.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f);
+        bar.Triangle(0, 1, 2);
+        bar.Triangle(0, 2, 3);
+        int barKey = cv.MeshUpload(bar);
+
+        Material whiteMat = Material.Solid(0.0f, 0.0f, 0.0f);
+        whiteMat.EmissiveRed = 1.0f;
+        whiteMat.EmissiveGreen = 1.0f;
+        whiteMat.EmissiveBlue = 1.0f;
+
+        SceneNode barRoot = new SceneNode("barRoot");
+        SceneNode barNode = new SceneNode("bar");
+        barNode.MeshKey = barKey;
+        barNode.BoundsRadius = 6.0f;
+        barNode.Material = whiteMat;
+        barRoot.AddChild(barNode);
+
+        RenderPlan tsPlan = new RenderPlan(frontCam);
+        cv.Clear(unchecked((int)0xFF000000));
+        tsPlan.Build(barRoot);
+        ren.Draw(cv, tsPlan);
+
+        List<int> centerBase = new List<int>();
+        List<int> topBase = new List<int>();
+        for (int px = 56; px <= 72; px = px + 1) {
+            centerBase.Add(zan_gui_read_pixel(sid, px, 64));
+            topBase.Add(zan_gui_read_pixel(sid, px, 12));
+        }
+
+        PostProcess post = new PostProcess();
+        post.TiltShiftStrength = 1.0f;
+        post.TiltShiftFocusY = 0.5f;
+        post.TiltShiftFocusBand = 0.15f;
+        ren.PostProcess = post;
+
+        cv.Clear(unchecked((int)0xFF000000));
+        tsPlan.Build(barRoot);
+        ren.Draw(cv, tsPlan);
+
+        int centerDiff = 0;
+        int topDiff = 0;
+        for (int i = 0; i <= 16; i = i + 1) {
+            int px = 56 + i;
+            centerDiff = centerDiff + PixelDiffRgb(zan_gui_read_pixel(sid, px, 64), centerBase[i]);
+            topDiff = topDiff + PixelDiffRgb(zan_gui_read_pixel(sid, px, 12), topBase[i]);
+        }
+
+        bool tiltShiftOk = centerDiff == 0 && topDiff >= 120;
+        Console.WriteLine("tilt_shift_ok=" + Convert.ToString(tiltShiftOk ? 1 : 0));
+
+        ren.Dispose();
+
+        // 3. FrustumLodSelector3D：滞回防闪烁、剔除距离与 LodBias 偏置测试
+        FrustumLodSelector3D lod = new FrustumLodSelector3D(2.0f, 1.0f);
+        lod.AddTier(300, 60.0f);
+        lod.AddTier(100, 15.0f);
+        lod.AddTier(200, 35.0f);
+
+        LodActorState3D actor = new LodActorState3D(1);
+        int m0 = lod.SelectMesh(actor, 10.0f); // 100
+        int m1 = lod.SelectMesh(actor, 16.5f); // 滞回保护，维持 100
+        int m2 = lod.SelectMesh(actor, 18.0f); // 跨过 15+2，降级到 200
+        int m3 = lod.SelectMesh(actor, 14.0f); // 滞回保护，未低于 15-2，维持 200
+        int m4 = lod.SelectMesh(actor, 12.0f); // 低于 13，升回 100
+        int m5 = lod.SelectMesh(actor, 65.0f); // 超出 60+2，剔除返回 -1
+
+        lod.LodBias = 2.0f;
+        int m6 = lod.SelectMesh(actor, 20.0f); // 等效 40m -> 档位 2 (300)
+
+        bool lodOk = lod.TierCount() == 3 && m0 == 100 && m1 == 100 && m2 == 200
+            && m3 == 200 && m4 == 100 && m5 == -1 && m6 == 300;
+        Console.WriteLine("lod_selector_ok=" + Convert.ToString(lodOk ? 1 : 0));
+    }
+}

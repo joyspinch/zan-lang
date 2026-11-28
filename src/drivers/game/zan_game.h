@@ -330,6 +330,16 @@ ZAN_GAME_API void zan_game_set_force_field_hex3d(int32_t enabled,
 ZAN_GAME_API void zan_game_set_post_glitch_rgb3d(float intensity,
     float slice_count, float seed);
 
+/* GPU 3D 世界空间雨滴水洼同心涟漪（Rain Puddle Ripples，仅投射在朝上表面，零贴图零额外 Pass）：
+ * enabled != 0 时按世界 XZ 单元格生成周期扩散的雨滴同心高光涟漪，strength [0..3]。 */
+ZAN_GAME_API void zan_game_set_rain_ripples3d(int32_t enabled, float scale,
+    float phase, float strength, float r, float g, float b);
+
+/* GPU 后处理微缩移轴景深模糊（Tilt-Shift Diorama Blur，单 Pass 零额外 FBO）：
+ * strength [0..1] 控制模糊强度，focus_y [0..1] 控制清晰焦带中心高度，focus_band [0.02..0.45] 控制焦带半宽。 */
+ZAN_GAME_API void zan_game_set_post_tilt_shift3d(float strength,
+    float focus_y, float focus_band);
+
 #ifdef __cplusplus
 }
 #endif
