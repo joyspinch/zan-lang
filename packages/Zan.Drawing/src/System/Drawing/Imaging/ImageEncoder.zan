@@ -1,0 +1,1040 @@
+using System;
+
+namespace System.Drawing.Imaging;
+
+internal class EncBuf {
+    public byte[] Data;
+    public int Len;
+    public int Cap;
+    public bool Oom;
+
+    public EncBuf(int initialCap) {
+        if (initialCap < 64) initialCap = 64;
+        this.Data = new byte[initialCap];
+        this.Len = 0;
+        this.Cap = initialCap;
+        this.Oom = false;
+    }
+
+    public void Reserve(int extra) {
+        if (this.Oom || extra <= 0) return;
+        if (extra > 2147483591 - this.Len) {
+            this.Oom = true;
+            return;
+        }
+        int need = this.Len + extra;
+        if (need <= this.Cap) return;
+        int ncap = this.Cap > 0 ? this.Cap : 4096;
+        while (ncap < need) {
+            if (ncap > 1073741795) {
+                ncap = need;
+                break;
+            }
+            ncap = ncap * 2;
+        }
+        byte[] next = new byte[ncap];
+        if (this.Len > 0) {
+            NativeMemory.Copy((nint)next, (nint)this.Data, this.Len);
+        }
+        this.Data = next;
+        this.Cap = ncap;
+    }
+
+    public void Put1(byte v) {
+        if (this.Len >= this.Cap) this.Reserve(1);
+        if (!this.Oom) {
+            this.Data[this.Len] = v;
+            this.Len = this.Len + 1;
+        }
+    }
+
+    public void PutBytes(byte[] src, int count) {
+        if (count <= 0) return;
+        this.Reserve(count);
+        if (!this.Oom) {
+            NativeMemory.Copy((nint)this.Data + (nint)this.Len, (nint)src, count);
+            this.Len = this.Len + count;
+        }
+    }
+
+    public void PutBe16(int v) {
+        this.Put1((byte)((v >> 8) & 0xFF));
+        this.Put1((byte)(v & 0xFF));
+    }
+
+    public void PutBe32(uint v) {
+        this.Put1((byte)((v >> 24) & 0xFFu));
+        this.Put1((byte)((v >> 16) & 0xFFu));
+        this.Put1((byte)((v >> 8) & 0xFFu));
+        this.Put1((byte)(v & 0xFFu));
+    }
+
+    public byte[] ToExactBytes() {
+        if (this.Oom || this.Len <= 0) return null;
+        if (this.Len == this.Cap) return this.Data;
+        byte[] result = new byte[this.Len];
+        NativeMemory.Copy((nint)result, (nint)this.Data, this.Len);
+        return result;
+    }
+}
+
+internal class JpgHuffTable {
+    public int[] Code;
+    public int[] Size;
+}
+
+internal class BitWriter {
+    public EncBuf Out;
+    public uint Acc;
+    public int Count;
+
+    public BitWriter(EncBuf buf) {
+        this.Out = buf;
+        this.Acc = 0u;
+        this.Count = 0;
+    }
+}
+
+// 纯 Zan 零外部依赖 ARGB32 图像编码器（PNG / JPEG Baseline / BMP32 / TGA32 / BMP24）：
+// - PNG：Sub 滤波 + 4096 哈希 LZ77 + 预计算 Fixed Huffman Deflate + IEEE CRC-32 + Adler-32
+// - JPEG：ITU-T T.81 Annex K 量化/哈夫曼表 + AAN 1D 分离 8x8 FDCT + 4:4:4 YCbCr
+// - BMP / TGA：预分配定长缓冲 + 小端整行 memcpy 零多余拷贝
+internal class ImageEncoder {
+    private static int[] Zigzag = new int[64] {
+         0,  1,  8, 16,  9,  2,  3, 10,
+        17, 24, 32, 25, 18, 11,  4,  5,
+        12, 19, 26, 33, 40, 48, 41, 34,
+        27, 20, 13,  6,  7, 14, 21, 28,
+        35, 42, 49, 56, 57, 50, 43, 36,
+        29, 22, 15, 23, 30, 37, 44, 51,
+        58, 59, 52, 45, 38, 31, 39, 46,
+        53, 60, 61, 54, 47, 55, 62, 63
+    };
+
+    private static int[] StdLumQ = new int[64] {
+        16, 11, 10, 16, 24, 40, 51, 61,
+        12, 12, 14, 19, 26, 58, 60, 55,
+        14, 13, 16, 24, 40, 57, 69, 56,
+        14, 17, 22, 29, 51, 87, 80, 62,
+        18, 22, 37, 56, 68,109,103, 77,
+        24, 35, 55, 64, 81,104,113, 92,
+        49, 64, 78, 87,103,121,120,101,
+        72, 92, 95, 98,112,100,103, 99
+    };
+
+    private static int[] StdChrQ = new int[64] {
+        17, 18, 24, 47, 99, 99, 99, 99,
+        18, 21, 26, 66, 99, 99, 99, 99,
+        24, 26, 56, 99, 99, 99, 99, 99,
+        47, 66, 99, 99, 99, 99, 99, 99,
+        99, 99, 99, 99, 99, 99, 99, 99,
+        99, 99, 99, 99, 99, 99, 99, 99,
+        99, 99, 99, 99, 99, 99, 99, 99,
+        99, 99, 99, 99, 99, 99, 99, 99
+    };
+
+    private static byte[] DcLumBits = new byte[16] { 0,1,5,1,1,1,1,1,1,0,0,0,0,0,0,0 };
+    private static byte[] DcLumVals = new byte[12] { 0,1,2,3,4,5,6,7,8,9,10,11 };
+    private static byte[] DcChrBits = new byte[16] { 0,3,1,1,1,1,1,1,1,1,1,0,0,0,0,0 };
+    private static byte[] DcChrVals = new byte[12] { 0,1,2,3,4,5,6,7,8,9,10,11 };
+
+    private static byte[] AcLumBits = new byte[16] { 0,2,1,3,3,2,4,3,5,5,4,4,0,0,1,125 };
+    private static byte[] AcLumVals = new byte[162] {
+        0x01,0x02,0x03,0x00,0x04,0x11,0x05,0x12,0x21,0x31,0x41,0x06,0x13,0x51,0x61,0x07,
+        0x22,0x71,0x14,0x32,0x81,0x91,0xa1,0x08,0x23,0x42,0xb1,0xc1,0x15,0x52,0xd1,0xf0,
+        0x24,0x33,0x62,0x72,0x82,0x09,0x0a,0x16,0x17,0x18,0x19,0x1a,0x25,0x26,0x27,0x28,
+        0x29,0x2a,0x34,0x35,0x36,0x37,0x38,0x39,0x3a,0x43,0x44,0x45,0x46,0x47,0x48,0x49,
+        0x4a,0x53,0x54,0x55,0x56,0x57,0x58,0x59,0x5a,0x63,0x64,0x65,0x66,0x67,0x68,0x69,
+        0x6a,0x73,0x74,0x75,0x76,0x77,0x78,0x79,0x7a,0x83,0x84,0x85,0x86,0x87,0x88,0x89,
+        0x8a,0x92,0x93,0x94,0x95,0x96,0x97,0x98,0x99,0x9a,0xa2,0xa3,0xa4,0xa5,0xa6,0xa7,
+        0xa8,0xa9,0xaa,0xb2,0xb3,0xb4,0xb5,0xb6,0xb7,0xb8,0xb9,0xba,0xc2,0xc3,0xc4,0xc5,
+        0xc6,0xc7,0xc8,0xc9,0xca,0xd2,0xd3,0xd4,0xd5,0xd6,0xd7,0xd8,0xd9,0xda,0xe1,0xe2,
+        0xe3,0xe4,0xe5,0xe6,0xe7,0xe8,0xe9,0xea,0xf1,0xf2,0xf3,0xf4,0xf5,0xf6,0xf7,0xf8,
+        0xf9,0xfa
+    };
+
+    private static byte[] AcChrBits = new byte[16] { 0,2,1,2,4,4,3,4,7,5,4,4,0,1,2,119 };
+    private static byte[] AcChrVals = new byte[162] {
+        0x00,0x01,0x02,0x03,0x11,0x04,0x05,0x21,0x31,0x06,0x12,0x41,0x51,0x07,0x61,0x71,
+        0x13,0x22,0x32,0x81,0x08,0x14,0x42,0x91,0xa1,0xb1,0xc1,0x09,0x23,0x33,0x52,0xf0,
+        0x15,0x62,0x72,0xd1,0x0a,0x16,0x24,0x34,0xe1,0x25,0xf1,0x17,0x18,0x19,0x1a,0x26,
+        0x27,0x28,0x29,0x2a,0x35,0x36,0x37,0x38,0x39,0x3a,0x43,0x44,0x45,0x46,0x47,0x48,
+        0x49,0x4a,0x53,0x54,0x55,0x56,0x57,0x58,0x59,0x5a,0x63,0x64,0x65,0x66,0x67,0x68,
+        0x69,0x6a,0x73,0x74,0x75,0x76,0x77,0x78,0x79,0x7a,0x82,0x83,0x84,0x85,0x86,0x87,
+        0x88,0x89,0x8a,0x92,0x93,0x94,0x95,0x96,0x97,0x98,0x99,0x9a,0xa2,0xa3,0xa4,0xa5,
+        0xa6,0xa7,0xa8,0xa9,0xaa,0xb2,0xb3,0xb4,0xb5,0xb6,0xb7,0xb8,0xb9,0xba,0xc2,0xc3,
+        0xc4,0xc5,0xc6,0xc7,0xc8,0xc9,0xca,0xd2,0xd3,0xd4,0xd5,0xd6,0xd7,0xd8,0xd9,0xda,
+        0xe2,0xe3,0xe4,0xe5,0xe6,0xe7,0xe8,0xe9,0xea,0xf2,0xf3,0xf4,0xf5,0xf6,0xf7,0xf8,
+        0xf9,0xfa
+    };
+
+    private static float[] AanScale = new float[8] {
+        1.000000000f, 1.387039845f, 1.306562965f, 1.175875602f,
+        1.000000000f, 0.785694958f, 0.541196100f, 0.275899379f
+    };
+
+    private static byte[] JpegApp0 = new byte[18] {
+        0xFF, 0xE0, 0x00, 0x10, 74, 70, 73, 70, 0x00,
+        0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00
+    };
+
+    private static byte[] JpegSos = new byte[14] {
+        0xFF, 0xDA, 0x00, 0x0C, 0x03,
+        0x01, 0x00, 0x02, 0x11, 0x03, 0x11,
+        0x00, 0x3F, 0x00
+    };
+
+    private static byte[] PngSig = new byte[8] { 137, 80, 78, 71, 13, 10, 26, 10 };
+    private static byte[] TagIhdr = new byte[4] { 73, 72, 68, 82 };
+    private static byte[] TagIdat = new byte[4] { 73, 68, 65, 84 };
+    private static byte[] TagIend = new byte[4] { 73, 69, 78, 68 };
+
+    private static int[] LenBase = new int[29] {
+        3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,
+        35,43,51,59,67,83,99,115,131,163,195,227,258
+    };
+    private static int[] LenEb = new int[29] {
+        0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,
+        3,3,3,3,4,4,4,4,5,5,5,5,0
+    };
+    private static int[] DistBase = new int[30] {
+        1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,
+        257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577
+    };
+    private static int[] DistEb = new int[30] {
+        0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,
+        7,7,8,8,9,9,10,10,11,11,12,12,13,13
+    };
+
+    // 启动期一次性预构建（只读、天然多线程安全）
+    private static uint[] Crc32Table = ImageEncoder.MakeCrc32Table();
+    private static uint[] DefLitCode = ImageEncoder.MakeDefLitCode();
+    private static int[] DefLitBits = ImageEncoder.MakeDefLitBits();
+    private static uint[] DefDistRev = ImageEncoder.MakeDefDistRev();
+    private static JpgHuffTable HuffDcLum = ImageEncoder.BuildJpgHuff(ImageEncoder.DcLumBits, ImageEncoder.DcLumVals);
+    private static JpgHuffTable HuffDcChr = ImageEncoder.BuildJpgHuff(ImageEncoder.DcChrBits, ImageEncoder.DcChrVals);
+    private static JpgHuffTable HuffAcLum = ImageEncoder.BuildJpgHuff(ImageEncoder.AcLumBits, ImageEncoder.AcLumVals);
+    private static JpgHuffTable HuffAcChr = ImageEncoder.BuildJpgHuff(ImageEncoder.AcChrBits, ImageEncoder.AcChrVals);
+
+    private static bool DimensionsOk(int w, int h) {
+        if (w <= 0 || h <= 0 || w > 32768 || h > 32768) return false;
+        return (long)w * (long)h * 4L <= 2147483591L;
+    }
+
+    private static uint BitRev(uint v, int bits) {
+        uint r = 0u;
+        for (int i = 0; i < bits; i = i + 1) {
+            r = (r << 1) | (v & 1u);
+            v = v >> 1;
+        }
+        return r;
+    }
+
+    private static uint[] MakeCrc32Table() {
+        uint[] tbl = new uint[256];
+        for (uint i = 0u; i < 256u; i = i + 1u) {
+            uint c = i;
+            for (int k = 0; k < 8; k = k + 1) {
+                c = (c & 1u) != 0u ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+            }
+            tbl[(int)i] = c;
+        }
+        return tbl;
+    }
+
+    private static uint[] MakeDefLitCode() {
+        uint[] codes = new uint[288];
+        for (int sym = 0; sym < 288; sym = sym + 1) {
+            if (sym <= 143) {
+                codes[sym] = ImageEncoder.BitRev((uint)(0x30 + sym), 8);
+            } else if (sym <= 255) {
+                codes[sym] = ImageEncoder.BitRev((uint)(0x190 + (sym - 144)), 9);
+            } else if (sym <= 279) {
+                codes[sym] = ImageEncoder.BitRev((uint)(sym - 256), 7);
+            } else {
+                codes[sym] = ImageEncoder.BitRev((uint)(0xC0 + (sym - 280)), 8);
+            }
+        }
+        return codes;
+    }
+
+    private static int[] MakeDefLitBits() {
+        int[] bits = new int[288];
+        for (int sym = 0; sym < 288; sym = sym + 1) {
+            if (sym <= 143) bits[sym] = 8;
+            else if (sym <= 255) bits[sym] = 9;
+            else if (sym <= 279) bits[sym] = 7;
+            else bits[sym] = 8;
+        }
+        return bits;
+    }
+
+    private static uint[] MakeDefDistRev() {
+        uint[] rev = new uint[30];
+        for (int i = 0; i < 30; i = i + 1) {
+            rev[i] = ImageEncoder.BitRev((uint)i, 5);
+        }
+        return rev;
+    }
+
+    private static JpgHuffTable BuildJpgHuff(byte[] bits, byte[] vals) {
+        JpgHuffTable h = new JpgHuffTable();
+        h.Code = new int[256];
+        h.Size = new int[256];
+        int code = 0;
+        int k = 0;
+        for (int len = 1; len <= 16; len = len + 1) {
+            int cnt = (int)bits[len - 1];
+            for (int i = 0; i < cnt; i = i + 1) {
+                int sym = (int)vals[k];
+                k = k + 1;
+                h.Code[sym] = code;
+                h.Size[sym] = len;
+                code = code + 1;
+            }
+            code = code << 1;
+        }
+        return h;
+    }
+
+    private static void WriteLe16(byte[] dst, int off, int v) {
+        dst[off] = (byte)(v & 0xFF);
+        dst[off + 1] = (byte)((v >> 8) & 0xFF);
+    }
+
+    private static void WriteLe32(byte[] dst, int off, uint v) {
+        dst[off] = (byte)(v & 0xFFu);
+        dst[off + 1] = (byte)((v >> 8) & 0xFFu);
+        dst[off + 2] = (byte)((v >> 16) & 0xFFu);
+        dst[off + 3] = (byte)((v >> 24) & 0xFFu);
+    }
+
+    // ---- BMP (32-bit BGRA / 24-bit BGR, top-down) ----
+    private static byte[] EncodeBmp(nint pixels, int w, int h, int stride, bool withAlpha) {
+        int bpp = withAlpha ? 4 : 3;
+        long rowBytesL = ((long)w * (long)bpp + 3L) & ~3L;
+        long imgBytesL = rowBytesL * (long)h;
+        long totalL = 54L + imgBytesL;
+        if (totalL <= 54L || totalL > 2147483591L) return null;
+
+        int rowBytes = (int)rowBytesL;
+        byte[] outBytes = new byte[(int)totalL];
+
+        // BITMAPFILEHEADER (14 bytes)
+        outBytes[0] = 66; // 'B'
+        outBytes[1] = 77; // 'M'
+        ImageEncoder.WriteLe32(outBytes, 2, (uint)totalL);
+        ImageEncoder.WriteLe16(outBytes, 6, 0);
+        ImageEncoder.WriteLe16(outBytes, 8, 0);
+        ImageEncoder.WriteLe32(outBytes, 10, 54u);
+
+        // BITMAPINFOHEADER (40 bytes), top-down negative height
+        ImageEncoder.WriteLe32(outBytes, 14, 40u);
+        ImageEncoder.WriteLe32(outBytes, 18, (uint)w);
+        ImageEncoder.WriteLe32(outBytes, 22, (uint)(-h));
+        ImageEncoder.WriteLe16(outBytes, 26, 1);
+        ImageEncoder.WriteLe16(outBytes, 28, bpp * 8);
+        ImageEncoder.WriteLe32(outBytes, 30, 0u);
+        ImageEncoder.WriteLe32(outBytes, 34, (uint)imgBytesL);
+        ImageEncoder.WriteLe32(outBytes, 38, 2835u);
+        ImageEncoder.WriteLe32(outBytes, 42, 2835u);
+        ImageEncoder.WriteLe32(outBytes, 46, 0u);
+        ImageEncoder.WriteLe32(outBytes, 50, 0u);
+
+        if (withAlpha) {
+            int copyBytes = w * 4;
+            nint dstBase = (nint)outBytes + (nint)54;
+            for (int y = 0; y < h; y = y + 1) {
+                NativeMemory.Copy(dstBase + (nint)((long)y * (long)rowBytes),
+                                  pixels + (nint)((long)y * (long)stride * 4L),
+                                  copyBytes);
+            }
+        } else {
+            for (int y = 0; y < h; y = y + 1) {
+                Span<uint> row = new Span<uint>(pixels + (nint)((long)y * (long)stride * 4L), w);
+                int pos = 54 + y * rowBytes;
+                for (int x = 0; x < w; x = x + 1) {
+                    uint p = row[x];
+                    outBytes[pos] = (byte)(p & 0xFFu);
+                    outBytes[pos + 1] = (byte)((p >> 8) & 0xFFu);
+                    outBytes[pos + 2] = (byte)((p >> 16) & 0xFFu);
+                    pos = pos + 3;
+                }
+            }
+        }
+        return outBytes;
+    }
+
+    // ---- TGA (32-bit uncompressed BGRA, top-left origin) ----
+    private static byte[] EncodeTga(nint pixels, int w, int h, int stride) {
+        if (w > 65535 || h > 65535) return null;
+        long totalL = 18L + (long)w * (long)h * 4L;
+        if (totalL <= 18L || totalL > 2147483591L) return null;
+
+        byte[] outBytes = new byte[(int)totalL];
+        outBytes[2] = 2; // uncompressed true-color
+        outBytes[12] = (byte)(w & 0xFF);
+        outBytes[13] = (byte)((w >> 8) & 0xFF);
+        outBytes[14] = (byte)(h & 0xFF);
+        outBytes[15] = (byte)((h >> 8) & 0xFF);
+        outBytes[16] = 32;
+        outBytes[17] = 0x28; // top-left origin (0x20) + 8-bit alpha (0x08)
+
+        int rowBytes = w * 4;
+        nint dstBase = (nint)outBytes + (nint)18;
+        for (int y = 0; y < h; y = y + 1) {
+            NativeMemory.Copy(dstBase + (nint)((long)y * (long)rowBytes),
+                              pixels + (nint)((long)y * (long)stride * 4L),
+                              rowBytes);
+        }
+        return outBytes;
+    }
+
+    // ---- JPEG Baseline (4:4:4 YCbCr, AAN 1D 分离式 8x8 FDCT) ----
+    private static void JpgPutBits(BitWriter bw, uint bits, int n) {
+        if (n <= 0) return;
+        bw.Acc = (bw.Acc << n) | (bits & ((1u << n) - 1u));
+        bw.Count = bw.Count + n;
+        while (bw.Count >= 8) {
+            bw.Count = bw.Count - 8;
+            byte bv = (byte)((bw.Acc >> bw.Count) & 0xFFu);
+            bw.Out.Put1(bv);
+            if (bv == 0xFF) bw.Out.Put1(0x00);
+        }
+    }
+
+    private static void JpgFlushBits(BitWriter bw) {
+        if (bw.Count > 0) {
+            int pad = 8 - bw.Count;
+            ImageEncoder.JpgPutBits(bw, (1u << pad) - 1u, pad);
+        }
+    }
+
+    private static void JpgWriteDht(EncBuf b, byte tcTh, byte[] bits, byte[] vals, int nvals) {
+        b.Put1(0xFF);
+        b.Put1(0xC4);
+        b.PutBe16(2 + 1 + 16 + nvals);
+        b.Put1(tcTh);
+        b.PutBytes(bits, 16);
+        b.PutBytes(vals, nvals);
+    }
+
+    private static int JpgBitLen(int v) {
+        int n = 0;
+        while (v > 0) {
+            v = v >> 1;
+            n = n + 1;
+        }
+        return n;
+    }
+
+    private static void JpgFdct8x8(float[] inp, float[] tmp, float[] outp) {
+        for (int i = 0; i < 8; i = i + 1) {
+            int r = i * 8;
+            float r0 = inp[r];
+            float r1 = inp[r + 1];
+            float r2 = inp[r + 2];
+            float r3 = inp[r + 3];
+            float r4 = inp[r + 4];
+            float r5 = inp[r + 5];
+            float r6 = inp[r + 6];
+            float r7 = inp[r + 7];
+
+            float t0 = r0 + r7;
+            float t7 = r0 - r7;
+            float t1 = r1 + r6;
+            float t6 = r1 - r6;
+            float t2 = r2 + r5;
+            float t5 = r2 - r5;
+            float t3 = r3 + r4;
+            float t4 = r3 - r4;
+
+            float t10 = t0 + t3;
+            float t13 = t0 - t3;
+            float t11 = t1 + t2;
+            float t12 = t1 - t2;
+
+            tmp[r] = t10 + t11;
+            tmp[r + 4] = t10 - t11;
+
+            float z1 = (t12 + t13) * 0.707106781f;
+            tmp[r + 2] = t13 + z1;
+            tmp[r + 6] = t13 - z1;
+
+            t10 = t4 + t5;
+            t11 = t5 + t6;
+            t12 = t6 + t7;
+
+            float z5 = (t10 - t12) * 0.382683433f;
+            float z2 = 0.541196100f * t10 + z5;
+            float z4 = 1.306562965f * t12 + z5;
+            float z3 = t11 * 0.707106781f;
+
+            float z11 = t7 + z3;
+            float z13 = t7 - z3;
+            tmp[r + 5] = z13 + z2;
+            tmp[r + 3] = z13 - z2;
+            tmp[r + 1] = z11 + z4;
+            tmp[r + 7] = z11 - z4;
+        }
+
+        for (int i = 0; i < 8; i = i + 1) {
+            float s0 = tmp[i];
+            float s1 = tmp[8 + i];
+            float s2 = tmp[16 + i];
+            float s3 = tmp[24 + i];
+            float s4 = tmp[32 + i];
+            float s5 = tmp[40 + i];
+            float s6 = tmp[48 + i];
+            float s7 = tmp[56 + i];
+
+            float t0 = s0 + s7;
+            float t7 = s0 - s7;
+            float t1 = s1 + s6;
+            float t6 = s1 - s6;
+            float t2 = s2 + s5;
+            float t5 = s2 - s5;
+            float t3 = s3 + s4;
+            float t4 = s3 - s4;
+
+            float t10 = t0 + t3;
+            float t13 = t0 - t3;
+            float t11 = t1 + t2;
+            float t12 = t1 - t2;
+
+            outp[i] = t10 + t11;
+            outp[32 + i] = t10 - t11;
+
+            float z1 = (t12 + t13) * 0.707106781f;
+            outp[16 + i] = t13 + z1;
+            outp[48 + i] = t13 - z1;
+
+            t10 = t4 + t5;
+            t11 = t5 + t6;
+            t12 = t6 + t7;
+
+            float z5 = (t10 - t12) * 0.382683433f;
+            float z2 = 0.541196100f * t10 + z5;
+            float z4 = 1.306562965f * t12 + z5;
+            float z3 = t11 * 0.707106781f;
+
+            float z11 = t7 + z3;
+            float z13 = t7 - z3;
+            outp[40 + i] = z13 + z2;
+            outp[24 + i] = z13 - z2;
+            outp[8 + i] = z11 + z4;
+            outp[56 + i] = z11 - z4;
+        }
+    }
+
+    private static void JpgEncodeBlock(BitWriter bw, float[] block, float[] tmp, float[] dct,
+                                       int[] qcoef, float[] invQ, int[] prevDc, int compIdx,
+                                       JpgHuffTable dcH, JpgHuffTable acH) {
+        ImageEncoder.JpgFdct8x8(block, tmp, dct);
+        int[] zz = ImageEncoder.Zigzag;
+        for (int i = 0; i < 64; i = i + 1) {
+            float v = dct[zz[i]] * invQ[i];
+            qcoef[i] = (int)(v >= 0.0f ? (v + 0.5f) : (v - 0.5f));
+        }
+
+        // 单 8x8 块含 0xFF 填充最坏不超过 512 字节：块首一次性扩容，内层零检查
+        EncBuf outb = bw.Out;
+        outb.Reserve(512);
+        if (outb.Oom) return;
+        byte[] data = outb.Data;
+        int len = outb.Len;
+        uint acc = bw.Acc;
+        int cnt = bw.Count;
+        int[] dcCode = dcH.Code;
+        int[] dcSize = dcH.Size;
+        int[] acCode = acH.Code;
+        int[] acSize = acH.Size;
+
+        int diff = qcoef[0] - prevDc[compIdx];
+        prevDc[compIdx] = qcoef[0];
+        if (diff == 0) {
+            int n = dcSize[0];
+            acc = (acc << n) | ((uint)dcCode[0] & ((1u << n) - 1u));
+            cnt = cnt + n;
+            while (cnt >= 8) {
+                cnt = cnt - 8;
+                byte bv = (byte)((acc >> cnt) & 0xFFu);
+                data[len] = bv;
+                len = len + 1;
+                if (bv == 0xFF) { data[len] = 0x00; len = len + 1; }
+            }
+        } else {
+            int absD = diff < 0 ? -diff : diff;
+            int s = ImageEncoder.JpgBitLen(absD);
+            int bits = diff < 0 ? (diff + (1 << s) - 1) : diff;
+            int n1 = dcSize[s];
+            acc = (acc << n1) | ((uint)dcCode[s] & ((1u << n1) - 1u));
+            cnt = cnt + n1;
+            while (cnt >= 8) {
+                cnt = cnt - 8;
+                byte bv = (byte)((acc >> cnt) & 0xFFu);
+                data[len] = bv;
+                len = len + 1;
+                if (bv == 0xFF) { data[len] = 0x00; len = len + 1; }
+            }
+            acc = (acc << s) | ((uint)bits & ((1u << s) - 1u));
+            cnt = cnt + s;
+            while (cnt >= 8) {
+                cnt = cnt - 8;
+                byte bv = (byte)((acc >> cnt) & 0xFFu);
+                data[len] = bv;
+                len = len + 1;
+                if (bv == 0xFF) { data[len] = 0x00; len = len + 1; }
+            }
+        }
+
+        int lastNz = 63;
+        while (lastNz > 0 && qcoef[lastNz] == 0) lastNz = lastNz - 1;
+        int idx = 1;
+        while (idx <= lastNz) {
+            int zeros = 0;
+            while (idx <= lastNz && qcoef[idx] == 0) {
+                zeros = zeros + 1;
+                idx = idx + 1;
+            }
+            while (zeros >= 16) {
+                int nz = acSize[0xF0];
+                acc = (acc << nz) | ((uint)acCode[0xF0] & ((1u << nz) - 1u));
+                cnt = cnt + nz;
+                while (cnt >= 8) {
+                    cnt = cnt - 8;
+                    byte bv = (byte)((acc >> cnt) & 0xFFu);
+                    data[len] = bv;
+                    len = len + 1;
+                    if (bv == 0xFF) { data[len] = 0x00; len = len + 1; }
+                }
+                zeros = zeros - 16;
+            }
+            int val = qcoef[idx];
+            idx = idx + 1;
+            int absV = val < 0 ? -val : val;
+            int s = ImageEncoder.JpgBitLen(absV);
+            int sym = (zeros << 4) | s;
+            int bits = val < 0 ? (val + (1 << s) - 1) : val;
+            int na = acSize[sym];
+            acc = (acc << na) | ((uint)acCode[sym] & ((1u << na) - 1u));
+            cnt = cnt + na;
+            while (cnt >= 8) {
+                cnt = cnt - 8;
+                byte bv = (byte)((acc >> cnt) & 0xFFu);
+                data[len] = bv;
+                len = len + 1;
+                if (bv == 0xFF) { data[len] = 0x00; len = len + 1; }
+            }
+            acc = (acc << s) | ((uint)bits & ((1u << s) - 1u));
+            cnt = cnt + s;
+            while (cnt >= 8) {
+                cnt = cnt - 8;
+                byte bv = (byte)((acc >> cnt) & 0xFFu);
+                data[len] = bv;
+                len = len + 1;
+                if (bv == 0xFF) { data[len] = 0x00; len = len + 1; }
+            }
+        }
+        if (lastNz < 63) {
+            int ne = acSize[0];
+            acc = (acc << ne) | ((uint)acCode[0] & ((1u << ne) - 1u));
+            cnt = cnt + ne;
+            while (cnt >= 8) {
+                cnt = cnt - 8;
+                byte bv = (byte)((acc >> cnt) & 0xFFu);
+                data[len] = bv;
+                len = len + 1;
+                if (bv == 0xFF) { data[len] = 0x00; len = len + 1; }
+            }
+        }
+
+        outb.Len = len;
+        bw.Acc = acc;
+        bw.Count = cnt;
+    }
+
+    private static byte[] EncodeJpeg(nint pixels, int w, int h, int stride, int quality) {
+        if (w <= 0 || h <= 0 || w > 65535 || h > 65535) return null;
+        if (quality < 1) quality = 1;
+        if (quality > 100) quality = 100;
+
+        int scale = quality < 50 ? (5000 / quality) : (200 - quality * 2);
+        byte[] qLum = new byte[64];
+        byte[] qChr = new byte[64];
+        float[] invQLum = new float[64];
+        float[] invQChr = new float[64];
+        int[] zzTbl = ImageEncoder.Zigzag;
+        int[] stdLum = ImageEncoder.StdLumQ;
+        int[] stdChr = ImageEncoder.StdChrQ;
+        float[] aanTbl = ImageEncoder.AanScale;
+
+        for (int i = 0; i < 64; i = i + 1) {
+            int zz = zzTbl[i];
+            int row = zz >> 3;
+            int col = zz & 7;
+            float aan = 8.0f * aanTbl[row] * aanTbl[col];
+            int ql = (stdLum[zz] * scale + 50) / 100;
+            int qc = (stdChr[zz] * scale + 50) / 100;
+            if (ql < 1) ql = 1;
+            else if (ql > 255) ql = 255;
+            if (qc < 1) qc = 1;
+            else if (qc > 255) qc = 255;
+            qLum[i] = (byte)ql;
+            qChr[i] = (byte)qc;
+            invQLum[i] = 1.0f / ((float)ql * aan);
+            invQChr[i] = 1.0f / ((float)qc * aan);
+        }
+
+        EncBuf b = new EncBuf(4096);
+
+        // SOI + APP0 (JFIF 1.01)
+        b.Put1(0xFF);
+        b.Put1(0xD8);
+        b.PutBytes(ImageEncoder.JpegApp0, 18);
+
+        // DQT (table 0: lum, table 1: chr)
+        b.Put1(0xFF);
+        b.Put1(0xDB);
+        b.PutBe16(67);
+        b.Put1(0);
+        b.PutBytes(qLum, 64);
+
+        b.Put1(0xFF);
+        b.Put1(0xDB);
+        b.PutBe16(67);
+        b.Put1(1);
+        b.PutBytes(qChr, 64);
+
+        // SOF0 (8-bit, 3 components, 4:4:4)
+        b.Put1(0xFF);
+        b.Put1(0xC0);
+        b.PutBe16(17);
+        b.Put1(8);
+        b.PutBe16(h);
+        b.PutBe16(w);
+        b.Put1(3);
+        b.Put1(1); b.Put1(0x11); b.Put1(0);
+        b.Put1(2); b.Put1(0x11); b.Put1(1);
+        b.Put1(3); b.Put1(0x11); b.Put1(1);
+
+        // DHT
+        ImageEncoder.JpgWriteDht(b, 0x00, ImageEncoder.DcLumBits, ImageEncoder.DcLumVals, 12);
+        ImageEncoder.JpgWriteDht(b, 0x10, ImageEncoder.AcLumBits, ImageEncoder.AcLumVals, 162);
+        ImageEncoder.JpgWriteDht(b, 0x01, ImageEncoder.DcChrBits, ImageEncoder.DcChrVals, 12);
+        ImageEncoder.JpgWriteDht(b, 0x11, ImageEncoder.AcChrBits, ImageEncoder.AcChrVals, 162);
+
+        // SOS
+        b.PutBytes(ImageEncoder.JpegSos, 14);
+
+        BitWriter bw = new BitWriter(b);
+        int[] prevDc = new int[3];
+        float[] yb = new float[64];
+        float[] cbb = new float[64];
+        float[] crb = new float[64];
+        float[] tmp = new float[64];
+        float[] dct = new float[64];
+        int[] qcoef = new int[64];
+
+        JpgHuffTable dcLum = ImageEncoder.HuffDcLum;
+        JpgHuffTable dcChr = ImageEncoder.HuffDcChr;
+        JpgHuffTable acLum = ImageEncoder.HuffAcLum;
+        JpgHuffTable acChr = ImageEncoder.HuffAcChr;
+
+        for (int by = 0; by < h; by = by + 8) {
+            for (int bx = 0; bx < w; bx = bx + 8) {
+                for (int dy = 0; dy < 8; dy = dy + 1) {
+                    int py = by + dy;
+                    if (py >= h) py = h - 1;
+                    Span<uint> row = new Span<uint>(pixels + (nint)((long)py * (long)stride * 4L), w);
+                    int baseIdx = dy * 8;
+                    for (int dx = 0; dx < 8; dx = dx + 1) {
+                        int px = bx + dx;
+                        if (px >= w) px = w - 1;
+                        uint p = row[px];
+                        float r = (float)((p >> 16) & 0xFFu);
+                        float g = (float)((p >> 8) & 0xFFu);
+                        float bl = (float)(p & 0xFFu);
+                        int idx = baseIdx + dx;
+                        yb[idx] = 0.299000f * r + 0.587000f * g + 0.114000f * bl - 128.0f;
+                        cbb[idx] = -0.168736f * r - 0.331264f * g + 0.500000f * bl;
+                        crb[idx] = 0.500000f * r - 0.418688f * g - 0.081312f * bl;
+                    }
+                }
+                ImageEncoder.JpgEncodeBlock(bw, yb, tmp, dct, qcoef, invQLum, prevDc, 0, dcLum, acLum);
+                ImageEncoder.JpgEncodeBlock(bw, cbb, tmp, dct, qcoef, invQChr, prevDc, 1, dcChr, acChr);
+                ImageEncoder.JpgEncodeBlock(bw, crb, tmp, dct, qcoef, invQChr, prevDc, 2, dcChr, acChr);
+                if (b.Oom) return null;
+            }
+        }
+
+        ImageEncoder.JpgFlushBits(bw);
+        b.Put1(0xFF);
+        b.Put1(0xD9);
+        return b.ToExactBytes();
+    }
+
+    // ---- PNG (Sub 滤波 + 4096 哈希 LZ77 + Fixed Huffman Deflate) ----
+    private static uint PngCrc32(byte[] buf, int start, int len) {
+        uint[] tbl = ImageEncoder.Crc32Table;
+        uint c = 0xFFFFFFFFu;
+        int end = start + len;
+        for (int i = start; i < end; i = i + 1) {
+            c = tbl[(int)((c ^ (uint)buf[i]) & 0xFFu)] ^ (c >> 8);
+        }
+        return c ^ 0xFFFFFFFFu;
+    }
+
+    private static uint PngAdler32(Span<byte> buf, int len) {
+        uint s1 = 1u;
+        uint s2 = 0u;
+        int i = 0;
+        while (i < len) {
+            int chunk = len - i;
+            if (chunk > 5552) chunk = 5552;
+            int end = i + chunk;
+            while (i < end) {
+                s1 = s1 + (uint)buf[i];
+                s2 = s2 + s1;
+                i = i + 1;
+            }
+            s1 = s1 % 65521u;
+            s2 = s2 % 65521u;
+        }
+        return (s2 << 16) | s1;
+    }
+
+    private static void PngWriteChunk(EncBuf b, byte[] tag, byte[] payload, int len) {
+        b.PutBe32((uint)len);
+        int start = b.Len;
+        b.PutBytes(tag, 4);
+        if (len > 0 && payload != null) {
+            b.PutBytes(payload, len);
+        }
+        if (!b.Oom) {
+            uint crc = ImageEncoder.PngCrc32(b.Data, start, 4 + len);
+            b.PutBe32(crc);
+        }
+    }
+
+    private static byte[] EncodePng(nint pixels, int w, int h, int stride) {
+        long rowRawL = 1L + (long)w * 4L;
+        long rawSizeL = rowRawL * (long)h;
+        if (rawSizeL <= 0L || rawSizeL > 0x3FFFFFFFL) return null;
+
+        int rowRaw = (int)rowRawL;
+        int n = (int)rawSizeL;
+        nint rawPtr = NativeMemory.Alloc(n);
+        if (rawPtr == 0) return null;
+
+        try {
+            Span<byte> raw = new Span<byte>(rawPtr, n);
+            // 单遍 ARGB32 -> RGBA + PNG Sub 滤波
+            for (int y = 0; y < h; y = y + 1) {
+                Span<uint> srow = new Span<uint>(pixels + (nint)((long)y * (long)stride * 4L), w);
+                int off = y * rowRaw;
+                raw[off] = 1; // Filter type 1 = Sub
+                int pr = 0;
+                int pg = 0;
+                int pb = 0;
+                int pa = 0;
+                int p = off + 1;
+                for (int x = 0; x < w; x = x + 1) {
+                    uint px = srow[x];
+                    int b = (int)(px & 0xFFu);
+                    int g = (int)((px >> 8) & 0xFFu);
+                    int r = (int)((px >> 16) & 0xFFu);
+                    int a = (int)((px >> 24) & 0xFFu);
+                    raw[p] = (byte)((r - pr) & 0xFF);
+                    raw[p + 1] = (byte)((g - pg) & 0xFF);
+                    raw[p + 2] = (byte)((b - pb) & 0xFF);
+                    raw[p + 3] = (byte)((a - pa) & 0xFF);
+                    pr = r;
+                    pg = g;
+                    pb = b;
+                    pa = a;
+                    p = p + 4;
+                }
+            }
+
+            int initCap = n / 2 + 1024;
+            EncBuf zbuf = new EncBuf(initCap);
+            // zlib header: CMF=0x78 (deflate 32K), FLG=0x01
+            zbuf.Put1(0x78);
+            zbuf.Put1(0x01);
+
+            int[] head = new int[4096];
+            for (int i = 0; i < 4096; i = i + 1) head[i] = -1;
+
+            uint[] litCode = ImageEncoder.DefLitCode;
+            int[] litBits = ImageEncoder.DefLitBits;
+            uint[] distRev = ImageEncoder.DefDistRev;
+            int[] lb = ImageEncoder.LenBase;
+            int[] leb = ImageEncoder.LenEb;
+            int[] db = ImageEncoder.DistBase;
+            int[] deb = ImageEncoder.DistEb;
+
+            byte[] zdata = zbuf.Data;
+            int zlen = zbuf.Len;
+            int zcap = zbuf.Cap;
+            uint acc = 1u | (1u << 1); // BFINAL=1 (1 bit) + BTYPE=01 (2 bits)
+            int bcnt = 3;
+
+            int pos = 0;
+            while (pos < n) {
+                if (zlen + 16 > zcap) {
+                    zbuf.Len = zlen;
+                    zbuf.Reserve(16);
+                    if (zbuf.Oom) break;
+                    zdata = zbuf.Data;
+                    zcap = zbuf.Cap;
+                }
+                int bestLen = 0;
+                int bestDist = 0;
+                if (pos + 3 <= n) {
+                    uint h3 = ((uint)raw[pos] << 16) | ((uint)raw[pos + 1] << 8) | (uint)raw[pos + 2];
+                    int hv = (int)((h3 * 2654435761u) >> 20);
+                    int prev = head[hv];
+                    head[hv] = pos;
+                    if (prev >= 0) {
+                        int dist = pos - prev;
+                        if (dist > 0 && dist <= 32768) {
+                            int maxL = n - pos;
+                            if (maxL > 258) maxL = 258;
+                            int l = 0;
+                            while (l < maxL && raw[prev + l] == raw[pos + l]) l = l + 1;
+                            if (l >= 3) {
+                                bestLen = l;
+                                bestDist = dist;
+                            }
+                        }
+                    }
+                }
+                if (bestLen >= 3) {
+                    int li = 0;
+                    while (li < 28 && bestLen >= lb[li + 1]) li = li + 1;
+                    int lsym = 257 + li;
+                    acc = acc | (litCode[lsym] << bcnt);
+                    bcnt = bcnt + litBits[lsym];
+                    while (bcnt >= 8) {
+                        zdata[zlen] = (byte)(acc & 0xFFu);
+                        zlen = zlen + 1;
+                        acc = acc >> 8;
+                        bcnt = bcnt - 8;
+                    }
+                    int le = leb[li];
+                    if (le > 0) {
+                        acc = acc | ((uint)(bestLen - lb[li]) << bcnt);
+                        bcnt = bcnt + le;
+                        while (bcnt >= 8) {
+                            zdata[zlen] = (byte)(acc & 0xFFu);
+                            zlen = zlen + 1;
+                            acc = acc >> 8;
+                            bcnt = bcnt - 8;
+                        }
+                    }
+                    int di = 0;
+                    while (di < 29 && bestDist >= db[di + 1]) di = di + 1;
+                    acc = acc | (distRev[di] << bcnt);
+                    bcnt = bcnt + 5;
+                    while (bcnt >= 8) {
+                        zdata[zlen] = (byte)(acc & 0xFFu);
+                        zlen = zlen + 1;
+                        acc = acc >> 8;
+                        bcnt = bcnt - 8;
+                    }
+                    int de = deb[di];
+                    if (de > 0) {
+                        acc = acc | ((uint)(bestDist - db[di]) << bcnt);
+                        bcnt = bcnt + de;
+                        while (bcnt >= 8) {
+                            zdata[zlen] = (byte)(acc & 0xFFu);
+                            zlen = zlen + 1;
+                            acc = acc >> 8;
+                            bcnt = bcnt - 8;
+                        }
+                    }
+
+                    int endM = pos + bestLen;
+                    pos = pos + 1;
+                    while (pos < endM && pos + 3 <= n) {
+                        uint h3 = ((uint)raw[pos] << 16) | ((uint)raw[pos + 1] << 8) | (uint)raw[pos + 2];
+                        head[(int)((h3 * 2654435761u) >> 20)] = pos;
+                        pos = pos + 1;
+                    }
+                    pos = endM;
+                } else {
+                    int sym = (int)raw[pos];
+                    pos = pos + 1;
+                    acc = acc | (litCode[sym] << bcnt);
+                    bcnt = bcnt + litBits[sym];
+                    while (bcnt >= 8) {
+                        zdata[zlen] = (byte)(acc & 0xFFu);
+                        zlen = zlen + 1;
+                        acc = acc >> 8;
+                        bcnt = bcnt - 8;
+                    }
+                }
+            }
+
+            zbuf.Len = zlen;
+            zbuf.Reserve(16);
+            if (!zbuf.Oom) {
+                zdata = zbuf.Data;
+                acc = acc | (litCode[256] << bcnt); // EOB
+                bcnt = bcnt + litBits[256];
+                while (bcnt >= 8) {
+                    zdata[zlen] = (byte)(acc & 0xFFu);
+                    zlen = zlen + 1;
+                    acc = acc >> 8;
+                    bcnt = bcnt - 8;
+                }
+                if (bcnt > 0) {
+                    zdata[zlen] = (byte)(acc & 0xFFu);
+                    zlen = zlen + 1;
+                }
+                zbuf.Len = zlen;
+            }
+
+            uint adler = ImageEncoder.PngAdler32(raw, n);
+            zbuf.PutBe32(adler);
+            if (zbuf.Oom) return null;
+
+            EncBuf outBuf = new EncBuf(zbuf.Len + 128);
+            outBuf.PutBytes(ImageEncoder.PngSig, 8);
+
+            byte[] ihdr = new byte[13];
+            ihdr[0] = (byte)((w >> 24) & 0xFF);
+            ihdr[1] = (byte)((w >> 16) & 0xFF);
+            ihdr[2] = (byte)((w >> 8) & 0xFF);
+            ihdr[3] = (byte)(w & 0xFF);
+            ihdr[4] = (byte)((h >> 24) & 0xFF);
+            ihdr[5] = (byte)((h >> 16) & 0xFF);
+            ihdr[6] = (byte)((h >> 8) & 0xFF);
+            ihdr[7] = (byte)(h & 0xFF);
+            ihdr[8] = 8; // bit depth
+            ihdr[9] = 6; // RGBA
+            ihdr[10] = 0;
+            ihdr[11] = 0;
+            ihdr[12] = 0;
+
+            ImageEncoder.PngWriteChunk(outBuf, ImageEncoder.TagIhdr, ihdr, 13);
+            ImageEncoder.PngWriteChunk(outBuf, ImageEncoder.TagIdat, zbuf.Data, zbuf.Len);
+            ImageEncoder.PngWriteChunk(outBuf, ImageEncoder.TagIend, null, 0);
+            return outBuf.ToExactBytes();
+        } finally {
+            NativeMemory.Free(rawPtr);
+        }
+    }
+
+    public static byte[] EncodeArgb(nint pixels, int w, int h, int stride, int format, int quality) {
+        if (pixels == 0 || !ImageEncoder.DimensionsOk(w, h) || stride < w) return null;
+        if ((long)stride * (long)h * 4L > 2147483591L) return null;
+        if (format == 1) return ImageEncoder.EncodePng(pixels, w, h, stride);
+        if (format == 2) return ImageEncoder.EncodeJpeg(pixels, w, h, stride, quality);
+        if (format == 3) return ImageEncoder.EncodeBmp(pixels, w, h, stride, true);
+        if (format == 4) return ImageEncoder.EncodeTga(pixels, w, h, stride);
+        if (format == 5) return ImageEncoder.EncodeBmp(pixels, w, h, stride, false);
+        return null;
+    }
+}

@@ -1,0 +1,654 @@
+using System;
+
+namespace System.Drawing.Imaging;
+
+internal class ResampleTable {
+    public int[] Starts;
+    public int[] Counts;
+    public int[] Offsets;
+    public short[] Weights;
+}
+
+// 纯 Zan 高性能 ARGB32 图像像素算子（零外部依赖，跨全部 10 目标统一行为）：
+// - 行主序连续访存（消除列遍历造成的 Cache 抖动）
+// - 14-bit 定点数可分离 Lanczos-3 / Area 缩放（预计算权重表，内层零浮点）
+// - 16.16 定点双线性缩放（双通道并行乘加）
+// - 32x32 Cache-Tiled 旋转转置
+// - 256-entry 查表调色 + O(1) 行主序滑窗模糊 + 3x3 锐化 + 定点数 Porter-Duff Over 合成
+internal class ImagePixelOps {
+    private static bool DimensionsOk(int w, int h) {
+        if (w <= 0 || h <= 0 || w > 32768 || h > 32768) return false;
+        return (long)w * (long)h * 4L <= 2147483591L;
+    }
+
+    private static uint ClampU8(int v) {
+        if (v < 0) return 0u;
+        if (v > 255) return 255u;
+        return (uint)v;
+    }
+
+    private static double Lanczos3Kernel(double x) {
+        if (x < 0.0) x = -x;
+        if (x < 1e-9) return 1.0;
+        if (x >= 3.0) return 0.0;
+        double pi = 3.14159265358979323846;
+        double px = pi * x;
+        double px3 = px / 3.0;
+        return (Math.Sin(px) / px) * (Math.Sin(px3) / px3);
+    }
+
+    private static double BoxKernel(double x) {
+        if (x < 0.0) x = -x;
+        return x < 0.5 ? 1.0 : 0.0;
+    }
+
+    private static ResampleTable BuildResampleTable(int srcLen, int dstLen, double radius, bool useLanczos) {
+        double ratio = (double)srcLen / (double)dstLen;
+        double scale = ratio > 1.0 ? ratio : 1.0;
+        double support = radius * scale;
+        int maxTaps = (int)Math.Ceiling(support * 2.0) + 4;
+        if (maxTaps > srcLen) maxTaps = srcLen;
+        if (maxTaps < 1) maxTaps = 1;
+        long totalWeightsL = (long)dstLen * (long)maxTaps;
+        if (totalWeightsL <= 0L || totalWeightsL * 2L > 2147483591L) return null;
+
+        ResampleTable tbl = new ResampleTable();
+        tbl.Starts = new int[dstLen];
+        tbl.Counts = new int[dstLen];
+        tbl.Offsets = new int[dstLen];
+        tbl.Weights = new short[(int)totalWeightsL];
+        double[] tmpw = new double[maxTaps];
+
+        int totalW = 0;
+        for (int d = 0; d < dstLen; d = d + 1) {
+            double center = ((double)d + 0.5) * ratio - 0.5;
+            int left = (int)Math.Floor(center - support);
+            int right = (int)Math.Ceiling(center + support);
+            if (left < 0) left = 0;
+            if (right >= srcLen) right = srcLen - 1;
+            if (right < left) right = left;
+
+            int cnt = right - left + 1;
+            if (cnt > maxTaps) cnt = maxTaps;
+            double sum = 0.0;
+            for (int k = 0; k < cnt; k = k + 1) {
+                double dist = ((double)(left + k) - center) / scale;
+                double w = useLanczos ? ImagePixelOps.Lanczos3Kernel(dist) : ImagePixelOps.BoxKernel(dist);
+                tmpw[k] = w;
+                sum = sum + w;
+            }
+            int trimStart = 0;
+            if (sum == 0.0) {
+                cnt = 1;
+                int cidx = (int)Math.Floor(center + 0.5);
+                if (cidx < 0) cidx = 0;
+                if (cidx >= srcLen) cidx = srcLen - 1;
+                left = cidx;
+                tmpw[0] = 1.0;
+                sum = 1.0;
+            }
+            while (cnt > 1 && Math.Abs(tmpw[trimStart]) < 1e-6) {
+                left = left + 1;
+                trimStart = trimStart + 1;
+                cnt = cnt - 1;
+            }
+            while (cnt > 1 && Math.Abs(tmpw[trimStart + cnt - 1]) < 1e-6) {
+                cnt = cnt - 1;
+            }
+
+            tbl.Starts[d] = left;
+            tbl.Counts[d] = cnt;
+            tbl.Offsets[d] = totalW;
+
+            double inv = 16384.0 / sum;
+            int qsum = 0;
+            int peak = 0;
+            int peakAbs = -1;
+            for (int k = 0; k < cnt; k = k + 1) {
+                double v = tmpw[trimStart + k] * inv;
+                int iv = (int)(v >= 0.0 ? (v + 0.5) : (v - 0.5));
+                tbl.Weights[totalW + k] = (short)iv;
+                qsum = qsum + iv;
+                int av = iv < 0 ? -iv : iv;
+                if (av > peakAbs) {
+                    peakAbs = av;
+                    peak = k;
+                }
+            }
+            tbl.Weights[totalW + peak] = (short)((int)tbl.Weights[totalW + peak] + (16384 - qsum));
+            totalW = totalW + cnt;
+        }
+        return tbl;
+    }
+
+    private static bool ResizeSeparable(nint src, int sw, int sh, nint dst, int dw, int dh,
+                                        double radius, bool useLanczos) {
+        long midBytesL = (long)dw * (long)sh * 4L;
+        long accBytesL = (long)dw * 16L;
+        if (midBytesL <= 0L || midBytesL > 2147483591L || accBytesL <= 0L || accBytesL > 2147483591L) {
+            return false;
+        }
+
+        ResampleTable hx = ImagePixelOps.BuildResampleTable(sw, dw, radius, useLanczos);
+        if (hx == null) return false;
+        ResampleTable vy = ImagePixelOps.BuildResampleTable(sh, dh, radius, useLanczos);
+        if (vy == null) return false;
+
+        nint midPtr = NativeMemory.Alloc((int)midBytesL);
+        if (midPtr == 0) return false;
+        nint accPtr = NativeMemory.Alloc((int)accBytesL);
+        if (accPtr == 0) {
+            NativeMemory.Free(midPtr);
+            return false;
+        }
+
+        try {
+            int[] hxStarts = hx.Starts;
+            int[] hxCounts = hx.Counts;
+            int[] hxOffsets = hx.Offsets;
+            short[] hxWeights = hx.Weights;
+
+            // 水平阶段：行主序连续读写
+            for (int y = 0; y < sh; y = y + 1) {
+                Span<uint> srow = new Span<uint>(src + (nint)((long)y * (long)sw * 4L), sw);
+                Span<uint> mrow = new Span<uint>(midPtr + (nint)((long)y * (long)dw * 4L), dw);
+                for (int x = 0; x < dw; x = x + 1) {
+                    int st = hxStarts[x];
+                    int cnt = hxCounts[x];
+                    int woff = hxOffsets[x];
+                    int sb = 8192;
+                    int sg = 8192;
+                    int sr = 8192;
+                    int sa = 8192;
+                    for (int k = 0; k < cnt; k = k + 1) {
+                        uint p = srow[st + k];
+                        int wk = (int)hxWeights[woff + k];
+                        sb = sb + (int)(p & 0xFFu) * wk;
+                        sg = sg + (int)((p >> 8) & 0xFFu) * wk;
+                        sr = sr + (int)((p >> 16) & 0xFFu) * wk;
+                        sa = sa + (int)((p >> 24) & 0xFFu) * wk;
+                    }
+                    uint b = ImagePixelOps.ClampU8(sb >> 14);
+                    uint g = ImagePixelOps.ClampU8(sg >> 14);
+                    uint r = ImagePixelOps.ClampU8(sr >> 14);
+                    uint a = ImagePixelOps.ClampU8(sa >> 14);
+                    mrow[x] = b | (g << 8) | (r << 16) | (a << 24);
+                }
+            }
+
+            // 垂直阶段：外层按输出行、内层按 x 顺序推进，保持连续访存
+            int[] vyStarts = vy.Starts;
+            int[] vyCounts = vy.Counts;
+            int[] vyOffsets = vy.Offsets;
+            short[] vyWeights = vy.Weights;
+            Span<int> acc = new Span<int>(accPtr, dw * 4);
+
+            for (int y = 0; y < dh; y = y + 1) {
+                int st = vyStarts[y];
+                int cnt = vyCounts[y];
+                int woff = vyOffsets[y];
+                Span<uint> drow = new Span<uint>(dst + (nint)((long)y * (long)dw * 4L), dw);
+
+                Span<uint> mrow0 = new Span<uint>(midPtr + (nint)((long)st * (long)dw * 4L), dw);
+                int w0 = (int)vyWeights[woff];
+                for (int x = 0; x < dw; x = x + 1) {
+                    uint p = mrow0[x];
+                    int baseIdx = x * 4;
+                    acc[baseIdx] = 8192 + (int)(p & 0xFFu) * w0;
+                    acc[baseIdx + 1] = 8192 + (int)((p >> 8) & 0xFFu) * w0;
+                    acc[baseIdx + 2] = 8192 + (int)((p >> 16) & 0xFFu) * w0;
+                    acc[baseIdx + 3] = 8192 + (int)((p >> 24) & 0xFFu) * w0;
+                }
+                for (int k = 1; k < cnt; k = k + 1) {
+                    Span<uint> mrowk = new Span<uint>(midPtr + (nint)((long)(st + k) * (long)dw * 4L), dw);
+                    int wk = (int)vyWeights[woff + k];
+                    for (int x = 0; x < dw; x = x + 1) {
+                        uint p = mrowk[x];
+                        int baseIdx = x * 4;
+                        acc[baseIdx] = acc[baseIdx] + (int)(p & 0xFFu) * wk;
+                        acc[baseIdx + 1] = acc[baseIdx + 1] + (int)((p >> 8) & 0xFFu) * wk;
+                        acc[baseIdx + 2] = acc[baseIdx + 2] + (int)((p >> 16) & 0xFFu) * wk;
+                        acc[baseIdx + 3] = acc[baseIdx + 3] + (int)((p >> 24) & 0xFFu) * wk;
+                    }
+                }
+                for (int x = 0; x < dw; x = x + 1) {
+                    int baseIdx = x * 4;
+                    uint b = ImagePixelOps.ClampU8(acc[baseIdx] >> 14);
+                    uint g = ImagePixelOps.ClampU8(acc[baseIdx + 1] >> 14);
+                    uint r = ImagePixelOps.ClampU8(acc[baseIdx + 2] >> 14);
+                    uint a = ImagePixelOps.ClampU8(acc[baseIdx + 3] >> 14);
+                    drow[x] = b | (g << 8) | (r << 16) | (a << 24);
+                }
+            }
+            return true;
+        } finally {
+            NativeMemory.Free(accPtr);
+            NativeMemory.Free(midPtr);
+        }
+    }
+
+    private static bool ResizeBilinear(nint src, int sw, int sh, nint dst, int dw, int dh) {
+        int[] x0 = new int[dw];
+        int[] x1 = new int[dw];
+        int[] wx = new int[dw];
+
+        for (int dx = 0; dx < dw; dx = dx + 1) {
+            long fp = dw > 1 ? (((long)dx * (long)(sw - 1)) << 16) / (long)(dw - 1) : 0L;
+            int sx = (int)(fp >> 16);
+            int fx = (int)((fp & 0xFFFFL) >> 8);
+            if (sx >= sw - 1) {
+                sx = sw - 1;
+                x0[dx] = sx;
+                x1[dx] = sx;
+                wx[dx] = 0;
+            } else {
+                x0[dx] = sx;
+                x1[dx] = sx + 1;
+                wx[dx] = fx;
+            }
+        }
+
+        for (int dy = 0; dy < dh; dy = dy + 1) {
+            long fp = dh > 1 ? (((long)dy * (long)(sh - 1)) << 16) / (long)(dh - 1) : 0L;
+            int sy = (int)(fp >> 16);
+            int fy = (int)((fp & 0xFFFFL) >> 8);
+            int sy1 = sy < sh - 1 ? (sy + 1) : (sh - 1);
+            if (sy >= sh - 1) {
+                sy = sh - 1;
+                sy1 = sh - 1;
+                fy = 0;
+            }
+            uint ufy = (uint)fy;
+            uint uify = (uint)(256 - fy);
+
+            Span<uint> r0 = new Span<uint>(src + (nint)((long)sy * (long)sw * 4L), sw);
+            Span<uint> r1 = new Span<uint>(src + (nint)((long)sy1 * (long)sw * 4L), sw);
+            Span<uint> drow = new Span<uint>(dst + (nint)((long)dy * (long)dw * 4L), dw);
+
+            for (int dx = 0; dx < dw; dx = dx + 1) {
+                int i0 = x0[dx];
+                int i1 = x1[dx];
+                uint ufx = (uint)wx[dx];
+                uint uifx = 256u - ufx;
+                uint p00 = r0[i0];
+                uint p10 = r0[i1];
+                uint p01 = r1[i0];
+                uint p11 = r1[i1];
+
+                uint rb0 = ((p00 & 0x00FF00FFu) * uifx + (p10 & 0x00FF00FFu) * ufx) >> 8;
+                uint ga0 = (((p00 >> 8) & 0x00FF00FFu) * uifx + ((p10 >> 8) & 0x00FF00FFu) * ufx) >> 8;
+                uint rb1 = ((p01 & 0x00FF00FFu) * uifx + (p11 & 0x00FF00FFu) * ufx) >> 8;
+                uint ga1 = (((p01 >> 8) & 0x00FF00FFu) * uifx + ((p11 >> 8) & 0x00FF00FFu) * ufx) >> 8;
+
+                uint rb = (((rb0 & 0x00FF00FFu) * uify + (rb1 & 0x00FF00FFu) * ufy + 0x00800080u) >> 8) & 0x00FF00FFu;
+                uint ga = (((ga0 & 0x00FF00FFu) * uify + (ga1 & 0x00FF00FFu) * ufy + 0x00800080u) >> 8) & 0x00FF00FFu;
+                drow[dx] = rb | (ga << 8);
+            }
+        }
+        return true;
+    }
+
+    // filter: 0=Nearest, 1=Bilinear, 2=Area/Box, 3=Lanczos-3
+    public static bool ResizeArgb(nint src, int sw, int sh, nint dst, int dw, int dh, int filter) {
+        if (src == 0 || dst == 0 || !ImagePixelOps.DimensionsOk(sw, sh) || !ImagePixelOps.DimensionsOk(dw, dh)) {
+            return false;
+        }
+        if (sw == dw && sh == dh) {
+            NativeMemory.Copy(dst, src, sw * sh * 4);
+            return true;
+        }
+        if (filter == 0) {
+            int[] xmap = new int[dw];
+            for (int dx = 0; dx < dw; dx = dx + 1) {
+                int sx = (int)((long)dx * (long)sw / (long)dw);
+                if (sx >= sw) sx = sw - 1;
+                xmap[dx] = sx;
+            }
+            for (int dy = 0; dy < dh; dy = dy + 1) {
+                int sy = (int)((long)dy * (long)sh / (long)dh);
+                if (sy >= sh) sy = sh - 1;
+                Span<uint> srow = new Span<uint>(src + (nint)((long)sy * (long)sw * 4L), sw);
+                Span<uint> drow = new Span<uint>(dst + (nint)((long)dy * (long)dw * 4L), dw);
+                for (int dx = 0; dx < dw; dx = dx + 1) {
+                    drow[dx] = srow[xmap[dx]];
+                }
+            }
+            return true;
+        }
+        if (filter == 1) return ImagePixelOps.ResizeBilinear(src, sw, sh, dst, dw, dh);
+        if (filter == 2) return ImagePixelOps.ResizeSeparable(src, sw, sh, dst, dw, dh, 0.5, false);
+        return ImagePixelOps.ResizeSeparable(src, sw, sh, dst, dw, dh, 3.0, true);
+    }
+
+    // 32x32 Cache-Tiled 旋转（mode: 90, 180, 270）
+    public static bool RotateArgb(nint src, int sw, int sh, nint dst, int mode) {
+        if (src == 0 || dst == 0 || !ImagePixelOps.DimensionsOk(sw, sh)) return false;
+        int n = sw * sh;
+        if (mode == 180) {
+            Span<uint> sp = new Span<uint>(src, n);
+            Span<uint> dp = new Span<uint>(dst, n);
+            int last = n - 1;
+            for (int i = 0; i < n; i = i + 1) {
+                dp[last - i] = sp[i];
+            }
+            return true;
+        }
+        int tile = 32;
+        if (mode == 90) {
+            Span<uint> dp = new Span<uint>(dst, n);
+            for (int by = 0; by < sh; by = by + tile) {
+                int yend = by + tile < sh ? (by + tile) : sh;
+                for (int bx = 0; bx < sw; bx = bx + tile) {
+                    int xend = bx + tile < sw ? (bx + tile) : sw;
+                    for (int y = by; y < yend; y = y + 1) {
+                        int dx = sh - 1 - y;
+                        Span<uint> srow = new Span<uint>(src + (nint)((long)y * (long)sw * 4L), sw);
+                        for (int x = bx; x < xend; x = x + 1) {
+                            dp[x * sh + dx] = srow[x];
+                        }
+                    }
+                }
+            }
+            return true;
+        }
+        if (mode == 270) {
+            Span<uint> dp = new Span<uint>(dst, n);
+            for (int by = 0; by < sh; by = by + tile) {
+                int yend = by + tile < sh ? (by + tile) : sh;
+                for (int bx = 0; bx < sw; bx = bx + tile) {
+                    int xend = bx + tile < sw ? (bx + tile) : sw;
+                    for (int y = by; y < yend; y = y + 1) {
+                        Span<uint> srow = new Span<uint>(src + (nint)((long)y * (long)sw * 4L), sw);
+                        for (int x = bx; x < xend; x = x + 1) {
+                            dp[(sw - 1 - x) * sh + y] = srow[x];
+                        }
+                    }
+                }
+            }
+            return true;
+        }
+        return false;
+    }
+
+    // LUT 对比度 + 定点数饱和度 + 灰度（单遍融合，保留 Alpha）
+    public static void ColorAdjustArgb(nint pixels, int count, int contrastPct, int satPct, bool grayscale) {
+        if (pixels == 0 || count <= 0 || (long)count * 4L > 2147483591L) return;
+        Span<uint> pix = new Span<uint>(pixels, count);
+        if (contrastPct != 0) {
+            if (contrastPct < -100) contrastPct = -100;
+            if (contrastPct > 100) contrastPct = 100;
+            double f = (100.0 + (double)contrastPct) / 100.0;
+            f = f * f;
+            int f256 = (int)(f * 256.0 + 0.5);
+            uint[] lut = new uint[256];
+            for (int i = 0; i < 256; i = i + 1) {
+                lut[i] = ImagePixelOps.ClampU8((((i - 128) * f256) >> 8) + 128);
+            }
+            for (int i = 0; i < count; i = i + 1) {
+                uint p = pix[i];
+                uint b = lut[(int)(p & 0xFFu)];
+                uint g = lut[(int)((p >> 8) & 0xFFu)];
+                uint r = lut[(int)((p >> 16) & 0xFFu)];
+                pix[i] = b | (g << 8) | (r << 16) | (p & 0xFF000000u);
+            }
+        }
+        if (grayscale) {
+            for (int i = 0; i < count; i = i + 1) {
+                uint p = pix[i];
+                uint b = p & 0xFFu;
+                uint g = (p >> 8) & 0xFFu;
+                uint r = (p >> 16) & 0xFFu;
+                uint y = (b * 29u + g * 150u + r * 77u) >> 8;
+                pix[i] = y | (y << 8) | (y << 16) | (p & 0xFF000000u);
+            }
+        } else if (satPct != 0) {
+            if (satPct < -100) satPct = -100;
+            if (satPct > 200) satPct = 200;
+            int s256 = (100 + satPct) * 256 / 100;
+            for (int i = 0; i < count; i = i + 1) {
+                uint p = pix[i];
+                int b = (int)(p & 0xFFu);
+                int g = (int)((p >> 8) & 0xFFu);
+                int r = (int)((p >> 16) & 0xFFu);
+                int lum = (b * 29 + g * 150 + r * 77) >> 8;
+                uint ob = ImagePixelOps.ClampU8(lum + (((b - lum) * s256) >> 8));
+                uint og = ImagePixelOps.ClampU8(lum + (((g - lum) * s256) >> 8));
+                uint orv = ImagePixelOps.ClampU8(lum + (((r - lum) * s256) >> 8));
+                pix[i] = ob | (og << 8) | (orv << 16) | (p & 0xFF000000u);
+            }
+        }
+    }
+
+    // 行主序 O(1) 可分离滑窗模糊（passes=1 盒式模糊，passes=3 近似高斯模糊）
+    public static bool BoxBlurArgb(nint pixels, int w, int h, int radius, int passes) {
+        if (pixels == 0 || !ImagePixelOps.DimensionsOk(w, h) || w <= 1 || h <= 1 || radius <= 0) {
+            return false;
+        }
+        if (passes < 1) passes = 1;
+        if (passes > 5) passes = 5;
+        int rx = radius < w - 1 ? radius : (w - 1);
+        int ry = radius < h - 1 ? radius : (h - 1);
+
+        long tmpBytesL = (long)w * (long)h * 4L;
+        long colBytesL = (long)w * 16L;
+        if (tmpBytesL <= 0L || tmpBytesL > 2147483591L || colBytesL <= 0L || colBytesL > 2147483591L) {
+            return false;
+        }
+
+        nint tmpPtr = NativeMemory.Alloc((int)tmpBytesL);
+        if (tmpPtr == 0) return false;
+        nint colPtr = NativeMemory.Alloc((int)colBytesL);
+        if (colPtr == 0) {
+            NativeMemory.Free(tmpPtr);
+            return false;
+        }
+
+        try {
+            int winX = 2 * rx + 1;
+            int winY = 2 * ry + 1;
+            ulong one32 = (ulong)1 << 32;
+            ulong half31 = (ulong)1 << 31;
+            ulong invX = (one32 + (ulong)(winX / 2)) / (ulong)winX;
+            ulong invY = (one32 + (ulong)(winY / 2)) / (ulong)winY;
+            Span<int> colSum = new Span<int>(colPtr, w * 4);
+
+            for (int pass = 0; pass < passes; pass = pass + 1) {
+                // 水平通行：pixels -> tmp
+                for (int y = 0; y < h; y = y + 1) {
+                    Span<uint> srow = new Span<uint>(pixels + (nint)((long)y * (long)w * 4L), w);
+                    Span<uint> trow = new Span<uint>(tmpPtr + (nint)((long)y * (long)w * 4L), w);
+                    uint p0 = srow[0];
+                    int sb = (int)(p0 & 0xFFu) * (rx + 1);
+                    int sg = (int)((p0 >> 8) & 0xFFu) * (rx + 1);
+                    int sr = (int)((p0 >> 16) & 0xFFu) * (rx + 1);
+                    int sa = (int)((p0 >> 24) & 0xFFu) * (rx + 1);
+                    for (int k = 1; k <= rx; k = k + 1) {
+                        uint pk = srow[k < w ? k : (w - 1)];
+                        sb = sb + (int)(pk & 0xFFu);
+                        sg = sg + (int)((pk >> 8) & 0xFFu);
+                        sr = sr + (int)((pk >> 16) & 0xFFu);
+                        sa = sa + (int)((pk >> 24) & 0xFFu);
+                    }
+                    for (int x = 0; x < w; x = x + 1) {
+                        uint ob = (uint)(((ulong)(uint)sb * invX + half31) >> 32);
+                        uint og = (uint)(((ulong)(uint)sg * invX + half31) >> 32);
+                        uint orv = (uint)(((ulong)(uint)sr * invX + half31) >> 32);
+                        uint oa = (uint)(((ulong)(uint)sa * invX + half31) >> 32);
+                        if (ob > 255u) ob = 255u;
+                        if (og > 255u) og = 255u;
+                        if (orv > 255u) orv = 255u;
+                        if (oa > 255u) oa = 255u;
+                        trow[x] = ob | (og << 8) | (orv << 16) | (oa << 24);
+
+                        int ex = x + rx + 1;
+                        if (ex >= w) ex = w - 1;
+                        int lx = x - rx;
+                        if (lx < 0) lx = 0;
+                        uint pe = srow[ex];
+                        uint pl = srow[lx];
+                        sb = sb + (int)(pe & 0xFFu) - (int)(pl & 0xFFu);
+                        sg = sg + (int)((pe >> 8) & 0xFFu) - (int)((pl >> 8) & 0xFFu);
+                        sr = sr + (int)((pe >> 16) & 0xFFu) - (int)((pl >> 16) & 0xFFu);
+                        sa = sa + (int)((pe >> 24) & 0xFFu) - (int)((pl >> 24) & 0xFFu);
+                    }
+                }
+
+                // 垂直通行（行主序扫描，保持 L1 连续访存）：tmp -> pixels
+                Span<uint> top0 = new Span<uint>(tmpPtr, w);
+                for (int x = 0; x < w; x = x + 1) {
+                    uint p = top0[x];
+                    int baseIdx = x * 4;
+                    colSum[baseIdx] = (int)(p & 0xFFu) * (ry + 1);
+                    colSum[baseIdx + 1] = (int)((p >> 8) & 0xFFu) * (ry + 1);
+                    colSum[baseIdx + 2] = (int)((p >> 16) & 0xFFu) * (ry + 1);
+                    colSum[baseIdx + 3] = (int)((p >> 24) & 0xFFu) * (ry + 1);
+                }
+                for (int k = 1; k <= ry; k = k + 1) {
+                    int rk = k < h ? k : (h - 1);
+                    Span<uint> rowk = new Span<uint>(tmpPtr + (nint)((long)rk * (long)w * 4L), w);
+                    for (int x = 0; x < w; x = x + 1) {
+                        uint p = rowk[x];
+                        int baseIdx = x * 4;
+                        colSum[baseIdx] = colSum[baseIdx] + (int)(p & 0xFFu);
+                        colSum[baseIdx + 1] = colSum[baseIdx + 1] + (int)((p >> 8) & 0xFFu);
+                        colSum[baseIdx + 2] = colSum[baseIdx + 2] + (int)((p >> 16) & 0xFFu);
+                        colSum[baseIdx + 3] = colSum[baseIdx + 3] + (int)((p >> 24) & 0xFFu);
+                    }
+                }
+                for (int y = 0; y < h; y = y + 1) {
+                    Span<uint> drow = new Span<uint>(pixels + (nint)((long)y * (long)w * 4L), w);
+                    int ey = y + ry + 1;
+                    if (ey >= h) ey = h - 1;
+                    int ly = y - ry;
+                    if (ly < 0) ly = 0;
+                    Span<uint> erow = new Span<uint>(tmpPtr + (nint)((long)ey * (long)w * 4L), w);
+                    Span<uint> lrow = new Span<uint>(tmpPtr + (nint)((long)ly * (long)w * 4L), w);
+                    for (int x = 0; x < w; x = x + 1) {
+                        int baseIdx = x * 4;
+                        uint ob = (uint)(((ulong)(uint)colSum[baseIdx] * invY + half31) >> 32);
+                        uint og = (uint)(((ulong)(uint)colSum[baseIdx + 1] * invY + half31) >> 32);
+                        uint orv = (uint)(((ulong)(uint)colSum[baseIdx + 2] * invY + half31) >> 32);
+                        uint oa = (uint)(((ulong)(uint)colSum[baseIdx + 3] * invY + half31) >> 32);
+                        if (ob > 255u) ob = 255u;
+                        if (og > 255u) og = 255u;
+                        if (orv > 255u) orv = 255u;
+                        if (oa > 255u) oa = 255u;
+                        drow[x] = ob | (og << 8) | (orv << 16) | (oa << 24);
+
+                        uint pe = erow[x];
+                        uint pl = lrow[x];
+                        colSum[baseIdx] = colSum[baseIdx] + (int)(pe & 0xFFu) - (int)(pl & 0xFFu);
+                        colSum[baseIdx + 1] = colSum[baseIdx + 1] + (int)((pe >> 8) & 0xFFu) - (int)((pl >> 8) & 0xFFu);
+                        colSum[baseIdx + 2] = colSum[baseIdx + 2] + (int)((pe >> 16) & 0xFFu) - (int)((pl >> 16) & 0xFFu);
+                        colSum[baseIdx + 3] = colSum[baseIdx + 3] + (int)((pe >> 24) & 0xFFu) - (int)((pl >> 24) & 0xFFu);
+                    }
+                }
+            }
+            return true;
+        } finally {
+            NativeMemory.Free(colPtr);
+            NativeMemory.Free(tmpPtr);
+        }
+    }
+
+    // 3x3 卷积锐化（amountPct: 1..300，保留 Alpha 与图像边缘）
+    public static bool SharpenArgb(nint pixels, int w, int h, int amountPct) {
+        if (pixels == 0 || !ImagePixelOps.DimensionsOk(w, h) || w < 3 || h < 3 || amountPct <= 0) {
+            return false;
+        }
+        if (amountPct > 300) amountPct = 300;
+        int k256 = (amountPct * 256) / 100;
+        int totalBytes = w * h * 4;
+        nint copyPtr = NativeMemory.Alloc(totalBytes);
+        if (copyPtr == 0) return false;
+
+        try {
+            NativeMemory.Copy(copyPtr, pixels, totalBytes);
+            for (int y = 1; y < h - 1; y = y + 1) {
+                Span<uint> r0 = new Span<uint>(copyPtr + (nint)((long)(y - 1) * (long)w * 4L), w);
+                Span<uint> r1 = new Span<uint>(copyPtr + (nint)((long)y * (long)w * 4L), w);
+                Span<uint> r2 = new Span<uint>(copyPtr + (nint)((long)(y + 1) * (long)w * 4L), w);
+                Span<uint> drow = new Span<uint>(pixels + (nint)((long)y * (long)w * 4L), w);
+                for (int x = 1; x < w - 1; x = x + 1) {
+                    uint c = r1[x];
+                    uint u = r0[x];
+                    uint d = r2[x];
+                    uint l = r1[x - 1];
+                    uint r = r1[x + 1];
+                    int cb = (int)(c & 0xFFu);
+                    int cg = (int)((c >> 8) & 0xFFu);
+                    int cr = (int)((c >> 16) & 0xFFu);
+
+                    int lb = 4 * cb - (int)(u & 0xFFu) - (int)(d & 0xFFu) - (int)(l & 0xFFu) - (int)(r & 0xFFu);
+                    int lg = 4 * cg - (int)((u >> 8) & 0xFFu) - (int)((d >> 8) & 0xFFu)
+                           - (int)((l >> 8) & 0xFFu) - (int)((r >> 8) & 0xFFu);
+                    int lr = 4 * cr - (int)((u >> 16) & 0xFFu) - (int)((d >> 16) & 0xFFu)
+                           - (int)((l >> 16) & 0xFFu) - (int)((r >> 16) & 0xFFu);
+
+                    uint ob = ImagePixelOps.ClampU8(cb + ((lb * k256) >> 8));
+                    uint og = ImagePixelOps.ClampU8(cg + ((lg * k256) >> 8));
+                    uint orv = ImagePixelOps.ClampU8(cr + ((lr * k256) >> 8));
+                    drow[x] = ob | (og << 8) | (orv << 16) | (c & 0xFF000000u);
+                }
+            }
+            return true;
+        } finally {
+            NativeMemory.Free(copyPtr);
+        }
+    }
+
+    // 带透明度缩放 (alphaScale: 1..255) 的高速 Porter-Duff Over 合成
+    public static bool BlitArgb(nint dst, int dw, int dh, nint src, int sw, int sh,
+                                int dx, int dy, int alphaScale) {
+        if (dst == 0 || src == 0 || dw <= 0 || dh <= 0 || sw <= 0 || sh <= 0 || alphaScale <= 0) {
+            return false;
+        }
+        if ((long)dw * (long)dh * 4L > 2147483591L || (long)sw * (long)sh * 4L > 2147483591L) {
+            return false;
+        }
+        if (alphaScale > 255) alphaScale = 255;
+
+        int sx = 0;
+        int sy = 0;
+        int cw = sw;
+        int ch = sh;
+        if (dx < 0) {
+            sx = sx - dx;
+            cw = cw + dx;
+            dx = 0;
+        }
+        if (dy < 0) {
+            sy = sy - dy;
+            ch = ch + dy;
+            dy = 0;
+        }
+        if (dx + cw > dw) cw = dw - dx;
+        if (dy + ch > dh) ch = dh - dy;
+        if (cw <= 0 || ch <= 0) return true;
+
+        uint uScale = (uint)alphaScale;
+        for (int y = 0; y < ch; y = y + 1) {
+            Span<uint> drow = new Span<uint>(dst + (nint)(((long)(dy + y) * (long)dw + (long)dx) * 4L), cw);
+            Span<uint> srow = new Span<uint>(src + (nint)(((long)(sy + y) * (long)sw + (long)sx) * 4L), cw);
+            for (int x = 0; x < cw; x = x + 1) {
+                uint sp = srow[x];
+                uint sa = (sp >> 24) & 0xFFu;
+                if (alphaScale < 255) sa = (sa * uScale + 127u) / 255u;
+                if (sa == 0u) continue;
+                if (sa == 255u) {
+                    drow[x] = (sp & 0x00FFFFFFu) | 0xFF000000u;
+                    continue;
+                }
+                uint dp = drow[x];
+                uint inv = 255u - sa;
+                uint da = (dp >> 24) & 0xFFu;
+                uint outA = sa + (((da * inv + 127u) * 257u) >> 16);
+                uint b = (((sp & 0xFFu) * sa + (dp & 0xFFu) * inv + 127u) * 257u) >> 16;
+                uint g = ((((sp >> 8) & 0xFFu) * sa + ((dp >> 8) & 0xFFu) * inv + 127u) * 257u) >> 16;
+                uint r = ((((sp >> 16) & 0xFFu) * sa + ((dp >> 16) & 0xFFu) * inv + 127u) * 257u) >> 16;
+                drow[x] = (b & 0xFFu) | ((g & 0xFFu) << 8) | ((r & 0xFFu) << 16) | ((outA & 0xFFu) << 24);
+            }
+        }
+        return true;
+    }
+}
