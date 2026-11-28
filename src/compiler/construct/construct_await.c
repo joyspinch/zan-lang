@@ -11,6 +11,10 @@ static LLVMValueRef coerce_ternary_value(zan_irgen_t *g, LLVMValueRef v,
   if ((vk == LLVMFloatTypeKind || vk == LLVMDoubleTypeKind) &&
       tk == LLVMIntegerTypeKind)
     return emit_fptosi_guarded(g, v, target, (zan_loc_t){0}, NULL);
+  /* 结构体臂：`new S(...)` 产出栈槽指针，属性/字段读产出按值结构体；
+   * PHI 取按值类型，指针臂就地 load（`c ? Vector3.Zero : new Vector3(..)`）。 */
+  if (vk == LLVMPointerTypeKind && tk == LLVMStructTypeKind)
+    return LLVMBuildLoad2(g->builder, target, v, "tern.sload");
   return coerce_int_to(g, v, target);
 }
 LLVMValueRef emit_expr_conditional(zan_irgen_t *g, zan_ast_node_t *expr,
