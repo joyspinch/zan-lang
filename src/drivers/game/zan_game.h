@@ -319,6 +319,17 @@ ZAN_GAME_API void zan_game_set_sonar_pulse3d(int32_t enabled,
 ZAN_GAME_API void zan_game_set_post_halftone_comic3d(float strength,
     float dot_scale, float contrast);
 
+/* GPU 3D 世界空间科幻六边形能量护盾网格（Hex Force-Field Shield，零贴图零额外 Pass）：
+ * enabled != 0 时按世界坐标生成正六边形晶格边界发光与能量脉冲，edge_width [0.02..0.35]。 */
+ZAN_GAME_API void zan_game_set_force_field_hex3d(int32_t enabled,
+    float scale, float phase, float edge_width, float strength,
+    float r, float g, float b);
+
+/* GPU 后处理赛博故障水平撕裂与 RGB 通道分离（Cyberpunk Glitch RGB Split，单 Pass 零额外 FBO）：
+ * intensity [0..1] 控制触发密度与位移幅度，slice_count [4..128] 控制水平条带数，seed 控制帧随机种子。 */
+ZAN_GAME_API void zan_game_set_post_glitch_rgb3d(float intensity,
+    float slice_count, float seed);
+
 #ifdef __cplusplus
 }
 #endif

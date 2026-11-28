@@ -156,6 +156,7 @@ typedef struct {
     zgl_int u_lava_crust_params, u_lava_crust_color;
     zgl_int u_iridescence_params;
     zgl_int u_sonar_origin_radius, u_sonar_style, u_sonar_color;
+    zgl_int u_force_field_params, u_force_field_color;
     zgl_int u_light_dir, u_light_color, u_light_count, u_ambient;
     zgl_int u_cam_pos, u_cam_valid, u_material, u_emissive;
     zgl_int u_point_pos, u_point_color, u_point_count;
@@ -248,6 +249,8 @@ static float g_game_iridescence_params[4] = { 0.0f, 2.0f, 0.0f, 0.0f }; /* enabl
 static float g_game_sonar_origin_radius[4] = { 0.0f, 0.0f, 0.0f, 1.0f }; /* ox, oy, oz, radius */
 static float g_game_sonar_style[3] = { 0.0f, 0.6f, 0.0f }; /* enabled, ring_width, strength */
 static float g_game_sonar_color[3] = { 0.1f, 0.9f, 1.0f };
+static float g_game_force_field_params[4] = { 0.0f, 2.0f, 0.0f, 0.10f }; /* enabled, scale, phase, edge_width */
+static float g_game_force_field_color[4] = { 0.1f, 0.75f, 1.0f, 0.0f }; /* r, g, b, strength */
 static float g_game_color_grade[2] = { 1.0f, 1.0f }; /* saturation, contrast */
 static float g_game_color_tint[3] = { 1.0f, 1.0f, 1.0f };
 static float g_game_post_lens[2] = { 0.0f, 0.0f }; /* fxaa, chromatic */
@@ -265,6 +268,7 @@ static float g_game_post_flash_params[2] = { 0.0f, 0.0f }; /* edge_strength, fla
 static float g_game_post_flash_color[3] = { 1.0f, 0.05f, 0.05f };
 static float g_game_post_night_vision[4] = { 0.0f, 3.0f, 0.06f, 0.0f }; /* strength, gain, noise_amount, seed */
 static float g_game_post_halftone[3] = { 0.0f, 6.0f, 1.0f }; /* strength, dot_scale, contrast */
+static float g_game_post_glitch[3] = { 0.0f, 24.0f, 0.0f }; /* intensity, slice_count, seed */
 static uint32_t g_game_light_version = 1;
 
 static zan_game_mesh *g_game_meshes = NULL;
@@ -573,6 +577,8 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
 "uniform vec4 uSonarOriginRadius;\n" \
 "uniform vec3 uSonarStyle;\n" \
 "uniform vec3 uSonarColor;\n" \
+"uniform vec4 uForceFieldParams;\n" \
+"uniform vec4 uForceFieldColor;\n" \
 "uniform vec3 uCamPos;\n" \
 "uniform int uCamValid;\n" \
 "uniform vec2 uMaterial;\n" \
@@ -815,6 +821,20 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
     "        float sInt = clamp(sWave + sLead * 0.55, 0.0, 1.5);\n" \
     "        rgb += uSonarColor * (sInt * clamp(uSonarStyle.z, 0.0, 3.0));\n" \
     "    }\n" \
+    "    if (uForceFieldParams.x > 0.5 && uForceFieldColor.w > 0.0005) {\n" \
+    "        vec2 hp = ((abs(N.y) > 0.6) ? v_world_pos.xz : vec2(v_world_pos.x + v_world_pos.z, v_world_pos.y))\n" \
+    "            * max(uForceFieldParams.y, 0.25);\n" \
+    "        vec2 hS = vec2(1.0, 1.7320508);\n" \
+    "        vec2 hH = hS * 0.5;\n" \
+    "        vec2 hA = mod(hp, hS) - hH;\n" \
+    "        vec2 hB = mod(hp - hH, hS) - hH;\n" \
+    "        vec2 hGv = (dot(hA, hA) < dot(hB, hB)) ? hA : hB;\n" \
+    "        float hDist = max(abs(hGv.x), abs(hGv.x) * 0.5 + abs(hGv.y) * 0.8660254);\n" \
+    "        float hW = clamp(uForceFieldParams.w, 0.02, 0.35);\n" \
+    "        float hEdge = smoothstep(0.5 - hW, 0.5, hDist);\n" \
+    "        float hPulse = 0.72 + 0.28 * sin(hp.y * 1.4 - uForceFieldParams.z * 3.0);\n" \
+    "        rgb += uForceFieldColor.rgb * (hEdge * hPulse * clamp(uForceFieldColor.w, 0.0, 3.0));\n" \
+    "    }\n" \
     "    if (uCamValid != 0) {\n" \
     "        float ndv = clamp(dot(N, V), 0.0, 1.0);\n" \
     "        if (uHemiOn != 0) {\n" \
@@ -958,6 +978,7 @@ static const char *const ZAN_GAME_POST_FS =
 "uniform vec3 uPostFlashColor;\n"
 "uniform vec4 uPostNightVision;\n"
 "uniform vec3 uPostHalftone;\n"
+"uniform vec3 uPostGlitch;\n"
 "in vec2 v_uv;\n"
 "out vec4 frag;\n"
 "vec3 brightPass(vec3 c, float th) {\n"
@@ -986,9 +1007,22 @@ static const char *const ZAN_GAME_POST_FS =
 "        vec2 stepUv = uTexelSize * uPostPixelate.x;\n"
 "        uv = clamp((floor(uv / stepUv) + vec2(0.5)) * stepUv, vec2(0.0), vec2(1.0));\n"
 "    }\n"
-"    vec4 src = texture(uScene, uv);\n"
-"    vec3 col = src.rgb;\n"
-"    if (uPostRadialBlur.x > 0.0005) {\n"
+    "    vec4 src = texture(uScene, uv);\n"
+    "    vec3 col = src.rgb;\n"
+    "    if (uPostGlitch.x > 0.0005) {\n"
+    "        float gBand = floor(uv.y * max(uPostGlitch.y, 4.0));\n"
+    "        float gHash = fract(sin(gBand * 127.1 + uPostGlitch.z * 311.7) * 43758.5453);\n"
+    "        if (gHash > (1.0 - clamp(uPostGlitch.x, 0.0, 1.0) * 0.65)) {\n"
+    "            float gDir = (fract(gHash * 19.3) > 0.5) ? 1.0 : -1.0;\n"
+    "            float gShift = gDir * clamp(uPostGlitch.x, 0.0, 1.0) * 0.08;\n"
+    "            float gSplit = clamp(uPostGlitch.x, 0.0, 1.0) * 0.045;\n"
+    "            vec2 gUv = vec2(clamp(uv.x + gShift, 0.0, 1.0), uv.y);\n"
+    "            col.r = texture(uScene, vec2(clamp(gUv.x + gSplit, 0.0, 1.0), gUv.y)).r;\n"
+    "            col.g = texture(uScene, gUv).g;\n"
+    "            col.b = texture(uScene, vec2(clamp(gUv.x - gSplit, 0.0, 1.0), gUv.y)).b;\n"
+    "        }\n"
+    "    }\n"
+    "    if (uPostRadialBlur.x > 0.0005) {\n"
 "        vec2 rDir = uv - uPostRadialBlur.yz;\n"
 "        vec3 rAcc = col;\n"
 "        for (int ri = 1; ri <= 4; ++ri) {\n"
@@ -1176,6 +1210,7 @@ typedef struct {
     zgl_int u_post_flash_color;
     zgl_int u_post_night_vision;
     zgl_int u_post_halftone;
+    zgl_int u_post_glitch;
 } zan_game_post_program;
 
 static const char *const ZAN_GAME_SKYBOX_FS =
@@ -1451,6 +1486,10 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
         : g_game_gl->GetUniformLocation(program, "uSonarStyle");
     zgl_int sonar_color = instanced ? -1
         : g_game_gl->GetUniformLocation(program, "uSonarColor");
+    zgl_int force_field_params = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uForceFieldParams");
+    zgl_int force_field_color = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uForceFieldColor");
     zgl_int color = instanced ? 0
         : g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
@@ -1539,6 +1578,8 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
     prog->u_sonar_origin_radius = sonar_origin_radius;
     prog->u_sonar_style = sonar_style;
     prog->u_sonar_color = sonar_color;
+    prog->u_force_field_params = force_field_params;
+    prog->u_force_field_color = force_field_color;
     prog->u_color = color;
     prog->u_light_dir = light_dir;
     prog->u_light_color = light_color;
@@ -1624,6 +1665,8 @@ static zan_game_program *zan_game_skin_program_get(void) {
     zgl_int sonar_origin_radius = g_game_gl->GetUniformLocation(program, "uSonarOriginRadius");
     zgl_int sonar_style = g_game_gl->GetUniformLocation(program, "uSonarStyle");
     zgl_int sonar_color = g_game_gl->GetUniformLocation(program, "uSonarColor");
+    zgl_int force_field_params = g_game_gl->GetUniformLocation(program, "uForceFieldParams");
+    zgl_int force_field_color = g_game_gl->GetUniformLocation(program, "uForceFieldColor");
     zgl_int color = g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
     zgl_int light_color = g_game_gl->GetUniformLocation(program, "uLightColor[0]");
@@ -1700,6 +1743,8 @@ static zan_game_program *zan_game_skin_program_get(void) {
     g_game_skin_prog.u_sonar_origin_radius = sonar_origin_radius;
     g_game_skin_prog.u_sonar_style = sonar_style;
     g_game_skin_prog.u_sonar_color = sonar_color;
+    g_game_skin_prog.u_force_field_params = force_field_params;
+    g_game_skin_prog.u_force_field_color = force_field_color;
     g_game_skin_prog.u_color = color;
     g_game_skin_prog.u_light_dir = light_dir;
     g_game_skin_prog.u_light_color = light_color;
@@ -2228,6 +2273,16 @@ static void zan_game_bind_shadow_uniforms(const zan_gl_api *gl, zan_game_program
     }
     if (prog->u_sonar_color >= 0) {
         gl->Uniform3fv(prog->u_sonar_color, 1, g_game_sonar_color);
+    }
+    if (prog->u_force_field_params >= 0) {
+        gl->Uniform4f(prog->u_force_field_params,
+            g_game_force_field_params[0], g_game_force_field_params[1],
+            g_game_force_field_params[2], g_game_force_field_params[3]);
+    }
+    if (prog->u_force_field_color >= 0) {
+        gl->Uniform4f(prog->u_force_field_color,
+            g_game_force_field_color[0], g_game_force_field_color[1],
+            g_game_force_field_color[2], g_game_force_field_color[3]);
     }
 }
 
@@ -2813,6 +2868,7 @@ static zan_game_post_program *zan_game_post_program_get(void) {
     g_game_post_prog.u_post_flash_color = g_game_gl->GetUniformLocation(prog, "uPostFlashColor");
     g_game_post_prog.u_post_night_vision = g_game_gl->GetUniformLocation(prog, "uPostNightVision");
     g_game_post_prog.u_post_halftone = g_game_gl->GetUniformLocation(prog, "uPostHalftone");
+    g_game_post_prog.u_post_glitch = g_game_gl->GetUniformLocation(prog, "uPostGlitch");
     return &g_game_post_prog;
 }
 
@@ -2967,6 +3023,9 @@ ZAN_GAME_API int32_t zan_game_postprocess3d(int32_t surface_id, float exposure,
     }
     if (prog->u_post_halftone >= 0) {
         gl->Uniform3fv(prog->u_post_halftone, 1, g_game_post_halftone);
+    }
+    if (prog->u_post_glitch >= 0) {
+        gl->Uniform3fv(prog->u_post_glitch, 1, g_game_post_glitch);
     }
     gl->BindVertexArray(g_game_post_vao);
     gl->DrawArrays(ZGL_TRIANGLES, 0, 3);
@@ -3505,4 +3564,32 @@ ZAN_GAME_API void zan_game_set_post_halftone_comic3d(float strength,
     g_game_post_halftone[0] = strength;
     g_game_post_halftone[1] = dot_scale;
     g_game_post_halftone[2] = contrast;
+}
+
+ZAN_GAME_API void zan_game_set_force_field_hex3d(int32_t enabled,
+    float scale, float phase, float edge_width, float strength,
+    float r, float g, float b) {
+    g_game_force_field_params[0] = enabled ? 1.0f : 0.0f;
+    g_game_force_field_params[1] = scale > 0.25f ? scale : 2.0f;
+    g_game_force_field_params[2] = phase;
+    if (edge_width < 0.02f) edge_width = 0.02f;
+    if (edge_width > 0.35f) edge_width = 0.35f;
+    g_game_force_field_params[3] = edge_width;
+    g_game_force_field_color[0] = r > 0.0f ? r : 0.0f;
+    g_game_force_field_color[1] = g > 0.0f ? g : 0.0f;
+    g_game_force_field_color[2] = b > 0.0f ? b : 0.0f;
+    if (strength < 0.0f) strength = 0.0f;
+    if (strength > 3.0f) strength = 3.0f;
+    g_game_force_field_color[3] = strength;
+}
+
+ZAN_GAME_API void zan_game_set_post_glitch_rgb3d(float intensity,
+    float slice_count, float seed) {
+    if (intensity < 0.0f) intensity = 0.0f;
+    if (intensity > 1.0f) intensity = 1.0f;
+    if (slice_count < 4.0f) slice_count = 4.0f;
+    if (slice_count > 128.0f) slice_count = 128.0f;
+    g_game_post_glitch[0] = intensity;
+    g_game_post_glitch[1] = slice_count;
+    g_game_post_glitch[2] = seed;
 }
