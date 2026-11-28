@@ -1,14 +1,17 @@
 using System;
+using System.Numerics;
 using Gui;
 using Game.Audio;
 using Game.Foundation;
 using Game.Foundation.Gui;
 using Fps3D;
 
-// 应用层：界面流程（开始页 → 对局 → 暂停/结算 → 重开）、音效、静音与
-// 玩家档案都在这里。FpsGame 只管世界与规则，无头回放（FpsSim）不经过本文件。
+// 应用层：界面流程（开始页 → 选关 → 倒计时对局 → 暂停/结算 → 下一关）、音效、静音、
+// 玩家档案（每关最佳与奖牌、碎片、解锁）都在这里。FpsGame 只管规则与物理，
+// FpsScene 只管画世界，无头回放（FpsSim）不经过本文件。
 public class FpsLoop : IGuiHostLoop {
     public FpsGame game;
+    public FpsScene scene;
     public FpsHud hud;
     public FpsView view;
     public GameProfile profile;
@@ -17,63 +20,113 @@ public class FpsLoop : IGuiHostLoop {
     public bool sceneInited;
     public int lastMouseX;
     public int lastMouseY;
-
     public bool isDragging;
     public int rightDownX;
     public int rightDownY;
     public bool rightButtonDown;
+    // 调试开关（FPS3D_DEBUG=1）：全部解锁、T 键瞬移并标记最近目标。默认关闭。
+    public bool debug;
+    bool automated;
 
-    // "title" / "play" / "pause" / "result"（与 FpsHud.mode 同步）
+    // "title" / "select" / "play" / "pause" / "result"
     public string mode;
-    // 本局开始后经过的真实毫秒（新手提示只显示前几秒）
     public int runShownMs;
     public int toastMs;
+    public double attractMs;
+    double pulseMs;
+    int seenTag;
+    int seenShard;
+    int seenJump;
+    int seenLand;
+    int lastBeat;
 
     public void Start(GuiHost host) {
-        // 关键：切换到 GPU 硬件加速后端 (1 = GL 3.3)，激活 3D 光栅化与深度缓冲管线
+        // GPU 硬件加速后端 (1 = GL 3.3)：3D 光栅化、深度缓冲、阴影与后处理
         int backend = host.App().SetRenderBackend(1);
-        string backendName = host.App().RenderBackendName();
+        this.debug = Environment.GetEnvironmentVariable("FPS3D_DEBUG") == "1";
+        string ui = Environment.GetEnvironmentVariable("ZAN_UI_SCRIPT");
+        this.automated = ui != null && ui != "";
 
         this.game = FpsGame.Create();
-        this.game.backendName = backendName;
-        this.game.isGpuBackend = (backend == 1);
-        this.game.drawResult = this.game.isGpuBackend ? 1 : 0;
+        this.scene = new FpsScene(this.game);
+        this.scene.drawResult = backend == 1 ? 1 : 0;
         this.hud = new FpsHud(host.App(), this.game);
 
         // 档案落在用户数据目录（ZAN_GAME_DATA_DIR 可改），不写工作目录
         this.profile = GameProfile.Open("fps-3d");
         this.view = new FpsView();
         this.view.muted = this.profile.Flag("muted", false);
+        this.game.freeLookMode = this.profile.Flag("freelook", false);
         this.bus = new AudioBus();
         this.bus.SetSfxMuted(this.view.muted);
         this.sfx = new SfxBank(this.bus);
-        // 本游戏的声音：标记 = 清脆的上扫"叮"，未命中 = 短低音，脚步 = 低通噪声
-        this.sfx.AddSynth("tag", SfxPresets.Coin().WithSweep(1180.0, 2360.0).WithDuration(0.06));
-        this.sfx.AddSynth("miss", SfxPresets.Error().WithFrequency(120.0).WithDuration(0.05).WithGain(0.08));
-        SynthOptions step = new SynthOptions().WithWaveform(Waveform.Noise)
-            .WithDuration(0.03).WithEnvelope(0.001, 0.025, 0.0, 0.03).WithGain(0.12);
-        step.filter = new BiquadFilter(FilterKind.LowPass, 520.0, 0.7, 44100, 1);
-        this.sfx.AddSynth("step", step);
-        this.sfx.AddPresets(new string[] { "click", "select", "success", "powerup" });
+        this.AddSounds();
         this.sfx.Warm();
         this.RefreshProfileView();
+        this.view.selected = this.SuggestStage();
+        string dbgStage = Environment.GetEnvironmentVariable("FPS3D_STAGE");
+        if (this.debug && dbgStage != null && dbgStage != "") {
+            int ds = Convert.ToInt32(dbgStage) - 1;
+            if (ds >= 0 && ds < FpsStages.Count()) { this.view.selected = ds; }
+        }
+        this.game.LoadStage(this.view.selected);
 
         this.mode = "title";
         this.hud.SetMode("title");
         this.sceneInited = false;
-        this.isDragging = false;
-        this.rightButtonDown = false;
-        this.rightDownX = 0;
-        this.rightDownY = 0;
         this.lastMouseX = host.MouseX();
         this.lastMouseY = host.MouseY();
+        this.lastBeat = -1;
     }
 
+    // 本游戏的声音：标记 = 随连击升调的清脆"叮"，未命中 = 短低音，踏台不对 = 双音拒绝，
+    // 跳跃 = 轻上扫，落地 = 低通闷响，倒计时 = 嘀 / 起跑 = 高音，碎片 = 上扬琶音
+    void AddSounds() {
+        for (int i = 1; i <= FpsGame.MaxCombo; i = i + 1) {
+            double f = 1100.0 * Math.Pow(1.1892, (double)(i - 1));
+            this.sfx.AddSynth("tag" + Convert.ToString(i), SfxPresets.Coin().WithSweep(f, f * 2.0).WithDuration(0.07 + 0.015 * (double)i));
+        }
+        this.sfx.AddSynth("miss", SfxPresets.Error().WithFrequency(120.0).WithDuration(0.05).WithGain(0.08));
+        this.sfx.AddSynth("deny", SfxPresets.Error().WithSweep(420.0, 260.0).WithDuration(0.11).WithGain(0.12));
+        SynthOptions step = new SynthOptions().WithWaveform(Waveform.Noise)
+            .WithDuration(0.03).WithEnvelope(0.001, 0.025, 0.0, 0.03).WithGain(0.12);
+        step.filter = new BiquadFilter(FilterKind.LowPass, 520.0, 0.7, 44100, 1);
+        this.sfx.AddSynth("step", step);
+        this.sfx.AddSynth("jump", new SynthOptions().WithWaveform(Waveform.Triangle).WithSweep(260.0, 520.0)
+            .WithDuration(0.08).WithEnvelope(0.002, 0.05, 0.2, 0.05).WithGain(0.16));
+        SynthOptions land = new SynthOptions().WithWaveform(Waveform.Noise)
+            .WithDuration(0.06).WithEnvelope(0.001, 0.06, 0.0, 0.06).WithGain(0.28);
+        land.filter = new BiquadFilter(FilterKind.LowPass, 260.0, 0.7, 44100, 1);
+        this.sfx.AddSynth("land", land);
+        this.sfx.AddSynth("beep", SfxPresets.Select().WithSweep(880.0, 880.0).WithDuration(0.08));
+        this.sfx.AddSynth("go", SfxPresets.Select().WithSweep(1320.0, 1760.0).WithDuration(0.16));
+        this.sfx.AddSynth("shard", SfxPresets.PowerUp().WithSweep(660.0, 1980.0).WithDuration(0.34));
+        this.sfx.AddSynth("medal", SfxPresets.Success().WithSweep(784.0, 1568.0).WithDuration(0.42));
+        this.sfx.AddPresets(new string[] { "click", "select", "success", "powerup" });
+    }
+
+    string BestKey(int i) { return "best_s" + Convert.ToString(i); }
+    string ShardKey(int i) { return "shard_s" + Convert.ToString(i); }
+
     void RefreshProfileView() {
-        this.view.hasBest = this.profile.HasBest("time");
-        this.view.bestMs = this.profile.Best("time");
+        int n = FpsStages.Count();
+        for (int i = 0; i < n; i = i + 1) {
+            this.view.hasBest[i] = this.profile.HasBest(this.BestKey(i));
+            this.view.bestMs[i] = this.view.hasBest[i] ? this.profile.Best(this.BestKey(i)) : 0;
+            this.view.shardFound[i] = this.profile.Flag(this.ShardKey(i), false);
+            this.view.unlocked[i] = this.debug || i == 0 || this.view.hasBest[i - 1];
+        }
         this.view.plays = this.profile.Counter("plays");
         this.view.clears = this.profile.Counter("clears");
+    }
+
+    // 开始页默认关卡：第一个已解锁但还没通关的；全通则最后一关
+    int SuggestStage() {
+        int n = FpsStages.Count();
+        for (int i = 0; i < n; i = i + 1) {
+            if (this.view.unlocked[i] && !this.view.hasBest[i]) { return i; }
+        }
+        return n - 1;
     }
 
     void SetMode(string m) {
@@ -81,21 +134,31 @@ public class FpsLoop : IGuiHostLoop {
         this.hud.SetMode(m);
         // 离开对局一律松开视角与按键（暂停“释放鼠标”）
         if (m != "play") {
-            this.game.freeLookMode = false;
             this.isDragging = false;
             this.rightButtonDown = false;
             this.game.ReleaseKeys();
         }
     }
 
-    void BeginRun(GuiHost host) {
-        this.game.Reset();
+    void BeginRun(GuiHost host, int stage) {
+        if (stage < 0 || stage >= FpsStages.Count() || !this.view.unlocked[stage]) { return; }
+        this.view.selected = stage;
+        this.game.LoadStage(stage);
         this.profile.Add("plays", 1);
         this.profile.Save();
         this.RefreshProfileView();
         this.view.newBest = false;
         this.view.toast = "";
+        this.view.bonusMs = 0;
+        this.view.hitMs = 0;
+        this.view.flashMs = 0;
+        this.view.shardEver = this.view.shardFound[stage];
         this.runShownMs = 0;
+        this.seenTag = this.game.tagSerial;
+        this.seenShard = this.game.shardSerial;
+        this.seenJump = this.game.jumpSerial;
+        this.seenLand = this.game.landSerial;
+        this.lastBeat = -1;
         this.lastMouseX = host.MouseX();
         this.lastMouseY = host.MouseY();
         this.SetMode("play");
@@ -116,15 +179,26 @@ public class FpsLoop : IGuiHostLoop {
     }
 
     void Finish() {
-        long ms = (long)this.game.elapsedMs;
-        this.view.lastMs = ms;
-        this.view.newBest = this.profile.SubmitLowest("time", ms);
+        int st = this.game.stageIndex;
+        FpsStage def = this.game.stage;
+        long net = this.game.NetMs();
+        bool wasUnlocked = st + 1 < FpsStages.Count() && this.view.unlocked[st + 1];
+        this.view.prevMedal = this.view.MedalOf(st, def);
+        this.view.lastNet = net;
+        this.view.lastRaw = (long)this.game.elapsedMs;
+        this.view.lastShard = this.game.shardTaken ? (long)FpsGame.ShardBonusMs : 0;
+        this.view.lastCombo = (long)this.game.bonusMs - this.view.lastShard;
+        this.view.bestCombo = this.game.bestCombo;
+        this.view.medal = def.MedalFor(net);
+        this.view.newBest = this.profile.SubmitLowest(this.BestKey(st), net);
+        if (this.game.shardTaken) { this.profile.SetFlag(this.ShardKey(st), true); }
         this.profile.Add("clears", 1);
         this.profile.Save();
         this.RefreshProfileView();
+        this.view.unlockedNext = !wasUnlocked && st + 1 < FpsStages.Count() && this.view.unlocked[st + 1];
         this.SetMode("result");
         this.sfx.Play("success");
-        if (this.view.newBest) { this.sfx.Play("powerup", 0.8); }
+        if (this.view.medal >= 3 || this.view.newBest) { this.sfx.Play("medal", 0.8); }
     }
 
     void ToggleMute() {
@@ -135,30 +209,76 @@ public class FpsLoop : IGuiHostLoop {
         this.sfx.Play("click");
     }
 
-    void Toast(string text, bool good) {
+    void ToggleFreeLook(GuiHost host) {
+        this.game.freeLookMode = !this.game.freeLookMode;
+        this.lastMouseX = host.MouseX();
+        this.lastMouseY = host.MouseY();
+        this.profile.SetFlag("freelook", this.game.freeLookMode);
+        this.profile.Save();
+    }
+
+    void Toast(string text, bool good, int ms) {
         this.view.toast = text;
         this.view.toastGood = good;
-        this.toastMs = 900;
+        this.toastMs = ms;
     }
 
     void TryTag() {
         int r = this.game.TryTag();
-        if (r == 3) {
-            this.sfx.Play("tag");
-            this.Finish();
-        } else if (r == 2) {
-            this.sfx.Play("tag");
+        if (r == 2 || r == 3) {
+            int c = this.game.combo;
+            this.sfx.Play("tag" + Convert.ToString(c));
+            this.view.hitMs = 160;
+            this.view.flashMs = 160;
+            this.view.flashColor = this.game.stage.Targets[this.game.lastTagIndex].Color;
+            if (this.game.lastTagBonus > 0.0) {
+                this.view.bonusText = "COMBO x" + Convert.ToString(c) + "   -" + FpsHud.Secs(this.game.lastTagBonus);
+                this.view.bonusMs = 1100;
+            }
             int left = this.game.targetCount - this.game.taggedCount;
-            this.Toast("TAGGED!  " + Convert.ToString(left) + " TO GO", true);
-        } else if (r == 1) {
+            if (r == 3) { this.Finish(); return; }
+            this.Toast(left == 1 ? "LAST ONE!" : Convert.ToString(left) + " TO GO", true, 800);
+        } else if (r == 4) {
             this.sfx.Play("miss", 1.0, 150);
-            this.Toast("ALREADY TAGGED", false);
-        } else if (this.game.targetHit) {
-            this.sfx.Play("miss", 1.0, 150);
-            this.Toast("TOO FAR - GET WITHIN 30m", false);
+            this.Toast("OUT OF RANGE - GET WITHIN 16 m", false, 900);
+        } else if (r == 5) {
+            this.sfx.Play("deny", 1.0, 150);
+            this.Toast("TAG THIS ONE FROM ITS GLOWING PAD", false, 1200);
+        } else if (r == 6) {
+            this.sfx.Play("miss", 0.5, 150);
         } else {
             this.sfx.Play("miss", 0.6, 150);
         }
+    }
+
+    // 调试：瞬移到目标附近（踏台目标直接站上踏台）、对准并走正常标记流程
+    void DebugTag() {
+        int t = this.game.NearestUntagged();
+        if (t < 0 || this.game.InCountdown()) { return; }
+        FpsTargetDef d = this.game.stage.Targets[t];
+        Vector3 p = this.game.targetPos[t];
+        if (d.Pad >= 0) {
+            FpsSolid pad = this.game.stage.Solids[d.Pad];
+            this.game.px = pad.CenterX();
+            this.game.pz = pad.CenterZ();
+            this.game.feet = pad.H0;
+            this.game.grounded = true;
+            this.game.groundSolid = d.Pad;
+        } else {
+            this.game.px = FpsGame.Clampf(p.X, -28.0f, 28.0f);
+            this.game.pz = FpsGame.Clampf(p.Z + 7.0f, -28.0f, 28.0f);
+            this.game.feet = 0.0f;
+            this.game.grounded = true;
+            this.game.groundSolid = -1;
+        }
+        for (int k = 0; k < 6; k = k + 1) {
+            float mx = 0.0f;
+            float my = 0.0f;
+            this.game.MouseToward(p, 4000.0f, out mx, out my);
+            this.game.OnMouseMove(mx, my);
+            this.game.Tick(0.0);
+        }
+        this.TryTag();
     }
 
     // 菜单/卡片动作：按钮点击与快捷键走同一入口
@@ -166,16 +286,39 @@ public class FpsLoop : IGuiHostLoop {
         if (action == "") { return; }
         this.sfx.Play("click");
         if (this.mode == "title") {
-            if (action == "primary") { this.BeginRun(host); }
-            else if (action == "secondary") { host.RequestStop(); }
+            if (action == "b0") { this.BeginRun(host, this.view.selected); }
+            else if (action == "b1") { this.SetMode("select"); }
+            else if (action == "b2") { host.RequestStop(); }
+        } else if (this.mode == "select") {
+            if (action == "back") { this.SetMode("title"); }
+            else if (action.StartsWith("play")) {
+                int i = Convert.ToInt32(action.Substring(4));
+                this.BeginRun(host, i);
+            }
         } else if (this.mode == "pause") {
-            if (action == "primary") { this.Resume(host); }
-            else if (action == "secondary") { this.BeginRun(host); }
-            else if (action == "tertiary") { host.RequestStop(); }
+            if (action == "b0") { this.Resume(host); }
+            else if (action == "b1") { this.BeginRun(host, this.game.stageIndex); }
+            else if (action == "b2") { this.view.selected = this.game.stageIndex; this.SetMode("select"); }
+            else if (action == "b3") { host.RequestStop(); }
         } else if (this.mode == "result") {
-            if (action == "primary") { this.BeginRun(host); }
-            else if (action == "secondary") { this.SetMode("title"); }
-            else if (action == "tertiary") { host.RequestStop(); }
+            int next = this.game.stageIndex + 1;
+            if (action == "b0") {
+                if (next < FpsStages.Count() && this.view.unlocked[next]) { this.BeginRun(host, next); }
+                else { this.view.selected = this.game.stageIndex; this.SetMode("select"); }
+            } else if (action == "b1") { this.BeginRun(host, this.game.stageIndex); }
+            else if (action == "b2") { this.view.selected = this.game.stageIndex; this.SetMode("select"); }
+        }
+    }
+
+    void MoveSelection(int d) {
+        int n = FpsStages.Count();
+        int s = this.view.selected + d;
+        if (s < 0) { s = 0; }
+        if (s >= n) { s = n - 1; }
+        if (s != this.view.selected) {
+            this.view.selected = s;
+            this.game.LoadStage(s);
+            this.sfx.Play("select", 0.5);
         }
     }
 
@@ -183,26 +326,41 @@ public class FpsLoop : IGuiHostLoop {
         if (code == 77) { this.ToggleMute(); return; } // M
         if (this.mode == "play") {
             if (code == 27 || code == 80) { this.Pause(false); } // Esc / P
-            else if (code == 70) { // F：切换自由视角
-                this.game.freeLookMode = !this.game.freeLookMode;
-                this.lastMouseX = host.MouseX();
-                this.lastMouseY = host.MouseY();
-            } else {
-                this.game.OnKeyDown(code);
-            }
+            else if (code == 70) { this.ToggleFreeLook(host); } // F
+            else if (code == 82) { this.BeginRun(host, this.game.stageIndex); } // R：快速重开
+            else if (code == 84 && this.debug) { this.DebugTag(); } // T（仅调试）
+            else { this.game.OnKeyDown(code); }
             return;
         }
         bool confirm = code == 13 || code == 32;
         if (this.mode == "title") {
-            if (confirm) { this.Act(host, "primary"); }
-            else if (code == 27) { this.Act(host, "secondary"); }
+            if (confirm) { this.Act(host, "b0"); }
+            else if (code == 83) { this.Act(host, "b1"); } // S
+            else if (code == 27) { this.Act(host, "b2"); }
+            else if (code == 37) { this.MoveSelectionUnlocked(-1); }
+            else if (code == 39) { this.MoveSelectionUnlocked(1); }
+        } else if (this.mode == "select") {
+            if (code == 37) { this.MoveSelection(-1); }
+            else if (code == 39) { this.MoveSelection(1); }
+            else if (code == 38) { this.MoveSelection(-3); }
+            else if (code == 40) { this.MoveSelection(3); }
+            else if (confirm) {
+                if (this.view.unlocked[this.view.selected]) { this.Act(host, "play" + Convert.ToString(this.view.selected)); }
+                else { this.sfx.Play("deny", 0.8, 150); }
+            } else if (code == 27) { this.Act(host, "back"); }
         } else if (this.mode == "pause") {
-            if (code == 27 || code == 80 || code == 13) { this.Act(host, "primary"); }
-            else if (code == 82) { this.Act(host, "secondary"); } // R
+            if (code == 27 || code == 80 || code == 13) { this.Act(host, "b0"); }
+            else if (code == 82) { this.Act(host, "b1"); } // R
         } else if (this.mode == "result") {
-            if (confirm || code == 82) { this.Act(host, "primary"); }
-            else if (code == 27) { this.Act(host, "secondary"); }
+            if (confirm) { this.Act(host, "b0"); }
+            else if (code == 82) { this.Act(host, "b1"); }
+            else if (code == 27) { this.Act(host, "b2"); }
         }
+    }
+
+    void MoveSelectionUnlocked(int d) {
+        int s = this.view.selected + d;
+        if (s >= 0 && s < FpsStages.Count() && this.view.unlocked[s]) { this.MoveSelection(d); }
     }
 
     public void Event(GuiHost host, int kind, int code) {
@@ -221,10 +379,9 @@ public class FpsLoop : IGuiHostLoop {
             this.isDragging = true;
             this.lastMouseX = mx;
             this.lastMouseY = my;
-
-            if (code == 0) { // 左键：标记准星对准的目标
+            if (code == 0) {
                 this.TryTag();
-            } else if (code == 1) { // 右键按下，记录起始坐标以识别单击与拖拽
+            } else if (code == 1) {
                 this.rightButtonDown = true;
                 this.rightDownX = mx;
                 this.rightDownY = my;
@@ -233,29 +390,22 @@ public class FpsLoop : IGuiHostLoop {
             int mx = host.MouseX();
             int my = host.MouseY();
             this.isDragging = false;
-
             if (code == 1 && this.rightButtonDown) {
                 this.rightButtonDown = false;
-                // 若按下到抬起位移极小（< 8 像素），判定为单击切换自由视角
+                // 按下到抬起位移极小（< 8 像素）判定为单击：切换自由视角
                 int dDownX = mx - this.rightDownX;
                 if (dDownX < 0) { dDownX = -dDownX; }
                 int dDownY = my - this.rightDownY;
                 if (dDownY < 0) { dDownY = -dDownY; }
-                if (dDownX < 8 && dDownY < 8) {
-                    this.game.freeLookMode = !this.game.freeLookMode;
-                    this.lastMouseX = mx;
-                    this.lastMouseY = my;
-                }
+                if (dDownX < 8 && dDownY < 8) { this.ToggleFreeLook(host); }
             }
-        } else if (kind == 1) { // MouseMove
+        } else if (kind == 1) { // MouseMove：即时转视角，渲染前再同步相机
             int mx = host.MouseX();
             int my = host.MouseY();
             int dx = mx - this.lastMouseX;
             int dy = my - this.lastMouseY;
             this.lastMouseX = mx;
             this.lastMouseY = my;
-
-            // 当按住鼠标拖拽 或 处于自由视角模式时，平滑转动 3D 视角
             if (this.isDragging || this.game.freeLookMode) {
                 if (Math.Abs(dx) < 300 && Math.Abs(dy) < 300) {
                     this.game.OnMouseMove((float)dx, (float)dy);
@@ -268,36 +418,75 @@ public class FpsLoop : IGuiHostLoop {
         // 只有对局中推进世界与计时；暂停/菜单/结算时世界静止
         if (this.mode != "play") { return; }
         this.game.Tick((double)dt / 1000.0);
-        // 脚步：贴地走动时每 ~0.36 秒一声（AudioBus 限频）
-        bool walking = this.game.keyFwd || this.game.keyBwd || this.game.keyLeft || this.game.keyRight;
-        if (walking && this.game.controller.Position.Y < 2.2f) {
-            this.sfx.Play("step", 0.5, 360);
+        this.PollEvents();
+        if (this.mode != "play") { return; }
+        // 脚步：贴地走动时按速度限频
+        bool walking = this.game.grounded && (this.game.vx * this.game.vx + this.game.vz * this.game.vz) > 4.0f;
+        if (walking) { this.sfx.Play("step", 0.5, this.game.keySprint ? 270 : 360); }
+    }
+
+    // 读规则层的事件计数器 → 音效与提示
+    void PollEvents() {
+        if (this.game.jumpSerial != this.seenJump) {
+            this.seenJump = this.game.jumpSerial;
+            this.sfx.Play("jump", 0.7, 80);
+        }
+        if (this.game.landSerial != this.seenLand) {
+            this.seenLand = this.game.landSerial;
+            this.sfx.Play("land", 0.8, 80);
+        }
+        if (this.game.shardSerial != this.seenShard) {
+            this.seenShard = this.game.shardSerial;
+            this.sfx.Play("shard");
+            this.view.bonusText = "SHARD FOUND   -" + FpsHud.Secs(FpsGame.ShardBonusMs);
+            this.view.bonusMs = 1600;
+            this.view.flashMs = 220;
+            this.view.flashColor = 0xFFD34D;
+        }
+        // 倒计时：每拍一声，起跑一声高音
+        int beat = this.game.InCountdown() ? (int)(this.game.countdownMs / 800.0) + 1 : 0;
+        if (beat != this.lastBeat) {
+            if (this.lastBeat >= 0) { this.sfx.Play(beat == 0 ? "go" : "beep", 0.8); }
+            this.lastBeat = beat;
         }
     }
 
     public void Update(GuiHost host, int dt) {
         if (!this.sceneInited && host.App().window.IsVisible()) {
-            this.game.InitScene(host.App().canvas);
+            this.scene.Init(host.App().canvas);
             this.sceneInited = true;
         }
         this.bus.Update(dt);
-        // 切走窗口/最小化时自动暂停（主循环在后台仍会步进逻辑）
-        if (this.mode == "play" && !host.WindowActive()) { this.Pause(true); }
+        // 切走窗口/最小化时自动暂停；UiDriver 自动化截图时不跟随桌面焦点（隔离宿主机输入）
+        if (this.mode == "play" && !host.WindowActive() && !this.automated) { this.Pause(true); }
         this.Act(host, this.hud.TakeAction());
+        // 选关时背景跟着光标切换到对应关卡
+        if ((this.mode == "select" || this.mode == "title") && this.game.stageIndex != this.view.selected) {
+            this.game.LoadStage(this.view.selected);
+        }
         if (this.mode == "play") {
             this.runShownMs = this.runShownMs + dt;
             if (this.toastMs > 0) {
                 this.toastMs = this.toastMs - dt;
                 if (this.toastMs <= 0) { this.view.toast = ""; }
             }
+            if (this.view.bonusMs > 0) { this.view.bonusMs = this.view.bonusMs - dt; }
+            if (this.view.hitMs > 0) { this.view.hitMs = this.view.hitMs - dt; }
+            if (this.view.flashMs > 0) { this.view.flashMs = this.view.flashMs - dt; }
+        } else {
+            this.attractMs = this.attractMs + (double)dt;
         }
-        // 新手提示：前两局全程显示，之后只在开局 8 秒内显示
-        this.view.showHint = this.view.plays <= 2 || this.runShownMs < 8000;
+        this.pulseMs = this.pulseMs + (double)dt;
+        this.view.pulse = 0.5f + 0.5f * (float)Math.Sin(this.pulseMs * 0.012);
+        // 新手提示：前三局全程显示，之后只在开局 6 秒内显示
+        this.view.showHint = this.view.plays <= 3 || this.runShownMs < 6000;
+        this.scene.Update(this.mode == "play" ? dt : (this.mode == "pause" ? 0 : dt));
         this.hud.SyncState(host.App(), this.view);
     }
 
     public void Render(GuiHost host, Canvas c, double alpha) {
-        this.game.Render(c);
+        bool attract = this.mode == "title" || this.mode == "select";
+        this.scene.Render(c, attract, this.attractMs);
         this.hud.Render(host.App());
     }
 
@@ -313,7 +502,7 @@ public class FpsLoop : IGuiHostLoop {
 
 public class App {
     public static void Main() {
-        GuiHost host = new GuiHost("3D First-Person Target Tag - Zan Game", 1280, 720, 60);
+        GuiHost host = new GuiHost("3D Target Tag - Neon Time Trial", 1280, 720, 60);
         // UiDriver automation (ZAN_UI_SCRIPT / ZAN_UI_DUMP) must be enabled before the window shows.
         host.OnAppCreated((Gui.App a) => Gui.Backend.UiDriver.Enable(a));
         host.Run(new FpsLoop());

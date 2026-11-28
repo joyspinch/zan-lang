@@ -1,31 +1,31 @@
 using System;
+using System.Numerics;
 using Game.Foundation;
 using Game.Render3D;
+using Fps3D;
 
-// 回放与回归（docs/ZAN_STANDARD.md S26/S27）：FpsGame 的漫游与准星拾取以固定 1/60 秒一帧
-// 无头推进（不上传网格、不画）。场景固定，种子不参与。replays/ 下的回放由 `zan-check`
-// 重放、逐校验点比对；Bot 是模糊测试用的机器人。改了移动或视角参数后回放分叉，就重新
-// 录制（见 README）。
+// 回放与回归（docs/ZAN_STANDARD.md S26/S27）：FpsGame 的关卡计时赛以固定 1/60 秒一帧
+// 无头推进（不上传网格、不画、不碰音频与档案）。种子决定关卡：seed % 关卡数。
+// replays/ 下的回放由 `zan-check` 重放、逐校验点比对；Bot 是模糊测试用的机器人。
+// 改了关卡布局、移动、跳跃或视角参数后回放分叉，就重新录制（见 README）。
 //
-// 输入编码：0 保持上一帧的按键；1 + 按键位（1 前、2 后、4 左、8 右、16 上升、32 下沉）
+// 输入编码：0 保持上一帧的按键；1 + 按键位（1 前、2 后、4 左、8 右、16 跳、32 冲刺）
 // = 本帧按住的键；100 + 方向（0..7，45° 一档）= 鼠标朝该方向拖 20 像素转视角；
-// 200 = 左键点击，标记准星对准的目标方块（用上一帧的拾取结果，与游戏里一致）。
-// 计时随固定步长推进，全部标记后冻结；声音、档案与窗口都在 main.zan 的
-// 应用层，仿真不碰。
+// 200 = 左键点击，标记准星对准的目标；300 = 朝最近的未标记目标"甩"一次鼠标
+// （最多 60 像素，换算成真实的鼠标位移再走 OnMouseMove）。
 public class FpsSim : IReplaySim {
     FpsGame game;
 
-    public void Reset(long seed) { game = FpsGame.Create(); }
+    public void Reset(long seed) {
+        game = FpsGame.Create();
+        long s = seed < 0 ? -seed : seed;
+        game.LoadStage((int)(s % (long)FpsStages.Count()));
+    }
 
     public void Step(int frame, int input) {
         if (input >= 1 && input <= 64) {
             int k = input - 1;
-            game.keyFwd = (k & 1) != 0;
-            game.keyBwd = (k & 2) != 0;
-            game.keyLeft = (k & 4) != 0;
-            game.keyRight = (k & 8) != 0;
-            game.keyUp = (k & 16) != 0;
-            game.keyDown = (k & 32) != 0;
+            game.SetKeys((k & 1) != 0, (k & 2) != 0, (k & 4) != 0, (k & 8) != 0, (k & 16) != 0, (k & 32) != 0);
         } else if (input >= 100 && input < 108) {
             int d = input - 100;
             int dx = d == 0 || d == 1 || d == 7 ? 20 : (d == 3 || d == 4 || d == 5 ? -20 : 0);
@@ -33,18 +33,33 @@ public class FpsSim : IReplaySim {
             game.OnMouseMove((float)dx, (float)dy);
         } else if (input == 200) {
             game.TryTag();
+        } else if (input == 300) {
+            int t = game.NearestUntagged();
+            if (t >= 0) {
+                float mx = 0.0f;
+                float my = 0.0f;
+                game.MouseToward(game.targetPos[t], 60.0f, out mx, out my);
+                game.OnMouseMove(mx, my);
+            }
         }
         game.Tick(1.0 / 60.0);
     }
 
     public int StateChecksum() {
         StateHasher h = new StateHasher();
-        Vector3 p = game.controller.Position;
-        h.Real(p.X).Real(p.Y).Real(p.Z).Real(game.controller.Yaw).Real(game.controller.Pitch)
-         .Bool(game.targetHit);
-        if (game.targetHit) { h.Real(game.hitDistance); }
-        h.Int(game.TaggedMask()).Bool(game.complete).Long((long)game.elapsedMs);
+        h.Int(game.stageIndex).Real(game.px).Real(game.feet).Real(game.pz)
+         .Real(game.controller.Yaw).Real(game.controller.Pitch).Bool(game.grounded)
+         .Int(game.aimIndex).Int(game.aimState);
+        h.Int(game.TaggedMask()).Bool(game.complete).Long((long)game.elapsedMs)
+         .Long((long)game.bonusMs).Int(game.combo).Bool(game.shardTaken);
         return h.Value();
+    }
+
+    // 调试摘要（探针用）
+    public string Stats() {
+        return "tagged=" + Convert.ToString(game.taggedCount) + "/" + Convert.ToString(game.targetCount)
+            + " bestCombo=" + Convert.ToString(game.bestCombo) + " jumps=" + Convert.ToString(game.jumpSerial)
+            + " shard=" + Convert.ToString(game.shardTaken) + " complete=" + Convert.ToString(game.complete);
     }
 
     // 俯仰角钳在 ±89°（防万向锁）
@@ -63,16 +78,48 @@ public class FpsSim : IReplaySim {
         return n == game.taggedCount && game.complete == (n == game.targetCount);
     }
 
-    // 计时非负且有限（1200 帧 = 20 秒，上限给足余量）
+    // 计时非负且有限；倒计时期间不计时；净用时不超过计时
     [Invariant]
-    public bool TimerValid() { return game.elapsedMs >= 0.0 && game.elapsedMs < 100000000.0; }
+    public bool TimerValid() {
+        if (game.elapsedMs < 0.0 || game.elapsedMs > 100000000.0) { return false; }
+        if (game.InCountdown() && game.elapsedMs > 0.0) { return false; }
+        return game.NetMs() >= 0 && (double)game.NetMs() <= game.elapsedMs + 0.5;
+    }
 
-    // 机器人：时不时换一组按键，偶尔拖动鼠标转视角、点左键标记
+    // 连击在 0..上限；奖励 = 连击奖励之和 + 碎片奖励，不会超过理论上限
+    [Invariant]
+    public bool ComboValid() {
+        if (game.combo < 0 || game.combo > FpsGame.MaxCombo || game.bestCombo < game.combo) { return false; }
+        double cap = (double)game.taggedCount * (double)(FpsGame.MaxCombo - 1) * FpsGame.ComboStepMs
+            + (game.shardTaken ? FpsGame.ShardBonusMs : 0.0);
+        return game.bonusMs >= 0.0 && game.bonusMs <= cap + 0.5;
+    }
+
+    // 玩家始终在场地内、不掉出世界、不嵌进建筑
+    [Invariant]
+    public bool PlayerInArena() {
+        float lim = FpsStages.ArenaHalf;
+        return game.px >= -lim && game.px <= lim && game.pz >= -lim && game.pz <= lim
+            && game.feet >= -10.5f && game.PlayerClear();
+    }
+
+    // 准星状态与目标一致：可标记 ⇒ 未标记、在射程内、踏台目标站在踏台上
+    [Invariant]
+    public bool AimStateConsistent() {
+        if (game.aimState != 1) { return true; }
+        if (game.aimIndex < 0 || game.tagged[game.aimIndex] || game.hitDistance > FpsGame.TagRange) { return false; }
+        int pad = game.stage.Targets[game.aimIndex].Pad;
+        return pad < 0 || game.OnPad(pad);
+    }
+
+    // 机器人：常按前进（偶尔跳/冲刺/侧移），经常朝最近目标甩鼠标、点左键标记
     public static int Bot(DeterministicRandom rng, int frame) {
         int roll = rng.NextBelow(100);
-        if (roll < 3) { return 200; }
-        if (roll < 4) { return 1 + rng.NextBelow(64); }
-        if (roll < 10) { return 100 + rng.NextBelow(8); }
+        if (roll < 4) { return 200; }
+        if (roll < 12) { return 300; }
+        if (roll < 15) { return 1 + (1 | rng.NextBelow(64)); }
+        if (roll < 16) { return 1 + rng.NextBelow(64); }
+        if (roll < 19) { return 100 + rng.NextBelow(8); }
         return 0;
     }
 }

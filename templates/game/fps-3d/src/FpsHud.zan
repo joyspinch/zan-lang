@@ -1,85 +1,108 @@
 using System;
+using System.Numerics;
 using Gui;
 using Gui.Widget;
 using Game.Foundation.Gui;
+using Game.Render3D;
 
 namespace Fps3D;
 
-// 全部玩家可见界面都是一棵常驻的标准 Gui 控件树（Label/Button/Panel），
-// 外观来自本文件的游戏皮肤（深色玻璃面板 + 青色霓虹描边，和场景的冷色
-// 环境光一致）。世界只由 FpsGame.Render 画；这里不在 Canvas 上重画控件。
+// 对局 HUD：一棵常驻的标准 Gui 控件树（Panel / Label / Progress + 两个自绘小件：
+// 准星与目标指示），外观全部来自本游戏的"霓虹黄昏"皮肤（FpsSkin.Css）。
+// 菜单卡片（开始页、选关、暂停、结算）由 FpsMenu 挂在同一棵树上。
 //
-// 模式：title（开始页 + 操作说明）/ play（对局 HUD）/ pause（暂停卡）/
-// result（结算卡）。按钮点击只记下 pendingAction，由 FpsLoop 在 Update 里
-// 按当前模式消费，避免在 Gui 回调里改游戏状态。
+// 布局：按 1280x720 设计稿等比缩放，顶部避开标准标题栏（app.ContentTop()）。
 public class FpsHud {
+    public const int MaxMarkers = 12;
+
     public Panel root;
-    public Panel status;
-    public Label title;
-    public Label progress;
-    public Label timer;
-    public Label best;
-    public Label aim;
-    public Label viewMode;
-    public Label backend;
-    public Label sound;
-    public Label hint;
-    public Label toast;
-    public FpsCrosshair crosshair;
-    public Panel veil;
-    public Panel card;
-    public Label heading;
-    public Label badge;
-    public Label[] lines;
-    public Button primary;
-    public Button secondary;
-    public Button tertiary;
     public HudLayer layer;
-    // 被点击的按钮："primary" / "secondary" / "tertiary"；"" = 无
-    public string pendingAction;
+    public FpsMenu menu;
     public string mode;
+
+    Panel flash;
+    FpsMarker[] markers;
+    Label[] markerText;
+    Panel chip;
+    Label chipStage;
+    Label chipName;
+    Label chipPace;
+    Label timer;
+    Label bonus;
+    Panel stats;
+    Progress ring;
+    Label ringText;
+    Label ringSub;
+    Label combo;
+    Progress comboBar;
+    Label shard;
+    FpsCrosshair crosshair;
+    Label aim;
+    Label countdown;
+    Label toast;
+    Label hint;
+    Label sound;
+
     FpsGame game;
     weak Gui.App app;
+    int lastCountBeat;
 
     public FpsHud(Gui.App app, FpsGame game) {
         this.game = game;
         this.app = app;
         this.mode = "title";
-        this.pendingAction = "";
-        app.UseCss(FpsHud.Css());
+        this.lastCountBeat = -1;
+        app.UseCss(FpsSkin.Css());
         this.root = new Panel("fps-hud");
         this.root.Class = "fps-hud";
 
-        this.status = this.Group(this.root, "fps-status");
-        this.title = this.LabelAt(this.status, "TARGET TAG", "fps-title");
-        this.progress = this.LabelAt(this.status, "", "fps-progress");
-        this.timer = this.LabelAt(this.status, "", "fps-timer");
-        this.best = this.LabelAt(this.status, "", "fps-muted");
-        this.aim = this.LabelAt(this.status, "", "fps-aim");
-        this.viewMode = this.LabelAt(this.status, "", "fps-view");
-        this.backend = this.LabelAt(this.status, "", "fps-backend");
-        this.sound = this.LabelAt(this.root, "", "fps-sound");
-        this.hint = this.LabelAt(this.root, "", "fps-hint");
-        this.toast = this.LabelAt(this.root, "", "fps-toast");
+        this.flash = FpsHud.Group(this.root, "fps-flash");
+        this.markers = new FpsMarker[FpsHud.MaxMarkers];
+        this.markerText = new Label[FpsHud.MaxMarkers];
+        for (int i = 0; i < FpsHud.MaxMarkers; i = i + 1) {
+            this.markers[i] = new FpsMarker();
+            this.markers[i].Class = "fps-marker";
+            this.root.Add(this.markers[i]);
+            this.markerText[i] = FpsHud.Text(this.root, "", "fps-mtext");
+        }
+
+        this.chip = FpsHud.Group(this.root, "fps-chip");
+        this.chipStage = FpsHud.Text(this.chip, "", "fps-chip-stage");
+        this.chipName = FpsHud.Text(this.chip, "", "fps-chip-name");
+        this.chipPace = FpsHud.Text(this.chip, "", "fps-chip-pace");
+
+        this.timer = FpsHud.Text(this.root, "", "fps-timer");
+        this.bonus = FpsHud.Text(this.root, "", "fps-bonus");
+
+        this.stats = FpsHud.Group(this.root, "fps-stats");
+        this.ring = new Progress(0, 1);
+        this.ring.Ring();
+        this.ring.showIndicator = false;
+        this.ring.FillColor(unchecked((int)0xFF19E6FF));
+        this.ring.RailColor(unchecked((int)0x40FFFFFF));
+        this.ring.Class = "fps-ring";
+        this.stats.Add(this.ring);
+        this.ringText = FpsHud.Text(this.stats, "", "fps-ring-text");
+        this.ringSub = FpsHud.Text(this.stats, "TARGETS", "fps-ring-sub");
+        this.combo = FpsHud.Text(this.stats, "", "fps-combo");
+        this.comboBar = new Progress(0, 1);
+        this.comboBar.showIndicator = false;
+        this.comboBar.FillColor(unchecked((int)0xFFFF2E9A));
+        this.comboBar.RailColor(unchecked((int)0x30FFFFFF));
+        this.comboBar.Class = "fps-combobar";
+        this.stats.Add(this.comboBar);
+        this.shard = FpsHud.Text(this.stats, "", "fps-shard");
 
         this.crosshair = new FpsCrosshair();
         this.crosshair.Class = "fps-crosshair";
         this.root.Add(this.crosshair);
+        this.aim = FpsHud.Text(this.root, "", "fps-aim");
+        this.countdown = FpsHud.Text(this.root, "", "fps-count");
+        this.toast = FpsHud.Text(this.root, "", "fps-toast");
+        this.hint = FpsHud.Text(this.root, "", "fps-hint");
+        this.sound = FpsHud.Text(this.root, "", "fps-sound");
 
-        this.veil = this.Group(this.root, "fps-veil");
-        this.card = this.Group(this.veil, "fps-card");
-        this.heading = this.LabelAt(this.card, "", "fps-heading");
-        this.badge = this.LabelAt(this.card, "NEW BEST!", "fps-badge");
-        this.lines = new Label[6];
-        for (int i = 0; i < 6; i = i + 1) {
-            this.lines[i] = this.LabelAt(this.card, "", "fps-line");
-        }
-        this.primary = this.ButtonAt(this.card, "fps-btn fps-primary");
-        this.secondary = this.ButtonAt(this.card, "fps-btn");
-        this.tertiary = this.ButtonAt(this.card, "fps-btn");
-        this.primary.Click.Add(() => this.Clicked("primary"));
-        this.secondary.Click.Add(() => this.Clicked("secondary"));
-        this.tertiary.Click.Add(() => this.Clicked("tertiary"));
+        this.menu = new FpsMenu(app, this.root, game);
 
         this.layer = new HudLayer();
         this.layer.Add(this.root);
@@ -87,44 +110,33 @@ public class FpsHud {
         this.layer.Bind(app);
     }
 
-    void Clicked(string which) { this.pendingAction = which; }
-
-    // 取走一次按钮点击（没有返回 ""）
-    public string TakeAction() {
-        string a = this.pendingAction;
-        this.pendingAction = "";
-        return a;
-    }
-
-    // 切换界面模式：清掉旧模式残留的点击，并释放卡片里按钮的焦点/捕获，
-    // 免得之后的 Space/Enter 被隐藏或改了含义的按钮吃掉。
-    public void SetMode(string m) {
-        if (this.mode == m) { return; }
-        this.mode = m;
-        this.pendingAction = "";
-        Gui.App a = this.app;
-        if (a != null) { a.ReleaseInputSubtree(this.veil); }
-    }
-
-    Panel Group(Control parent, string cls) {
+    public static Panel Group(Control parent, string cls) {
         Panel p = new Panel(cls);
         p.Class = cls;
         parent.Add(p);
         return p;
     }
 
-    Label LabelAt(Control parent, string text, string cls) {
+    public static Label Text(Control parent, string text, string cls) {
         Label l = new Label(text);
         l.Class = "fps-label " + cls;
         parent.Add(l);
         return l;
     }
 
-    Button ButtonAt(Control parent, string cls) {
-        Button b = new Button("");
-        b.Class = cls;
-        parent.Add(b);
-        return b;
+    public static void Box(Control control, int x, int y, int w, int h, int font) {
+        string style = "left:" + Convert.ToString(x) + "dpx;top:" + Convert.ToString(y)
+            + "dpx;width:" + Convert.ToString(w) + "dpx;height:" + Convert.ToString(h) + "dpx";
+        if (font > 0) { style = style + ";font-size:" + Convert.ToString(font) + "dpx"; }
+        if (control.inlineStyleCss != style) { control.SetProp("style", style); }
+    }
+
+    public static void SetClass(Control c, string cls) {
+        if (c.Class != cls) { c.Class = cls; }
+    }
+
+    public static void SetText(Label l, string text) {
+        l.SetProp("text", text);
     }
 
     // m:ss.d
@@ -138,135 +150,250 @@ public class FpsHud {
             + "." + Convert.ToString(tenths % 10);
     }
 
-    // view：由 FpsLoop 汇总的界面状态（档案、静音、提示、结算）
+    // 秒，一位小数（奖励提示用）
+    public static string Secs(double ms) {
+        long tenths = (long)(ms / 100.0 + 0.5);
+        return Convert.ToString(tenths / 10) + "." + Convert.ToString(tenths % 10) + "s";
+    }
+
+    public static string MedalClass(int m) {
+        if (m == 3) { return "fps-gold"; }
+        if (m == 2) { return "fps-silver"; }
+        if (m == 1) { return "fps-bronze"; }
+        return "fps-nomedal";
+    }
+
+    // 切换界面模式：清掉旧模式残留的点击并释放卡片按钮的焦点/捕获
+    public void SetMode(string m) {
+        if (this.mode == m) { return; }
+        this.mode = m;
+        this.menu.SetMode(m);
+        Gui.App a = this.app;
+        if (a != null) { a.ReleaseInputSubtree(this.menu.veil); }
+    }
+
+    public string TakeAction() { return this.menu.TakeAction(); }
+
     public void SyncState(Gui.App app, FpsView view) {
-        int n = game.targetCount;
-        this.progress.SetProp("text", "TAGGED  " + Convert.ToString(game.taggedCount) + " / " + Convert.ToString(n));
-        this.timer.SetProp("text", "TIME  " + FpsHud.FormatTime((long)game.elapsedMs));
-        this.best.SetProp("text", view.hasBest ? "BEST  " + FpsHud.FormatTime(view.bestMs) : "BEST  --:--.-");
-        bool taggable = game.AimTaggable();
-        string aimText = "AIM: NO TARGET";
-        if (game.targetHit) {
-            string dist = Convert.ToString((int)game.hitDistance) + "m";
-            if (game.tagged[game.aimIndex]) { aimText = "AIM: ALREADY TAGGED (" + dist + ")"; }
-            else if (taggable) { aimText = "LOCKED (" + dist + ") - CLICK TO TAG"; }
-            else { aimText = "TOO FAR (" + dist + ") - GET WITHIN 30m"; }
-        }
-        this.aim.SetProp("text", aimText);
-        this.aim.Class = taggable ? "fps-label fps-aim fps-locked" : "fps-label fps-aim";
-        this.viewMode.SetProp("text", game.freeLookMode
-            ? "VIEW: FREE LOOK  (F / right-click to release)"
-            : "VIEW: DRAG  (hold mouse to look, F = free look)");
-        this.viewMode.Class = game.freeLookMode ? "fps-label fps-view fps-free" : "fps-label fps-view";
-        bool gpu = game.drawResult > 0;
-        this.backend.SetProp("text", gpu ? "GPU (OpenGL 3.3)" : "CPU wireframe fallback");
-        this.backend.Class = gpu ? "fps-label fps-backend fps-gpu" : "fps-label fps-backend fps-cpu";
-        this.sound.SetProp("text", view.muted ? "SOUND OFF  [M]" : "SOUND ON  [M]");
-        this.sound.Class = view.muted ? "fps-label fps-sound fps-off" : "fps-label fps-sound";
-        this.hint.SetProp("text", "WASD move  |  hold mouse / F: look  |  SPACE / SHIFT: up / down  |  CLICK: tag  |  P: pause");
-        this.toast.SetProp("text", view.toast);
-        this.toast.Class = view.toastGood ? "fps-label fps-toast fps-good" : "fps-label fps-toast fps-bad";
-        this.crosshair.Class = taggable ? "fps-crosshair fps-locked" : "fps-crosshair";
-
-        bool playing = this.mode == "play";
-        this.status.SetShown(this.mode != "title");
-        this.crosshair.SetShown(playing);
-        this.hint.SetShown(playing && view.showHint);
-        this.toast.SetShown(playing && view.toast != "");
-        this.veil.SetShown(!playing);
-        this.SyncCard(view);
-
-        this.Layout(app);
-        this.layer.SetBounds(0, 0, app.canvas.Width(), app.canvas.Height());
-        this.layer.SetVisible(app.window.GetHandle() == 0 || app.window.IsVisible());
-    }
-
-    void SyncCard(FpsView view) {
-        string[] t = new string[6] { "", "", "", "", "", "" };
-        string bestText = view.hasBest ? FpsHud.FormatTime(view.bestMs) : "--:--.-";
-        string n = Convert.ToString(game.targetCount);
-        this.badge.SetShown(false);
-        this.tertiary.SetShown(true);
-        if (this.mode == "title") {
-            this.heading.SetProp("text", "TARGET TAG");
-            t[0] = "Tag all " + n + " glowing blocks as fast as you can.";
-            t[1] = "WASD  move          SPACE / SHIFT  fly up / down";
-            t[2] = "Hold a mouse button and drag to look  -  F or right-click: free look";
-            t[3] = "LEFT-CLICK  tag the block in your crosshair (within 30 m)";
-            t[4] = "P / ESC  pause          M  mute";
-            t[5] = "BEST  " + bestText + "      RUNS  " + Convert.ToString(view.plays);
-            this.primary.SetText("START  [ENTER]");
-            this.secondary.SetText("QUIT  [ESC]");
-            this.tertiary.SetShown(false);
-        } else if (this.mode == "pause") {
-            this.heading.SetProp("text", "PAUSED");
-            t[1] = "TAGGED  " + Convert.ToString(game.taggedCount) + " / " + n
-                + "      TIME  " + FpsHud.FormatTime((long)game.elapsedMs);
-            t[2] = "BEST  " + bestText;
-            t[4] = view.autoPaused ? "Paused because the window lost focus." : "The clock is stopped.";
-            this.primary.SetText("RESUME  [P]");
-            this.secondary.SetText("RESTART  [R]");
-            this.tertiary.SetText("QUIT");
-        } else if (this.mode == "result") {
-            this.heading.SetProp("text", "ALL TARGETS TAGGED");
-            this.badge.SetShown(view.newBest);
-            t[1] = "TIME  " + FpsHud.FormatTime(view.lastMs);
-            t[2] = "BEST  " + bestText;
-            t[4] = "RUNS  " + Convert.ToString(view.plays) + "      CLEARS  " + Convert.ToString(view.clears);
-            this.primary.SetText("PLAY AGAIN  [ENTER]");
-            this.secondary.SetText("MENU  [ESC]");
-            this.tertiary.SetText("QUIT");
-        }
-        for (int i = 0; i < 6; i = i + 1) { this.lines[i].SetProp("text", t[i]); }
-    }
-
-    // 以 1280x720 为设计稿按画布等比缩放；dpx 即画布像素
-    void Layout(Gui.App app) {
         int w = app.canvas.Width();
         int h = app.canvas.Height();
         double s = Math.Min((double)w / 1280.0, (double)h / 720.0);
         if (s <= 0.0) { s = 1.0; }
-        this.Box(this.status, (int)(16 * s), (int)(16 * s), (int)(430 * s), (int)(178 * s), 0);
-        int lw = (int)(400 * s);
-        int lx = (int)(16 * s);
-        this.Box(this.title, lx, (int)(10 * s), lw, (int)(24 * s), (int)(16 * s));
-        this.Box(this.progress, lx, (int)(36 * s), lw, (int)(32 * s), (int)(26 * s));
-        this.Box(this.timer, lx, (int)(70 * s), lw, (int)(28 * s), (int)(22 * s));
-        this.Box(this.best, lx, (int)(100 * s), lw, (int)(20 * s), (int)(15 * s));
-        this.Box(this.aim, lx, (int)(122 * s), lw, (int)(20 * s), (int)(15 * s));
-        this.Box(this.viewMode, lx, (int)(142 * s), lw, (int)(16 * s), (int)(12 * s));
-        this.Box(this.backend, lx, (int)(158 * s), lw, (int)(16 * s), (int)(12 * s));
-        this.Box(this.sound, w - (int)(196 * s), (int)(16 * s), (int)(180 * s), (int)(28 * s), (int)(15 * s));
-        this.Box(this.hint, 0, h - (int)(48 * s), w, (int)(28 * s), (int)(16 * s));
-        this.Box(this.toast, 0, h / 2 + (int)(28 * s), w, (int)(30 * s), (int)(20 * s));
-        int ch = (int)(21 * s);
-        this.Box(this.crosshair, w / 2 - ch / 2, h / 2 - ch / 2, ch, ch, 0);
+        int top = app.ContentTop();
+        bool playing = this.mode == "play";
+        bool inRun = playing || this.mode == "pause";
 
-        this.Box(this.veil, 0, 0, w, h, 0);
-        int cw = (int)(640 * s);
-        int chh = (int)(470 * s);
-        this.Box(this.card, (w - cw) / 2, (h - chh) / 2, cw, chh, 0);
-        this.Box(this.heading, 0, (int)(28 * s), cw, (int)(48 * s), (int)(38 * s));
-        this.Box(this.badge, 0, (int)(80 * s), cw, (int)(30 * s), (int)(22 * s));
-        for (int i = 0; i < 6; i = i + 1) {
-            this.Box(this.lines[i], (int)(24 * s), (int)((118 + i * 32) * s), cw - (int)(48 * s), (int)(28 * s), (int)(17 * s));
-        }
-        int bw = (int)(180 * s);
-        int bh = (int)(48 * s);
-        int by = chh - (int)(80 * s);
-        int count = this.tertiary.visible ? 3 : 2;
-        int gap = (int)(16 * s);
-        int x0 = (cw - (count * bw + (count - 1) * gap)) / 2;
-        this.Box(this.primary, x0, by, bw, bh, (int)(16 * s));
-        this.Box(this.secondary, x0 + bw + gap, by, bw, bh, (int)(16 * s));
-        this.Box(this.tertiary, x0 + 2 * (bw + gap), by, bw, bh, (int)(16 * s));
+        this.SyncPlay(app, view, w, h, s, top, playing);
+        this.SetShownAll(inRun, playing, view);
+        this.menu.Sync(app, view, w, h, s, top);
+
+        this.layer.SetBounds(0, 0, w, h);
+        this.layer.SetVisible(app.window.GetHandle() == 0 || app.window.IsVisible());
     }
 
-    void Box(Control control, int x, int y, int w, int h, int font) {
-        string style = "left:" + Convert.ToString(x) + "dpx;top:" + Convert.ToString(y)
-            + "dpx;width:" + Convert.ToString(w) + "dpx;height:" + Convert.ToString(h) + "dpx";
-        if (font > 0) { style = style + ";font-size:" + Convert.ToString(font) + "dpx"; }
-        if (control.inlineStyleCss != style) { control.SetProp("style", style); }
+    void SetShownAll(bool inRun, bool playing, FpsView view) {
+        this.chip.SetShown(inRun);
+        this.timer.SetShown(inRun);
+        this.stats.SetShown(inRun);
+        this.crosshair.SetShown(playing && !this.game.complete);
+        this.aim.SetShown(playing && this.game.aimState != 0);
+        this.countdown.SetShown(playing && (this.game.InCountdown() || this.game.elapsedMs < 600.0));
+        this.toast.SetShown(playing && view.toast != "");
+        this.bonus.SetShown(playing && view.bonusMs > 0);
+        this.hint.SetShown(playing && view.showHint);
+        this.sound.SetShown(inRun);
+        this.flash.SetShown(playing && view.flashMs > 0);
+    }
+
+    void SyncPlay(Gui.App app, FpsView view, int w, int h, double s, int top, bool playing) {
+        FpsStage st = this.game.stage;
+        int n = this.game.targetCount;
+        long net = this.game.NetMs();
+
+        // 左上：关卡牌 + 奖牌配速
+        FpsHud.Box(this.chip, (int)(20 * s), top + (int)(14 * s), (int)(330 * s), (int)(92 * s), 0);
+        FpsHud.Box(this.chipStage, (int)(18 * s), (int)(10 * s), (int)(300 * s), (int)(18 * s), (int)(13 * s));
+        FpsHud.Box(this.chipName, (int)(18 * s), (int)(28 * s), (int)(300 * s), (int)(32 * s), (int)(26 * s));
+        FpsHud.Box(this.chipPace, (int)(18 * s), (int)(62 * s), (int)(300 * s), (int)(20 * s), (int)(14 * s));
+        FpsHud.SetText(this.chipStage, "STAGE " + Convert.ToString(this.game.stageIndex + 1) + " / " + Convert.ToString(FpsStages.Count()));
+        FpsHud.SetText(this.chipName, st.Name);
+        int pace = st.MedalFor(net);
+        string paceText = "MEDAL LOST - FINISH TO UNLOCK NEXT";
+        if (pace == 3) { paceText = "GOLD PACE  " + FpsHud.FormatTime(st.Gold); }
+        else if (pace == 2) { paceText = "SILVER PACE  " + FpsHud.FormatTime(st.Silver); }
+        else if (pace == 1) { paceText = "BRONZE PACE  " + FpsHud.FormatTime(st.Bronze); }
+        FpsHud.SetText(this.chipPace, paceText);
+        FpsHud.SetClass(this.chipPace, "fps-label fps-chip-pace " + FpsHud.MedalClass(pace));
+
+        // 顶部中央：大计时 + 奖励飘字
+        FpsHud.Box(this.timer, w / 2 - (int)(160 * s), top + (int)(8 * s), (int)(320 * s), (int)(56 * s), (int)(46 * s));
+        FpsHud.SetText(this.timer, FpsHud.FormatTime(net));
+        FpsHud.SetClass(this.timer, "fps-label fps-timer " + FpsHud.MedalClass(pace));
+        FpsHud.Box(this.bonus, w / 2 - (int)(160 * s), top + (int)(64 * s), (int)(320 * s), (int)(26 * s), (int)(20 * s));
+        FpsHud.SetText(this.bonus, view.bonusText);
+
+        // 右上：进度环 + 连击 + 碎片
+        int sw = (int)(250 * s);
+        FpsHud.Box(this.stats, w - sw - (int)(20 * s), top + (int)(14 * s), sw, (int)(92 * s), 0);
+        int rs = (int)(72 * s);
+        FpsHud.Box(this.ring, (int)(10 * s), (int)(10 * s), rs, rs, 0);
+        this.ring.StrokeWidth((int)(7 * s) > 2 ? (int)(7 * s) : 2);
+        this.ring.SetPercent(n > 0 ? this.game.taggedCount * 100 / n : 0);
+        FpsHud.Box(this.ringText, (int)(10 * s), (int)(28 * s), rs, (int)(24 * s), (int)(20 * s));
+        FpsHud.SetText(this.ringText, Convert.ToString(this.game.taggedCount) + "/" + Convert.ToString(n));
+        FpsHud.Box(this.ringSub, (int)(10 * s), (int)(50 * s), rs, (int)(14 * s), (int)(9 * s));
+        int cx = (int)(96 * s);
+        int cw = sw - cx - (int)(14 * s);
+        FpsHud.Box(this.combo, cx, (int)(12 * s), cw, (int)(26 * s), (int)(20 * s));
+        int c = this.game.combo;
+        FpsHud.SetText(this.combo, c >= 2 ? "COMBO x" + Convert.ToString(c) : "COMBO  -");
+        FpsHud.SetClass(this.combo, c >= 2 ? "fps-label fps-combo fps-hot" : "fps-label fps-combo");
+        FpsHud.Box(this.comboBar, cx, (int)(42 * s), cw, (int)(8 * s), 0);
+        this.comboBar.StrokeWidth((int)(6 * s) > 2 ? (int)(6 * s) : 2);
+        this.comboBar.SetPercent((int)(this.game.ComboLeft() * 100.0f));
+        FpsHud.Box(this.shard, cx, (int)(58 * s), cw, (int)(22 * s), (int)(14 * s));
+        FpsHud.SetText(this.shard, this.game.shardTaken ? "SHARD FOUND  -2.0s" : (view.shardEver ? "SHARD  (found before)" : "SHARD  hidden"));
+        FpsHud.SetClass(this.shard, this.game.shardTaken ? "fps-label fps-shard fps-gold" : "fps-label fps-shard");
+
+        // 准星（状态 + 命中闪）与下方说明
+        int ch = (int)(64 * s);
+        FpsHud.Box(this.crosshair, w / 2 - ch / 2, h / 2 - ch / 2, ch, ch, 0);
+        this.crosshair.state = this.game.aimState;
+        this.crosshair.hitMs = view.hitMs;
+        this.crosshair.pulse = view.pulse;
+        string cc = "fps-crosshair";
+        if (this.game.aimState == 1) { cc = "fps-crosshair fps-x-lock"; }
+        else if (this.game.aimState == 2) { cc = "fps-crosshair fps-x-far"; }
+        else if (this.game.aimState == 3) { cc = "fps-crosshair fps-x-pad"; }
+        FpsHud.SetClass(this.crosshair, cc);
+        FpsHud.Box(this.aim, w / 2 - (int)(200 * s), h / 2 + (int)(40 * s), (int)(400 * s), (int)(22 * s), (int)(15 * s));
+        string aimText = "";
+        string aimCls = "fps-label fps-aim";
+        if (this.game.aimState == 1) {
+            aimText = "LOCKED  " + Convert.ToString((int)this.game.hitDistance) + " m";
+            aimCls = "fps-label fps-aim fps-x-lock";
+        } else if (this.game.aimState == 2) {
+            aimText = "OUT OF RANGE  " + Convert.ToString((int)this.game.hitDistance) + " m  (max 16)";
+            aimCls = "fps-label fps-aim fps-x-far";
+        } else if (this.game.aimState == 3) {
+            aimText = "STAND ON THE MATCHING PAD";
+            aimCls = "fps-label fps-aim fps-x-pad";
+        }
+        FpsHud.SetText(this.aim, aimText);
+        FpsHud.SetClass(this.aim, aimCls);
+
+        // 倒计时 3-2-1-GO
+        FpsHud.Box(this.countdown, 0, h / 2 - (int)(150 * s), w, (int)(110 * s), (int)(96 * s));
+        if (this.game.InCountdown()) {
+            int beat = (int)(this.game.countdownMs / 800.0) + 1;
+            FpsHud.SetText(this.countdown, Convert.ToString(beat));
+            FpsHud.SetClass(this.countdown, "fps-label fps-count");
+        } else {
+            FpsHud.SetText(this.countdown, "GO!");
+            FpsHud.SetClass(this.countdown, "fps-label fps-count fps-go");
+        }
+
+        FpsHud.Box(this.toast, 0, h / 2 + (int)(70 * s), w, (int)(34 * s), (int)(24 * s));
+        FpsHud.SetText(this.toast, view.toast);
+        FpsHud.SetClass(this.toast, view.toastGood ? "fps-label fps-toast fps-good" : "fps-label fps-toast fps-bad");
+
+        FpsHud.Box(this.hint, 0, h - (int)(44 * s), w, (int)(24 * s), (int)(15 * s));
+        FpsHud.SetText(this.hint, this.game.freeLookMode
+            ? "WASD move  |  SPACE jump  |  SHIFT sprint  |  mouse: look (free)  |  F release  |  CLICK tag  |  P pause"
+            : "WASD move  |  SPACE jump  |  SHIFT sprint  |  hold mouse + drag: look  |  F free look  |  CLICK tag  |  P pause");
+        FpsHud.Box(this.sound, w - (int)(220 * s), h - (int)(30 * s), (int)(204 * s), (int)(20 * s), (int)(12 * s));
+        FpsHud.SetText(this.sound, (view.muted ? "SOUND OFF" : "SOUND ON") + "  [M]   " + (this.game.freeLookMode ? "FREE LOOK [F]" : "DRAG LOOK [F]"));
+
+        FpsHud.Box(this.flash, 0, 0, w, h, 0);
+        if (view.flashMs > 0) {
+            int a = view.flashMs * 22 / 160;
+            if (a > 22) { a = 22; }
+            string col = "rgba(" + Convert.ToString((view.flashColor >> 16) & 255) + "," + Convert.ToString((view.flashColor >> 8) & 255)
+                + "," + Convert.ToString(view.flashColor & 255) + ",0." + (a < 10 ? "0" : "") + Convert.ToString(a) + ")";
+            string fs = "left:0dpx;top:0dpx;width:" + Convert.ToString(w) + "dpx;height:" + Convert.ToString(h) + "dpx;background:" + col;
+            if (this.flash.inlineStyleCss != fs) { this.flash.SetProp("style", fs); }
+        }
+
+        this.SyncMarkers(w, h, s, top, playing);
+    }
+
+    // 目标指示：屏幕内菱形 + 距离；屏幕外贴边箭头
+    void SyncMarkers(int w, int h, double s, int top, bool playing) {
+        FpsStage st = this.game.stage;
+        Camera3D cam = this.game.camera;
+        Vector3 eye = cam.Position;
+        Vector3 fwd = cam.Forward();
+        Vector3 right = cam.Right();
+        Vector3 up = Vector3.Normalize(Vector3.Cross(right, fwd));
+        int ms = (int)(26 * s);
+        int mo = (int)(40 * s);
+        int count = 0;
+        for (int i = 0; i < this.game.targetCount && i < FpsHud.MaxMarkers; i = i + 1) {
+            FpsMarker mk = this.markers[i];
+            Label tx = this.markerText[i];
+            if (!playing || this.game.tagged[i] || this.game.complete) {
+                mk.SetShown(false);
+                tx.SetShown(false);
+                continue;
+            }
+            Vector3 p = this.game.targetPos[i];
+            float half = this.game.targetHalf[i];
+            Vector3 head = new Vector3(p.X, p.Y + half + 0.7f, p.Z);
+            float dist = Vector3.Distance(p, eye);
+            float sx = 0.0f;
+            float sy = 0.0f;
+            float depth = 0.0f;
+            Vector3 rel = Vector3.Subtract(head, eye);
+            bool front = Vector3.Dot(rel, fwd) > 0.2f;
+            bool onScreen = front && Raycast3D.WorldToScreen(head, w, h, cam, out sx, out sy, out depth)
+                && sx > (float)mo && sx < (float)(w - mo) && sy > (float)(top + mo + (int)(90 * s)) && sy < (float)(h - mo);
+            mk.color = st.Targets[i].Color;
+            mk.gated = st.Targets[i].Pad >= 0;
+            mk.focus = this.game.aimIndex == i;
+            if (onScreen) {
+                mk.offscreen = false;
+                FpsHud.Box(mk, (int)sx - ms / 2, (int)sy - ms / 2, ms, ms, 0);
+                FpsHud.Box(tx, (int)sx - (int)(40 * s), (int)sy + ms / 2, (int)(80 * s), (int)(16 * s), (int)(11 * s));
+            } else {
+                // 方向投到相机平面：x 向右、y 向下（屏幕坐标）
+                float rx = Vector3.Dot(rel, right);
+                float ry = 0.0f - Vector3.Dot(rel, up);
+                if (!front && rx * rx + ry * ry < 0.01f) { rx = 1.0f; }
+                float len = (float)Math.Sqrt((double)(rx * rx + ry * ry));
+                if (len < 0.0001f) { len = 1.0f; }
+                float dx = rx / len;
+                float dy = ry / len;
+                // 箭头只贴在 HUD 顶栏之下、提示行之上的区域，不压计时与面板
+                int bandTop = top + (int)(118 * s);
+                int bandBot = h - (int)(56 * s);
+                float hw = (float)(w / 2 - mo);
+                float hh = (float)((bandBot - bandTop) / 2 - (int)(16 * s));
+                float k = 1.0e9f;
+                if (dx > 0.001f || dx < -0.001f) { k = hw / (dx > 0.0f ? dx : 0.0f - dx); }
+                if (dy > 0.001f || dy < -0.001f) {
+                    float ky = hh / (dy > 0.0f ? dy : 0.0f - dy);
+                    if (ky < k) { k = ky; }
+                }
+                int ax = w / 2 + (int)(dx * k);
+                int ay = (bandTop + bandBot) / 2 + (int)(dy * k);
+                mk.offscreen = true;
+                mk.angle = (float)Math.Atan2((double)dy, (double)dx);
+                int as2 = (int)(30 * s);
+                FpsHud.Box(mk, ax - as2 / 2, ay - as2 / 2, as2, as2, 0);
+                int ty = ay + as2 / 2;
+                if (ty > h - (int)(20 * s)) { ty = ay - as2 / 2 - (int)(16 * s); }
+                FpsHud.Box(tx, ax - (int)(40 * s), ty, (int)(80 * s), (int)(16 * s), (int)(11 * s));
+            }
+            FpsHud.SetText(tx, Convert.ToString((int)dist) + " m");
+            FpsHud.SetClass(tx, dist <= FpsGame.TagRange ? "fps-label fps-mtext fps-inrange" : "fps-label fps-mtext");
+            mk.SetShown(true);
+            tx.SetShown(true);
+            count = count + 1;
+        }
+        for (int i = this.game.targetCount; i < FpsHud.MaxMarkers; i = i + 1) {
+            this.markers[i].SetShown(false);
+            this.markerText[i].SetShown(false);
+        }
     }
 
     public void Render(Gui.App app) {
@@ -277,59 +404,58 @@ public class FpsHud {
         this.layer.SetVisible(false);
         this.layer.Clear();
     }
-
-    public static string Css() {
-        return ".fps-hud{position:relative;background:transparent;padding:0;border:0}"
-            + ".fps-status,.fps-veil,.fps-card{position:absolute;padding:0;margin:0}"
-            + ".fps-status{background:rgba(4,14,20,0.78);border:1dpx solid rgba(0,229,255,0.35);border-radius:6dpx}"
-            + ".fps-veil{background:rgba(2,8,12,0.72);border:0}"
-            + ".fps-card{background:rgba(6,20,28,0.94);border:2dpx solid #00e5ff;border-radius:10dpx;"
-            + "box-shadow:0 0 24dpx rgba(0,229,255,0.25)}"
-            + "label.fps-label{position:absolute;padding:0;margin:0;border:0;background:transparent;"
-            + "text-align:left;vertical-align:top;color:#e6fbff}"
-            + "label.fps-title{color:#00e5ff}"
-            + "label.fps-progress{color:#ffffff}"
-            + "label.fps-timer{color:#ffd666}"
-            + "label.fps-muted{color:#8fa9b5}"
-            + "label.fps-aim{color:#8fa9b5}label.fps-aim.fps-locked{color:#5cff8a}"
-            + "label.fps-view{color:#ffa940}label.fps-view.fps-free{color:#00e5ff}"
-            + "label.fps-backend{color:#8fa9b5}label.fps-gpu{color:#52c41a}label.fps-cpu{color:#faad14}"
-            + "label.fps-sound{text-align:right;color:#8fa9b5}label.fps-sound.fps-off{color:#ff7875}"
-            + "label.fps-hint{text-align:center;color:#e6fbff}"
-            + "label.fps-toast{text-align:center}label.fps-toast.fps-good{color:#5cff8a}label.fps-toast.fps-bad{color:#ff9c6e}"
-            + "label.fps-heading{text-align:center;color:#00e5ff}"
-            + "label.fps-badge{text-align:center;color:#ffd666}"
-            + "label.fps-line{text-align:center;color:#cfe9f2}"
-            + "button.fps-btn{position:absolute;padding:0;margin:0;justify-content:center;align-items:center;"
-            + "color:#cfe9f2;background:rgba(10,32,42,0.95);border:2dpx solid #3d6170;border-radius:6dpx}"
-            + "button.fps-btn.fps-primary{color:#e6fbff;border-color:#00e5ff;background:#0b3a47}"
-            + "button.fps-btn label{background:transparent;border:0;font-size:inherit;color:inherit;"
-            + "text-align:center;padding:0;margin:0}"
-            + "button.fps-btn:hover{background:#0f5566;color:#ffffff;border-color:#00e5ff}"
-            + "button.fps-btn:active{background:#00e5ff;color:#03161d;border-color:#ffffff}"
-            + "button.fps-btn:focus{border:2dpx solid #ffffff}"
-            + ".fps-crosshair{position:absolute;padding:0;border:0;background:transparent;color:#ffffff}"
-            + ".fps-crosshair.fps-locked{color:#5cff8a}";
-    }
 }
 
-// FpsLoop 汇总给 HUD 的应用层状态（档案、静音、提示、结算），
-// 让 FpsHud 不依赖 GameProfile/音频。
+// FpsLoop 汇总给 HUD/菜单的应用层状态（档案、静音、提示、结算），
+// 让界面层不依赖 GameProfile/音频。
 public class FpsView {
-    public bool hasBest;
-    public long bestMs;
-    public long lastMs;
-    public bool newBest;
-    public long plays;
-    public long clears;
     public bool muted;
     public bool showHint;
     public bool autoPaused;
     public string toast;
     public bool toastGood;
+    public string bonusText;
+    public int bonusMs;
+    public int hitMs;
+    public int flashMs;
+    public int flashColor;
+    public float pulse;
+    public bool shardEver;
+    public long plays;
+    public long clears;
+
+    // 每关档案
+    public bool[] hasBest;
+    public long[] bestMs;
+    public bool[] shardFound;
+    public bool[] unlocked;
+    public int selected;
+
+    // 结算
+    public long lastNet;
+    public long lastRaw;
+    public long lastCombo;
+    public long lastShard;
+    public bool newBest;
+    public int medal;
+    public int prevMedal;
+    public int bestCombo;
+    public bool unlockedNext;
 
     public FpsView() {
+        int n = FpsStages.Count();
         this.toast = "";
         this.toastGood = true;
+        this.bonusText = "";
+        this.hasBest = new bool[n];
+        this.bestMs = new long[n];
+        this.shardFound = new bool[n];
+        this.unlocked = new bool[n];
+        this.unlocked[0] = true;
+    }
+
+    public int MedalOf(int stage, FpsStage def) {
+        if (!this.hasBest[stage]) { return 0; }
+        return def.MedalFor(this.bestMs[stage]);
     }
 }

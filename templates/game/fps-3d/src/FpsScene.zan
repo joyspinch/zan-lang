@@ -1,0 +1,801 @@
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+using Gui;
+using Game.Animation;
+using Game.Render3D;
+using Game.Graphics;
+
+namespace Fps3D;
+
+// 世界表现层：把 FpsGame 的关卡与状态画成一座霓虹竞技场。
+// - 程序化黄昏天空盒 + 同色距离雾 + 半球环境光 + 斜射日光阴影 + ACES/暗角/泛光后处理；
+// - 地面是双色方砖（顶点色网格）+ 青色发光网格线；建筑按用途配色，顶边嵌发光灯条；
+// - 目标 = 旋转发光核心 + 半透明光壳 + 直冲天空的信标光柱，最近的 4 个未标记目标各挂一盏
+//   同色点光并随节拍脉动；踏台目标外加旋转光环，踏台顶面同色；
+// - 标记时迸出碎片、地面冲击波与镜头轻震；隐藏碎片是旋转的金色晶体。
+// 只读 FpsGame，不改规则；粒子用自己的随机数，与回放无关。
+public class FpsScene {
+    public RenderPlan plan;
+    public Renderer3D renderer;
+    public SceneNode root;
+    public bool ready;
+    // 最近一次真实提交（0 = GPU 没画，走 CPU 线框兜底）
+    public int drawResult;
+
+    int cubeKey;
+    int sphereKey;
+    int cylKey;
+    int wedgeKey;
+    int groundKey;
+    int gridKey;
+    int ringKey;
+
+    FpsGame game;
+    int builtStage;
+    SceneNode stageRoot;
+    SceneNode[] cores;
+    SceneNode[] shells;
+    SceneNode[] beams;
+    SceneNode[] rings;
+    SceneNode[] padCaps;
+    SceneNode shard;
+    SceneNode shardGlow;
+    Light sun;
+    Light[] glows;
+
+    // 粒子（标记碎片）与冲击波
+    const int PartCount = 72;
+    SceneNode[] parts;
+    float[] pvx;
+    float[] pvy;
+    float[] pvz;
+    float[] plife;
+    float[] psize;
+    int nextPart;
+    const int WaveCount = 4;
+    SceneNode[] waves;
+    float[] wlife;
+    int nextWave;
+    uint rng;
+
+    int seenTag;
+    int seenShard;
+    int seenLand;
+    // 镜头震动（米）与节拍时钟（毫秒，表现用）
+    public float shake;
+    double clockMs;
+
+    public FpsScene(FpsGame game) {
+        this.game = game;
+        this.plan = new RenderPlan(game.camera);
+        this.plan.AmbientRed = 0.10f;
+        this.plan.AmbientGreen = 0.09f;
+        this.plan.AmbientBlue = 0.16f;
+        this.sun = Light.DirectionalLight(1.0f, 0.78f, 0.62f, 1.05f, new Vector3(-0.45f, -1.0f, -0.55f));
+        this.plan.Lights.Add(this.sun);
+        this.glows = new Light[4];
+        for (int i = 0; i < 4; i = i + 1) {
+            this.glows[i] = Light.PointLight(1.0f, 1.0f, 1.0f, 0.0f, Vector3.Zero, 9.0f);
+            this.glows[i].Enabled = false;
+            this.plan.Lights.Add(this.glows[i]);
+        }
+
+        this.renderer = new Renderer3D(512);
+        Skybox3D sky = new Skybox3D();
+        sky.TopRed = 0.02f; sky.TopGreen = 0.02f; sky.TopBlue = 0.09f;
+        sky.HorizonRed = 0.42f; sky.HorizonGreen = 0.12f; sky.HorizonBlue = 0.30f;
+        sky.GroundRed = 0.03f; sky.GroundGreen = 0.02f; sky.GroundBlue = 0.06f;
+        sky.SunDirection = new Vector3(0.35f, 0.18f, -1.0f);
+        this.renderer.Skybox = sky;
+        this.renderer.SyncHemisphereFromSkybox(0.9f);
+        this.renderer.EnableFog = true;
+        this.renderer.FogRed = 0.16f;
+        this.renderer.FogGreen = 0.06f;
+        this.renderer.FogBlue = 0.16f;
+        this.renderer.FogStart = 28.0f;
+        this.renderer.FogEnd = 120.0f;
+        this.renderer.EnableShadows = true;
+        this.renderer.ShadowMapSize = 2048;
+        this.renderer.ShadowBounds = 36.0f;
+        this.renderer.ShadowDistance = 60.0f;
+        PostProcess post = new PostProcess();
+        post.Exposure = 1.08f;
+        post.Tonemap = TonemapKind.Aces;
+        post.VignetteStrength = 0.38f;
+        post.BloomThreshold = 0.72f;
+        post.BloomIntensity = 0.55f;
+        // GPU 后处理 Pass 在当前 macOS GL 后端会把整帧上下翻转（见 README "已知缺口"），
+        // 设 FPS3D_POST=1 可打开以便验证驱动修复；默认关闭，雾/自发光/阴影不受影响。
+        if (Environment.GetEnvironmentVariable("FPS3D_POST") == "1") { this.renderer.PostProcess = post; }
+
+        this.root = new SceneNode("World");
+        this.builtStage = -1;
+        this.rng = 2463534242;
+        this.ready = false;
+        this.drawResult = 1;
+    }
+
+    // 上传共享网格（窗口可见后调用一次）
+    public void Init(Canvas canvas) {
+        if (canvas == null || this.ready) { return; }
+        this.cubeKey = canvas.MeshUpload(Primitives3D.CreateCube(2.0f, 2.0f, 2.0f));
+        this.sphereKey = canvas.MeshUpload(Primitives3D.CreateSphere(1.0f, 10, 14));
+        this.cylKey = canvas.MeshUpload(Primitives3D.CreateCylinder(1.0f, 2.0f, 20));
+        this.wedgeKey = canvas.MeshUpload(FpsScene.WedgeMesh());
+        this.groundKey = canvas.MeshUpload(FpsScene.GroundMesh());
+        this.gridKey = canvas.MeshUpload(FpsScene.GridMesh());
+        this.ringKey = canvas.MeshUpload(FpsScene.RingMesh(0.82f, 32));
+        this.ready = true;
+        this.builtStage = -1;
+    }
+
+    // ---- 网格 ----
+
+    // 单位楔形：x∈[-1,1]、z∈[-1,1]，高度从 z=-1 的 0 升到 z=+1 的 1
+    static Mesh3D WedgeMesh() {
+        Mesh3D m = new Mesh3D();
+        int a = m.Vertex(-1, 0, -1, 0, -1, 0, 0, 0);
+        int b = m.Vertex(1, 0, -1, 0, -1, 0, 1, 0);
+        int c = m.Vertex(1, 0, 1, 0, -1, 0, 1, 1);
+        int d = m.Vertex(-1, 0, 1, 0, -1, 0, 0, 1);
+        m.Quad(a, b, c, d);
+        a = m.Vertex(-1, 0, 1, 0, 0, 1, 0, 0);
+        b = m.Vertex(1, 0, 1, 0, 0, 1, 1, 0);
+        c = m.Vertex(1, 1, 1, 0, 0, 1, 1, 1);
+        d = m.Vertex(-1, 1, 1, 0, 0, 1, 0, 1);
+        m.Quad(a, b, c, d);
+        float ny = 0.894f;
+        float nz = -0.447f;
+        a = m.Vertex(1, 0, -1, 0, ny, nz, 1, 0);
+        b = m.Vertex(-1, 0, -1, 0, ny, nz, 0, 0);
+        c = m.Vertex(-1, 1, 1, 0, ny, nz, 0, 1);
+        d = m.Vertex(1, 1, 1, 0, ny, nz, 1, 1);
+        m.Quad(a, b, c, d);
+        a = m.Vertex(-1, 0, -1, -1, 0, 0, 0, 0);
+        b = m.Vertex(-1, 0, 1, -1, 0, 0, 1, 0);
+        c = m.Vertex(-1, 1, 1, -1, 0, 0, 1, 1);
+        m.Triangle(a, b, c);
+        a = m.Vertex(1, 0, -1, 1, 0, 0, 0, 0);
+        b = m.Vertex(1, 1, 1, 1, 0, 0, 1, 1);
+        c = m.Vertex(1, 0, 1, 1, 0, 0, 1, 0);
+        m.Triangle(a, b, c);
+        return m;
+    }
+
+    // 水平圆环（内半径 inner、外半径 1），上下两面都朝外，任何角度都看得见
+    static Mesh3D RingMesh(float inner, int seg) {
+        Mesh3D m = new Mesh3D();
+        for (int i = 0; i < seg; i = i + 1) {
+            double a0 = (double)i * 6.2831853 / (double)seg;
+            double a1 = (double)(i + 1) * 6.2831853 / (double)seg;
+            float c0 = (float)Math.Cos(a0);
+            float s0 = (float)Math.Sin(a0);
+            float c1 = (float)Math.Cos(a1);
+            float s1 = (float)Math.Sin(a1);
+            int a = m.Vertex(c0 * inner, 0, s0 * inner, 0, 1, 0, 0, 0);
+            int b = m.Vertex(c0, 0, s0, 0, 1, 0, 1, 0);
+            int c = m.Vertex(c1, 0, s1, 0, 1, 0, 1, 1);
+            int d = m.Vertex(c1 * inner, 0, s1 * inner, 0, 1, 0, 0, 1);
+            m.Quad(a, d, c, b);
+            int e = m.Vertex(c0 * inner, 0, s0 * inner, 0, -1, 0, 0, 0);
+            int f = m.Vertex(c0, 0, s0, 0, -1, 0, 1, 0);
+            int g = m.Vertex(c1, 0, s1, 0, -1, 0, 1, 1);
+            int h = m.Vertex(c1 * inner, 0, s1 * inner, 0, -1, 0, 0, 1);
+            m.Quad(e, f, g, h);
+        }
+        return m;
+    }
+
+    // 地面：20 x 20 块 3 m 方砖，双色棋盘 + 每块轻微明暗变化（顶点色）
+    static Mesh3D GroundMesh() {
+        Mesh3D m = new Mesh3D();
+        float half = FpsStages.ArenaHalf;
+        float step = 3.0f;
+        int n = 20;
+        for (int j = 0; j < n; j = j + 1) {
+            for (int i = 0; i < n; i = i + 1) {
+                float x0 = -half + (float)i * step;
+                float z0 = -half + (float)j * step;
+                float x1 = x0 + step;
+                float z1 = z0 + step;
+                bool dark = ((i + j) & 1) == 0;
+                float v = (float)(((i * 7 + j * 13) % 5)) * 0.006f;
+                float r = (dark ? 0.060f : 0.085f) + v;
+                float g = (dark ? 0.066f : 0.092f) + v;
+                float b = (dark ? 0.120f : 0.150f) + v * 1.5f;
+                // 中轴（出生通道）略亮，给出方向感
+                if (i == 9 || i == 10) { r = r + 0.02f; g = g + 0.03f; b = b + 0.05f; }
+                int a0 = m.VertexC(x0, 0, z1, 0, 1, 0, 0, 0, r, g, b, 1);
+                int a1 = m.VertexC(x1, 0, z1, 0, 1, 0, 1, 0, r, g, b, 1);
+                int a2 = m.VertexC(x1, 0, z0, 0, 1, 0, 1, 1, r, g, b, 1);
+                int a3 = m.VertexC(x0, 0, z0, 0, 1, 0, 0, 1, r, g, b, 1);
+                m.Quad(a0, a1, a2, a3);
+            }
+        }
+        return m;
+    }
+
+    // 发光网格线：每 3 m 一条细长四边形，略高于地面
+    static Mesh3D GridMesh() {
+        Mesh3D m = new Mesh3D();
+        float half = FpsStages.ArenaHalf;
+        float w = 0.035f;
+        float y = 0.015f;
+        for (int i = 0; i <= 20; i = i + 1) {
+            float c = -half + (float)i * 3.0f;
+            int a0 = m.Vertex(c - w, y, half, 0, 1, 0, 0, 0);
+            int a1 = m.Vertex(c + w, y, half, 0, 1, 0, 1, 0);
+            int a2 = m.Vertex(c + w, y, -half, 0, 1, 0, 1, 1);
+            int a3 = m.Vertex(c - w, y, -half, 0, 1, 0, 0, 1);
+            m.Quad(a0, a1, a2, a3);
+            int b0 = m.Vertex(-half, y, c + w, 0, 1, 0, 0, 0);
+            int b1 = m.Vertex(half, y, c + w, 0, 1, 0, 1, 0);
+            int b2 = m.Vertex(half, y, c - w, 0, 1, 0, 1, 1);
+            int b3 = m.Vertex(-half, y, c - w, 0, 1, 0, 0, 1);
+            m.Quad(b0, b1, b2, b3);
+        }
+        return m;
+    }
+
+    // ---- 材质 ----
+
+    static float R(int c) { return (float)((c >> 16) & 255) / 255.0f; }
+    static float G(int c) { return (float)((c >> 8) & 255) / 255.0f; }
+    static float B(int c) { return (float)(c & 255) / 255.0f; }
+
+    static Material Mat(float r, float g, float b, float rough) {
+        Material m = Material.Solid(r, g, b);
+        m.Roughness = rough;
+        return m;
+    }
+
+    static Material Glow(int color, float k) {
+        Material m = Material.Solid(FpsScene.R(color), FpsScene.G(color), FpsScene.B(color));
+        m.EmissiveRed = FpsScene.R(color) * k;
+        m.EmissiveGreen = FpsScene.G(color) * k;
+        m.EmissiveBlue = FpsScene.B(color) * k;
+        m.Roughness = 0.4f;
+        return m;
+    }
+
+    // 建筑配色：墙 深紫/洋红灯条，柱 青蓝/青灯条，平台 暖棕/琥珀灯条，坡道 琥珀，掩体 石板/冰蓝
+    static Material BodyMat(int look) {
+        if (look == 1) { return FpsScene.Mat(0.10f, 0.20f, 0.28f, 0.55f); }
+        if (look == 2) { return FpsScene.Mat(0.30f, 0.19f, 0.12f, 0.7f); }
+        if (look == 3) { return FpsScene.Mat(0.42f, 0.30f, 0.10f, 0.6f); }
+        if (look == 4) { return FpsScene.Mat(0.16f, 0.18f, 0.23f, 0.75f); }
+        if (look == 5) { return FpsScene.Mat(0.12f, 0.12f, 0.16f, 0.6f); }
+        return FpsScene.Mat(0.17f, 0.12f, 0.27f, 0.8f);
+    }
+
+    static int TrimColor(int look) {
+        if (look == 1) { return 0x19E6FF; }
+        if (look == 2) { return 0xFFA31A; }
+        if (look == 3) { return 0xFFC53D; }
+        if (look == 4) { return 0x8FD8FF; }
+        return 0xFF2E9A;
+    }
+
+    SceneNode Node(string name, int mesh, Material mat, float x, float y, float z, float sx, float sy, float sz) {
+        SceneNode n = new SceneNode(name);
+        n.MeshKey = mesh;
+        n.Material = mat;
+        n.BoundsRadius = 1.8f;
+        n.Local = new Transform3D(new Vector3(x, y, z), Quaternion.Identity, new Vector3(sx, sy, sz));
+        this.stageRoot.Children.Add(n);
+        return n;
+    }
+
+    // ---- 关卡搭建 ----
+
+    public void BuildStage() {
+        if (!this.ready) { return; }
+        FpsStage st = this.game.stage;
+        this.builtStage = this.game.stageIndex;
+        this.root.Children.Clear();
+        this.stageRoot = new SceneNode("Stage");
+        this.root.Children.Add(this.stageRoot);
+
+        Material groundMat = FpsScene.Mat(1.0f, 1.0f, 1.0f, 0.85f);
+        SceneNode ground = this.Node("Ground", this.groundKey, groundMat, 0, 0, 0, 1, 1, 1);
+        ground.BoundsRadius = 50.0f;
+        ground.CastShadow = false;
+        Material gridMat = FpsScene.Glow(0x14C8E6, 0.4f);
+        SceneNode grid = this.Node("Grid", this.gridKey, gridMat, 0, 0, 0, 1, 1, 1);
+        grid.BoundsRadius = 50.0f;
+        grid.CastShadow = false;
+
+        // 建筑 + 顶边灯条
+        for (int i = 0; i < st.Solids.Count; i = i + 1) {
+            FpsSolid s = st.Solids[i];
+            float w = (s.MaxX - s.MinX) * 0.5f;
+            float d = (s.MaxZ - s.MinZ) * 0.5f;
+            if (s.Axis != 0) {
+                this.BuildRamp(s);
+                continue;
+            }
+            float hh = (s.H0 - s.Bottom) * 0.5f;
+            SceneNode body = this.Node("Solid", this.cubeKey, FpsScene.BodyMat(s.Look),
+                s.CenterX(), s.Bottom + hh, s.CenterZ(), w, hh, d);
+            body.BoundsRadius = 1.8f;
+            int trim = s.Look == 5 ? s.PadColor : FpsScene.TrimColor(s.Look);
+            float k = 0.8f;
+            if (s.Look == 4) { k = 0.28f; }
+            else if (s.Look == 2) { k = 0.5f; }
+            else if (s.Look == 5) { k = 0.9f; }
+            SceneNode cap = this.Node("Trim", this.cubeKey, FpsScene.Glow(trim, k),
+                s.CenterX(), s.H0 + 0.02f, s.CenterZ(), w + 0.03f, 0.05f, d + 0.03f);
+            cap.CastShadow = false;
+            if (s.Look == 5) {
+                // 踏台：顶面整块同色发光
+                cap.Local.Scale = new Vector3(w - 0.25f, 0.06f, d - 0.25f);
+                SceneNode rim = this.Node("PadRim", this.cubeKey, FpsScene.Glow(trim, 0.35f),
+                    s.CenterX(), s.H0 * 0.5f, s.CenterZ(), w + 0.04f, 0.08f, d + 0.04f);
+                rim.CastShadow = false;
+            } else if (s.Look == 1 && s.H0 > 3.5f) {
+                // 高柱：中段再加一圈灯带
+                SceneNode band = this.Node("Band", this.cubeKey, FpsScene.Glow(trim, 0.6f),
+                    s.CenterX(), s.H0 * 0.55f, s.CenterZ(), w + 0.03f, 0.06f, d + 0.03f);
+                band.CastShadow = false;
+            } else if (s.Look == 0 && s.H0 >= 3.0f) {
+                SceneNode band = this.Node("Band", this.cubeKey, FpsScene.Glow(0x7A2CFF, 0.5f),
+                    s.CenterX(), 0.6f, s.CenterZ(), w + 0.02f, 0.04f, d + 0.02f);
+                band.CastShadow = false;
+            }
+        }
+
+        // 目标
+        int n = this.game.targetCount;
+        this.cores = new SceneNode[n];
+        this.shells = new SceneNode[n];
+        this.beams = new SceneNode[n];
+        this.rings = new SceneNode[n];
+        this.padCaps = new SceneNode[n];
+        for (int i = 0; i < n; i = i + 1) {
+            FpsTargetDef t = st.Targets[i];
+            float h = t.Size * 0.5f;
+            this.cores[i] = this.Node("Core", this.cubeKey, FpsScene.Glow(t.Color, 0.8f), t.X, t.Y, t.Z, h, h, h);
+            Material shellMat = FpsScene.Glow(t.Color, 0.9f);
+            shellMat.Alpha = 0.22f;
+            this.shells[i] = this.Node("Shell", this.cubeKey, shellMat, t.X, t.Y, t.Z, h * 1.45f, h * 1.45f, h * 1.45f);
+            this.shells[i].Layer = 1;
+            this.shells[i].CastShadow = false;
+            Material beamMat = FpsScene.Glow(t.Color, 1.0f);
+            beamMat.Alpha = 0.16f;
+            this.beams[i] = this.Node("Beam", this.cylKey, beamMat, t.X, 20.0f, t.Z, 0.10f, 20.0f, 0.10f);
+            this.beams[i].Layer = 1;
+            this.beams[i].CastShadow = false;
+            this.beams[i].BoundsRadius = 21.0f;
+            if (t.Pad >= 0) {
+                Material ringMat = FpsScene.Glow(t.Color, 1.0f);
+                ringMat.Alpha = 0.55f;
+                this.rings[i] = this.Node("Ring", this.ringKey, ringMat, t.X, t.Y, t.Z, h * 2.1f, 1.0f, h * 2.1f);
+                this.rings[i].Layer = 1;
+                this.rings[i].CastShadow = false;
+            }
+            // 路径提示：往返目标画一条暗色导轨，环绕目标画一圈光点
+            if (t.Kind == 1) {
+                float mx = (t.X + t.X2) * 0.5f;
+                float my = (t.Y + t.Y2) * 0.5f;
+                float mz = (t.Z + t.Z2) * 0.5f;
+                float dx = t.X2 - t.X;
+                float dy = t.Y2 - t.Y;
+                float dz = t.Z2 - t.Z;
+                float len = (float)Math.Sqrt((double)(dx * dx + dy * dy + dz * dz));
+                SceneNode rail = this.Node("Rail", this.cubeKey, FpsScene.Glow(t.Color, 0.35f), mx, my - h - 0.25f, mz, 0.04f, 0.04f, len * 0.5f);
+                rail.CastShadow = false;
+                rail.BoundsRadius = len * 0.5f + 1.0f;
+                float yaw = (float)Math.Atan2((double)dx, (double)dz);
+                float pitch = 0.0f - (float)Math.Atan2((double)dy, Math.Sqrt((double)(dx * dx + dz * dz)));
+                rail.Local.Rotation = Quaternion.FromEulerRadians(pitch, yaw, 0.0f);
+                rail.Local.Scale = new Vector3(0.04f, 0.04f, len * 0.5f);
+            } else if (t.Kind == 2) {
+                for (int k = 0; k < 24; k = k + 1) {
+                    double a = (double)k * 6.2831853 / 24.0;
+                    SceneNode dot = this.Node("OrbitDot", this.cubeKey, FpsScene.Glow(t.Color, 0.5f),
+                        t.X + (float)Math.Cos(a) * t.Radius, t.Y - h - 0.2f, t.Z + (float)Math.Sin(a) * t.Radius, 0.07f, 0.07f, 0.07f);
+                    dot.CastShadow = false;
+                }
+            }
+        }
+
+        // 隐藏碎片：旋转的金色晶体 + 光晕
+        Material shardMat = FpsScene.Glow(0xFFD34D, 1.1f);
+        shardMat.Metallic = 0.8f;
+        shardMat.Roughness = 0.25f;
+        this.shard = this.Node("Shard", this.cubeKey, shardMat, st.ShardX, st.ShardY, st.ShardZ, 0.28f, 0.28f, 0.28f);
+        Material haloMat = FpsScene.Glow(0xFFD34D, 1.0f);
+        haloMat.Alpha = 0.18f;
+        this.shardGlow = this.Node("ShardGlow", this.sphereKey, haloMat, st.ShardX, st.ShardY, st.ShardZ, 0.7f, 0.7f, 0.7f);
+        this.shardGlow.Layer = 1;
+        this.shardGlow.CastShadow = false;
+
+        // 粒子与冲击波池
+        this.parts = new SceneNode[FpsScene.PartCount];
+        this.pvx = new float[FpsScene.PartCount];
+        this.pvy = new float[FpsScene.PartCount];
+        this.pvz = new float[FpsScene.PartCount];
+        this.plife = new float[FpsScene.PartCount];
+        this.psize = new float[FpsScene.PartCount];
+        for (int i = 0; i < FpsScene.PartCount; i = i + 1) {
+            this.parts[i] = this.Node("Spark", this.cubeKey, FpsScene.Glow(0xFFFFFF, 1.0f), 0, -50, 0, 0.1f, 0.1f, 0.1f);
+            this.parts[i].Visible = false;
+            this.parts[i].CastShadow = false;
+            this.plife[i] = 0.0f;
+        }
+        this.waves = new SceneNode[FpsScene.WaveCount];
+        this.wlife = new float[FpsScene.WaveCount];
+        for (int i = 0; i < FpsScene.WaveCount; i = i + 1) {
+            Material wm = FpsScene.Glow(0xFFFFFF, 1.0f);
+            wm.Alpha = 0.5f;
+            this.waves[i] = this.Node("Wave", this.ringKey, wm, 0, -50, 0, 1, 1, 1);
+            this.waves[i].Layer = 1;
+            this.waves[i].Visible = false;
+            this.waves[i].CastShadow = false;
+            this.waves[i].BoundsRadius = 8.0f;
+        }
+        this.nextPart = 0;
+        this.nextWave = 0;
+        this.seenTag = this.game.tagSerial;
+        this.seenShard = this.game.shardSerial;
+        this.seenLand = this.game.landSerial;
+        this.shake = 0.0f;
+    }
+
+    void BuildRamp(FpsSolid s) {
+        // 楔形网格按升起方向绕 Y 旋转：+Z 升 = 0°，-Z 升 = 180°，+X 升 = 90°，-X 升 = 270°
+        float yaw = 0.0f;
+        float halfW = (s.MaxX - s.MinX) * 0.5f;
+        float halfL = (s.MaxZ - s.MinZ) * 0.5f;
+        if (s.Axis == 2) { yaw = s.H1 >= s.H0 ? 0.0f : 3.14159265f; }
+        else {
+            yaw = s.H1 >= s.H0 ? 1.5707963f : -1.5707963f;
+            halfW = (s.MaxZ - s.MinZ) * 0.5f;
+            halfL = (s.MaxX - s.MinX) * 0.5f;
+        }
+        float top = s.Top();
+        SceneNode n = this.Node("Ramp", this.wedgeKey, FpsScene.BodyMat(3), s.CenterX(), 0.0f, s.CenterZ(), halfW, top, halfL);
+        n.Local.Rotation = Quaternion.FromEulerRadians(0.0f, yaw, 0.0f);
+        n.BoundsRadius = 1.8f;
+        n.Normal = new Vector3(0.0f, 0.9f, 0.0f);
+        // 坡面两侧的琥珀灯条
+        float rise = top;
+        float len = halfL * 2.0f;
+        float slope = (float)Math.Atan2((double)rise, (double)len);
+        float hyp = (float)Math.Sqrt((double)(rise * rise + len * len));
+        for (int side = -1; side <= 1; side = side + 2) {
+            float ox = (float)side * (halfW - 0.08f);
+            // 局部 (ox, rise/2, 0) 旋转到世界
+            float wx = s.CenterX() + ox * (float)Math.Cos((double)yaw);
+            float wz = s.CenterZ() - ox * (float)Math.Sin((double)yaw);
+            SceneNode strip = this.Node("RampTrim", this.cubeKey, FpsScene.Glow(0xFFC53D, 0.8f), wx, rise * 0.5f + 0.03f, wz, 0.06f, 0.04f, hyp * 0.5f);
+            strip.Local.Rotation = Quaternion.FromEulerRadians(0.0f - slope, yaw, 0.0f);
+            strip.CastShadow = false;
+            strip.BoundsRadius = hyp * 0.5f + 1.0f;
+        }
+    }
+
+    float Rand() {
+        this.rng = this.rng ^ (this.rng << 13);
+        this.rng = this.rng ^ (this.rng >> 17);
+        this.rng = this.rng ^ (this.rng << 5);
+        return (float)(this.rng & 65535u) / 65535.0f;
+    }
+
+    void Burst(Vector3 p, int color, int count, float speed) {
+        for (int k = 0; k < count; k = k + 1) {
+            int i = this.nextPart;
+            this.nextPart = (this.nextPart + 1) % FpsScene.PartCount;
+            float a = this.Rand() * 6.2831853f;
+            float up = this.Rand();
+            float sp = speed * (0.45f + this.Rand() * 0.75f);
+            this.pvx[i] = (float)Math.Cos((double)a) * sp * (1.0f - up * 0.5f);
+            this.pvz[i] = (float)Math.Sin((double)a) * sp * (1.0f - up * 0.5f);
+            this.pvy[i] = 2.0f + up * speed;
+            this.plife[i] = 0.7f + this.Rand() * 0.5f;
+            this.psize[i] = 0.05f + this.Rand() * 0.08f;
+            SceneNode n = this.parts[i];
+            n.Visible = true;
+            n.Local.Position = p;
+            Material m = n.Material;
+            m.Red = FpsScene.R(color); m.Green = FpsScene.G(color); m.Blue = FpsScene.B(color);
+            m.EmissiveRed = m.Red * 1.2f; m.EmissiveGreen = m.Green * 1.2f; m.EmissiveBlue = m.Blue * 1.2f;
+        }
+    }
+
+    void Wave(Vector3 p, int color) {
+        int i = this.nextWave;
+        this.nextWave = (this.nextWave + 1) % FpsScene.WaveCount;
+        this.wlife[i] = 1.0f;
+        SceneNode n = this.waves[i];
+        n.Visible = true;
+        n.Local.Position = p;
+        Material m = n.Material;
+        m.Red = FpsScene.R(color); m.Green = FpsScene.G(color); m.Blue = FpsScene.B(color);
+        m.EmissiveRed = m.Red; m.EmissiveGreen = m.Green; m.EmissiveBlue = m.Blue;
+    }
+
+    // 每帧表现更新（dtMs = 真实帧间隔）
+    public void Update(int dtMs) {
+        if (!this.ready) { return; }
+        if (this.builtStage != this.game.stageIndex || this.stageRoot == null) { this.BuildStage(); }
+        float dt = (float)dtMs / 1000.0f;
+        if (dt > 0.1f) { dt = 0.1f; }
+        this.clockMs = this.clockMs + (double)dtMs;
+        double t = this.clockMs / 1000.0;
+        FpsStage st = this.game.stage;
+
+        // 事件 → 特效
+        if (this.game.tagSerial != this.seenTag) {
+            this.seenTag = this.game.tagSerial;
+            int ti = this.game.lastTagIndex;
+            if (ti >= 0 && ti < this.game.targetCount) {
+                int col = st.Targets[ti].Color;
+                Vector3 p = this.game.targetPos[ti];
+                this.Burst(p, col, 22, 7.0f);
+                this.Burst(p, 0xFFFFFF, 6, 4.0f);
+                this.Wave(p, col);
+                this.shake = this.shake + 0.06f + 0.03f * (float)this.game.combo;
+            }
+        }
+        if (this.game.shardSerial != this.seenShard) {
+            this.seenShard = this.game.shardSerial;
+            Vector3 sp = new Vector3(st.ShardX, st.ShardY, st.ShardZ);
+            this.Burst(sp, 0xFFD34D, 28, 5.0f);
+            this.Wave(sp, 0xFFD34D);
+        }
+        if (this.game.landSerial != this.seenLand) {
+            this.seenLand = this.game.landSerial;
+            this.shake = this.shake + 0.05f;
+        }
+        this.shake = this.shake * (float)Math.Pow(0.0015, (double)dt);
+
+        // 目标：自转 + 脉动发光；已标记缩成灰色残骸
+        for (int i = 0; i < this.game.targetCount; i = i + 1) {
+            FpsTargetDef d = st.Targets[i];
+            Vector3 p = this.game.targetPos[i];
+            float h = d.Size * 0.5f;
+            SceneNode core = this.cores[i];
+            Material m = core.Material;
+            if (this.game.tagged[i]) {
+                core.Local = new Transform3D(p, Quaternion.FromEulerRadians(0.6f, 0.8f, 0.0f), new Vector3(h * 0.32f, h * 0.32f, h * 0.32f));
+                m.Red = 0.2f; m.Green = 0.22f; m.Blue = 0.27f;
+                m.EmissiveRed = 0.0f; m.EmissiveGreen = 0.0f; m.EmissiveBlue = 0.0f;
+                this.shells[i].Visible = false;
+                this.beams[i].Visible = false;
+                if (this.rings[i] != null) { this.rings[i].Visible = false; }
+                continue;
+            }
+            float pulse = 0.5f + 0.5f * (float)Math.Sin(t * 4.2 + (double)i * 0.9);
+            bool aimed = this.game.aimIndex == i;
+            float glow = 0.55f + 0.45f * pulse + (aimed ? 0.5f : 0.0f);
+            m.Red = FpsScene.R(d.Color); m.Green = FpsScene.G(d.Color); m.Blue = FpsScene.B(d.Color);
+            m.EmissiveRed = m.Red * glow; m.EmissiveGreen = m.Green * glow; m.EmissiveBlue = m.Blue * glow;
+            float spin = (float)(t * 1.3 + (double)i);
+            float bob = (float)Math.Sin(t * 2.0 + (double)i) * 0.12f;
+            Vector3 q = new Vector3(p.X, p.Y + bob, p.Z);
+            float s = h * (aimed ? 1.08f : 1.0f);
+            core.Local = new Transform3D(q, Quaternion.FromEulerRadians(0.35f, spin, 0.2f), new Vector3(s, s, s));
+            float sh = h * (1.22f + 0.12f * pulse);
+            this.shells[i].Visible = true;
+            this.shells[i].Local = new Transform3D(q, Quaternion.FromEulerRadians(0.0f, 0.0f - spin * 0.7f, 0.55f), new Vector3(sh, sh, sh));
+            this.shells[i].Material.Alpha = 0.08f + 0.08f * pulse;
+            this.beams[i].Visible = true;
+            float beamTop = 34.0f;
+            float beamLen = (beamTop - q.Y) * 0.5f;
+            this.beams[i].Local = new Transform3D(new Vector3(q.X, q.Y + beamLen, q.Z), Quaternion.Identity,
+                new Vector3(0.09f + 0.05f * pulse, beamLen, 0.09f + 0.05f * pulse));
+            this.beams[i].Material.Alpha = 0.10f + 0.08f * pulse;
+            if (this.rings[i] != null) {
+                bool onPad = this.game.OnPad(d.Pad);
+                float rs = h * (2.0f + 0.15f * pulse);
+                this.rings[i].Local = new Transform3D(q, Quaternion.FromEulerRadians(1.2f, spin * 1.5f, 0.0f), new Vector3(rs, 1.0f, rs));
+                this.rings[i].Material.Alpha = onPad ? 0.85f : 0.4f;
+            }
+        }
+
+        // 碎片
+        if (this.shard != null) {
+            this.shard.Visible = !this.game.shardTaken;
+            this.shardGlow.Visible = !this.game.shardTaken;
+            float by = st.ShardY + (float)Math.Sin(t * 2.4) * 0.15f;
+            Vector3 sp = new Vector3(st.ShardX, by, st.ShardZ);
+            this.shard.Local = new Transform3D(sp, Quaternion.FromEulerRadians(0.785f, (float)(t * 2.0), 0.785f), new Vector3(0.28f, 0.28f, 0.28f));
+            float gs = 0.6f + 0.1f * (float)Math.Sin(t * 5.0);
+            this.shardGlow.Local = new Transform3D(sp, Quaternion.Identity, new Vector3(gs, gs, gs));
+        }
+
+        // 粒子：重力 + 缩小 + 落地反弹
+        for (int i = 0; i < FpsScene.PartCount; i = i + 1) {
+            if (this.plife[i] <= 0.0f) { continue; }
+            this.plife[i] = this.plife[i] - dt;
+            SceneNode n = this.parts[i];
+            if (this.plife[i] <= 0.0f) { n.Visible = false; continue; }
+            this.pvy[i] = this.pvy[i] - 14.0f * dt;
+            Vector3 p = n.Local.Position;
+            float nx = p.X + this.pvx[i] * dt;
+            float ny = p.Y + this.pvy[i] * dt;
+            float nz = p.Z + this.pvz[i] * dt;
+            if (ny < 0.05f) { ny = 0.05f; this.pvy[i] = 0.0f - this.pvy[i] * 0.35f; this.pvx[i] = this.pvx[i] * 0.6f; this.pvz[i] = this.pvz[i] * 0.6f; }
+            float s = this.psize[i] * FpsGame.Clampf(this.plife[i] * 1.6f, 0.0f, 1.0f);
+            n.Local = new Transform3D(new Vector3(nx, ny, nz), Quaternion.FromEulerRadians(this.plife[i] * 7.0f, this.plife[i] * 5.0f, 0.0f), new Vector3(s, s, s));
+        }
+        for (int i = 0; i < FpsScene.WaveCount; i = i + 1) {
+            if (this.wlife[i] <= 0.0f) { continue; }
+            this.wlife[i] = this.wlife[i] - dt * 1.6f;
+            SceneNode n = this.waves[i];
+            if (this.wlife[i] <= 0.0f) { n.Visible = false; continue; }
+            float k = 1.0f - this.wlife[i];
+            float r = 0.6f + k * 5.5f;
+            n.Local.Scale = new Vector3(r, 1.0f, r);
+            n.Material.Alpha = 0.55f * this.wlife[i];
+        }
+
+        // 最近的 4 个未标记目标各挂一盏脉动点光
+        Vector3 eye = this.game.camera.Position;
+        bool[] used = new bool[this.game.targetCount];
+        for (int l = 0; l < 4; l = l + 1) {
+            int best = -1;
+            float bd = 1.0e9f;
+            for (int i = 0; i < this.game.targetCount; i = i + 1) {
+                if (used[i] || this.game.tagged[i]) { continue; }
+                float dd = Vector3.DistanceSquared(this.game.targetPos[i], eye);
+                if (dd < bd) { bd = dd; best = i; }
+            }
+            Light lt = this.glows[l];
+            if (best < 0) { lt.Enabled = false; continue; }
+            used[best] = true;
+            int c = st.Targets[best].Color;
+            lt.Enabled = true;
+            lt.Red = FpsScene.R(c); lt.Green = FpsScene.G(c); lt.Blue = FpsScene.B(c);
+            lt.Position = this.game.targetPos[best];
+            lt.Intensity = 1.4f + 0.6f * (float)Math.Sin(t * 4.2 + (double)best * 0.9);
+            lt.Range = 10.0f;
+        }
+    }
+
+    // 开始页/选关：镜头绕场地缓慢环飞
+    public void AttractCamera(double ms) {
+        double a = ms / 1000.0 * 0.12;
+        float r = 40.0f;
+        Camera3D cam = this.game.camera;
+        cam.Position = new Vector3((float)Math.Sin(a) * r, 15.0f, (float)Math.Cos(a) * r);
+        cam.Target = new Vector3(0.0f, 2.0f, -2.0f);
+        cam.Up = new Vector3(0.0f, 1.0f, 0.0f);
+    }
+
+    public void Render(Canvas c, bool attract, double attractMs) {
+        if (c == null) { return; }
+        if (attract) {
+            this.AttractCamera(attractMs);
+        } else {
+            this.game.SyncCamera();
+            if (this.shake > 0.002f) {
+                Camera3D cam = this.game.camera;
+                float sx = (this.Rand() - 0.5f) * this.shake;
+                float sy = (this.Rand() - 0.5f) * this.shake;
+                cam.Position = new Vector3(cam.Position.X + sx, cam.Position.Y + sy, cam.Position.Z);
+                cam.Target = new Vector3(cam.Target.X + sx, cam.Target.Y + sy, cam.Target.Z);
+            }
+        }
+        if (attract) { this.renderer.ShadowFocus = new Vector3(0.0f, 0.0f, 0.0f); }
+        else { this.renderer.ShadowFocus = new Vector3(this.game.px, 0.0f, this.game.pz - 6.0f); }
+        bool flip = FpsScene.FlipWorkaround();
+        if (flip) { this.Mirror(); }
+        // 包缺口绕行：RenderPlan.Build 每帧把上一帧的绘制项再次追加进复用池却从不清空，
+        // 池子无限增长且同一绘制项会被重复取出——可见项变多的那一帧，地面与建筑会被后来的
+        // 粒子覆盖掉。这里每帧用一份新的计划（共享光源与后处理配置）绕开。
+        RenderPlan frame = new RenderPlan(this.game.camera);
+        frame.Lights = this.plan.Lights;
+        frame.AmbientRed = this.plan.AmbientRed;
+        frame.AmbientGreen = this.plan.AmbientGreen;
+        frame.AmbientBlue = this.plan.AmbientBlue;
+        frame.Post = this.plan.Post;
+        frame.Build(this.root);
+        this.drawResult = this.renderer.Draw(c, frame);
+        if (flip) { this.Mirror(); }
+        if (attract) { this.AttractCamera(attractMs); } else { this.game.SyncCamera(); }
+        if (this.drawResult == 0) { this.DrawCpuFallback(c); }
+    }
+
+    // 驱动缺口绕行：macOS 的 GL 后端把 Render3D 的 3D 输出上下颠倒（HUD 正常）。
+    // 在不改包的前提下，把世界、相机、光源一起沿 X 镜像并把相机"倒挂"（Up = -Y）：
+    // 镜像让画面左右翻、倒挂让画面上下 + 左右翻，合起来正好只抵消驱动的上下翻转。
+    // 驱动修好后删掉本函数即可；FPS3D_FLIP=0/1 可强制关/开以便对照。
+    public static bool FlipWorkaround() {
+        string f = Environment.GetEnvironmentVariable("FPS3D_FLIP");
+        if (f == "0") { return false; }
+        if (f == "1") { return true; }
+        #if MACOS
+        return true;
+        #else
+        return false;
+        #endif
+    }
+
+    // X 镜像（自逆：调两次复原），相机 Up 在 +Y / -Y 间切换
+    void Mirror() {
+        Vector3 sc = this.root.Local.Scale;
+        this.root.Local.Scale = new Vector3(0.0f - sc.X, sc.Y, sc.Z);
+        Camera3D cam = this.game.camera;
+        cam.Position = new Vector3(0.0f - cam.Position.X, cam.Position.Y, cam.Position.Z);
+        cam.Target = new Vector3(0.0f - cam.Target.X, cam.Target.Y, cam.Target.Z);
+        cam.Up = new Vector3(0.0f, 0.0f - cam.Up.Y, 0.0f);
+        for (int i = 0; i < this.plan.Lights.Count; i = i + 1) {
+            Light lt = this.plan.Lights[i];
+            lt.Direction = new Vector3(0.0f - lt.Direction.X, lt.Direction.Y, lt.Direction.Z);
+            lt.Position = new Vector3(0.0f - lt.Position.X, lt.Position.Y, lt.Position.Z);
+        }
+        this.renderer.ShadowFocus = new Vector3(0.0f - this.renderer.ShadowFocus.X, this.renderer.ShadowFocus.Y, this.renderer.ShadowFocus.Z);
+        if (this.renderer.Skybox != null) {
+            Vector3 sd = this.renderer.Skybox.SunDirection;
+            // 天空盒着色器按倒挂相机取太阳高度，Y 也要一起翻
+            this.renderer.Skybox.SunDirection = new Vector3(0.0f - sd.X, 0.0f - sd.Y, sd.Z);
+        }
+    }
+
+    // ---- CPU 线框兜底（GPU 不可用时） ----
+
+    void DrawCpuFallback(Canvas c) {
+        Mat4 vp = this.game.camera.ViewProjectionMatrix();
+        int w = c.Width();
+        int h = c.Height();
+        c.FillVGrad(0, 0, w, h / 2, unchecked((int)0xFF0A0618), unchecked((int)0xFF3A1236));
+        c.FillVGrad(0, h / 2, w, h - h / 2, unchecked((int)0xFF0C0E1C), unchecked((int)0xFF06070E));
+        float half = FpsStages.ArenaHalf;
+        for (int i = 0; i <= 20; i = i + 1) {
+            float k = -half + (float)i * 3.0f;
+            this.Line(c, vp, w, h, -half, 0, k, half, 0, k, unchecked((int)0xFF1B5566));
+            this.Line(c, vp, w, h, k, 0, -half, k, 0, half, unchecked((int)0xFF1B5566));
+        }
+        FpsStage st = this.game.stage;
+        for (int i = 0; i < st.Solids.Count; i = i + 1) {
+            FpsSolid s = st.Solids[i];
+            int col = unchecked((int)0xFF000000) | (s.Look == 5 ? s.PadColor : FpsScene.TrimColor(s.Look));
+            this.Box(c, vp, w, h, s.MinX, s.Bottom, s.MinZ, s.MaxX, s.Top(), s.MaxZ, col);
+        }
+        for (int i = 0; i < this.game.targetCount; i = i + 1) {
+            Vector3 p = this.game.targetPos[i];
+            float k = this.game.targetHalf[i];
+            int col = this.game.tagged[i] ? unchecked((int)0xFF3A4450) : (unchecked((int)0xFF000000) | st.Targets[i].Color);
+            this.Box(c, vp, w, h, p.X - k, p.Y - k, p.Z - k, p.X + k, p.Y + k, p.Z + k, col);
+        }
+    }
+
+    void Box(Canvas c, Mat4 vp, int w, int h, float x0, float y0, float z0, float x1, float y1, float z1, int col) {
+        this.Line(c, vp, w, h, x0, y0, z0, x1, y0, z0, col);
+        this.Line(c, vp, w, h, x1, y0, z0, x1, y0, z1, col);
+        this.Line(c, vp, w, h, x1, y0, z1, x0, y0, z1, col);
+        this.Line(c, vp, w, h, x0, y0, z1, x0, y0, z0, col);
+        this.Line(c, vp, w, h, x0, y1, z0, x1, y1, z0, col);
+        this.Line(c, vp, w, h, x1, y1, z0, x1, y1, z1, col);
+        this.Line(c, vp, w, h, x1, y1, z1, x0, y1, z1, col);
+        this.Line(c, vp, w, h, x0, y1, z1, x0, y1, z0, col);
+        this.Line(c, vp, w, h, x0, y0, z0, x0, y1, z0, col);
+        this.Line(c, vp, w, h, x1, y0, z0, x1, y1, z0, col);
+        this.Line(c, vp, w, h, x1, y0, z1, x1, y1, z1, col);
+        this.Line(c, vp, w, h, x0, y0, z1, x0, y1, z1, col);
+    }
+
+    void Line(Canvas c, Mat4 vp, int w, int h, float x1, float y1, float z1, float x2, float y2, float z2, int color) {
+        int sx1 = 0; int sy1 = 0; int sx2 = 0; int sy2 = 0;
+        if (FpsScene.Project(vp, w, h, x1, y1, z1, out sx1, out sy1) && FpsScene.Project(vp, w, h, x2, y2, z2, out sx2, out sy2)) {
+            c.DrawLine(sx1, sy1, sx2, sy2, color, 1);
+        }
+    }
+
+    static bool Project(Mat4 vp, int w, int h, float x, float y, float z, out int sx, out int sy) {
+        sx = 0; sy = 0;
+        float cx = vp.m[0] * x + vp.m[1] * y + vp.m[2] * z + vp.m[3];
+        float cy = vp.m[4] * x + vp.m[5] * y + vp.m[6] * z + vp.m[7];
+        float cw = vp.m[12] * x + vp.m[13] * y + vp.m[14] * z + vp.m[15];
+        if (cw < 0.1f) { return false; }
+        float nx = cx / cw;
+        float ny = cy / cw;
+        if (nx < -2.0f || nx > 2.0f || ny < -2.0f || ny > 2.0f) { return false; }
+        sx = (int)((nx * 0.5f + 0.5f) * (float)w);
+        sy = (int)((0.5f - ny * 0.5f) * (float)h);
+        return true;
+    }
+}

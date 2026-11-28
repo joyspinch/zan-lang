@@ -1,142 +1,160 @@
 using System;
 using System.Collections.Generic;
 using System.Numerics;
-using Gui;
-using Game.Animation;
 using Game.Render3D;
-using Game.Graphics;
 
 namespace Fps3D;
 
+// 规则与物理：一关计时赛。玩家是一根 0.7 m 宽、1.8 m 高的立方"胶囊"，
+// 受重力、可跳跃与冲刺，与关卡实心体（方块与坡道）碰撞。准星射线每步
+// 求一次：最近的目标若没被建筑挡住，就是"对准的目标"。
+//
+// 纯逻辑：不碰画布、音频、档案与窗口；FpsScene 只读本类状态画世界，
+// FpsSim 以固定 1/60 秒步长无头推进它做回放与模糊测试。
+// 表现层通过 *Serial 计数器感知事件（标记、跳跃、落地、拾取碎片），
+// 仿真因此不需要回调。
 public class FpsGame {
+    public const float TagRange = 16.0f;
+    public const float Radius = 0.35f;
+    public const float Height = 1.8f;
+    public const float Eye = 1.65f;
+    public const float StepUp = 0.45f;
+    public const float WalkSpeed = 7.0f;
+    public const float SprintSpeed = 10.5f;
+    public const float JumpSpeed = 7.6f;
+    public const float Gravity = 22.0f;
+    public const double CountdownMs = 2400.0;
+    public const double ComboWindowMs = 2000.0;
+    public const int MaxCombo = 4;
+    public const double ComboStepMs = 200.0;
+    public const double ShardBonusMs = 2000.0;
+
     public Camera3D camera;
     public FpsController3D controller;
-    public RenderPlan plan;
-    public Renderer3D renderer;
-    public SceneNode rootNode;
 
-    // 渲染后端状态
-    public string backendName;
-    public bool isGpuBackend;
-    // Last actual world submission; HUD samples it in the update phase.
-    public int drawResult;
+    public FpsStage stage;
+    public int stageIndex;
+    public int targetCount;
 
-    // 鼠标视角模式（按住右键拖拽 或 右键单击切换自由视角）
-    public bool freeLookMode;
+    // 玩家
+    public float px;
+    public float pz;
+    public float feet;
+    public float vx;
+    public float vy;
+    public float vz;
+    public bool grounded;
+    // 脚下的实心体下标（-1 = 地面）
+    public int groundSolid;
+    double coyoteMs;
+    double jumpBufferMs;
 
-    // 交互拾取状态
-    public bool targetHit;
-    public float hitDistance;
-
-    // 键盘移动状态
+    // 输入
     public bool keyFwd;
     public bool keyBwd;
     public bool keyLeft;
     public bool keyRight;
-    public bool keyUp;
-    public bool keyDown;
+    public bool keyJump;
+    public bool keySprint;
+    public bool freeLookMode;
 
-    // 场景中目标方块的 AABB 包围盒（用于射线检测）
-    public Vector3[] targetMins;
-    public Vector3[] targetMaxs;
-    public int targetCount;
-
-    // 目标：用准星点中（标记）全部方块，计时越短越好
-    public const float TagRange = 30.0f;
+    // 目标（当前位置随世界时钟更新；被标记后冻结在原地）
+    public Vector3[] targetPos;
+    public float[] targetHalf;
     public bool[] tagged;
     public int taggedCount;
-    // 准星当前对准的目标下标（-1 = 没有）
+
+    // 准星
+    public bool targetHit;
+    public float hitDistance;
     public int aimIndex;
-    // 本局用时（毫秒，只随固定步长推进；全部标记后冻结）
+    // 0 无 1 可标记 2 太远 3 需站踏台（已标记的目标不参与拾取）
+    public int aimState;
+
+    // 计时（毫秒）：elapsed 只在倒计时结束后推进；bonus 是连击与碎片奖励
+    public double worldMs;
+    public double countdownMs;
     public double elapsedMs;
+    public double bonusMs;
     public bool complete;
-    // 每个目标的场景节点（标记后换材质）；无头时为空
-    SceneNode[] targetNodes;
+
+    // 连击
+    public int combo;
+    public int bestCombo;
+    public double lastTagMs;
+
+    // 隐藏碎片
+    public bool shardTaken;
+
+    // 事件计数器（表现层比较前后值触发特效/音效）
+    public int tagSerial;
+    public int lastTagIndex;
+    public double lastTagBonus;
+    public int jumpSerial;
+    public int landSerial;
+    public int shardSerial;
+    public int respawnSerial;
 
     public FpsGame() {
         this.camera = new Camera3D();
         this.camera.SetViewport(1280, 720);
+        this.camera.FarPlane = 220.0f;
         this.controller = new FpsController3D();
-        this.controller.Position = new Vector3(0.0f, 1.8f, 12.0f); // 初始站在场景前方
+        this.LoadStage(0);
+    }
 
-        this.plan = new RenderPlan(this.camera);
-        this.plan.AmbientRed = 0.2f;
-        this.plan.AmbientGreen = 0.22f;
-        this.plan.AmbientBlue = 0.28f;
+    public static FpsGame Create() {
+        return new FpsGame();
+    }
 
-        // 添加一束斜向阳光
-        Light sun = new Light();
-        sun.Kind = LightKind.Directional;
-        sun.Direction = new Vector3(-0.5f, -1.0f, -0.6f);
-        sun.Red = 1.0f;
-        sun.Green = 0.95f;
-        sun.Blue = 0.85f;
-        sun.Intensity = 1.2f;
-        this.plan.Lights.Add(sun);
-
-        this.renderer = new Renderer3D(256);
-        this.rootNode = new SceneNode("WorldRoot");
-
-        this.targetHit = false;
-        this.hitDistance = 0.0f;
-        this.backendName = "gl";
-        this.isGpuBackend = true;
-        this.freeLookMode = false;
-
-        this.keyFwd = false;
-        this.keyBwd = false;
-        this.keyLeft = false;
-        this.keyRight = false;
-        this.keyUp = false;
-        this.keyDown = false;
-
-        // 准星拾取用的包围盒是游戏数据（不依赖 GPU）：构造时就摆好，无头回放
-        // （FpsSim）与上传网格前的第一帧都能做射线检测
-        this.targetCount = FpsGame.TargetX().Length;
-        this.targetMins = new Vector3[this.targetCount];
-        this.targetMaxs = new Vector3[this.targetCount];
-        float[] tx = FpsGame.TargetX();
-        float[] ty = FpsGame.TargetY();
-        float[] tz = FpsGame.TargetZ();
-        float[] ts = FpsGame.TargetSize();
-        for (int i = 0; i < this.targetCount; i = i + 1) {
-            float h = ts[i] * 0.5f;
-            this.targetMins[i] = new Vector3(tx[i] - h, ty[i] - h, tz[i] - h);
-            this.targetMaxs[i] = new Vector3(tx[i] + h, ty[i] + h, tz[i] + h);
-        }
+    // 载入一关并回到起跑状态
+    public void LoadStage(int index) {
+        int n = FpsStages.Count();
+        if (index < 0) { index = 0; }
+        if (index >= n) { index = n - 1; }
+        this.stageIndex = index;
+        this.stage = FpsStages.Build(index);
+        this.targetCount = this.stage.Targets.Count;
+        this.targetPos = new Vector3[this.targetCount];
+        this.targetHalf = new float[this.targetCount];
         this.tagged = new bool[this.targetCount];
-        this.targetNodes = new SceneNode[this.targetCount];
+        for (int i = 0; i < this.targetCount; i = i + 1) {
+            this.targetHalf[i] = this.stage.Targets[i].Size * 0.5f;
+        }
         this.Reset();
     }
 
-    // 目标方块布局（中心点与边长，米）：前方三栋原有方块 + 散布四周、
-    // 有的悬空（要 Space 升空或抬头）的五块。
-    public static float[] TargetX() { return new float[8] { -4.0f, 0.0f, 4.0f, -13.0f, 12.0f, 0.0f, -14.0f, 13.0f }; }
-    public static float[] TargetY() { return new float[8] { 1.0f, 1.0f, 1.0f, 1.0f, 1.5f, 6.0f, 4.0f, 0.75f }; }
-    public static float[] TargetZ() { return new float[8] { 0.0f, 0.0f, 0.0f, -10.0f, -8.0f, -14.0f, 10.0f, 14.0f }; }
-    public static float[] TargetSize() { return new float[8] { 2.0f, 2.0f, 2.0f, 2.0f, 3.0f, 2.0f, 2.0f, 1.5f }; }
-    // 未标记时的颜色（0xRRGGBB）；标记后统一变暗为石板灰
-    public static int[] TargetColor() {
-        return new int[8] { 0xFF4D4F, 0x40A9FF, 0x52C41A, 0xFAAD14, 0xB37FEB, 0x13C2C2, 0xFF7A45, 0xF759AB };
-    }
-
-    // 回到出生点、清空标记与计时（重开一局不用重建场景）
+    // 回到出生点、清空标记与计时（重开不重建关卡）
     public void Reset() {
-        this.controller.Position = new Vector3(0.0f, 1.8f, 12.0f);
-        this.controller.Yaw = 0.0f;
-        this.controller.Pitch = 0.0f;
-        this.controller.SyncToCamera(this.camera);
-        for (int i = 0; i < this.targetCount; i = i + 1) {
-            this.tagged[i] = false;
-            this.PaintTarget(i);
-        }
+        this.px = this.stage.SpawnX;
+        this.pz = this.stage.SpawnZ;
+        this.feet = 0.0f;
+        this.vx = 0.0f;
+        this.vy = 0.0f;
+        this.vz = 0.0f;
+        this.grounded = true;
+        this.groundSolid = -1;
+        this.coyoteMs = 0.0;
+        this.jumpBufferMs = 0.0;
+        this.controller.Yaw = this.stage.SpawnYaw;
+        this.controller.Pitch = -0.05f;
+        for (int i = 0; i < this.targetCount; i = i + 1) { this.tagged[i] = false; }
         this.taggedCount = 0;
-        this.aimIndex = -1;
+        this.worldMs = 0.0;
+        this.countdownMs = FpsGame.CountdownMs;
         this.elapsedMs = 0.0;
+        this.bonusMs = 0.0;
         this.complete = false;
-        this.targetHit = false;
-        this.hitDistance = 0.0f;
+        this.combo = 0;
+        this.bestCombo = 0;
+        this.lastTagMs = -100000.0;
+        this.shardTaken = false;
+        this.lastTagIndex = -1;
+        this.lastTagBonus = 0.0;
         this.ReleaseKeys();
+        this.UpdateTargets();
+        this.SyncCamera();
+        this.UpdateAim();
     }
 
     public void ReleaseKeys() {
@@ -144,19 +162,107 @@ public class FpsGame {
         this.keyBwd = false;
         this.keyLeft = false;
         this.keyRight = false;
-        this.keyUp = false;
-        this.keyDown = false;
+        this.keyJump = false;
+        this.keySprint = false;
     }
 
-    // 标记准星对准的目标。返回：0 = 没对准/太远，1 = 已标记过，
-    // 2 = 标记成功，3 = 标记成功且全部完成。
+    // 净用时：计时减去奖励，不小于 0
+    public long NetMs() {
+        double v = this.elapsedMs - this.bonusMs;
+        if (v < 0.0) { v = 0.0; }
+        return (long)v;
+    }
+
+    public bool InCountdown() { return this.countdownMs > 0.0; }
+
+    // 连击窗口剩余比例（0..1）；没有连击时为 0
+    public float ComboLeft() {
+        if (this.combo <= 0 || this.complete) { return 0.0f; }
+        double left = FpsGame.ComboWindowMs - (this.elapsedMs - this.lastTagMs);
+        if (left <= 0.0) { return 0.0f; }
+        return (float)(left / FpsGame.ComboWindowMs);
+    }
+
+    public bool OnPad(int solid) {
+        return solid >= 0 && this.grounded && this.groundSolid == solid;
+    }
+
+    public Vector3 EyePos() {
+        return new Vector3(this.px, this.feet + FpsGame.Eye, this.pz);
+    }
+
+    // ---- 输入 ----
+
+    public void OnKeyDown(int code) {
+        if (code == 87 || code == 38) { this.keyFwd = true; }
+        if (code == 83 || code == 40) { this.keyBwd = true; }
+        if (code == 65 || code == 37) { this.keyLeft = true; }
+        if (code == 68 || code == 39) { this.keyRight = true; }
+        if (code == 32) {
+            if (!this.keyJump) { this.jumpBufferMs = 140.0; }
+            this.keyJump = true;
+        }
+        if (code == 16) { this.keySprint = true; }
+    }
+
+    public void OnKeyUp(int code) {
+        if (code == 87 || code == 38) { this.keyFwd = false; }
+        if (code == 83 || code == 40) { this.keyBwd = false; }
+        if (code == 65 || code == 37) { this.keyLeft = false; }
+        if (code == 68 || code == 39) { this.keyRight = false; }
+        if (code == 32) { this.keyJump = false; }
+        if (code == 16) { this.keySprint = false; }
+    }
+
+    // 仿真用：直接设置一整组按键（跳跃键按下沿同样排队一次跳跃）
+    public void SetKeys(bool fwd, bool bwd, bool left, bool right, bool jump, bool sprint) {
+        this.keyFwd = fwd;
+        this.keyBwd = bwd;
+        this.keyLeft = left;
+        this.keyRight = right;
+        if (jump && !this.keyJump) { this.jumpBufferMs = 140.0; }
+        this.keyJump = jump;
+        this.keySprint = sprint;
+    }
+
+    public void OnMouseMove(float deltaX, float deltaY) {
+        this.controller.OnMouseMove(deltaX, deltaY);
+    }
+
+    // 把视角同步给相机（渲染前也调一次，转视角不必等下一个逻辑步）
+    public void SyncCamera() {
+        this.controller.Position = this.EyePos();
+        this.controller.SyncToCamera(this.camera);
+    }
+
+    // ---- 标记 ----
+
+    // 返回：0 没对准 1 已标记 2 标记成功 3 标记成功且全部完成 4 太远 5 需站踏台 6 倒计时中
     public int TryTag() {
         if (this.complete) { return 0; }
-        if (this.aimIndex < 0 || this.hitDistance > FpsGame.TagRange) { return 0; }
+        if (this.InCountdown()) { return 6; }
+        if (this.aimIndex < 0) { return 0; }
         if (this.tagged[this.aimIndex]) { return 1; }
-        this.tagged[this.aimIndex] = true;
+        if (this.hitDistance > FpsGame.TagRange) { return 4; }
+        int pad = this.stage.Targets[this.aimIndex].Pad;
+        if (pad >= 0 && !this.OnPad(pad)) { return 5; }
+        int i = this.aimIndex;
+        this.tagged[i] = true;
         this.taggedCount = this.taggedCount + 1;
-        this.PaintTarget(this.aimIndex);
+        if (this.elapsedMs - this.lastTagMs <= FpsGame.ComboWindowMs && this.combo > 0) {
+            this.combo = this.combo + 1;
+            if (this.combo > FpsGame.MaxCombo) { this.combo = FpsGame.MaxCombo; }
+        } else {
+            this.combo = 1;
+        }
+        if (this.combo > this.bestCombo) { this.bestCombo = this.combo; }
+        this.lastTagMs = this.elapsedMs;
+        double bonus = (double)(this.combo - 1) * FpsGame.ComboStepMs;
+        this.bonusMs = this.bonusMs + bonus;
+        this.lastTagBonus = bonus;
+        this.lastTagIndex = i;
+        this.tagSerial = this.tagSerial + 1;
+        this.UpdateAim();
         if (this.taggedCount >= this.targetCount) {
             this.complete = true;
             return 3;
@@ -173,208 +279,278 @@ public class FpsGame {
         return m;
     }
 
-    void PaintTarget(int i) {
-        if (this.targetNodes == null || this.targetNodes[i] == null) { return; }
-        Material m = this.targetNodes[i].Material;
-        if (this.tagged[i]) {
-            m.Red = 0.22f; m.Green = 0.26f; m.Blue = 0.3f;
-            m.EmissiveRed = 0.0f; m.EmissiveGreen = 0.0f; m.EmissiveBlue = 0.0f;
-        } else {
-            int c = FpsGame.TargetColor()[i];
-            m.Red = (float)((c >> 16) & 255) / 255.0f;
-            m.Green = (float)((c >> 8) & 255) / 255.0f;
-            m.Blue = (float)(c & 255) / 255.0f;
-            m.EmissiveRed = m.Red * 0.25f;
-            m.EmissiveGreen = m.Green * 0.25f;
-            m.EmissiveBlue = m.Blue * 0.25f;
-        }
-    }
-
-    public static FpsGame Create() {
-        return new FpsGame();
-    }
-
-    // 初始化场景几何体并上传到 GPU
-    public void InitScene(Canvas canvas) {
-        if (canvas == null) { return; }
-
-        // 1. 生成并上传地面平面 (40m x 40m)
-        Mesh3D groundMesh = Primitives3D.CreatePlane(40.0f, 40.0f, 4, 4);
-        int groundKey = canvas.MeshUpload(groundMesh);
-
-        SceneNode groundNode = new SceneNode("Ground");
-        groundNode.MeshKey = groundKey;
-        groundNode.BoundsRadius = 30.0f;
-        groundNode.Material = new Material();
-        groundNode.Material.Red = 0.2f;
-        groundNode.Material.Green = 0.2f;
-        groundNode.Material.Blue = 0.28f;
-        rootNode.Children.Add(groundNode);
-
-        // 2. 生成立方体网格 (2m x 2m x 2m)
-        Mesh3D cubeMesh = Primitives3D.CreateCube(2.0f, 2.0f, 2.0f);
-        int cubeKey = canvas.MeshUpload(cubeMesh);
-
-        // 摆放目标方块（立方体网格 2m，按边长缩放）
-        float[] tx = FpsGame.TargetX();
-        float[] ty = FpsGame.TargetY();
-        float[] tz = FpsGame.TargetZ();
-        float[] ts = FpsGame.TargetSize();
-        for (int i = 0; i < this.targetCount; i = i + 1) {
-            SceneNode b = new SceneNode("Target_" + Convert.ToString(i));
-            float k = ts[i] * 0.5f;
-            b.MeshKey = cubeKey;
-            b.BoundsRadius = 2.0f * k;
-            b.Local = new Transform3D(new Vector3(tx[i], ty[i], tz[i]), Quaternion.Identity, new Vector3(k, k, k));
-            b.Material = new Material();
-            this.targetNodes[i] = b;
-            this.PaintTarget(i);
-            rootNode.Children.Add(b);
-        }
-    }
-
-    public void OnKeyDown(int code) {
-        if (code == 87 || code == 38) { keyFwd = true; } // W
-        if (code == 83 || code == 40) { keyBwd = true; } // S
-        if (code == 65 || code == 37) { keyLeft = true; } // A
-        if (code == 68 || code == 39) { keyRight = true; } // D
-        if (code == 32) { keyUp = true; } // Space 向上升
-        if (code == 16) { keyDown = true; } // Shift 向下沉
-    }
-
-    public void OnKeyUp(int code) {
-        if (code == 87 || code == 38) { keyFwd = false; }
-        if (code == 83 || code == 40) { keyBwd = false; }
-        if (code == 65 || code == 37) { keyLeft = false; }
-        if (code == 68 || code == 39) { keyRight = false; }
-        if (code == 32) { keyUp = false; }
-        if (code == 16) { keyDown = false; }
-    }
-
-    public void OnMouseMove(float deltaX, float deltaY) {
-        controller.OnMouseMove(deltaX, deltaY);
-    }
+    // ---- 步进 ----
 
     public void Tick(double dt) {
         float fdt = (float)dt;
-        // 键盘移动步进
-        controller.UpdateInput(keyFwd, keyBwd, keyLeft, keyRight, keyUp, keyDown, fdt);
-        // 同步位置到 Camera3D
-        controller.SyncToCamera(camera);
+        double ms = dt * 1000.0;
+        this.worldMs = this.worldMs + ms;
+        if (this.countdownMs > 0.0) {
+            this.countdownMs = this.countdownMs - ms;
+            if (this.countdownMs < 0.0) { this.countdownMs = 0.0; }
+        } else if (!this.complete) {
+            this.elapsedMs = this.elapsedMs + ms;
+            if (this.combo > 0 && this.elapsedMs - this.lastTagMs > FpsGame.ComboWindowMs) { this.combo = 0; }
+            this.StepPlayer(fdt);
+            this.CheckShard();
+        }
+        this.UpdateTargets();
+        this.SyncCamera();
+        this.UpdateAim();
+    }
 
-        // 从屏幕中心点 (640, 360) 发射视线射线检测准星目标
-        Ray3D centerRay = Raycast3D.ScreenPointToRay(640, 360, 1280, 720, camera);
+    void StepPlayer(float dt) {
+        // 期望速度：前后左右相对视线水平方向，冲刺加速
+        Vector3 fwd = this.controller.WalkForward();
+        Vector3 right = this.controller.WalkRight();
+        float wx = 0.0f;
+        float wz = 0.0f;
+        if (this.keyFwd) { wx = wx + fwd.X; wz = wz + fwd.Z; }
+        if (this.keyBwd) { wx = wx - fwd.X; wz = wz - fwd.Z; }
+        if (this.keyRight) { wx = wx + right.X; wz = wz + right.Z; }
+        if (this.keyLeft) { wx = wx - right.X; wz = wz - right.Z; }
+        float len = (float)Math.Sqrt((double)(wx * wx + wz * wz));
+        if (len > 0.001f) {
+            float sp = this.keySprint ? FpsGame.SprintSpeed : FpsGame.WalkSpeed;
+            wx = wx / len * sp;
+            wz = wz / len * sp;
+        }
+        // 地面几乎即时响应，空中保留一些惯性
+        float k = (this.grounded ? 20.0f : 7.0f) * dt;
+        if (k > 1.0f) { k = 1.0f; }
+        this.vx = this.vx + (wx - this.vx) * k;
+        this.vz = this.vz + (wz - this.vz) * k;
 
-        targetHit = false;
-        hitDistance = 999999.0f;
-        aimIndex = -1;
+        // 跳跃：按下沿缓冲 140ms + 离地后 100ms 土狼时间
+        if (this.jumpBufferMs > 0.0) { this.jumpBufferMs = this.jumpBufferMs - (double)dt * 1000.0; }
+        if (this.grounded) {
+            this.coyoteMs = 100.0;
+            // 按住跳跃键落地即再跳（连跳）
+            if (this.keyJump && this.jumpBufferMs <= 0.0) { this.jumpBufferMs = 1.0; }
+        }
+        else if (this.coyoteMs > 0.0) { this.coyoteMs = this.coyoteMs - (double)dt * 1000.0; }
+        if (this.jumpBufferMs > 0.0 && this.coyoteMs > 0.0) {
+            this.vy = FpsGame.JumpSpeed;
+            this.grounded = false;
+            this.coyoteMs = 0.0;
+            this.jumpBufferMs = 0.0;
+            this.jumpSerial = this.jumpSerial + 1;
+        }
 
-        for (int i = 0; i < targetCount; i = i + 1) {
-            float dist = 0.0f;
-            if (Raycast3D.IntersectAabb(centerRay, targetMins[i], targetMaxs[i], out dist)) {
-                if (dist < hitDistance) {
-                    hitDistance = dist;
-                    targetHit = true;
-                    aimIndex = i;
+        // 水平：逐轴移动，撞墙则该轴停下（贴墙滑行）
+        float nx = this.px + this.vx * dt;
+        if (this.Blocked(nx, this.pz, this.feet)) { this.vx = 0.0f; } else { this.px = nx; }
+        float nz = this.pz + this.vz * dt;
+        if (this.Blocked(this.px, nz, this.feet)) { this.vz = 0.0f; } else { this.pz = nz; }
+        float lim = FpsStages.ArenaHalf - FpsGame.Radius;
+        this.px = FpsGame.Clampf(this.px, -lim, lim);
+        this.pz = FpsGame.Clampf(this.pz, -lim, lim);
+
+        // 垂直：重力 → 落地/上坡贴地 → 顶头
+        bool wasGrounded = this.grounded;
+        float prevFeet = this.feet;
+        float fallSpeed = this.vy;
+        if (!this.grounded || this.vy > 0.0f) {
+            this.vy = this.vy - FpsGame.Gravity * dt;
+            if (this.vy < -40.0f) { this.vy = -40.0f; }
+        }
+        this.feet = this.feet + this.vy * dt;
+        if (this.vy <= 0.0f) {
+            int idx = -1;
+            float floor = this.Floor(this.px, this.pz, prevFeet + FpsGame.StepUp, out idx);
+            bool snap = wasGrounded && floor >= prevFeet - 0.35f;
+            if (this.feet <= floor || snap) {
+                this.feet = floor;
+                this.vy = 0.0f;
+                this.grounded = true;
+                this.groundSolid = idx;
+                if (!wasGrounded && fallSpeed < -7.0f) { this.landSerial = this.landSerial + 1; }
+            } else {
+                this.grounded = false;
+                this.groundSolid = -1;
+            }
+        } else {
+            this.grounded = false;
+            this.groundSolid = -1;
+            float head = this.feet + FpsGame.Height;
+            float prevHead = prevFeet + FpsGame.Height;
+            for (int i = 0; i < this.stage.Solids.Count; i = i + 1) {
+                FpsSolid s = this.stage.Solids[i];
+                if (s.Bottom > 0.01f && s.Bottom >= prevHead - 0.01f && s.Bottom < head
+                    && s.Overlaps(this.px, this.pz, FpsGame.Radius)) {
+                    this.feet = s.Bottom - FpsGame.Height;
+                    this.vy = 0.0f;
+                    head = s.Bottom;
                 }
             }
         }
-
-        if (!complete) { elapsedMs = elapsedMs + dt * 1000.0; }
+        if (this.feet < -10.0f) { this.Respawn(); }
     }
 
-    // 准星对准的是可以标记的目标（未标记且在射程内）
-    public bool AimTaggable() {
-        return aimIndex >= 0 && !tagged[aimIndex] && hitDistance <= FpsGame.TagRange;
+    void Respawn() {
+        this.px = this.stage.SpawnX;
+        this.pz = this.stage.SpawnZ;
+        this.feet = 0.0f;
+        this.vx = 0.0f;
+        this.vy = 0.0f;
+        this.vz = 0.0f;
+        this.grounded = true;
+        this.groundSolid = -1;
+        this.respawnSerial = this.respawnSerial + 1;
     }
 
-    public void Render(Canvas c) {
-        if (c == null) { return; }
-
-        // 1. 提交 3D 场景渲染计划
-        plan.Build(rootNode);
-        int drawRes = renderer.Draw(c, plan);
-        this.drawResult = drawRes;
-
-        // 如果 GPU 批次渲染未提交 (返回 0，通常为 CPU 兜底后端)，启用 CPU 3D 透视投影线框
-        if (drawRes == 0) {
-            DrawCpuWireframeFallback(c);
+    // 脚印在 (x, z)、脚底在 footY 时是否会嵌进某个实心体
+    public bool Blocked(float x, float z, float footY) {
+        for (int i = 0; i < this.stage.Solids.Count; i = i + 1) {
+            FpsSolid s = this.stage.Solids[i];
+            if (!s.Overlaps(x, z, FpsGame.Radius)) { continue; }
+            float h = s.HeightAt(x, z);
+            if (h > footY + FpsGame.StepUp && s.Bottom < footY + FpsGame.Height) { return true; }
         }
-
-        // The persistent FpsHud tree composes status and crosshair after the world.
+        return false;
     }
 
-    // CPU 3D 透视投影线框兜底渲染器
-    private void DrawCpuWireframeFallback(Canvas c) {
-        Mat4 vp = camera.ViewProjectionMatrix();
-
-        // 1. 绘制地面网格 (XZ 平面，-20m 到 +20m，每隔 4m 一道线)
-        for (int i = -5; i <= 5; i = i + 1) {
-            float coord = (float)i * 4.0f;
-            // 横线：(-20, 0, coord) -> (20, 0, coord)
-            Draw3DLine(c, vp, -20.0f, 0.0f, coord, 20.0f, 0.0f, coord, unchecked((int)0xFF2A2A3D));
-            // 纵线：(coord, 0, -20) -> (coord, 0, 20)
-            Draw3DLine(c, vp, coord, 0.0f, -20.0f, coord, 0.0f, 20.0f, unchecked((int)0xFF2A2A3D));
+    // (x, z) 处不高于 maxY 的最高支撑面；idx 为提供支撑的实心体（地面 = -1）
+    public float Floor(float x, float z, float maxY, out int idx) {
+        float best = 0.0f;
+        idx = -1;
+        for (int i = 0; i < this.stage.Solids.Count; i = i + 1) {
+            FpsSolid s = this.stage.Solids[i];
+            if (!s.Overlaps(x, z, FpsGame.Radius)) { continue; }
+            float h = s.HeightAt(x, z);
+            if (h <= maxY && h >= best) {
+                best = h;
+                idx = i;
+            }
         }
+        return best;
+    }
 
-        // 2. 绘制每个目标方块的 12 条棱线（已标记的变暗）
-        for (int b = 0; b < targetCount; b = b + 1) {
-            Vector3 lo = targetMins[b];
-            Vector3 hi = targetMaxs[b];
-            int col = tagged[b] ? unchecked((int)0xFF3A4450) : (unchecked((int)0xFF000000) | FpsGame.TargetColor()[b]);
-            float x0 = lo.X; float y0 = lo.Y; float z0 = lo.Z;
-            float x1 = hi.X; float y1 = hi.Y; float z1 = hi.Z;
-
-            // 底面 4 条边
-            Draw3DLine(c, vp, x0, y0, z0, x1, y0, z0, col);
-            Draw3DLine(c, vp, x1, y0, z0, x1, y0, z1, col);
-            Draw3DLine(c, vp, x1, y0, z1, x0, y0, z1, col);
-            Draw3DLine(c, vp, x0, y0, z1, x0, y0, z0, col);
-
-            // 顶面 4 条边
-            Draw3DLine(c, vp, x0, y1, z0, x1, y1, z0, col);
-            Draw3DLine(c, vp, x1, y1, z0, x1, y1, z1, col);
-            Draw3DLine(c, vp, x1, y1, z1, x0, y1, z1, col);
-            Draw3DLine(c, vp, x0, y1, z1, x0, y1, z0, col);
-
-            // 4 条垂直立柱
-            Draw3DLine(c, vp, x0, y0, z0, x0, y1, z0, col);
-            Draw3DLine(c, vp, x1, y0, z0, x1, y1, z0, col);
-            Draw3DLine(c, vp, x1, y0, z1, x1, y1, z1, col);
-            Draw3DLine(c, vp, x0, y0, z1, x0, y1, z1, col);
+    void CheckShard() {
+        if (this.shardTaken) { return; }
+        float dx = this.stage.ShardX - this.px;
+        float dy = this.stage.ShardY - (this.feet + 0.9f);
+        float dz = this.stage.ShardZ - this.pz;
+        if (dx * dx + dy * dy + dz * dz < 1.6f * 1.6f) {
+            this.shardTaken = true;
+            this.bonusMs = this.bonusMs + FpsGame.ShardBonusMs;
+            this.shardSerial = this.shardSerial + 1;
         }
     }
 
-    // 空间两点通过相机透视投影矩阵绘制 2D 线段
-    private void Draw3DLine(Canvas c, Mat4 vp, float x1, float y1, float z1, float x2, float y2, float z2, int color) {
-        int sx1 = 0; int sy1 = 0;
-        int sx2 = 0; int sy2 = 0;
-        if (ProjectPoint(vp, x1, y1, z1, out sx1, out sy1) && ProjectPoint(vp, x2, y2, z2, out sx2, out sy2)) {
-            c.DrawLine(sx1, sy1, sx2, sy2, color, 1);
+    // 目标当前位置：往返用余弦缓动，环绕绕中心转圈（带轻微上下浮动）
+    public Vector3 TargetAt(int i, double ms) {
+        FpsTargetDef d = this.stage.Targets[i];
+        double t = ms / 1000.0;
+        if (d.Kind == 1) {
+            float s = (float)(0.5 - 0.5 * Math.Cos((double)d.Phase + t * (double)d.Speed));
+            return new Vector3(d.X + (d.X2 - d.X) * s, d.Y + (d.Y2 - d.Y) * s, d.Z + (d.Z2 - d.Z) * s);
+        }
+        if (d.Kind == 2) {
+            double a = (double)d.Phase + t * (double)d.Speed;
+            return new Vector3(d.X + (float)Math.Cos(a) * d.Radius,
+                               d.Y + (float)Math.Sin(a * 2.0) * 0.4f,
+                               d.Z + (float)Math.Sin(a) * d.Radius);
+        }
+        return new Vector3(d.X, d.Y, d.Z);
+    }
+
+    void UpdateTargets() {
+        for (int i = 0; i < this.targetCount; i = i + 1) {
+            if (!this.tagged[i]) { this.targetPos[i] = this.TargetAt(i, this.worldMs); }
         }
     }
 
-    // 单点透视投影至屏幕像素坐标 (1280x720)
-    private bool ProjectPoint(Mat4 vp, float x, float y, float z, out int sx, out int sy) {
-        sx = 0; sy = 0;
-        // 列主序矩阵变换: v' = M * v
-        float clipX = vp.m[0] * x + vp.m[1] * y + vp.m[2] * z + vp.m[3];
-        float clipY = vp.m[4] * x + vp.m[5] * y + vp.m[6] * z + vp.m[7];
-        float clipW = vp.m[12] * x + vp.m[13] * y + vp.m[14] * z + vp.m[15];
-
-        if (clipW < 0.1f) {
-            return false; // 在相机近平面后方
+    // 视线射线：最近的目标；若有方块挡在它前面则判为没对准
+    void UpdateAim() {
+        Ray3D ray = new Ray3D(this.camera.Position, this.controller.LookDirection());
+        this.targetHit = false;
+        this.hitDistance = 999999.0f;
+        this.aimIndex = -1;
+        for (int i = 0; i < this.targetCount; i = i + 1) {
+            // 已标记的目标缩成灰色残骸，不再挡准星
+            if (this.tagged[i]) { continue; }
+            float h = this.targetHalf[i];
+            Vector3 c = this.targetPos[i];
+            float dist = 0.0f;
+            if (ray.IntersectAabb(new Vector3(c.X - h, c.Y - h, c.Z - h), new Vector3(c.X + h, c.Y + h, c.Z + h), out dist)) {
+                if (dist < this.hitDistance) {
+                    this.hitDistance = dist;
+                    this.targetHit = true;
+                    this.aimIndex = i;
+                }
+            }
         }
-
-        float ndcX = clipX / clipW;
-        float ndcY = clipY / clipW;
-
-        if (ndcX < -2.0f || ndcX > 2.0f || ndcY < -2.0f || ndcY > 2.0f) {
-            return false;
+        if (this.targetHit) {
+            for (int i = 0; i < this.stage.Solids.Count; i = i + 1) {
+                FpsSolid s = this.stage.Solids[i];
+                if (s.Axis != 0) { continue; }
+                float dist = 0.0f;
+                if (ray.IntersectAabb(new Vector3(s.MinX, s.Bottom, s.MinZ), new Vector3(s.MaxX, s.H0, s.MaxZ), out dist)) {
+                    if (dist < this.hitDistance) {
+                        this.targetHit = false;
+                        this.aimIndex = -1;
+                        this.hitDistance = 999999.0f;
+                        break;
+                    }
+                }
+            }
         }
+        this.aimState = 0;
+        if (this.aimIndex >= 0) {
+            int pad = this.stage.Targets[this.aimIndex].Pad;
+            if (this.hitDistance > FpsGame.TagRange) { this.aimState = 2; }
+            else if (pad >= 0 && !this.OnPad(pad)) { this.aimState = 3; }
+            else { this.aimState = 1; }
+        }
+    }
 
-        sx = (int)((ndcX * 0.5f + 0.5f) * 1280.0f);
-        sy = (int)((0.5f - ndcY * 0.5f) * 720.0f);
+    public bool AimTaggable() { return this.aimState == 1; }
+
+    // 离出生点最近的未标记目标（机器人与"甩枪"输入用）
+    public int NearestUntagged() {
+        int best = -1;
+        float bestD = 1.0e9f;
+        for (int i = 0; i < this.targetCount; i = i + 1) {
+            if (this.tagged[i]) { continue; }
+            float dx = this.targetPos[i].X - this.px;
+            float dz = this.targetPos[i].Z - this.pz;
+            float d = dx * dx + dz * dz;
+            if (d < bestD) { bestD = d; best = i; }
+        }
+        return best;
+    }
+
+    // 把视角转向 p 需要的鼠标位移（像素，按灵敏度换算；每次最多 maxPx）
+    public void MouseToward(Vector3 p, float maxPx, out float dx, out float dy) {
+        Vector3 e = this.EyePos();
+        float ddx = p.X - e.X;
+        float ddy = p.Y - e.Y;
+        float ddz = p.Z - e.Z;
+        float wantYaw = (float)Math.Atan2((double)(0.0f - ddx), (double)(0.0f - ddz));
+        float wantPitch = (float)Math.Atan2((double)ddy, Math.Sqrt((double)(ddx * ddx + ddz * ddz)));
+        float dyaw = this.controller.Yaw - wantYaw;
+        while (dyaw > 3.14159265f) { dyaw = dyaw - 6.2831853f; }
+        while (dyaw < -3.14159265f) { dyaw = dyaw + 6.2831853f; }
+        float sens = this.controller.MouseSensitivity;
+        dx = FpsGame.Clampf(dyaw / sens, -maxPx, maxPx);
+        dy = FpsGame.Clampf((this.controller.Pitch - wantPitch) / sens, -maxPx, maxPx);
+    }
+
+    // 玩家脚印没有嵌进任何实心体（不变量）
+    public bool PlayerClear() {
+        for (int i = 0; i < this.stage.Solids.Count; i = i + 1) {
+            FpsSolid s = this.stage.Solids[i];
+            if (!s.Overlaps(this.px, this.pz, FpsGame.Radius - 0.02f)) { continue; }
+            float h = s.HeightAt(this.px, this.pz);
+            if (h > this.feet + FpsGame.StepUp + 0.05f && s.Bottom < this.feet + FpsGame.Height - 0.05f) { return false; }
+        }
         return true;
+    }
+
+    public static float Clampf(float v, float lo, float hi) {
+        if (v < lo) { return lo; }
+        if (v > hi) { return hi; }
+        return v;
     }
 }
