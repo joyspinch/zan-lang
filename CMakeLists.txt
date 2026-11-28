@@ -9089,6 +9089,40 @@ if(Python3_Interpreter_FOUND)
   set_tests_properties(tool_lsp_zan_session PROPERTIES TIMEOUT 120)
 endif()
 
+# ---- Pure-Zan DAP server (B-ID201) ----
+set(_dapzan_srcs
+  ${CMAKE_SOURCE_DIR}/tests/selfhost/dap_zan_session_entry.zan
+  ${CMAKE_SOURCE_DIR}/src/selfhost/tools/dap_gdb.zan
+  ${CMAKE_SOURCE_DIR}/src/selfhost/tools/dap.zan
+)
+set(_dapzan_exe ${CMAKE_BINARY_DIR}/cases/tool_dap_zan_session${_exe_ext})
+add_custom_command(OUTPUT ${_dapzan_exe}
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/cases
+  COMMAND $<TARGET_FILE:zanc>
+          ${_dapzan_srcs}
+          --auto-stdlib -o ${_dapzan_exe}
+  DEPENDS zanc ${_dapzan_srcs}
+  COMMENT "Building the pure-Zan DAP server test binary")
+add_custom_target(dap_zan_tool ALL DEPENDS ${_dapzan_exe})
+
+add_test(NAME tool_dap_zan
+  COMMAND ${CMAKE_COMMAND}
+    -DEXE=${_dapzan_exe}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_lsp_zan_build.cmake)
+set_tests_properties(tool_dap_zan PROPERTIES TIMEOUT 60)
+
+if(Python3_Interpreter_FOUND)
+  add_test(NAME tool_dap_zan_session
+    COMMAND ${Python3_EXECUTABLE} -I -B ${CMAKE_SOURCE_DIR}/tests/dap/run_dap_zan_session_test.py
+      --exe ${_dapzan_exe}
+      --integration-exe $<TARGET_FILE:dap_integration_test>
+      --target-exe ${_dap_dbg}
+      --target-src ${CMAKE_SOURCE_DIR}/tests/dap/dbgtarget.zan
+      --burn-exe ${_dap_burn}
+      --burn-src ${CMAKE_SOURCE_DIR}/tests/dap/dbgtarget_burn.zan)
+  set_tests_properties(tool_dap_zan_session PROPERTIES TIMEOUT 300)
+endif()
+
 if(Python3_Interpreter_FOUND)
   add_test(NAME tool_mcp_process_governance
     COMMAND ${Python3_EXECUTABLE} -I -B ${CMAKE_SOURCE_DIR}/tests/mcp_process_governance.py
