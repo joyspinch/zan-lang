@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Json;
+using System.Text;
 
 namespace System.Web;
 
@@ -38,28 +39,56 @@ public class Validator {
     }
 
     public Validator IsInt(string val, string field) {
-        if (val.Length == 0) { return this; }
+        int n = val.Length;
+        if (n == 0) { return this; }
         int i = 0;
-        if (val[0] == 45) { i = 1; }
-        if (i >= val.Length) { this.errors.Add(field + " must be an integer"); return this; }
-        bool ok = true;
-        while (i < val.Length) {
+        if ((val[0] & 255) == 45) { i = 1; }
+        if (i >= n) { this.errors.Add(field + " must be an integer"); return this; }
+        while (i < n) {
             int c = val[i] & 255;
-            if (c < 48 || c > 57) { ok = false; break; }
+            if (c < 48 || c > 57) {
+                this.errors.Add(field + " must be an integer");
+                return this;
+            }
             i = i + 1;
         }
-        if (!ok) { this.errors.Add(field + " must be an integer"); }
         return this;
+    }
+
+    private static bool CsvContainsSlice(string csv, string needle, int nStart, int nLen) {
+        int clen = csv.Length;
+        if (clen < nLen) { return false; }
+        int firstB = needle[nStart] & 255;
+        int pos = 0;
+        while (pos <= clen) {
+            int end = pos;
+            while (end < clen && (csv[end] & 255) != 44) { end = end + 1; }
+            if (end - pos == nLen && (csv[pos] & 255) == firstB) {
+                bool eq = true;
+                for (int k = 1; k < nLen; k = k + 1) {
+                    if ((csv[pos + k] & 255) != (needle[nStart + k] & 255)) { eq = false; break; }
+                }
+                if (eq) { return true; }
+            }
+            pos = end + 1;
+        }
+        return false;
     }
 
     public Validator OneOf(string val, string allowedCsv, string field) {
         if (val == null || val.Length == 0) { return this; }
-        if (allowedCsv == null || val.IndexOf(",") >= 0) {
+        if (allowedCsv == null) {
             this.errors.Add(field + " is not an allowed value");
             return this;
         }
-        string csv = "," + allowedCsv + ",";
-        if (!Validator.ContainsStr(csv, "," + val + ",")) {
+        int vlen = val.Length;
+        for (int i = 0; i < vlen; i = i + 1) {
+            if ((val[i] & 255) == 44) {
+                this.errors.Add(field + " is not an allowed value");
+                return this;
+            }
+        }
+        if (!Validator.CsvContainsSlice(allowedCsv, val, 0, vlen)) {
             this.errors.Add(field + " is not an allowed value");
         }
         return this;
@@ -72,48 +101,84 @@ public class Validator {
 
     // 错误列表的 JSON 数组。
     public string ErrorsJson() {
-        JsonValue arr = JsonValue.NewArray();
-        for (int i = 0; i < this.errors.Count; i = i + 1) {
-            arr.Append(JsonValue.NewStr(this.errors[i]));
+        int cnt = this.errors.Count;
+        if (cnt == 0) { return "[]"; }
+        StringBuilder sb = new StringBuilder(cnt * 32 + 4);
+        sb.Append("[");
+        for (int i = 0; i < cnt; i = i + 1) {
+            if (i > 0) { sb.Append(","); }
+            sb.Append("\"");
+            Encoding.JsonEscapeTo(sb, this.errors[i]);
+            sb.Append("\"");
         }
-        return arr.ToJson();
+        sb.Append("]");
+        return sb.ToString();
     }
 
     // 客户端上传文件名路径遍历防御净化：剥离目录分隔符、相对路径及前导点隐藏文件。
     public static string SafeFileName(string name) {
-        if (name == null || name.Length == 0) { return "file"; }
-        int slash1 = name.LastIndexOf("/");
-        int slash2 = name.LastIndexOf("\\");
-        int cut = slash1 > slash2 ? slash1 : slash2;
-        string base_ = cut >= 0 ? name.Substring(cut + 1) : name;
-        int blen = base_.Length;
-        byte[] buf = new byte[blen];
+        if (name == null) { return "file"; }
+        int n = name.Length;
+        if (n == 0) { return "file"; }
+        int baseStart = 0;
+        for (int i = n - 1; i >= 0; i = i - 1) {
+            int c = name[i] & 255;
+            if (c == 47 || c == 92) {
+                baseStart = i + 1;
+                break;
+            }
+        }
+        int blen = n - baseStart;
+        if (blen <= 0) { return "file"; }
+
+        // 单遍快路径：若全程合法且无前导/连续点号则零 byte[] 分配；遇非法字节时惰性拷贝已扫合法前缀。
+        byte[] buf = null;
         int outLen = 0;
         int prev = 0;
-        for (int j = 0; j < blen; j = j + 1) {
-            int c = base_[j] & 255;
+        if ((name[baseStart] & 255) == 46) {
+            buf = new byte[blen];
+        }
+        for (int j = baseStart; j < n; j = j + 1) {
+            int c = name[j] & 255;
             bool ok = (c >= 97 && c <= 122) || (c >= 65 && c <= 90)
                 || (c >= 48 && c <= 57) || c == 46 || c == 95 || c == 45;
-            if (ok && !(c == 46 && prev == 46)) {
+            bool keep = ok && !(c == 46 && prev == 46);
+            if (buf == null) {
+                if (keep) {
+                    prev = c;
+                    continue;
+                }
+                buf = new byte[blen];
+                outLen = j - baseStart;
+                for (int k = 0; k < outLen; k = k + 1) {
+                    buf[k] = (byte)(name[baseStart + k] & 255);
+                }
+            } else if (keep) {
                 buf[outLen] = (byte)c;
                 outLen = outLen + 1;
                 prev = c;
             }
         }
+        if (buf == null) {
+            return baseStart == 0 ? name : name.Substring(baseStart, blen);
+        }
         int start = 0;
         while (start < outLen && buf[start] == 46) { start = start + 1; }
         if (start >= outLen) { return "file"; }
-        return buf.ToStr(start, outLen - start);
+        return NativeMemory.GetString((nint)buf, start, outLen - start);
     }
 
     // 校验文件扩展名是否属于逗号分隔的安全白名单。
     public static bool ExtAllowed(string name, string allowedCsv) {
         if (name == null || allowedCsv == null) { return false; }
-        int dot = name.LastIndexOf(".");
-        if (dot < 0 || dot == name.Length - 1) { return false; }
-        string ext = name.Substring(dot + 1);
-        if (ext.IndexOf(",") >= 0) { return false; }
-        string csv = "," + allowedCsv + ",";
-        return Validator.ContainsStr(csv, "," + ext + ",");
+        int n = name.Length;
+        int dot = -1;
+        for (int i = n - 1; i >= 0; i = i - 1) {
+            int c = name[i] & 255;
+            if (c == 46) { dot = i; break; }
+            if (c == 44) { return false; }
+        }
+        if (dot < 0 || dot == n - 1) { return false; }
+        return Validator.CsvContainsSlice(allowedCsv, name, dot + 1, n - dot - 1);
     }
 }

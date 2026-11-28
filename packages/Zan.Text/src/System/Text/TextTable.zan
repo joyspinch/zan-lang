@@ -27,54 +27,120 @@ public class TextTable {
     // 追加一行。比表头短的行
     // 以空单元格补齐；更长的行则被截断。
     public void AddRow(List<string> row) {
-        for (int i = 0; i < row.Count && i < headers.Count; i = i + 1) {
-            if (row[i].Length > widths[i]) { widths[i] = row[i].Length; }
+        int lim = row.Count < headers.Count ? row.Count : headers.Count;
+        for (int i = 0; i < lim; i = i + 1) {
+            int len = row[i].Length;
+            if (len > widths[i]) { widths[i] = len; }
         }
         rows.Add(row);
     }
 
+    private static int BorderLen(int[] widths) {
+        int total = 1;
+        int n = widths.Length;
+        for (int i = 0; i < n; i = i + 1) {
+            int w = widths[i] + 2;
+            if (w > 0) { total = total + w; }
+            total = total + 1;
+        }
+        return total;
+    }
+
+    private static int WriteBorder(byte[] buf, nint bp, int di, int[] widths) {
+        buf[di] = 43; // '+'
+        di = di + 1;
+        int n = widths.Length;
+        for (int i = 0; i < n; i = i + 1) {
+            int w = widths[i] + 2;
+            if (w > 0) {
+                NativeMemory.Fill(bp + (nint)di, 45, w); // '-'
+                di = di + w;
+            }
+            buf[di] = 43; // '+'
+            di = di + 1;
+        }
+        return di;
+    }
+
+    private static int LineLen(List<string> cells, int[] widths) {
+        int total = 1;
+        int n = widths.Length;
+        int cc = cells.Count;
+        for (int i = 0; i < n; i = i + 1) {
+            int clen = i < cc ? cells[i].Length : 0;
+            int w = widths[i];
+            total = total + 3 + (clen > w ? clen : w);
+        }
+        return total;
+    }
+
+    // 目标缓冲已预填充空格（0x20）：单次 Fill 免除每格 padding，单元格用 NativeMemory.Copy 避免逐字节边界检查。
+    private static int WriteLinePreFilled(byte[] buf, nint bp, int di, List<string> cells, int[] widths) {
+        buf[di] = 124; // '|'
+        di = di + 1;
+        int n = widths.Length;
+        int cc = cells.Count;
+        for (int i = 0; i < n; i = i + 1) {
+            di = di + 1; // 保留前导空格
+            int clen = 0;
+            if (i < cc) {
+                string cell = cells[i];
+                clen = cell.Length;
+                if (clen > 0) {
+                    NativeMemory.Copy(bp + (nint)di, (nint)cell, clen);
+                }
+            }
+            int colW = widths[i];
+            int span = clen > colW ? clen : colW;
+            di = di + span + 1; // 跳过单元格、补齐空格与尾随空格
+            buf[di] = 124; // '|'
+            di = di + 1;
+        }
+        return di;
+    }
+
     // 渲染对齐后的表格（ASCII 边框）。
     public string Render() {
-        StringBuilder sb = new StringBuilder();
-        sb.Append(TextTable.Border(widths));
-        sb.Append("\n");
-        sb.Append(TextTable.Line(headers, widths));
-        sb.Append("\n");
-        sb.Append(TextTable.Border(widths));
-        sb.Append("\n");
-        for (int r = 0; r < rows.Count; r = r + 1) {
-            sb.Append(TextTable.Line(rows[r], widths));
-            sb.Append("\n");
+        int rcnt = rows.Count;
+        int borderLen = TextTable.BorderLen(widths);
+        int total = borderLen * 3 + TextTable.LineLen(headers, widths) + rcnt + 3;
+        for (int r = 0; r < rcnt; r = r + 1) {
+            total = total + TextTable.LineLen(rows[r], widths);
         }
-        sb.Append(TextTable.Border(widths));
-        return sb.ToString();
+        byte[] buf = new byte[total];
+        nint bp = (nint)buf;
+        NativeMemory.Fill(bp, 32, total);
+        int di = TextTable.WriteBorder(buf, bp, 0, widths);
+        buf[di] = 10; di = di + 1;
+        di = TextTable.WriteLinePreFilled(buf, bp, di, headers, widths);
+        buf[di] = 10; di = di + 1;
+        NativeMemory.Copy(bp + (nint)di, bp, borderLen);
+        di = di + borderLen;
+        buf[di] = 10; di = di + 1;
+        for (int r = 0; r < rcnt; r = r + 1) {
+            di = TextTable.WriteLinePreFilled(buf, bp, di, rows[r], widths);
+            buf[di] = 10; di = di + 1;
+        }
+        NativeMemory.Copy(bp + (nint)di, bp, borderLen);
+        return NativeMemory.GetString(bp, 0, total);
     }
 
     // 渲染分隔线：每列按 widths[i]+2 个 `-` 输出，形如 `+----+---+`。
     public static string Border(int[] widths) {
-        StringBuilder sb = new StringBuilder();
-        sb.Append("+");
-        for (int i = 0; i < widths.Length; i = i + 1) {
-            int w = widths[i] + 2;
-            for (int k = 0; k < w; k = k + 1) { sb.Append("-"); }
-            sb.Append("+");
-        }
-        return sb.ToString();
+        int total = TextTable.BorderLen(widths);
+        byte[] buf = new byte[total];
+        nint bp = (nint)buf;
+        TextTable.WriteBorder(buf, bp, 0, widths);
+        return NativeMemory.GetString(bp, 0, total);
     }
 
     // 渲染一行：单元格左对齐、按 widths 补空格；cells 缺列时以空单元格补齐。
     public static string Line(List<string> cells, int[] widths) {
-        StringBuilder sb = new StringBuilder();
-        sb.Append("|");
-        for (int i = 0; i < widths.Length; i = i + 1) {
-            string cell = "";
-            if (i < cells.Count) { cell = cells[i]; }
-            sb.Append(" ");
-            sb.Append(cell);
-            int pad = widths[i] - cell.Length;
-            for (int k = 0; k < pad; k = k + 1) { sb.Append(" "); }
-            sb.Append(" |");
-        }
-        return sb.ToString();
+        int total = TextTable.LineLen(cells, widths);
+        byte[] buf = new byte[total];
+        nint bp = (nint)buf;
+        NativeMemory.Fill(bp, 32, total);
+        TextTable.WriteLinePreFilled(buf, bp, 0, cells, widths);
+        return NativeMemory.GetString(bp, 0, total);
     }
 }
