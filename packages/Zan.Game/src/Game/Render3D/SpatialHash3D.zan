@@ -1,0 +1,138 @@
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+
+namespace Game.Render3D;
+
+// 3D 空间哈希网格中的实体包围球条目。
+public class SpatialBody3D {
+    public int Id;
+    public Vector3 Position;
+    public float Radius;
+    public int CellX;
+    public int CellY;
+    public int CellZ;
+
+    public SpatialBody3D(int id, Vector3 position, float radius) {
+        this.Id = id;
+        this.Position = position;
+        this.Radius = radius >= 0.0f ? radius : 0.0f;
+        this.CellX = 0;
+        this.CellY = 0;
+        this.CellZ = 0;
+    }
+}
+
+// 3D 均匀空间哈希宽相加速结构（Uniform 3D Spatial Hash Grid）：
+// 适用于大世界 3D 碰撞宽相、AI 视野感知、动态光源裁剪与空间音频邻近检索（O(1) 插入/移动 + 局部格网球查询）。
+public class SpatialHash3D {
+    public float CellSize;
+    private Dictionary<long, List<SpatialBody3D>> cells;
+    private Dictionary<int, SpatialBody3D> byId;
+
+    public SpatialHash3D(float cellSize) {
+        this.CellSize = cellSize > 0.01f ? cellSize : 4.0f;
+        this.cells = new Dictionary<long, List<SpatialBody3D>>();
+        this.byId = new Dictionary<int, SpatialBody3D>();
+    }
+
+    public int BodyCount { get { return this.byId.Count; } }
+
+    private int CoordToCell(float v) {
+        return (int)Math.Floor((double)(v / this.CellSize));
+    }
+
+    private static long PackCellKey(int cx, int cy, int cz) {
+        // 每轴 20-bit 有符号偏置（支持 ±500,000 格），无哈希冲突碰撞风险
+        long x = (long)(cx + 524288) & 1048575L;
+        long y = (long)(cy + 524288) & 1048575L;
+        long z = (long)(cz + 524288) & 1048575L;
+        return (x << 40) | (y << 20) | z;
+    }
+
+    private void AddToCell(long key, SpatialBody3D body) {
+        List<SpatialBody3D> bucket;
+        if (!this.cells.TryGetValue(key, out bucket)) {
+            bucket = new List<SpatialBody3D>();
+            this.cells[key] = bucket;
+        }
+        bucket.Add(body);
+    }
+
+    private void RemoveFromCell(long key, int id) {
+        List<SpatialBody3D> bucket;
+        if (!this.cells.TryGetValue(key, out bucket)) { return; }
+        for (int i = 0; i < bucket.Count; i = i + 1) {
+            if (bucket[i].Id == id) {
+                bucket.RemoveAt(i);
+                break;
+            }
+        }
+    }
+
+    // 插入或更新实体位置与包围球半径（跨格自动迁桶）。
+    public void Upsert(int id, Vector3 position, float radius) {
+        int cx = this.CoordToCell(position.X);
+        int cy = this.CoordToCell(position.Y);
+        int cz = this.CoordToCell(position.Z);
+        SpatialBody3D existing;
+        if (this.byId.TryGetValue(id, out existing)) {
+            if (existing.CellX != cx || existing.CellY != cy || existing.CellZ != cz) {
+                this.RemoveFromCell(PackCellKey(existing.CellX, existing.CellY, existing.CellZ), id);
+                existing.CellX = cx;
+                existing.CellY = cy;
+                existing.CellZ = cz;
+                this.AddToCell(PackCellKey(cx, cy, cz), existing);
+            }
+            existing.Position = position;
+            existing.Radius = radius >= 0.0f ? radius : 0.0f;
+            return;
+        }
+        SpatialBody3D b = new SpatialBody3D(id, position, radius);
+        b.CellX = cx;
+        b.CellY = cy;
+        b.CellZ = cz;
+        this.byId[id] = b;
+        this.AddToCell(PackCellKey(cx, cy, cz), b);
+    }
+
+    public bool Remove(int id) {
+        SpatialBody3D existing;
+        if (!this.byId.TryGetValue(id, out existing)) { return false; }
+        this.RemoveFromCell(PackCellKey(existing.CellX, existing.CellY, existing.CellZ), id);
+        this.byId.Remove(id);
+        return true;
+    }
+
+    // 球形范围查询：返回所有与 (center, radius) 相交的实体 Id（仅扫描局部相邻桶，避免 O(N) 全表遍历）。
+    public List<int> QuerySphere(Vector3 center, float radius, float maxBodyRadius) {
+        List<int> hits = new List<int>();
+        float r = radius >= 0.0f ? radius : 0.0f;
+        float pad = r + (maxBodyRadius >= 0.0f ? maxBodyRadius : 0.0f);
+        int minX = this.CoordToCell(center.X - pad);
+        int maxX = this.CoordToCell(center.X + pad);
+        int minY = this.CoordToCell(center.Y - pad);
+        int maxY = this.CoordToCell(center.Y + pad);
+        int minZ = this.CoordToCell(center.Z - pad);
+        int maxZ = this.CoordToCell(center.Z + pad);
+
+        for (int cx = minX; cx <= maxX; cx = cx + 1) {
+            for (int cy = minY; cy <= maxY; cy = cy + 1) {
+                for (int cz = minZ; cz <= maxZ; cz = cz + 1) {
+                    List<SpatialBody3D> bucket;
+                    if (!this.cells.TryGetValue(PackCellKey(cx, cy, cz), out bucket)) { continue; }
+                    for (int i = 0; i < bucket.Count; i = i + 1) {
+                        SpatialBody3D b = bucket[i];
+                        Vector3 d = Vector3.Subtract(b.Position, center);
+                        float distSq = d.X * d.X + d.Y * d.Y + d.Z * d.Z;
+                        float lim = r + b.Radius;
+                        if (distSq <= lim * lim) {
+                            hits.Add(b.Id);
+                        }
+                    }
+                }
+            }
+        }
+        return hits;
+    }
+}

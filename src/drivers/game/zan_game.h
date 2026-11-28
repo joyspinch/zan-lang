@@ -184,6 +184,17 @@ ZAN_GAME_API void zan_game_set_toon_shading3d(float bands, float specular_step);
  * fxaa_strength [0..1] 控制边缘亮度抗锯齿强度；chromatic_strength [0..0.1] 控制径向红蓝分离强度。 */
 ZAN_GAME_API void zan_game_set_post_lens3d(float fxaa_strength, float chromatic_strength);
 
+/* GPU 程序化噪声消融特效（Dissolve Shader，零额外贴图）：
+ * threshold [0..1.1] 控制噪声丢弃阈值（<=0 关闭，>=1.05 全消融）；
+ * edge_width 控制燃烧发光边缘宽度，edge_r/g/b 为边缘发光线性颜色（可联动 Bloom）。 */
+ZAN_GAME_API void zan_game_set_dissolve3d(float threshold, float edge_width,
+    float edge_r, float edge_g, float edge_b);
+
+/* GPU 世界空间任意裁剪平面（Clip Plane，用于水面平面反射、传送门、剖面视图、斩击切面）：
+ * enabled != 0 时丢弃满足 dot(worldPos, (nx,ny,nz)) + d < 0 的片元。 */
+ZAN_GAME_API void zan_game_set_clip_plane3d(int32_t enabled,
+    float nx, float ny, float nz, float d);
+
 #ifdef __cplusplus
 }
 #endif

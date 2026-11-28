@@ -1,0 +1,291 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Net;
+
+// 排位赛季玩家积分档案。
+public class RankedPlayerProfile {
+    public int PlayerId;
+    public int Mmr;
+    public int GamesPlayed;
+    public int WinStreak;
+    public int DemotionShieldGames;
+
+    public RankedPlayerProfile(int playerId, int initialMmr) {
+        this.PlayerId = playerId;
+        this.Mmr = initialMmr;
+        this.GamesPlayed = 0;
+        this.WinStreak = 0;
+        this.DemotionShieldGames = 0;
+    }
+}
+
+// 商业联机排位积分与赛季结算引擎（Elo + 定级赛 K 值加速 + 连胜加分 + 掉段保护盾 + 赛季软重置）。
+public class NetRankedRatingEngine {
+    public int BaseMmr;
+    public int PlacementGames;
+    public int PlacementK;
+    public int StandardK;
+    public int StreakBonusThreshold;
+    public int StreakBonusMmr;
+
+    public NetRankedRatingEngine() {
+        this.BaseMmr = 1200;
+        this.PlacementGames = 5;
+        this.PlacementK = 48;
+        this.StandardK = 24;
+        this.StreakBonusThreshold = 3;
+        this.StreakBonusMmr = 6;
+    }
+
+    public static string ClassifyTier(int mmr) {
+        if (mmr < 1000) { return "Bronze"; }
+        if (mmr < 1300) { return "Silver"; }
+        if (mmr < 1600) { return "Gold"; }
+        if (mmr < 1900) { return "Platinum"; }
+        if (mmr < 2200) { return "Diamond"; }
+        return "Grandmaster";
+    }
+
+    private static int TierFloorMmr(int mmr) {
+        if (mmr < 1000) { return 0; }
+        if (mmr < 1300) { return 1000; }
+        if (mmr < 1600) { return 1300; }
+        if (mmr < 1900) { return 1600; }
+        if (mmr < 2200) { return 1900; }
+        return 2200;
+    }
+
+    // 结算一场 1v1 或队均分对局（winnerWon = true 表示 a 胜 b；否则 b 胜 a）。
+    public void RecordMatch(RankedPlayerProfile a, RankedPlayerProfile b, bool aWon) {
+        if (a == null || b == null) { return; }
+        double expA = 1.0 / (1.0 + Math.Pow(10.0, (double)(b.Mmr - a.Mmr) / 400.0));
+        double expB = 1.0 - expA;
+        double scoreA = aWon ? 1.0 : 0.0;
+        double scoreB = aWon ? 0.0 : 1.0;
+
+        int kA = a.GamesPlayed < this.PlacementGames ? this.PlacementK : this.StandardK;
+        int kB = b.GamesPlayed < this.PlacementGames ? this.PlacementK : this.StandardK;
+        int deltaA = (int)Math.Round((double)kA * (scoreA - expA));
+        int deltaB = (int)Math.Round((double)kB * (scoreB - expB));
+
+        this.ApplyDelta(a, aWon, deltaA);
+        this.ApplyDelta(b, !aWon, deltaB);
+    }
+
+    private void ApplyDelta(RankedPlayerProfile p, bool won, int delta) {
+        int prevFloor = TierFloorMmr(p.Mmr);
+        p.GamesPlayed = p.GamesPlayed + 1;
+        if (won) {
+            p.WinStreak = p.WinStreak + 1;
+            int gain = delta > 0 ? delta : 1;
+            if (p.WinStreak >= this.StreakBonusThreshold) {
+                gain = gain + this.StreakBonusMmr;
+            }
+            int nextMmr = p.Mmr + gain;
+            if (TierFloorMmr(nextMmr) > prevFloor) {
+                // 晋级新大段位自动赠送 2 场掉段保护盾
+                p.DemotionShieldGames = 2;
+            }
+            p.Mmr = nextMmr;
+        } else {
+            p.WinStreak = 0;
+            int loss = delta < 0 ? delta : -1;
+            int nextMmr = p.Mmr + loss;
+            if (nextMmr < prevFloor && p.DemotionShieldGames > 0) {
+                p.DemotionShieldGames = p.DemotionShieldGames - 1;
+                nextMmr = prevFloor;
+            }
+            if (nextMmr < 0) { nextMmr = 0; }
+            p.Mmr = nextMmr;
+        }
+    }
+
+    // 赛季软重置：向基准分回归一半并清零连胜与场次，保留历史实力区分度。
+    public void ApplySeasonSoftReset(RankedPlayerProfile p) {
+        if (p == null) { return; }
+        p.Mmr = (p.Mmr + this.BaseMmr) / 2;
+        p.GamesPlayed = 0;
+        p.WinStreak = 0;
+        p.DemotionShieldGames = 0;
+    }
+}
+
+// 权威服防调包原子双向交易托管状态机（Atomic Two-Party Trade Escrow）：
+// - 任一方修改出价（金币/物品）立即强制解除双方的锁定与确认状态，杜绝经典"最后一秒改价诈骗"
+// - 只有双方均 Lock 且均 Confirm 且资金充足时才允许 ExecuteAtomicSwap 原子成交一次
+public class NetAuthoritativeTradeEscrow {
+    public int PlayerA;
+    public int PlayerB;
+    public string OfferItemA;
+    public string OfferItemB;
+    public int OfferGoldA;
+    public int OfferGoldB;
+    public bool LockedA;
+    public bool LockedB;
+    public bool ConfirmedA;
+    public bool ConfirmedB;
+    public bool Completed;
+    public bool Cancelled;
+
+    public NetAuthoritativeTradeEscrow(int playerA, int playerB) {
+        this.PlayerA = playerA;
+        this.PlayerB = playerB;
+        this.OfferItemA = "";
+        this.OfferItemB = "";
+        this.OfferGoldA = 0;
+        this.OfferGoldB = 0;
+        this.LockedA = false;
+        this.LockedB = false;
+        this.ConfirmedA = false;
+        this.ConfirmedB = false;
+        this.Completed = false;
+        this.Cancelled = false;
+    }
+
+    private void InvalidateLocks() {
+        this.LockedA = false;
+        this.LockedB = false;
+        this.ConfirmedA = false;
+        this.ConfirmedB = false;
+    }
+
+    public bool UpdateOffer(int playerId, string itemId, int gold) {
+        if (this.Completed || this.Cancelled || gold < 0) { return false; }
+        string item = itemId != null ? itemId : "";
+        if (playerId == this.PlayerA) {
+            this.OfferItemA = item;
+            this.OfferGoldA = gold;
+            this.InvalidateLocks();
+            return true;
+        }
+        if (playerId == this.PlayerB) {
+            this.OfferItemB = item;
+            this.OfferGoldB = gold;
+            this.InvalidateLocks();
+            return true;
+        }
+        return false;
+    }
+
+    public bool LockOffer(int playerId) {
+        if (this.Completed || this.Cancelled) { return false; }
+        if (playerId == this.PlayerA) { this.LockedA = true; return true; }
+        if (playerId == this.PlayerB) { this.LockedB = true; return true; }
+        return false;
+    }
+
+    public bool ConfirmTrade(int playerId) {
+        if (this.Completed || this.Cancelled || !this.LockedA || !this.LockedB) { return false; }
+        if (playerId == this.PlayerA) { this.ConfirmedA = true; return true; }
+        if (playerId == this.PlayerB) { this.ConfirmedB = true; return true; }
+        return false;
+    }
+
+    public bool ExecuteAtomicSwap(ref int balanceGoldA, ref int balanceGoldB,
+                                  out string receivedItemByA, out string receivedItemByB) {
+        receivedItemByA = "";
+        receivedItemByB = "";
+        if (this.Completed || this.Cancelled) { return false; }
+        if (!this.LockedA || !this.LockedB || !this.ConfirmedA || !this.ConfirmedB) { return false; }
+        if (balanceGoldA < this.OfferGoldA || balanceGoldB < this.OfferGoldB) { return false; }
+
+        balanceGoldA = balanceGoldA - this.OfferGoldA + this.OfferGoldB;
+        balanceGoldB = balanceGoldB - this.OfferGoldB + this.OfferGoldA;
+        receivedItemByA = this.OfferItemB;
+        receivedItemByB = this.OfferItemA;
+        this.Completed = true;
+        return true;
+    }
+}
+
+// 专用服实例生命周期状态常量（Agones 模型）。
+public static class FleetHostState {
+    public const int Ready = 0;
+    public const int Allocated = 1;
+    public const int Draining = 2;
+}
+
+// 单个专用服实例描述。
+public class DedicatedHostInstance {
+    public string HostId;
+    public string Region;
+    public int State;
+    public string MatchId;
+
+    public DedicatedHostInstance(string hostId, string region) {
+        this.HostId = hostId != null ? hostId : "";
+        this.Region = region != null ? region : "";
+        this.State = FleetHostState.Ready;
+        this.MatchId = "";
+    }
+}
+
+// 商业云专用服集群弹性伸缩与优雅排水编排器（Dedicated Server Fleet Autoscaler）：
+// - 按大区分配 Ready 节点承载对局，维持 MinReadyBuffer 预热缓冲池避免匹配冷启动排队
+// - 缩容时仅标记空闲 Ready 节点为 Draining，绝不强杀正在运行对局的 Allocated 节点
+public class NetDedicatedFleetScaler {
+    public int MinHosts;
+    public int MaxHosts;
+    public int MinReadyBuffer;
+    private List<DedicatedHostInstance> hosts;
+
+    public NetDedicatedFleetScaler(int minHosts, int maxHosts, int minReadyBuffer) {
+        this.MinHosts = minHosts >= 1 ? minHosts : 2;
+        this.MaxHosts = maxHosts >= this.MinHosts ? maxHosts : 64;
+        this.MinReadyBuffer = minReadyBuffer >= 1 ? minReadyBuffer : 2;
+        this.hosts = new List<DedicatedHostInstance>();
+    }
+
+    public int TotalHosts { get { return this.hosts.Count; } }
+
+    public void RegisterHost(string hostId, string region) {
+        if (hostId == null || hostId == "") { return; }
+        this.hosts.Add(new DedicatedHostInstance(hostId, region));
+    }
+
+    public int CountByState(int state) {
+        int c = 0;
+        for (int i = 0; i < this.hosts.Count; i = i + 1) {
+            if (this.hosts[i].State == state) { c = c + 1; }
+        }
+        return c;
+    }
+
+    // 为对局分配指定大区的空闲 Ready 节点。
+    public DedicatedHostInstance AllocateHost(string region, string matchId) {
+        for (int i = 0; i < this.hosts.Count; i = i + 1) {
+            DedicatedHostInstance h = this.hosts[i];
+            if (h.State == FleetHostState.Ready && h.Region == region) {
+                h.State = FleetHostState.Allocated;
+                h.MatchId = matchId != null ? matchId : "";
+                return h;
+            }
+        }
+        return null;
+    }
+
+    // 计算本轮弹性伸缩建议值：正数表示需扩容的新节点数，负数表示可优雅排水的冗余 Ready 节点数。
+    public int ComputeScaleDelta() {
+        int allocated = this.CountByState(FleetHostState.Allocated);
+        int ready = this.CountByState(FleetHostState.Ready);
+        int active = allocated + ready;
+        int desired = allocated + this.MinReadyBuffer;
+        if (desired < this.MinHosts) { desired = this.MinHosts; }
+        if (desired > this.MaxHosts) { desired = this.MaxHosts; }
+        return desired - active;
+    }
+
+    // 优雅缩容：至多将 maxDrain 个空闲 Ready 节点置为 Draining，正在运行对局的 Allocated 节点 100% 豁免。
+    public int DrainExcessReadyHosts(int maxDrain) {
+        if (maxDrain <= 0) { return 0; }
+        int drained = 0;
+        for (int i = 0; i < this.hosts.Count && drained < maxDrain; i = i + 1) {
+            if (this.hosts[i].State == FleetHostState.Ready) {
+                this.hosts[i].State = FleetHostState.Draining;
+                drained = drained + 1;
+            }
+        }
+        return drained;
+    }
+}

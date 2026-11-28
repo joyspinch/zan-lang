@@ -5,65 +5,64 @@ namespace Cloud.Oss;
 
 // AWS Signature Version 4（S3 协议）签名实现（兼容 AWS S3、MinIO 及各云 S3 网关）。
 public class S3Signer {
-    // 凭据范围：日期/区域/服务/aws4_request。
+    // 凭据范围：日期/区域/服务/aws4_request（单次精确 byte[] 组装）。
     public static string Scope(string dateOnly, string region, string service) {
-        return dateOnly + "/" + region + "/" + service + "/aws4_request";
+        string d = dateOnly == null ? "" : dateOnly;
+        string r = region == null ? "" : region;
+        string s = service == null ? "" : service;
+        int total = d.Length + 1 + r.Length + 1 + s.Length + 13;
+        byte[] buf = new byte[total];
+        nint bp = (nint)buf;
+        int pos = 0;
+        if (d.Length > 0) { NativeMemory.PutString(bp, pos, d, d.Length); pos = pos + d.Length; }
+        buf[pos] = 47; pos = pos + 1;
+        if (r.Length > 0) { NativeMemory.PutString(bp, pos, r, r.Length); pos = pos + r.Length; }
+        buf[pos] = 47; pos = pos + 1;
+        if (s.Length > 0) { NativeMemory.PutString(bp, pos, s, s.Length); pos = pos + s.Length; }
+        NativeMemory.PutString(bp, pos, "/aws4_request", 13);
+        return NativeMemory.GetString(bp, 0, total);
     }
 
-    // 规范化 URI：逐段 RFC3986 编码，保留单 '/' 分隔且始终以 '/' 起始。
+    // 规范化 URI：单遍 RFC3986 编码并保留 '/'，零分段 Substring 与 StringBuilder。
     public static string CanonicalUri(string path) {
-        if (path == null || path.Length == 0) { return "/"; }
-        StringBuilder sb = new StringBuilder();
-        if ((path[0] & 255) != 47) { sb.Append("/"); }
-        int i = 0;
-        int n = path.Length;
-        while (i < n) {
-            int slash = path.IndexOf("/", i);
-            int end = slash < 0 ? n : slash;
-            if (end > i) {
-                sb.Append(OssSigner.Rfc3986(path.Substring(i, end - i)));
-            }
-            if (slash < 0) { break; }
-            sb.Append("/");
-            i = slash + 1;
-        }
-        return sb.Length == 0 ? "/" : sb.ToString();
+        return OssSigner.Rfc3986CanonicalUri(path);
     }
 
-    private static int CompareAscii(string a, string b) {
-        int la = a == null ? 0 : a.Length;
-        int lb = b == null ? 0 : b.Length;
-        int min = la < lb ? la : lb;
-        for (int i = 0; i < min; i = i + 1) {
-            int ca = a[i] & 255;
-            int cb = b[i] & 255;
-            if (ca != cb) { return ca < cb ? -1 : 1; }
-        }
-        return la < lb ? -1 : (la > lb ? 1 : 0);
-    }
-
-    // 规范化查询串：按 AWS SigV4 要求对编码后的参数名（及同名参数值）升序排序后拼接。
+    // 规范化查询串：切片直接编码（零原串 Substring）+ String.CompareOrdinal 排序 + 单次精确 byte[] 拼装。
     public static string CanonicalQuery(List<string> pairs) {
         if (pairs == null || pairs.Count == 0) { return ""; }
-        List<string> encNames = new List<string>();
-        List<string> encVals = new List<string>();
-        for (int i = 0; i < pairs.Count; i = i + 1) {
+        int pc = pairs.Count;
+        string[] encNames = new string[pc];
+        string[] encVals = new string[pc];
+        int n = 0;
+        int totalLen = 0;
+        for (int i = 0; i < pc; i = i + 1) {
             string p = pairs[i];
             if (p == null || p.Length == 0) { continue; }
-            int eq = p.IndexOf("=");
-            string name = eq < 0 ? p : p.Substring(0, eq);
-            string value = eq < 0 ? "" : p.Substring(eq + 1);
-            encNames.Add(OssSigner.Rfc3986(name));
-            encVals.Add(OssSigner.Rfc3986(value));
+            int plen = p.Length;
+            int eq = NativeMemory.Find((nint)p, 0, 61, plen);
+            string en;
+            string ev;
+            if (eq < 0) {
+                en = OssSigner.Rfc3986Slice(p, 0, plen, false);
+                ev = "";
+            } else {
+                en = OssSigner.Rfc3986Slice(p, 0, eq, false);
+                ev = OssSigner.Rfc3986Slice(p, eq + 1, plen, false);
+            }
+            encNames[n] = en;
+            encVals[n] = ev;
+            totalLen = totalLen + en.Length + 1 + ev.Length + (n > 0 ? 1 : 0);
+            n = n + 1;
         }
-        int n = encNames.Count;
+        if (n == 0) { return ""; }
         for (int i = 1; i < n; i = i + 1) {
             string cn = encNames[i];
             string cv = encVals[i];
             int j = i - 1;
             while (j >= 0) {
-                int cmp = S3Signer.CompareAscii(encNames[j], cn);
-                if (cmp < 0 || (cmp == 0 && S3Signer.CompareAscii(encVals[j], cv) <= 0)) {
+                int cmp = String.CompareOrdinal(encNames[j], cn);
+                if (cmp < 0 || (cmp == 0 && String.CompareOrdinal(encVals[j], cv) <= 0)) {
                     break;
                 }
                 encNames[j + 1] = encNames[j];
@@ -73,28 +72,74 @@ public class S3Signer {
             encNames[j + 1] = cn;
             encVals[j + 1] = cv;
         }
-        StringBuilder sb = new StringBuilder();
+        byte[] buf = new byte[totalLen];
+        nint bp = (nint)buf;
+        int pos = 0;
         for (int i = 0; i < n; i = i + 1) {
-            if (i > 0) { sb.Append("&"); }
-            sb.Append(encNames[i]);
-            sb.Append("=");
-            sb.Append(encVals[i]);
+            if (i > 0) {
+                buf[pos] = 38;  // '&'
+                pos = pos + 1;
+            }
+            string en = encNames[i];
+            if (en.Length > 0) {
+                NativeMemory.PutString(bp, pos, en, en.Length);
+                pos = pos + en.Length;
+            }
+            buf[pos] = 61;  // '='
+            pos = pos + 1;
+            string ev = encVals[i];
+            if (ev.Length > 0) {
+                NativeMemory.PutString(bp, pos, ev, ev.Length);
+                pos = pos + ev.Length;
+            }
         }
-        return sb.ToString();
+        return NativeMemory.GetString(bp, 0, totalLen);
     }
 
-    // 规范化请求（canonicalHeaders 每行以 '\n' 结尾，与 signedHeaders 间保留空行）。
+    // 规范化请求（单次精确 byte[] 拷贝，消除 10 次中间字符串分配）。
     public static string CanonicalRequest(string method, string uri, string query,
                                           string canonicalHeaders, string signedHeaders,
                                           string payloadHash) {
-        return method + "\n" + uri + "\n" + query + "\n" + canonicalHeaders + "\n"
-            + signedHeaders + "\n" + payloadHash;
+        string m = method == null ? "" : method;
+        string u = uri == null ? "" : uri;
+        string q = query == null ? "" : query;
+        string ch = canonicalHeaders == null ? "" : canonicalHeaders;
+        string sh = signedHeaders == null ? "" : signedHeaders;
+        string ph = payloadHash == null ? "" : payloadHash;
+        int total = m.Length + u.Length + q.Length + ch.Length + sh.Length + ph.Length + 5;
+        byte[] buf = new byte[total];
+        nint bp = (nint)buf;
+        int pos = 0;
+        if (m.Length > 0) { NativeMemory.PutString(bp, pos, m, m.Length); pos = pos + m.Length; }
+        buf[pos] = 10; pos = pos + 1;
+        if (u.Length > 0) { NativeMemory.PutString(bp, pos, u, u.Length); pos = pos + u.Length; }
+        buf[pos] = 10; pos = pos + 1;
+        if (q.Length > 0) { NativeMemory.PutString(bp, pos, q, q.Length); pos = pos + q.Length; }
+        buf[pos] = 10; pos = pos + 1;
+        if (ch.Length > 0) { NativeMemory.PutString(bp, pos, ch, ch.Length); pos = pos + ch.Length; }
+        buf[pos] = 10; pos = pos + 1;
+        if (sh.Length > 0) { NativeMemory.PutString(bp, pos, sh, sh.Length); pos = pos + sh.Length; }
+        buf[pos] = 10; pos = pos + 1;
+        if (ph.Length > 0) { NativeMemory.PutString(bp, pos, ph, ph.Length); }
+        return NativeMemory.GetString(bp, 0, total);
     }
 
     // 待签串：算法 + 时间 + 范围 + 规范化请求的 SHA-256。
     public static string StringToSign(string amzDate, string scope, string canonicalRequest) {
-        return "AWS4-HMAC-SHA256\n" + amzDate + "\n" + scope + "\n"
-            + OssSigner.Sha256Hex(canonicalRequest);
+        string d = amzDate == null ? "" : amzDate;
+        string sc = scope == null ? "" : scope;
+        string hash = OssSigner.Sha256Hex(canonicalRequest);
+        int total = 17 + d.Length + 1 + sc.Length + 1 + hash.Length;
+        byte[] buf = new byte[total];
+        nint bp = (nint)buf;
+        NativeMemory.PutString(bp, 0, "AWS4-HMAC-SHA256\n", 17);
+        int pos = 17;
+        if (d.Length > 0) { NativeMemory.PutString(bp, pos, d, d.Length); pos = pos + d.Length; }
+        buf[pos] = 10; pos = pos + 1;
+        if (sc.Length > 0) { NativeMemory.PutString(bp, pos, sc, sc.Length); pos = pos + sc.Length; }
+        buf[pos] = 10; pos = pos + 1;
+        if (hash.Length > 0) { NativeMemory.PutString(bp, pos, hash, hash.Length); }
+        return NativeMemory.GetString(bp, 0, total);
     }
 
     // 派生签名密钥：HMAC 链（日期 -> 区域 -> 服务 -> aws4_request）。
@@ -116,10 +161,25 @@ public class S3Signer {
         return OssSigner.Hex(sig);
     }
 
-    // Authorization 头值。
+    // Authorization 头值（单次精确 byte[] 拷贝）。
     public static string Authorization(string accessKey, string scope, string signedHeaders,
                                        string signature) {
-        return "AWS4-HMAC-SHA256 Credential=" + (accessKey == null ? "" : accessKey) + "/" + scope
-            + ", SignedHeaders=" + signedHeaders + ", Signature=" + signature;
+        string ak = accessKey == null ? "" : accessKey;
+        string sc = scope == null ? "" : scope;
+        string sh = signedHeaders == null ? "" : signedHeaders;
+        string sig = signature == null ? "" : signature;
+        int total = 28 + ak.Length + 1 + sc.Length + 16 + sh.Length + 12 + sig.Length;
+        byte[] buf = new byte[total];
+        nint bp = (nint)buf;
+        NativeMemory.PutString(bp, 0, "AWS4-HMAC-SHA256 Credential=", 28);
+        int pos = 28;
+        if (ak.Length > 0) { NativeMemory.PutString(bp, pos, ak, ak.Length); pos = pos + ak.Length; }
+        buf[pos] = 47; pos = pos + 1;
+        if (sc.Length > 0) { NativeMemory.PutString(bp, pos, sc, sc.Length); pos = pos + sc.Length; }
+        NativeMemory.PutString(bp, pos, ", SignedHeaders=", 16); pos = pos + 16;
+        if (sh.Length > 0) { NativeMemory.PutString(bp, pos, sh, sh.Length); pos = pos + sh.Length; }
+        NativeMemory.PutString(bp, pos, ", Signature=", 12); pos = pos + 12;
+        if (sig.Length > 0) { NativeMemory.PutString(bp, pos, sig, sig.Length); }
+        return NativeMemory.GetString(bp, 0, total);
     }
 }

@@ -57,241 +57,269 @@ public class ApiDocs {
         ctx.Html(ApiDocs.Html());
     }
 
-    // 全程 JsonValue 树构建 + ToJson 序列化——标题/描述等文本自动转义，
-    // 任何路由名/参数名都毁不掉文档结构。
-    public static string SpecJson(WebApp host) {
-        JsonValue paths = JsonValue.NewObject();
+    // 静态 {"code","msg","data"} 信封 schema 常量片段，消除每条路由数十个 JsonValue 树节点分配。
+    private static const string ENVELOPE_SCHEMA_JSON =
+        "{\"type\":\"object\",\"required\":[\"code\",\"msg\"],\"properties\":{"
+        + "\"code\":{\"type\":\"string\",\"description\":\"0000 表示成功，其余为错误码\"},"
+        + "\"msg\":{\"type\":\"string\",\"description\":\"提示文案\"},"
+        + "\"data\":{\"description\":\"业务数据，可为 null\"}}}";
 
-        List<Route> routes = null;
-        if (host != null) { routes = host.Router().All(); }
-        if (routes == null) { routes = new List<Route>(); }
-
-        List<string> seen = new List<string>();
-        for (int i = 0; i < routes.Count; i++) {
-            string pt = routes[i].Pattern();
-            bool done = false;
-            for (int j = 0; j < seen.Count; j++) {
-                if (seen[j] == pt) { done = true; }
-            }
-            if (done) { continue; }
-            seen.Add(pt);
-
-            JsonValue ops = JsonValue.NewObject();
-            for (int k = 0; k < routes.Count; k++) {
-                Route rt = routes[k];
-                if (rt.Pattern() != pt) { continue; }
-                ops.Put(rt.Method().ToLower(), ApiDocs.Operation(rt, host));
-            }
-            paths.Put(ApiDocs.OpenApiPath(pt), ops);
+    private static void AppendJsonStr(StringBuilder sb, string v) {
+        if (v == null) {
+            sb.Append("null");
+            return;
         }
-
-        JsonValue info = JsonValue.NewObject();
-        info.PutStr("title", ApiDocs.title);
-        info.PutStr("version", "1.0.0");
-        JsonValue root = JsonValue.NewObject();
-        root.PutStr("openapi", "3.0.3");
-        root.Put("info", info);
-        root.Put("paths", paths);
-        return root.ToJson();
+        sb.Append("\"");
+        Encoding.JsonEscapeTo(sb, v);
+        sb.Append("\"");
     }
 
-    private static string OpenApiPath(string pattern) { return pattern; }
+    private static void AppendJsonArrayStr(StringBuilder sb, string v) {
+        sb.Append("\"");
+        if (v != null && v.Length > 0) {
+            Encoding.JsonEscapeTo(sb, v);
+        }
+        sb.Append("\"");
+    }
 
-    // 把一条路由写成一个 OpenAPI operation：summary/operationId/tags、
-    // x-login/x-auth/x-menu 徽标、parameters 与 requestBody（写请求的
-    // 非 path 参数归入表单体）、responses。
-    private static JsonValue Operation(Route rt, WebApp host) {
-        JsonValue op = JsonValue.NewObject();
+    private static string LowerMethod(string m) {
+        if (m == "GET") { return "get"; }
+        if (m == "POST") { return "post"; }
+        if (m == "PUT") { return "put"; }
+        if (m == "DELETE") { return "delete"; }
+        if (m == "PATCH") { return "patch"; }
+        if (m == "HEAD") { return "head"; }
+        if (m == "OPTIONS") { return "options"; }
+        return m.ToLower();
+    }
+
+    // 单遍 O(R) 路径分组 + 流式 JSON 序列化（零 JsonValue DOM 树分配，与原 JsonValue.ToJson 字节级等价）。
+    public static string SpecJson(WebApp host) {
+        List<Route> routes = null;
+        if (host != null) { routes = host.Router().All(); }
+        int rcount = routes != null ? routes.Count : 0;
+
+        StringBuilder sb = new StringBuilder(rcount * 640 + 256);
+        sb.Append("{\"openapi\":\"3.0.3\",\"info\":{\"title\":");
+        ApiDocs.AppendJsonStr(sb, ApiDocs.title);
+        sb.Append(",\"version\":\"1.0.0\"},\"paths\":{");
+
+        if (rcount > 0) {
+            Dictionary<string, List<Route>> groups = new Dictionary<string, List<Route>>();
+            List<string> pathOrder = new List<string>();
+            for (int i = 0; i < rcount; i = i + 1) {
+                Route rt = routes[i];
+                string pt = rt.Pattern();
+                List<Route> bucket = null;
+                if (!groups.TryGetValue(pt, out bucket)) {
+                    bucket = new List<Route>();
+                    groups[pt] = bucket;
+                    pathOrder.Add(pt);
+                }
+                bucket.Add(rt);
+            }
+
+            int pcount = pathOrder.Count;
+            for (int i = 0; i < pcount; i = i + 1) {
+                if (i > 0) { sb.Append(","); }
+                string pt = pathOrder[i];
+                ApiDocs.AppendJsonStr(sb, pt);
+                sb.Append(":{");
+                List<Route> bucket = groups[pt];
+                int bcount = bucket.Count;
+                for (int k = 0; k < bcount; k = k + 1) {
+                    if (k > 0) { sb.Append(","); }
+                    Route rt = bucket[k];
+                    ApiDocs.AppendJsonStr(sb, ApiDocs.LowerMethod(rt.Method()));
+                    sb.Append(":");
+                    ApiDocs.AppendOperation(sb, rt, host);
+                }
+                sb.Append("}");
+            }
+        }
+
+        sb.Append("}}");
+        return sb.ToString();
+    }
+
+    // 把一条路由流式写成 OpenAPI operation 对象（字段顺序与转义规则与原 JsonValue 路径字节级一致）。
+    private static void AppendOperation(StringBuilder sb, Route rt, WebApp host) {
+        string act = rt.Action();
         string sum = rt.GetTitle();
-        if (sum.Length == 0) { sum = rt.Action(); }
-        op.PutStr("summary", sum);
-        op.PutStr("operationId", rt.Action());
-        JsonValue tags = JsonValue.NewArray();
-        tags.AppendStr(ApiDocs.Tag(rt));
-        op.Put("tags", tags);
-
-        op.PutBool("x-login", rt.NeedsLogin());
-        op.PutBool("x-auth", rt.NeedsAuth());
-        op.PutBool("x-menu", rt.InMenu());
+        if (sum.Length == 0) { sum = act; }
+        sb.Append("{\"summary\":");
+        ApiDocs.AppendJsonStr(sb, sum);
+        sb.Append(",\"operationId\":");
+        ApiDocs.AppendJsonStr(sb, act);
+        sb.Append(",\"tags\":[");
+        ApiDocs.AppendJsonArrayStr(sb, ApiDocs.Tag(rt));
+        sb.Append("],\"x-login\":");
+        sb.Append(rt.NeedsLogin() ? "true" : "false");
+        sb.Append(",\"x-auth\":");
+        sb.Append(rt.NeedsAuth() ? "true" : "false");
+        sb.Append(",\"x-menu\":");
+        sb.Append(rt.InMenu() ? "true" : "false");
 
         List<ApiParam> ps = rt.DocParams();
-        JsonValue parameters = JsonValue.NewArray();
-        bool bodyForm = rt.Method() != "GET" && rt.Method() != "HEAD";
-        for (int i = 0; i < ps.Count; i++) {
+        int pcount = ps.Count;
+        string method = rt.Method();
+        bool bodyForm = method != "GET" && method != "HEAD";
+        sb.Append(",\"parameters\":[");
+        bool anyParam = false;
+        bool anyBody = false;
+        for (int i = 0; i < pcount; i = i + 1) {
             ApiParam p = ps[i];
-            if (bodyForm && p.Source() != "path") { continue; }
-            parameters.Append(ApiDocs.ParamJson(p));
-        }
-        op.Put("parameters", parameters);
-
-        if (bodyForm) {
-            bool anyBody = false;
-            for (int i = 0; i < ps.Count; i++) {
-                if (ps[i].Source() != "path") { anyBody = true; }
+            if (bodyForm && p.Source() != "path") {
+                anyBody = true;
+                continue;
             }
-            if (anyBody) {
-                JsonValue properties = JsonValue.NewObject();
-                JsonValue required = JsonValue.NewArray();
-                for (int i = 0; i < ps.Count; i++) {
-                    ApiParam p = ps[i];
-                    if (p.Source() == "path") { continue; }
-                    JsonValue prop = JsonValue.NewObject();
-                    prop.PutStr("type", p.JsonType());
-                    if (p.Desc().Length > 0) { prop.PutStr("description", p.Desc()); }
-                    if (p.Default().Length > 0) { prop.PutStr("default", p.Default()); }
-                    properties.Put(p.Name(), prop);
-                    if (p.Required()) { required.AppendStr(p.Name()); }
+            if (anyParam) { sb.Append(","); }
+            anyParam = true;
+            ApiDocs.AppendParamJson(sb, p);
+        }
+        sb.Append("]");
+
+        if (anyBody) {
+            sb.Append(",\"requestBody\":{\"content\":{\"application/x-www-form-urlencoded\":{\"schema\":{\"type\":\"object\",\"properties\":{");
+            bool firstProp = true;
+            for (int i = 0; i < pcount; i = i + 1) {
+                ApiParam p = ps[i];
+                if (p.Source() == "path") { continue; }
+                if (!firstProp) { sb.Append(","); }
+                firstProp = false;
+                ApiDocs.AppendJsonStr(sb, p.Name());
+                sb.Append(":{\"type\":");
+                ApiDocs.AppendJsonStr(sb, p.JsonType());
+                string desc = p.Desc();
+                if (desc.Length > 0) {
+                    sb.Append(",\"description\":");
+                    ApiDocs.AppendJsonStr(sb, desc);
                 }
-                JsonValue schema = JsonValue.NewObject();
-                schema.PutStr("type", "object");
-                schema.Put("properties", properties);
-                schema.Put("required", required);
-                JsonValue form = JsonValue.NewObject();
-                form.Put("schema", schema);
-                JsonValue content = JsonValue.NewObject();
-                content.Put("application/x-www-form-urlencoded", form);
-                JsonValue requestBody = JsonValue.NewObject();
-                requestBody.Put("content", content);
-                op.Put("requestBody", requestBody);
+                string def = p.Default();
+                if (def.Length > 0) {
+                    sb.Append(",\"default\":");
+                    ApiDocs.AppendJsonStr(sb, def);
+                }
+                sb.Append("}");
             }
+            sb.Append("},\"required\":[");
+            bool firstReq = true;
+            for (int i = 0; i < pcount; i = i + 1) {
+                ApiParam p = ps[i];
+                if (p.Source() == "path" || !p.Required()) { continue; }
+                if (!firstReq) { sb.Append(","); }
+                firstReq = false;
+                ApiDocs.AppendJsonArrayStr(sb, p.Name());
+            }
+            sb.Append("]}}}}");
         }
 
-        op.Put("responses", ApiDocs.Responses(rt, host));
-        return op;
+        sb.Append(",\"responses\":");
+        ApiDocs.AppendResponses(sb, rt, host, method);
+        sb.Append("}");
     }
 
     private static bool IsDefaultApiPattern(string pat) {
         string p = pat;
         if (p == HttpLimits.DefaultApiPrefix) { return true; }
-        return p.StartsWith(HttpLimits.DefaultApiPrefix + "/");
+        int plen = HttpLimits.DefaultApiPrefix.Length;
+        return p.Length > plen && (p[plen] & 255) == 47 && p.StartsWith(HttpLimits.DefaultApiPrefix);
     }
 
-    private static JsonValue Responses(Route rt, WebApp host) {
-        string kind = rt.MetaGet("ResponseKind").ToLower();
+    private static void AppendResponses(StringBuilder sb, Route rt, WebApp host, string method) {
+        string rawKind = rt.MetaGet("ResponseKind");
+        string kind = rawKind.Length > 0 ? rawKind.ToLower() : "";
+        string pat = rt.Pattern();
         bool stream = kind == "stream"
-            || (kind.Length == 0 && rt.Pattern().IndexOf("/stream") >= 0);
+            || (kind.Length == 0 && pat.IndexOf("/stream") >= 0);
         bool json = kind == "json";
         if (kind.Length == 0 && !stream) {
-            json = rt.Method() != "GET" && rt.Method() != "HEAD";
+            json = method != "GET" && method != "HEAD";
             if (!json) {
                 json = host != null
-                    ? host.IsApiPath(rt.Pattern())
-                    : ApiDocs.IsDefaultApiPattern(rt.Pattern());
+                    ? host.IsApiPath(pat)
+                    : ApiDocs.IsDefaultApiPattern(pat);
             }
         }
 
-        JsonValue ok = JsonValue.NewObject();
+        sb.Append("{\"200\":");
         if (stream) {
-            ok.PutStr("description", "事件流已建立，服务端持续推送");
-            JsonValue schema = JsonValue.NewObject();
-            schema.PutStr("type", "string");
-            JsonValue sse = JsonValue.NewObject();
-            sse.Put("schema", schema);
-            sse.PutStr("example", "event: metrics\ndata: {\"requests\":{\"count\":128}}\n\n");
-            JsonValue content = JsonValue.NewObject();
-            content.Put("text/event-stream", sse);
-            ok.Put("content", content);
+            sb.Append("{\"description\":\"事件流已建立，服务端持续推送\",\"content\":{\"text/event-stream\":{\"schema\":{\"type\":\"string\"},\"example\":\"event: metrics\\ndata: {\\\"requests\\\":{\\\"count\\\":128}}\\n\\n\"}}}");
         } else if (json) {
-            ok.PutStr("description", "成功");
-            JsonValue schemaJson = JsonValue.NewObject();
-            schemaJson.Put("schema", ApiDocs.EnvelopeSchema());
-            JsonValue example = JsonValue.NewObject();
-            example.PutStr("code", "0000");
-            example.PutStr("msg", "ok");
-            example.PutNull("data");
-            schemaJson.Put("example", example);
-            JsonValue content = JsonValue.NewObject();
-            content.Put("application/json", schemaJson);
-            ok.Put("content", content);
+            sb.Append("{\"description\":\"成功\",\"content\":{\"application/json\":{\"schema\":");
+            sb.Append(ApiDocs.ENVELOPE_SCHEMA_JSON);
+            sb.Append(",\"example\":{\"code\":\"0000\",\"msg\":\"ok\",\"data\":null}}}}");
         } else {
-            ok.PutStr("description", "页面");
-            JsonValue schema = JsonValue.NewObject();
-            schema.PutStr("type", "string");
-            JsonValue html = JsonValue.NewObject();
-            html.Put("schema", schema);
-            JsonValue content = JsonValue.NewObject();
-            content.Put("text/html", html);
-            ok.Put("content", content);
+            sb.Append("{\"description\":\"页面\",\"content\":{\"text/html\":{\"schema\":{\"type\":\"string\"}}}}");
         }
 
-        JsonValue responses = JsonValue.NewObject();
-        responses.Put("200", ok);
         if (json || stream) {
-            responses.Put("400", ApiDocs.ErrorResponse("参数不合法", ApiDocs.err400Code, ApiDocs.err400Msg));
+            sb.Append(",\"400\":");
+            ApiDocs.AppendErrorResponse(sb, "参数不合法", ApiDocs.err400Code, ApiDocs.err400Msg);
         }
         if (rt.NeedsLogin() || rt.NeedsAuth()) {
-            responses.Put("401", ApiDocs.ErrorResponse("未登录或登录已过期", ApiDocs.err401Code, ApiDocs.err401Msg));
-        }
-        if (rt.NeedsLogin() || rt.NeedsAuth()) {
-            responses.Put("403", ApiDocs.ErrorResponse("没有该操作的权限", ApiDocs.err403Code, ApiDocs.err403Msg));
+            sb.Append(",\"401\":");
+            ApiDocs.AppendErrorResponse(sb, "未登录或登录已过期", ApiDocs.err401Code, ApiDocs.err401Msg);
+            sb.Append(",\"403\":");
+            ApiDocs.AppendErrorResponse(sb, "没有该操作的权限", ApiDocs.err403Code, ApiDocs.err403Msg);
         }
         if (json) {
-            responses.Put("404", ApiDocs.ErrorResponse("对象不存在", ApiDocs.err404Code, ApiDocs.err404Msg));
+            sb.Append(",\"404\":");
+            ApiDocs.AppendErrorResponse(sb, "对象不存在", ApiDocs.err404Code, ApiDocs.err404Msg);
         }
-        return responses;
-    }
-
-    // {"code","msg","data"} 统一信封的 schema。
-    private static JsonValue EnvelopeSchema() {
-        JsonValue code = JsonValue.NewObject();
-        code.PutStr("type", "string");
-        code.PutStr("description", "0000 表示成功，其余为错误码");
-        JsonValue msg = JsonValue.NewObject();
-        msg.PutStr("type", "string");
-        msg.PutStr("description", "提示文案");
-        JsonValue data = JsonValue.NewObject();
-        data.PutStr("description", "业务数据，可为 null");
-        JsonValue properties = JsonValue.NewObject();
-        properties.Put("code", code);
-        properties.Put("msg", msg);
-        properties.Put("data", data);
-        JsonValue schema = JsonValue.NewObject();
-        schema.PutStr("type", "object");
-        JsonValue required = JsonValue.NewArray();
-        required.AppendStr("code");
-        required.AppendStr("msg");
-        schema.Put("required", required);
-        schema.Put("properties", properties);
-        return schema;
+        sb.Append("}");
     }
 
     // 一个错误状态响应（信封 schema + 示例）。
-    private static JsonValue ErrorResponse(string desc, string code, string msg) {
-        JsonValue example = JsonValue.NewObject();
-        example.PutStr("code", code);
-        example.PutStr("msg", msg);
-        JsonValue schemaJson = JsonValue.NewObject();
-        schemaJson.Put("schema", ApiDocs.EnvelopeSchema());
-        schemaJson.Put("example", example);
-        JsonValue content = JsonValue.NewObject();
-        content.Put("application/json", schemaJson);
-        JsonValue resp = JsonValue.NewObject();
-        resp.PutStr("description", desc);
-        resp.Put("content", content);
-        return resp;
+    private static void AppendErrorResponse(StringBuilder sb, string desc, string code, string msg) {
+        sb.Append("{\"description\":");
+        ApiDocs.AppendJsonStr(sb, desc);
+        sb.Append(",\"content\":{\"application/json\":{\"schema\":");
+        sb.Append(ApiDocs.ENVELOPE_SCHEMA_JSON);
+        sb.Append(",\"example\":{\"code\":");
+        ApiDocs.AppendJsonStr(sb, code);
+        sb.Append(",\"msg\":");
+        ApiDocs.AppendJsonStr(sb, msg);
+        sb.Append("}}}}");
     }
 
     // 一个 OpenAPI parameter 对象（in 取 path/query）。
-    private static JsonValue ParamJson(ApiParam p) {
-        JsonValue param = JsonValue.NewObject();
-        param.PutStr("name", p.Name());
-        param.PutStr("in", p.Source());
-        param.PutBool("required", p.Required());
-        if (p.Desc().Length > 0) { param.PutStr("description", p.Desc()); }
-        JsonValue schema = JsonValue.NewObject();
-        schema.PutStr("type", p.JsonType());
-        if (p.Default().Length > 0) { schema.PutStr("default", p.Default()); }
-        param.Put("schema", schema);
-        return param;
+    private static void AppendParamJson(StringBuilder sb, ApiParam p) {
+        sb.Append("{\"name\":");
+        ApiDocs.AppendJsonStr(sb, p.Name());
+        sb.Append(",\"in\":");
+        ApiDocs.AppendJsonStr(sb, p.Source());
+        sb.Append(",\"required\":");
+        sb.Append(p.Required() ? "true" : "false");
+        string desc = p.Desc();
+        if (desc.Length > 0) {
+            sb.Append(",\"description\":");
+            ApiDocs.AppendJsonStr(sb, desc);
+        }
+        sb.Append(",\"schema\":{\"type\":");
+        ApiDocs.AppendJsonStr(sb, p.JsonType());
+        string def = p.Default();
+        if (def.Length > 0) {
+            sb.Append(",\"default\":");
+            ApiDocs.AppendJsonStr(sb, def);
+        }
+        sb.Append("}}");
     }
 
-    // organised.
+    // 提取分组标签：零 Router.SplitPath 分配。
     private static string Tag(Route rt) {
         string a = rt.Action();
         int dot = a.IndexOf(".");
         if (dot > 0) { return a.Substring(0, dot); }
-        List<string> segs = Router.SplitPath(rt.Pattern());
-        if (segs.Count > 0) { return segs[0]; }
+        string pat = rt.Pattern();
+        int n = pat.Length;
+        int i = 0;
+        while (i < n && (pat[i] & 255) == 47) { i = i + 1; }
+        if (i < n) {
+            int slash = pat.IndexOf("/", i);
+            int end = slash < 0 ? n : slash;
+            if (end > i) { return pat.Substring(i, end - i); }
+        }
         return "api";
     }
 

@@ -75,20 +75,26 @@ public class ForwardedHeaders {
     }
 
     // 从 HttpContext 还原真实客户端 IP（规范拼写；对端缺失时答 "unknown"）。
+    // 直接使用 O(1) trustedProxySet 查表，消除 List<string>.Contains 线性扫描。
     public string ResolveClientIp(HttpContext ctx) {
         if (ctx == null) { return ""; }
         if (!this.enabled) { return ctx.RemoteIp(); }
-        List<string> trusted = this.trustedProxies;
-        if (this.trustInvalid) { trusted = new List<string>(); }
-        return ForwardedHeaders.Resolve(ctx.RemoteIp(), ctx.Request(), trusted);
+        if (this.trustInvalid || this.trustedProxySet == null || this.trustedProxySet.Count() == 0) {
+            string peer = ForwardedHeaders.Canonical(ctx.RemoteIp());
+            return peer.Length == 0 ? "unknown" : peer;
+        }
+        return ForwardedHeaders.ResolveCore(ctx.RemoteIp(), ctx.Request(), null, this.trustedProxySet);
     }
 
     private static bool IsXffName(string s, int start, int end) {
         while (start < end && (s[start] & 255) <= 32) { start = start + 1; }
         while (end > start && (s[end - 1] & 255) <= 32) { end = end - 1; }
         if (end - start != 15) { return false; }
+        int c0 = s[start] & 255;
+        if (c0 != 120 && c0 != 88) { return false; }
+        if ((s[start + 1] & 255) != 45) { return false; }
         string target = "x-forwarded-for";
-        for (int i = 0; i < 15; i = i + 1) {
+        for (int i = 2; i < 15; i = i + 1) {
             int c = s[start + i] & 255;
             if (c >= 65 && c <= 90) { c = c + 32; }
             if (c != (target[i] & 255)) { return false; }
@@ -99,148 +105,383 @@ public class ForwardedHeaders {
     // 纯函数口径（WebApp 与 MVC ClientIp 共用）：peer 为套接字对端，
     // trusted 为规范拼写的受托代理名单。单遍零 Split 扫描 rawHeaders 与 XFF 链。
     public static string Resolve(string remoteIp, HttpRequest request, List<string> trusted) {
+        return ForwardedHeaders.ResolveCore(remoteIp, request, trusted, null);
+    }
+
+    private static bool IsTrusted(string ip, List<string> trustedList, HashSet<string> trustedSet) {
+        if (trustedSet != null) { return trustedSet.Contains(ip); }
+        return trustedList != null && trustedList.Contains(ip);
+    }
+
+    private static string ResolveCore(string remoteIp, HttpRequest request,
+                                      List<string> trustedList, HashSet<string> trustedSet) {
         string peer = ForwardedHeaders.Canonical(remoteIp);
         if (peer.Length == 0) { return "unknown"; }
-        if (trusted == null || trusted.Count == 0 || !trusted.Contains(peer)) { return peer; }
+        if (trustedSet != null) {
+            if (trustedSet.Count() == 0 || !trustedSet.Contains(peer)) { return peer; }
+        } else {
+            if (trustedList == null || trustedList.Count == 0 || !trustedList.Contains(peer)) { return peer; }
+        }
         if (request == null || request.parseStatus != 0) { return peer; }
         // 多行同名 XFF 拼接语义不一（各代理各取一行），出现即不信；
-        // 折行（obs-fold）同理。单遍扫描同时定位唯一 XFF 值区间，避免 Split + 二次扫。
+        // 折行（obs-fold）同理。NativeMemory.Find 扫行 + 单遍定位唯一 XFF 值区间。
         string raw = request.rawHeaders;
         int rlen = raw != null ? raw.Length : 0;
+        nint rawPtr = rlen > 0 ? (nint)raw : 0;
         int fields = 0;
         int xffStart = -1;
         int xffEnd = -1;
         int pos = 0;
         while (pos < rlen) {
-            int lineEnd = pos;
-            while (lineEnd < rlen && (raw[lineEnd] & 255) != 10) { lineEnd = lineEnd + 1; }
+            int nl = NativeMemory.Find(rawPtr, pos, 10, rlen - pos);
+            int lineEnd = nl < 0 ? rlen : nl;
             int lineStop = lineEnd;
             if (lineStop > pos && (raw[lineStop - 1] & 255) == 13) { lineStop = lineStop - 1; }
             if (lineStop > pos) {
                 int c0 = raw[pos] & 255;
                 if (c0 == 32 || c0 == 9) { return peer; }
-                int colon = pos;
-                while (colon < lineStop && (raw[colon] & 255) != 58) { colon = colon + 1; }
-                if (colon < lineStop && ForwardedHeaders.IsXffName(raw, pos, colon)) {
-                    fields = fields + 1;
-                    if (fields > 1) { return peer; }
-                    int vs = colon + 1;
-                    int ve = lineStop;
-                    while (vs < ve && (raw[vs] & 255) <= 32) { vs = vs + 1; }
-                    while (ve > vs && (raw[ve - 1] & 255) <= 32) { ve = ve - 1; }
-                    xffStart = vs;
-                    xffEnd = ve;
+                // 仅首字节为 'x'/'X' 时才扫 ':' 并比对 "x-forwarded-for"，跳过 80%+ 非相关头行。
+                if (c0 == 120 || c0 == 88) {
+                    int colon = NativeMemory.Find(rawPtr, pos, 58, lineStop - pos);
+                    if (colon >= 0 && ForwardedHeaders.IsXffName(raw, pos, colon)) {
+                        fields = fields + 1;
+                        if (fields > 1) { return peer; }
+                        int vs = colon + 1;
+                        int ve = lineStop;
+                        while (vs < ve && (raw[vs] & 255) <= 32) { vs = vs + 1; }
+                        while (ve > vs && (raw[ve - 1] & 255) <= 32) { ve = ve - 1; }
+                        xffStart = vs;
+                        xffEnd = ve;
+                    }
                 }
             }
             pos = lineEnd + 1;
         }
-        // 只认 X-Forwarded-For 一种转发头：X-Real-IP / Forwarded 不并行
-        // 采信（多一种头就多一处代理配置可漏改的伪造面）。
+        // 只认 X-Forwarded-For 一种转发头：X-Real-IP / Forwarded 不并行采信。
         if (fields != 1) { return peer; }
         int xffLen = xffEnd - xffStart;
         if (xffLen <= 0 || xffLen > ForwardedHeaders.MaxHeaderLength) { return peer; }
-        // 零 Split 扫描逗号分隔的 XFF 跳链（全部跳均校验合法性，再自右向左跳过受托代理）。
-        string[] addresses = new string[ForwardedHeaders.MaxHops];
+        // 零 Split / 零每跳 Substring / 4 跳以内零 string[] 堆数组分配。
+        string h0 = "";
+        string h1 = "";
+        string h2 = "";
+        string h3 = "";
+        string[] extra = null;
         int hopCount = 0;
         int hp = xffStart;
         while (hp <= xffEnd) {
-            int comma = hp;
-            while (comma < xffEnd && (raw[comma] & 255) != 44) { comma = comma + 1; }
+            int comma = hp < xffEnd ? NativeMemory.Find(rawPtr, hp, 44, xffEnd - hp) : -1;
+            int segEnd = comma < 0 ? xffEnd : comma;
             if (hopCount >= ForwardedHeaders.MaxHops) { return peer; }
             int hs = hp;
-            int he = comma;
+            int he = segEnd;
             while (hs < he && (raw[hs] & 255) <= 32) { hs = hs + 1; }
             while (he > hs && (raw[he - 1] & 255) <= 32) { he = he - 1; }
             if (he <= hs) { return peer; }
-            string hop = ForwardedHeaders.Canonical(raw.Substring(hs, he - hs));
+            string hop = ForwardedHeaders.CanonicalSlice(raw, hs, he);
             if (hop.Length == 0) { return peer; }
-            addresses[hopCount] = hop;
+            if (hopCount == 0) { h0 = hop; }
+            else if (hopCount == 1) { h1 = hop; }
+            else if (hopCount == 2) { h2 = hop; }
+            else if (hopCount == 3) { h3 = hop; }
+            else {
+                if (extra == null) { extra = new string[ForwardedHeaders.MaxHops]; }
+                extra[hopCount] = hop;
+            }
             hopCount = hopCount + 1;
-            hp = comma + 1;
+            hp = segEnd + 1;
         }
         string current = peer;
         for (int i = hopCount - 1; i >= 0; i = i - 1) {
-            if (!trusted.Contains(current)) { return current; }
-            current = addresses[i];
+            if (!ForwardedHeaders.IsTrusted(current, trustedList, trustedSet)) { return current; }
+            if (i == 0) { current = h0; }
+            else if (i == 1) { current = h1; }
+            else if (i == 2) { current = h2; }
+            else if (i == 3) { current = h3; }
+            else { current = extra[i]; }
         }
         return current;
     }
 
-    // IPv4/IPv6 字面量的唯一拼写：等价文本不得制造额外限流桶或绕过名单
-    // （IPv6 展开为 8 组 4 位小写十六进制，IPv4-mapped 还原为 IPv4）。
-    // 非法输入答 ""。
+    // 切片严格解析点分 IPv4（0..255，拒绝前导零），打包进单 32 位正整数返回，非法返 -1L（零数组分配）。
+    private static long ParseIPv4Packed(string s, int start, int end) {
+        int len = end - start;
+        if (len < 7 || len > 15) { return -1L; }
+        int part = 0;
+        int val = 0;
+        int digits = 0;
+        long packed = 0L;
+        for (int i = start; i < end; i = i + 1) {
+            int c = s[i] & 255;
+            if (c >= 48 && c <= 57) {
+                if (digits == 1 && val == 0) { return -1L; }
+                digits = digits + 1;
+                if (digits > 3) { return -1L; }
+                val = val * 10 + (c - 48);
+                if (val > 255) { return -1L; }
+            } else if (c == 46) {
+                if (digits == 0 || part >= 3) { return -1L; }
+                packed = (packed << 8) | (long)val;
+                part = part + 1;
+                val = 0;
+                digits = 0;
+            } else {
+                return -1L;
+            }
+        }
+        if (part != 3 || digits == 0) { return -1L; }
+        return (packed << 8) | (long)val;
+    }
+
+    private static int WriteByteDec(byte[] buf, int p, int v) {
+        if (v >= 100) {
+            buf[p] = (byte)(48 + v / 100);
+            buf[p + 1] = (byte)(48 + (v / 10) % 10);
+            buf[p + 2] = (byte)(48 + v % 10);
+            return p + 3;
+        }
+        if (v >= 10) {
+            buf[p] = (byte)(48 + v / 10);
+            buf[p + 1] = (byte)(48 + v % 10);
+            return p + 2;
+        }
+        buf[p] = (byte)(48 + v);
+        return p + 1;
+    }
+
+    private static void WriteHex4(byte[] hex, int p, int w) {
+        int d0 = (w >> 12) & 15;
+        int d1 = (w >> 8) & 15;
+        int d2 = (w >> 4) & 15;
+        int d3 = w & 15;
+        hex[p] = (byte)(d0 < 10 ? 48 + d0 : 87 + d0);
+        hex[p + 1] = (byte)(d1 < 10 ? 48 + d1 : 87 + d1);
+        hex[p + 2] = (byte)(d2 < 10 ? 48 + d2 : 87 + d2);
+        hex[p + 3] = (byte)(d3 < 10 ? 48 + d3 : 87 + d3);
+    }
+
+    // IPv4/IPv6 字面量的唯一拼写：纯寄存器双 64 位位打包解析（零 int[8]/int[4]/List/Substring）。
+    // IPv6 展开为 8 组 4 位小写十六进制，IPv4-mapped 还原为 IPv4；非法输入答 ""。
     public static string Canonical(string ip) {
         if (ip == null || ip.Length == 0 || ip.Length > 45) { return ""; }
-        if (ExternalTarget.ValidIPv4(ip)) { return ip; }
-        if (!ip.Contains(":")) { return ""; }
-        if (ip.Contains(".")) {
-            int tail = ip.LastIndexOf(":") + 1;
-            string v4 = ip.Substring(tail);
-            if (!ExternalTarget.ValidIPv4(v4)) { return ""; }
-            List<string> octets = v4.Split(".");
-            int high = Convert.ToInt32(octets[0]) * 256 + Convert.ToInt32(octets[1]);
-            int low = Convert.ToInt32(octets[2]) * 256 + Convert.ToInt32(octets[3]);
-            ip = ip.Substring(0, tail) + ForwardedHeaders.IpHex(high) + ":"
-                + ForwardedHeaders.IpHex(low);
+        return ForwardedHeaders.CanonicalSlice(ip, 0, ip.Length);
+    }
+
+    private static string CanonicalSlice(string s, int start, int end) {
+        int len = end - start;
+        if (len <= 0 || len > 45) { return ""; }
+        if (len >= 7 && len <= 15 && ForwardedHeaders.ParseIPv4Packed(s, start, end) >= 0L) {
+            if (start == 0 && end == s.Length) { return s; }
+            return s.Substring(start, len);
         }
-        int gap = ip.IndexOf("::");
-        if (gap >= 0 && ip.IndexOf("::", gap + 2) >= 0) { return ""; }
-        string left = ip;
-        string right = "";
-        if (gap >= 0) { left = ip.Substring(0, gap); right = ip.Substring(gap + 2); }
-        List<int> before = new List<int>();
-        List<int> after = new List<int>();
-        if (!ForwardedHeaders.IpGroups(left, before) || !ForwardedHeaders.IpGroups(right, after)) {
-            return "";
+        if (len < 2) { return ""; }
+        // 8 个 16 位词分装在 2 个 64 位寄存器长整型：hi=[w0,w1,w2,w3], lo=[w4,w5,w6,w7]（零堆数组）。
+        long headBits = 0L;
+        long tailBits = 0L;
+        int headCnt = 0;
+        int tailCnt = 0;
+        bool seenGap = false;
+        int i = start;
+        if ((s[i] & 255) == 58) {
+            if (i + 1 >= end || (s[i + 1] & 255) != 58) { return ""; }
+            seenGap = true;
+            i = i + 2;
+            if (i < end && (s[i] & 255) == 58) { return ""; }
         }
-        int count = before.Count + after.Count;
-        if ((gap < 0 && count != 8) || (gap >= 0 && count >= 8)) { return ""; }
-        List<int> words = new List<int>();
-        for (int i = 0; i < before.Count; i = i + 1) { words.Add(before[i]); }
-        for (int i = count; i < 8; i = i + 1) { words.Add(0); }
-        for (int i = 0; i < after.Count; i = i + 1) { words.Add(after[i]); }
-        if (words[0] == 0 && words[1] == 0 && words[2] == 0 && words[3] == 0
-            && words[4] == 0 && words[5] == 65535) {
-            return Convert.ToString(words[6] / 256) + "." + Convert.ToString(words[6] % 256)
-                + "." + Convert.ToString(words[7] / 256) + "." + Convert.ToString(words[7] % 256);
+        while (i < end) {
+            int tokStart = i;
+            bool hasDot = false;
+            while (i < end) {
+                int ch = s[i] & 255;
+                if (ch == 58) { break; }
+                if (ch == 46) { hasDot = true; }
+                i = i + 1;
+            }
+            if (hasDot) {
+                if (i != end || headCnt + tailCnt > 6) { return ""; }
+                long v4 = ForwardedHeaders.ParseIPv4Packed(s, tokStart, end);
+                if (v4 < 0L) { return ""; }
+                if (seenGap && headCnt == 0 && tailCnt == 1 && (tailBits & 65535L) == 65535L) {
+                    return s.Substring(tokStart, end - tokStart);
+                }
+                return ForwardedHeaders.CanonicalV6Slow(s, start, end);
+            }
+            int glen = i - tokStart;
+            if (glen < 1 || glen > 4) { return ""; }
+            int val = 0;
+            for (int k = tokStart; k < i; k = k + 1) {
+                int hc = s[k] & 255;
+                int d;
+                if (hc >= 48 && hc <= 57) { d = hc - 48; }
+                else if (hc >= 97 && hc <= 102) { d = hc - 87; }
+                else if (hc >= 65 && hc <= 70) { d = hc - 55; }
+                else { return ""; }
+                val = (val << 4) | d;
+            }
+            if (!seenGap) {
+                if (headCnt >= 4) {
+                    if (headCnt >= 8) { return ""; }
+                    tailBits = (tailBits << 16) | (long)val;
+                    headCnt = headCnt + 1;
+                } else {
+                    headBits = (headBits << 16) | (long)val;
+                    headCnt = headCnt + 1;
+                }
+            } else {
+                if (headCnt + tailCnt >= 7) { return ""; }
+                if (tailCnt < 4) {
+                    tailBits = (tailBits << 16) | (long)val;
+                    tailCnt = tailCnt + 1;
+                } else {
+                    return ForwardedHeaders.CanonicalV6Slow(s, start, end);
+                }
+            }
+            if (i < end) {
+                if (i + 1 >= end) { return ""; }
+                if ((s[i + 1] & 255) == 58) {
+                    if (seenGap) { return ""; }
+                    if (headCnt > 4) { return ForwardedHeaders.CanonicalV6Slow(s, start, end); }
+                    seenGap = true;
+                    i = i + 2;
+                    if (i < end && (s[i] & 255) == 58) { return ""; }
+                } else {
+                    i = i + 1;
+                }
+            }
+        }
+        int w0 = 0; int w1 = 0; int w2 = 0; int w3 = 0;
+        int w4 = 0; int w5 = 0; int w6 = 0; int w7 = 0;
+        if (!seenGap) {
+            if (headCnt != 8) { return ""; }
+            w0 = (int)((headBits >> 48) & 65535L);
+            w1 = (int)((headBits >> 32) & 65535L);
+            w2 = (int)((headBits >> 16) & 65535L);
+            w3 = (int)(headBits & 65535L);
+            w4 = (int)((tailBits >> 48) & 65535L);
+            w5 = (int)((tailBits >> 32) & 65535L);
+            w6 = (int)((tailBits >> 16) & 65535L);
+            w7 = (int)(tailBits & 65535L);
+        } else {
+            if (headCnt + tailCnt >= 8) { return ""; }
+            if (headCnt == 4) {
+                w0 = (int)((headBits >> 48) & 65535L);
+                w1 = (int)((headBits >> 32) & 65535L);
+                w2 = (int)((headBits >> 16) & 65535L);
+                w3 = (int)(headBits & 65535L);
+            } else if (headCnt == 3) {
+                w0 = (int)((headBits >> 32) & 65535L);
+                w1 = (int)((headBits >> 16) & 65535L);
+                w2 = (int)(headBits & 65535L);
+            } else if (headCnt == 2) {
+                w0 = (int)((headBits >> 16) & 65535L);
+                w1 = (int)(headBits & 65535L);
+            } else if (headCnt == 1) {
+                w0 = (int)(headBits & 65535L);
+            }
+            if (tailCnt >= 1) { w7 = (int)(tailBits & 65535L); }
+            if (tailCnt >= 2) { w6 = (int)((tailBits >> 16) & 65535L); }
+            if (tailCnt >= 3) { w5 = (int)((tailBits >> 32) & 65535L); }
+            if (tailCnt >= 4) { w4 = (int)((tailBits >> 48) & 65535L); }
+        }
+        return ForwardedHeaders.FormatV6Words(w0, w1, w2, w3, w4, w5, w6, w7);
+    }
+
+    private static string FormatV6Words(int w0, int w1, int w2, int w3,
+                                        int w4, int w5, int w6, int w7) {
+        if (w0 == 0 && w1 == 0 && w2 == 0 && w3 == 0 && w4 == 0 && w5 == 65535) {
+            byte[] v4b = new byte[15];
+            int vp = ForwardedHeaders.WriteByteDec(v4b, 0, (w6 >> 8) & 255);
+            v4b[vp] = 46; vp = vp + 1;
+            vp = ForwardedHeaders.WriteByteDec(v4b, vp, w6 & 255);
+            v4b[vp] = 46; vp = vp + 1;
+            vp = ForwardedHeaders.WriteByteDec(v4b, vp, (w7 >> 8) & 255);
+            v4b[vp] = 46; vp = vp + 1;
+            vp = ForwardedHeaders.WriteByteDec(v4b, vp, w7 & 255);
+            return NativeMemory.GetString((nint)v4b, 0, vp);
         }
         byte[] hex = new byte[39];
-        int p = 0;
-        for (int i = 0; i < 8; i = i + 1) {
-            if (i > 0) {
-                hex[p] = (byte)58;
-                p = p + 1;
-            }
-            int w = words[i];
-            for (int shift = 12; shift >= 0; shift = shift - 4) {
-                int d = (w >> shift) & 15;
-                hex[p] = (byte)(d < 10 ? 48 + d : 87 + d);
-                p = p + 1;
-            }
-        }
+        ForwardedHeaders.WriteHex4(hex, 0, w0); hex[4] = 58;
+        ForwardedHeaders.WriteHex4(hex, 5, w1); hex[9] = 58;
+        ForwardedHeaders.WriteHex4(hex, 10, w2); hex[14] = 58;
+        ForwardedHeaders.WriteHex4(hex, 15, w3); hex[19] = 58;
+        ForwardedHeaders.WriteHex4(hex, 20, w4); hex[24] = 58;
+        ForwardedHeaders.WriteHex4(hex, 25, w5); hex[29] = 58;
+        ForwardedHeaders.WriteHex4(hex, 30, w6); hex[34] = 58;
+        ForwardedHeaders.WriteHex4(hex, 35, w7);
         return NativeMemory.GetString((nint)hex, 0, 39);
     }
 
-    private static bool IpGroups(string part, List<int> words) {
-        if (part.Length == 0) { return true; }
-        int start = 0;
-        for (int i = 0; i <= part.Length; i = i + 1) {
-            if (i == part.Length || part[i] == ':') {
-                int word = ExternalTarget.ParseHex(part.Substring(start, i - start));
-                if (word < 0 || words.Count >= 8) { return false; }
-                words.Add(word);
-                start = i + 1;
+    // 含内嵌 IPv4 或 head/tail > 4 词的通用 IPv6 切片解析路径。
+    private static string CanonicalV6Slow(string s, int start, int end) {
+        int[] words = new int[8];
+        int count = 0;
+        int gapPos = -1;
+        int i = start;
+        if ((s[i] & 255) == 58) {
+            if (i + 1 >= end || (s[i + 1] & 255) != 58) { return ""; }
+            gapPos = 0;
+            i = i + 2;
+            if (i < end && (s[i] & 255) == 58) { return ""; }
+        }
+        while (i < end) {
+            int tokStart = i;
+            bool hasDot = false;
+            while (i < end) {
+                int ch = s[i] & 255;
+                if (ch == 58) { break; }
+                if (ch == 46) { hasDot = true; }
+                i = i + 1;
+            }
+            if (hasDot) {
+                if (i != end || count > 6) { return ""; }
+                long v4 = ForwardedHeaders.ParseIPv4Packed(s, tokStart, end);
+                if (v4 < 0L) { return ""; }
+                words[count] = (int)((v4 >> 16) & 65535L);
+                words[count + 1] = (int)(v4 & 65535L);
+                count = count + 2;
+                break;
+            }
+            int glen = i - tokStart;
+            if (glen < 1 || glen > 4 || count >= 8) { return ""; }
+            int val = 0;
+            for (int k = tokStart; k < i; k = k + 1) {
+                int hc = s[k] & 255;
+                int d;
+                if (hc >= 48 && hc <= 57) { d = hc - 48; }
+                else if (hc >= 97 && hc <= 102) { d = hc - 87; }
+                else if (hc >= 65 && hc <= 70) { d = hc - 55; }
+                else { return ""; }
+                val = (val << 4) | d;
+            }
+            words[count] = val;
+            count = count + 1;
+            if (i < end) {
+                if (i + 1 >= end) { return ""; }
+                if ((s[i + 1] & 255) == 58) {
+                    if (gapPos >= 0) { return ""; }
+                    gapPos = count;
+                    i = i + 2;
+                    if (i < end && (s[i] & 255) == 58) { return ""; }
+                } else {
+                    i = i + 1;
+                }
             }
         }
-        return true;
-    }
-
-    private static string IpHex(int word) {
-        byte[] hex = new byte[4];
-        for (int i = 0; i < 4; i = i + 1) {
-            int d = (word >> (12 - i * 4)) & 15;
-            hex[i] = (byte)(d < 10 ? 48 + d : 87 + d);
+        if (gapPos < 0) {
+            if (count != 8) { return ""; }
+        } else {
+            if (count >= 8) { return ""; }
+            int tailLen = count - gapPos;
+            int zeros = 8 - count;
+            for (int t = tailLen - 1; t >= 0; t = t - 1) {
+                words[gapPos + zeros + t] = words[gapPos + t];
+            }
+            for (int z = 0; z < zeros; z = z + 1) {
+                words[gapPos + z] = 0;
+            }
         }
-        return NativeMemory.GetString((nint)hex, 0, 4);
+        return ForwardedHeaders.FormatV6Words(
+            words[0], words[1], words[2], words[3],
+            words[4], words[5], words[6], words[7]);
     }
 }

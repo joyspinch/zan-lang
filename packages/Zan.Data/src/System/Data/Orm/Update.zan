@@ -11,23 +11,23 @@ public class Update {
     private IRows src;
     private List<string> only;
     private List<string> skip;
-    private string sets;
+    private StringBuilder setBuf;
     private DbParams sp;
-    private string w;
+    private StringBuilder whereBuf;
     private DbParams wp;
     private bool on;
 
-    // 构造；统一经 <see cref="Create"/> 或直接创建。
+    // 构造；统一经 <see cref="Create"/> 或直接创建。only/skip 按需懒分配。
     public Update(IDbExecutor db, Meta meta) {
         this.db = db;
         this.meta = meta;
         this.tbl = meta.Table;
         this.src = null;
-        this.only = new List<string>();
-        this.skip = new List<string>();
-        this.sets = "";
+        this.only = null;
+        this.skip = null;
+        this.setBuf = new StringBuilder(128);
         this.sp = new DbParams();
-        this.w = "";
+        this.whereBuf = new StringBuilder(128);
         this.wp = new DbParams();
         this.on = true;
     }
@@ -42,11 +42,17 @@ public class Update {
         Update copy = new Update(this.db, this.meta);
         copy.tbl = this.tbl;
         copy.src = this.src;
-        copy.only.AddRange(this.only);
-        copy.skip.AddRange(this.skip);
-        copy.sets = this.sets;
+        if (this.only != null && this.only.Count > 0) {
+            copy.only = new List<string>();
+            copy.only.AddRange(this.only);
+        }
+        if (this.skip != null && this.skip.Count > 0) {
+            copy.skip = new List<string>();
+            copy.skip.AddRange(this.skip);
+        }
+        if (this.setBuf.Length > 0) { copy.setBuf.Append(this.setBuf.ToString()); }
         Dialect.CopyInto(this.sp, copy.sp);
-        copy.w = this.w;
+        if (this.whereBuf.Length > 0) { copy.whereBuf.Append(this.whereBuf.ToString()); }
         Dialect.CopyInto(this.wp, copy.wp);
         copy.on = this.on;
         copy.ApplySource();
@@ -56,11 +62,23 @@ public class Update {
 
     // 候选 SQL 的 OR 分支也必须受委托命中集合约束。
     public void PredicateCondition(string condition) {
-        if (this.w.Length == 0) { this.w = condition; }
-        else { this.w = "(" + this.w + ") AND (" + condition + ")"; }
+        if (this.whereBuf.Length == 0) {
+            this.whereBuf.Append(condition);
+        } else {
+            string prev = this.whereBuf.ToString();
+            this.whereBuf.Clear();
+            this.whereBuf.Append("(");
+            this.whereBuf.Append(prev);
+            this.whereBuf.Append(") AND (");
+            this.whereBuf.Append(condition);
+            this.whereBuf.Append(")");
+        }
     }
 
-    public string CandidateWhere() { return this.w; }
+    public string CandidateWhere() {
+        return this.whereBuf.Length == 0 ? "" : this.whereBuf.ToString();
+    }
+
     public DbParams CandidateParams() {
         DbParams copy = new DbParams();
         Dialect.CopyInto(this.wp, copy);
@@ -70,9 +88,15 @@ public class Update {
     // 改写到另一张表（标识符校验，防注入）。
     public void AsTable(string t) { this.tbl = QueryBuilder.RequireIdent(t); }
     // 只更新该列（与 Skip 互斥语义，可多次调用，列名经元数据校验）。
-    public void Only(string c) { this.only.Add(this.meta.Require(c)); }
+    public void Only(string c) {
+        if (this.only == null) { this.only = new List<string>(); }
+        this.only.Add(this.meta.Require(c));
+    }
     // 跳过该列（可多次调用，列名经元数据校验）。
-    public void Skip(string c) { this.skip.Add(this.meta.Require(c)); }
+    public void Skip(string c) {
+        if (this.skip == null) { this.skip = new List<string>(); }
+        this.skip.Add(this.meta.Require(c));
+    }
     // 实体整体更新的值来源（取第一行）。
     public void SetSource(IRows rows) { this.src = rows; }
     // 条件开关：false 期间 W/P* 收集的片段全部失效（ORM 内部
@@ -92,70 +116,122 @@ public class Update {
 
     // 该列是否进 SET：Only 优先，其次非 Skip。
     public bool Use(string c) {
-        if (this.only.Count > 0) { return Dialect.Has(this.only, c); }
+        if (this.only != null && this.only.Count > 0) { return Dialect.Has(this.only, c); }
+        if (this.skip == null || this.skip.Count == 0) { return true; }
         return !Dialect.Has(this.skip, c);
     }
 
     // 追加一段 SET 片段（片段间以逗号连接）。
     public void Frag(string f) {
-        if (this.sets.Length > 0) { this.sets = this.sets + ", "; }
-        this.sets = this.sets + f;
+        if (this.setBuf.Length > 0) { this.setBuf.Append(", "); }
+        this.setBuf.Append(f);
+    }
+
+    // 直接向 StringBuilder 写入方言引用标识符（单段无特殊字符快路径，零临时 string 分配）。
+    private static void AppendQuotedIdent(StringBuilder sb, int p, string ident) {
+        if (ident == null || ident.Length == 0) { return; }
+        int len = ident.Length;
+        if (len == 1 && (ident[0] & 255) == 42) { sb.Append("*"); return; }
+        int openCh = 34;
+        int closeCh = 34;
+        if (p == DbProvider.MySQL || p == DbProvider.MariaDB) {
+            openCh = 96;
+            closeCh = 96;
+        } else if (p == DbProvider.SqlServer) {
+            openCh = 91;
+            closeCh = 93;
+        }
+        nint ip = (nint)ident;
+        if (NativeMemory.IndexOfAny(ip, len, 46, (byte)closeCh) < 0
+            && (ident[0] & 255) != openCh) {
+            if (openCh == 34) { sb.Append("\""); sb.Append(ident); sb.Append("\""); }
+            else if (openCh == 96) { sb.Append("`"); sb.Append(ident); sb.Append("`"); }
+            else { sb.Append("["); sb.Append(ident); sb.Append("]"); }
+            return;
+        }
+        sb.Append(Dialect.QuoteIdentifier(p, ident));
+    }
+
+    private void AppendSetCol(int p, string col) {
+        if (this.setBuf.Length > 0) { this.setBuf.Append(", "); }
+        Update.AppendQuotedIdent(this.setBuf, p, col);
+        this.setBuf.Append(" = ?");
+    }
+
+    private void AppendSetIncrCol(int p, string col) {
+        if (this.setBuf.Length > 0) { this.setBuf.Append(", "); }
+        Update.AppendQuotedIdent(this.setBuf, p, col);
+        this.setBuf.Append(" = ");
+        Update.AppendQuotedIdent(this.setBuf, p, col);
+        this.setBuf.Append(" + ?");
+    }
+
+    private void AppendWhereEqCol(int p, string col) {
+        if (this.whereBuf.Length > 0) { this.whereBuf.Append(" AND "); }
+        Update.AppendQuotedIdent(this.whereBuf, p, col);
+        this.whereBuf.Append(" = ?");
     }
 
     // SET 片段：追加一个 "col = ?" 并把值排入 SET 参数区。
-    public void SetI(string c, int v) { this.sp.AddInt(v); this.Frag(this.QuoteCol(c) + " = ?"); }
+    public void SetI(string c, int v) { this.sp.AddInt(v); this.AppendSetCol(this.Provider(), this.RequireCol(c)); }
     // <see cref="SetI"/> 的 long 版本。
-    public void SetL(string c, long v) { this.sp.AddLong(v); this.Frag(this.QuoteCol(c) + " = ?"); }
+    public void SetL(string c, long v) { this.sp.AddLong(v); this.AppendSetCol(this.Provider(), this.RequireCol(c)); }
     // <see cref="SetI"/> 的 double 版本。
-    public void SetD(string c, double v) { this.sp.AddDouble(v); this.Frag(this.QuoteCol(c) + " = ?"); }
+    public void SetD(string c, double v) { this.sp.AddDouble(v); this.AppendSetCol(this.Provider(), this.RequireCol(c)); }
     // <see cref="SetI"/> 的 string 版本。
-    public void SetS(string c, string v) { this.sp.Add(v); this.Frag(this.QuoteCol(c) + " = ?"); }
+    public void SetS(string c, string v) { this.sp.Add(v); this.AppendSetCol(this.Provider(), this.RequireCol(c)); }
 
     // 布尔值写整型 0/1。
     public void SetB(string c, bool v) {
         if (v) { this.sp.AddInt(1); } else { this.sp.AddInt(0); }
-        this.Frag(this.QuoteCol(c) + " = ?");
+        this.AppendSetCol(this.Provider(), this.RequireCol(c));
     }
 
     // 自增片段："col = col + ?"（数据库侧原值累加）。
     public void SetIncrI(string c, int v) {
-        string col = this.QuoteCol(c);
+        string col = this.RequireCol(c);
         this.sp.AddInt(v);
-        this.Frag(col + " = " + col + " + ?");
+        this.AppendSetIncrCol(this.Provider(), col);
     }
 
     // <see cref="SetIncrI"/> 的 long 版本。
     public void SetIncrL(string c, long v) {
-        string col = this.QuoteCol(c);
+        string col = this.RequireCol(c);
         this.sp.AddLong(v);
-        this.Frag(col + " = " + col + " + ?");
+        this.AppendSetIncrCol(this.Provider(), col);
     }
 
     // <see cref="SetIncrI"/> 的 double 版本。
     public void SetIncrD(string c, double v) {
-        string col = this.QuoteCol(c);
+        string col = this.RequireCol(c);
         this.sp.AddDouble(v);
-        this.Frag(col + " = " + col + " + ?");
+        this.AppendSetIncrCol(this.Provider(), col);
     }
 
-    // 字典键值批量进 SET（列名经元数据校验，按列类型绑定）。
+    // 字典键值批量进 SET（列名经元数据校验，按列类型绑定，单次 Col 查找 + 零临时引用串）。
     public void SetDict(DbValues v) {
         int p = this.Provider();
-        for (int i = 0; i < v.Count(); i = i + 1) {
-            string c = this.meta.Require(v.NameAt(i));
+        int n = v.Count();
+        for (int i = 0; i < n; i = i + 1) {
+            string name = v.NameAt(i);
+            Col col = this.meta.Find(name);
+            if (col == null) {
+                throw new Exception(this.meta.Table + " has no column: " + name);
+            }
+            string c = col.Col;
             if (this.Use(c)) {
-                v.BindAs(this.sp, i, this.meta.KindOf(c));
-                this.Frag(Dialect.QuoteIdentifier(p, c) + " = ?");
+                v.BindAs(this.sp, i, col.Kind);
+                this.AppendSetCol(p, c);
             }
         }
     }
 
-    // WHERE 片段：多个片段以 AND 连接。
+    // WHERE 片段：多个片段以 AND 连接；无 "t." 前缀时跳过 Dialect.Unalias 逐字符重扫。
     public void W(string f) {
         if (!this.on) { return; }
-        string u = Dialect.Unalias(f);
-        if (this.w.Length == 0) { this.w = u; }
-        else { this.w = this.w + " AND " + u; }
+        string u = (f != null && f.IndexOf("t.") >= 0) ? Dialect.Unalias(f) : (f == null ? "" : f);
+        if (this.whereBuf.Length > 0) { this.whereBuf.Append(" AND "); }
+        this.whereBuf.Append(u);
     }
 
     // 表达式树下推到 UPDATE WHERE 条件（编译期降级，零反射零装箱）
@@ -202,10 +278,18 @@ public class Update {
     // 字典键值批量进 WHERE（等值条件）。
     public void WhereDict(DbValues v) {
         if (!this.on) { return; }
-        for (int i = 0; i < v.Count(); i = i + 1) {
-            string c = this.meta.Require(v.NameAt(i));
-            this.W(c + " = ?");
-            v.BindAs(this.wp, i, this.meta.KindOf(c));
+        int n = v.Count();
+        for (int i = 0; i < n; i = i + 1) {
+            string name = v.NameAt(i);
+            Col col = this.meta.Find(name);
+            if (col == null) {
+                throw new Exception(this.meta.Table + " has no column: " + name);
+            }
+            string c = col.Col;
+            if (this.whereBuf.Length > 0) { this.whereBuf.Append(" AND "); }
+            this.whereBuf.Append(c);
+            this.whereBuf.Append(" = ?");
+            v.BindAs(this.wp, i, col.Kind);
         }
     }
 
@@ -215,7 +299,7 @@ public class Update {
     // 校验列名属于本实体（剥掉可选的 "t." 前缀）；未知列抛异常。
     public string RequireCol(string c) {
         string n = c;
-        if (n.Length > 2 && n.IndexOf("t.") == 0) { n = n.Substring(2); }
+        if (n.Length > 2 && (n[0] & 255) == 116 && (n[1] & 255) == 46) { n = n.Substring(2); }
         if (!this.meta.Has(n)) {
             throw new Exception(this.meta.Table + " has no column: " + c);
         }
@@ -225,85 +309,92 @@ public class Update {
     // column = 文本值。
     public void WhereEq(string c, string v) {
         if (!this.on) { return; }
-        this.W(this.QuoteCol(c) + " = ?");
+        this.AppendWhereEqCol(this.Provider(), this.RequireCol(c));
         this.wp.Add(v);
     }
 
     // column = 整数值。
     public void WhereEq(string c, int v) {
         if (!this.on) { return; }
-        this.W(this.QuoteCol(c) + " = ?");
+        this.AppendWhereEqCol(this.Provider(), this.RequireCol(c));
         this.wp.AddInt(v);
     }
 
     // column = 64 位整数值。
     public void WhereEq(string c, long v) {
         if (!this.on) { return; }
-        this.W(this.QuoteCol(c) + " = ?");
+        this.AppendWhereEqCol(this.Provider(), this.RequireCol(c));
         this.wp.AddLong(v);
+    }
+
+    // 直接向 whereBuf 写入 "col IN (?, ?, ...)"：零临时 QuoteIdentifier / StringBuilder / Dialect.Unalias。
+    private void AppendWhereInCol(int p, string col, int count) {
+        if (this.whereBuf.Length > 0) { this.whereBuf.Append(" AND "); }
+        Update.AppendQuotedIdent(this.whereBuf, p, col);
+        this.whereBuf.Append(" IN (?");
+        int rem = count - 1;
+        while (rem >= 16) {
+            this.whereBuf.Append(", ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?");
+            rem = rem - 16;
+        }
+        while (rem >= 4) {
+            this.whereBuf.Append(", ?, ?, ?, ?");
+            rem = rem - 4;
+        }
+        while (rem > 0) {
+            this.whereBuf.Append(", ?");
+            rem = rem - 1;
+        }
+        this.whereBuf.Append(")");
     }
 
     // column IN (逐个占位符)；空列表按恒假处理，不生成 `IN ()`。带 2000 参数安全防御上限。
     public void WhereIn(string c, List<int> vs) {
         if (!this.on) { return; }
-        if (vs.Count == 0) { this.W("1 = 0"); return; }
-        if (vs.Count > 2000) {
+        int cnt = vs.Count;
+        if (cnt == 0) { this.W("1 = 0"); return; }
+        if (cnt > 2000) {
             throw new Exception("WhereIn parameter count exceeds safety limit of 2000");
         }
-        string col = this.QuoteCol(c);
-        StringBuilder sb = new StringBuilder();
-        sb.Append(col + " IN (");
-        for (int i = 0; i < vs.Count; i = i + 1) {
-            if (i > 0) { sb.Append(", "); }
-            sb.Append("?");
+        this.AppendWhereInCol(this.Provider(), this.RequireCol(c), cnt);
+        for (int i = 0; i < cnt; i = i + 1) {
             this.wp.AddInt(vs[i]);
         }
-        sb.Append(")");
-        this.W(sb.ToString());
     }
 
     // <see cref="WhereIn"/> 的 long 版本。
     public void WhereIn(string c, List<long> vs) {
         if (!this.on) { return; }
-        if (vs.Count == 0) { this.W("1 = 0"); return; }
-        if (vs.Count > 2000) {
+        int cnt = vs.Count;
+        if (cnt == 0) { this.W("1 = 0"); return; }
+        if (cnt > 2000) {
             throw new Exception("WhereIn parameter count exceeds safety limit of 2000");
         }
-        string col = this.QuoteCol(c);
-        StringBuilder sb = new StringBuilder();
-        sb.Append(col + " IN (");
-        for (int i = 0; i < vs.Count; i = i + 1) {
-            if (i > 0) { sb.Append(", "); }
-            sb.Append("?");
+        this.AppendWhereInCol(this.Provider(), this.RequireCol(c), cnt);
+        for (int i = 0; i < cnt; i = i + 1) {
             this.wp.AddLong(vs[i]);
         }
-        sb.Append(")");
-        this.W(sb.ToString());
     }
 
     // <see cref="WhereIn"/> 的 string 版本。
     public void WhereIn(string c, List<string> vs) {
         if (!this.on) { return; }
-        if (vs.Count == 0) { this.W("1 = 0"); return; }
-        if (vs.Count > 2000) {
+        int cnt = vs.Count;
+        if (cnt == 0) { this.W("1 = 0"); return; }
+        if (cnt > 2000) {
             throw new Exception("WhereIn parameter count exceeds safety limit of 2000");
         }
-        string col = this.QuoteCol(c);
-        StringBuilder sb = new StringBuilder();
-        sb.Append(col + " IN (");
-        for (int i = 0; i < vs.Count; i = i + 1) {
-            if (i > 0) { sb.Append(", "); }
-            sb.Append("?");
+        this.AppendWhereInCol(this.Provider(), this.RequireCol(c), cnt);
+        for (int i = 0; i < cnt; i = i + 1) {
             this.wp.Add(vs[i]);
         }
-        sb.Append(")");
-        this.W(sb.ToString());
     }
 
     // 恒假条件：数据边界为空集时用它表达"一行都不许动"。
     public void WhereNone() {
         if (!this.on) { return; }
-        this.W("1 = 0");
+        if (this.whereBuf.Length > 0) { this.whereBuf.Append(" AND "); }
+        this.whereBuf.Append("1 = 0");
     }
 
     // WHERE 参数：与 W 片段中占位符的出现顺序一致。
@@ -325,28 +416,43 @@ public class Update {
         if (o.RowCount() == 0) { return; }
         if (this.meta.PkCol() == null) { return; }
         int p = this.Provider();
-        for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
+        int colCount = this.meta.Cols.Count;
+        for (int i = 0; i < colCount; i = i + 1) {
             Col c = this.meta.Cols[i];
             if (c.IsPk || !this.Use(c.Col)) { continue; }
             o.BindCol(0, c, this.sp);
-            this.Frag(Dialect.QuoteIdentifier(p, c.Col) + " = ?");
+            this.AppendSetCol(p, c.Col);
         }
-        for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
+        for (int i = 0; i < colCount; i = i + 1) {
             Col c = this.meta.Cols[i];
             if (!c.IsPk) { continue; }
-            this.W(Dialect.QuoteIdentifier(p, c.Col) + " = ?");
+            this.AppendWhereEqCol(p, c.Col);
             o.BindCol(0, c, this.wp);
         }
     }
 
-    // 生成 UPDATE 语句；无 SET 或无 WHERE 时返回 ""
-    // （绝无全表更新）。
+    // 生成 UPDATE 语句；无 SET 或无 WHERE 时返回 ""（绝无全表更新）。
     public string BuildUpdate() {
         this.ApplySource();
-        if (this.sets.Length == 0) { return ""; }
-        if (this.w.Length == 0) { return ""; }
+        if (this.setBuf.Length == 0 || this.whereBuf.Length == 0) { return ""; }
         string qtbl = Dialect.QuoteIdentifier(this.Provider(), this.tbl);
-        return "UPDATE " + qtbl + " SET " + this.sets + " WHERE " + this.w;
+        string sStr = this.setBuf.ToString();
+        string wStr = this.whereBuf.ToString();
+        int total = 7 + qtbl.Length + 5 + sStr.Length + 7 + wStr.Length;
+        byte[] buf = new byte[total];
+        nint bp = (nint)buf;
+        NativeMemory.PutString(bp, 0, "UPDATE ", 7);
+        int pos = 7;
+        NativeMemory.PutString(bp, pos, qtbl, qtbl.Length);
+        pos = pos + qtbl.Length;
+        NativeMemory.PutString(bp, pos, " SET ", 5);
+        pos = pos + 5;
+        NativeMemory.PutString(bp, pos, sStr, sStr.Length);
+        pos = pos + sStr.Length;
+        NativeMemory.PutString(bp, pos, " WHERE ", 7);
+        pos = pos + 7;
+        NativeMemory.PutString(bp, pos, wStr, wStr.Length);
+        return NativeMemory.GetString(bp, 0, total);
     }
 
     // 执行并返回受影响行数。

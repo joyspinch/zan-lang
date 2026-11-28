@@ -1,0 +1,82 @@
+using System;
+using Game.Net;
+
+namespace Conf;
+
+class MultiplayerRankedTradeFleetTest {
+    static void Main() {
+        // 1. 排位 Elo + 定级赛 K 加成 + 连胜加分 + 晋级掉段保护盾 + 赛季软重置
+        NetRankedRatingEngine ranked = new NetRankedRatingEngine();
+        RankedPlayerProfile pA = new RankedPlayerProfile(1, 1590);
+        RankedPlayerProfile pB = new RankedPlayerProfile(2, 1600);
+        // pA 3 连胜：第 1 场即突破 1600 晋级 Platinum 并获得 2 场掉段保护盾
+        ranked.RecordMatch(pA, pB, true);
+        bool promotedWithShield = NetRankedRatingEngine.ClassifyTier(pA.Mmr) == "Platinum" && pA.DemotionShieldGames == 2;
+        ranked.RecordMatch(pA, pB, true);
+        ranked.RecordMatch(pA, pB, true); // 第 3 场连胜触发 +6 连胜加分
+        int peakMmr = pA.Mmr;
+
+        // 模拟把 pA 降到段位底线 1605 再输一场：掉段盾挡住跌破 1600，稳住 1600 且护盾 -1
+        pA.Mmr = 1605;
+        ranked.RecordMatch(pA, pB, false);
+        bool shieldSaved = pA.Mmr == 1600 && pA.DemotionShieldGames == 1;
+
+        pA.Mmr = 2000;
+        ranked.ApplySeasonSoftReset(pA); // (2000 + 1200) / 2 = 1600
+        bool rankOk = promotedWithShield && peakMmr > 1650 && shieldSaved && pA.Mmr == 1600 && pA.GamesPlayed == 0;
+        Console.WriteLine("net-ranked-elo-shield-reset: " + Convert.ToString(rankOk ? 1 : 0));
+
+        // 2. 防调包原子双向交易托管状态机
+        NetAuthoritativeTradeEscrow escrow = new NetAuthoritativeTradeEscrow(10, 20);
+        escrow.UpdateOffer(10, "sword_epic", 100);
+        escrow.UpdateOffer(20, "mount_dragon", 0);
+        escrow.LockOffer(10);
+        escrow.LockOffer(20);
+        escrow.ConfirmTrade(10);
+        // 玩家 20 试图最后时刻调包把龙坐骑换成空 -> 必须自动打断双方 Lock & Confirm！
+        escrow.UpdateOffer(20, "", 0);
+        bool scamBlocked = !escrow.LockedA && !escrow.LockedB && !escrow.ConfirmedA && !escrow.ConfirmedB;
+
+        // 双方重新正常出价、锁定、确认 -> 原子成交一次（禁止重放二次成交）
+        escrow.UpdateOffer(20, "mount_dragon", 25);
+        escrow.LockOffer(10);
+        escrow.LockOffer(20);
+        escrow.ConfirmTrade(10);
+        escrow.ConfirmTrade(20);
+        int goldA = 500;
+        int goldB = 100;
+        string gotA = "";
+        string gotB = "";
+        bool swapOk = escrow.ExecuteAtomicSwap(ref goldA, ref goldB, out gotA, out gotB);
+        string dummyA = "";
+        string dummyB = "";
+        bool doubleSwapBlocked = !escrow.ExecuteAtomicSwap(ref goldA, ref goldB, out dummyA, out dummyB);
+        bool tradeOk = scamBlocked && swapOk && doubleSwapBlocked
+            && goldA == 425 && goldB == 175
+            && gotA == "mount_dragon" && gotB == "sword_epic";
+        Console.WriteLine("net-atomic-trade-escrow: " + Convert.ToString(tradeOk ? 1 : 0));
+
+        // 3. 云专用服集群弹性伸缩与优雅排水（绝不误杀运行中对局节点）
+        NetDedicatedFleetScaler fleet = new NetDedicatedFleetScaler(2, 10, 2);
+        fleet.RegisterHost("h1", "ap-east");
+        fleet.RegisterHost("h2", "ap-east");
+        fleet.RegisterHost("h3", "ap-east");
+        DedicatedHostInstance m1 = fleet.AllocateHost("ap-east", "match-1");
+        DedicatedHostInstance m2 = fleet.AllocateHost("ap-east", "match-2");
+        // 当前 2 Allocated + 1 Ready = 3，目标 = 2 + MinReadyBuffer(2) = 4 -> 需扩容 +1
+        int scaleUp = fleet.ComputeScaleDelta();
+
+        fleet.RegisterHost("h4", "ap-east");
+        fleet.RegisterHost("h5", "ap-east");
+        fleet.RegisterHost("h6", "ap-east");
+        // 现在 2 Allocated + 4 Ready = 6，目标 4 -> 需缩容 -2，优雅排水 2 个 Ready 节点，2 个 Allocated 完好无损
+        int scaleDown = fleet.ComputeScaleDelta();
+        int drained = fleet.DrainExcessReadyHosts(-scaleDown);
+        bool fleetOk = m1 != null && m2 != null && scaleUp == 1 && scaleDown == -2
+            && drained == 2
+            && fleet.CountByState(FleetHostState.Allocated) == 2
+            && fleet.CountByState(FleetHostState.Ready) == 2
+            && fleet.CountByState(FleetHostState.Draining) == 2;
+        Console.WriteLine("net-dedicated-fleet-scaler: " + Convert.ToString(fleetOk ? 1 : 0));
+    }
+}
