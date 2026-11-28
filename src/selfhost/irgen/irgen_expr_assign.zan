@@ -18,19 +18,53 @@ partial class Irgen {
     Node HoistSubExpr(Node n) {
         if (n == null || IsTrivialLhs(n)) { return n; }
         ExprVal v = GenExpr(n);
-        string tname = "__zca_" + locName.Count;
+        string tname = ".zca." + locName.Count;
         string reg = AddLocal(tname, v.ty);
         string lt = MapType(v.ty);
         EA(reg, lt);
         string sv = Coerce(v, lt);
+        bool owned = v.ty != null && (ArcManaged(v.ty) || v.ty.ival >= 1);
+        if (curAsync && eaActive && owned) {
+            entryAllocas.Append("  store " + lt + " null, " + lt + "* " + reg + "\n");
+        }
         L("  store " + lt + " " + sv + ", " + lt + "* " + reg);
-        if (ArcManaged(v.ty) || v.ty.ival >= 1) { EmitArcRetain(sv, v.ty); }
+        if (owned) {
+            if (!TransferTempOwner(v)) { EmitArcRetain(sv, v.ty); }
+            if (curAsync && eaActive) { ArmLocalSlot(reg, v.ty, false); }
+        }
         Node id = new Node(AK.Ident());
         id.sval = tname;
         id.type = v.ty;
         id.line = n.line;
         id.col = n.col;
         return id;
+    }
+
+    void DropHoistedLocals(int from) {
+        if (from >= locName.Count) { return; }
+        if (!term) {
+            if (!curAsync) {
+                ReleaseLocalsFrom(from);
+            } else {
+                int i = from;
+                while (i < locName.Count) {
+                    Node ty = locType[i];
+                    if (ty != null && (ArcManaged(ty) || ty.ival >= 1)) {
+                        string lt = MapType(ty);
+                        if (eaActive) {
+                            DropLocalSlot(locReg[i], ty, lt);
+                        } else {
+                            string t = NT();
+                            L("  " + t + " = load " + lt + ", " + lt + "* " + locReg[i]);
+                            L("  store " + lt + " null, " + lt + "* " + locReg[i]);
+                            EmitArcRelease(t, ty);
+                        }
+                    }
+                    i = i + 1;
+                }
+            }
+        }
+        TrimLocals(from);
     }
 
     void HoistCompoundSpine(Node lhs) {
@@ -134,6 +168,16 @@ partial class Irgen {
 
     // ---- assignment ----
     ExprVal GenAssign(Node e) {
+        int hoistBase = locName.Count;
+        bool arm = eaActive;
+        if (arm) { EnterCallArm(); }
+        ExprVal res = GenAssignCore(e);
+        DropHoistedLocals(hoistBase);
+        if (arm) { LeaveCallArm(); }
+        return res;
+    }
+
+    ExprVal GenAssignCore(Node e) {
         Node target = e.a;
         if (target.sval == "target") {
             Node cls = null;

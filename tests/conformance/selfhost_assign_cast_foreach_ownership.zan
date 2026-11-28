@@ -1,0 +1,225 @@
+using System;
+using System.Collections.Generic;
+using System.Threading.Tasks;
+
+namespace SelfhostAssignCastForeachOwnership;
+
+struct PointVal {
+    public int X;
+    public int Y;
+    public PointVal(int x, int y) { this.X = x; this.Y = y; }
+}
+
+class Box {
+    public int Val;
+    public string Name;
+    public Box Child;
+    public Box(int v) { this.Val = v; this.Name = "b_" + v.ToString(); }
+    public virtual string NameProp {
+        get { return this.Name; }
+        set { this.Name = value; }
+    }
+    public Box ThrowProp {
+        get { return this.Child; }
+        set { throw new Exception("set_boom_" + value.Val.ToString()); }
+    }
+}
+
+class SubBox : Box {
+    public SubBox(int v) : base(v) { }
+    public override string NameProp {
+        get { return base.NameProp; }
+        set { base.NameProp = value; }
+    }
+}
+
+class Other {
+    public int X;
+    public Other(int x) { this.X = x; }
+}
+
+class Target {
+    public int V;
+    public string Tag;
+    public Target(int v, string t) { this.V = v; this.Tag = t; }
+}
+
+class Source {
+    public int V;
+    public Source(int v) { this.V = v; }
+    public static implicit operator Target(Source s) {
+        if (s.V < 0) { throw new Exception("imp_boom"); }
+        return new Target(s.V, "imp_" + s.V.ToString());
+    }
+    public static explicit operator Box(Source s) {
+        if (s.V < 0) { throw new Exception("exp_boom"); }
+        return new Box(s.V + 100);
+    }
+}
+
+class Program {
+    static int dictCalls = 0;
+    static int syncAwaitVal = 0;
+
+    static Box MakeBox(int v) { return new Box(v); }
+    static string MakeStr(int v) { return "s_" + v.ToString(); }
+    static object MakeObjOther(int v) { return new Other(v); }
+    static Box[] MakeArr() { return new Box[] { MakeBox(1), MakeBox(2) }; }
+    static List<Box> MakeList() { return new List<Box> { MakeBox(1), MakeBox(2) }; }
+    static Dictionary<string, Box> MakeDictCounted() {
+        dictCalls = dictCalls + 1;
+        return new Dictionary<string, Box> { { MakeStr(1), MakeBox(1) }, { MakeStr(2), MakeBox(2) } };
+    }
+    static Box BoomBox() { throw new Exception("boom_box"); }
+    static string BoomStr() { throw new Exception("boom_str"); }
+    static int BoomInt() { throw new Exception("boom_int"); }
+
+    static async Task<Box> AsyncMakeBox(int v) {
+        await Task.Delay(1);
+        return MakeBox(v);
+    }
+
+    static async Task<Box> AsyncIdentity(Box b) {
+        await Task.Delay(1);
+        return MakeBox(b.Val + 1);
+    }
+
+    static int TestAssignUnwind() {
+        int sum = 0;
+        try {
+            Box[] empty = new Box[1];
+            empty[0].Name = MakeStr(1);
+            sum = sum + 100;
+        } catch (Exception e) { sum = sum + (e.Message.Length > 0 ? 1 : 0); }
+        try {
+            MakeArr()[BoomInt()] = MakeBox(1);
+            sum = sum + 100;
+        } catch (Exception e) { sum = sum + e.Message.Length; }
+        try {
+            MakeList()[99] = MakeBox(1);
+            sum = sum + 100;
+        } catch (Exception e) { sum = sum + (e.Message.Length > 0 ? 1 : 0); }
+        try {
+            MakeBox(1).ThrowProp = MakeBox(2);
+            sum = sum + 100;
+        } catch (Exception e) { sum = sum + e.Message.Length; }
+        try {
+            Dictionary<string, string> d = new Dictionary<string, string> { { MakeStr(1), MakeStr(10) } };
+            d[MakeStr(1)] += BoomStr();
+            sum = sum + d.Count;
+        } catch (Exception e) { sum = sum + e.Message.Length; }
+        try {
+            MakeBox(1).Name += BoomStr();
+            sum = sum + 100;
+        } catch (Exception e) { sum = sum + e.Message.Length; }
+        try {
+            MakeArr()[MakeBox(0).Val].Name += BoomStr();
+            sum = sum + 100;
+        } catch (Exception e) { sum = sum + e.Message.Length; }
+        try {
+            MakeBox(1).NameProp += BoomStr();
+            sum = sum + 100;
+        } catch (Exception e) { sum = sum + e.Message.Length; }
+        Box a = null;
+        try {
+            MakeArr()[BoomInt()] = a = MakeBox(7);
+            sum = sum + 100;
+        } catch (Exception e) { sum = sum + e.Message.Length + (a != null ? a.Val : 0); }
+        return sum;
+    }
+
+    static Target ReturnImplicitThrow() {
+        return new Source(-3);
+    }
+
+    static int TestCastAndConv() {
+        int sum = 0;
+        try {
+            Box b = (Box)MakeObjOther(5);
+            sum = sum + b.Val;
+        } catch (Exception e) { sum = sum + (e.Message.Length > 0 ? 1 : 0); }
+        try {
+            SubBox[] s = (SubBox[])MakeArr();
+            sum = sum + s.Length;
+        } catch (Exception e) { sum = sum + (e.Message.Length > 0 ? 1 : 0); }
+        try {
+            PointVal p = (PointVal)MakeObjOther(5);
+            sum = sum + p.X;
+        } catch (Exception e) { sum = sum + (e.Message.Length > 0 ? 1 : 0); }
+        try {
+            checked {
+                byte x = (byte)MakeBox(300).Val;
+                sum = sum + (int)x;
+            }
+        } catch (Exception e) { sum = sum + (e.Message.Length > 0 ? 1 : 0); }
+        Target t = new Source(5);
+        sum = sum + t.V + t.Tag.Length;
+        Box b2 = (Box)new Source(5);
+        sum = sum + b2.Val + b2.Name.Length;
+        try {
+            Target tBad = new Source(-1);
+            sum = sum + tBad.V;
+        } catch (Exception e) { sum = sum + e.Message.Length; }
+        try {
+            Box bBad = (Box)new Source(-2);
+            sum = sum + bBad.Val;
+        } catch (Exception e) { sum = sum + e.Message.Length; }
+        try {
+            Target tRet = ReturnImplicitThrow();
+            sum = sum + tRet.V;
+        } catch (Exception e) { sum = sum + e.Message.Length; }
+        return sum;
+    }
+
+    static int TestForeachDict() {
+        dictCalls = 0;
+        int n = 0;
+        foreach (string k in MakeDictCounted()) {
+            n = n + k.Length;
+        }
+        int errLen = 0;
+        try {
+            foreach (string k in MakeDictCounted()) {
+                if (k == "s_2") { throw new Exception("dict_fe_boom"); }
+            }
+        } catch (Exception e) { errLen = e.Message.Length; }
+        return dictCalls * 100 + n + errLen;
+    }
+
+    static async Task<int> TestAsyncAssignAndAwait() {
+        int sum = 0;
+        try {
+            Box tb = MakeBox(1);
+            tb.ThrowProp = await AsyncMakeBox(1);
+            sum = sum + 100;
+        } catch (Exception e) { sum = sum + e.Message.Length; }
+        try {
+            MakeBox(1).Name += BoomStr();
+            sum = sum + 100;
+        } catch (Exception e) { sum = sum + e.Message.Length; }
+        Box holder = MakeBox(3);
+        holder.Name += "_ok";
+        await Task.Delay(1);
+        sum = sum + holder.Name.Length;
+        Box x = null;
+        x = await AsyncIdentity(MakeBox(10));
+        sum = sum + x.Val;
+        return sum;
+    }
+
+    static void Main() {
+        Console.WriteLine("assign=" + TestAssignUnwind().ToString());
+        Console.WriteLine("cast=" + TestCastAndConv().ToString());
+        Console.WriteLine("foreach=" + TestForeachDict().ToString());
+        Console.WriteLine("async=" + (await TestAsyncAssignAndAwait()).ToString());
+        syncAwaitVal = 0;
+        try {
+            Box r = await AsyncMakeBox(12);
+            syncAwaitVal = r.Val;
+            throw new Exception("sync_main_boom");
+        } catch (Exception e) {
+            syncAwaitVal = syncAwaitVal + e.Message.Length;
+        }
+        Console.WriteLine("sync_await=" + syncAwaitVal.ToString());
+    }
+}
