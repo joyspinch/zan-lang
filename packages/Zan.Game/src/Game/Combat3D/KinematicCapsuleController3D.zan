@@ -47,6 +47,7 @@ public class KinematicCapsuleController3D {
     public bool IsCrouching;
     public Vector3 GroundNormal;
     public int GroundMaterialId;
+    public int GroundInstanceId;
     public float CurrentHeight;
     public float CurrentEyeHeight;
 
@@ -57,6 +58,7 @@ public class KinematicCapsuleController3D {
     private Vector3 lastResolvedPos;
     private float lastResolvedHeight;
     private int lastWorldNodeCount;
+    private int lastDynamicEpoch;
     private bool needsDepenetration;
 
     private Vector3[] clipPlanes;
@@ -87,6 +89,7 @@ public class KinematicCapsuleController3D {
         this.IsCrouching = false;
         this.GroundNormal = new Vector3(0.0f, 1.0f, 0.0f);
         this.GroundMaterialId = SurfaceMaterial3D.Default;
+        this.GroundInstanceId = -1;
         this.CurrentHeight = this.StandingHeight;
         this.CurrentEyeHeight = this.StandingHeight * 0.90f;
 
@@ -95,6 +98,7 @@ public class KinematicCapsuleController3D {
         this.lastResolvedPos = new Vector3(1e30f, 1e30f, 1e30f);
         this.lastResolvedHeight = -1.0f;
         this.lastWorldNodeCount = -1;
+        this.lastDynamicEpoch = -1;
         this.needsDepenetration = true;
         this.clipPlanes = new Vector3[6];
     }
@@ -544,6 +548,7 @@ public class KinematicCapsuleController3D {
                 this.IsGrounded = true;
                 this.GroundNormal = groundHit.Normal.Y >= this.MinWalkableNormalY ? groundHit.Normal : groundHit.SurfaceNormal;
                 this.GroundMaterialId = groundHit.MaterialId;
+                this.GroundInstanceId = -1;
                 if (this.Velocity.Y < 0.0f) {
                     this.Velocity = new Vector3(this.Velocity.X, 0.0f, this.Velocity.Z);
                 }
@@ -552,6 +557,425 @@ public class KinematicCapsuleController3D {
         }
 
         this.IsGrounded = false;
+        this.GroundInstanceId = -1;
+        this.GroundNormal = new Vector3(0.0f, 1.0f, 0.0f);
+    }
+
+    // 检测在动态双层场景 TLAS 下当前位置能否安全恢复站立。
+    public bool CanStandUpDynamic(DynamicSceneTlas3D world, int layerMask) {
+        if (world == null) { return true; }
+        float standH = this.StandingHeight;
+        float crouchH = this.CrouchHeight;
+        if (standH <= crouchH + 0.001f) { return true; }
+
+        Vector3 c0;
+        Vector3 c1;
+        this.GetCapsuleSegmentAt(this.Position, crouchH, out c0, out c1);
+        SceneSweepHit3D hit;
+        if (world.SweepCapsule(c1, c1, this.Radius - this.SkinWidth * 0.5f,
+                               new Vector3(0.0f, standH - crouchH, 0.0f), layerMask, out hit)) {
+            return false;
+        }
+        return true;
+    }
+
+    // 双层动态世界完整单 Tick 角色仿真（内置电梯/列车/旋转转盘附着带人位移与起跳动量继承）。
+    public void SimulateDynamic(DynamicSceneTlas3D world, int layerMask, CharacterMoveInput3D input, float dt) {
+        if (dt <= 0.0f) { return; }
+        if (dt > 0.1f) { dt = 0.1f; }
+
+        // 0. 移动/旋转平台附着跟随（Platform Carry）并记录瞬时牵连速度供起跳继承
+        Vector3 platformCarryVel = Vector3.Zero;
+        if (this.IsGrounded && this.GroundInstanceId >= 0 && world != null && world.IsInstanceEnabled(this.GroundInstanceId)) {
+            platformCarryVel = world.GetInstancePointVelocity(this.GroundInstanceId, this.Position);
+            Vector3 carryDelta = Vector3.Multiply(platformCarryVel, dt);
+            if (carryDelta.LengthSquared() > 1e-12f) {
+                Vector3 p0;
+                Vector3 p1;
+                this.GetCapsuleSegmentAt(this.Position, this.CurrentHeight, out p0, out p1);
+                SceneSweepHit3D carryHit;
+                if (world.SweepCapsule(p0, p1, this.Radius - this.SkinWidth * 0.5f, carryDelta, layerMask, out carryHit)) {
+                    if (carryHit.Distance > this.SkinWidth) {
+                        float frac = (carryHit.Distance - this.SkinWidth) / MathF.Sqrt(carryDelta.LengthSquared());
+                        this.Position = Vector3.Add(this.Position, Vector3.Multiply(carryDelta, frac));
+                    } else if (carryHit.StartedPenetrating) {
+                        this.needsDepenetration = true;
+                    }
+                } else {
+                    this.Position = Vector3.Add(this.Position, carryDelta);
+                }
+            }
+        }
+
+        if (input.CrouchHeld) {
+            this.IsCrouching = true;
+            this.CurrentHeight = this.CrouchHeight;
+        } else if (this.IsCrouching) {
+            if (this.CanStandUpDynamic(world, layerMask)) {
+                this.IsCrouching = false;
+                this.CurrentHeight = this.StandingHeight;
+            } else {
+                this.IsCrouching = true;
+                this.CurrentHeight = this.CrouchHeight;
+            }
+        } else {
+            this.CurrentHeight = this.StandingHeight;
+        }
+
+        if (this.IsGrounded) {
+            this.timeSinceGrounded = 0.0f;
+        } else {
+            this.timeSinceGrounded = this.timeSinceGrounded + dt;
+        }
+        if (input.JumpPressed) {
+            this.jumpBufferTimer = this.JumpBufferWindow;
+        } else if (this.jumpBufferTimer > 0.0f) {
+            this.jumpBufferTimer = Math.Max(0.0f, this.jumpBufferTimer - dt);
+        }
+
+        float wx = input.WishDirection.X;
+        float wz = input.WishDirection.Z;
+        float wishMagSq = wx * wx + wz * wz;
+        Vector3 wishDir = Vector3.Zero;
+        float wishMag = 0.0f;
+        if (wishMagSq > 1e-10f) {
+            wishMag = MathF.Sqrt(wishMagSq);
+            float invWish = 1.0f / wishMag;
+            wishDir = new Vector3(wx * invWish, 0.0f, wz * invWish);
+            if (wishMag > 1.0f) { wishMag = 1.0f; }
+        }
+
+        float targetTopSpeed = this.WalkSpeed;
+        if (this.IsCrouching) {
+            targetTopSpeed = this.CrouchSpeed;
+        } else if (input.SprintHeld) {
+            targetTopSpeed = this.SprintSpeed;
+        }
+        float wishSpeed = targetTopSpeed * wishMag;
+
+        if (this.IsGrounded) {
+            this.ApplyGroundFriction(dt);
+            this.AccelerateHorizontal(wishDir, wishSpeed, this.GroundAcceleration, dt);
+        } else {
+            this.AccelerateHorizontal(wishDir, wishSpeed, this.AirAcceleration, dt);
+        }
+
+        bool canCoyoteJump = this.IsGrounded || (this.timeSinceGrounded <= this.CoyoteTimeWindow);
+        if (this.jumpBufferTimer > 0.0f && canCoyoteJump) {
+            if (!this.IsCrouching || this.CanStandUpDynamic(world, layerMask)) {
+                float jumpVy = this.JumpSpeed + Math.Max(0.0f, platformCarryVel.Y);
+                this.Velocity = new Vector3(
+                    this.Velocity.X + platformCarryVel.X,
+                    jumpVy,
+                    this.Velocity.Z + platformCarryVel.Z);
+                this.IsGrounded = false;
+                this.GroundInstanceId = -1;
+                this.timeSinceGrounded = this.CoyoteTimeWindow + 1.0f;
+                this.jumpBufferTimer = 0.0f;
+            }
+        }
+
+        if (!this.IsGrounded) {
+            this.Velocity = new Vector3(this.Velocity.X, this.Velocity.Y - this.Gravity * dt, this.Velocity.Z);
+        }
+        this.MoveDynamic(world, layerMask, dt);
+
+        float targetEye = this.CurrentHeight * 0.90f;
+        float eyeDiff = targetEye - this.CurrentEyeHeight;
+        if (Math.Abs(eyeDiff) > 1e-5f) {
+            float x = 16.0f * dt;
+            float invExp = 1.0f / (1.0f + x + 0.5f * x * x + 0.16666667f * x * x * x);
+            this.CurrentEyeHeight = this.CurrentEyeHeight + eyeDiff * (1.0f - invExp);
+        } else {
+            this.CurrentEyeHeight = targetEye;
+        }
+    }
+
+    // 双层动态世界连续移动解算（支持移动电梯向上顶起静止角色、跨实例多平面滑行与登阶）。
+    public void MoveDynamic(DynamicSceneTlas3D world, int layerMask, float dt) {
+        if (dt <= 0.0f) { return; }
+        if (world == null) {
+            this.Position = Vector3.Add(this.Position, Vector3.Multiply(this.Velocity, dt));
+            this.IsGrounded = false;
+            this.GroundInstanceId = -1;
+            return;
+        }
+
+        world.EnsureReady();
+        int curEpoch = world.DynamicEpoch();
+        bool posChangedExternally = Vector3.DistanceSquared(this.Position, this.lastResolvedPos) > 1e-10f;
+        bool grewTaller = this.CurrentHeight > this.lastResolvedHeight + 1e-4f;
+        bool worldChanged = curEpoch != this.lastDynamicEpoch;
+
+        if (this.needsDepenetration || posChangedExternally || grewTaller || worldChanged) {
+            Vector3 seg0;
+            Vector3 seg1;
+            this.GetCapsuleSegmentAt(this.Position, this.CurrentHeight, out seg0, out seg1);
+            Vector3 pushOut;
+            if (world.OverlapCapsuleDepenetrate(seg0, seg1, this.Radius - this.SkinWidth * 0.25f, layerMask, out pushOut)) {
+                this.Position = Vector3.Add(this.Position, pushOut);
+            }
+            this.needsDepenetration = false;
+            this.lastDynamicEpoch = curEpoch;
+        }
+
+        bool wasGrounded = this.IsGrounded;
+        if (wasGrounded && !posChangedExternally && !worldChanged && this.Velocity.LengthSquared() <= 1e-12f) {
+            this.lastResolvedPos = this.Position;
+            this.lastResolvedHeight = this.CurrentHeight;
+            return;
+        }
+
+        Vector3 moveVel = this.Velocity;
+        if (wasGrounded && moveVel.Y <= 0.0f && this.GroundNormal.Y >= this.MinWalkableNormalY && this.GroundNormal.Y < 0.9995f) {
+            float horizSq = moveVel.X * moveVel.X + moveVel.Z * moveVel.Z;
+            if (horizSq > 1e-10f) {
+                Vector3 clippedSlope = KinematicCapsuleController3D.ClipVelocity(moveVel, this.GroundNormal, 1.0f);
+                float cLenSq = clippedSlope.LengthSquared();
+                if (cLenSq > 1e-10f) {
+                    moveVel = Vector3.Multiply(clippedSlope, MathF.Sqrt(horizSq / cLenSq));
+                }
+            }
+        }
+
+        Vector3 slidePos;
+        Vector3 slideVel;
+        bool hitHorizontalObstacle;
+        this.SlideMoveDynamic(world, layerMask, this.Position, moveVel, dt, wasGrounded, out slidePos, out slideVel, out hitHorizontalObstacle);
+
+        Vector3 chosenPos = slidePos;
+        Vector3 chosenVel = slideVel;
+
+        float horizIntentSq = this.Velocity.X * this.Velocity.X + this.Velocity.Z * this.Velocity.Z;
+        if (hitHorizontalObstacle && this.MaxStepHeight > 0.01f && horizIntentSq > 1e-4f && (wasGrounded || this.Velocity.Y <= 1.0f)) {
+            Vector3 stepPos;
+            Vector3 stepVel;
+            if (this.TryStepMoveDynamic(world, layerMask, this.Position, new Vector3(this.Velocity.X, 0.0f, this.Velocity.Z), dt, out stepPos, out stepVel)) {
+                float slideDistSq = KinematicCapsuleController3D.HorizontalDistanceSq(this.Position, slidePos);
+                float stepDistSq = KinematicCapsuleController3D.HorizontalDistanceSq(this.Position, stepPos);
+                if (stepDistSq > slideDistSq + 0.0001f) {
+                    chosenPos = stepPos;
+                    chosenVel = new Vector3(stepVel.X, 0.0f, stepVel.Z);
+                }
+            }
+        }
+
+        this.Position = chosenPos;
+        this.Velocity = chosenVel;
+
+        this.UpdateGroundStateAndSnapDynamic(world, layerMask, wasGrounded);
+
+        this.lastResolvedPos = this.Position;
+        this.lastResolvedHeight = this.CurrentHeight;
+    }
+
+    private bool IsSceneHitWalkable(SceneSweepHit3D hit) {
+        if (hit.Normal.Y >= this.MinWalkableNormalY) { return true; }
+        if (hit.SurfaceNormal.Y >= this.MinWalkableNormalY && hit.Normal.Y > 0.15f) { return true; }
+        return false;
+    }
+
+    private bool TryStepMoveDynamic(DynamicSceneTlas3D world, int layerMask, Vector3 startPos, Vector3 horizVel, float dt,
+                                    out Vector3 outPos, out Vector3 outVel) {
+        outPos = startPos;
+        outVel = horizVel;
+
+        Vector3 p0;
+        Vector3 p1;
+        this.GetCapsuleSegmentAt(startPos, this.CurrentHeight, out p0, out p1);
+        SceneSweepHit3D upHit;
+        float upDist = this.MaxStepHeight;
+        if (world.SweepCapsule(p0, p1, this.Radius, new Vector3(0.0f, this.MaxStepHeight, 0.0f), layerMask, out upHit)) {
+            if (upHit.StartedPenetrating) { return false; }
+            upDist = upHit.Distance - this.SkinWidth;
+        }
+        if (upDist <= 0.02f) { return false; }
+
+        Vector3 raisedPos = new Vector3(startPos.X, startPos.Y + upDist, startPos.Z);
+        Vector3 fwdPos;
+        Vector3 fwdVel;
+        bool dummyBlocked;
+        this.SlideMoveDynamic(world, layerMask, raisedPos, horizVel, dt, true, out fwdPos, out fwdVel, out dummyBlocked);
+
+        if (KinematicCapsuleController3D.HorizontalDistanceSq(raisedPos, fwdPos) <= 1e-6f) {
+            return false;
+        }
+
+        this.GetCapsuleSegmentAt(fwdPos, this.CurrentHeight, out p0, out p1);
+        float maxDown = upDist + this.SkinWidth * 2.0f;
+        SceneSweepHit3D downHit;
+        if (!world.SweepCapsule(p0, p1, this.Radius, new Vector3(0.0f, -maxDown, 0.0f), layerMask, out downHit)) {
+            return false;
+        }
+        if (downHit.StartedPenetrating || !this.IsSceneHitWalkable(downHit)) {
+            return false;
+        }
+
+        float safeDrop = Math.Max(0.0f, downHit.Distance - this.SkinWidth);
+        Vector3 landedPos = new Vector3(fwdPos.X, fwdPos.Y - safeDrop, fwdPos.Z);
+        float netStepUp = landedPos.Y - startPos.Y;
+        if (netStepUp < -0.02f || netStepUp > this.MaxStepHeight + 0.01f) {
+            return false;
+        }
+
+        outPos = landedPos;
+        outVel = fwdVel;
+        return true;
+    }
+
+    private void SlideMoveDynamic(DynamicSceneTlas3D world, int layerMask, Vector3 startPos, Vector3 initialVel, float dt,
+                                  bool preventSteepClimb, out Vector3 endPos, out Vector3 endVel, out bool hitWallOrStep) {
+        Vector3 curPos = startPos;
+        Vector3 vel = initialVel;
+        Vector3 primalVel = initialVel;
+        hitWallOrStep = false;
+
+        float timeLeft = dt;
+        int numPlanes = 0;
+        Vector3[] planes = this.clipPlanes;
+
+        for (int bump = 0; bump < 4; bump = bump + 1) {
+            Vector3 delta = Vector3.Multiply(vel, timeLeft);
+            float moveLenSq = delta.LengthSquared();
+            if (moveLenSq <= 1e-12f) { break; }
+            float moveLen = MathF.Sqrt(moveLenSq);
+
+            Vector3 p0;
+            Vector3 p1;
+            this.GetCapsuleSegmentAt(curPos, this.CurrentHeight, out p0, out p1);
+
+            SceneSweepHit3D hit;
+            if (!world.SweepCapsule(p0, p1, this.Radius, delta, layerMask, out hit)) {
+                curPos = Vector3.Add(curPos, delta);
+                break;
+            }
+
+            if (hit.Distance > this.SkinWidth) {
+                float safeFrac = (hit.Distance - this.SkinWidth) / moveLen;
+                curPos = new Vector3(
+                    curPos.X + delta.X * safeFrac,
+                    curPos.Y + delta.Y * safeFrac,
+                    curPos.Z + delta.Z * safeFrac);
+                timeLeft = timeLeft * (1.0f - safeFrac);
+            } else if (hit.StartedPenetrating) {
+                this.needsDepenetration = true;
+                curPos = Vector3.Add(curPos, Vector3.Multiply(hit.Normal, this.SkinWidth * 0.5f));
+            }
+
+            Vector3 planeNormal = hit.Normal;
+            if (planeNormal.Y < this.MinWalkableNormalY) {
+                hitWallOrStep = true;
+                if (preventSteepClimb && planeNormal.Y > -0.05f && vel.Y <= 0.5f) {
+                    float hx = planeNormal.X;
+                    float hz = planeNormal.Z;
+                    float hLenSq = hx * hx + hz * hz;
+                    if (hLenSq > 1e-10f) {
+                        float invH = 1.0f / MathF.Sqrt(hLenSq);
+                        planeNormal = new Vector3(hx * invH, 0.0f, hz * invH);
+                    }
+                }
+            }
+
+            if (hit.Normal.Y < -0.7f && vel.Y > 0.0f) {
+                vel = new Vector3(vel.X, 0.0f, vel.Z);
+            }
+
+            bool duplicate = false;
+            for (int i = 0; i < numPlanes; i = i + 1) {
+                if (Vector3.Dot(planeNormal, planes[i]) > 0.99f) {
+                    vel = Vector3.Add(vel, Vector3.Multiply(planeNormal, 0.01f));
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) { continue; }
+
+            if (numPlanes >= planes.Length) {
+                vel = Vector3.Zero;
+                break;
+            }
+            planes[numPlanes] = planeNormal;
+            numPlanes = numPlanes + 1;
+
+            bool resolved = false;
+            for (int i = 0; i < numPlanes; i = i + 1) {
+                if (Vector3.Dot(vel, planes[i]) >= 0.0f) { continue; }
+
+                Vector3 clipped = KinematicCapsuleController3D.ClipVelocity(vel, planes[i], 1.001f);
+                for (int j = 0; j < numPlanes; j = j + 1) {
+                    if (j == i) { continue; }
+                    if (Vector3.Dot(clipped, planes[j]) < 0.0f) {
+                        Vector3 crease = Vector3.Cross(planes[i], planes[j]);
+                        float cLenSq = crease.LengthSquared();
+                        if (cLenSq <= 1e-8f) {
+                            clipped = Vector3.Zero;
+                            break;
+                        }
+                        crease = Vector3.Multiply(crease, 1.0f / MathF.Sqrt(cLenSq));
+                        clipped = Vector3.Multiply(crease, Vector3.Dot(vel, crease));
+
+                        for (int k = 0; k < numPlanes; k = k + 1) {
+                            if (k == i || k == j) { continue; }
+                            if (Vector3.Dot(clipped, planes[k]) < 0.0f) {
+                                clipped = Vector3.Zero;
+                                break;
+                            }
+                        }
+                        break;
+                    }
+                }
+                vel = clipped;
+                resolved = true;
+                break;
+            }
+
+            if (!resolved) { continue; }
+
+            if (vel.X * primalVel.X + vel.Z * primalVel.Z < -1e-5f) {
+                vel = new Vector3(0.0f, vel.Y, 0.0f);
+            }
+        }
+
+        endPos = curPos;
+        endVel = vel;
+    }
+
+    private void UpdateGroundStateAndSnapDynamic(DynamicSceneTlas3D world, int layerMask, bool wasGrounded) {
+        if (this.Velocity.Y > 0.5f) {
+            this.IsGrounded = false;
+            this.GroundInstanceId = -1;
+            return;
+        }
+
+        float probeDist = (wasGrounded && this.GroundSnapDistance > this.SkinWidth * 4.0f)
+            ? this.GroundSnapDistance
+            : (this.SkinWidth * 4.0f + 0.02f);
+
+        Vector3 p0;
+        Vector3 p1;
+        this.GetCapsuleSegmentAt(this.Position, this.CurrentHeight, out p0, out p1);
+
+        SceneSweepHit3D groundHit;
+        if (world.SweepCapsule(p0, p1, this.Radius, new Vector3(0.0f, -probeDist, 0.0f), layerMask, out groundHit)) {
+            if (this.IsSceneHitWalkable(groundHit)) {
+                if (groundHit.StartedPenetrating) { this.needsDepenetration = true; }
+                float snapDrop = groundHit.Distance - this.SkinWidth;
+                if (snapDrop > 0.0f) {
+                    this.Position = new Vector3(this.Position.X, this.Position.Y - snapDrop, this.Position.Z);
+                }
+                this.IsGrounded = true;
+                this.GroundNormal = groundHit.Normal.Y >= this.MinWalkableNormalY ? groundHit.Normal : groundHit.SurfaceNormal;
+                this.GroundMaterialId = groundHit.MaterialId;
+                this.GroundInstanceId = groundHit.InstanceId;
+                if (this.Velocity.Y < 0.0f) {
+                    this.Velocity = new Vector3(this.Velocity.X, 0.0f, this.Velocity.Z);
+                }
+                return;
+            }
+        }
+
+        this.IsGrounded = false;
+        this.GroundInstanceId = -1;
         this.GroundNormal = new Vector3(0.0f, 1.0f, 0.0f);
     }
 

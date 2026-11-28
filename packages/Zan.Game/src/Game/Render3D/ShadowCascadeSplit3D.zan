@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Numerics;
 
 namespace Game.Render3D;
 
@@ -16,7 +17,28 @@ public class ShadowCascadeSlice3D {
     }
 }
 
-// 商业 3D 级联阴影实用分割器（PSSM Practical Split Scheme + 纹理像素防闪烁对齐）。
+// 旋转不变包络球纹素对齐后的单层级联正交阴影矩阵包（可直接提交 Renderer3D.ShadowLightVp 或多级联 CSM 通道）。
+public class ShadowCascadeMatrix3D {
+    public int CascadeIndex;
+    public float SplitNear;
+    public float SplitFar;
+    public float BoundingRadius;
+    public float WorldTexelSize;
+    public Vector3 SnappedSphereCenter;
+    public Mat4 LightView;
+    public Mat4 LightProj;
+    public Mat4 LightViewProj;
+
+    public ShadowCascadeMatrix3D() {
+        this.LightView = Mat4.Identity();
+        this.LightProj = Mat4.Identity();
+        this.LightViewProj = Mat4.Identity();
+    }
+}
+
+// 商业 3D 级联阴影实用分割与防闪烁矩阵合成器（PSSM Practical Split + Michal Valient 旋转不变最小包络球对齐）：
+// - 级联正交视体半径仅取决于 (near, far, fovY, aspect)，对摄像机任意俯仰/偏航/翻滚旋转 100% 几何不变
+// - 在世界固定光源正交基下将包络球心对齐到 WorldTexelSize 整数网格，彻底根除镜头转动与平移时的阴影边缘闪烁游走
 public class ShadowCascadeSplitter3D {
     public int CascadeCount;
     public float SplitLambda;
@@ -57,5 +79,111 @@ public class ShadowCascadeSplitter3D {
         if (worldTexelSize <= 0.000001f) { return coord; }
         double step = (double)worldTexelSize;
         return (float)(Math.Floor((double)coord / step) * step);
+    }
+
+    // 合成全套旋转不变 + 纹素网格对齐的级联阴影正交矩阵（兼容 OpenGL NDC [-1..1] 行主序 Mat4，可直接赋给 Renderer3D.ShadowLightVp）。
+    public List<ShadowCascadeMatrix3D> ComputeCascadeMatrices(
+        Vector3 cameraPosition, Vector3 cameraForward,
+        float fovYRadians, float aspect,
+        float nearPlane, float maxShadowDist,
+        Vector3 lightDirection, float casterPullbackMargin) {
+        List<ShadowCascadeMatrix3D> cascades = new List<ShadowCascadeMatrix3D>();
+        List<ShadowCascadeSlice3D> slices = this.ComputeSlices(nearPlane, maxShadowDist);
+
+        // 归一化相机视线方向与平行光传播方向
+        Vector3 camFwd = cameraForward.LengthSquared() > 1e-10f
+            ? Vector3.Normalize(cameraForward)
+            : new Vector3(0.0f, 0.0f, -1.0f);
+        Vector3 lDir = lightDirection.LengthSquared() > 1e-10f
+            ? Vector3.Normalize(lightDirection)
+            : new Vector3(0.0f, -1.0f, 0.0f);
+
+        // 构造仅依赖平行光方向的世界固定正交基（绝不随摄像机姿态变化）
+        Vector3 refUp = Math.Abs(lDir.Y) > 0.98f ? new Vector3(0.0f, 0.0f, 1.0f) : new Vector3(0.0f, 1.0f, 0.0f);
+        Mat4 originLightRot = Mat4.LookAt(0.0f, 0.0f, 0.0f, lDir.X, lDir.Y, lDir.Z, refUp.X, refUp.Y, refUp.Z);
+        Vector3 lRight = new Vector3(originLightRot.m[0], originLightRot.m[1], originLightRot.m[2]);
+        Vector3 lUp    = new Vector3(originLightRot.m[4], originLightRot.m[5], originLightRot.m[6]);
+        Vector3 lBack  = new Vector3(originLightRot.m[8], originLightRot.m[9], originLightRot.m[10]); // = -lDir
+
+        float safeFov = Math.Max(0.1f, Math.Min(2.8f, fovYRadians));
+        float safeAspect = Math.Max(0.1f, aspect);
+        float tanHalfY = (float)Math.Tan((double)(safeFov * 0.5f));
+        float tanHalfX = tanHalfY * safeAspect;
+        float tanSqSum = tanHalfX * tanHalfX + tanHalfY * tanHalfY;
+        float pullbackExtra = Math.Max(10.0f, casterPullbackMargin);
+        float resF = (float)this.ShadowMapResolution;
+
+        for (int i = 0; i < slices.Count; i = i + 1) {
+            ShadowCascadeSlice3D sl = slices[i];
+            float n = sl.NearPlane;
+            float f = sl.FarPlane;
+
+            // 解析求解对称视锥台切片 [n, f] 的最小外接球圆心轴向距离 dc 与半径 R（对摄像机旋转严格不变）
+            float dc = 0.5f * (n + f) * (1.0f + tanSqSum);
+            if (dc > f) { dc = f; }
+            float dn = dc - n;
+            float df = f - dc;
+            float rNearSq = dn * dn + n * n * tanSqSum;
+            float rFarSq  = df * df + f * f * tanSqSum;
+            float rawRadius = MathF.Sqrt(Math.Max(rNearSq, rFarSq));
+
+            // 1/16 米量化上取整锁死正交视体半径，防止浮点尾数微抖改变正交缩放比例
+            float radius = (float)(Math.Ceiling((double)rawRadius * 16.0) / 16.0);
+            if (radius < 0.5f) { radius = 0.5f; }
+            float texelSize = (2.0f * radius) / resF;
+
+            Vector3 sphereCenter = Vector3.Add(cameraPosition, Vector3.Multiply(camFwd, dc));
+
+            // 投影到光源正交平面并执行纹素网格吸附，深度轴做稳定步进防止深度微颤
+            float lx = ShadowCascadeSplitter3D.TexelSnap(Vector3.Dot(lRight, sphereCenter), texelSize);
+            float ly = ShadowCascadeSplitter3D.TexelSnap(Vector3.Dot(lUp, sphereCenter), texelSize);
+            float lz = ShadowCascadeSplitter3D.TexelSnap(Vector3.Dot(lBack, sphereCenter), texelSize);
+
+            Vector3 snappedWorldCenter = new Vector3(
+                lRight.X * lx + lUp.X * ly + lBack.X * lz,
+                lRight.Y * lx + lUp.Y * ly + lBack.Y * lz,
+                lRight.Z * lx + lUp.Z * ly + lBack.Z * lz);
+
+            float pullback = radius + pullbackExtra;
+            Vector3 lightEye = Vector3.Add(snappedWorldCenter, Vector3.Multiply(lBack, pullback));
+
+            Mat4 lightView = Mat4.Identity();
+            lightView.m[0] = lRight.X; lightView.m[1] = lRight.Y; lightView.m[2] = lRight.Z;
+            lightView.m[4] = lUp.X;    lightView.m[5] = lUp.Y;    lightView.m[6] = lUp.Z;
+            lightView.m[8] = lBack.X;  lightView.m[9] = lBack.Y;  lightView.m[10] = lBack.Z;
+            lightView.m[3]  = -Vector3.Dot(lRight, lightEye);
+            lightView.m[7]  = -Vector3.Dot(lUp, lightEye);
+            lightView.m[11] = -Vector3.Dot(lBack, lightEye);
+
+            Mat4 lightProj = ShadowCascadeSplitter3D.BuildOrthoGl(-radius, radius, -radius, radius, 0.0f, pullback + radius);
+
+            ShadowCascadeMatrix3D cm = new ShadowCascadeMatrix3D();
+            cm.CascadeIndex = i;
+            cm.SplitNear = n;
+            cm.SplitFar = f;
+            cm.BoundingRadius = radius;
+            cm.WorldTexelSize = texelSize;
+            cm.SnappedSphereCenter = snappedWorldCenter;
+            cm.LightView = lightView;
+            cm.LightProj = lightProj;
+            cm.LightViewProj = Mat4.Mul(lightProj, lightView);
+            cascades.Add(cm);
+        }
+        return cascades;
+    }
+
+    // 与 zan_game 原生阴影通道（NDC Z in [-1..1]）完全对齐的正交投影矩阵。
+    public static Mat4 BuildOrthoGl(float left, float right, float bottom, float top, float nearZ, float farZ) {
+        Mat4 r = Mat4.Identity();
+        float invW = 1.0f / (right - left);
+        float invH = 1.0f / (top - bottom);
+        float invD = 1.0f / (farZ - nearZ);
+        r.m[0] = 2.0f * invW;
+        r.m[5] = 2.0f * invH;
+        r.m[10] = -2.0f * invD;
+        r.m[3] = -(right + left) * invW;
+        r.m[7] = -(top + bottom) * invH;
+        r.m[11] = -(farZ + nearZ) * invD;
+        return r;
     }
 }
