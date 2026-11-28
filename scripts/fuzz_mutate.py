@@ -264,7 +264,7 @@ def _mut_tryei(lines, rng):
     lines[start : end + 1] = (
         [indent + "try {"]
         + inner
-        + [indent + '} catch (System.Exception e) { Console.WriteLine("caught:" + e.GetType().Name); }']
+        + [indent + '} catch (Exception e) { Console.WriteLine("caught:" + e.GetType().Name); }']
     )
     return lines
 
