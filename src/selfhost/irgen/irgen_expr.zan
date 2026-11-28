@@ -118,15 +118,32 @@ partial class Irgen {
             }
             fi0 = fi0 + 1;
         }
+        int hoistedMark = locName.Count;
         Node recvNode = e.a;
         if (hasUnoverridden && e.a.kind != AK.Ident()) {
-            string tmp = AddLocal(".with.recv", recv.ty);
+            string tname = ".with.recv." + locName.Count;
+            string tmp = AddLocal(tname, recv.ty);
             string rll = MapType(recv.ty);
-            EA(tmp, rll);
-            if (ArcManaged(recv.ty)) { EmitArcRetain(recv.op, recv.ty); }
+            bool owned = ArcManaged(recv.ty) || recv.ty.ival >= 1;
+            int wslot = curAsync ? AsyncPatternSlot(e) : -1;
+            if (wslot >= 0) {
+                MaterializeAsyncLoopLocal(tmp, rll, wslot);
+            } else {
+                EA(tmp, rll);
+                if (curAsync && eaActive && owned) {
+                    entryAllocas.Append("  store " + rll + " null, " + rll + "* " + tmp + "\n");
+                }
+            }
+            if (owned) {
+                if (!TransferTempOwner(recv)) { EmitArcRetain(recv.op, recv.ty); }
+            }
             L("  store " + rll + " " + recv.op + ", " + rll + "* " + tmp);
+            if (curAsync && owned) {
+                if (wslot >= 0) { ArmAsyncLocal(tmp, recv.ty, false); }
+                else if (eaActive) { ArmLocalSlot(tmp, recv.ty, false); }
+            }
             recvNode = new Node(AK.Ident());
-            recvNode.sval = ".with.recv";
+            recvNode.sval = tname;
             recvNode.type = recv.ty;
         }
         Node call = new Node(AK.Call());
@@ -156,7 +173,9 @@ partial class Irgen {
             }
             fi = fi + 1;
         }
-        return EmitInstanceCall(recv, cls.sval, "__CloneWith", call);
+        ExprVal res = EmitInstanceCall(recv, cls.sval, "__CloneWith", call);
+        DropHoistedLocals(hoistedMark);
+        return res;
     }
 
     // The receiver's static type in the method being emitted: the concrete

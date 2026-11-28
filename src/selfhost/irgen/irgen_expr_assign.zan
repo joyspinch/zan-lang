@@ -1358,13 +1358,20 @@ partial class Irgen {
 
     // deconstruction: var (a, b, ...) = tupleExpr;  unpacks each slot into a local.
     void GenDecon(Node s) {
+        bool arm = eaActive;
+        if (arm) { EnterCallArm(); }
         ExprVal rhs = GenExpr(s.b);
+        if (arm) { LeaveCallArm(); }
         List<Node> ekids = rhs.ty.kids;
         string p = NT();
         L("  " + p + " = bitcast i8* " + rhs.op + " to i64*");
         int i = 0;
         while (i < s.kids.Count) {
             Node tgt = s.kids[i];
+            if (tgt == null || tgt.sval == null || tgt.sval == "" || tgt.sval == "_") {
+                i = i + 1;
+                continue;
+            }
             Node srcTy = i < ekids.Count ? ekids[i] : null;
             Node ety = tgt.type;
             if (ety == null) {
@@ -1378,14 +1385,39 @@ partial class Irgen {
             ExprVal ev = FromSlot(raw, srcTy);
             ev = NarrowToDeclared(ev, ety);
             string lt = MapType(ety);
-            string reg = AddLocal(tgt.sval, ety);
-            EA(reg, lt);
             if (IsStructTy(ety)) {
                 ev = CopyStructValue(ev);
             } else if (ArcManaged(ety) || ety.ival >= 1) {
                 EmitArcRetain(ev.op, ety);
             }
-            L("  store " + lt + " " + Coerce(ev, lt) + ", " + lt + "* " + reg);
+            string sv = Coerce(ev, lt);
+            string reg = AddLocal(tgt.sval, ety);
+            int li = locName.Count - 1;
+            bool isBx = ShouldBox(tgt.sval);
+            int dslot = curAsync ? AsyncPatternSlot(tgt) : -1;
+            if (dslot >= 0) {
+                if (isBx) {
+                    MaterializeAsyncLoopLocal(reg, "i8*", dslot);
+                    locBox[li] = true;
+                    locCell[li] = "";
+                    string cell = OwnedCell(ety);
+                    string payload = NT();
+                    L("  " + payload + " = bitcast i8* " + cell + " to " + lt + "*");
+                    L("  store " + lt + " " + sv + ", " + lt + "* " + payload);
+                    L("  store i8* " + cell + ", i8** " + reg);
+                    ArmAsyncLocal(reg, ety, true);
+                } else {
+                    MaterializeAsyncLoopLocal(reg, lt, dslot);
+                    L("  store " + lt + " " + sv + ", " + lt + "* " + reg);
+                    ArmAsyncLocal(reg, ety, false);
+                }
+            } else if (isBx) {
+                string ptr = BoxLocal(li);
+                L("  store " + lt + " " + sv + ", " + lt + "* " + ptr);
+            } else {
+                EA(reg, lt);
+                L("  store " + lt + " " + sv + ", " + lt + "* " + reg);
+            }
             i = i + 1;
         }
     }

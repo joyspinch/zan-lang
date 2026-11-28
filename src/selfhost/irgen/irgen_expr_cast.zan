@@ -474,6 +474,7 @@ partial class Irgen {
     }
 
     ExprVal GenConditional(Node e) {
+        BranchTempScope condBts = EnterBranchTempScope();
         ExprVal c = GenExpr(e.a);
         string ci = NT();
         // type-aware like GenCond: a pointer condition (an un-awaited async
@@ -487,6 +488,7 @@ partial class Irgen {
         } else {
             L("  " + ci + " = icmp ne i64 " + c.op + ", 0");
         }
+        LeaveBranchTempScope(condBts);
         // Resolve promotion before either branch emits its value: decimal
         // arms carry the same 128-bit aggregate as ordinary decimal locals.
         Node mty = MergeArmTypes(ArmStaticTy(e.b), ArmStaticTy(e.c));
@@ -751,9 +753,39 @@ partial class Irgen {
         if (pty == null) { return; }
         string plt = MapType(pty);
         string reg = AddLocal(cse.sval, pty);
+        int li = locName.Count - 1;
+        bool isBx = ShouldBox(cse.sval);
         int pslot = curAsync ? AsyncPatternSlot(cse) : -1;
         if (pslot >= 0) {
+            if (isBx) {
+                MaterializeAsyncLoopLocal(reg, "i8*", pslot);
+                locBox[li] = true;
+                locCell[li] = "";
+                string cell = OwnedCell(pty);
+                string dst = NT();
+                L("  " + dst + " = bitcast i8* " + cell + " to " + plt + "*");
+                if (IsNullableValue(pty)) {
+                    StoreNullable(dst, subj, pty, false);
+                } else {
+                    string sv = Coerce(subj, plt);
+                    L("  store " + plt + " " + sv + ", " + plt + "* " + dst);
+                    EmitArcRetain(sv, pty);
+                }
+                L("  store i8* " + cell + ", i8** " + reg);
+                ArmAsyncLocal(reg, pty, true);
+                return;
+            }
             MaterializeAsyncLoopLocal(reg, plt, pslot);
+        } else if (isBx) {
+            string dst = BoxLocal(li);
+            if (IsNullableValue(pty)) {
+                StoreNullable(dst, subj, pty, false);
+                return;
+            }
+            string sv = Coerce(subj, plt);
+            L("  store " + plt + " " + sv + ", " + plt + "* " + dst);
+            EmitArcRetain(sv, pty);
+            return;
         } else {
             EA(reg, plt);
         }
