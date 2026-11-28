@@ -308,6 +308,17 @@ ZAN_GAME_API void zan_game_set_iridescence3d(int32_t enabled,
 ZAN_GAME_API void zan_game_set_post_night_vision3d(float strength, float gain,
     float noise_amount, float seed);
 
+/* GPU 3D 世界空间球面战术声呐脉冲波前（Sonar/Radar Echo Ring，零贴图零额外 Pass）：
+ * enabled != 0 时沿距 (origin_x,origin_y,origin_z) 半径 radius 处渲染高能扫描环及宽度 ring_width 的尾迹。 */
+ZAN_GAME_API void zan_game_set_sonar_pulse3d(int32_t enabled,
+    float origin_x, float origin_y, float origin_z,
+    float radius, float ring_width, float strength, float r, float g, float b);
+
+/* GPU 后处理 45° 半色调漫画网点滤镜（Ben-Day Halftone Print Dots，单 Pass 零额外 FBO）：
+ * strength [0..1] 控制混入强度，dot_scale [2..32] 控制像素网点间距，contrast [0.25..3] 控制网点对比度。 */
+ZAN_GAME_API void zan_game_set_post_halftone_comic3d(float strength,
+    float dot_scale, float contrast);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1,0 +1,233 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Windows;
+
+// 桌面伴侣健康饮水追踪器：每日目标 ml、饮水间隔提醒、勿扰抑制与达标连击统计。
+public class CompanionHydrationTracker {
+    public int DailyGoalMl;
+    public int ConsumedTodayMl;
+    public int ReminderIntervalMin;
+    public int MinutesSinceLastDrink;
+    public int GoalMetStreakDays;
+    public bool QuietMode;
+
+    public CompanionHydrationTracker(int dailyGoalMl, int reminderIntervalMin) {
+        this.DailyGoalMl = dailyGoalMl > 0 ? dailyGoalMl : 2000;
+        this.ConsumedTodayMl = 0;
+        this.ReminderIntervalMin = reminderIntervalMin > 5 ? reminderIntervalMin : 45;
+        this.MinutesSinceLastDrink = 0;
+        this.GoalMetStreakDays = 0;
+        this.QuietMode = false;
+    }
+
+    public void LogDrink(int ml) {
+        if (ml <= 0) { return; }
+        this.ConsumedTodayMl = this.ConsumedTodayMl + ml;
+        this.MinutesSinceLastDrink = 0;
+    }
+
+    public bool AdvanceMinutes(int minutes) {
+        if (minutes > 0) {
+            this.MinutesSinceLastDrink = this.MinutesSinceLastDrink + minutes;
+        }
+        if (this.QuietMode || this.ConsumedTodayMl >= this.DailyGoalMl) {
+            return false;
+        }
+        return this.MinutesSinceLastDrink >= this.ReminderIntervalMin;
+    }
+
+    public double ProgressRatio() {
+        if (this.DailyGoalMl <= 0) { return 1.0; }
+        double r = (double)this.ConsumedTodayMl / (double)this.DailyGoalMl;
+        return r > 1.0 ? 1.0 : r;
+    }
+
+    public void EndOfDayReset() {
+        if (this.ConsumedTodayMl >= this.DailyGoalMl) {
+            this.GoalMetStreakDays = this.GoalMetStreakDays + 1;
+        } else {
+            this.GoalMetStreakDays = 0;
+        }
+        this.ConsumedTodayMl = 0;
+        this.MinutesSinceLastDrink = 0;
+    }
+}
+
+// 20-20-20 护眼休息状态。
+public enum EyeRestPhase {
+    Working = 0,
+    BreakDue = 1,
+    Resting = 2
+}
+
+// 商业桌面 20-20-20 护眼计时器：工作 20 分钟提醒远眺 20 秒、AFK 空闲自动暂停累计、支持有限次延后（Snooze）。
+public class CompanionEyeRest202020 {
+    public EyeRestPhase Phase;
+    public int WorkIntervalSec;
+    public int BreakDurationSec;
+    public int ElapsedWorkSec;
+    public int RemainingBreakSec;
+    public int MaxSnoozes;
+    public int SnoozesUsed;
+    public int CompletedBreaksToday;
+
+    public CompanionEyeRest202020(int workIntervalSec, int breakDurationSec, int maxSnoozes) {
+        this.Phase = EyeRestPhase.Working;
+        this.WorkIntervalSec = workIntervalSec > 10 ? workIntervalSec : 1200;
+        this.BreakDurationSec = breakDurationSec > 5 ? breakDurationSec : 20;
+        this.ElapsedWorkSec = 0;
+        this.RemainingBreakSec = 0;
+        this.MaxSnoozes = maxSnoozes >= 0 ? maxSnoozes : 2;
+        this.SnoozesUsed = 0;
+        this.CompletedBreaksToday = 0;
+    }
+
+    public EyeRestPhase Tick(int dtSec, bool userActive) {
+        if (dtSec <= 0) { return this.Phase; }
+        if (this.Phase == EyeRestPhase.Working) {
+            if (!userActive) { return this.Phase; } // AFK 时不累计用眼疲劳
+            this.ElapsedWorkSec = this.ElapsedWorkSec + dtSec;
+            if (this.ElapsedWorkSec >= this.WorkIntervalSec) {
+                this.Phase = EyeRestPhase.BreakDue;
+            }
+        } else if (this.Phase == EyeRestPhase.Resting) {
+            this.RemainingBreakSec = this.RemainingBreakSec - dtSec;
+            if (this.RemainingBreakSec <= 0) {
+                this.RemainingBreakSec = 0;
+                this.ElapsedWorkSec = 0;
+                this.SnoozesUsed = 0;
+                this.CompletedBreaksToday = this.CompletedBreaksToday + 1;
+                this.Phase = EyeRestPhase.Working;
+            }
+        }
+        return this.Phase;
+    }
+
+    public bool StartBreak() {
+        if (this.Phase != EyeRestPhase.BreakDue) { return false; }
+        this.Phase = EyeRestPhase.Resting;
+        this.RemainingBreakSec = this.BreakDurationSec;
+        return true;
+    }
+
+    public bool Snooze(int extendSec) {
+        if (this.Phase != EyeRestPhase.BreakDue) { return false; }
+        if (this.SnoozesUsed >= this.MaxSnoozes) { return false; }
+        this.SnoozesUsed = this.SnoozesUsed + 1;
+        int back = extendSec > 0 ? extendSec : 300;
+        this.ElapsedWorkSec = this.WorkIntervalSec - back;
+        if (this.ElapsedWorkSec < 0) { this.ElapsedWorkSec = 0; }
+        this.Phase = EyeRestPhase.Working;
+        return true;
+    }
+}
+
+// 放置手作/泡茶工作台配方定义。
+public class CraftRecipeSpec {
+    public string RecipeId;
+    public string IngredientId;
+    public int IngredientCost;
+    public string OutputItemId;
+    public int DurationSec;
+
+    public CraftRecipeSpec(string recipeId, string ingredientId, int ingredientCost,
+                           string outputItemId, int durationSec) {
+        this.RecipeId = recipeId;
+        this.IngredientId = ingredientId;
+        this.IngredientCost = ingredientCost > 0 ? ingredientCost : 1;
+        this.OutputItemId = outputItemId;
+        this.DurationSec = durationSec > 0 ? durationSec : 60;
+    }
+}
+
+internal class CraftStockEntry {
+    public string ItemId;
+    public int Count;
+
+    public CraftStockEntry(string itemId, int count) {
+        this.ItemId = itemId;
+        this.Count = count;
+    }
+}
+
+// 桌面伴侣放置手作/泡茶工作台：原料库存账本、单槽定时制作、完成自动可领取与成品入库统计。
+public class CompanionIdleCraftBench {
+    private List<CraftRecipeSpec> recipes;
+    private List<CraftStockEntry> stock;
+    public string ActiveRecipeId;
+    public string ActiveOutputId;
+    public int RemainingSec;
+    public bool ReadyToCollect;
+
+    public CompanionIdleCraftBench() {
+        this.recipes = new List<CraftRecipeSpec>();
+        this.stock = new List<CraftStockEntry>();
+        this.ActiveRecipeId = "";
+        this.ActiveOutputId = "";
+        this.RemainingSec = 0;
+        this.ReadyToCollect = false;
+    }
+
+    public void RegisterRecipe(string recipeId, string ingredientId, int cost, string outputId, int durationSec) {
+        this.recipes.Add(new CraftRecipeSpec(recipeId, ingredientId, cost, outputId, durationSec));
+    }
+
+    public void AddStock(string itemId, int delta) {
+        if (delta <= 0) { return; }
+        for (int i = 0; i < this.stock.Count; i = i + 1) {
+            if (this.stock[i].ItemId == itemId) {
+                this.stock[i].Count = this.stock[i].Count + delta;
+                return;
+            }
+        }
+        this.stock.Add(new CraftStockEntry(itemId, delta));
+    }
+
+    public int GetStock(string itemId) {
+        for (int i = 0; i < this.stock.Count; i = i + 1) {
+            if (this.stock[i].ItemId == itemId) { return this.stock[i].Count; }
+        }
+        return 0;
+    }
+
+    public bool StartCraft(string recipeId) {
+        if (this.ActiveRecipeId != "" || this.ReadyToCollect) { return false; }
+        CraftRecipeSpec spec = null;
+        for (int i = 0; i < this.recipes.Count; i = i + 1) {
+            if (this.recipes[i].RecipeId == recipeId) { spec = this.recipes[i]; break; }
+        }
+        if (spec == null) { return false; }
+        for (int i = 0; i < this.stock.Count; i = i + 1) {
+            if (this.stock[i].ItemId == spec.IngredientId && this.stock[i].Count >= spec.IngredientCost) {
+                this.stock[i].Count = this.stock[i].Count - spec.IngredientCost;
+                this.ActiveRecipeId = spec.RecipeId;
+                this.ActiveOutputId = spec.OutputItemId;
+                this.RemainingSec = spec.DurationSec;
+                this.ReadyToCollect = false;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public void AdvanceSec(int dtSec) {
+        if (dtSec <= 0 || this.ActiveRecipeId == "" || this.ReadyToCollect) { return; }
+        this.RemainingSec = this.RemainingSec - dtSec;
+        if (this.RemainingSec <= 0) {
+            this.RemainingSec = 0;
+            this.ReadyToCollect = true;
+        }
+    }
+
+    public string Collect() {
+        if (!this.ReadyToCollect || this.ActiveOutputId == "") { return ""; }
+        string outItem = this.ActiveOutputId;
+        this.AddStock(outItem, 1);
+        this.ActiveRecipeId = "";
+        this.ActiveOutputId = "";
+        this.RemainingSec = 0;
+        this.ReadyToCollect = false;
+        return outItem;
+    }
+}

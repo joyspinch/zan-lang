@@ -155,6 +155,7 @@ typedef struct {
     zgl_int u_ice_frost_params, u_ice_frost_color;
     zgl_int u_lava_crust_params, u_lava_crust_color;
     zgl_int u_iridescence_params;
+    zgl_int u_sonar_origin_radius, u_sonar_style, u_sonar_color;
     zgl_int u_light_dir, u_light_color, u_light_count, u_ambient;
     zgl_int u_cam_pos, u_cam_valid, u_material, u_emissive;
     zgl_int u_point_pos, u_point_color, u_point_count;
@@ -244,6 +245,9 @@ static float g_game_ice_frost_color[3] = { 0.65f, 0.92f, 1.0f };
 static float g_game_lava_crust_params[4] = { 0.0f, 1.5f, 0.0f, 0.18f }; /* enabled, scale, phase, crack_width */
 static float g_game_lava_crust_color[4] = { 1.0f, 0.35f, 0.04f, 0.0f }; /* r, g, b, strength */
 static float g_game_iridescence_params[4] = { 0.0f, 2.0f, 0.0f, 0.0f }; /* enabled, film_thickness, phase_shift, strength */
+static float g_game_sonar_origin_radius[4] = { 0.0f, 0.0f, 0.0f, 1.0f }; /* ox, oy, oz, radius */
+static float g_game_sonar_style[3] = { 0.0f, 0.6f, 0.0f }; /* enabled, ring_width, strength */
+static float g_game_sonar_color[3] = { 0.1f, 0.9f, 1.0f };
 static float g_game_color_grade[2] = { 1.0f, 1.0f }; /* saturation, contrast */
 static float g_game_color_tint[3] = { 1.0f, 1.0f, 1.0f };
 static float g_game_post_lens[2] = { 0.0f, 0.0f }; /* fxaa, chromatic */
@@ -260,6 +264,7 @@ static float g_game_post_thermal[3] = { 0.0f, 1.0f, 0.0f }; /* strength, sensiti
 static float g_game_post_flash_params[2] = { 0.0f, 0.0f }; /* edge_strength, flash_strength */
 static float g_game_post_flash_color[3] = { 1.0f, 0.05f, 0.05f };
 static float g_game_post_night_vision[4] = { 0.0f, 3.0f, 0.06f, 0.0f }; /* strength, gain, noise_amount, seed */
+static float g_game_post_halftone[3] = { 0.0f, 6.0f, 1.0f }; /* strength, dot_scale, contrast */
 static uint32_t g_game_light_version = 1;
 
 static zan_game_mesh *g_game_meshes = NULL;
@@ -565,6 +570,9 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
 "uniform vec4 uLavaCrustParams;\n" \
 "uniform vec4 uLavaCrustColor;\n" \
 "uniform vec4 uIridescenceParams;\n" \
+"uniform vec4 uSonarOriginRadius;\n" \
+"uniform vec3 uSonarStyle;\n" \
+"uniform vec3 uSonarColor;\n" \
 "uniform vec3 uCamPos;\n" \
 "uniform int uCamValid;\n" \
 "uniform vec2 uMaterial;\n" \
@@ -797,6 +805,16 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
     "        float irFres = 0.25 + 0.75 * pow(1.0 - irNdv, 1.5);\n" \
     "        rgb += irCol * (irFres * clamp(uIridescenceParams.w, 0.0, 2.0));\n" \
     "    }\n" \
+    "    if (uSonarStyle.x > 0.5 && uSonarStyle.z > 0.0005) {\n" \
+    "        float sDist = length(v_world_pos - uSonarOriginRadius.xyz);\n" \
+    "        float sRad = max(uSonarOriginRadius.w, 0.05);\n" \
+    "        float sW = max(uSonarStyle.y, 0.05);\n" \
+    "        float sBehind = sRad - sDist;\n" \
+    "        float sWave = (sBehind >= 0.0 && sBehind <= sW) ? pow(1.0 - (sBehind / sW), 1.6) : 0.0;\n" \
+    "        float sLead = smoothstep(sW * 0.25, 0.0, abs(sDist - sRad));\n" \
+    "        float sInt = clamp(sWave + sLead * 0.55, 0.0, 1.5);\n" \
+    "        rgb += uSonarColor * (sInt * clamp(uSonarStyle.z, 0.0, 3.0));\n" \
+    "    }\n" \
     "    if (uCamValid != 0) {\n" \
     "        float ndv = clamp(dot(N, V), 0.0, 1.0);\n" \
     "        if (uHemiOn != 0) {\n" \
@@ -939,6 +957,7 @@ static const char *const ZAN_GAME_POST_FS =
 "uniform vec2 uPostFlashParams;\n"
 "uniform vec3 uPostFlashColor;\n"
 "uniform vec4 uPostNightVision;\n"
+"uniform vec3 uPostHalftone;\n"
 "in vec2 v_uv;\n"
 "out vec4 frag;\n"
 "vec3 brightPass(vec3 c, float th) {\n"
@@ -1091,6 +1110,18 @@ static const char *const ZAN_GAME_POST_FS =
     "        float nvMask = smoothstep(0.96, 0.76, nvRad);\n"
     "        col = mix(col, nvPhos * nvMask, clamp(uPostNightVision.x, 0.0, 1.0));\n"
     "    }\n"
+    "    if (uPostHalftone.x > 0.0005) {\n"
+    "        vec2 htPx = uv / max(uTexelSize, vec2(0.0001));\n"
+    "        vec2 htRot = vec2(htPx.x + htPx.y, htPx.y - htPx.x) * 0.70710678;\n"
+    "        vec2 htCell = fract(htRot / max(uPostHalftone.y, 2.0)) - vec2(0.5);\n"
+    "        float htDist = length(htCell);\n"
+    "        float htLum = clamp(dot(col, vec3(0.299, 0.587, 0.114)), 0.0, 1.0);\n"
+    "        float htAdj = pow(htLum, clamp(uPostHalftone.z, 0.25, 3.0));\n"
+    "        float htDotRad = sqrt(clamp(1.0 - htAdj, 0.0, 1.0)) * 0.62;\n"
+    "        float htInk = smoothstep(htDotRad + 0.05, htDotRad - 0.05, htDist);\n"
+    "        vec3 htCol = mix(clamp(col * 1.15 + vec3(0.06), 0.0, 1.0), col * 0.08, htInk);\n"
+    "        col = mix(col, htCol, clamp(uPostHalftone.x, 0.0, 1.0));\n"
+    "    }\n"
     "    if (uVignette > 0.001) {\n"
     "        vec2 d = (v_uv - vec2(0.5)) * 2.0;\n"
     "        float vig = clamp(1.0 - uVignette * dot(d, d) * 0.5, 0.0, 1.0);\n"
@@ -1144,6 +1175,7 @@ typedef struct {
     zgl_int u_post_flash_params;
     zgl_int u_post_flash_color;
     zgl_int u_post_night_vision;
+    zgl_int u_post_halftone;
 } zan_game_post_program;
 
 static const char *const ZAN_GAME_SKYBOX_FS =
@@ -1413,6 +1445,12 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
         : g_game_gl->GetUniformLocation(program, "uLavaCrustColor");
     zgl_int iridescence_params = instanced ? -1
         : g_game_gl->GetUniformLocation(program, "uIridescenceParams");
+    zgl_int sonar_origin_radius = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uSonarOriginRadius");
+    zgl_int sonar_style = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uSonarStyle");
+    zgl_int sonar_color = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uSonarColor");
     zgl_int color = instanced ? 0
         : g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
@@ -1498,6 +1536,9 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
     prog->u_lava_crust_params = lava_crust_params;
     prog->u_lava_crust_color = lava_crust_color;
     prog->u_iridescence_params = iridescence_params;
+    prog->u_sonar_origin_radius = sonar_origin_radius;
+    prog->u_sonar_style = sonar_style;
+    prog->u_sonar_color = sonar_color;
     prog->u_color = color;
     prog->u_light_dir = light_dir;
     prog->u_light_color = light_color;
@@ -1580,6 +1621,9 @@ static zan_game_program *zan_game_skin_program_get(void) {
     zgl_int lava_crust_params = g_game_gl->GetUniformLocation(program, "uLavaCrustParams");
     zgl_int lava_crust_color = g_game_gl->GetUniformLocation(program, "uLavaCrustColor");
     zgl_int iridescence_params = g_game_gl->GetUniformLocation(program, "uIridescenceParams");
+    zgl_int sonar_origin_radius = g_game_gl->GetUniformLocation(program, "uSonarOriginRadius");
+    zgl_int sonar_style = g_game_gl->GetUniformLocation(program, "uSonarStyle");
+    zgl_int sonar_color = g_game_gl->GetUniformLocation(program, "uSonarColor");
     zgl_int color = g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
     zgl_int light_color = g_game_gl->GetUniformLocation(program, "uLightColor[0]");
@@ -1653,6 +1697,9 @@ static zan_game_program *zan_game_skin_program_get(void) {
     g_game_skin_prog.u_lava_crust_params = lava_crust_params;
     g_game_skin_prog.u_lava_crust_color = lava_crust_color;
     g_game_skin_prog.u_iridescence_params = iridescence_params;
+    g_game_skin_prog.u_sonar_origin_radius = sonar_origin_radius;
+    g_game_skin_prog.u_sonar_style = sonar_style;
+    g_game_skin_prog.u_sonar_color = sonar_color;
     g_game_skin_prog.u_color = color;
     g_game_skin_prog.u_light_dir = light_dir;
     g_game_skin_prog.u_light_color = light_color;
@@ -2170,6 +2217,17 @@ static void zan_game_bind_shadow_uniforms(const zan_gl_api *gl, zan_game_program
         gl->Uniform4f(prog->u_iridescence_params,
             g_game_iridescence_params[0], g_game_iridescence_params[1],
             g_game_iridescence_params[2], g_game_iridescence_params[3]);
+    }
+    if (prog->u_sonar_origin_radius >= 0) {
+        gl->Uniform4f(prog->u_sonar_origin_radius,
+            g_game_sonar_origin_radius[0], g_game_sonar_origin_radius[1],
+            g_game_sonar_origin_radius[2], g_game_sonar_origin_radius[3]);
+    }
+    if (prog->u_sonar_style >= 0) {
+        gl->Uniform3fv(prog->u_sonar_style, 1, g_game_sonar_style);
+    }
+    if (prog->u_sonar_color >= 0) {
+        gl->Uniform3fv(prog->u_sonar_color, 1, g_game_sonar_color);
     }
 }
 
@@ -2754,6 +2812,7 @@ static zan_game_post_program *zan_game_post_program_get(void) {
     g_game_post_prog.u_post_flash_params = g_game_gl->GetUniformLocation(prog, "uPostFlashParams");
     g_game_post_prog.u_post_flash_color = g_game_gl->GetUniformLocation(prog, "uPostFlashColor");
     g_game_post_prog.u_post_night_vision = g_game_gl->GetUniformLocation(prog, "uPostNightVision");
+    g_game_post_prog.u_post_halftone = g_game_gl->GetUniformLocation(prog, "uPostHalftone");
     return &g_game_post_prog;
 }
 
@@ -2905,6 +2964,9 @@ ZAN_GAME_API int32_t zan_game_postprocess3d(int32_t surface_id, float exposure,
         gl->Uniform4f(prog->u_post_night_vision,
             g_game_post_night_vision[0], g_game_post_night_vision[1],
             g_game_post_night_vision[2], g_game_post_night_vision[3]);
+    }
+    if (prog->u_post_halftone >= 0) {
+        gl->Uniform3fv(prog->u_post_halftone, 1, g_game_post_halftone);
     }
     gl->BindVertexArray(g_game_post_vao);
     gl->DrawArrays(ZGL_TRIANGLES, 0, 3);
@@ -3413,4 +3475,34 @@ ZAN_GAME_API void zan_game_set_post_night_vision3d(float strength, float gain,
     g_game_post_night_vision[1] = gain;
     g_game_post_night_vision[2] = noise_amount;
     g_game_post_night_vision[3] = seed;
+}
+
+ZAN_GAME_API void zan_game_set_sonar_pulse3d(int32_t enabled,
+    float origin_x, float origin_y, float origin_z,
+    float radius, float ring_width, float strength, float r, float g, float b) {
+    g_game_sonar_origin_radius[0] = origin_x;
+    g_game_sonar_origin_radius[1] = origin_y;
+    g_game_sonar_origin_radius[2] = origin_z;
+    g_game_sonar_origin_radius[3] = radius > 0.05f ? radius : 0.05f;
+    g_game_sonar_style[0] = enabled ? 1.0f : 0.0f;
+    g_game_sonar_style[1] = ring_width > 0.05f ? ring_width : 0.05f;
+    if (strength < 0.0f) strength = 0.0f;
+    if (strength > 3.0f) strength = 3.0f;
+    g_game_sonar_style[2] = strength;
+    g_game_sonar_color[0] = r > 0.0f ? r : 0.0f;
+    g_game_sonar_color[1] = g > 0.0f ? g : 0.0f;
+    g_game_sonar_color[2] = b > 0.0f ? b : 0.0f;
+}
+
+ZAN_GAME_API void zan_game_set_post_halftone_comic3d(float strength,
+    float dot_scale, float contrast) {
+    if (strength < 0.0f) strength = 0.0f;
+    if (strength > 1.0f) strength = 1.0f;
+    if (dot_scale < 2.0f) dot_scale = 2.0f;
+    if (dot_scale > 32.0f) dot_scale = 32.0f;
+    if (contrast < 0.25f) contrast = 0.25f;
+    if (contrast > 3.0f) contrast = 3.0f;
+    g_game_post_halftone[0] = strength;
+    g_game_post_halftone[1] = dot_scale;
+    g_game_post_halftone[2] = contrast;
 }
