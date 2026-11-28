@@ -112,7 +112,10 @@ int finalScore = score ?? 0;        // 空合并运算符
 
 ### 3.4 泛型 (Generics)
 - **类型参数约束**：`where T : struct`（值类型）、`where T : BaseClass`（基类约束）、`where T : IInterface`（接口约束）。
-- **实现模型**：值类型单态化展开（Monomorphization，生成零成本独立专用代码），引用类型采用类型擦除配合虚表分发。
+- **`[rule:SPEC-GEN-01]` 单态化与 `$__Canon` 双路径**：值类型（`int`/`double`/`bool`/`struct`/`enum`/`Nullable<T>`）、`string`、`Task<T>`/`ValueTask<T>`、`Binding<T>` 与重载了 `==`/`!=` 的类按具体类型实参单态化展开；普通引用类（无 `==`/`!=` 重载）、`object` 与接口在方法体不含无约束鸭子类型访问时共享 `$__Canon` 代码，并携带每实例化独立的 `__gctx` 运行期字典。*(锚定用例：`tests/conformance/generic_dual_path_matrix.zan`、`tests/conformance/generic_canon_gctx.zan`)*
+- **`[rule:SPEC-GEN-02]` 具体类型身份与反射等价**：两条路径均保持精确类型身份，`typeof(T)`、`is T`、`as T`、`(T)x` 与 `TypeInfo` 反射（`Name`/`FieldCount`）在 `$__Canon` 下经 `__gctx` 解析为真实类型实参，不退化为擦除占位符。*(锚定用例：`tests/conformance/generic_dual_path_matrix.zan`、`tests/conformance/generic_canon_gctx.zan`)*
+- **`[rule:SPEC-GEN-03]` 静态字段隔离与默认零值**：泛型静态字段（如 `Box<T>.Counter`）按具体实例化隔离存储（`Box<Alpha>.Counter` 与 `Box<Beta>.Counter` 互不别名）；未初始化的 `T` 字段与 `T[]` 元素自动零初始化（值类型为 `0`/`false`/零结构体，引用类型为 `null`；Zan 不提供 `default(T)` 表达式语法）。*(锚定用例：`tests/conformance/generic_dual_path_matrix.zan`、`tests/conformance/generic_statics.zan`)*
+- **`[rule:SPEC-GEN-04]` 约束与虚分发**：实例化期校验 `struct`/基类/接口约束；虚方法体依赖 `T` 时按实例化生成专属虚表分发。*(锚定用例：`tests/conformance/generic_constraints.zan`、`tests/conformance/generic_virtual_dispatch.zan`)*
 
 ---
 
@@ -173,6 +176,15 @@ Zan 采用与 Swift 类似的确定性 **自动引用计数 (ARC)** 机制，不
    **事件订阅绑定订阅者生命周期**：`+=` 的目标以 `this` 为根（`Click`、`this.saveBtn.Click`、实例字段 `saveBtn.Click`、`items[i].Changed`）且右侧 lambda 用到 `this` 时，lambda **弱捕获** `this`——宿主→发布者→处理器→宿主的环不会形成，订阅者释放后处理器自动失效，写法不变、无需退订。目标是形参、局部量或静态成员时保持 C# 的强捕获（只靠事件存活的订阅者照常收到事件）；带返回类型的处理器、结构体方法里的 lambda、方法组订阅不受影响。
 3. **确定性作用域释放**：配合 `using` 语句或局部变量离开作用域，保证系统资源即时回收。
 
+#### 6.1 形式化 ARC 所有权与运行期语义 (S30)
+- **`[rule:SPEC-ARC-01]` 参数所有权（借用与被调方持有）**：实参按借用传入，被调方将 ARC 托管值参 `retain` 入局部槽并在离开作用域时 `release`（只读不逃逸借用参数可消除）；`ref`/`out` 参数直接别名调用方存储，不额外增减计数。*(锚定用例：`tests/conformance/arc_local_alias_borrow.zan`、`tests/conformance/arc_lookup_owned_arg.zan`)*
+- **`[rule:SPEC-ARC-02]` 返回值与临时量所有权**：返回 ARC 托管对象的函数向调用方移交 `+1` 持有引用；丢弃的返回值与表达式临时量在所属语句边界确定性释放。*(锚定用例：`tests/conformance/arc_chained_temp.zan`)*
+- **`[rule:SPEC-ARC-03]` 闭包捕获所有权**：lambda 强捕获引用对象并将可变捕获局部变量装箱为 ARC 堆单元；目标以 `this` 为根的 `+=` 事件订阅弱捕获 `this`（S12），避免订阅成环。*(锚定用例：`tests/conformance/event_weak_this.zan`)*
+- **`[rule:SPEC-ARC-04]` 引用计数原子性与不朽哨兵**：`retain` 先以原子 `monotonic` 读判定 `ZAN_RC_IMMORTAL` 哨兵（静态字面量跳过计数写），再执行 `atomicrmw add monotonic`；`release` 执行 `atomicrmw sub release`，计数 `1 -> 0` 时插入 `acquire` 栅栏再析构（非调试守卫且全局弱引用表为空时，`rc == 1` 走独占快路径直接析构）。*(锚定用例：`tests/conformance/arc_immortal_object_slot.zan`)*
+- **`[rule:SPEC-ARC-05]` `weak` 置空时机、释放顺序与禁用析构器**：`rc == 0` 经 `acquire` 栅栏后，先由 `zan_rt_weak_destroy_begin` 原子置空所有指向该对象的弱引用（若并发弱读复活 `rc` 则中止销毁），**之后**再按字段声明顺序释放实例字段（`weak` 字段退注册、强字段递减）；线程局部延迟释放深度 `__zan_arc_rel_depth` 以迭代排水避免深层对象图栈溢出；编译期以 `E1016` 拒绝用户析构函数 `~X()`。*(锚定用例：`tests/conformance/weak_field_lifecycle.zan`、`tests/conformance/arc_deep_tree_drop.zan`、`tests/conformance/arc_deferred_stack.zan`、`tests/selfhost/reject/destructor_declaration.zan`)*
+- **`[rule:SPEC-ARC-06]` 异常展开与 `using` 确定性释放**：抛异常展开栈帧时，已武装的局部变量、临时量、`finally` 与 `using` `Dispose()` 按词法逆序确定性执行。*(锚定用例：`tests/conformance/arc_eh_concat_throw.zan`、`tests/conformance/cs_b02_using.zan`)*
+- **`[rule:SPEC-ARC-07]` 编译期环检与退出泄漏诊断**：用户代码类间强引用环触发编译期 `W2111` 告警并附 `weak` 补丁；运行期 `--check-leaks` 报告存活对象并追踪孤儿环路（`GC.CollectCycles` 仅作显式兜底 API，无后台 GC）。*(锚定用例：`tests/conformance/closure_cycle_warning.zan`、`tests/conformance/gc_cycle_detector.zan`)*
+
 ---
 
 ## 7. 原生互操作与底层能力 (FFI & Unsafe)
@@ -192,6 +204,9 @@ public static class NativeMethods {
 
 ## 8. 异步编程与并发反应堆 (Async / Await & Concurrency)
 
-- 基于 CPS 转换的无栈/有栈协程调度系统。
-- 关键字 `async` / `await` 语法与 C# 完全对齐。
+- 基于状态机协程帧的异步调度系统，`async` / `await` 语法与 C# 对齐（`ValueTask` / `ValueTask<T>` 降级为 `Task`）。
 - 内建高效轻量级并发通道 `Channel<T>` 与多工分片 `AsyncRuntime`，支持在游戏主循环与服务端网络高并发场景下灵活调度。
+- **`[rule:SPEC-ASYNC-01]` 协程帧字段生命周期与 ANF 挂起**：跨 `await` 存活的参数与局部变量驻留于协程堆帧；`await` 前的子表达式与计算接收者经 ANF 提升到帧槽以保求值顺序与 ARC 存活；装箱闭包单元在每次恢复后重新加载单元地址；返回值写入帧尾类型化 `RVAL` 槽。*(锚定用例：`tests/conformance/async_frame_storage.zan`、`tests/conformance/async_var_locals_across_await.zan`、`tests/conformance/async_boxed_local_release.zan`、`tests/conformance/async_receiver_temp.zan`)*
+- **`[rule:SPEC-ASYNC-02]` `await` 前后持有关系与终结释放**：协程帧跨越全部挂起点持有捕获实参/局部槽，并在正常完成、异常失败或取消时释放所有已武装槽位；`await` 完成时将任务持有的 `+1` 结果移交给等待方。*(锚定用例：`tests/conformance/async_spawn_result_release.zan`、`tests/conformance/async_frame_storage.zan`)*
+- **`[rule:SPEC-ASYNC-03]` 跨 `await` 异常传播与 `finally`**：每次恢复挂载异常处理器并在挂起时卸载；未捕获异常写入任务故障槽并在 `await` 处重抛；包裹 `await` 的 `try`/`catch`/`finally` 清理块在完成或重抛前确定性执行。*(锚定用例：`tests/conformance/async_await_exception_finally.zan`、`tests/conformance/async_throw_across_frames.zan`)*
+- **`[rule:SPEC-ASYNC-04]` 取消语义**：协程帧取消标志在挂起/检查点以原子 `acquire` 读取，位于 `finally`/catch 清理区间内时暂缓退出以确保清理完成；`CancellationToken` 提供 `IsCancellationRequested`、`ThrowIfCancellationRequested()` 与多等待者非阻塞 `WaitHandle()` 协作取消。*(锚定用例：`tests/conformance/async_cancel.zan`、`tests/conformance/cancellation_token_lifecycle.zan`)*

@@ -8976,6 +8976,9 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME selfhost_ir_golden_audit_protocol
     COMMAND ${Python3_EXECUTABLE} -I -B ${CMAKE_SOURCE_DIR}/tests/test_selfhost_ir_golden_audit.py)
   set_tests_properties(selfhost_ir_golden_audit_protocol PROPERTIES TIMEOUT 30)
+  add_test(NAME spec_anchors_protocol
+    COMMAND ${Python3_EXECUTABLE} -I -B ${CMAKE_SOURCE_DIR}/tests/test_spec_anchors.py)
+  set_tests_properties(spec_anchors_protocol PROPERTIES TIMEOUT 30)
   add_test(NAME release_source_manifest_protocol
     COMMAND ${Python3_EXECUTABLE} -I -B ${CMAKE_SOURCE_DIR}/tests/test_release_source_manifest.py
       --gate ${CMAKE_SOURCE_DIR}/scripts/release_quality_gate.cmake
