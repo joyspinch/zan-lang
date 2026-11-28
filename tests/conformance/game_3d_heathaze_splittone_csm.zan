@@ -1,0 +1,173 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Game.Graphics;
+using Game.Render3D;
+
+namespace Conf;
+
+class Game3DHeatHazeSplitToneCsmTest {
+    [DllImport("zan_gui")]
+    private static extern int zan_gui_read_pixel(int surfaceId, int x, int y);
+
+    static int AbsInt(int v) { return v < 0 ? -v : v; }
+    static int RedOf(int argb) { return (argb >> 16) & 255; }
+    static int GreenOf(int argb) { return (argb >> 8) & 255; }
+    static int BlueOf(int argb) { return argb & 255; }
+
+    static void Main() {
+        Canvas.SetBackend(1);
+        Canvas cv = new Canvas(128, 128);
+        int sid = cv.SurfaceId();
+        Renderer3D ren = new Renderer3D(16);
+        ren.UseCpuLighting = false;
+
+        Camera3D cam = new Camera3D();
+        cam.Position = new Vector3(0.0f, 0.0f, 3.2f);
+        cam.Target = new Vector3(0.0f, 0.0f, 0.0f);
+        cam.AspectRatio = 1.0f;
+        cam.FieldOfView = 1.1f;
+
+        // 1. GPU 3D 世界空间热浪对流折射微光：存在明暗热浪峰谷，且推进 phase 时像素热浪显著上移
+        Mesh3D wall = new Mesh3D();
+        wall.Vertex(-2.0f, -2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        wall.Vertex( 2.0f, -2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+        wall.Vertex( 2.0f,  2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        wall.Vertex(-2.0f,  2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f);
+        wall.Triangle(0, 1, 2);
+        wall.Triangle(0, 2, 3);
+        int wallKey = cv.MeshUpload(wall);
+
+        Material heatMat = Material.Solid(0.0f, 0.0f, 0.0f);
+        heatMat.EmissiveRed = 0.03f;
+        heatMat.EmissiveGreen = 0.02f;
+        heatMat.EmissiveBlue = 0.01f;
+        heatMat.HeatHazeEnabled = true;
+        heatMat.HeatHazeFreq = 4.5f;
+        heatMat.HeatHazePhase = 0.0f;
+        heatMat.HeatHazeStrength = 2.0f;
+        heatMat.HeatHazeRed = 1.0f;
+        heatMat.HeatHazeGreen = 0.55f;
+        heatMat.HeatHazeBlue = 0.12f;
+
+        SceneNode root1 = new SceneNode("root1");
+        SceneNode wallNode = new SceneNode("wall");
+        wallNode.MeshKey = wallKey;
+        wallNode.BoundsRadius = 6.0f;
+        wallNode.Material = heatMat;
+        root1.AddChild(wallNode);
+
+        RenderPlan plan1 = new RenderPlan(cam);
+        cv.Clear(unchecked((int)0xFF000000));
+        plan1.Build(root1);
+        ren.Draw(cv, plan1);
+
+        int maxR = 0;
+        int minR = 255;
+        int sumPhase0 = 0;
+        int[] samples0 = new int[20];
+        for (int i = 0; i < 20; i = i + 1) {
+            int y = 24 + i * 4;
+            int r = RedOf(zan_gui_read_pixel(sid, 64, y));
+            samples0[i] = r;
+            sumPhase0 = sumPhase0 + r;
+            if (r > maxR) { maxR = r; }
+            if (r < minR) { minR = r; }
+        }
+
+        heatMat.HeatHazePhase = 1.9f;
+        cv.Clear(unchecked((int)0xFF000000));
+        plan1.Build(root1);
+        ren.Draw(cv, plan1);
+        int phaseDeltaSum = 0;
+        for (int i = 0; i < 20; i = i + 1) {
+            int y = 24 + i * 4;
+            int r1 = RedOf(zan_gui_read_pixel(sid, 64, y));
+            phaseDeltaSum = phaseDeltaSum + AbsInt(r1 - samples0[i]);
+        }
+        bool heatOk = (maxR - minR) >= 120 && maxR >= 160 && minR <= 35 && phaseDeltaSum >= 400;
+        Console.WriteLine("heat_haze_ok=" + Convert.ToString(heatOk ? 1 : 0));
+
+        // 2. GPU 后处理电影级阴影/高光分离色调：左侧暗灰块转冷蓝阴影，右侧亮灰块转暖橙高光，背景纯黑不变
+        Mesh3D leftQuad = new Mesh3D();
+        leftQuad.Vertex(-1.6f, -1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        leftQuad.Vertex(-0.2f, -1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+        leftQuad.Vertex(-0.2f,  1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        leftQuad.Vertex(-1.6f,  1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f);
+        leftQuad.Triangle(0, 1, 2);
+        leftQuad.Triangle(0, 2, 3);
+        int leftKey = cv.MeshUpload(leftQuad);
+
+        Mesh3D rightQuad = new Mesh3D();
+        rightQuad.Vertex(0.2f, -1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        rightQuad.Vertex(1.6f, -1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+        rightQuad.Vertex(1.6f,  1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        rightQuad.Vertex(0.2f,  1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f);
+        rightQuad.Triangle(0, 1, 2);
+        rightQuad.Triangle(0, 2, 3);
+        int rightKey = cv.MeshUpload(rightQuad);
+
+        Material darkGray = Material.Solid(0.0f, 0.0f, 0.0f);
+        darkGray.EmissiveRed = 0.18f;
+        darkGray.EmissiveGreen = 0.18f;
+        darkGray.EmissiveBlue = 0.18f;
+
+        Material brightGray = Material.Solid(0.0f, 0.0f, 0.0f);
+        brightGray.EmissiveRed = 0.85f;
+        brightGray.EmissiveGreen = 0.85f;
+        brightGray.EmissiveBlue = 0.85f;
+
+        SceneNode root2 = new SceneNode("root2");
+        SceneNode ln = new SceneNode("left");
+        ln.MeshKey = leftKey;
+        ln.BoundsRadius = 4.0f;
+        ln.Material = darkGray;
+        SceneNode rn = new SceneNode("right");
+        rn.MeshKey = rightKey;
+        rn.BoundsRadius = 4.0f;
+        rn.Material = brightGray;
+        root2.AddChild(ln);
+        root2.AddChild(rn);
+
+        PostProcess post = new PostProcess();
+        post.SplitToneStrength = 1.0f;
+        post.SplitToneBalance = 0.0f;
+        post.SplitShadowRed = 0.05f;
+        post.SplitShadowGreen = 0.35f;
+        post.SplitShadowBlue = 1.0f;
+        post.SplitHighRed = 1.0f;
+        post.SplitHighGreen = 0.55f;
+        post.SplitHighBlue = 0.12f;
+        ren.PostProcess = post;
+
+        RenderPlan plan2 = new RenderPlan(cam);
+        cv.Clear(unchecked((int)0xFF000000));
+        plan2.Build(root2);
+        ren.Draw(cv, plan2);
+
+        int shadowPx = zan_gui_read_pixel(sid, 36, 64);
+        int highPx = zan_gui_read_pixel(sid, 92, 64);
+        int voidPx = zan_gui_read_pixel(sid, 64, 64);
+
+        bool splitOk = (BlueOf(shadowPx) - RedOf(shadowPx)) >= 60
+            && (RedOf(highPx) - BlueOf(highPx)) >= 120
+            && RedOf(voidPx) == 0 && GreenOf(voidPx) == 0 && BlueOf(voidPx) == 0;
+        Console.WriteLine("split_tone_ok=" + Convert.ToString(splitOk ? 1 : 0));
+
+        ren.Dispose();
+
+        // 3. ShadowCascadeSplitter3D：PSSM 混合对数/线性切分单调递增 + 阴影纹理像素防游动对齐
+        ShadowCascadeSplitter3D csm = new ShadowCascadeSplitter3D(4, 0.75f, 1024);
+        List<ShadowCascadeSlice3D> slices = csm.ComputeSlices(0.1f, 200.0f);
+        bool mono = slices.Count == 4
+            && slices[0].NearPlane < slices[0].FarPlane
+            && slices[0].FarPlane < slices[1].FarPlane
+            && slices[1].FarPlane < slices[2].FarPlane
+            && slices[2].FarPlane < slices[3].FarPlane
+            && slices[3].FarPlane >= 199.9f
+            && slices[0].WorldTexelSize < slices[3].WorldTexelSize;
+        float snapped = ShadowCascadeSplitter3D.TexelSnap(3.73f, 0.25f);
+        bool snapOk = snapped > 3.49f && snapped < 3.51f;
+        Console.WriteLine("shadow_cascade_ok=" + Convert.ToString((mono && snapOk) ? 1 : 0));
+    }
+}

@@ -371,6 +371,18 @@ ZAN_GAME_API void zan_game_set_blueprint_wire3d(int32_t enabled,
 ZAN_GAME_API void zan_game_set_post_sun_bloom_streak3d(float strength,
     float threshold, float r, float g, float b);
 
+/* GPU 3D 世界空间热浪对流折射微光（Heat Haze Shimmer，零贴图零额外 Pass）：
+ * enabled != 0 时按世界坐标生成向上漂浮的双波热浪对流微光纹，strength [0..3]。 */
+ZAN_GAME_API void zan_game_set_heat_haze_shimmer3d(int32_t enabled,
+    float freq, float phase, float strength, float r, float g, float b);
+
+/* GPU 后处理电影级阴影/高光分离色调（Cinema Split-Toning，单 Pass 零额外 FBO）：
+ * strength [0..1] 控制分离色调混合强度，balance [-1..1] 控制明暗分割支点，
+ * shadow_r/g/b 染暗部（保留纯黑背景），high_r/g/b 染高光部。 */
+ZAN_GAME_API void zan_game_set_post_split_tone3d(float strength, float balance,
+    float shadow_r, float shadow_g, float shadow_b,
+    float high_r, float high_g, float high_b);
+
 #ifdef __cplusplus
 }
 #endif

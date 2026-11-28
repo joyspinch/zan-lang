@@ -1,0 +1,172 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Windows;
+
+// 商业桌面伴侣久坐坐姿保护守卫：过滤短暂低头前倾，连续驼背达阈值才轻柔提醒并进入防骚扰冷却。
+public class CompanionPostureGuard {
+    public float SlouchTriggerSec;
+    public float CooldownSec;
+    public float ContinuousSlouchSec;
+    public float CooldownRemainingSec;
+    public int NudgeCount;
+
+    public CompanionPostureGuard(float slouchTriggerSec, float cooldownSec) {
+        this.SlouchTriggerSec = slouchTriggerSec > 0.0f ? slouchTriggerSec : 15.0f;
+        this.CooldownSec = cooldownSec >= 0.0f ? cooldownSec : 120.0f;
+        this.ContinuousSlouchSec = 0.0f;
+        this.CooldownRemainingSec = 0.0f;
+        this.NudgeCount = 0;
+    }
+
+    public bool StepFrame(float dtSec, bool isSlouched) {
+        if (dtSec <= 0.0f) { return false; }
+        if (this.CooldownRemainingSec > 0.0f) {
+            this.CooldownRemainingSec = this.CooldownRemainingSec - dtSec;
+            if (this.CooldownRemainingSec < 0.0f) { this.CooldownRemainingSec = 0.0f; }
+        }
+        if (!isSlouched) {
+            this.ContinuousSlouchSec = 0.0f;
+            return false;
+        }
+        this.ContinuousSlouchSec = this.ContinuousSlouchSec + dtSec;
+        if (this.ContinuousSlouchSec >= this.SlouchTriggerSec && this.CooldownRemainingSec <= 0.0f) {
+            this.ContinuousSlouchSec = 0.0f;
+            this.CooldownRemainingSec = this.CooldownSec;
+            this.NudgeCount = this.NudgeCount + 1;
+            return true;
+        }
+        return false;
+    }
+}
+
+// 剪贴板历史条目。
+public class ClipboardEntryCard {
+    public string Content;
+    public bool Pinned;
+
+    public ClipboardEntryCard(string content) {
+        this.Content = content;
+        this.Pinned = false;
+    }
+}
+
+// 商业桌面伴侣剪贴板历史保险库：去重置顶、置顶免疫容量淘汰、按近期顺序子串检索。
+public class CompanionClipboardHistoryVault {
+    private List<ClipboardEntryCard> entries;
+    public int MaxEntries;
+
+    public CompanionClipboardHistoryVault(int maxEntries) {
+        this.entries = new List<ClipboardEntryCard>();
+        this.MaxEntries = maxEntries > 0 ? maxEntries : 32;
+    }
+
+    public void PushSnippet(string text) {
+        if (text == null || text.Length == 0) { return; }
+        bool wasPinned = false;
+        for (int i = 0; i < this.entries.Count; i = i + 1) {
+            if (this.entries[i].Content == text) {
+                wasPinned = this.entries[i].Pinned;
+                this.entries.RemoveAt(i);
+                break;
+            }
+        }
+        ClipboardEntryCard card = new ClipboardEntryCard(text);
+        card.Pinned = wasPinned;
+        List<ClipboardEntryCard> rebuilt = new List<ClipboardEntryCard>();
+        rebuilt.Add(card);
+        for (int i = 0; i < this.entries.Count; i = i + 1) {
+            rebuilt.Add(this.entries[i]);
+        }
+        this.entries = rebuilt;
+        while (this.entries.Count > this.MaxEntries) {
+            int evictIdx = -1;
+            for (int i = this.entries.Count - 1; i >= 0; i = i - 1) {
+                if (!this.entries[i].Pinned) {
+                    evictIdx = i;
+                    break;
+                }
+            }
+            if (evictIdx < 0) { break; }
+            this.entries.RemoveAt(evictIdx);
+        }
+    }
+
+    public bool SetPinned(string text, bool pinned) {
+        for (int i = 0; i < this.entries.Count; i = i + 1) {
+            if (this.entries[i].Content == text) {
+                this.entries[i].Pinned = pinned;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public int Count() { return this.entries.Count; }
+
+    public string EntryAt(int index) {
+        if (index < 0 || index >= this.entries.Count) { return ""; }
+        return this.entries[index].Content;
+    }
+
+    public List<string> Search(string keyword) {
+        List<string> hits = new List<string>();
+        for (int i = 0; i < this.entries.Count; i = i + 1) {
+            if (keyword == "" || this.entries[i].Content.Contains(keyword)) {
+                hits.Add(this.entries[i].Content);
+            }
+        }
+        return hits;
+    }
+}
+
+// 笔记本省电多级空闲休眠阶段。
+public enum IdleSleepStage {
+    Awake = 0,
+    Drowsy = 1,
+    Sleeping = 2,
+    DeepHibernate = 3
+}
+
+// 商业桌面伴侣多级空闲降帧状态机：无操作逐步降帧省电（60 -> 30 -> 12 -> 2 FPS），任意键鼠输入瞬醒。
+public class CompanionIdleSleepMachine {
+    public float DrowsyAfterSec;
+    public float SleepAfterSec;
+    public float HibernateAfterSec;
+    public float IdleSeconds;
+    public IdleSleepStage Stage;
+
+    public CompanionIdleSleepMachine(float drowsyAfterSec, float sleepAfterSec, float hibernateAfterSec) {
+        this.DrowsyAfterSec = drowsyAfterSec > 0.0f ? drowsyAfterSec : 60.0f;
+        this.SleepAfterSec = sleepAfterSec > this.DrowsyAfterSec ? sleepAfterSec : 180.0f;
+        this.HibernateAfterSec = hibernateAfterSec > this.SleepAfterSec ? hibernateAfterSec : 600.0f;
+        this.IdleSeconds = 0.0f;
+        this.Stage = IdleSleepStage.Awake;
+    }
+
+    public IdleSleepStage AdvanceIdle(float dtSec) {
+        if (dtSec > 0.0f) { this.IdleSeconds = this.IdleSeconds + dtSec; }
+        if (this.IdleSeconds >= this.HibernateAfterSec) {
+            this.Stage = IdleSleepStage.DeepHibernate;
+        } else if (this.IdleSeconds >= this.SleepAfterSec) {
+            this.Stage = IdleSleepStage.Sleeping;
+        } else if (this.IdleSeconds >= this.DrowsyAfterSec) {
+            this.Stage = IdleSleepStage.Drowsy;
+        } else {
+            this.Stage = IdleSleepStage.Awake;
+        }
+        return this.Stage;
+    }
+
+    public void NotifyUserInput() {
+        this.IdleSeconds = 0.0f;
+        this.Stage = IdleSleepStage.Awake;
+    }
+
+    public int TargetFps() {
+        if (this.Stage == IdleSleepStage.Awake) { return 60; }
+        if (this.Stage == IdleSleepStage.Drowsy) { return 30; }
+        if (this.Stage == IdleSleepStage.Sleeping) { return 12; }
+        return 2;
+    }
+}

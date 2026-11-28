@@ -1,0 +1,61 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Render3D;
+
+// 单层级联阴影切片的近远平面与世界空间纹理像素尺寸。
+public class ShadowCascadeSlice3D {
+    public float NearPlane;
+    public float FarPlane;
+    public float WorldTexelSize;
+
+    public ShadowCascadeSlice3D(float nearPlane, float farPlane, float worldTexelSize) {
+        this.NearPlane = nearPlane;
+        this.FarPlane = farPlane;
+        this.WorldTexelSize = worldTexelSize;
+    }
+}
+
+// 商业 3D 级联阴影实用分割器（PSSM Practical Split Scheme + 纹理像素防闪烁对齐）。
+public class ShadowCascadeSplitter3D {
+    public int CascadeCount;
+    public float SplitLambda;
+    public int ShadowMapResolution;
+
+    public ShadowCascadeSplitter3D(int cascadeCount, float splitLambda, int shadowMapResolution) {
+        this.CascadeCount = cascadeCount > 0 ? cascadeCount : 4;
+        if (this.CascadeCount > 8) { this.CascadeCount = 8; }
+        this.SplitLambda = splitLambda;
+        if (this.SplitLambda < 0.0f) { this.SplitLambda = 0.0f; }
+        if (this.SplitLambda > 1.0f) { this.SplitLambda = 1.0f; }
+        this.ShadowMapResolution = shadowMapResolution >= 64 ? shadowMapResolution : 1024;
+    }
+
+    // 计算近平面到最大阴影距离之间的各层 PSSM 混合对数/线性切分点与单 texel 世界跨度。
+    public List<ShadowCascadeSlice3D> ComputeSlices(float nearPlane, float maxShadowDist) {
+        List<ShadowCascadeSlice3D> slices = new List<ShadowCascadeSlice3D>();
+        float n = nearPlane > 0.01f ? nearPlane : 0.1f;
+        float f = maxShadowDist > n + 0.1f ? maxShadowDist : n + 50.0f;
+        float prev = n;
+        for (int i = 1; i <= this.CascadeCount; i = i + 1) {
+            double p = (double)i / (double)this.CascadeCount;
+            double logSplit = (double)n * Math.Pow((double)(f / n), p);
+            double linSplit = (double)n + (double)(f - n) * p;
+            float splitFar = (float)((double)this.SplitLambda * logSplit
+                + (1.0 - (double)this.SplitLambda) * linSplit);
+            if (i == this.CascadeCount) { splitFar = f; }
+            float span = splitFar - prev;
+            float texel = span / (float)this.ShadowMapResolution;
+            slices.Add(new ShadowCascadeSlice3D(prev, splitFar, texel));
+            prev = splitFar;
+        }
+        return slices;
+    }
+
+    // 将光源空间中心坐标对齐到 Shadow Map texel 网格，消除相机微移时的阴影边缘游动抖动。
+    public static float TexelSnap(float coord, float worldTexelSize) {
+        if (worldTexelSize <= 0.000001f) { return coord; }
+        double step = (double)worldTexelSize;
+        return (float)(Math.Floor((double)coord / step) * step);
+    }
+}
