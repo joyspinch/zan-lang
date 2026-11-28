@@ -1,0 +1,265 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Render3D;
+
+public class NavCellCoord3D {
+    public int X;
+    public int Z;
+    public float Y;
+
+    public NavCellCoord3D(int x, int z, float y) {
+        this.X = x;
+        this.Z = z;
+        this.Y = y;
+    }
+}
+
+// 商用 3D 高度层 A* 导航网格寻路器：支持障碍阻挡、最大跨步高差、对角防穿角、世界坐标映射与直线抽稀。
+public class NavGridPathfinder3D {
+    public int Width;
+    public int Depth;
+    public float CellSize;
+    public float OriginX;
+    public float OriginZ;
+    public float MaxStepHeight;
+
+    private bool[] blocked;
+    private float[] heights;
+
+    public NavGridPathfinder3D(int width, int depth, float cellSize, float originX, float originZ, float maxStepHeight) {
+        this.Width = width < 1 ? 1 : width;
+        this.Depth = depth < 1 ? 1 : depth;
+        this.CellSize = cellSize > 0.05f ? cellSize : 1.0f;
+        this.OriginX = originX;
+        this.OriginZ = originZ;
+        this.MaxStepHeight = maxStepHeight > 0.01f ? maxStepHeight : 0.75f;
+        int n = this.Width * this.Depth;
+        this.blocked = new bool[n];
+        this.heights = new float[n];
+    }
+
+    public bool InBounds(int x, int z) {
+        return x >= 0 && x < this.Width && z >= 0 && z < this.Depth;
+    }
+
+    public void SetBlocked(int x, int z, bool isBlocked) {
+        if (!this.InBounds(x, z)) { return; }
+        this.blocked[z * this.Width + x] = isBlocked;
+    }
+
+    public bool IsBlocked(int x, int z) {
+        if (!this.InBounds(x, z)) { return true; }
+        return this.blocked[z * this.Width + x];
+    }
+
+    public void SetHeight(int x, int z, float y) {
+        if (!this.InBounds(x, z)) { return; }
+        this.heights[z * this.Width + x] = y;
+    }
+
+    public float GetHeight(int x, int z) {
+        if (!this.InBounds(x, z)) { return 0.0f; }
+        return this.heights[z * this.Width + x];
+    }
+
+    public Vector3 CellToWorld(int x, int z) {
+        float wx = this.OriginX + ((float)x + 0.5f) * this.CellSize;
+        float wz = this.OriginZ + ((float)z + 0.5f) * this.CellSize;
+        float wy = this.GetHeight(x, z);
+        return new Vector3(wx, wy, wz);
+    }
+
+    public NavCellCoord3D WorldToCell(Vector3 pos) {
+        int cx = (int)Math.Floor((double)((pos.X - this.OriginX) / this.CellSize));
+        int cz = (int)Math.Floor((double)((pos.Z - this.OriginZ) / this.CellSize));
+        if (cx < 0) { cx = 0; }
+        if (cx >= this.Width) { cx = this.Width - 1; }
+        if (cz < 0) { cz = 0; }
+        if (cz >= this.Depth) { cz = this.Depth - 1; }
+        return new NavCellCoord3D(cx, cz, this.GetHeight(cx, cz));
+    }
+
+    public List<NavCellCoord3D> FindPath(int startX, int startZ, int goalX, int goalZ) {
+        List<NavCellCoord3D> path = new List<NavCellCoord3D>();
+        if (!this.InBounds(startX, startZ) || !this.InBounds(goalX, goalZ)) { return path; }
+        if (this.IsBlocked(startX, startZ) || this.IsBlocked(goalX, goalZ)) { return path; }
+
+        int n = this.Width * this.Depth;
+        int startIdx = startZ * this.Width + startX;
+        int goalIdx = goalZ * this.Width + goalX;
+        if (startIdx == goalIdx) {
+            path.Add(new NavCellCoord3D(startX, startZ, this.heights[startIdx]));
+            return path;
+        }
+
+        float[] gScore = new float[n];
+        float[] fScore = new float[n];
+        int[] cameFrom = new int[n];
+        bool[] inOpen = new bool[n];
+        bool[] closed = new bool[n];
+        for (int i = 0; i < n; i = i + 1) {
+            gScore[i] = 1000000000.0f;
+            fScore[i] = 1000000000.0f;
+            cameFrom[i] = -1;
+        }
+
+        List<int> openList = new List<int>();
+        gScore[startIdx] = 0.0f;
+        fScore[startIdx] = Heuristic(startX, startZ, goalX, goalZ);
+        openList.Add(startIdx);
+        inOpen[startIdx] = true;
+
+        int[] dxs = new int[8];
+        int[] dzs = new int[8];
+        dxs[0] = 1;  dzs[0] = 0;
+        dxs[1] = -1; dzs[1] = 0;
+        dxs[2] = 0;  dzs[2] = 1;
+        dxs[3] = 0;  dzs[3] = -1;
+        dxs[4] = 1;  dzs[4] = 1;
+        dxs[5] = 1;  dzs[5] = -1;
+        dxs[6] = -1; dzs[6] = 1;
+        dxs[7] = -1; dzs[7] = -1;
+
+        bool found = false;
+        while (openList.Count > 0) {
+            int bestPos = 0;
+            int current = openList[0];
+            float bestF = fScore[current];
+            for (int i = 1; i < openList.Count; i = i + 1) {
+                int cand = openList[i];
+                if (fScore[cand] < bestF) {
+                    bestF = fScore[cand];
+                    current = cand;
+                    bestPos = i;
+                }
+            }
+
+            if (current == goalIdx) {
+                found = true;
+                break;
+            }
+
+            openList.RemoveAt(bestPos);
+            inOpen[current] = false;
+            closed[current] = true;
+
+            int cx = current % this.Width;
+            int cz = current / this.Width;
+            float ch = this.heights[current];
+
+            for (int k = 0; k < 8; k = k + 1) {
+                int nx = cx + dxs[k];
+                int nz = cz + dzs[k];
+                if (!this.InBounds(nx, nz)) { continue; }
+                int nIdx = nz * this.Width + nx;
+                if (closed[nIdx] || this.blocked[nIdx]) { continue; }
+
+                bool isDiag = dxs[k] != 0 && dzs[k] != 0;
+                if (isDiag) {
+                    if (this.IsBlocked(cx + dxs[k], cz) || this.IsBlocked(cx, cz + dzs[k])) {
+                        continue;
+                    }
+                }
+
+                float dh = this.heights[nIdx] - ch;
+                if (dh < 0.0f) { dh = -dh; }
+                if (dh > this.MaxStepHeight) { continue; }
+
+                float stepCost = (isDiag ? 1.4142135f : 1.0f) + dh * 0.25f;
+                float tentativeG = gScore[current] + stepCost;
+                if (tentativeG < gScore[nIdx]) {
+                    cameFrom[nIdx] = current;
+                    gScore[nIdx] = tentativeG;
+                    fScore[nIdx] = tentativeG + Heuristic(nx, nz, goalX, goalZ);
+                    if (!inOpen[nIdx]) {
+                        openList.Add(nIdx);
+                        inOpen[nIdx] = true;
+                    }
+                }
+            }
+        }
+
+        if (!found) { return path; }
+
+        List<int> rev = new List<int>();
+        int cur = goalIdx;
+        while (cur >= 0) {
+            rev.Add(cur);
+            cur = cameFrom[cur];
+        }
+        for (int i = rev.Count - 1; i >= 0; i = i - 1) {
+            int idx = rev[i];
+            int px = idx % this.Width;
+            int pz = idx / this.Width;
+            path.Add(new NavCellCoord3D(px, pz, this.heights[idx]));
+        }
+        return path;
+    }
+
+    public List<Vector3> FindWorldPath(Vector3 start, Vector3 goal) {
+        NavCellCoord3D sc = this.WorldToCell(start);
+        NavCellCoord3D gc = this.WorldToCell(goal);
+        List<NavCellCoord3D> cells = this.FindPath(sc.X, sc.Z, gc.X, gc.Z);
+        List<Vector3> pts = new List<Vector3>();
+        for (int i = 0; i < cells.Count; i = i + 1) {
+            pts.Add(this.CellToWorld(cells[i].X, cells[i].Z));
+        }
+        return pts;
+    }
+
+    public List<NavCellCoord3D> SmoothPath(List<NavCellCoord3D> raw) {
+        List<NavCellCoord3D> smooth = new List<NavCellCoord3D>();
+        if (raw == null || raw.Count == 0) { return smooth; }
+        smooth.Add(raw[0]);
+        if (raw.Count <= 2) {
+            if (raw.Count == 2) { smooth.Add(raw[1]); }
+            return smooth;
+        }
+        int anchor = 0;
+        while (anchor < raw.Count - 1) {
+            int furthest = anchor + 1;
+            for (int probe = raw.Count - 1; probe > anchor + 1; probe = probe - 1) {
+                if (this.HasLineOfSight(raw[anchor].X, raw[anchor].Z, raw[probe].X, raw[probe].Z)) {
+                    furthest = probe;
+                    break;
+                }
+            }
+            smooth.Add(raw[furthest]);
+            anchor = furthest;
+        }
+        return smooth;
+    }
+
+    private bool HasLineOfSight(int x0, int z0, int x1, int z1) {
+        int dx = x1 - x0;
+        int dz = z1 - z0;
+        int steps = dx < 0 ? -dx : dx;
+        int az = dz < 0 ? -dz : dz;
+        if (az > steps) { steps = az; }
+        if (steps == 0) { return !this.IsBlocked(x0, z0); }
+        float prevH = this.GetHeight(x0, z0);
+        for (int i = 1; i <= steps; i = i + 1) {
+            double t = (double)i / (double)steps;
+            int cx = (int)Math.Round((double)x0 + (double)dx * t);
+            int cz = (int)Math.Round((double)z0 + (double)dz * t);
+            if (this.IsBlocked(cx, cz)) { return false; }
+            float h = this.GetHeight(cx, cz);
+            float diff = h - prevH;
+            if (diff < 0.0f) { diff = -diff; }
+            if (diff > this.MaxStepHeight) { return false; }
+            prevH = h;
+        }
+        return true;
+    }
+
+    private static float Heuristic(int x0, int z0, int x1, int z1) {
+        int dx = x1 - x0;
+        int dz = z1 - z0;
+        if (dx < 0) { dx = -dx; }
+        if (dz < 0) { dz = -dz; }
+        int mn = dx < dz ? dx : dz;
+        int mx = dx > dz ? dx : dz;
+        return (float)(mx - mn) + 1.4142135f * (float)mn;
+    }
+}

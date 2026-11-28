@@ -1,0 +1,64 @@
+using System;
+using Game.Net;
+
+namespace Conf;
+
+class MultiplayerLootAuctionBackfillTest {
+    static void Main() {
+        // 1. 副本战利品需求/贪婪掷点分配：Need 压制 Greed、全员提交即刻结案、超时自动 Pass
+        NetLootRollSession loot = new NetLootRollSession(9001, 10000L, 42);
+        loot.AddParticipant(1);
+        loot.AddParticipant(2);
+        loot.AddParticipant(3);
+
+        int r1 = loot.SubmitChoice(1, LootRollChoice.Greed, 1000L);
+        int r2 = loot.SubmitChoice(2, LootRollChoice.Need, 1500L);
+        int r3 = loot.SubmitChoice(3, LootRollChoice.Pass, 2000L);
+        bool dupRejected = loot.SubmitChoice(2, LootRollChoice.Need, 2100L) == -1;
+
+        NetLootRollSession timeoutLoot = new NetLootRollSession(9002, 5000L, 7);
+        timeoutLoot.AddParticipant(10);
+        timeoutLoot.AddParticipant(20);
+        timeoutLoot.SubmitChoice(10, LootRollChoice.Greed, 1000L);
+        bool resolvedOnTimeout = timeoutLoot.UpdateClock(6000L);
+
+        bool lootOk = r1 >= 1 && r1 <= 100 && r2 >= 1 && r2 <= 100 && r3 == 0
+            && dupRejected && loot.Resolved && loot.WinnerPlayerId == 2 && loot.WinningRoll == r2
+            && resolvedOnTimeout && timeoutLoot.WinnerPlayerId == 10;
+        Console.WriteLine("net-loot-roll-session: " + Convert.ToString(lootOk ? 1 : 0));
+
+        // 2. 拍卖行竞价托管：最小加价步长、临期反狙击延时、超车退款账单与一口价秒杀
+        NetAuctionBidHouse ah = new NetAuctionBidHouse(5000L, 10000L);
+        ah.CreateListing(1, 100, 555, 100, 20, 500, 20000L);
+
+        bool sellerBlocked = !ah.PlaceBid(1, 100, 120, 1000L);
+        bool firstBid = ah.PlaceBid(1, 201, 100, 1000L);
+        bool lowStepBlocked = !ah.PlaceBid(1, 202, 110, 2000L); // 需 >= 120
+        bool snipeBid = ah.PlaceBid(1, 202, 150, 18000L);       // 距截止 2s <= 5s，触发反狙击延至 30000L
+        AuctionListingRecord rec1 = ah.GetListing(1);
+        bool extendedOk = rec1 != null && rec1.EndMs == 30000L && ah.PendingRefund(201) == 100;
+
+        bool buyoutOk = ah.PlaceBid(1, 203, 600, 22000L);       // 超过一口价 500，按 500 秒杀结拍
+        bool postBuyoutBlocked = !ah.PlaceBid(1, 204, 700, 23000L);
+        bool ahOk = sellerBlocked && firstBid && lowStepBlocked && snipeBid && extendedOk
+            && buyoutOk && postBuyoutBlocked
+            && rec1.Settled && rec1.CurrentBid == 500 && rec1.HighestBidderId == 203
+            && ah.PendingRefund(202) == 150;
+        Console.WriteLine("net-auction-bid-house: " + Convert.ToString(ahOk ? 1 : 0));
+
+        // 3. 缺人局实时热补位调度：MMR 容差最优匹配、拒接回退补发下一候补并最终补齐
+        NetBackfillQueueManager bf = new NetBackfillQueueManager();
+        bf.RegisterOpenSlot(50, 1500, 120);
+        bf.EnqueueCandidate(301, 1900); // 超出容差
+        bf.EnqueueCandidate(302, 1530); // 最近 (+30)
+        bf.EnqueueCandidate(303, 1420); // 次近 (-80)
+
+        int firstOffer = bf.DispatchOffer(50, 1000L, 10000L); // 应选 302
+        bool declined = bf.RespondOffer(50, 302, false, 2000L);
+        int secondOffer = bf.DispatchOffer(50, 3000L, 10000L); // 应顺延选 303
+        bool accepted = bf.RespondOffer(50, 303, true, 4000L);
+
+        bool bfOk = firstOffer == 302 && declined && secondOffer == 303 && accepted && bf.OpenSlotCount() == 0;
+        Console.WriteLine("net-backfill-queue-manager: " + Convert.ToString(bfOk ? 1 : 0));
+    }
+}

@@ -1,0 +1,190 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Game.Graphics;
+using Game.Render3D;
+
+namespace Conf;
+
+class Game3DIceFrostThermalNavGridTest {
+    [DllImport("zan_gui")]
+    private static extern int zan_gui_read_pixel(int surfaceId, int x, int y);
+
+    static int RedOf(int argb) { return (argb >> 16) & 255; }
+    static int GreenOf(int argb) { return (argb >> 8) & 255; }
+    static int BlueOf(int argb) { return argb & 255; }
+
+    static void Main() {
+        Canvas.SetBackend(1);
+        Canvas cv = new Canvas(128, 128);
+        int sid = cv.SurfaceId();
+
+        // 1. GPU 世界空间冰霜晶面闪烁与菲涅尔冰膜覆层
+        Mesh3D wideQuad = new Mesh3D();
+        wideQuad.Vertex(-2.5f, -2.5f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        wideQuad.Vertex( 2.5f, -2.5f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+        wideQuad.Vertex( 2.5f,  2.5f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        wideQuad.Vertex(-2.5f,  2.5f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f);
+        wideQuad.Triangle(0, 1, 2);
+        wideQuad.Triangle(0, 2, 3);
+        int wideKey = cv.MeshUpload(wideQuad);
+
+        Camera3D cam = new Camera3D();
+        cam.Position = new Vector3(0.0f, 0.0f, 3.2f);
+        cam.Target = new Vector3(0.0f, 0.0f, 0.0f);
+        cam.AspectRatio = 1.0f;
+        cam.FieldOfView = 1.1f;
+
+        Material frostMat = Material.Solid(0.0f, 0.0f, 0.0f);
+        frostMat.EmissiveRed = 0.04f;
+        frostMat.EmissiveGreen = 0.04f;
+        frostMat.EmissiveBlue = 0.04f;
+
+        SceneNode root1 = new SceneNode("root1");
+        SceneNode n1 = new SceneNode("panel");
+        n1.MeshKey = wideKey;
+        n1.BoundsRadius = 6.0f;
+        n1.Material = frostMat;
+        root1.AddChild(n1);
+
+        Renderer3D ren = new Renderer3D(16);
+        ren.UseCpuLighting = false;
+        RenderPlan plan1 = new RenderPlan(cam);
+
+        // 1a. 关闭冰霜基准
+        cv.Clear(unchecked((int)0xFF000000));
+        plan1.Build(root1);
+        ren.Draw(cv, plan1);
+        int baseMaxB = 0;
+        for (int x = 16; x <= 112; x = x + 2) {
+            int b = BlueOf(zan_gui_read_pixel(sid, x, 64));
+            if (b > baseMaxB) { baseMaxB = b; }
+        }
+
+        // 1b. 开启冰霜晶面闪烁 + 菲涅尔冰膜
+        frostMat.IceFrostEnabled = true;
+        frostMat.IceFrostScale = 1.6f;
+        frostMat.IceFrostGlintStrength = 1.4f;
+        frostMat.IceFrostFresnelPower = 2.0f;
+        frostMat.IceFrostRed = 0.45f;
+        frostMat.IceFrostGreen = 0.90f;
+        frostMat.IceFrostBlue = 1.0f;
+
+        cv.Clear(unchecked((int)0xFF000000));
+        plan1.Build(root1);
+        ren.Draw(cv, plan1);
+        int frostMinB = 255;
+        int frostMaxB = 0;
+        int frostMaxR = 0;
+        for (int x = 16; x <= 112; x = x + 2) {
+            int px = zan_gui_read_pixel(sid, x, 64);
+            int b = BlueOf(px);
+            int r = RedOf(px);
+            if (b < frostMinB) { frostMinB = b; }
+            if (b > frostMaxB) { frostMaxB = b; }
+            if (r > frostMaxR) { frostMaxR = r; }
+        }
+        bool iceFrostOk = baseMaxB < 30
+            && frostMaxB > baseMaxB + 70
+            && (frostMaxB - frostMinB) > 25
+            && frostMaxB > frostMaxR + 40;
+        Console.WriteLine("gpu-ice-frost: " + Convert.ToString(iceFrostOk ? 1 : 0));
+
+        // 2. GPU 后处理红外热成像伪彩：冷底映射深蓝、中温左块映射橙红、高温右块映射亮黄
+        Mesh3D leftQuad = new Mesh3D();
+        leftQuad.Vertex(-1.5f, -0.8f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        leftQuad.Vertex(-0.2f, -0.8f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+        leftQuad.Vertex(-0.2f,  0.8f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        leftQuad.Vertex(-1.5f,  0.8f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f);
+        leftQuad.Triangle(0, 1, 2);
+        leftQuad.Triangle(0, 2, 3);
+        int leftKey = cv.MeshUpload(leftQuad);
+
+        Mesh3D rightQuad = new Mesh3D();
+        rightQuad.Vertex(0.2f, -0.8f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        rightQuad.Vertex(1.5f, -0.8f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+        rightQuad.Vertex(1.5f,  0.8f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        rightQuad.Vertex(0.2f,  0.8f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f);
+        rightQuad.Triangle(0, 1, 2);
+        rightQuad.Triangle(0, 2, 3);
+        int rightKey = cv.MeshUpload(rightQuad);
+
+        Material warmMat = Material.Solid(0.0f, 0.0f, 0.0f);
+        warmMat.EmissiveRed = 0.50f;
+        warmMat.EmissiveGreen = 0.50f;
+        warmMat.EmissiveBlue = 0.50f;
+
+        Material hotMat = Material.Solid(0.0f, 0.0f, 0.0f);
+        hotMat.EmissiveRed = 0.76f;
+        hotMat.EmissiveGreen = 0.76f;
+        hotMat.EmissiveBlue = 0.76f;
+
+        SceneNode root2 = new SceneNode("root2");
+        SceneNode leftNode = new SceneNode("warm");
+        leftNode.MeshKey = leftKey;
+        leftNode.BoundsRadius = 4.0f;
+        leftNode.Material = warmMat;
+        root2.AddChild(leftNode);
+
+        SceneNode rightNode = new SceneNode("hot");
+        rightNode.MeshKey = rightKey;
+        rightNode.BoundsRadius = 4.0f;
+        rightNode.Material = hotMat;
+        root2.AddChild(rightNode);
+
+        PostProcess post = new PostProcess();
+        post.ThermalStrength = 1.0f;
+        post.ThermalSensitivity = 1.0f;
+        post.ThermalColdShift = 0.0f;
+        ren.PostProcess = post;
+
+        Camera3D cam2 = new Camera3D();
+        cam2.Position = new Vector3(0.0f, 0.0f, 4.0f);
+        cam2.Target = new Vector3(0.0f, 0.0f, 0.0f);
+        cam2.AspectRatio = 1.0f;
+        cam2.FieldOfView = 1.0f;
+        RenderPlan plan2 = new RenderPlan(cam2);
+
+        cv.Clear(unchecked((int)0xFF000000));
+        plan2.Build(root2);
+        ren.Draw(cv, plan2);
+
+        int coldPx = zan_gui_read_pixel(sid, 8, 8);
+        int warmPx = zan_gui_read_pixel(sid, 42, 64);
+        int hotPx = zan_gui_read_pixel(sid, 86, 64);
+
+        bool coldIsBlue = BlueOf(coldPx) > 85 && RedOf(coldPx) < 40 && GreenOf(coldPx) < 40;
+        bool warmIsOrange = RedOf(warmPx) > 200 && GreenOf(warmPx) < 120 && BlueOf(warmPx) < 55;
+        bool hotIsYellow = RedOf(hotPx) > 225 && GreenOf(hotPx) > 200 && BlueOf(hotPx) < 110;
+        Console.WriteLine("gpu-post-thermal-heat: " + Convert.ToString((coldIsBlue && warmIsOrange && hotIsYellow) ? 1 : 0));
+
+        ren.Dispose();
+
+        // 3. 3D 高度层 A* 导航网格寻路：绕墙 + 避开陡崖走缓坡 + 直线抽稀
+        NavGridPathfinder3D nav = new NavGridPathfinder3D(10, 10, 2.0f, 0.0f, 0.0f, 0.6f);
+        for (int z = 0; z <= 7; z = z + 1) {
+            nav.SetBlocked(4, z, true);
+        }
+        // (4, 8) 设为陡峭高台 (2.5m > maxStep 0.6m)，逼迫经由 (4, 9) 缓坡绕行
+        nav.SetHeight(4, 8, 2.5f);
+        nav.SetHeight(3, 9, 0.4f);
+        nav.SetHeight(4, 9, 0.8f);
+        nav.SetHeight(5, 9, 0.4f);
+
+        List<NavCellCoord3D> rawPath = nav.FindPath(1, 2, 8, 2);
+        bool usedRamp = false;
+        bool avoidedCliff = true;
+        for (int i = 0; i < rawPath.Count; i = i + 1) {
+            if (rawPath[i].X == 4 && rawPath[i].Z == 9) { usedRamp = true; }
+            if (rawPath[i].X == 4 && rawPath[i].Z == 8) { avoidedCliff = false; }
+        }
+        List<NavCellCoord3D> smooth = nav.SmoothPath(rawPath);
+        List<Vector3> worldPath = nav.FindWorldPath(new Vector3(3.0f, 0.0f, 5.0f), new Vector3(17.0f, 0.0f, 5.0f));
+
+        bool navOk = rawPath.Count >= 10
+            && usedRamp && avoidedCliff
+            && smooth.Count >= 3 && smooth.Count < rawPath.Count
+            && worldPath.Count == rawPath.Count;
+        Console.WriteLine("nav-grid-pathfinder-3d: " + Convert.ToString(navOk ? 1 : 0));
+    }
+}

@@ -1,0 +1,367 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Net;
+
+public enum LootRollChoice {
+    Pass = 0,
+    Greed = 1,
+    Need = 2
+}
+
+internal class LootRollParticipant {
+    public int PlayerId;
+    public bool Submitted;
+    public LootRollChoice Choice;
+    public int RollValue;
+    public int OrderSeq;
+
+    public LootRollParticipant(int playerId) {
+        this.PlayerId = playerId;
+        this.Submitted = false;
+        this.Choice = LootRollChoice.Pass;
+        this.RollValue = 0;
+        this.OrderSeq = 0;
+    }
+}
+
+// 商用副本战利品需求/贪婪掷点分配会话：Need 优先于 Greed、确定性可回放骰点与超时自动 Pass。
+public class NetLootRollSession {
+    public int ItemId;
+    public long DeadlineMs;
+    public bool Resolved;
+    public int WinnerPlayerId;
+    public int WinningRoll;
+    private List<LootRollParticipant> members;
+    private int rngState;
+    private int seqCounter;
+
+    public NetLootRollSession(int itemId, long deadlineMs, int seed) {
+        this.ItemId = itemId;
+        this.DeadlineMs = deadlineMs;
+        this.Resolved = false;
+        this.WinnerPlayerId = -1;
+        this.WinningRoll = 0;
+        this.members = new List<LootRollParticipant>();
+        this.rngState = seed == 0 ? 1337 : seed;
+        this.seqCounter = 0;
+    }
+
+    public bool AddParticipant(int playerId) {
+        if (this.Resolved) { return false; }
+        for (int i = 0; i < this.members.Count; i = i + 1) {
+            if (this.members[i].PlayerId == playerId) { return false; }
+        }
+        this.members.Add(new LootRollParticipant(playerId));
+        return true;
+    }
+
+    public int SubmitChoice(int playerId, LootRollChoice choice, long nowMs) {
+        if (this.Resolved) { return -1; }
+        if (nowMs > this.DeadlineMs) {
+            this.ResolveNow();
+            return -1;
+        }
+        LootRollParticipant p = null;
+        for (int i = 0; i < this.members.Count; i = i + 1) {
+            if (this.members[i].PlayerId == playerId) {
+                p = this.members[i];
+                break;
+            }
+        }
+        if (p == null || p.Submitted) { return -1; }
+
+        this.seqCounter = this.seqCounter + 1;
+        p.Submitted = true;
+        p.Choice = choice;
+        p.OrderSeq = this.seqCounter;
+        p.RollValue = choice == LootRollChoice.Pass ? 0 : this.NextRoll1To100();
+
+        if (this.AllSubmitted()) {
+            this.ResolveNow();
+        }
+        return p.RollValue;
+    }
+
+    public bool UpdateClock(long nowMs) {
+        if (!this.Resolved && nowMs > this.DeadlineMs) {
+            this.ResolveNow();
+        }
+        return this.Resolved;
+    }
+
+    private bool AllSubmitted() {
+        for (int i = 0; i < this.members.Count; i = i + 1) {
+            if (!this.members[i].Submitted) { return false; }
+        }
+        return this.members.Count > 0;
+    }
+
+    private void ResolveNow() {
+        this.Resolved = true;
+        LootRollParticipant best = null;
+        for (int i = 0; i < this.members.Count; i = i + 1) {
+            LootRollParticipant cur = this.members[i];
+            if (!cur.Submitted || cur.Choice == LootRollChoice.Pass) { continue; }
+            if (best == null) {
+                best = cur;
+            } else if ((int)cur.Choice > (int)best.Choice) {
+                best = cur;
+            } else if (cur.Choice == best.Choice) {
+                if (cur.RollValue > best.RollValue) {
+                    best = cur;
+                } else if (cur.RollValue == best.RollValue && cur.OrderSeq < best.OrderSeq) {
+                    best = cur;
+                }
+            }
+        }
+        if (best != null) {
+            this.WinnerPlayerId = best.PlayerId;
+            this.WinningRoll = best.RollValue;
+        } else {
+            this.WinnerPlayerId = -1;
+            this.WinningRoll = 0;
+        }
+    }
+
+    private int NextRoll1To100() {
+        long next = ((long)this.rngState * 1103515245L + 12345L) & 0x7FFFFFFFL;
+        this.rngState = (int)next;
+        return (int)(next % 100L) + 1;
+    }
+}
+
+public class AuctionListingRecord {
+    public int ListingId;
+    public int SellerId;
+    public int ItemId;
+    public int CurrentBid;
+    public int MinIncrement;
+    public int BuyoutPrice;
+    public int HighestBidderId;
+    public long EndMs;
+    public bool Settled;
+
+    public AuctionListingRecord(int listingId, int sellerId, int itemId,
+        int startPrice, int minIncrement, int buyoutPrice, long endMs) {
+        this.ListingId = listingId;
+        this.SellerId = sellerId;
+        this.ItemId = itemId;
+        this.CurrentBid = startPrice > 0 ? startPrice : 1;
+        this.MinIncrement = minIncrement > 0 ? minIncrement : 1;
+        this.BuyoutPrice = buyoutPrice > 0 ? buyoutPrice : 0;
+        this.HighestBidderId = -1;
+        this.EndMs = endMs;
+        this.Settled = false;
+    }
+}
+
+internal class AuctionRefundEntry {
+    public int PlayerId;
+    public int Amount;
+
+    public AuctionRefundEntry(int playerId, int amount) {
+        this.PlayerId = playerId;
+        this.Amount = amount;
+    }
+}
+
+// 商用拍卖行与竞价托管账本：最小加价步长、一口价秒杀、临期反狙击延时与超车退款账单。
+public class NetAuctionBidHouse {
+    private long antiSnipeWindowMs;
+    private long antiSnipeExtendMs;
+    private List<AuctionListingRecord> listings;
+    private List<AuctionRefundEntry> refunds;
+
+    public NetAuctionBidHouse(long antiSnipeWindowMs, long antiSnipeExtendMs) {
+        this.antiSnipeWindowMs = antiSnipeWindowMs > 0L ? antiSnipeWindowMs : 0L;
+        this.antiSnipeExtendMs = antiSnipeExtendMs > 0L ? antiSnipeExtendMs : 0L;
+        this.listings = new List<AuctionListingRecord>();
+        this.refunds = new List<AuctionRefundEntry>();
+    }
+
+    public bool CreateListing(int listingId, int sellerId, int itemId,
+        int startPrice, int minIncrement, int buyoutPrice, long endMs) {
+        if (this.GetListing(listingId) != null) { return false; }
+        this.listings.Add(new AuctionListingRecord(
+            listingId, sellerId, itemId, startPrice, minIncrement, buyoutPrice, endMs));
+        return true;
+    }
+
+    public AuctionListingRecord GetListing(int listingId) {
+        for (int i = 0; i < this.listings.Count; i = i + 1) {
+            if (this.listings[i].ListingId == listingId) { return this.listings[i]; }
+        }
+        return null;
+    }
+
+    public bool PlaceBid(int listingId, int bidderId, int amount, long nowMs) {
+        AuctionListingRecord rec = this.GetListing(listingId);
+        if (rec == null || rec.Settled || nowMs > rec.EndMs) { return false; }
+        if (bidderId == rec.SellerId) { return false; }
+
+        int minRequired = rec.HighestBidderId < 0
+            ? rec.CurrentBid
+            : (rec.CurrentBid + rec.MinIncrement);
+        if (amount < minRequired) { return false; }
+
+        if (rec.HighestBidderId >= 0) {
+            this.AddRefund(rec.HighestBidderId, rec.CurrentBid);
+        }
+        rec.HighestBidderId = bidderId;
+        rec.CurrentBid = amount;
+
+        if (rec.BuyoutPrice > 0 && amount >= rec.BuyoutPrice) {
+            rec.CurrentBid = rec.BuyoutPrice;
+            rec.Settled = true;
+            return true;
+        }
+
+        if (this.antiSnipeWindowMs > 0L && (rec.EndMs - nowMs) <= this.antiSnipeWindowMs) {
+            rec.EndMs = rec.EndMs + this.antiSnipeExtendMs;
+        }
+        return true;
+    }
+
+    public int SettleExpired(long nowMs) {
+        int settledCount = 0;
+        for (int i = 0; i < this.listings.Count; i = i + 1) {
+            AuctionListingRecord rec = this.listings[i];
+            if (!rec.Settled && nowMs > rec.EndMs) {
+                rec.Settled = true;
+                settledCount = settledCount + 1;
+            }
+        }
+        return settledCount;
+    }
+
+    public int PendingRefund(int playerId) {
+        for (int i = 0; i < this.refunds.Count; i = i + 1) {
+            if (this.refunds[i].PlayerId == playerId) {
+                return this.refunds[i].Amount;
+            }
+        }
+        return 0;
+    }
+
+    private void AddRefund(int playerId, int amount) {
+        for (int i = 0; i < this.refunds.Count; i = i + 1) {
+            if (this.refunds[i].PlayerId == playerId) {
+                this.refunds[i].Amount = this.refunds[i].Amount + amount;
+                return;
+            }
+        }
+        this.refunds.Add(new AuctionRefundEntry(playerId, amount));
+    }
+}
+
+internal class BackfillSlot {
+    public int MatchId;
+    public int TargetMmr;
+    public int Tolerance;
+    public int OfferedPlayerId;
+    public long OfferExpiresMs;
+    public bool Filled;
+
+    public BackfillSlot(int matchId, int targetMmr, int tolerance) {
+        this.MatchId = matchId;
+        this.TargetMmr = targetMmr;
+        this.Tolerance = tolerance > 0 ? tolerance : 100;
+        this.OfferedPlayerId = -1;
+        this.OfferExpiresMs = 0L;
+        this.Filled = false;
+    }
+}
+
+internal class BackfillCandidate {
+    public int PlayerId;
+    public int Mmr;
+
+    public BackfillCandidate(int playerId, int mmr) {
+        this.PlayerId = playerId;
+        this.Mmr = mmr;
+    }
+}
+
+// 商用缺人局实时热补位调度器：按 MMR 容差挑选最接近候补玩家、限时邀约与拒接/超时回退。
+public class NetBackfillQueueManager {
+    private List<BackfillSlot> slots;
+    private List<BackfillCandidate> candidates;
+
+    public NetBackfillQueueManager() {
+        this.slots = new List<BackfillSlot>();
+        this.candidates = new List<BackfillCandidate>();
+    }
+
+    public void RegisterOpenSlot(int matchId, int targetMmr, int tolerance) {
+        this.slots.Add(new BackfillSlot(matchId, targetMmr, tolerance));
+    }
+
+    public void EnqueueCandidate(int playerId, int mmr) {
+        for (int i = 0; i < this.candidates.Count; i = i + 1) {
+            if (this.candidates[i].PlayerId == playerId) {
+                this.candidates[i].Mmr = mmr;
+                return;
+            }
+        }
+        this.candidates.Add(new BackfillCandidate(playerId, mmr));
+    }
+
+    // 为空缺对局撮合最佳 MMR 候补并下发限时邀约；返回被邀约玩家 ID，无合适人选返回 -1。
+    public int DispatchOffer(int matchId, long nowMs, long offerTtlMs) {
+        BackfillSlot slot = this.FindOpenSlot(matchId);
+        if (slot == null || slot.OfferedPlayerId >= 0) { return -1; }
+
+        int bestIdx = -1;
+        int bestDelta = 2147483647;
+        for (int i = 0; i < this.candidates.Count; i = i + 1) {
+            int delta = this.candidates[i].Mmr - slot.TargetMmr;
+            if (delta < 0) { delta = -delta; }
+            if (delta <= slot.Tolerance && delta < bestDelta) {
+                bestDelta = delta;
+                bestIdx = i;
+            }
+        }
+        if (bestIdx < 0) { return -1; }
+
+        int pid = this.candidates[bestIdx].PlayerId;
+        this.candidates.RemoveAt(bestIdx);
+        slot.OfferedPlayerId = pid;
+        slot.OfferExpiresMs = nowMs + (offerTtlMs > 0L ? offerTtlMs : 15000L);
+        return pid;
+    }
+
+    public bool RespondOffer(int matchId, int playerId, bool accept, long nowMs) {
+        BackfillSlot slot = this.FindOpenSlot(matchId);
+        if (slot == null || slot.OfferedPlayerId != playerId) { return false; }
+        if (nowMs > slot.OfferExpiresMs) {
+            slot.OfferedPlayerId = -1;
+            slot.OfferExpiresMs = 0L;
+            return false;
+        }
+        if (accept) {
+            slot.Filled = true;
+            return true;
+        }
+        slot.OfferedPlayerId = -1;
+        slot.OfferExpiresMs = 0L;
+        return true;
+    }
+
+    public int OpenSlotCount() {
+        int c = 0;
+        for (int i = 0; i < this.slots.Count; i = i + 1) {
+            if (!this.slots[i].Filled) { c = c + 1; }
+        }
+        return c;
+    }
+
+    private BackfillSlot FindOpenSlot(int matchId) {
+        for (int i = 0; i < this.slots.Count; i = i + 1) {
+            if (this.slots[i].MatchId == matchId && !this.slots[i].Filled) {
+                return this.slots[i];
+            }
+        }
+        return null;
+    }
+}

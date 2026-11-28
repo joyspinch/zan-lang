@@ -152,6 +152,7 @@ typedef struct {
     zgl_int u_wind_params, u_dist_fade;
     zgl_int u_world_grid_params, u_world_grid_color;
     zgl_int u_caustics_params, u_caustics_color;
+    zgl_int u_ice_frost_params, u_ice_frost_color;
     zgl_int u_light_dir, u_light_color, u_light_count, u_ambient;
     zgl_int u_cam_pos, u_cam_valid, u_material, u_emissive;
     zgl_int u_point_pos, u_point_color, u_point_count;
@@ -236,6 +237,8 @@ static float g_game_world_grid_params[4] = { 0.0f, 1.0f, 0.05f, 0.0f }; /* enabl
 static float g_game_world_grid_color[3] = { 0.0f, 0.9f, 1.0f };
 static float g_game_caustics_params[4] = { 0.0f, 1.0f, 0.0f, 0.0f }; /* enabled, scale, phase, strength */
 static float g_game_caustics_color[3] = { 0.4f, 0.9f, 1.0f };
+static float g_game_ice_frost_params[4] = { 0.0f, 2.0f, 0.0f, 2.5f }; /* enabled, scale, glint_strength, fresnel_power */
+static float g_game_ice_frost_color[3] = { 0.65f, 0.92f, 1.0f };
 static float g_game_color_grade[2] = { 1.0f, 1.0f }; /* saturation, contrast */
 static float g_game_color_tint[3] = { 1.0f, 1.0f, 1.0f };
 static float g_game_post_lens[2] = { 0.0f, 0.0f }; /* fxaa, chromatic */
@@ -248,6 +251,7 @@ static float g_game_post_duotone_light[3] = { 0.2f, 1.0f, 0.35f }; /* light_r, g
 static float g_game_post_crt[4] = { 0.0f, 64.0f, 0.0f, 1.0f }; /* intensity, count, curvature, glow_boost */
 static float g_game_post_outline_params[2] = { 0.0f, 0.2f }; /* strength, threshold */
 static float g_game_post_outline_color[3] = { 0.0f, 0.0f, 0.0f };
+static float g_game_post_thermal[3] = { 0.0f, 1.0f, 0.0f }; /* strength, sensitivity, cold_shift */
 static uint32_t g_game_light_version = 1;
 
 static zan_game_mesh *g_game_meshes = NULL;
@@ -548,6 +552,8 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
 "uniform vec3 uWorldGridColor;\n" \
 "uniform vec4 uCausticsParams;\n" \
 "uniform vec3 uCausticsColor;\n" \
+"uniform vec4 uIceFrostParams;\n" \
+"uniform vec3 uIceFrostColor;\n" \
 "uniform vec3 uCamPos;\n" \
 "uniform int uCamValid;\n" \
 "uniform vec2 uMaterial;\n" \
@@ -753,6 +759,16 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
     "            rgb += uCausticsColor * (cNet * cUp * clamp(uCausticsParams.w, 0.0, 2.0));\n" \
     "        }\n" \
     "    }\n" \
+    "    if (uIceFrostParams.x > 0.5 && uIceFrostParams.z > 0.0005) {\n" \
+    "        vec3 fN = normalize(v_normal);\n" \
+    "        vec3 fV = uCamValid > 0.5 ? normalize(uCamPos - v_world_pos) : vec3(0.0, 0.0, 1.0);\n" \
+    "        float fEdge = pow(clamp(1.0 - abs(dot(fN, fV)), 0.0, 1.0), max(uIceFrostParams.w, 0.5));\n" \
+    "        vec3 fPos = v_world_pos * max(uIceFrostParams.y, 0.2);\n" \
+    "        float fFacet = abs(sin(fPos.x * 7.3 + fPos.z * 5.1) * cos(fPos.y * 6.7 - fPos.x * 4.3));\n" \
+    "        float fGlint = pow(clamp(fFacet, 0.0, 1.0), 4.0);\n" \
+    "        float fStr = clamp(uIceFrostParams.z, 0.0, 2.0);\n" \
+    "        rgb += uIceFrostColor * ((fEdge * 0.75 + fGlint * 0.65) * fStr);\n" \
+    "    }\n" \
     "    if (uCamValid != 0) {\n" \
     "        float ndv = clamp(dot(N, V), 0.0, 1.0);\n" \
     "        if (uHemiOn != 0) {\n" \
@@ -891,6 +907,7 @@ static const char *const ZAN_GAME_POST_FS =
 "uniform vec4 uPostCrt;\n"
 "uniform vec2 uPostOutlineParams;\n"
 "uniform vec3 uPostOutlineColor;\n"
+"uniform vec3 uPostThermal;\n"
 "in vec2 v_uv;\n"
 "out vec4 frag;\n"
 "vec3 brightPass(vec3 c, float th) {\n"
@@ -1013,6 +1030,20 @@ static const char *const ZAN_GAME_POST_FS =
     "        float oMask = smoothstep(uPostOutlineParams.y, uPostOutlineParams.y + 0.08, oMag);\n"
     "        col = mix(col, uPostOutlineColor, oMask * clamp(uPostOutlineParams.x, 0.0, 1.0));\n"
     "    }\n"
+    "    if (uPostThermal.x > 0.0005) {\n"
+    "        float tLum = dot(col, vec3(0.299, 0.587, 0.114));\n"
+    "        float tVal = clamp(tLum * max(uPostThermal.y, 0.1) + uPostThermal.z, 0.0, 1.0);\n"
+    "        vec3 c0 = vec3(0.04, 0.06, 0.45);\n"
+    "        vec3 c1 = vec3(0.48, 0.08, 0.65);\n"
+    "        vec3 c2 = vec3(0.95, 0.25, 0.05);\n"
+    "        vec3 c3 = vec3(1.00, 0.92, 0.15);\n"
+    "        vec3 c4 = vec3(1.00, 1.00, 1.00);\n"
+    "        vec3 tCol = tVal < 0.25 ? mix(c0, c1, tVal * 4.0)\n"
+    "            : (tVal < 0.50 ? mix(c1, c2, (tVal - 0.25) * 4.0)\n"
+    "            : (tVal < 0.75 ? mix(c2, c3, (tVal - 0.50) * 4.0)\n"
+    "            : mix(c3, c4, (tVal - 0.75) * 4.0)));\n"
+    "        col = mix(col, tCol, clamp(uPostThermal.x, 0.0, 1.0));\n"
+    "    }\n"
     "    if (uVignette > 0.001) {\n"
     "        vec2 d = (v_uv - vec2(0.5)) * 2.0;\n"
     "        float vig = clamp(1.0 - uVignette * dot(d, d) * 0.5, 0.0, 1.0);\n"
@@ -1062,6 +1093,7 @@ typedef struct {
     zgl_int u_post_crt;
     zgl_int u_post_outline_params;
     zgl_int u_post_outline_color;
+    zgl_int u_post_thermal;
 } zan_game_post_program;
 
 static const char *const ZAN_GAME_SKYBOX_FS =
@@ -1321,6 +1353,10 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
         : g_game_gl->GetUniformLocation(program, "uCausticsParams");
     zgl_int caustics_color = instanced ? -1
         : g_game_gl->GetUniformLocation(program, "uCausticsColor");
+    zgl_int ice_frost_params = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uIceFrostParams");
+    zgl_int ice_frost_color = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uIceFrostColor");
     zgl_int color = instanced ? 0
         : g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
@@ -1401,6 +1437,8 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
     prog->u_world_grid_color = world_grid_color;
     prog->u_caustics_params = caustics_params;
     prog->u_caustics_color = caustics_color;
+    prog->u_ice_frost_params = ice_frost_params;
+    prog->u_ice_frost_color = ice_frost_color;
     prog->u_color = color;
     prog->u_light_dir = light_dir;
     prog->u_light_color = light_color;
@@ -1478,6 +1516,8 @@ static zan_game_program *zan_game_skin_program_get(void) {
     zgl_int world_grid_color = g_game_gl->GetUniformLocation(program, "uWorldGridColor");
     zgl_int caustics_params = g_game_gl->GetUniformLocation(program, "uCausticsParams");
     zgl_int caustics_color = g_game_gl->GetUniformLocation(program, "uCausticsColor");
+    zgl_int ice_frost_params = g_game_gl->GetUniformLocation(program, "uIceFrostParams");
+    zgl_int ice_frost_color = g_game_gl->GetUniformLocation(program, "uIceFrostColor");
     zgl_int color = g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
     zgl_int light_color = g_game_gl->GetUniformLocation(program, "uLightColor[0]");
@@ -1546,6 +1586,8 @@ static zan_game_program *zan_game_skin_program_get(void) {
     g_game_skin_prog.u_world_grid_color = world_grid_color;
     g_game_skin_prog.u_caustics_params = caustics_params;
     g_game_skin_prog.u_caustics_color = caustics_color;
+    g_game_skin_prog.u_ice_frost_params = ice_frost_params;
+    g_game_skin_prog.u_ice_frost_color = ice_frost_color;
     g_game_skin_prog.u_color = color;
     g_game_skin_prog.u_light_dir = light_dir;
     g_game_skin_prog.u_light_color = light_color;
@@ -2040,6 +2082,14 @@ static void zan_game_bind_shadow_uniforms(const zan_gl_api *gl, zan_game_program
     }
     if (prog->u_caustics_color >= 0) {
         gl->Uniform3fv(prog->u_caustics_color, 1, g_game_caustics_color);
+    }
+    if (prog->u_ice_frost_params >= 0) {
+        gl->Uniform4f(prog->u_ice_frost_params,
+            g_game_ice_frost_params[0], g_game_ice_frost_params[1],
+            g_game_ice_frost_params[2], g_game_ice_frost_params[3]);
+    }
+    if (prog->u_ice_frost_color >= 0) {
+        gl->Uniform3fv(prog->u_ice_frost_color, 1, g_game_ice_frost_color);
     }
 }
 
@@ -2595,7 +2645,7 @@ done:
 static zan_game_post_program *zan_game_post_program_get(void) {
     if (g_game_post_prog.program) return &g_game_post_prog;
     char vs_src[1024];
-    char fs_src[8192];
+    char fs_src[16384];
     const char *head = zan_game_glsl_head();
     snprintf(vs_src, sizeof(vs_src), "%s%s", head, ZAN_GAME_POST_VS);
     snprintf(fs_src, sizeof(fs_src), "%s%s", head, ZAN_GAME_POST_FS);
@@ -2620,6 +2670,7 @@ static zan_game_post_program *zan_game_post_program_get(void) {
     g_game_post_prog.u_post_crt = g_game_gl->GetUniformLocation(prog, "uPostCrt");
     g_game_post_prog.u_post_outline_params = g_game_gl->GetUniformLocation(prog, "uPostOutlineParams");
     g_game_post_prog.u_post_outline_color = g_game_gl->GetUniformLocation(prog, "uPostOutlineColor");
+    g_game_post_prog.u_post_thermal = g_game_gl->GetUniformLocation(prog, "uPostThermal");
     return &g_game_post_prog;
 }
 
@@ -2756,6 +2807,9 @@ ZAN_GAME_API int32_t zan_game_postprocess3d(int32_t surface_id, float exposure,
     }
     if (prog->u_post_outline_color >= 0) {
         gl->Uniform3fv(prog->u_post_outline_color, 1, g_game_post_outline_color);
+    }
+    if (prog->u_post_thermal >= 0) {
+        gl->Uniform3fv(prog->u_post_thermal, 1, g_game_post_thermal);
     }
     gl->BindVertexArray(g_game_post_vao);
     gl->DrawArrays(ZGL_TRIANGLES, 0, 3);
@@ -3181,4 +3235,32 @@ ZAN_GAME_API void zan_game_set_post_edge_outline3d(float strength,
     g_game_post_outline_color[0] = r > 0.0f ? r : 0.0f;
     g_game_post_outline_color[1] = g > 0.0f ? g : 0.0f;
     g_game_post_outline_color[2] = b > 0.0f ? b : 0.0f;
+}
+
+ZAN_GAME_API void zan_game_set_ice_frost3d(int32_t enabled, float scale,
+    float glint_strength, float fresnel_power, float r, float g, float b) {
+    g_game_ice_frost_params[0] = enabled ? 1.0f : 0.0f;
+    g_game_ice_frost_params[1] = scale > 0.2f ? scale : 2.0f;
+    if (glint_strength < 0.0f) glint_strength = 0.0f;
+    if (glint_strength > 2.0f) glint_strength = 2.0f;
+    g_game_ice_frost_params[2] = glint_strength;
+    if (fresnel_power < 0.5f) fresnel_power = 0.5f;
+    if (fresnel_power > 8.0f) fresnel_power = 8.0f;
+    g_game_ice_frost_params[3] = fresnel_power;
+    g_game_ice_frost_color[0] = r > 0.0f ? r : 0.0f;
+    g_game_ice_frost_color[1] = g > 0.0f ? g : 0.0f;
+    g_game_ice_frost_color[2] = b > 0.0f ? b : 0.0f;
+}
+
+ZAN_GAME_API void zan_game_set_post_thermal_heat3d(float strength,
+    float sensitivity, float cold_shift) {
+    if (strength < 0.0f) strength = 0.0f;
+    if (strength > 1.0f) strength = 1.0f;
+    if (sensitivity < 0.1f) sensitivity = 0.1f;
+    if (sensitivity > 5.0f) sensitivity = 5.0f;
+    if (cold_shift < -0.5f) cold_shift = -0.5f;
+    if (cold_shift > 0.5f) cold_shift = 0.5f;
+    g_game_post_thermal[0] = strength;
+    g_game_post_thermal[1] = sensitivity;
+    g_game_post_thermal[2] = cold_shift;
 }

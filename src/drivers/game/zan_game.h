@@ -278,6 +278,16 @@ ZAN_GAME_API void zan_game_set_water_caustics3d(int32_t enabled, float scale,
 ZAN_GAME_API void zan_game_set_post_edge_outline3d(float strength,
     float threshold, float r, float g, float b);
 
+/* GPU 世界空间冰霜晶面闪烁与菲涅尔冰膜覆层（Ice/Frost Glint，零贴图零额外 Pass）：
+ * enabled != 0 时按视角菲涅尔与世界空间晶面叠加冷霜闪烁光效，glint_strength [0..2]。 */
+ZAN_GAME_API void zan_game_set_ice_frost3d(int32_t enabled, float scale,
+    float glint_strength, float fresnel_power, float r, float g, float b);
+
+/* GPU 后处理红外热成像伪彩视图（Thermal/IR Heat Vision，五段铁红光谱色带，单 Pass 零额外 FBO）：
+ * strength [0..1] 控制混入强度，sensitivity 控制亮度放大系数，cold_shift [-0.5..0.5] 控制冷端偏移。 */
+ZAN_GAME_API void zan_game_set_post_thermal_heat3d(float strength,
+    float sensitivity, float cold_shift);
+
 #ifdef __cplusplus
 }
 #endif
