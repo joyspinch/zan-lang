@@ -170,6 +170,36 @@ description: Zan 游戏开发规范——Gui 美术风格一致性、帧循环�
   比对才能证明整棵树同构。坑出处：把工厂自动化的敌军寻路抽成公共距离场时，
   用 400 张随机网格、28532 格比对，零差异才算过。
 
+## 商业化外壳：每个游戏都要的那一层（模板打磨实测）
+
+- **外壳用基座，不各写一遍**：`Game.Foundation` 的 `GameProfile`（纪录/计数/
+  开关，落用户数据目录 `ZanGames/<游戏>/`，无头用 `InMemory()`）、`SfxPresets` +
+  `SfxBank.AddPresets/AddSynth/Warm`（零音频文件的程序化音效）、
+  `GuiHost.WindowActive()`（失焦自动暂停——最小化时主循环仍步进逻辑）、
+  Form 应用的 `App.OnUnhandledKey` / `OnWindowBlur`（全局快捷键与失焦，
+  焦点在输入框时不回调）。**存档绝不写工作目录**（安装目录可能只读）。
+- **验收清单**：开始页 → 对局 → 暂停（P/Esc，Esc 不得一键退出）→ 结算
+  （NEW BEST）→ 重开不重启；M 静音入档；首玩操作提示；规则改了就重录回放并
+  补不变量，难度曲线用无头 Sim + 机器人量化（空闲/随机/中等/高手各跑一组）。
+- **画布画法的坑**：`DrawRect(…, thickness)` 是**描边**不是填充（match3/survivor
+  曾全是空心框）——实心用 `FillRect/FillRoundRect/FillCircle`；Canvas 无多边形
+  填充，菱形/三角/六边形用逐行 `FillRect` 扫描线；`FillRadial` 的末参是中心不透明度，
+  传 0 什么都不画。
+- **皮肤**：`app.UseSkin(...)` 会让 `app.UseCss(...)` 失效——游戏皮肤只用
+  `UseCss(<内嵌 CSS 串>)`。HTML 场景里 `<p>/<h1>` 是 Typography 不是 Element，
+  按 `is Element` 改字会静默失效；皮肤按钮定高，竖向 padding 会把字挤没——写
+  显式 height + 仅横向 padding。GuiHost 标题栏盖住内容顶部约 32px，HUD 从
+  `app.ContentTop()` 起排。
+- **内嵌资源**：`Canvas.ImageWidth(path)` 只认磁盘，发布后返回 0 致整图跳过——
+  用 `CDraw.ImageWidth/ImageHeight(c, path)`（与 BlitImage 同一解析）。
+- **GuiHost 只在请求重绘时步进**：动画/提示计时在静止画面会冻结，动画期每帧请求一帧。
+- **像素复核（macOS）**：GuiHost 游戏须在 `host.Run` 前
+  `host.OnAppCreated((Gui.App a) => Gui.Backend.UiDriver.Enable(a))`（会话在窗口
+  显示时启动，`Start` 里启用已晚）；GuiHost 的 `dump pixels` 前必须 `redraw full`，
+  否则是全白帧。被其他窗口遮住的 Mac 窗口拿不到显示帧，`redraw full` 永久挂起——
+  多个游戏同时截图要用跨进程锁串行（实测 9 个并行代理互相遮挡）；自动暂停在
+  自动化脚本运行时应豁免，否则截到的是暂停页。
+
 ## 主题档案索引
 
 - 门控渲染、合成契约、世界画布与 HUD 边界、资源内嵌、精灵合批：[game-dev-render.md](references/game-dev-render.md)
