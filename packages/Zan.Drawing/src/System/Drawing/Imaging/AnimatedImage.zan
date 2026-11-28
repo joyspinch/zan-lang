@@ -18,7 +18,11 @@ public class AnimatedImage : IDisposable {
     }
 
     public bool IsValid {
-        get { return this.handle != 0 && this.Width > 0 && this.Height > 0 && this.FrameCount > 0; }
+        get {
+            lock (this) {
+                return this.handle != 0 && this.Width > 0 && this.Height > 0 && this.FrameCount > 0;
+            }
+        }
     }
 
     public static AnimatedImage FromFile(string path) {
@@ -34,29 +38,43 @@ public class AnimatedImage : IDisposable {
 
     // 返回第 index 帧的展示时长（毫秒）。
     public int GetFrameDelayMs(int index) {
-        if (this.handle == 0 || index < 0 || index >= this.FrameCount) return 0;
-        return ImageCodec.AnimFrameDelayMs(this.handle, index);
+        lock (this) {
+            if (this.handle == 0 || index < 0 || index >= this.FrameCount) return 0;
+            return ImageCodec.AnimFrameDelayMs(this.handle, index);
+        }
     }
 
     // 分配新 ImageBuffer 并拷出第 index 帧（ARGB32）。
     public ImageBuffer GetFrame(int index) {
-        if (!this.IsValid || index < 0 || index >= this.FrameCount) return new ImageBuffer(0, 0);
-        return ImageBuffer.FromAnimHandle(this.handle, index);
+        lock (this) {
+            if (this.handle == 0 || this.Width <= 0 || this.Height <= 0 || index < 0 || index >= this.FrameCount) {
+                return new ImageBuffer(0, 0);
+            }
+            return ImageBuffer.FromAnimHandle(this.handle, index);
+        }
     }
 
     // 将第 index 帧直接拷贝到已有同尺寸 ImageBuffer（零分配热路径）。
     public bool CopyFrameTo(int index, ImageBuffer dst) {
-        if (!this.IsValid || dst == null || dst.IsEmpty) return false;
-        if (index < 0 || index >= this.FrameCount) return false;
-        if (dst.Width != this.Width || dst.Height != this.Height) return false;
-        int expected = this.Width * this.Height;
-        return ImageCodec.AnimCopyFrame(this.handle, index, dst.Pixels, expected) == expected;
+        if (dst == null || dst.IsEmpty || dst.Pixels == 0) return false;
+        lock (this) {
+            if (this.handle == 0 || this.Width <= 0 || this.Height <= 0 || index < 0 || index >= this.FrameCount) {
+                return false;
+            }
+            if (dst.Width != this.Width || dst.Height != this.Height) return false;
+            long expectedL = (long)this.Width * (long)this.Height;
+            if (expectedL <= 0L || expectedL * 4L > 2147483591L) return false;
+            int expected = (int)expectedL;
+            return ImageCodec.AnimCopyFrame(this.handle, index, dst.Pixels, expected) == expected;
+        }
     }
 
     public void Dispose() {
-        if (this.handle != 0) {
-            ImageCodec.AnimClose(this.handle);
-            this.handle = 0;
+        lock (this) {
+            if (this.handle != 0) {
+                ImageCodec.AnimClose(this.handle);
+                this.handle = 0;
+            }
         }
     }
 }

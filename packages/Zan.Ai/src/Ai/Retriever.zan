@@ -75,13 +75,13 @@ public class Retriever : IRetriever {
         if (k < 1) { return outp; }
 
         // --- 第一路：向量 ---
-        List<VectorHit> vHits = new List<VectorHit>();
+        List<VectorHit> vHits = null;
         if (this.vectors != null && queryVector != null) {
             vHits = this.vectors.Search(queryVector, this.candidatePool);
         }
 
         // --- 第二路：BM25 ---
-        List<Bm25Hit> bHits = new List<Bm25Hit>();
+        List<Bm25Hit> bHits = null;
         if (this.keyword != null && queryText != null && queryText.Length > 0) {
             bHits = this.keyword.SearchTop(queryText, this.candidatePool);
         }
@@ -89,26 +89,41 @@ public class Retriever : IRetriever {
         // --- RRF 融合 ---
         // 累积表：id → (两路排名, RRF 分数, 原始分数)
         Dictionary<int, RetrieverHit> acc = new Dictionary<int, RetrieverHit>();
-        for (int i = 0; i < vHits.Count; i = i + 1) {
-            int id = vHits[i].id;
-            int rank = i + 1;   // 1 起
-            RetrieverHit h = RetrieverHit.Of(id);
-            h.vectorRank = rank;
-            h.vectorDistance = vHits[i].distance;
-            h.score = h.score + 1.0 / ((double)this.rrfK + (double)rank);
-            acc[id] = h;
-        }
-        for (int i = 0; i < bHits.Count; i = i + 1) {
-            int id = bHits[i].id;
-            int rank = i + 1;
-            RetrieverHit h = null;
-            if (!acc.TryGetValue(id, out h)) {
-                h = RetrieverHit.Of(id);
-                acc[id] = h;
+        if (vHits != null) {
+            for (int i = 0; i < vHits.Count; i = i + 1) {
+                VectorHit vh = vHits[i];
+                if (vh == null) { continue; }
+                int id = vh.id;
+                int rank = i + 1;   // 1 起
+                RetrieverHit h = null;
+                if (!acc.TryGetValue(id, out h)) {
+                    h = RetrieverHit.Of(id);
+                    acc[id] = h;
+                }
+                if (h.vectorRank == 0) {
+                    h.vectorRank = rank;
+                    h.vectorDistance = vh.distance;
+                }
+                h.score = h.score + 1.0 / ((double)this.rrfK + (double)rank);
             }
-            h.bm25Rank = rank;
-            h.bm25Score = bHits[i].score;
-            h.score = h.score + 1.0 / ((double)this.rrfK + (double)rank);
+        }
+        if (bHits != null) {
+            for (int i = 0; i < bHits.Count; i = i + 1) {
+                Bm25Hit bh = bHits[i];
+                if (bh == null) { continue; }
+                int id = bh.id;
+                int rank = i + 1;
+                RetrieverHit h = null;
+                if (!acc.TryGetValue(id, out h)) {
+                    h = RetrieverHit.Of(id);
+                    acc[id] = h;
+                }
+                if (h.bm25Rank == 0) {
+                    h.bm25Rank = rank;
+                    h.bm25Score = bh.score;
+                }
+                h.score = h.score + 1.0 / ((double)this.rrfK + (double)rank);
+            }
         }
 
         // --- 取出并排序 ---
@@ -126,12 +141,15 @@ public class Retriever : IRetriever {
     // 只做向量检索（不融合）——需要原始距离时用。
     public List<RetrieverHit> SearchVector(List<double> queryVector, int k) {
         List<RetrieverHit> outp = new List<RetrieverHit>();
-        if (this.vectors == null || queryVector == null) { return outp; }
+        if (k < 1 || this.vectors == null || queryVector == null) { return outp; }
         List<VectorHit> hits = this.vectors.Search(queryVector, k);
+        if (hits == null) { return outp; }
         for (int i = 0; i < hits.Count; i = i + 1) {
-            RetrieverHit h = RetrieverHit.Of(hits[i].id);
+            VectorHit vh = hits[i];
+            if (vh == null) { continue; }
+            RetrieverHit h = RetrieverHit.Of(vh.id);
             h.vectorRank = i + 1;
-            h.vectorDistance = hits[i].distance;
+            h.vectorDistance = vh.distance;
             h.score = 1.0 / ((double)this.rrfK + (double)(i + 1));
             outp.Add(h);
         }
@@ -141,14 +159,17 @@ public class Retriever : IRetriever {
     // 只做字面检索（不融合）。
     public List<RetrieverHit> SearchKeyword(string queryText, int k) {
         List<RetrieverHit> outp = new List<RetrieverHit>();
-        if (this.keyword == null || queryText == null || queryText.Length == 0) {
+        if (k < 1 || this.keyword == null || queryText == null || queryText.Length == 0) {
             return outp;
         }
         List<Bm25Hit> hits = this.keyword.SearchTop(queryText, k);
+        if (hits == null) { return outp; }
         for (int i = 0; i < hits.Count; i = i + 1) {
-            RetrieverHit h = RetrieverHit.Of(hits[i].id);
+            Bm25Hit bh = hits[i];
+            if (bh == null) { continue; }
+            RetrieverHit h = RetrieverHit.Of(bh.id);
             h.bm25Rank = i + 1;
-            h.bm25Score = hits[i].score;
+            h.bm25Score = bh.score;
             h.score = 1.0 / ((double)this.rrfK + (double)(i + 1));
             outp.Add(h);
         }
@@ -165,7 +186,8 @@ public class Retriever : IRetriever {
     // 内存档的原文存在 `VectorStore` 里（`VectorStore.TextOf`）。
     public string TextOf(int id) {
         if (this.vectors == null) { return ""; }
-        return this.vectors.TextOf(id);
+        string txt = this.vectors.TextOf(id);
+        return txt == null ? "" : txt;
     }
 
     // 协程版检索——内存档没有 IO 等待，直接转发。

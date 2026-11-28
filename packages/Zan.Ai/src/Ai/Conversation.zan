@@ -41,11 +41,14 @@ public class Conversation {
     public void Clear() { this.messages.Clear(); }
 
     public int UsedTokens() {
-        int sum = 0;
+        long sum = 0L;
         for (int i = 0; i < this.messages.Count; i = i + 1) {
-            sum = sum + Chunking.EstimateTokens(this.messages[i].content);
+            AiMessage msg = this.messages[i];
+            if (msg == null) { continue; }
+            sum = sum + (long)Chunking.EstimateTokens(msg.content);
         }
-        return sum;
+        if (sum > 2147483647L) { return 2147483647; }
+        return (int)sum;
     }
 
     // 超预算时从最老完整轮开始裁剪，保住进行中或最新一轮。
@@ -55,20 +58,24 @@ public class Conversation {
         if (count == 0) { return; }
 
         int[] msgTokens = new int[count];
-        int total = 0;
+        long total = 0L;
+        long budgetL = (long)this.budgetTokens;
         for (int idx = 0; idx < count; idx = idx + 1) {
-            int t = Chunking.EstimateTokens(this.messages[idx].content);
+            AiMessage msg = this.messages[idx];
+            int t = msg == null ? 0 : Chunking.EstimateTokens(msg.content);
             msgTokens[idx] = t;
-            total = total + t;
+            total = total + (long)t;
         }
-        if (total <= this.budgetTokens) { return; }
+        if (total <= budgetL) { return; }
 
         int pending = -1;
         for (int i = count - 1; i >= 0; i = i - 1) {
-            if (!this.messages[i].IsUser()) { continue; }
+            AiMessage mi = this.messages[i];
+            if (mi == null || !mi.IsUser()) { continue; }
             bool answered = false;
             for (int j = i + 1; j < count; j = j + 1) {
-                if (this.messages[j].IsAssistant()) { answered = true; break; }
+                AiMessage mj = this.messages[j];
+                if (mj != null && mj.IsAssistant()) { answered = true; break; }
             }
             if (!answered) { pending = i; }
             break;
@@ -79,7 +86,7 @@ public class Conversation {
         int pos = regionEnd - 1;
         while (pos >= 0) {
             int j = pos;
-            while (j >= 0 && !this.messages[j].IsUser()) { j = j - 1; }
+            while (j >= 0 && (this.messages[j] == null || !this.messages[j].IsUser())) { j = j - 1; }
             if (j < 0) { break; }
             starts.Add(j);
             pos = j - 1;
@@ -87,11 +94,11 @@ public class Conversation {
 
         int dropCount = 0;
         for (int k = starts.Count - 1; k >= 0; k = k - 1) {
-            if (total <= this.budgetTokens) { break; }
+            if (total <= budgetL) { break; }
             int start = starts[k];
             int end = k == 0 ? regionEnd - 1 : starts[k - 1] - 1;
             for (int j = start; j <= end; j = j + 1) {
-                total = total - msgTokens[j];
+                total = total - (long)msgTokens[j];
             }
             dropCount = end + 1;
         }
@@ -117,7 +124,9 @@ public class Conversation {
             outp.Add(AiMessage.System(systemPrompt));
         }
         for (int i = 0; i < this.messages.Count; i = i + 1) {
-            outp.Add(this.messages[i]);
+            if (this.messages[i] != null) {
+                outp.Add(this.messages[i]);
+            }
         }
         return outp;
     }
@@ -126,9 +135,11 @@ public class Conversation {
         JsonWriter w = new JsonWriter();
         w.WriteStartArray();
         for (int i = 0; i < this.messages.Count; i = i + 1) {
+            AiMessage msg = this.messages[i];
+            if (msg == null) { continue; }
             w.WriteStartObject();
-            w.WriteProperty("role", this.messages[i].role);
-            w.WriteProperty("content", this.messages[i].content);
+            w.WriteProperty("role", msg.role == null ? "" : msg.role);
+            w.WriteProperty("content", msg.content == null ? "" : msg.content);
             w.WriteEndObject();
         }
         w.WriteEndArray();
@@ -136,22 +147,28 @@ public class Conversation {
     }
 
     public bool FromJson(string json) {
-        this.messages.Clear();
-        if (json == null || json.Length == 0) { return true; }
+        if (json == null || json.Length == 0) {
+            this.messages.Clear();
+            return true;
+        }
         try {
             JsonDoc doc = JsonDoc.Parse(json);
             if (doc == null || doc.KindAt(0) != 4) {
                 this.lastError = "会话内容格式不对";
                 return false;
             }
+            List<AiMessage> parsed = new List<AiMessage>();
             int count = doc.Count(0);
             int p = doc.FirstChild(0);
             for (int i = 0; i < count; i = i + 1) {
                 if (p < 0) { break; }
-                this.messages.Add(new AiMessage(doc.Str(p, "role", "user"),
-                    doc.Str(p, "content", "")));
+                if (doc.KindAt(p) == 5) {
+                    parsed.Add(new AiMessage(doc.Str(p, "role", "user"),
+                        doc.Str(p, "content", "")));
+                }
                 p = doc.NextSibling(p);
             }
+            this.messages = parsed;
             return true;
         } catch (Exception _ex) {
             this.lastError = "会话内容无法解析: " + _ex.Message;
