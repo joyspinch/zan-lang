@@ -11,7 +11,7 @@ public class GeoSchema {
     private List<Dictionary<string, string>> items;
 
     public GeoSchema(string type) {
-        this.schemaType = type;
+        this.schemaType = type != null ? type : "";
         this.properties = new List<GeoProp>();
         this.items = new List<Dictionary<string, string>>();
     }
@@ -84,8 +84,8 @@ public class GeoSchema {
     /* 添加 FAQ 问答对 */
     public GeoSchema AddFAQ(string question, string answer) {
         Dictionary<string, string> qa = new Dictionary<string, string>();
-        qa.Add("q", question);
-        qa.Add("a", answer);
+        qa.Add("q", question != null ? question : "");
+        qa.Add("a", answer != null ? answer : "");
         this.items.Add(qa);
         return this;
     }
@@ -93,22 +93,34 @@ public class GeoSchema {
     /* 添加面包屑条目 */
     public GeoSchema AddBreadcrumb(string name, string url) {
         Dictionary<string, string> crumb = new Dictionary<string, string>();
-        crumb.Add("name", name);
-        crumb.Add("url", url);
+        crumb.Add("name", name != null ? name : "");
+        crumb.Add("url", url != null ? url : "");
         this.items.Add(crumb);
         return this;
     }
 
     private static const string HEX_LOWER = "0123456789abcdef";
 
-    /* JSON 字符串安全转义（同时转义 < > & 及控制字符，阻断 JSON-LD <script> 逃逸 XSS） */
+    private static bool NeedsJsonEscapeByte(string s, int i, int len) {
+        int b = s[i] & 255;
+        if (b < 32 || b == 34 || b == 92 || b == 60 || b == 62 || b == 38 || b == 127) {
+            return true;
+        }
+        // U+2028 (E2 80 A8) / U+2029 (E2 80 A9)：阻断 JSON-LD <script> 行分隔符注入
+        if (b == 226 && i + 2 < len && (s[i + 1] & 255) == 128) {
+            int b2 = s[i + 2] & 255;
+            if (b2 == 168 || b2 == 169) { return true; }
+        }
+        return false;
+    }
+
+    /* JSON 字符串安全转义（同时转义 < > &、控制字符及 U+2028/U+2029，阻断 JSON-LD <script> 逃逸 XSS） */
     public static string JsonEscape(string s) {
         if (s == null || s.Length == 0) { return ""; }
         int len = s.Length;
         int first = -1;
         for (int i = 0; i < len; i = i + 1) {
-            int b = s[i] & 255;
-            if (b < 32 || b == 34 || b == 92 || b == 60 || b == 62 || b == 38) {
+            if (GeoSchema.NeedsJsonEscapeByte(s, i, len)) {
                 first = i;
                 break;
             }
@@ -124,8 +136,7 @@ public class GeoSchema {
         int len = s.Length;
         int first = -1;
         for (int i = 0; i < len; i = i + 1) {
-            int b = s[i] & 255;
-            if (b < 32 || b == 34 || b == 92 || b == 60 || b == 62 || b == 38) {
+            if (GeoSchema.NeedsJsonEscapeByte(s, i, len)) {
                 first = i;
                 break;
             }
@@ -143,7 +154,7 @@ public class GeoSchema {
         nint basePtr = (nint)s;
         for (int i = first; i < len; i = i + 1) {
             int b = s[i] & 255;
-            if (b < 32 || b == 34 || b == 92 || b == 60 || b == 62 || b == 38) {
+            if (b < 32 || b == 34 || b == 92 || b == 60 || b == 62 || b == 38 || b == 127) {
                 if (i > start) { sb.Append(new StringView(basePtr + (nint)start, i - start)); }
                 if (b == 34) { sb.Append("\\\""); }
                 else if (b == 92) { sb.Append("\\\\"); }
@@ -155,15 +166,31 @@ public class GeoSchema {
                 else if (b == 60) { sb.Append("\\u003c"); }
                 else if (b == 62) { sb.Append("\\u003e"); }
                 else if (b == 38) { sb.Append("\\u0026"); }
+                else if (b == 127) { sb.Append("\\u007f"); }
                 else {
                     sb.Append("\\u00");
                     sb.Append(GeoSchema.HEX_LOWER[(b >> 4) & 15]);
                     sb.Append(GeoSchema.HEX_LOWER[b & 15]);
                 }
                 start = i + 1;
+            } else if (b == 226 && i + 2 < len && (s[i + 1] & 255) == 128) {
+                int b2 = s[i + 2] & 255;
+                if (b2 == 168 || b2 == 169) {
+                    if (i > start) { sb.Append(new StringView(basePtr + (nint)start, i - start)); }
+                    sb.Append(b2 == 168 ? "\\u2028" : "\\u2029");
+                    i = i + 2;
+                    start = i + 1;
+                }
             }
         }
         if (len > start) { sb.Append(new StringView(basePtr + (nint)start, len - start)); }
+    }
+
+    private static string SafeDictGet(Dictionary<string, string> dict, string key) {
+        if (dict == null) { return ""; }
+        string val;
+        if (dict.TryGetValue(key, out val) && val != null) { return val; }
+        return "";
     }
 
     internal void ToJsonInto(StringBuilder sb) {
@@ -175,6 +202,7 @@ public class GeoSchema {
         int pCount = this.properties.Count;
         for (int k = 0; k < pCount; k = k + 1) {
             GeoProp prop = this.properties[k];
+            if (prop == null) { continue; }
             sb.Append(",\n  \"");
             GeoSchema.JsonEscapeInto(prop.Key(), sb);
             sb.Append("\": \"");
@@ -189,9 +217,9 @@ public class GeoSchema {
             for (int i = 0; i < iCount; i = i + 1) {
                 Dictionary<string, string> qa = this.items[i];
                 sb.Append("    {\n      \"@type\": \"Question\",\n      \"name\": \"");
-                GeoSchema.JsonEscapeInto(qa["q"], sb);
+                GeoSchema.JsonEscapeInto(GeoSchema.SafeDictGet(qa, "q"), sb);
                 sb.Append("\",\n      \"acceptedAnswer\": {\n        \"@type\": \"Answer\",\n        \"text\": \"");
-                GeoSchema.JsonEscapeInto(qa["a"], sb);
+                GeoSchema.JsonEscapeInto(GeoSchema.SafeDictGet(qa, "a"), sb);
                 sb.Append("\"\n      }\n    }");
                 if (i < iCount - 1) { sb.Append(","); }
                 sb.Append("\n");
@@ -206,9 +234,9 @@ public class GeoSchema {
                 sb.Append("    {\n      \"@type\": \"ListItem\",\n      \"position\": ");
                 sb.Append(j + 1);
                 sb.Append(",\n      \"name\": \"");
-                GeoSchema.JsonEscapeInto(crumb["name"], sb);
+                GeoSchema.JsonEscapeInto(GeoSchema.SafeDictGet(crumb, "name"), sb);
                 sb.Append("\",\n      \"item\": \"");
-                GeoSchema.JsonEscapeInto(crumb["url"], sb);
+                GeoSchema.JsonEscapeInto(GeoSchema.SafeDictGet(crumb, "url"), sb);
                 sb.Append("\"\n    }");
                 if (j < iCount - 1) { sb.Append(","); }
                 sb.Append("\n");
@@ -227,14 +255,18 @@ public class GeoSchema {
 
     /* 序列化为标准 JSON-LD 字符串 */
     public string ToJson() {
-        StringBuilder sb = new StringBuilder(128 + this.properties.Count * 64 + this.items.Count * 192);
+        long capL = 128L + (long)this.properties.Count * 64L + (long)this.items.Count * 192L;
+        if (capL > 65536L) { capL = 65536L; }
+        StringBuilder sb = new StringBuilder((int)capL);
         this.ToJsonInto(sb);
         return sb.ToString();
     }
 
     /* 渲染为可直接放入 HTML <head> 的 script 标签 */
     public string ToHtmlTag() {
-        StringBuilder sb = new StringBuilder(192 + this.properties.Count * 64 + this.items.Count * 192);
+        long capL = 192L + (long)this.properties.Count * 64L + (long)this.items.Count * 192L;
+        if (capL > 65536L) { capL = 65536L; }
+        StringBuilder sb = new StringBuilder((int)capL);
         this.ToHtmlTagInto(sb);
         return sb.ToString();
     }

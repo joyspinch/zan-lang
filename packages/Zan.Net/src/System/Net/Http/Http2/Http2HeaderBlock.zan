@@ -15,9 +15,13 @@ public class Http2HeaderBlock {
     private int fragments;
     private int limit;
 
-    public Http2HeaderBlock(int limit) { this.limit = limit; }
+    public Http2HeaderBlock(int limit) { this.limit = limit > 0 ? limit : 0; }
 
     public byte[] Accept(Http2Frame frame, byte[] payload) {
+        if (frame == null) { throw new IOException("Null HTTP2 frame"); }
+        if (frame.length < 0 || (frame.length > 0 && (payload == null || frame.length > payload.Length))) {
+            throw new IOException("Invalid HTTP2 frame payload");
+        }
         if (this.streamId != 0 && (frame.type != Http2FrameType.CONTINUATION || frame.streamId != this.streamId)) {
             throw new IOException("Interleaved HTTP2 header block");
         }
@@ -26,48 +30,57 @@ public class Http2HeaderBlock {
         int size = frame.length;
         if (frame.type == Http2FrameType.HEADERS) {
             if (this.streamId != 0) { throw new IOException("Nested HTTP2 headers"); }
-            this.streamId = frame.streamId;
-            this.endStream = (frame.flags & Http2Flags.END_STREAM) != 0;
-            this.count = 0;
-            this.fragments = 0;
-            this.bytes = null;
+            if (frame.streamId <= 0) { throw new IOException("Invalid HTTP2 stream id"); }
             if ((frame.flags & Http2Flags.PADDED) != 0) {
-                if (size < 1) { throw new IOException("Missing HTTP2 padding length"); }
+                if (size < 1 || payload == null) { throw new IOException("Missing HTTP2 padding length"); }
                 start = 1;
                 size = size - 1 - (payload[0] & 255);
                 if (size < 0) { throw new IOException("Invalid HTTP2 padding"); }
             }
             if ((frame.flags & Http2Flags.PRIORITY) != 0) {
-                if (size < 5) { throw new IOException("Truncated HTTP2 priority"); }
+                if (size < 5 || payload == null || start > payload.Length - 5) { throw new IOException("Truncated HTTP2 priority"); }
                 int dependency = ((payload[start] & 127) << 24) | ((payload[start + 1] & 255) << 16)
                     | ((payload[start + 2] & 255) << 8) | (payload[start + 3] & 255);
                 if (dependency == frame.streamId) { throw new IOException("HTTP2 priority self dependency"); }
                 start = start + 5;
                 size = size - 5;
             }
+            if (size > this.limit) { throw new IOException("HTTP2 header block limit"); }
             // 单帧完结快路径：直接按实际片段长度分配一次并拷贝，免去 64 KiB 暂存缓冲与二次拷贝。
             if ((frame.flags & Http2Flags.END_HEADERS) != 0) {
-                if (size > this.limit) { throw new IOException("HTTP2 header block limit"); }
                 byte[] single = new byte[size];
                 if (size > 0) { NativeMemory.Copy((nint)single, (nint)payload + start, size); }
+                this.endStream = (frame.flags & Http2Flags.END_STREAM) != 0;
                 this.count = size;
                 this.fragments = 1;
+                this.bytes = null;
                 this.streamId = 0;
                 return single;
             }
+            this.streamId = frame.streamId;
+            this.endStream = (frame.flags & Http2Flags.END_STREAM) != 0;
+            this.count = 0;
+            this.fragments = 0;
             int initCap = size < 1024 ? 1024 : size;
             if (initCap > this.limit) { initCap = this.limit; }
             this.bytes = new byte[initCap];
         } else if (this.streamId == 0) { throw new IOException("Unexpected HTTP2 continuation"); }
         this.fragments = this.fragments + 1;
-        if (this.fragments > 16 || size > this.limit - this.count) { throw new IOException("HTTP2 header block limit"); }
+        if (this.fragments > 16 || size > this.limit - this.count) {
+            this.streamId = 0;
+            this.bytes = null;
+            this.count = 0;
+            this.fragments = 0;
+            throw new IOException("HTTP2 header block limit");
+        }
         int need = this.count + size;
         if (this.bytes == null || need > this.bytes.Length) {
-            int newCap = this.bytes != null ? this.bytes.Length * 2 : 1024;
-            while (newCap < need) { newCap = newCap * 2; }
-            if (newCap > this.limit) { newCap = this.limit; }
+            long newCapL = this.bytes != null && this.bytes.Length > 0 ? (long)this.bytes.Length * 2L : 1024L;
+            while (newCapL < (long)need) { newCapL = newCapL * 2L; }
+            if (newCapL > (long)this.limit) { newCapL = (long)this.limit; }
+            int newCap = (int)newCapL;
             byte[] grown = new byte[newCap];
-            if (this.count > 0) { NativeMemory.Copy((nint)grown, (nint)this.bytes, this.count); }
+            if (this.count > 0 && this.bytes != null) { NativeMemory.Copy((nint)grown, (nint)this.bytes, this.count); }
             this.bytes = grown;
         }
         if (size > 0) { NativeMemory.Copy((nint)this.bytes + this.count, (nint)payload + start, size); }
@@ -81,8 +94,12 @@ public class Http2HeaderBlock {
     }
 
     public static int DataOffset(Http2Frame frame, byte[] payload) {
+        if (frame == null) { throw new IOException("Null HTTP2 frame"); }
+        if (frame.length < 0 || (frame.length > 0 && (payload == null || frame.length > payload.Length))) {
+            throw new IOException("Invalid HTTP2 DATA payload");
+        }
         if ((frame.flags & Http2Flags.PADDED) == 0) { return 0; }
-        if (frame.length < 1 || (payload[0] & 255) >= frame.length) { throw new IOException("Invalid HTTP2 DATA padding"); }
+        if (frame.length < 1 || payload == null || (payload[0] & 255) >= frame.length) { throw new IOException("Invalid HTTP2 DATA padding"); }
         return 1;
     }
 
@@ -103,7 +120,7 @@ public class Http2HeaderBlock {
     }
 
     public static int ContentLength(string value) {
-        if (value.Length == 0) { throw new IOException("Empty HTTP2 content-length"); }
+        if (value == null || value.Length == 0) { throw new IOException("Empty HTTP2 content-length"); }
         int n = 0;
         for (int i = 0; i < value.Length; i = i + 1) {
             int digit = (value[i] & 255) - 48;
@@ -121,21 +138,35 @@ public class Http2HeaderBlock {
         return false;
     }
 
+    private static bool IsValidAuthority(string value) {
+        if (value == null || value.Length == 0) { return false; }
+        for (int i = 0; i < value.Length; i = i + 1) {
+            int c = value[i] & 255;
+            // 拒绝空白、控制符、非 ASCII、userinfo(@)、路径/查询/片段/反斜杠(/ ? # \)
+            if (c <= 32 || c >= 127 || c == 64 || c == 47 || c == 63 || c == 35 || c == 92) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     // Returns declared length or -1. Trailer and CONNECT semantics are explicitly unsupported.
     public static int Validate(List<HpackHeader> headers, bool request) {
+        if (headers == null) { throw new IOException("Null HTTP2 headers"); }
         bool regular = false;
         bool method = false;
         bool path = false;
         bool scheme = false;
         bool authority = false;
         bool status = false;
+        bool hasHost = false;
         int length = -1;
         List<string> pseudos = new List<string>();
         string host = "";
         string auth = "";
         for (int i = 0; i < headers.Count; i = i + 1) {
             HpackHeader h = headers[i];
-            if (h.name == null || h.name.Length == 0 || h.value == null || Http2HeaderBlock.HasUpperAscii(h.name)) { throw new IOException("Invalid HTTP2 header name"); }
+            if (h == null || h.name == null || h.name.Length == 0 || h.value == null || Http2HeaderBlock.HasUpperAscii(h.name)) { throw new IOException("Invalid HTTP2 header name"); }
             for (int j = 0; j < h.value.Length; j = j + 1) {
                 int c = h.value[j] & 255;
                 if (c == 0 || c == 10 || c == 13 || c == 127 || (c < 32 && c != 9)) { throw new IOException("Invalid HTTP2 header value"); }
@@ -157,7 +188,7 @@ public class Http2HeaderBlock {
                     if (h.value != "http" && h.value != "https") { throw new IOException("Invalid HTTP2 scheme"); }
                     scheme = true;
                 } else if (request && h.name == ":authority") {
-                    if (h.value.Length == 0 || h.value.Contains("@") || h.value.Contains("/") || h.value.Contains(" ")) { throw new IOException("Invalid HTTP2 authority"); }
+                    if (!Http2HeaderBlock.IsValidAuthority(h.value)) { throw new IOException("Invalid HTTP2 authority"); }
                     authority = true;
                     auth = h.value;
                 } else if (!request && h.name == ":status") {
@@ -175,12 +206,14 @@ public class Http2HeaderBlock {
                     length = Http2HeaderBlock.ContentLength(h.value);
                 }
                 if (h.name == "host") {
-                    if (host != "") { throw new IOException("Duplicate HTTP2 host"); }
+                    if (hasHost) { throw new IOException("Duplicate HTTP2 host"); }
+                    if (!Http2HeaderBlock.IsValidAuthority(h.value)) { throw new IOException("Invalid HTTP2 host"); }
+                    hasHost = true;
                     host = h.value;
                 }
             }
         }
-        if ((request && (!method || !path || !scheme || !authority)) || (!request && !status) || (host != "" && auth != "" && host != auth)) {
+        if ((request && (!method || !path || !scheme || !authority)) || (!request && !status) || (hasHost && authority && host != auth)) {
             throw new IOException("Missing or conflicting HTTP2 pseudo-header");
         }
         return length;

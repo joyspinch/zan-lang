@@ -69,13 +69,13 @@ public class WechatPayV2Request {
         int n = this.fields.Count;
         int[] order = new int[n];
         int cnt = 0;
-        int bodyLen = 0;
+        long bodyLenL = 0L;
         for (int i = 0; i < n; i = i + 1) {
             WechatPayV2Field field = this.fields[i];
-            if (field.value.Length > 0 && field.name != "sign") {
+            if (field.value != null && field.value.Length > 0 && field.name != "sign") {
                 order[cnt] = i;
                 cnt = cnt + 1;
-                bodyLen = bodyLen + field.name.Length + 1 + field.value.Length;
+                bodyLenL = bodyLenL + (long)field.name.Length + 1L + (long)field.value.Length;
             }
         }
         if (cnt > 1) {
@@ -103,7 +103,11 @@ public class WechatPayV2Request {
             }
         }
         int mkLen = merchantKey == null ? 0 : merchantKey.Length;
-        int totalLen = (cnt > 0 ? bodyLen + cnt : 0) + 4 + mkLen;
+        long totalLenL = (cnt > 0 ? bodyLenL + (long)cnt : 0L) + 4L + (long)mkLen;
+        if (totalLenL > 2147483591L) {
+            throw new Exception("WechatPayV2Request.Canonical: payload exceeds maximum buffer size");
+        }
+        int totalLen = (int)totalLenL;
         byte[] buf = new byte[totalLen];
         nint bp = (nint)buf;
         int di = 0;
@@ -132,12 +136,12 @@ public class WechatPayV2Request {
     }
 
     public string Sign(string merchantKey, string signType) {
+        string mk = merchantKey == null ? "" : merchantKey;
         string st = (signType == null || signType.Length == 0) ? "MD5" : signType;
-        string source = this.Canonical(merchantKey);
+        string source = this.Canonical(mk);
         byte[] digest;
         if (st == "HMAC-SHA256") {
-            digest = Hmac.Sha256Mac(merchantKey, merchantKey.Length,
-                                    source, source.Length);
+            digest = Hmac.Sha256Mac(mk, mk.Length, source, source.Length);
             return Hex.Encode(digest, 32).ToUpperAscii();
         }
         if (st != "MD5") {
@@ -170,16 +174,19 @@ public class WechatPayV2Request {
     }
 
     public string ToSignedXml(WechatPayV2Config config) {
-        if (!this.Has("appid") && config.AppId.Length > 0) {
+        if (config == null) {
+            throw new ArgumentException("微信支付 V2 配置不能为空");
+        }
+        if (!this.Has("appid") && config.AppId != null && config.AppId.Length > 0) {
             this.Set("appid", config.AppId);
         }
-        if (!this.Has("mch_id") && config.MerchantId.Length > 0) {
+        if (!this.Has("mch_id") && config.MerchantId != null && config.MerchantId.Length > 0) {
             this.Set("mch_id", config.MerchantId);
         }
         if (!this.Has("nonce_str")) {
             this.Set("nonce_str", WechatPayV3Client.RandomNonceHex());
         }
-        if (!this.Has("notify_url") && config.NotifyUrl.Length > 0) {
+        if (!this.Has("notify_url") && config.NotifyUrl != null && config.NotifyUrl.Length > 0) {
             this.Set("notify_url", config.NotifyUrl);
         }
         if (config.SignType == "HMAC-SHA256" && !this.Has("sign_type")) {
@@ -197,26 +204,30 @@ public class WechatPayV2Request {
 
     public string ToXml() {
         int n = this.fields.Count;
-        int totalLen = 11; // "<xml></xml>"
-        int cdataHits = 0;
+        long totalLenL = 11L; // "<xml></xml>"
+        long cdataHits = 0L;
         int firstCdataField = -1;
         for (int i = 0; i < n; i = i + 1) {
             WechatPayV2Field f = this.fields[i];
             string v = f.value == null ? "" : f.value;
             int vlen = v.Length;
-            totalLen = totalLen + f.name.Length * 2 + vlen + 17;
+            totalLenL = totalLenL + (long)f.name.Length * 2L + (long)vlen + 17L;
             if (vlen >= 3) {
                 int hit = XmlUtil.FindCdataEnd(v, 0, vlen);
                 if (hit >= 0) {
                     if (firstCdataField < 0) { firstCdataField = i; }
                     while (hit >= 0) {
-                        cdataHits = cdataHits + 1;
+                        cdataHits = cdataHits + 1L;
                         hit = XmlUtil.FindCdataEnd(v, hit + 3, vlen);
                     }
                 }
             }
         }
-        totalLen = totalLen + cdataHits * 12;
+        totalLenL = totalLenL + cdataHits * 12L;
+        if (totalLenL > 2147483591L) {
+            throw new Exception("WechatPayV2Request.ToXml: payload exceeds maximum buffer size");
+        }
+        int totalLen = (int)totalLenL;
         byte[] buf = new byte[totalLen];
         nint bp = (nint)buf;
         NativeMemory.Copy(bp, (nint)"<xml>", 5);
@@ -269,8 +280,8 @@ public class WechatPayV2Request {
         int rootGt = NativeMemory.Find(xp, pos + 4, 62, xlen - (pos + 4));
         if (rootGt < 0) { return result; }
         pos = rootGt + 1;
-        int xmlEnd = xml.IndexOf("</xml>", pos);
-        if (xmlEnd < 0) { xmlEnd = xlen; }
+        int xmlEnd = xml.LastIndexOf("</xml>");
+        if (xmlEnd < pos) { xmlEnd = xlen; }
         while (pos < xmlEnd) {
             int open = NativeMemory.Find(xp, pos, 60, xmlEnd - pos);
             if (open < 0 || open + 1 >= xmlEnd) { break; }
