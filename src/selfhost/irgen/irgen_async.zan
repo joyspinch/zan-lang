@@ -528,8 +528,20 @@ partial class Irgen {
         Node ty = curAsyncRetElem;
         ExprVal value = new ExprVal("0", MkType("int"));
         if (s.a != null) {
-            stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
-            value = s.a.kind == AK.AwaitExpr() ? EmitAwait(s.a.a, true) : GenExpr(s.a);
+            ResetStmtTemps();
+            bool isAw = s.a.kind == AK.AwaitExpr();
+            bool arm = eaActive;
+            if (isAw) {
+                value = EmitAwait(s.a.a, false);
+                if (arm) { EnterCallArm(); }
+                if (value != null && value.ty != null && (ArcManaged(value.ty) || value.ty.ival >= 1)) {
+                    TransferTempOwner(value);
+                    AddTemp(value.op, value.ty);
+                }
+            } else {
+                if (arm) { EnterCallArm(); }
+                value = GenExpr(s.a);
+            }
             if (ty != null) {
                 value = ApplyUserConv(ty, value, false);
                 if (!convApplied) { value = StrSlotConv(ty, value); }
@@ -539,6 +551,7 @@ partial class Irgen {
             }
             if (IsStructTy(value.ty)) { value = CopyStructValue(value); }
             else if (!IsConstOperand(value.op)) { EmitArcRetain(value.op, value.ty); }
+            if (arm) { LeaveCallArm(); }
         }
         bool pending = finBodies.Count > 0 && asyncPendingBase != 0;
         string bits = "0";
@@ -593,8 +606,16 @@ partial class Irgen {
                 reg = AddLocal(s.sval, ty);
                 EA(reg, lt);
             }
-            res = NarrowToDeclared(res, ty);
-            string sv = Coerce(res, lt);
+            bool arm = eaActive;
+            if (arm) { EnterCallArm(); }
+            if (res != null && res.ty != null && (ArcManaged(res.ty) || res.ty.ival >= 1)) {
+                TransferTempOwner(res);
+                AddTemp(res.op, res.ty);
+            }
+            ExprVal src = ApplyUserConv(ty, res, false);
+            if (!convApplied) { src = StrSlotConv(ty, src); }
+            src = NarrowToDeclared(src, ty);
+            string sv = Coerce(src, lt);
             if (curAsync && isBx) {
                 string cell = OwnedCell(ty); string payload = NT();
                 L("  " + payload + " = bitcast i8* " + cell + " to " + lt + "*");
@@ -602,6 +623,9 @@ partial class Irgen {
                 L("  store i8* " + cell + ", i8** " + reg);
             } else {
                 L("  store " + lt + " " + sv + ", " + lt + "* " + reg);
+            }
+            if (ty != null && (ArcManaged(ty) || ty.ival >= 1)) {
+                if (!TransferTempOwner(src)) { EmitArcRetain(sv, ty); }
             }
             if (curAsync) {
                 locName.Add(s.sval);
@@ -614,21 +638,54 @@ partial class Irgen {
                 locOpaque.Add(false);
                 ArmAsyncLocal(reg, ty, isBx);
             }
-            // await result is already +1 owned; transfer ownership (no retain).
-            // Its destination is armed before any remaining operand cleanup.
-            TransferAwaitTemp(res);
+            if (arm) { LeaveCallArm(); }
             EmitTempReleases();
             return;
         }
         if (k == AK.ReturnStmt()) {
+            ResetStmtTemps();
             ExprVal res = EmitAwait(s.a.a);
-            ReleaseLocalsFrom(0);
-            if (curRet == "void") { L("  ret void"); }
-            else {
+            if (curRet == "void") {
+                if (res != null && res.ty != null && (ArcManaged(res.ty) || res.ty.ival >= 1)) {
+                    TransferTempOwner(res);
+                    EmitArcRelease(res.op, res.ty);
+                }
+                EmitTempReleases();
+                EmitSyncReturnFins("");
+                if (term) { return; }
+                ReleaseLocalsFrom(0);
+                L("  ret void");
+            } else {
+                bool arm = eaActive;
+                if (arm) { EnterCallArm(); }
+                if (res != null && res.ty != null && (ArcManaged(res.ty) || res.ty.ival >= 1)) {
+                    TransferTempOwner(res);
+                    AddTemp(res.op, res.ty);
+                }
                 ExprVal src = ApplyUserConv(curRetTy, res, false);
                 if (!convApplied) { src = StrSlotConv(curRetTy, src); }
                 src = NarrowToDeclared(src, curRetTy);
-                L("  ret " + curRet + " " + Coerce(src, curRet));
+                string rv = IsNullableValue(curRetTy) ? BoxFor(src, curRetTy) : Coerce(src, curRet);
+                if (IsStructTy(src.ty)) {
+                    src = CopyStructValue(src);
+                    rv = Coerce(src, curRet);
+                } else if (!IsConstOperand(src.op)) {
+                    if (ArcManaged(src.ty) || (src.ty != null && src.ty.ival >= 1)) {
+                        EmitArcRetain(src.op, src.ty);
+                    } else if ((curRet == "i8*" || (src.ty != null && src.ty.sval == "object"))
+                        && (src.ty == null || MapType(src.ty) == "i8*")
+                        && (curRetTy == null || curRetTy.sval != "Task" || binder.FindType("Task") != null)) {
+                        EmitArcRetainObject(src.op);
+                    }
+                }
+                if (arm) { LeaveCallArm(); }
+                string pending = ArmSyncPendingReturn(src);
+                EmitTempReleases();
+                EmitSyncReturnFins(pending);
+                if (term) { return; }
+                ReleaseLocalsFrom(0);
+                CommitSyncPendingReturn(pending);
+                L("  ret " + curRet + " " + rv);
             }
             term = true;
             return;
@@ -713,6 +770,29 @@ partial class Irgen {
         AssignAsyncForeachSlots(s.c);
         AssignAsyncForeachSlots(s.d);
     }
+    int CountAsyncStmtSlots(Node s) {
+        if (s == null || s.kind == AK.Lambda()) { return 0; }
+        int n = 0;
+        if (s.kind == AK.SwitchStmt() || s.kind == AK.LockStmt()) { n = 1; }
+        int i = 0;
+        while (i < s.kids.Count) { n = n + CountAsyncStmtSlots(s.kids[i]); i = i + 1; }
+        n = n + CountAsyncStmtSlots(s.a) + CountAsyncStmtSlots(s.b)
+            + CountAsyncStmtSlots(s.c) + CountAsyncStmtSlots(s.d);
+        return n;
+    }
+    void AssignAsyncStmtSlots(Node s) {
+        if (s == null || s.kind == AK.Lambda()) { return; }
+        if (s.kind == AK.SwitchStmt() || s.kind == AK.LockStmt()) {
+            s.ival = asyncForeachBase + asyncForeachNext;
+            asyncForeachNext = asyncForeachNext + 1;
+        }
+        int i = 0;
+        while (i < s.kids.Count) { AssignAsyncStmtSlots(s.kids[i]); i = i + 1; }
+        AssignAsyncStmtSlots(s.a);
+        AssignAsyncStmtSlots(s.b);
+        AssignAsyncStmtSlots(s.c);
+        AssignAsyncStmtSlots(s.d);
+    }
     void GenAsyncMethod(Node cls, Node m) {
         bool stat = IsStatic(m);
         int thisExtra = 0; if (!stat) { thisExtra = 1; }
@@ -749,8 +829,9 @@ partial class Irgen {
         // inside the body. The frame is heap memory, so it survives the
         // suspension.
         int feCount = 0; if (m.d != null) { feCount = CountAsyncForeach(m.d); }
+        int stmtSlotCount = 0; if (m.d != null) { stmtSlotCount = CountAsyncStmtSlots(m.d); }
         int subSlots = 1;
-        asyncExceptionBase = subBase + subSlots + feCount * 6;
+        asyncExceptionBase = subBase + subSlots + feCount * 6 + stmtSlotCount;
         asyncExceptionDepth = 0;
         asyncCatchBindings = new List<Node>();
         asyncCatchEntries = new List<int>();
@@ -766,7 +847,10 @@ partial class Irgen {
         }
         asyncForeachBase = subBase + subSlots;
         asyncForeachNext = 0;
-        if (m.d != null) { AssignAsyncForeachSlots(m.d); }
+        if (m.d != null) {
+            AssignAsyncForeachSlots(m.d);
+            AssignAsyncStmtSlots(m.d);
+        }
         usesAsync = true;
         string sym = MethodSym(cls.sval, m);
         string resumeSym = sym + "$resume";

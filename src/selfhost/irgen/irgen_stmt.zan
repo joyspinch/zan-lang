@@ -215,15 +215,19 @@ partial class Irgen {
         syncFlow.localScopes.Add(s); syncFlow.localScopeStarts.Add(lockScope);
         BranchTempScope lockBts = EnterBranchTempScope();
         ExprVal v = GenExpr(s.a);
-        bool keepAsyncLock = curAsync && (ArcManaged(v.ty) || (v.ty != null && v.ty.ival >= 1));
-        if (!curAsync && (ArcManaged(v.ty) || (v.ty != null && v.ty.ival >= 1))) {
+        if (ArcManaged(v.ty) || (v.ty != null && v.ty.ival >= 1)) {
             string vll = MapType(v.ty);
             string lockReg = AddLocal(".lock.obj", v.ty);
-            EA(lockReg, vll);
+            if (curAsync) {
+                MaterializeAsyncLoopLocal(lockReg, vll, (int)s.ival);
+            } else {
+                EA(lockReg, vll);
+            }
             L("  store " + vll + " " + v.op + ", " + vll + "* " + lockReg);
             if (!TransferTempOwner(v)) { EmitArcRetain(v.op, v.ty); }
+            if (curAsync) { ArmAsyncLocal(lockReg, v.ty, false); }
         }
-        if (!keepAsyncLock) { LeaveBranchTempScope(lockBts); }
+        LeaveBranchTempScope(lockBts);
         string vt = MapType(v.ty);
         string obj = v.op;
         if (vt != "i8*") {
@@ -290,7 +294,6 @@ partial class Irgen {
         finBodies.RemoveAt(finBodies.Count - 1);
         finLive.RemoveAt(finLive.Count - 1);
         finMonSlot.RemoveAt(finMonSlot.Count - 1);
-        if (keepAsyncLock) { LeaveBranchTempScope(lockBts); }
         if (!term) { ReleaseLocalsFrom(lockScope); }
         TrimLocals(lockScope);
         syncFlow.localScopes.RemoveAt(syncFlow.localScopes.Count - 1);
@@ -437,12 +440,18 @@ partial class Irgen {
                     if (s.b.kind == AK.Lambda() && IsDelegate(pty0)) {
                         AnnotateLambda(s.b, pty0);
                     }
+                    bool initArm0 = eaActive;
+                    if (initArm0) { EnterCallArm(); }
                     ExprVal iv0;
                     if (IsBindingTy(pty0)) {
                         ExprVal bv0 = GenBindingValue(s.b, pty0);
                         iv0 = bv0 != null ? bv0 : GenExpr(s.b);
                     } else {
                         iv0 = GenExpr(s.b);
+                    }
+                    if (!IsNullableValue(pty0)) {
+                        iv0 = ApplyUserConv(pty0, iv0, false);
+                        if (!convApplied) { iv0 = StrSlotConv(pty0, iv0); }
                     }
                     if (isBx) {
                         string c = OwnedCell(pty0);
@@ -461,6 +470,7 @@ partial class Irgen {
                         L("  store " + plt0 + " " + sv0 + ", " + plt0 + "* " + preg0);
                         EmitArcRetain(sv0, pty0);
                     }
+                    if (initArm0) { LeaveCallArm(); }
                 } else {
                     Node sd0 = binder.FindType(pty0.sval);
                     if (sd0 != null && sd0.kind == AK.StructDecl() && pty0.ival == 0 && !IsNullable(pty0)) {
@@ -616,10 +626,7 @@ partial class Irgen {
         // (arc_is_owned_operand: "owned pattern scope released", "failed
         // pattern before else released"). The temps used to be dropped
         // unreleased and the binding only borrowed them.
-        List<string> svT = stmtTemps; List<string> svTV = stmtTempValues;
-        List<string> svTO = stmtTempOwners; List<Node> svTT = stmtTempTypes;
-        stmtTemps = new List<string>(); stmtTempValues = new List<string>();
-        stmtTempOwners = new List<string>(); stmtTempTypes = new List<Node>();
+        BranchTempScope condBts = EnterBranchTempScope();
         int condScope = locName.Count;
         bool svOwn = ifCondOwnsPattern;
         List<int> svPat = ifCondPatternLocs;
@@ -629,8 +636,7 @@ partial class Irgen {
         string c = GenCond(s.a);
         ifCondOwnsPattern = svOwn;
         ifCondPatternLocs = svPat;
-        EmitTempReleases();
-        stmtTemps = svT; stmtTempValues = svTV; stmtTempOwners = svTO; stmtTempTypes = svTT;
+        LeaveBranchTempScope(condBts);
         int lt = NL(); int le = NL(); int lend = NL();
         if (s.c != null) { L("  br i1 " + c + ", label %L" + lt + ", label %L" + le); }
         else { L("  br i1 " + c + ", label %L" + lt + ", label %L" + lend); }
@@ -662,16 +668,12 @@ partial class Irgen {
     // released at the back edge (ReleaseCondLocals) and when the loop exits
     // (arc_is_owned_operand: "while backedge and false cleanup").
     string GenLoopCond(Node cond) {
-        List<string> svT = stmtTemps; List<string> svTV = stmtTempValues;
-        List<string> svTO = stmtTempOwners; List<Node> svTT = stmtTempTypes;
-        stmtTemps = new List<string>(); stmtTempValues = new List<string>();
-        stmtTempOwners = new List<string>(); stmtTempTypes = new List<Node>();
+        BranchTempScope condBts = EnterBranchTempScope();
         bool svOwn = ifCondOwnsPattern;
         ifCondOwnsPattern = !curAsync;
         string c = GenCond(cond);
         ifCondOwnsPattern = svOwn;
-        EmitTempReleases();
-        stmtTemps = svT; stmtTempValues = svTV; stmtTempOwners = svTO; stmtTempTypes = svTT;
+        LeaveBranchTempScope(condBts);
         return c;
     }
     // Release (without forgetting) the locals a loop condition declared.
@@ -1270,11 +1272,11 @@ partial class Irgen {
         // the raw declaration, or the element slot maps T as an erased i64
         if (en.ty != null && en.ty.kids.Count > 0) { enumTy = en.ty; }
         string enTy = MapType(enumTy);
-        string enReg = AddLocal("__zenum", enumTy);
+        string enReg = AddLocal(".fe.enum", enumTy);
         if (curAsync) { MaterializeAsyncLoopLocal(enReg, enTy, s.ival); }
         else { EA(enReg, enTy); }
         L("  store " + enTy + " " + en.op + ", " + enTy + "* " + enReg);
-        TransferTempOwner(en);
+        if (!TransferTempOwner(en)) { EmitArcRetain(en.op, enumTy); }
         if (curAsync) { ArmAsyncLocal(enReg, enumTy, false); }
         EmitTempReleases();
         string elt = MapType(elemTy);
@@ -1304,6 +1306,7 @@ partial class Irgen {
         loopScopeBase = locName.Count;
         L("  br label %L" + lc);
         Label(lc);
+        ResetStmtTemps();
         string enVal = NT();
         L("  " + enVal + " = load " + enTy + ", " + enTy + "* " + enReg);
         ExprVal curEn = new ExprVal(enVal, enumTy);
@@ -1311,8 +1314,10 @@ partial class Irgen {
         ExprVal mn = EmitInstanceCall(curEn, ecls.sval, "MoveNext", call1);
         string c = NT();
         L("  " + c + " = icmp ne i64 " + mn.op + ", 0");
+        EmitTempReleases();
         L("  br i1 " + c + ", label %L" + lb + ", label %L" + lend);
         Label(lb);
+        ResetStmtTemps();
         ExprVal ev;
         if (curIsField) {
             ev = LoadField(curEn.op, enumTy, "Current");
@@ -1333,6 +1338,7 @@ partial class Irgen {
         } else {
             L("  store " + elt + " " + sv + ", " + elt + "* " + ereg);
         }
+        EmitTempReleases();
         GenStmt(s.c);
         if (!term) { L("  br label %L" + linc); }
         Label(linc);

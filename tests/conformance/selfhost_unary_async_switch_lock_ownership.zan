@@ -1,0 +1,263 @@
+using System;
+using System.Collections.Generic;
+using System.Threading.Tasks;
+
+namespace SelfhostUnaryAsyncSwitchLockOwnership;
+
+class Box {
+    public int Val;
+    public string Name;
+    public Box(int v) { this.Val = v; this.Name = "b_" + v.ToString(); }
+    public int ThrowIntProp {
+        get { return this.Val; }
+        set { throw new Exception("int_set_boom"); }
+    }
+    public bool ThrowBoolProp {
+        get { throw new Exception("bool_get_boom"); }
+    }
+}
+
+class Counter {
+    public int N;
+    public string Tag;
+    public Counter(int n) { this.N = n; this.Tag = "c_" + n.ToString(); }
+    public static Counter operator ++(Counter c) {
+        if (c.N < 0) { throw new Exception("inc_boom"); }
+        return new Counter(c.N + 1);
+    }
+    public static Counter operator -(Counter c) {
+        if (c.N < 0) { throw new Exception("neg_boom"); }
+        return new Counter(-c.N);
+    }
+}
+
+class CounterHolder {
+    public Counter C;
+    public CounterHolder(int n) { this.C = new Counter(n); }
+}
+
+class BoxEnumerator {
+    public int Idx;
+    public bool ThrowMove;
+    public bool ThrowCur;
+    public Box Current {
+        get {
+            if (this.ThrowCur && this.Idx == 2) { throw new Exception("cur_boom"); }
+            return new Box(this.Idx * 10);
+        }
+    }
+    public BoxEnumerator(bool tm, bool tc) { this.Idx = 0; this.ThrowMove = tm; this.ThrowCur = tc; }
+    public bool MoveNext() {
+        this.Idx = this.Idx + 1;
+        if (this.ThrowMove && this.Idx == 2) { throw new Exception("move_boom"); }
+        return this.Idx <= 3;
+    }
+}
+
+class BoxEnumerable {
+    public string Label;
+    public bool ThrowGet;
+    public bool ThrowMove;
+    public bool ThrowCur;
+    public BoxEnumerator Cached;
+    public BoxEnumerable(string l, bool tg, bool tm, bool tc, bool cached) {
+        this.Label = l;
+        this.ThrowGet = tg;
+        this.ThrowMove = tm;
+        this.ThrowCur = tc;
+        if (cached) { this.Cached = new BoxEnumerator(tm, tc); }
+    }
+    public BoxEnumerator GetEnumerator() {
+        if (this.ThrowGet) { throw new Exception("getenum_boom"); }
+        if (this.Cached != null) { return this.Cached; }
+        return new BoxEnumerator(this.ThrowMove, this.ThrowCur);
+    }
+}
+
+class Target {
+    public int V;
+    public string Tag;
+    public Target(int v, string t) { this.V = v; this.Tag = t; }
+}
+
+class Source {
+    public int V;
+    public Source(int v) { this.V = v; }
+    public static implicit operator Target(Source s) {
+        if (s.V < 0) { throw new Exception("imp_boom"); }
+        return new Target(s.V, "imp_" + s.V.ToString());
+    }
+}
+
+class Program {
+    static Box MakeBox(int v) { return new Box(v); }
+    static string MakeStr(int v) { return "s_" + v.ToString(); }
+    static Counter MakeCounter(int n) { return new Counter(n); }
+    static CounterHolder MakeHolder(int n) { return new CounterHolder(n); }
+
+    static async Task<Source> AsyncMakeSource(int v) {
+        await Task.Delay(1);
+        return new Source(v);
+    }
+
+    static int TestPostfixOpOverload() {
+        Counter c = MakeCounter(10);
+        Counter old = c++;
+        int r1 = old.N * 100 + c.N + old.Tag.Length + c.Tag.Length;
+        Counter r2 = ++MakeHolder(5).C;
+        return r1 + r2.N + r2.Tag.Length;
+    }
+
+    static int TestUnaryExprStmtThrows() {
+        int acc = 0;
+        try {
+            -MakeCounter(-5);
+        } catch (Exception e) { acc = acc + e.Message.Length; }
+        try {
+            ++MakeBox(1).ThrowIntProp;
+        } catch (Exception e) { acc = acc + e.Message.Length; }
+        try {
+            MakeBox(1).ThrowIntProp++;
+        } catch (Exception e) { acc = acc + e.Message.Length; }
+        try {
+            Counter old = MakeHolder(-1).C++;
+            acc = acc + old.N;
+        } catch (Exception e) { acc = acc + e.Message.Length; }
+        try {
+            if (MakeBox(1).ThrowBoolProp) { acc = acc + 100; }
+        } catch (Exception e) { acc = acc + e.Message.Length; }
+        return acc;
+    }
+
+    static async Task<int> TestAsyncUnaryHoist() {
+        int acc = 0;
+        ++MakeHolder(5).C;
+        MakeHolder(6).C++;
+        try {
+            ++MakeHolder(-1).C;
+        } catch (Exception e) {
+            await Task.Delay(1);
+            acc = acc + e.Message.Length;
+        }
+        await Task.Delay(1);
+        return acc + 10;
+    }
+
+    static async Task<int> TestAsyncLockLoopAndEarlyReturn(bool earlyRet) {
+        int sum = 0;
+        int i = 0;
+        while (i < 3) {
+            lock (MakeBox(i + 1)) {
+                int x = (i + 1) * 10;
+                sum = sum + x;
+                if (earlyRet && i == 1) { return sum; }
+            }
+            i = i + 1;
+        }
+        try {
+            lock (MakeBox(9)) {
+                int y = 5;
+                if (y > 0) { throw new Exception("lock_boom"); }
+            }
+        } catch (Exception e) {
+            await Task.Delay(1);
+            sum = sum + e.Message.Length;
+        }
+        return sum;
+    }
+
+    static async Task<int> TestAsyncSwitchLoopAndAwait(bool earlyRet) {
+        int sum = 0;
+        int i = 0;
+        while (i < 2) {
+            switch (MakeStr(i + 1)) {
+                case "s_1":
+                    int a = 11;
+                    await Task.Delay(1);
+                    sum = sum + a;
+                    if (earlyRet) { return sum; }
+                    break;
+                case "s_2":
+                    int b = 22;
+                    sum = sum + b;
+                    break;
+                default:
+                    sum = sum + 1;
+                    break;
+            }
+            i = i + 1;
+        }
+        return sum;
+    }
+
+    static Source SyncReturnAwaitHelper(int v) {
+        return await AsyncMakeSource(v);
+    }
+
+    static async Task<Target> AsyncReturnAwaitHelper(int v) {
+        Source s = await AsyncMakeSource(v);
+        Target t = s;
+        return t;
+    }
+
+    static int TestSyncReturnAwait() {
+        int acc = 0;
+        Source s1 = SyncReturnAwaitHelper(5);
+        Target t1 = s1;
+        acc = acc + t1.V + t1.Tag.Length;
+        try {
+            Source s2 = SyncReturnAwaitHelper(-1);
+            Target t2 = s2;
+            acc = acc + t2.V;
+        } catch (Exception e) { acc = acc + e.Message.Length; }
+        return acc;
+    }
+
+    static async Task<int> TestReturnAwaitConversions() {
+        int acc = TestSyncReturnAwait();
+        Target t3 = await AsyncReturnAwaitHelper(7);
+        acc = acc + t3.V + t3.Tag.Length;
+        try {
+            Target t4 = await AsyncReturnAwaitHelper(-1);
+            acc = acc + t4.V;
+        } catch (Exception e) { acc = acc + e.Message.Length; }
+        return acc;
+    }
+
+    static int RunEnumCase(bool tg, bool tm, bool tc) {
+        int sum = 0;
+        foreach (Box b in new BoxEnumerable("e", tg, tm, tc, false)) {
+            sum = sum + b.Val;
+        }
+        return sum;
+    }
+
+    static int TestForeachEnumerable() {
+        int acc = 0;
+        BoxEnumerable src = new BoxEnumerable("e4", false, false, false, true);
+        foreach (Box b in src) { acc = acc + b.Val; }
+        acc = acc + src.Cached.Idx;
+        try {
+            acc = acc + RunEnumCase(true, false, false);
+        } catch (Exception e) { acc = acc + e.Message.Length; }
+        try {
+            acc = acc + RunEnumCase(false, true, false);
+        } catch (Exception e) { acc = acc + e.Message.Length; }
+        try {
+            acc = acc + RunEnumCase(false, false, true);
+        } catch (Exception e) { acc = acc + e.Message.Length; }
+        return acc;
+    }
+
+    static void Main() {
+        Console.WriteLine("postfix=" + TestPostfixOpOverload().ToString());
+        Console.WriteLine("unaryThrow=" + TestUnaryExprStmtThrows().ToString());
+        Console.WriteLine("asyncUnary=" + (await TestAsyncUnaryHoist()).ToString());
+        Console.WriteLine("asyncLock=" + (await TestAsyncLockLoopAndEarlyReturn(false)).ToString());
+        Console.WriteLine("asyncLockEarly=" + (await TestAsyncLockLoopAndEarlyReturn(true)).ToString());
+        Console.WriteLine("asyncSwitch=" + (await TestAsyncSwitchLoopAndAwait(false)).ToString());
+        Console.WriteLine("asyncSwitchEarly=" + (await TestAsyncSwitchLoopAndAwait(true)).ToString());
+        Console.WriteLine("retAwait=" + (await TestReturnAwaitConversions()).ToString());
+        Console.WriteLine("feEnum=" + TestForeachEnumerable().ToString());
+    }
+}
