@@ -1,0 +1,656 @@
+using System;
+using System.Collections.Generic;
+
+namespace Gui.Cad.Gpu;
+
+internal sealed class CadLayerSlot {
+    public bool Used;
+    public ulong Epoch;
+    public double Ox;
+    public double Oy;
+
+    public uint LineVao;
+    public uint LineVbo;
+    public int LineCount;
+    public bool LineDirty;
+    public nint HostLines;
+    public int HostLineCount;
+
+    public uint ArcVao;
+    public uint ArcVbo;
+    public int ArcCount;
+    public bool ArcDirty;
+    public nint HostArcs;
+    public int HostArcCount;
+
+    public uint FillVao;
+    public uint FillVbo;
+    public uint FillEbo;
+    public int FillVcount;
+    public int FillIcount;
+    public bool FillDirty;
+    public nint HostFillVerts;
+    public int HostFillVcount;
+    public nint HostFillIdx;
+    public int HostFillIcount;
+
+    public void ResetGlHandles() {
+        LineVao = 0u; LineVbo = 0u; LineCount = 0;
+        ArcVao = 0u; ArcVbo = 0u; ArcCount = 0;
+        FillVao = 0u; FillVbo = 0u; FillEbo = 0u; FillVcount = 0; FillIcount = 0;
+    }
+
+    public void FreeHostBuffers() {
+        if (HostLines != 0) { NativeMemory.Free(HostLines); HostLines = 0; }
+        HostLineCount = 0;
+        if (HostArcs != 0) { NativeMemory.Free(HostArcs); HostArcs = 0; }
+        HostArcCount = 0;
+        if (HostFillVerts != 0) { NativeMemory.Free(HostFillVerts); HostFillVerts = 0; }
+        HostFillVcount = 0;
+        if (HostFillIdx != 0) { NativeMemory.Free(HostFillIdx); HostFillIdx = 0; }
+        HostFillIcount = 0;
+    }
+}
+
+internal sealed class CadMeshSlot {
+    public bool Used;
+    public ulong Epoch;
+
+    public uint FaceVao;
+    public uint FaceVbo;
+    public uint FaceEbo;
+    public int FaceVcount;
+    public int FaceIcount;
+    public bool FaceDirty;
+    public nint HostFaceVerts;
+    public int HostFaceVcount;
+    public nint HostFaceIdx;
+    public int HostFaceIcount;
+
+    public uint EdgeVao;
+    public uint EdgeVbo;
+    public uint EdgeEbo;
+    public int EdgeVcount;
+    public int EdgeIcount;
+    public bool EdgeDirty;
+    public nint HostEdgeVerts;
+    public int HostEdgeVcount;
+    public nint HostEdgeIdx;
+    public int HostEdgeIcount;
+
+    public void ResetGlHandles() {
+        FaceVao = 0u; FaceVbo = 0u; FaceEbo = 0u; FaceVcount = 0; FaceIcount = 0;
+        EdgeVao = 0u; EdgeVbo = 0u; EdgeEbo = 0u; EdgeVcount = 0; EdgeIcount = 0;
+    }
+
+    public void FreeHostBuffers() {
+        if (HostFaceVerts != 0) { NativeMemory.Free(HostFaceVerts); HostFaceVerts = 0; }
+        HostFaceVcount = 0;
+        if (HostFaceIdx != 0) { NativeMemory.Free(HostFaceIdx); HostFaceIdx = 0; }
+        HostFaceIcount = 0;
+        if (HostEdgeVerts != 0) { NativeMemory.Free(HostEdgeVerts); HostEdgeVerts = 0; }
+        HostEdgeVcount = 0;
+        if (HostEdgeIdx != 0) { NativeMemory.Free(HostEdgeIdx); HostEdgeIdx = 0; }
+        HostEdgeIcount = 0;
+    }
+}
+
+// CAD GPU 渲染管线全局状态、着色器/FBO 生命周期与惰性几何同步
+internal static class CadGpuState {
+    public const int MaxLayers2D = 256;
+    public const int MaxMeshes3D = 512;
+    public const int MaxClipPlanes = 6;
+
+    public static CadLayerSlot[] Layers;
+    public static CadMeshSlot[] Meshes;
+    public static List<uint> PendingDelVaos;
+    public static List<uint> PendingDelBufs;
+
+    public static bool Ready;
+    public static ulong CurEpoch;
+    public static int MaxSamples;
+    public static uint EmptyVao;
+
+    // 6 套 CAD 着色器与 uniform 位置缓存
+    public static uint ProgGrid;
+    public static int UGridVp;
+    public static int UGridClip;
+    public static int UGridParam;
+    public static int UGridOrigin;
+    public static int UGridBg;
+    public static int UGridMinor;
+    public static int UGridMajor;
+    public static int UGridAx;
+    public static int UGridAy;
+
+    public static uint ProgLine2D;
+    public static int ULineVp;
+    public static int ULineRte;
+    public static int ULineCam;
+    public static int ULineClip;
+    public static int ULinePick;
+
+    public static uint ProgArc2D;
+    public static int UArcVp;
+    public static int UArcRte;
+    public static int UArcCam;
+    public static int UArcClip;
+    public static int UArcPick;
+
+    public static uint ProgFill2D;
+    public static int UFillVp;
+    public static int UFillRte;
+    public static int UFillCam;
+    public static int UFillClip;
+    public static int UFillPick;
+
+    public static uint ProgSolid3D;
+    public static int US3dMvp;
+    public static int US3dModel;
+    public static int US3dTint;
+    public static int US3dClips;
+    public static int US3dClipn;
+    public static int US3dFlags;
+    public static int US3dPick;
+    public static int US3dId;
+
+    public static uint ProgEdge3D;
+    public static int UE3dMvp;
+    public static int UE3dModel;
+    public static int UE3dCol;
+    public static int UE3dClips;
+    public static int UE3dClipn;
+    public static int UE3dFlags;
+    public static int UE3dPick;
+    public static int UE3dId;
+
+    // 3D MSAA FBO
+    public static uint Fbo3D;
+    public static uint Rb3DCol;
+    public static uint Rb3DDs;
+    public static int Fbo3DW;
+    public static int Fbo3DH;
+    public static int Fbo3DSamples;
+
+    // 拾取 FBO
+    public static uint PickFbo;
+    public static uint PickColRb;
+    public static uint PickDepRb;
+    public static int PickW;
+    public static int PickH;
+
+    // 复用非托管缓冲
+    public static nint Vp3DMatBuf;
+    public static nint PickVpMatBuf;
+    public static nint ClipPlanesBuf;
+    public static nint MvpScratchBuf;
+    public static nint IdentMatBuf;
+    public static nint Cam3ScratchBuf;
+    public static nint PickReadBuf;
+
+    public static void EnsureTables() {
+        if (CadGpuState.Layers == null) {
+            CadGpuState.Layers = new CadLayerSlot[MaxLayers2D];
+            CadGpuState.Meshes = new CadMeshSlot[MaxMeshes3D];
+            CadGpuState.PendingDelVaos = new List<uint>();
+            CadGpuState.PendingDelBufs = new List<uint>();
+            CadGpuState.MaxSamples = 1;
+        }
+        if (CadGpuState.Vp3DMatBuf == 0) {
+            CadGpuState.Vp3DMatBuf = NativeMemory.Alloc(64);
+            CadGpuState.PickVpMatBuf = NativeMemory.Alloc(64);
+            CadGpuState.ClipPlanesBuf = NativeMemory.Alloc(MaxClipPlanes * 16);
+            CadGpuState.MvpScratchBuf = NativeMemory.Alloc(64);
+            CadGpuState.IdentMatBuf = NativeMemory.Alloc(64);
+            CadGpuState.Cam3ScratchBuf = NativeMemory.Alloc(16);
+            CadGpuState.PickReadBuf = NativeMemory.Alloc(33 * 33 * 4);
+            NativeMemory.Fill(CadGpuState.IdentMatBuf, 0, 64);
+            Span<float> id = new Span<float>(CadGpuState.IdentMatBuf, 16);
+            id[0] = 1.0f; id[5] = 1.0f; id[10] = 1.0f; id[15] = 1.0f;
+        }
+    }
+
+    public static CadLayerSlot GetLayer(int id) {
+        CadGpuState.EnsureTables();
+        if (id < 1 || id > MaxLayers2D) { return null; }
+        CadLayerSlot slot = CadGpuState.Layers[id - 1];
+        return (slot != null && slot.Used) ? slot : null;
+    }
+
+    public static CadMeshSlot GetMesh(int id) {
+        CadGpuState.EnsureTables();
+        if (id < 1 || id > MaxMeshes3D) { return null; }
+        CadMeshSlot slot = CadGpuState.Meshes[id - 1];
+        return (slot != null && slot.Used) ? slot : null;
+    }
+
+    public static void QueueVaoDelete(uint vao) {
+        if (vao != 0u) { CadGpuState.PendingDelVaos.Add(vao); }
+    }
+
+    public static void QueueBufDelete(uint buf) {
+        if (buf != 0u) { CadGpuState.PendingDelBufs.Add(buf); }
+    }
+
+    public static void DrainPendingDeletes(CadGlApi gl) {
+        int vc = CadGpuState.PendingDelVaos.Count;
+        for (int i = 0; i < vc; i = i + 1) {
+            CadGlBridge.DeleteOne(gl.DeleteVertexArrays, CadGpuState.PendingDelVaos[i]);
+        }
+        if (vc > 0) { CadGpuState.PendingDelVaos.Clear(); }
+        int bc = CadGpuState.PendingDelBufs.Count;
+        for (int i = 0; i < bc; i = i + 1) {
+            CadGlBridge.DeleteOne(gl.DeleteBuffers, CadGpuState.PendingDelBufs[i]);
+        }
+        if (bc > 0) { CadGpuState.PendingDelBufs.Clear(); }
+    }
+
+    public static void DropFbo3D(CadGlApi gl) {
+        if (gl != null) {
+            if (CadGpuState.Fbo3D != 0u) { CadGlBridge.DeleteOne(gl.DeleteFramebuffers, CadGpuState.Fbo3D); }
+            if (CadGpuState.Rb3DCol != 0u) { CadGlBridge.DeleteOne(gl.DeleteRenderbuffers, CadGpuState.Rb3DCol); }
+            if (CadGpuState.Rb3DDs != 0u) { CadGlBridge.DeleteOne(gl.DeleteRenderbuffers, CadGpuState.Rb3DDs); }
+        }
+        CadGpuState.Fbo3D = 0u;
+        CadGpuState.Rb3DCol = 0u;
+        CadGpuState.Rb3DDs = 0u;
+        CadGpuState.Fbo3DW = 0;
+        CadGpuState.Fbo3DH = 0;
+        CadGpuState.Fbo3DSamples = 0;
+    }
+
+    public static void DropPickFbo(CadGlApi gl) {
+        if (gl != null) {
+            if (CadGpuState.PickFbo != 0u) { CadGlBridge.DeleteOne(gl.DeleteFramebuffers, CadGpuState.PickFbo); }
+            if (CadGpuState.PickColRb != 0u) { CadGlBridge.DeleteOne(gl.DeleteRenderbuffers, CadGpuState.PickColRb); }
+            if (CadGpuState.PickDepRb != 0u) { CadGlBridge.DeleteOne(gl.DeleteRenderbuffers, CadGpuState.PickDepRb); }
+        }
+        CadGpuState.PickFbo = 0u;
+        CadGpuState.PickColRb = 0u;
+        CadGpuState.PickDepRb = 0u;
+        CadGpuState.PickW = 0;
+        CadGpuState.PickH = 0;
+    }
+
+    private static void ResetGpuStateOnNewEpoch() {
+        CadGpuState.Ready = false;
+        CadGpuState.EmptyVao = 0u;
+        CadGpuState.ProgGrid = 0u;
+        CadGpuState.ProgLine2D = 0u;
+        CadGpuState.ProgArc2D = 0u;
+        CadGpuState.ProgFill2D = 0u;
+        CadGpuState.ProgSolid3D = 0u;
+        CadGpuState.ProgEdge3D = 0u;
+        CadGpuState.Fbo3D = 0u;
+        CadGpuState.Rb3DCol = 0u;
+        CadGpuState.Rb3DDs = 0u;
+        CadGpuState.Fbo3DW = 0;
+        CadGpuState.Fbo3DH = 0;
+        CadGpuState.Fbo3DSamples = 0;
+        CadGpuState.PickFbo = 0u;
+        CadGpuState.PickColRb = 0u;
+        CadGpuState.PickDepRb = 0u;
+        CadGpuState.PickW = 0;
+        CadGpuState.PickH = 0;
+        CadGpuState.PendingDelVaos.Clear();
+        CadGpuState.PendingDelBufs.Clear();
+    }
+
+    private static void DeletePrograms(CadGlApi gl) {
+        if (CadGpuState.EmptyVao != 0u) { CadGlBridge.DeleteOne(gl.DeleteVertexArrays, CadGpuState.EmptyVao); }
+        if (CadGpuState.ProgGrid != 0u) { gl.DeleteProgram(CadGpuState.ProgGrid); }
+        if (CadGpuState.ProgLine2D != 0u) { gl.DeleteProgram(CadGpuState.ProgLine2D); }
+        if (CadGpuState.ProgArc2D != 0u) { gl.DeleteProgram(CadGpuState.ProgArc2D); }
+        if (CadGpuState.ProgFill2D != 0u) { gl.DeleteProgram(CadGpuState.ProgFill2D); }
+        if (CadGpuState.ProgSolid3D != 0u) { gl.DeleteProgram(CadGpuState.ProgSolid3D); }
+        if (CadGpuState.ProgEdge3D != 0u) { gl.DeleteProgram(CadGpuState.ProgEdge3D); }
+        CadGpuState.ResetGpuStateOnNewEpoch();
+    }
+
+    public static bool EnsureInit(CadGlApi gl, ulong epoch) {
+        CadGpuState.EnsureTables();
+        if (gl == null) { return false; }
+        if (CadGpuState.Ready && CadGpuState.CurEpoch == epoch) {
+            CadGpuState.DrainPendingDeletes(gl);
+            return true;
+        }
+        if (CadGpuState.Ready) {
+            CadGpuState.ResetGpuStateOnNewEpoch();
+        }
+
+        string head = CadShaders.GlslHeader(gl);
+        CadGpuState.ProgGrid = CadGlBridge.GpuProgram(head + CadShaders.VsGrid(), head + CadShaders.FsGrid());
+        CadGpuState.ProgLine2D = CadGlBridge.GpuProgram(head + CadShaders.VsLine2D(), head + CadShaders.FsLine2D());
+        CadGpuState.ProgArc2D = CadGlBridge.GpuProgram(head + CadShaders.VsArc2D(), head + CadShaders.FsArc2D());
+        CadGpuState.ProgFill2D = CadGlBridge.GpuProgram(head + CadShaders.VsFill2D(), head + CadShaders.FsFill2D());
+        CadGpuState.ProgSolid3D = CadGlBridge.GpuProgram(head + CadShaders.VsSolid3D(), head + CadShaders.FsSolid3D());
+        CadGpuState.ProgEdge3D = CadGlBridge.GpuProgram(head + CadShaders.VsEdge3D(), head + CadShaders.FsEdge3D());
+
+        if (CadGpuState.ProgGrid == 0u || CadGpuState.ProgLine2D == 0u || CadGpuState.ProgArc2D == 0u
+            || CadGpuState.ProgFill2D == 0u || CadGpuState.ProgSolid3D == 0u || CadGpuState.ProgEdge3D == 0u) {
+            CadGpuState.DeletePrograms(gl);
+            return false;
+        }
+
+        CadGpuState.EmptyVao = CadGlBridge.GenOne(gl.GenVertexArrays);
+
+        CadGpuState.UGridVp = CadGlBridge.UniformLoc(gl, CadGpuState.ProgGrid, "uViewport");
+        CadGpuState.UGridClip = CadGlBridge.UniformLoc(gl, CadGpuState.ProgGrid, "uClip");
+        CadGpuState.UGridParam = CadGlBridge.UniformLoc(gl, CadGpuState.ProgGrid, "uGridParam");
+        CadGpuState.UGridOrigin = CadGlBridge.UniformLoc(gl, CadGpuState.ProgGrid, "uGridOrigin");
+        CadGpuState.UGridBg = CadGlBridge.UniformLoc(gl, CadGpuState.ProgGrid, "uBgColor");
+        CadGpuState.UGridMinor = CadGlBridge.UniformLoc(gl, CadGpuState.ProgGrid, "uMinorColor");
+        CadGpuState.UGridMajor = CadGlBridge.UniformLoc(gl, CadGpuState.ProgGrid, "uMajorColor");
+        CadGpuState.UGridAx = CadGlBridge.UniformLoc(gl, CadGpuState.ProgGrid, "uAxisXColor");
+        CadGpuState.UGridAy = CadGlBridge.UniformLoc(gl, CadGpuState.ProgGrid, "uAxisYColor");
+
+        CadGpuState.ULineVp = CadGlBridge.UniformLoc(gl, CadGpuState.ProgLine2D, "uViewport");
+        CadGpuState.ULineRte = CadGlBridge.UniformLoc(gl, CadGpuState.ProgLine2D, "uRteOffset");
+        CadGpuState.ULineCam = CadGlBridge.UniformLoc(gl, CadGpuState.ProgLine2D, "uCam");
+        CadGpuState.ULineClip = CadGlBridge.UniformLoc(gl, CadGpuState.ProgLine2D, "uClip");
+        CadGpuState.ULinePick = CadGlBridge.UniformLoc(gl, CadGpuState.ProgLine2D, "uPickMode");
+
+        CadGpuState.UArcVp = CadGlBridge.UniformLoc(gl, CadGpuState.ProgArc2D, "uViewport");
+        CadGpuState.UArcRte = CadGlBridge.UniformLoc(gl, CadGpuState.ProgArc2D, "uRteOffset");
+        CadGpuState.UArcCam = CadGlBridge.UniformLoc(gl, CadGpuState.ProgArc2D, "uCam");
+        CadGpuState.UArcClip = CadGlBridge.UniformLoc(gl, CadGpuState.ProgArc2D, "uClip");
+        CadGpuState.UArcPick = CadGlBridge.UniformLoc(gl, CadGpuState.ProgArc2D, "uPickMode");
+
+        CadGpuState.UFillVp = CadGlBridge.UniformLoc(gl, CadGpuState.ProgFill2D, "uViewport");
+        CadGpuState.UFillRte = CadGlBridge.UniformLoc(gl, CadGpuState.ProgFill2D, "uRteOffset");
+        CadGpuState.UFillCam = CadGlBridge.UniformLoc(gl, CadGpuState.ProgFill2D, "uCam");
+        CadGpuState.UFillClip = CadGlBridge.UniformLoc(gl, CadGpuState.ProgFill2D, "uClip");
+        CadGpuState.UFillPick = CadGlBridge.UniformLoc(gl, CadGpuState.ProgFill2D, "uPickMode");
+
+        CadGpuState.US3dMvp = CadGlBridge.UniformLoc(gl, CadGpuState.ProgSolid3D, "uMvp");
+        CadGpuState.US3dModel = CadGlBridge.UniformLoc(gl, CadGpuState.ProgSolid3D, "uModel");
+        CadGpuState.US3dTint = CadGlBridge.UniformLoc(gl, CadGpuState.ProgSolid3D, "uTint");
+        CadGpuState.US3dClips = CadGlBridge.UniformLoc(gl, CadGpuState.ProgSolid3D, "uClipPlanes");
+        CadGpuState.US3dClipn = CadGlBridge.UniformLoc(gl, CadGpuState.ProgSolid3D, "uClipCount");
+        CadGpuState.US3dFlags = CadGlBridge.UniformLoc(gl, CadGpuState.ProgSolid3D, "uFlags");
+        CadGpuState.US3dPick = CadGlBridge.UniformLoc(gl, CadGpuState.ProgSolid3D, "uPickMode");
+        CadGpuState.US3dId = CadGlBridge.UniformLoc(gl, CadGpuState.ProgSolid3D, "uEntityId");
+
+        CadGpuState.UE3dMvp = CadGlBridge.UniformLoc(gl, CadGpuState.ProgEdge3D, "uMvp");
+        CadGpuState.UE3dModel = CadGlBridge.UniformLoc(gl, CadGpuState.ProgEdge3D, "uModel");
+        CadGpuState.UE3dCol = CadGlBridge.UniformLoc(gl, CadGpuState.ProgEdge3D, "uEdgeColor");
+        CadGpuState.UE3dClips = CadGlBridge.UniformLoc(gl, CadGpuState.ProgEdge3D, "uClipPlanes");
+        CadGpuState.UE3dClipn = CadGlBridge.UniformLoc(gl, CadGpuState.ProgEdge3D, "uClipCount");
+        CadGpuState.UE3dFlags = CadGlBridge.UniformLoc(gl, CadGpuState.ProgEdge3D, "uFlags");
+        CadGpuState.UE3dPick = CadGlBridge.UniformLoc(gl, CadGpuState.ProgEdge3D, "uPickMode");
+        CadGpuState.UE3dId = CadGlBridge.UniformLoc(gl, CadGpuState.ProgEdge3D, "uEntityId");
+
+        CadGpuState.MaxSamples = 1;
+        if (gl.HasGetIntegerv && gl.HasRenderbufferStorageMultisample) {
+            int ms = CadGlBridge.GetInt(gl, CadGlConst.MaxSamples, 1);
+            if (ms > 1) { CadGpuState.MaxSamples = ms; }
+        }
+
+        CadGpuState.CurEpoch = epoch;
+        CadGpuState.Ready = true;
+        return true;
+    }
+
+    public static void SyncLayerGpu(CadGlApi gl, CadLayerSlot slot) {
+        if (slot.Epoch != CadGpuState.CurEpoch) {
+            slot.ResetGlHandles();
+            slot.Epoch = CadGpuState.CurEpoch;
+            slot.LineDirty = slot.HostLineCount > 0;
+            slot.ArcDirty = slot.HostArcCount > 0;
+            slot.FillDirty = slot.HostFillVcount > 0 || slot.HostFillIcount > 0;
+        }
+        if (slot.LineDirty) {
+            if (slot.LineVao == 0u) {
+                slot.LineVao = CadGlBridge.GenOne(gl.GenVertexArrays);
+                slot.LineVbo = CadGlBridge.GenOne(gl.GenBuffers);
+                gl.BindVertexArray(slot.LineVao);
+                gl.BindBuffer(CadGlConst.ArrayBuffer, slot.LineVbo);
+                int stride = 48;
+                gl.EnableVertexAttribArray(0u);
+                gl.VertexAttribPointer(0u, 4, CadGlConst.Float, 0, stride, 0);
+                gl.VertexAttribDivisor(0u, 1u);
+                gl.EnableVertexAttribArray(1u);
+                gl.VertexAttribPointer(1u, 4, CadGlConst.Float, 0, stride, 16);
+                gl.VertexAttribDivisor(1u, 1u);
+                gl.EnableVertexAttribArray(2u);
+                gl.VertexAttribPointer(2u, 4, CadGlConst.Float, 0, stride, 32);
+                gl.VertexAttribDivisor(2u, 1u);
+            } else {
+                gl.BindBuffer(CadGlConst.ArrayBuffer, slot.LineVbo);
+            }
+            gl.BufferData(CadGlConst.ArrayBuffer, (nint)slot.HostLineCount * 48,
+                          slot.HostLineCount > 0 ? slot.HostLines : 0, CadGlConst.DynamicDraw);
+            gl.BindVertexArray(0u);
+            slot.LineCount = slot.HostLineCount;
+            slot.LineDirty = false;
+        }
+        if (slot.ArcDirty) {
+            if (slot.ArcVao == 0u) {
+                slot.ArcVao = CadGlBridge.GenOne(gl.GenVertexArrays);
+                slot.ArcVbo = CadGlBridge.GenOne(gl.GenBuffers);
+                gl.BindVertexArray(slot.ArcVao);
+                gl.BindBuffer(CadGlConst.ArrayBuffer, slot.ArcVbo);
+                int stride = 56;
+                gl.EnableVertexAttribArray(0u);
+                gl.VertexAttribPointer(0u, 4, CadGlConst.Float, 0, stride, 0);
+                gl.VertexAttribDivisor(0u, 1u);
+                gl.EnableVertexAttribArray(1u);
+                gl.VertexAttribPointer(1u, 4, CadGlConst.Float, 0, stride, 16);
+                gl.VertexAttribDivisor(1u, 1u);
+                gl.EnableVertexAttribArray(2u);
+                gl.VertexAttribPointer(2u, 4, CadGlConst.Float, 0, stride, 32);
+                gl.VertexAttribDivisor(2u, 1u);
+                gl.EnableVertexAttribArray(3u);
+                gl.VertexAttribPointer(3u, 2, CadGlConst.Float, 0, stride, 48);
+                gl.VertexAttribDivisor(3u, 1u);
+            } else {
+                gl.BindBuffer(CadGlConst.ArrayBuffer, slot.ArcVbo);
+            }
+            gl.BufferData(CadGlConst.ArrayBuffer, (nint)slot.HostArcCount * 56,
+                          slot.HostArcCount > 0 ? slot.HostArcs : 0, CadGlConst.DynamicDraw);
+            gl.BindVertexArray(0u);
+            slot.ArcCount = slot.HostArcCount;
+            slot.ArcDirty = false;
+        }
+        if (slot.FillDirty) {
+            if (slot.FillVao == 0u) {
+                slot.FillVao = CadGlBridge.GenOne(gl.GenVertexArrays);
+                slot.FillVbo = CadGlBridge.GenOne(gl.GenBuffers);
+                slot.FillEbo = CadGlBridge.GenOne(gl.GenBuffers);
+                gl.BindVertexArray(slot.FillVao);
+                gl.BindBuffer(CadGlConst.ArrayBuffer, slot.FillVbo);
+                gl.BindBuffer(CadGlConst.ElementArrayBuffer, slot.FillEbo);
+                int stride = 32;
+                gl.EnableVertexAttribArray(0u);
+                gl.VertexAttribPointer(0u, 2, CadGlConst.Float, 0, stride, 0);
+                gl.EnableVertexAttribArray(1u);
+                gl.VertexAttribPointer(1u, 4, CadGlConst.Float, 0, stride, 8);
+                gl.EnableVertexAttribArray(2u);
+                gl.VertexAttribPointer(2u, 2, CadGlConst.Float, 0, stride, 24);
+            } else {
+                gl.BindVertexArray(slot.FillVao);
+                gl.BindBuffer(CadGlConst.ArrayBuffer, slot.FillVbo);
+                gl.BindBuffer(CadGlConst.ElementArrayBuffer, slot.FillEbo);
+            }
+            gl.BufferData(CadGlConst.ArrayBuffer, (nint)slot.HostFillVcount * 32,
+                          slot.HostFillVcount > 0 ? slot.HostFillVerts : 0, CadGlConst.DynamicDraw);
+            gl.BufferData(CadGlConst.ElementArrayBuffer, (nint)slot.HostFillIcount * 4,
+                          slot.HostFillIcount > 0 ? slot.HostFillIdx : 0, CadGlConst.DynamicDraw);
+            gl.BindVertexArray(0u);
+            slot.FillVcount = slot.HostFillVcount;
+            slot.FillIcount = slot.HostFillIcount;
+            slot.FillDirty = false;
+        }
+    }
+
+    public static void SyncMeshGpu(CadGlApi gl, CadMeshSlot slot) {
+        if (slot.Epoch != CadGpuState.CurEpoch) {
+            slot.ResetGlHandles();
+            slot.Epoch = CadGpuState.CurEpoch;
+            slot.FaceDirty = slot.HostFaceVcount > 0 || slot.HostFaceIcount > 0;
+            slot.EdgeDirty = slot.HostEdgeVcount > 0 || slot.HostEdgeIcount > 0;
+        }
+        if (slot.FaceDirty) {
+            if (slot.FaceVao == 0u) {
+                slot.FaceVao = CadGlBridge.GenOne(gl.GenVertexArrays);
+                slot.FaceVbo = CadGlBridge.GenOne(gl.GenBuffers);
+                slot.FaceEbo = CadGlBridge.GenOne(gl.GenBuffers);
+                gl.BindVertexArray(slot.FaceVao);
+                gl.BindBuffer(CadGlConst.ArrayBuffer, slot.FaceVbo);
+                gl.BindBuffer(CadGlConst.ElementArrayBuffer, slot.FaceEbo);
+                int stride = 40;
+                gl.EnableVertexAttribArray(0u);
+                gl.VertexAttribPointer(0u, 3, CadGlConst.Float, 0, stride, 0);
+                gl.EnableVertexAttribArray(1u);
+                gl.VertexAttribPointer(1u, 3, CadGlConst.Float, 0, stride, 12);
+                gl.EnableVertexAttribArray(2u);
+                gl.VertexAttribPointer(2u, 4, CadGlConst.Float, 0, stride, 24);
+            } else {
+                gl.BindVertexArray(slot.FaceVao);
+                gl.BindBuffer(CadGlConst.ArrayBuffer, slot.FaceVbo);
+                gl.BindBuffer(CadGlConst.ElementArrayBuffer, slot.FaceEbo);
+            }
+            gl.BufferData(CadGlConst.ArrayBuffer, (nint)slot.HostFaceVcount * 40,
+                          slot.HostFaceVcount > 0 ? slot.HostFaceVerts : 0, CadGlConst.StaticDraw);
+            gl.BufferData(CadGlConst.ElementArrayBuffer, (nint)slot.HostFaceIcount * 4,
+                          slot.HostFaceIcount > 0 ? slot.HostFaceIdx : 0, CadGlConst.StaticDraw);
+            gl.BindVertexArray(0u);
+            slot.FaceVcount = slot.HostFaceVcount;
+            slot.FaceIcount = slot.HostFaceIcount;
+            slot.FaceDirty = false;
+        }
+        if (slot.EdgeDirty) {
+            if (slot.EdgeVao == 0u) {
+                slot.EdgeVao = CadGlBridge.GenOne(gl.GenVertexArrays);
+                slot.EdgeVbo = CadGlBridge.GenOne(gl.GenBuffers);
+                slot.EdgeEbo = CadGlBridge.GenOne(gl.GenBuffers);
+                gl.BindVertexArray(slot.EdgeVao);
+                gl.BindBuffer(CadGlConst.ArrayBuffer, slot.EdgeVbo);
+                gl.BindBuffer(CadGlConst.ElementArrayBuffer, slot.EdgeEbo);
+                int stride = 28;
+                gl.EnableVertexAttribArray(0u);
+                gl.VertexAttribPointer(0u, 3, CadGlConst.Float, 0, stride, 0);
+                gl.EnableVertexAttribArray(1u);
+                gl.VertexAttribPointer(1u, 4, CadGlConst.Float, 0, stride, 12);
+            } else {
+                gl.BindVertexArray(slot.EdgeVao);
+                gl.BindBuffer(CadGlConst.ArrayBuffer, slot.EdgeVbo);
+                gl.BindBuffer(CadGlConst.ElementArrayBuffer, slot.EdgeEbo);
+            }
+            gl.BufferData(CadGlConst.ArrayBuffer, (nint)slot.HostEdgeVcount * 28,
+                          slot.HostEdgeVcount > 0 ? slot.HostEdgeVerts : 0, CadGlConst.StaticDraw);
+            gl.BufferData(CadGlConst.ElementArrayBuffer, (nint)slot.HostEdgeIcount * 4,
+                          slot.HostEdgeIcount > 0 ? slot.HostEdgeIdx : 0, CadGlConst.StaticDraw);
+            gl.BindVertexArray(0u);
+            slot.EdgeVcount = slot.HostEdgeVcount;
+            slot.EdgeIcount = slot.HostEdgeIcount;
+            slot.EdgeDirty = false;
+        }
+    }
+
+    public static bool EnsureFbo3D(CadGlApi gl, int w, int h, int reqSamples) {
+        int samples = reqSamples;
+        if (samples < 1) { samples = 1; }
+        if (samples > CadGpuState.MaxSamples) { samples = CadGpuState.MaxSamples; }
+        if (!gl.HasRenderbufferStorageMultisample) { samples = 1; }
+        if (CadGpuState.Fbo3D != 0u && CadGpuState.Fbo3DW == w && CadGpuState.Fbo3DH == h
+            && CadGpuState.Fbo3DSamples == samples) {
+            return true;
+        }
+
+        for (int attempt = 0; attempt < 2; attempt = attempt + 1) {
+            int s = attempt == 0 ? samples : 1;
+            CadGpuState.DropFbo3D(gl);
+            CadGpuState.Fbo3D = CadGlBridge.GenOne(gl.GenFramebuffers);
+            gl.BindFramebuffer(CadGlConst.Framebuffer, CadGpuState.Fbo3D);
+
+            CadGpuState.Rb3DCol = CadGlBridge.GenOne(gl.GenRenderbuffers);
+            gl.BindRenderbuffer(CadGlConst.Renderbuffer, CadGpuState.Rb3DCol);
+            if (s > 1) {
+                gl.RenderbufferStorageMultisample(CadGlConst.Renderbuffer, s, CadGlConst.Rgba8, w, h);
+            } else {
+                gl.RenderbufferStorage(CadGlConst.Renderbuffer, CadGlConst.Rgba8, w, h);
+            }
+            gl.FramebufferRenderbuffer(CadGlConst.Framebuffer, CadGlConst.ColorAttachment0,
+                                       CadGlConst.Renderbuffer, CadGpuState.Rb3DCol);
+
+            CadGpuState.Rb3DDs = CadGlBridge.GenOne(gl.GenRenderbuffers);
+            gl.BindRenderbuffer(CadGlConst.Renderbuffer, CadGpuState.Rb3DDs);
+            if (s > 1) {
+                gl.RenderbufferStorageMultisample(CadGlConst.Renderbuffer, s, CadGlConst.Depth24Stencil8, w, h);
+            } else {
+                gl.RenderbufferStorage(CadGlConst.Renderbuffer, CadGlConst.Depth24Stencil8, w, h);
+            }
+            gl.FramebufferRenderbuffer(CadGlConst.Framebuffer, CadGlConst.DepthStencilAttachment,
+                                       CadGlConst.Renderbuffer, CadGpuState.Rb3DDs);
+
+            if (gl.CheckFramebufferStatus(CadGlConst.Framebuffer) == CadGlConst.FramebufferComplete) {
+                CadGpuState.Fbo3DW = w;
+                CadGpuState.Fbo3DH = h;
+                CadGpuState.Fbo3DSamples = s;
+                return true;
+            }
+            if (s == 1) { break; }
+        }
+        CadGpuState.DropFbo3D(gl);
+        return false;
+    }
+
+    public static bool EnsurePickFbo(CadGlApi gl, int w, int h) {
+        if (CadGpuState.PickFbo != 0u && CadGpuState.PickW == w && CadGpuState.PickH == h) {
+            return true;
+        }
+        CadGpuState.DropPickFbo(gl);
+        CadGpuState.PickFbo = CadGlBridge.GenOne(gl.GenFramebuffers);
+        gl.BindFramebuffer(CadGlConst.Framebuffer, CadGpuState.PickFbo);
+
+        CadGpuState.PickColRb = CadGlBridge.GenOne(gl.GenRenderbuffers);
+        gl.BindRenderbuffer(CadGlConst.Renderbuffer, CadGpuState.PickColRb);
+        gl.RenderbufferStorage(CadGlConst.Renderbuffer, CadGlConst.Rgba8, w, h);
+        gl.FramebufferRenderbuffer(CadGlConst.Framebuffer, CadGlConst.ColorAttachment0,
+                                   CadGlConst.Renderbuffer, CadGpuState.PickColRb);
+
+        CadGpuState.PickDepRb = CadGlBridge.GenOne(gl.GenRenderbuffers);
+        gl.BindRenderbuffer(CadGlConst.Renderbuffer, CadGpuState.PickDepRb);
+        gl.RenderbufferStorage(CadGlConst.Renderbuffer, CadGlConst.Depth24Stencil8, w, h);
+        gl.FramebufferRenderbuffer(CadGlConst.Framebuffer, CadGlConst.DepthStencilAttachment,
+                                   CadGlConst.Renderbuffer, CadGpuState.PickDepRb);
+
+        if (gl.CheckFramebufferStatus(CadGlConst.Framebuffer) != CadGlConst.FramebufferComplete) {
+            CadGpuState.DropPickFbo(gl);
+            return false;
+        }
+        CadGpuState.PickW = w;
+        CadGpuState.PickH = h;
+        return true;
+    }
+
+    public static void Mat4Mul(nint outPtr, nint aPtr, nint bPtr) {
+        Span<float> o = new Span<float>(outPtr, 16);
+        Span<float> a = new Span<float>(aPtr, 16);
+        Span<float> b = new Span<float>(bPtr, 16);
+        for (int col = 0; col < 4; col = col + 1) {
+            int c4 = col * 4;
+            float b0 = b[c4];
+            float b1 = b[c4 + 1];
+            float b2 = b[c4 + 2];
+            float b3 = b[c4 + 3];
+            for (int row = 0; row < 4; row = row + 1) {
+                o[c4 + row] = a[row] * b0 + a[4 + row] * b1 + a[8 + row] * b2 + a[12 + row] * b3;
+            }
+        }
+    }
+
+    public static float ArgbR(int argb) { return (float)((argb >> 16) & 255) / 255.0f; }
+    public static float ArgbG(int argb) { return (float)((argb >> 8) & 255) / 255.0f; }
+    public static float ArgbB(int argb) { return (float)(argb & 255) / 255.0f; }
+    public static float ArgbA(int argb) { return (float)((argb >> 24) & 255) / 255.0f; }
+
+    public static int Float4ToArgb(float r, float g, float b, float a) {
+        int ri = r <= 0.0f ? 0 : (r >= 1.0f ? 255 : (int)(r * 255.0f + 0.5f));
+        int gi = g <= 0.0f ? 0 : (g >= 1.0f ? 255 : (int)(g * 255.0f + 0.5f));
+        int bi = b <= 0.0f ? 0 : (b >= 1.0f ? 255 : (int)(b * 255.0f + 0.5f));
+        int ai = a <= 0.0f ? 0 : (a >= 1.0f ? 255 : (int)(a * 255.0f + 0.5f));
+        return (ai << 24) | (ri << 16) | (gi << 8) | bi;
+    }
+}
