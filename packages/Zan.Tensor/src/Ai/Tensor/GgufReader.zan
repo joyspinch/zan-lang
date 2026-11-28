@@ -53,22 +53,53 @@ public class GgufReader {
             g.ReadMetadata(r);
         }
 
+        HashSet<string> seenTensors = new HashSet<string>();
         for (long i = 0; i < g.tensorCount; i = i + 1) {
-            g.tensors.Add(g.ReadTensorInfo(r));
+            WeightTensorInfo info = g.ReadTensorInfo(r);
+            if (seenTensors.Contains(info.name)) {
+                throw new Exception("duplicate GGUF tensor name '" + info.name + "'");
+            }
+            seenTensors.Add(info.name);
+            g.tensors.Add(info);
         }
 
-        // 数据区起点：按 general.alignment（默认 32）对齐。
+        // 数据区起点：按 general.alignment（默认 32，必须是 2 的幂且 <= 1 MiB）对齐。
         int alignment = 32;
         string alignText = null;
         if (g.metadata.TryGetValue("general.alignment", out alignText)) {
-            alignment = Convert.ToInt32(alignText);
-            if (alignment <= 0) { alignment = 32; }
+            int parsedAlign = 0;
+            if (!int.TryParse(alignText, out parsedAlign)
+                || parsedAlign <= 0 || parsedAlign > 1048576
+                || (parsedAlign & (parsedAlign - 1)) != 0) {
+                throw new Exception("invalid GGUF general.alignment: " + (alignText != null ? alignText : ""));
+            }
+            alignment = parsedAlign;
         }
-        long start = r.pos;
-        long pad = alignment - (start % alignment);
-        if (pad != alignment) { start = start + pad; }
+        long start = (long)r.pos;
+        long pad = (long)alignment - (start % (long)alignment);
+        if (pad != (long)alignment) { start = start + pad; }
+        long fileLen = (long)file.Length;
+        if (start > fileLen) {
+            throw new Exception("GGUF data start exceeds file length");
+        }
         g.dataStart = start;
+        long dataAvail = fileLen - start;
+        for (int i = 0; i < g.tensors.Count; i = i + 1) {
+            WeightTensorInfo t = g.tensors[i];
+            if (t.offset < 0L || t.byteLength < 0L
+                || t.offset > dataAvail || t.byteLength > dataAvail - t.offset) {
+                throw new Exception("GGUF tensor '" + t.name + "' slice exceeds file bounds");
+            }
+        }
         return g;
+    }
+
+    private static int PrimitiveElementBytes(int type) {
+        if (type == 0 || type == 1 || type == 7) { return 1; }
+        if (type == 2 || type == 3) { return 2; }
+        if (type == 4 || type == 5 || type == 6) { return 4; }
+        if (type == 10 || type == 11 || type == 12) { return 8; }
+        return 0;
     }
 
     // 一条元数据：键 + 类型 + 值。
@@ -82,24 +113,35 @@ public class GgufReader {
         }
         if (type == 9) {
             // 数组：元素类型 + 个数 + 元素。只有字符串数组值得留着
-            // （分词器的 token 表就是它），其余数组读完就丢。
+            // （分词器的 token 表就是它），定长原始类型数组 O(1) 跳过防 CPU 放大。
             int elemType = (int)r.U32();
             long count = r.U64();
             if (count < 0L) {
                 throw new Exception("GGUF metadata array '" + key + "' has invalid count");
             }
-            List<string> strs = new List<string>();
-            bool keep = elemType == 8;
-            for (long i = 0; i < count; i = i + 1) {
-                if (elemType == 8) {
-                    string s = r.Str();
-                    if (keep) { strs.Add(s); }
-                } else {
-                    SkipValue(r, elemType);
+            if (elemType == 8) {
+                if (count > (long)r.Remaining() / 8L) {
+                    throw new Exception("GGUF string array '" + key + "' count exceeds remaining bytes");
                 }
+                List<string> strs = new List<string>();
+                for (long i = 0L; i < count; i = i + 1L) {
+                    strs.Add(r.Str());
+                }
+                metadataArrays[key] = strs;
+                return;
             }
-            if (keep) { metadataArrays[key] = strs; }
-            return;
+            int elemBytes = GgufReader.PrimitiveElementBytes(elemType);
+            if (elemBytes > 0) {
+                if (count > (long)r.Remaining() / (long)elemBytes) {
+                    throw new Exception("GGUF metadata array '" + key + "' exceeds remaining bytes");
+                }
+                r.Skip(count * (long)elemBytes);
+                return;
+            }
+            if (elemType == 9) {
+                throw new Exception("nested GGUF metadata arrays are not supported");
+            }
+            throw new Exception("unknown GGUF metadata element type " + Convert.ToString(elemType));
         }
         // 标量：统一渲染成字符串（键值对语义上都是"文本化"的元数据）。
         if (type == 0 || type == 1 || type == 2 || type == 3 || type == 4
@@ -181,6 +223,10 @@ public class GgufReader {
         info.count = count;
         info.ggmlType = (int)r.U32();
         info.dtype = GgmlType.Name(info.ggmlType);
+        if (info.dtype == "?") {
+            throw new Exception("unknown GGUF tensor type " + Convert.ToString(info.ggmlType)
+                + " for tensor '" + info.name + "'");
+        }
         info.offset = r.U64();
         if (info.offset < 0L) {
             throw new Exception("GGUF tensor '" + info.name + "' has invalid offset");

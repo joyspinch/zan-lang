@@ -19,10 +19,13 @@ public class Lang {
     // 仓库内运行用工程相对路径，发布形态用 exe 旁的 assets/ 相对路径。
     public static List<string> dirs;
 
-    private static object packLock = new object();
+    private static string packLock = "System.Globalization.Lang.packLock";
+    private static long dirsEpoch = 0L;
+    private static const long MAX_LANG_FILE_BYTES = 16777216L;
 
     private static bool IsSafeCode(string c) {
         if (c == null || c.Length == 0) { return false; }
+        if (c == "." || (c[0] & 255) == 46) { return false; }
         for (int i = 0; i < c.Length; i = i + 1) {
             int b = c[i] & 255;
             if (b < 32 || b == 47 || b == 58 || b == 92 || b == 127) { return false; }
@@ -72,6 +75,7 @@ public class Lang {
         }
         lock (Lang.packLock) {
             Lang.dirs = copy;
+            Lang.dirsEpoch = Lang.dirsEpoch + 1L;
             if (Lang.packs != null) { Lang.packs.Clear(); }
             cur = Lang.code;
         }
@@ -102,11 +106,13 @@ public class Lang {
     public static Dictionary<string, string> Pack(string code) {
         if (!Lang.IsSafeCode(code)) { return null; }
         List<string> searchDirs = null;
+        long epoch = 0L;
         lock (Lang.packLock) {
             Dictionary<string, string> cached = null;
             if (Lang.packs != null && Lang.packs.TryGetValue(code, out cached)) {
                 return cached;
             }
+            epoch = Lang.dirsEpoch;
             if (Lang.dirs != null) {
                 searchDirs = new List<string>();
                 for (int i = 0; i < Lang.dirs.Count; i = i + 1) {
@@ -123,8 +129,11 @@ public class Lang {
                 if (!File.Exists(path)) { continue; }
                 JsonValue root = null;
                 try {
-                    string raw = File.ReadAllText(path);
-                    root = raw != null ? JsonValue.Parse(raw) : null;
+                    long sz = File.GetSize64(path);
+                    if (sz >= 0L && sz <= Lang.MAX_LANG_FILE_BYTES) {
+                        string raw = File.ReadAllText(path);
+                        root = raw != null ? JsonValue.Parse(raw) : null;
+                    }
                 } catch (Exception) {
                     root = null;
                 }
@@ -140,6 +149,7 @@ public class Lang {
             }
         }
         lock (Lang.packLock) {
+            if (Lang.dirsEpoch != epoch) { return pack; }
             if (Lang.packs == null) {
                 Lang.packs = new Dictionary<string, Dictionary<string, string>>();
             }

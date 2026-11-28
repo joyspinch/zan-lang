@@ -54,18 +54,35 @@ public class FixtureRandom {
         return this.rng.NextInt(0, 2147483647);
     }
 
-    // [min, max) 区间的长整数。
+    // [min, max) 区间的长整数（防 64 位有符号减法溢出与浮点舍入越界）。
     public long Long(long minInclusive, long maxExclusive) {
-        long span = maxExclusive - minInclusive;
-        if (span <= 0L) { return minInclusive; }
+        if (maxExclusive <= minInclusive) { return minInclusive; }
         double d = this.rng.NextDouble();
-        return minInclusive + (long)(d * (double)span);
+        if (minInclusive < 0L && maxExclusive > 0L) {
+            double range = (double)maxExclusive - (double)minInclusive;
+            double v = (double)minInclusive + d * range;
+            if (v >= (double)maxExclusive) { return maxExclusive - 1L; }
+            if (v < (double)minInclusive) { return minInclusive; }
+            return (long)v;
+        }
+        long span = maxExclusive - minInclusive;
+        long off = (long)(d * (double)span);
+        if (off < 0L) { off = 0L; }
+        if (off >= span) { off = span - 1L; }
+        return minInclusive + off;
     }
 
     // [min, max) 区间的双精度数。
     public double Double(double min, double max) {
-        if (max <= min) { return min; }
-        return min + (max - min) * this.rng.NextDouble();
+        if (!(max > min)) { return min; }
+        double diff = max - min;
+        double d = this.rng.NextDouble();
+        if (diff == diff && diff - diff == 0.0) {
+            return min + diff * d;
+        }
+        // 大跨度避免 max - min 溢出为 +Inf
+        double half = (max * 0.5) - (min * 0.5);
+        return min + (half * d) * 2.0;
     }
 
     // [0.0, 1.0) 区间的双精度数。
@@ -75,8 +92,9 @@ public class FixtureRandom {
 
     // [min, max) 区间的单精度数。
     public float Float(float min, float max) {
-        if (max <= min) { return min; }
-        return min + (max - min) * (float)this.rng.NextDouble();
+        if (!(max > min)) { return min; }
+        double r = this.Double((double)min, (double)max);
+        return (float)r;
     }
 
     // [0.0, 1.0) 区间的单精度数。
@@ -111,7 +129,9 @@ public class FixtureRandom {
     // 长度在 [minLength, maxLength] 的随机字符串（可打印 ASCII）。
     public string String(int minLength, int maxLength) {
         int lo = minLength < 0 ? 0 : minLength;
+        if (lo > 16777216) { lo = 16777216; }
         int hi = maxLength < lo ? lo : maxLength;
+        if (hi > 16777216) { hi = 16777216; }
         int len = this.Int(lo, hi + 1);
         return this.Chars(FixtureRandom.Printable(), len);
     }
@@ -124,14 +144,18 @@ public class FixtureRandom {
     // 只含小写字母的字符串。
     public string Alpha(int minLength, int maxLength) {
         int lo = minLength < 0 ? 0 : minLength;
+        if (lo > 16777216) { lo = 16777216; }
         int hi = maxLength < lo ? lo : maxLength;
+        if (hi > 16777216) { hi = 16777216; }
         return this.Chars(FixtureRandom.LowerLetters(), this.Int(lo, hi + 1));
     }
 
     // 只含小写字母与数字的字符串。
     public string Alphanumeric(int minLength, int maxLength) {
         int lo = minLength < 0 ? 0 : minLength;
+        if (lo > 16777216) { lo = 16777216; }
         int hi = maxLength < lo ? lo : maxLength;
+        if (hi > 16777216) { hi = 16777216; }
         return this.Chars("abcdefghijklmnopqrstuvwxyz0123456789", this.Int(lo, hi + 1));
     }
 
@@ -152,21 +176,30 @@ public class FixtureRandom {
     // **不用 `Guid.NewV4()`**：那走操作系统随机源，不可复现——同一批测试两次
     // 跑出来的样本不一致，失败样本就复现不了。
     public string Uuid() {
-        byte[] b = new byte[16];
+        byte[] outBuf = new byte[36];
+        int di = 0;
         for (int i = 0; i < 16; i = i + 1) {
-            b[i] = (byte)this.Int(0, 256);
+            if (i == 4 || i == 6 || i == 8 || i == 10) {
+                outBuf[di] = 45;
+                di = di + 1;
+            }
+            int v = this.rng.NextInt(0, 256);
+            if (i == 6) { v = (v & 15) | 64; }
+            else if (i == 8) { v = (v & 63) | 128; }
+            int hi = (v >> 4) & 15;
+            int lo = v & 15;
+            outBuf[di] = (byte)(hi < 10 ? 48 + hi : 87 + hi);
+            outBuf[di + 1] = (byte)(lo < 10 ? 48 + lo : 87 + lo);
+            di = di + 2;
         }
-        // 摆正版本位（4）与变体位（10xx）：随机字节直接拼出来的串过不了
-        // 严格的 UUID 校验（第三段首字符必须是 4、第四段首字符必须是 8/9/a/b）。
-        b[6] = (byte)((b[6] & 0x0F) | 0x40);
-        b[8] = (byte)((b[8] & 0x3F) | 0x80);
-        return Guid.Format(b);
+        return NativeMemory.GetString((nint)outBuf, 0, 36);
     }
 
     // [minYear, maxYear] 之间的随机时刻（UTC）。
     public DateTime DateTime(int minYear, int maxYear) {
-        if (maxYear <= minYear) { maxYear = minYear + 1; }
-        int year = this.Int(minYear, maxYear);
+        int y0 = minYear < 1 ? 1 : (minYear > 9998 ? 9998 : minYear);
+        int y1 = maxYear <= y0 ? y0 + 1 : (maxYear > 9999 ? 9999 : maxYear);
+        int year = this.Int(y0, y1);
         int month = this.Int(1, 13);
         int day = this.Int(1, 29);
         return DateTime.FromParts(year, month, day, this.Int(0, 24), this.Int(0, 60), this.Int(0, 60));
@@ -174,10 +207,15 @@ public class FixtureRandom {
 
     // 两个时刻之间的随机时刻（UTC）。
     public DateTime DateTimeBetween(DateTime from, DateTime to) {
+        if (from == null) {
+            throw new FixtureException(FixtureError.InvalidArgument, "",
+                "FixtureRandom.DateTimeBetween: 'from' must not be null");
+        }
+        if (to == null) { return from; }
         long lo = from.ToUnixMilliseconds();
         long hi = to.ToUnixMilliseconds();
         if (hi <= lo) { return from; }
-        long ms = lo + (long)(this.rng.NextDouble() * (double)(hi - lo));
+        long ms = this.Long(lo, hi);
         return DateTime.FromUnixMilliseconds(ms);
     }
 
@@ -185,12 +223,17 @@ public class FixtureRandom {
     public TimeSpan TimeSpan(int minSeconds, int maxSeconds) {
         int lo = minSeconds < 0 ? 0 : minSeconds;
         int hi = maxSeconds < lo ? lo : maxSeconds;
-        return TimeSpan.FromSeconds(this.Int(lo, hi + 1));
+        long sec = this.Long((long)lo, (long)hi + 1L);
+        return TimeSpan.FromSeconds((int)sec);
     }
 
     // count 个随机字节。
     public byte[] Bytes(int count) {
         if (count <= 0) { return new byte[0]; }
+        if (count > 16777216) {
+            throw new FixtureException(FixtureError.InvalidArgument, "",
+                "FixtureRandom.Bytes: count exceeds limit");
+        }
         byte[] b = new byte[count];
         for (int i = 0; i < count; i = i + 1) {
             b[i] = (byte)this.Int(0, 256);
@@ -228,13 +271,17 @@ public class FixtureRandom {
 
     // 按字符集生成 count 个字符。
     private string Chars(string charset, int count) {
-        if (count <= 0) { return ""; }
+        if (count <= 0 || charset == null || charset.Length == 0) { return ""; }
+        if (count > 16777216) {
+            throw new FixtureException(FixtureError.InvalidArgument, "",
+                "FixtureRandom: string length exceeds limit");
+        }
         byte[] buf = new byte[count];
         int clen = charset.Length;
         for (int i = 0; i < count; i = i + 1) {
-            buf[i] = (byte)(charset[this.Int(0, clen)] & 255);
+            buf[i] = (byte)(charset[this.rng.NextInt(0, clen)] & 255);
         }
-        return buf.ToStr(0, count);
+        return NativeMemory.GetString((nint)buf, 0, count);
     }
 
     // 可打印 ASCII 字符集。

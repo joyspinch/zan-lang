@@ -84,8 +84,9 @@ public class DataFrame {
         return ColKind.Str;
     }
 
-    // 严格十进制整数形态：可选 +/- 后全数字（不允许空白）。
+    // 严格十进制 64 位整数形态：可选 +/- 后全数字且在 Int64 范围内（不允许空白）。
     public static bool LooksInt(string s) {
+        if (s == null) { return false; }
         int n = s.Length;
         int i = 0;
         if (n > 0 && ((s[0] & 255) == 45 || (s[0] & 255) == 43)) { i = 1; }
@@ -94,13 +95,15 @@ public class DataFrame {
             int c = s[i] & 255;
             if (c < 48 || c > 57) { return false; }
         }
-        return true;
+        long parsed = 0L;
+        return long.TryParse(s, out parsed);
     }
 
     // 严格数值形态：可选 +/- + 尾数（数字与至多一个小数点，至少一位数字）
     // 加可选指数（e/E [+/-] 数字）。排除 strtod 也接受的
     // inf/nan/十六进制与前后空白。
     public static bool LooksFloat(string s) {
+        if (s == null) { return false; }
         int n = s.Length;
         int i = 0;
         if (n > 0 && ((s[0] & 255) == 45 || (s[0] & 255) == 43)) { i = 1; }
@@ -203,6 +206,7 @@ public class DataFrame {
 
     // 追加一行并按字符串逐列填入（缺的补空、多的丢弃）。
     public void AddStrRow(params string[] cells) {
+        if (cells == null) { throw new ArgumentNullException("cells"); }
         int row = this.AddRow();
         for (int c = 0; c < this.cols.Count && c < cells.Length; c = c + 1) {
             this.cols[c].PutStr(row, cells[c]);
@@ -211,6 +215,7 @@ public class DataFrame {
 
     // 追加一行并按 double 逐列填入（Int 列截断）。
     public void AddFloatRow(params double[] cells) {
+        if (cells == null) { throw new ArgumentNullException("cells"); }
         int row = this.AddRow();
         for (int c = 0; c < this.cols.Count && c < cells.Length; c = c + 1) {
             this.cols[c].PutDouble(row, cells[c]);
@@ -294,34 +299,44 @@ public class DataFrame {
 
     // 写单元格（文本形态，按列类型转换）。
     public void SetStr(int row, int col, string v) {
+        if (row < 0 || row >= this.rowCount) { throw new ArgumentOutOfRangeException("row"); }
+        if (col < 0 || col >= this.cols.Count) { throw new ArgumentOutOfRangeException("col"); }
         this.cols[col].PutStr(row, v);
     }
 
     public void SetStr(int row, string col, string v) {
+        if (row < 0 || row >= this.rowCount) { throw new ArgumentOutOfRangeException("row"); }
         this.ColOrThrow(col).PutStr(row, v);
     }
 
     // 写单元格（64 位整数）。
     public void SetInt(int row, int col, long v) {
+        if (row < 0 || row >= this.rowCount) { throw new ArgumentOutOfRangeException("row"); }
+        if (col < 0 || col >= this.cols.Count) { throw new ArgumentOutOfRangeException("col"); }
         this.cols[col].PutLong(row, v);
     }
 
     public void SetInt(int row, string col, long v) {
+        if (row < 0 || row >= this.rowCount) { throw new ArgumentOutOfRangeException("row"); }
         this.ColOrThrow(col).PutLong(row, v);
     }
 
     // 写单元格（double；Int 列截断）。
     public void SetFloat(int row, int col, double v) {
+        if (row < 0 || row >= this.rowCount) { throw new ArgumentOutOfRangeException("row"); }
+        if (col < 0 || col >= this.cols.Count) { throw new ArgumentOutOfRangeException("col"); }
         this.cols[col].PutDouble(row, v);
     }
 
     public void SetFloat(int row, string col, double v) {
+        if (row < 0 || row >= this.rowCount) { throw new ArgumentOutOfRangeException("row"); }
         this.ColOrThrow(col).PutDouble(row, v);
     }
 
     // 过滤：谓词为 true 的行组成新表（同一 schema），列式批量物化。
     // 谓词闭包可捕获本帧读取任意单元格。
     public DataFrame Filter(RowFn fn) {
+        if (fn == null) { throw new ArgumentNullException("fn"); }
         List<int> matched = new List<int>();
         int n = this.rowCount;
         for (int r = 0; r < n; r = r + 1) {
@@ -360,22 +375,47 @@ public class DataFrame {
         return all;
     }
 
-    // 按列稳定排序（相等保持原相对顺序），返回新表。
+    // 按列稳定排序（相等保持原相对顺序；缺失值与 Float NaN 稳定排在末尾），返回新表。
     // desc 为 true 时降序。列不存在抛异常。
     public DataFrame SortBy(string col, bool desc) {
         DataCol key = this.ColOrThrow(col);
         int n = this.rowCount;
         int[] idx = new int[n];
-        for (int r = 0; r < n; r = r + 1) { idx[r] = r; }
-        if (n >= 2) {
-            int[] tmp = new int[n];
-            int kind = key.Kind();
+        int kind = key.Kind();
+        int validCount = 0;
+        bool hasSpecial = key.missing.Count > 0;
+        if (!hasSpecial && kind == ColKind.Float) {
+            List<double> fv = key.nums;
+            for (int r = 0; r < n; r = r + 1) {
+                if (fv[r] != fv[r]) { hasSpecial = true; break; }
+            }
+        }
+        if (!hasSpecial) {
+            for (int r = 0; r < n; r = r + 1) { idx[r] = r; }
+            validCount = n;
+        } else {
+            List<int> tail = new List<int>();
+            for (int r = 0; r < n; r = r + 1) {
+                bool isSpecial = key.IsMissing(r) || (kind == ColKind.Float && key.nums[r] != key.nums[r]);
+                if (isSpecial) {
+                    tail.Add(r);
+                } else {
+                    idx[validCount] = r;
+                    validCount = validCount + 1;
+                }
+            }
+            for (int i = 0; i < tail.Count; i = i + 1) {
+                idx[validCount + i] = tail[i];
+            }
+        }
+        if (validCount >= 2) {
+            int[] tmp = new int[validCount];
             if (kind == ColKind.Int) {
-                DataFrame.MergeSortInt(idx, tmp, 0, n, key.ints, desc);
+                DataFrame.MergeSortInt(idx, tmp, 0, validCount, key.ints, desc);
             } else if (kind == ColKind.Float) {
-                DataFrame.MergeSortFloat(idx, tmp, 0, n, key.nums, desc);
+                DataFrame.MergeSortFloat(idx, tmp, 0, validCount, key.nums, desc);
             } else {
-                DataFrame.MergeSortStr(idx, tmp, 0, n, key.text, desc);
+                DataFrame.MergeSortStr(idx, tmp, 0, validCount, key.text, desc);
             }
         }
         DataFrame outDf = new DataFrame();
@@ -719,6 +759,9 @@ public class DataFrame {
     // 的哈希连接。结果列为左表全部列加右表除键列外的列；右表列与
     // 左表撞名时加 "_1" 后缀。每对匹配行产出一行（左行序 × 右行序）。
     public DataFrame Join(DataFrame right, string keyCol, string rightKeyCol) {
+        if (right == null) {
+            throw new InvalidOperationException("Join: 右表为 null");
+        }
         int li = this.ColIndex(keyCol);
         int ri = right.ColIndex(rightKeyCol);
         if (li < 0) {

@@ -47,20 +47,23 @@ public class BenchRunner {
     // 测量循环（内部共用一份逻辑）。
     BenchResult Measure(string name, Action body) {
         BenchOptions opt = this.options;
-        for (int i = 0; i < opt.warmupIterations; i++) {
+        int warmup = opt.warmupIterations > 0 ? opt.warmupIterations : 0;
+        int minIter = opt.minIterations > 0 ? opt.minIterations : 0;
+        int maxIter = opt.maxIterations > 0 ? opt.maxIterations : 0;
+        for (int i = 0; i < warmup; i++) {
             body();
         }
 
         long freq = Stopwatch.Frequency();
         List<long> samples = new List<long>();
-        int preCap = opt.maxIterations > 0 ? opt.maxIterations : opt.minIterations;
+        int preCap = maxIter > 0 ? maxIter : minIter;
         if (preCap > 1048576) { preCap = 1048576; }
         if (preCap > 0) { samples.Reserve(preCap); }
         long startTicks = Stopwatch.NowTicks();
         long allocStart = GC.GetAllocatedBytesForCurrentThread();
         while (true) {
-            if (samples.Count >= opt.maxIterations) { break; }
-            if (samples.Count >= opt.minIterations
+            if (samples.Count >= maxIter) { break; }
+            if (samples.Count >= minIter
                 && opt.targetMilliseconds <= 0) {
                 break;
             }
@@ -70,7 +73,7 @@ public class BenchRunner {
             long delta = t1 - t0;
             if (delta < 0) { delta = 0; }
             samples.Add(BenchRunner.TicksToNs(delta, freq));
-            if (opt.targetMilliseconds > 0 && samples.Count >= opt.minIterations) {
+            if (opt.targetMilliseconds > 0 && samples.Count >= minIter) {
                 long elapsedMs = BenchRunner.TicksToMs(Stopwatch.NowTicks() - startTicks, freq);
                 if (elapsedMs >= opt.targetMilliseconds) { break; }
             }
@@ -80,9 +83,9 @@ public class BenchRunner {
         if (allocDelta < 0) { allocDelta = 0; }
 
         BenchResult r = new BenchResult();
-        r.name = name;
+        r.name = name == null ? "" : name;
         r.iterations = samples.Count;
-        r.warmupIterations = opt.warmupIterations;
+        r.warmupIterations = warmup;
         r.samples = samples;
         if (samples.Count > 0) {
             r.allocatedBytes = allocDelta / (long)samples.Count;
@@ -101,17 +104,27 @@ public class BenchRunner {
         return r;
     }
 
-    // tick 差换算成纳秒（先除后乘，避免长时间测量时溢出）。
+    // tick 差换算成纳秒（防长时间或超高频率下的 64 位乘法溢出）。
     public static long TicksToNs(long ticks, long freq) {
-        if (freq <= 0) { return 0; }
-        if (ticks < 0) { return 0; }
-        return (ticks / freq) * 1000000000 + (ticks % freq) * 1000000000 / freq;
+        if (freq <= 0L || ticks <= 0L) { return 0L; }
+        long whole = ticks / freq;
+        long rem = ticks % freq;
+        long frac = rem <= 9223372036L
+            ? (rem * 1000000000L) / freq
+            : (long)((double)rem * 1000000000.0 / (double)freq);
+        if (whole >= 9223372036L) { return 9223372036854775807L; }
+        return whole * 1000000000L + frac;
     }
 
-    // tick 差换算成毫秒。
+    // tick 差换算成毫秒（防 64 位乘法溢出）。
     public static long TicksToMs(long ticks, long freq) {
-        if (freq <= 0) { return 0; }
-        if (ticks < 0) { return 0; }
-        return (ticks / freq) * 1000 + (ticks % freq) * 1000 / freq;
+        if (freq <= 0L || ticks <= 0L) { return 0L; }
+        long whole = ticks / freq;
+        long rem = ticks % freq;
+        long frac = rem <= 9223372036854775L
+            ? (rem * 1000L) / freq
+            : (long)((double)rem * 1000.0 / (double)freq);
+        if (whole >= 9223372036854775L) { return 9223372036854775807L; }
+        return whole * 1000L + frac;
     }
 }

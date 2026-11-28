@@ -16,6 +16,7 @@ public enum NetworkType {
 // 在 Windows/Linux 桌面与服务端直接通过操作系统原生接口无头探测活动网卡，
 // 不依赖任何 GUI 后端；若上层注册了 HardwareHost，优先委派宿主探测。
 public class Network {
+    static string mockLock = "System.Hardware.Network.mockLock";
     static bool hasMock;
     static int mockType;
 
@@ -27,11 +28,13 @@ public class Network {
 
     // 获取当前网络连接类型（Wifi, Cellular, Ethernet, None, Unknown）
     public static NetworkType Type() {
-        if (Network.hasMock) {
-            if (Network.mockType >= -1 && Network.mockType <= 3) {
-                return (NetworkType)Network.mockType;
+        lock (Network.mockLock) {
+            if (Network.hasMock) {
+                if (Network.mockType >= -1 && Network.mockType <= 3) {
+                    return (NetworkType)Network.mockType;
+                }
+                return NetworkType.Unknown;
             }
-            return NetworkType.Unknown;
         }
         IHardwareHost host = HardwareHost.Current();
         if (host != null) {
@@ -46,14 +49,18 @@ public class Network {
 
     // 仿真/注入当前网络状态（用于离线测试、断网演练）
     public static void Inject(NetworkType t) {
-        Network.mockType = (int)t;
-        Network.hasMock = true;
+        lock (Network.mockLock) {
+            Network.mockType = (int)t;
+            Network.hasMock = true;
+        }
     }
 
     // 清除仿真注入，恢复真实网络探测。
     public static void Reset() {
-        Network.hasMock = false;
-        Network.mockType = -1;
+        lock (Network.mockLock) {
+            Network.hasMock = false;
+            Network.mockType = -1;
+        }
     }
 
     static NetworkType NativeType() {
@@ -120,12 +127,15 @@ public class Network {
             new Span<int>(sizePtr, 1)[0] = 0;
             int rc0 = Network.WinGetIfTable(0, sizePtr, 0);
             int needed = new Span<int>(sizePtr, 1)[0];
+            if (rc0 != 0 && rc0 != 122) {
+                return NetworkType.Unknown;
+            }
             if (needed <= 4) {
                 return rc0 == 0 ? NetworkType.None : NetworkType.Unknown;
             }
             for (int attempt = 0; attempt < 3; attempt = attempt + 1) {
-                if (needed <= 4) { return NetworkType.Unknown; }
-                nint tbl = NativeMemory.Alloc((long)needed);
+                if (needed <= 4 || needed > 67108864) { return NetworkType.Unknown; }
+                nint tbl = NativeMemory.Alloc(needed);
                 if (tbl == 0) { return NetworkType.Unknown; }
                 try {
                     new Span<int>(sizePtr, 1)[0] = needed;

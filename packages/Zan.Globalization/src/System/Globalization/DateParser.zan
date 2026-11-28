@@ -431,6 +431,7 @@ public class DateParser {
                 if (nums == 0) { nv1 = v; nd1 = digits; }
                 else if (nums == 1) { nv2 = v; nd2 = digits; }
                 else if (nums == 2) { nv3 = v; nd3 = digits; }
+                else { return null; }
                 nums = nums + 1;
                 continue;
             }
@@ -598,6 +599,7 @@ public class DateParser {
             else { if (hour == 12) { hour = 0; } }
         }
 
+        if (year < -99999 || year > 99999) { return null; }
         if (month < 1 || month > 12) { return null; }
         if (day < 1 || day > DateTime.DaysInMonth(year, month)) { return null; }
         if (hour < 0 || hour > 23) { return null; }
@@ -624,7 +626,7 @@ public class DateParser {
 
     // 中文标记：年(1) / 月(2) / 日(3)；不是则返回 0。
     public static int ChineseMarker(string s, int i) {
-        if (s == null || i + 3 > s.Length) { return 0; }
+        if (s == null || i < 0 || i + 3 > s.Length) { return 0; }
         int b0 = s[i] & 255;
         int b1 = s[i + 1] & 255;
         int b2 = s[i + 2] & 255;
@@ -637,58 +639,65 @@ public class DateParser {
     // ---- 模式格式化与精确解析 ---------------------------------------
 
     private static byte[] EnsureOut(byte[] buf, int pos, int need) {
-        if (pos + need <= buf.Length) { return buf; }
-        int nc = buf.Length * 2;
-        while (nc < pos + need) { nc = nc * 2; }
-        byte[] grown = new byte[nc];
+        if (need < 0 || pos > 67108864 - need) {
+            throw new InvalidOperationException("DateParser.Format output exceeds limit");
+        }
+        int target = pos + need;
+        if (target <= buf.Length) { return buf; }
+        long ncL = (long)buf.Length * 2L;
+        if (ncL < 32L) { ncL = 32L; }
+        while (ncL < (long)target) { ncL = ncL * 2L; }
+        if (ncL > 67108864L) { ncL = 67108864L; }
+        byte[] grown = new byte[(int)ncL];
         if (pos > 0) { NativeMemory.Copy((nint)grown, (nint)buf, pos); }
         return grown;
     }
 
     private static int WriteIntInline(byte[] buf, int pos, int v) {
-        if (v < 0) {
+        long lv = (long)v;
+        if (lv < 0L) {
             buf[pos] = 45;
             pos = pos + 1;
-            v = 0 - v;
+            lv = 0L - lv;
         }
-        if (v < 10) {
-            buf[pos] = (byte)(48 + v);
+        if (lv < 10L) {
+            buf[pos] = (byte)(48L + lv);
             return pos + 1;
         }
-        if (v < 100) {
-            int q = v / 10;
-            buf[pos] = (byte)(48 + q);
-            buf[pos + 1] = (byte)(48 + (v - q * 10));
+        if (lv < 100L) {
+            long q = lv / 10L;
+            buf[pos] = (byte)(48L + q);
+            buf[pos + 1] = (byte)(48L + (lv - q * 10L));
             return pos + 2;
         }
-        if (v < 1000) {
-            int h = v / 100;
-            int r = v - h * 100;
-            int t = r / 10;
-            buf[pos] = (byte)(48 + h);
-            buf[pos + 1] = (byte)(48 + t);
-            buf[pos + 2] = (byte)(48 + (r - t * 10));
+        if (lv < 1000L) {
+            long h = lv / 100L;
+            long r = lv - h * 100L;
+            long t = r / 10L;
+            buf[pos] = (byte)(48L + h);
+            buf[pos + 1] = (byte)(48L + t);
+            buf[pos + 2] = (byte)(48L + (r - t * 10L));
             return pos + 3;
         }
-        if (v < 10000) {
-            int th = v / 1000;
-            int r1 = v - th * 1000;
-            int h = r1 / 100;
-            int r2 = r1 - h * 100;
-            int t = r2 / 10;
-            buf[pos] = (byte)(48 + th);
-            buf[pos + 1] = (byte)(48 + h);
-            buf[pos + 2] = (byte)(48 + t);
-            buf[pos + 3] = (byte)(48 + (r2 - t * 10));
+        if (lv < 10000L) {
+            long th = lv / 1000L;
+            long r1 = lv - th * 1000L;
+            long h = r1 / 100L;
+            long r2 = r1 - h * 100L;
+            long t = r2 / 10L;
+            buf[pos] = (byte)(48L + th);
+            buf[pos + 1] = (byte)(48L + h);
+            buf[pos + 2] = (byte)(48L + t);
+            buf[pos + 3] = (byte)(48L + (r2 - t * 10L));
             return pos + 4;
         }
-        // 一般正整数（>=10000）
+        // 一般正整数（>=10000，兼容 INT_MIN）
         int start = pos;
-        while (v > 0) {
-            int q = v / 10;
-            buf[pos] = (byte)(48 + (v - q * 10));
+        while (lv > 0L) {
+            long q = lv / 10L;
+            buf[pos] = (byte)(48L + (lv - q * 10L));
             pos = pos + 1;
-            v = q;
+            lv = q;
         }
         int lo = start;
         int hi = pos - 1;
@@ -711,6 +720,10 @@ public class DateParser {
         }
         if (v < 0) {
             buf[pos] = 48;
+            if (v == -2147483648) {
+                NativeMemory.Copy((nint)buf + (nint)(pos + 1), (nint)"2147483648", 10);
+                return pos + 11;
+            }
             return DateParser.WriteIntInline(buf, pos + 1, 0 - v);
         }
         return DateParser.WriteIntInline(buf, pos, v);
@@ -806,7 +819,11 @@ public class DateParser {
             switch (c) {
                 case 121: // y
                     if (len >= 4) { oPos = DateParser.WritePad4(outBuf, oPos, value.year); }
-                    else { oPos = DateParser.WritePad2(outBuf, oPos, value.year % 100); }
+                    else {
+                        int yy = value.year % 100;
+                        if (yy < 0) { yy = 0 - yy; }
+                        oPos = DateParser.WritePad2(outBuf, oPos, yy);
+                    }
                     break;
                 case 77:  // M 月
                     if (len >= 2) { oPos = DateParser.WritePad2(outBuf, oPos, value.month); }
@@ -1073,7 +1090,7 @@ public class DateParser {
             b[1] = (byte)(48 + (v - q * 10));
             return NativeMemory.GetString((nint)b, 0, 2);
         }
-        if (v < 0) { return "0" + (0 - v); }
+        if (v < 0) { return "0" + Convert.ToString(0L - (long)v); }
         return Convert.ToString(v);
     }
 

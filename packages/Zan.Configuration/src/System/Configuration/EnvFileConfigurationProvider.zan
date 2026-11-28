@@ -33,38 +33,53 @@ public class EnvFileConfigurationProvider : ConfigurationProvider {
         return c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12;
     }
 
+    private const long MAX_CONFIG_FILE_BYTES = 67108864L;
+
     // 读文件并重建内容。文件不存在时：optional 为真则跳过，
     // 否则抛 FileNotFoundException（配置缺文件是启动期错误，不该静默）。
     public override void Load() {
-        if (this.path == null || this.path.Length == 0) { return; }
-        if (!File.Exists(this.path)) {
+        if (this.path == null || this.path.Length == 0) {
             if (this.optional) {
-                this.data.Clear();
+                this.data = new Dictionary<string, string>();
                 return;
             }
-            throw new FileNotFoundException("Configuration file not found: " + this.path);
+            throw new FileNotFoundException("Configuration file path is empty");
         }
-        string text = File.ReadAllText(this.path);
-        this.data.Clear();
+        string text = null;
+        try {
+            long sz = File.GetSize64(this.path);
+            if (sz > EnvFileConfigurationProvider.MAX_CONFIG_FILE_BYTES) {
+                throw new IOException("Configuration file exceeds 64 MiB limit: " + this.path);
+            }
+            text = File.ReadAllText(this.path);
+        } catch (FileNotFoundException e) {
+            if (this.optional) {
+                this.data = new Dictionary<string, string>();
+                return;
+            }
+            throw e;
+        }
+        Dictionary<string, string> next = new Dictionary<string, string>();
         int n = text.Length;
         nint tp = (nint)text;
         int pos = 0;
         while (pos < n) {
             int nl = NativeMemory.Find(tp, pos, 10, n - pos);
             int end = nl >= 0 ? nl : n;
-            this.ParseLineSlice(text, tp, pos, end);
+            this.ParseLineSliceInto(next, text, tp, pos, end);
             if (nl < 0) { break; }
             pos = nl + 1;
         }
+        this.data = next;
     }
 
     // 解析一行 "KEY=VALUE"。
     protected void ParseLine(string rawLine) {
         if (rawLine == null || rawLine.Length == 0) { return; }
-        this.ParseLineSlice(rawLine, (nint)rawLine, 0, rawLine.Length);
+        this.ParseLineSliceInto(this.data, rawLine, (nint)rawLine, 0, rawLine.Length);
     }
 
-    private void ParseLineSlice(string text, nint tp, int start, int end) {
+    private void ParseLineSliceInto(Dictionary<string, string> target, string text, nint tp, int start, int end) {
         int s = start;
         int e = end;
         while (s < e && EnvFileConfigurationProvider.IsTrimWs(text[s] & 255)) { s = s + 1; }
@@ -99,7 +114,10 @@ public class EnvFileConfigurationProvider : ConfigurationProvider {
         string value = (hadLeadingWs && vs < ve && (text[vs] & 255) == 35)
             ? ""
             : EnvFileConfigurationProvider.ParseValueSlice(text, tp, vs, ve);
-        this.Set(rawKey, value);
+        string canonical = ConfigurationKeys.Canonical(rawKey);
+        if (canonical.Length > 0 && target != null) {
+            target[canonical] = value;
+        }
     }
 
     private static bool IsTrailingCommentOrWs(string raw, int pos, int end) {
@@ -115,11 +133,8 @@ public class EnvFileConfigurationProvider : ConfigurationProvider {
             return (start == 0 && end == raw.Length) ? raw : raw.Substring(start, len);
         }
         int first = raw[start] & 255;
-        int last = raw[end - 1] & 255;
         if (first == 34) {
-            if (last == 34) {
-                return EnvFileConfigurationProvider.UnescapeSlice(raw, rp, start + 1, end - 1);
-            }
+            // 从左向右扫描首个未转义的闭引号，避免行尾注释含 '"' 时把注释吞进值里
             int p = start + 1;
             while (p < end) {
                 int c = raw[p] & 255;
@@ -137,9 +152,6 @@ public class EnvFileConfigurationProvider : ConfigurationProvider {
             }
         }
         if (first == 39) {
-            if (last == 39) {
-                return raw.Substring(start + 1, len - 2);
-            }
             int close = NativeMemory.Find(rp, start + 1, 39, end - (start + 1));
             if (close >= 0 && EnvFileConfigurationProvider.IsTrailingCommentOrWs(raw, close + 1, end)) {
                 return raw.Substring(start + 1, close - (start + 1));

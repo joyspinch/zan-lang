@@ -13,18 +13,47 @@ namespace Tools.Bench;
 // **为什么中位数是主指标**：均值会被偶发尖峰拉走（一次 GC 式停顿、一次
 // 调度抖动），中位数不会。基准报告以中位数为准，均值只作参考。
 public class BenchStats {
-    // 原地升序排序（插入排序）。
+    private static void SiftDown(long[] values, int root, int end) {
+        int cur = root;
+        while (true) {
+            int child = cur * 2 + 1;
+            if (child >= end) { break; }
+            int swapIdx = cur;
+            if (values[swapIdx] < values[child]) { swapIdx = child; }
+            if (child + 1 < end && values[swapIdx] < values[child + 1]) { swapIdx = child + 1; }
+            if (swapIdx == cur) { break; }
+            long tmp = values[cur];
+            values[cur] = values[swapIdx];
+            values[swapIdx] = tmp;
+            cur = swapIdx;
+        }
+    }
+
+    // 原地升序排序（小数组插入排序，大数组堆排序，最坏 O(n log n) 零额外分配）。
     public static void Sort(long[] values) {
         if (values == null) { return; }
         int n = values.Length;
-        for (int i = 1; i < n; i++) {
-            long key = values[i];
-            int j = i - 1;
-            while (j >= 0 && values[j] > key) {
-                values[j + 1] = values[j];
-                j = j - 1;
+        if (n <= 1) { return; }
+        if (n <= 32) {
+            for (int i = 1; i < n; i++) {
+                long key = values[i];
+                int j = i - 1;
+                while (j >= 0 && values[j] > key) {
+                    values[j + 1] = values[j];
+                    j = j - 1;
+                }
+                values[j + 1] = key;
             }
-            values[j + 1] = key;
+            return;
+        }
+        for (int start = n / 2 - 1; start >= 0; start = start - 1) {
+            BenchStats.SiftDown(values, start, n);
+        }
+        for (int end = n - 1; end > 0; end = end - 1) {
+            long tmp = values[0];
+            values[0] = values[end];
+            values[end] = tmp;
+            BenchStats.SiftDown(values, 0, end);
         }
     }
 
@@ -37,13 +66,16 @@ public class BenchStats {
         return copy;
     }
 
-    // 中位数（偶数个取中间两个的平均，向下取整）。
+    // 中位数（偶数个取中间两个的平均，防溢出）。
     public static long Median(long[] values) {
         if (values == null || values.Length == 0) { return 0; }
         long[] s = BenchStats.SortedCopy(values);
         int n = s.Length;
         if (n % 2 == 1) { return s[n / 2]; }
-        return (s[n / 2 - 1] + s[n / 2]) / 2;
+        long a = s[n / 2 - 1];
+        long b = s[n / 2];
+        if (a < 0L && b > 0L) { return (a + b) / 2L; }
+        return a + (b - a) / 2L;
     }
 
     // 最小值。
@@ -66,12 +98,30 @@ public class BenchStats {
         return m;
     }
 
-    // 均值（整数除法，截断）。
+    // 均值（商余分开累加，消除大样本求和时的 64 位溢出）。
     public static long Mean(long[] values) {
         if (values == null || values.Length == 0) { return 0; }
-        long sum = 0;
-        for (int i = 0; i < values.Length; i++) { sum = sum + values[i]; }
-        return sum / values.Length;
+        long n = (long)values.Length;
+        long qSum = 0L;
+        long rSum = 0L;
+        for (int i = 0; i < values.Length; i++) {
+            long v = values[i];
+            qSum = qSum + (v / n);
+            rSum = rSum + (v % n);
+            if (rSum >= n) {
+                qSum = qSum + 1L;
+                rSum = rSum - n;
+            } else if (rSum <= -n) {
+                qSum = qSum - 1L;
+                rSum = rSum + n;
+            }
+        }
+        if (qSum > 0L && rSum < 0L) {
+            qSum = qSum - 1L;
+        } else if (qSum < 0L && rSum > 0L) {
+            qSum = qSum + 1L;
+        }
+        return qSum;
     }
 
     // 样本标准差（n-1 分母；样本不足 2 个时返回 0）。
@@ -89,9 +139,9 @@ public class BenchStats {
         return BenchStats.Sqrt(variance);
     }
 
-    // 平方根（委托标准库 Math.Sqrt，保留公开静态签名兼容）。
+    // 平方根（委托标准库 Math.Sqrt，NaN 与非正值统一归 0）。
     public static double Sqrt(double v) {
-        if (v <= 0.0) { return 0.0; }
+        if (!(v > 0.0)) { return 0.0; }
         return Math.Sqrt(v);
     }
 }

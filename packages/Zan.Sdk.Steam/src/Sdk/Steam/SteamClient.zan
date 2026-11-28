@@ -23,7 +23,7 @@ public class SteamClient {
     ExternalCallPolicy callPolicy;
 
     public SteamClient(string key, int appId) {
-        this.key = key;
+        this.key = key != null ? key : "";
         this.appId = appId;
         this.host = SteamClient.DEFAULT_HOST;
         this.port = SteamClient.DEFAULT_PORT;
@@ -39,14 +39,38 @@ public class SteamClient {
     }
 
     public SteamClient Server(string host, int port) {
+        if (host == null || host.Length == 0) {
+            throw new SteamException("client.paramError", "host 不能为空", "");
+        }
+        if (port <= 0 || port > 65535) {
+            throw new SteamException("client.paramError", "port 必须在 1..65535 之间", "");
+        }
         this.host = host;
         this.port = port;
         return this;
     }
 
     public SteamClient Timeout(int ms) {
+        if (ms <= 0) {
+            throw new SteamException("client.paramError", "timeoutMs 必须 > 0", "");
+        }
         this.timeoutMs = ms;
         return this;
+    }
+
+    private void RequireKey() {
+        if (this.key == null || this.key.Length == 0) {
+            throw new SteamException("client.paramError", "Steam Web API key 不能为空", "");
+        }
+    }
+
+    private static bool IsValidSteamIdToken(string id) {
+        if (id == null || id.Length == 0) { return false; }
+        for (int i = 0; i < id.Length; i = i + 1) {
+            int c = id[i] & 255;
+            if (c == 44 || c <= 32 || c == 127) { return false; }
+        }
+        return true;
     }
 
     public SteamClient WithCallPolicy(ExternalCallPolicy policy) {
@@ -69,6 +93,7 @@ public class SteamClient {
 
     // 查询游戏成就与统计 Schema（ISteamUserStats/GetSchemaForGame/v2）。
     public async SteamResponse GetSchemaForGameAsync(string language) {
+        this.RequireKey();
         string path = "/ISteamUserStats/GetSchemaForGame/v2"
             + "?key=" + Encoding.UrlEncode(this.key)
             + "&appid=" + Convert.ToString(this.appId);
@@ -80,6 +105,7 @@ public class SteamClient {
 
     // 上报成就与统计（ISteamUserStats/SetUserStatsForGame/v1，按官方文档携带 steamid / count / name[i] / value[i]）。
     public async SteamResponse SetUserStatsForGameAsync(string steamId, JsonValue stats, int count) {
+        this.RequireKey();
         if (steamId == null || steamId.Length == 0) {
             throw new SteamException("client.paramError", "steamId 不能为空", "");
         }
@@ -94,10 +120,13 @@ public class SteamClient {
         List<int> values = new List<int>();
         for (int i = 0; i < stats.Count() && names.Count < count; i = i + 1) {
             string name = stats.KeyAt(i);
-            if (name.Length == 0) { continue; }
+            if (name == null || name.Length == 0) { continue; }
             int value = stats.ValAt(i) != null ? stats.ValAt(i).AsInt(0) : 0;
             names.Add(name);
             values.Add(value);
+        }
+        if (names.Count == 0) {
+            throw new SteamException("client.paramError", "stats 至少包含一项有效字段", "");
         }
         StringBuilder body = new StringBuilder();
         body.Append("key="); body.Append(Encoding.UrlEncode(this.key));
@@ -117,6 +146,7 @@ public class SteamClient {
 
     // 兼容旧两参签名：上报成就与统计（建议使用带 steamId 的三参重载）。
     public async SteamResponse SetUserStatsForGameAsync(JsonValue stats, int count) {
+        this.RequireKey();
         if (stats == null || !stats.IsObject()) {
             throw new SteamException("client.paramError",
                 "stats 必须是 JSON 对象，如 {\"achieved\":1}", "");
@@ -130,11 +160,14 @@ public class SteamClient {
         int added = 0;
         for (int i = 0; i < stats.Count() && added < count; i = i + 1) {
             string name = stats.KeyAt(i);
+            if (name == null || name.Length == 0) { continue; }
             int value = stats.ValAt(i) != null ? stats.ValAt(i).AsInt(0) : 0;
-            if (name.Length == 0) { continue; }
             body.Append("&stats["); body.Append(Encoding.UrlEncode(name));
             body.Append("]="); body.Append(Convert.ToString(value));
             added = added + 1;
+        }
+        if (added == 0) {
+            throw new SteamException("client.paramError", "stats 至少包含一项有效字段", "");
         }
         return await this.SendAsync("POST", "/ISteamUserStats/SetUserStatsForGame/v1",
             body.ToString(), "application/x-www-form-urlencoded");
@@ -144,6 +177,7 @@ public class SteamClient {
 
     // 批量查询玩家资料（ISteamUser/GetPlayerSummaries/v0002，单次上限 100）。
     public async SteamResponse GetPlayerSummariesAsync(List<string> steamIds) {
+        this.RequireKey();
         if (steamIds == null || steamIds.Count == 0) {
             throw new SteamException("client.paramError", "steamIds 不能为空", "");
         }
@@ -153,8 +187,13 @@ public class SteamClient {
         }
         StringBuilder ids = new StringBuilder();
         for (int i = 0; i < steamIds.Count; i = i + 1) {
+            string sid = steamIds[i];
+            if (!SteamClient.IsValidSteamIdToken(sid)) {
+                throw new SteamException("client.paramError",
+                    "steamIds 包含空值或非法字符（禁止逗号与控制字符）", "");
+            }
             if (i > 0) { ids.Append(","); }
-            ids.Append(steamIds[i]);
+            ids.Append(sid);
         }
         string path = "/ISteamUser/GetPlayerSummaries/v0002"
             + "?key=" + Encoding.UrlEncode(this.key)
@@ -167,6 +206,7 @@ public class SteamClient {
     // 服务端校验客户端票据（ISteamUserAuth/AuthenticateUserTicket/v1，须发行商 key）。
     public async SteamTicketResult AuthenticateUserTicketAsync(string ticket,
                                                         string identity) {
+        this.RequireKey();
         if (ticket == null || ticket.Length == 0) {
             throw new SteamException("client.paramError", "ticket 不能为空", "");
         }
@@ -188,6 +228,7 @@ public class SteamClient {
     public async SteamResponse GetOwnedGamesAsync(string steamId, bool includeAppInfo,
                                            bool includeFreeGames,
                                            List<int> appIds) {
+        this.RequireKey();
         if (steamId == null || steamId.Length == 0) {
             throw new SteamException("client.paramError", "steamId 不能为空", "");
         }
@@ -214,7 +255,9 @@ public class SteamClient {
         JsonValue arr = resp.Value.PathGet("response.players");
         if (arr == null || !arr.IsArray()) { return players; }
         for (int i = 0; i < arr.Count(); i = i + 1) {
-            players.Add(SteamPlayerSummary.From(arr.At(i)));
+            JsonValue item = arr.At(i);
+            if (item == null || !item.IsObject()) { continue; }
+            players.Add(SteamPlayerSummary.From(item));
         }
         return players;
     }
@@ -225,7 +268,9 @@ public class SteamClient {
         JsonValue arr = resp.Value.PathGet("game.availableGameStats.achievements");
         if (arr == null || !arr.IsArray()) { return items; }
         for (int i = 0; i < arr.Count(); i = i + 1) {
-            items.Add(SteamAchievement.From(arr.At(i)));
+            JsonValue item = arr.At(i);
+            if (item == null || !item.IsObject()) { continue; }
+            items.Add(SteamAchievement.From(item));
         }
         return items;
     }
@@ -239,7 +284,9 @@ public class SteamClient {
         JsonValue arr = resp.Value.PathGet("response.games");
         if (arr == null || !arr.IsArray()) { return games; }
         for (int i = 0; i < arr.Count(); i = i + 1) {
-            games.Add(SteamOwnedGame.From(arr.At(i)));
+            JsonValue item = arr.At(i);
+            if (item == null || !item.IsObject()) { continue; }
+            games.Add(SteamOwnedGame.From(item));
         }
         return games;
     }

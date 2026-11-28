@@ -84,18 +84,23 @@ public class MessageBus {
         return this.DispatchDelivery(message);
     }
 
+    private int CountHandlers(object message) {
+        int handlers = 0;
+        for (int i = 0; i < this.channels.Count; i = i + 1) {
+            MessageChannelBase channel = this.channels[i];
+            if (channel == null || !channel.Accepts(message)) { continue; }
+            handlers = handlers + channel.SubscriberCount();
+        }
+        return handlers;
+    }
+
     // 命令：恰好一个订阅者，零个或多个都报错。
     public void Send(object command) {
         if (command == null) {
             throw new MessageException(MessageError.InvalidMessage, null,
                 "MessageBus.Send: the command must not be null");
         }
-        int handlers = 0;
-        for (int i = 0; i < this.channels.Count; i = i + 1) {
-            MessageChannelBase channel = this.channels[i];
-            if (!channel.Accepts(command)) { continue; }
-            handlers = handlers + channel.SubscriberCount();
-        }
+        int handlers = this.CountHandlers(command);
         if (handlers == 0) {
             throw new MessageException(MessageError.NoHandler, command,
                 "MessageBus.Send: no handler is registered for this command");
@@ -104,7 +109,23 @@ public class MessageBus {
             throw new MessageException(MessageError.TooManyHandlers, command,
                 "MessageBus.Send: expected exactly one handler, got " + handlers.ToString());
         }
-        this.DispatchDelivery(command);
+        MessageBus self = this;
+        MessageHolder holder = new MessageHolder(command);
+        MessageDelivery delivery = new MessageDelivery(this, this.channels, holder);
+        Action finalAction = () => {
+            int now = self.CountHandlers(holder.Value);
+            if (now == 0) {
+                throw new MessageException(MessageError.NoHandler, holder.Value,
+                    "MessageBus.Send: no handler is registered for this command");
+            }
+            if (now > 1) {
+                throw new MessageException(MessageError.TooManyHandlers, holder.Value,
+                    "MessageBus.Send: expected exactly one handler, got " + now.ToString());
+            }
+            delivery.Run();
+        };
+        this.RunPipeline(command, finalAction);
+        this.delivered = this.delivered + delivery.Delivered();
     }
 
     private int DispatchDelivery(object message) {
@@ -118,25 +139,26 @@ public class MessageBus {
 
     // 跑中间件链（公开给查询端点用）。
     public void RunPipeline(object message, Action finalAction) {
-        this.RunMiddleware(0, new MessageHolder(message), finalAction);
+        this.RunMiddleware(0, this.middleware.Count, new MessageHolder(message), finalAction);
     }
 
     // 报告订阅者的异常（登记了错误处理器时用）。
     public void ReportError(Exception cause, object message) {
-        if (this.errorHandler == null) { return; }
-        string text = cause != null ? cause.Message : "subscriber failed";
+        Action<Exception, object> handler = this.errorHandler;
+        if (handler == null) { return; }
+        string text = cause != null && cause.Message != null ? cause.Message : "subscriber failed";
         MessageException wrapped = new MessageException(MessageError.HandlerFailed, message, text, cause);
-        this.errorHandler(wrapped, message);
+        handler(wrapped, message);
     }
 
-    // 逐层跑中间件（递归深度 = 中间件数量）。
-    private void RunMiddleware(int index, MessageHolder holder, Action finalAction) {
-        if (index >= this.middleware.Count) {
+    // 逐层跑中间件（递归深度 = 入口快照的中间件数量）。
+    private void RunMiddleware(int index, int count, MessageHolder holder, Action finalAction) {
+        if (index >= count || index >= this.middleware.Count) {
             if (finalAction != null) { finalAction(); }
             return;
         }
         MessageBus self = this;
-        Action next = () => { self.RunMiddleware(index + 1, holder, finalAction); };
+        Action next = () => { self.RunMiddleware(index + 1, count, holder, finalAction); };
         MessageMiddleware handler = this.middleware[index];
         handler(holder.Value, next);
     }

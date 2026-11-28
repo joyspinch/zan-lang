@@ -16,6 +16,8 @@ public class SubscriptionList<T> {
     private Dictionary<int, int> idToSlot;
     private int nextId;
     private int activeCount;
+    private int publishDepth;
+    private bool needsCompact;
 
     public SubscriptionList() {
         this.handlers = new List<Action<T>>();
@@ -23,19 +25,24 @@ public class SubscriptionList<T> {
         this.idToSlot = new Dictionary<int, int>();
         this.nextId = 0;
         this.activeCount = 0;
+        this.publishDepth = 0;
+        this.needsCompact = false;
     }
 
     // 订阅（返回订阅编号，供退订用）。
     public int Add(Action<T> handler) {
+        if (handler == null) { return -1; }
+        if (this.nextId == 2147483647) {
+            throw new MessageException(MessageError.InvalidHandler, null,
+                "SubscriptionList.Add: subscription id overflow");
+        }
         int id = this.nextId;
         this.nextId = this.nextId + 1;
-        if (handler != null) {
-            int slot = this.handlers.Count;
-            this.handlers.Add(handler);
-            this.ids.Add(id);
-            this.idToSlot.Add(id, slot);
-            this.activeCount = this.activeCount + 1;
-        }
+        int slot = this.handlers.Count;
+        this.handlers.Add(handler);
+        this.ids.Add(id);
+        this.idToSlot.Add(id, slot);
+        this.activeCount = this.activeCount + 1;
         return id;
     }
 
@@ -49,7 +56,11 @@ public class SubscriptionList<T> {
         }
         if (this.activeCount > 0) { this.activeCount = this.activeCount - 1; }
         if (this.handlers.Count >= 32 && this.activeCount * 2 <= this.handlers.Count) {
-            this.Compact();
+            if (this.publishDepth > 0) {
+                this.needsCompact = true;
+            } else {
+                this.Compact();
+            }
         }
         return true;
     }
@@ -92,20 +103,29 @@ public class SubscriptionList<T> {
     public int Publish(T message, Action<Exception> onError) {
         int called = 0;
         int n = this.handlers.Count;
-        for (int i = 0; i < n; i = i + 1) {
-            if (i >= this.handlers.Count) { break; }
-            Action<T> h = this.handlers[i];
-            if (h == null) { continue; }
-            if (onError != null) {
-                try {
+        this.publishDepth = this.publishDepth + 1;
+        try {
+            for (int i = 0; i < n; i = i + 1) {
+                if (i >= this.handlers.Count) { break; }
+                Action<T> h = this.handlers[i];
+                if (h == null) { continue; }
+                if (onError != null) {
+                    try {
+                        h(message);
+                        called = called + 1;
+                    } catch (Exception ex) {
+                        onError(ex);
+                    }
+                } else {
                     h(message);
                     called = called + 1;
-                } catch (Exception ex) {
-                    onError(ex);
                 }
-            } else {
-                h(message);
-                called = called + 1;
+            }
+        } finally {
+            this.publishDepth = this.publishDepth - 1;
+            if (this.publishDepth == 0 && this.needsCompact) {
+                this.needsCompact = false;
+                this.Compact();
             }
         }
         return called;

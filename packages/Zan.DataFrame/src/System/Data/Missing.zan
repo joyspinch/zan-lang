@@ -5,10 +5,17 @@ namespace System.Data;
 
 // 缺失值处理（由 DataCol.missing 布尔掩码表达；Str 列无独立缺失态）。
 public class Missing {
-    public static bool IsNaN(DataFrame df, int row, string col) { return df.ColOrThrow(col).IsMissing(row); }
-    public static bool NotNaN(DataFrame df, int row, string col) { return !df.ColOrThrow(col).IsMissing(row); }
+    public static bool IsNaN(DataFrame df, int row, string col) {
+        if (df == null) { throw new ArgumentNullException("df"); }
+        return df.ColOrThrow(col).IsMissing(row);
+    }
+    public static bool NotNaN(DataFrame df, int row, string col) {
+        if (df == null) { throw new ArgumentNullException("df"); }
+        return !df.ColOrThrow(col).IsMissing(row);
+    }
 
     public static List<bool> Mask(DataFrame df, string col) {
+        if (df == null) { throw new ArgumentNullException("df"); }
         DataCol c = df.ColOrThrow(col);
         List<bool> outp = new List<bool>();
         for (int r = 0; r < df.Rows(); r = r + 1) { outp.Add(c.IsMissing(r)); }
@@ -16,6 +23,7 @@ public class Missing {
     }
 
     public static List<bool> ValidMask(DataFrame df, string col) {
+        if (df == null) { throw new ArgumentNullException("df"); }
         DataCol c = df.ColOrThrow(col);
         List<bool> outp = new List<bool>();
         for (int r = 0; r < df.Rows(); r = r + 1) { outp.Add(!c.IsMissing(r)); }
@@ -23,6 +31,7 @@ public class Missing {
     }
 
     public static int NaNCountInRow(DataFrame df, int row) {
+        if (df == null) { throw new ArgumentNullException("df"); }
         int n = 0;
         for (int c = 0; c < df.ColCount(); c = c + 1) {
             if (df.cols[c].IsMissing(row)) { n = n + 1; }
@@ -32,6 +41,7 @@ public class Missing {
 
     // 丢掉含缺失的行：how 为 "any"（任一列缺失）或 "all"（全部列缺失），返回新表。
     public static DataFrame DropNa(DataFrame df, string how, params string[] subset) {
+        if (df == null) { throw new ArgumentNullException("df"); }
         if (how != "any" && how != "all") {
             throw new ArgumentException("dropna 的 how 只能是 \"any\" 或 \"all\"");
         }
@@ -45,7 +55,7 @@ public class Missing {
             for (int i = 0; i < cols.Count; i = i + 1) {
                 if (df.cols[cols[i]].IsMissing(r)) { missingCount = missingCount + 1; }
             }
-            if (how == "any" ? (missingCount > 0) : (missingCount == cols.Count)) { continue; }
+            if (cols.Count > 0 && (how == "any" ? (missingCount > 0) : (missingCount == cols.Count))) { continue; }
             for (int c = 0; c < df.ColCount(); c = c + 1) {
                 outDf.cols[c].AppendFrom(df.cols[c], r);
             }
@@ -64,6 +74,7 @@ public class Missing {
     }
 
     public static DataFrame FillNa(DataFrame df, string value, params string[] subset) {
+        if (df == null) { throw new ArgumentNullException("df"); }
         List<int> cols = Missing.ResolveCols(df, subset);
         DataFrame outDf = df.Copy();
         for (int i = 0; i < cols.Count; i = i + 1) {
@@ -73,18 +84,24 @@ public class Missing {
     }
 
     public static DataFrame FillNaByColumn(DataFrame df, Dictionary<string, string> values) {
+        if (df == null) { throw new ArgumentNullException("df"); }
         DataFrame outDf = df.Copy();
+        if (values == null) { return outDf; }
         List<string> names = df.Names();
         for (int i = 0; i < names.Count; i = i + 1) {
             string name = names[i];
             if (!values.ContainsKey(name)) { continue; }
-            Missing.FillColStr(outDf.cols[df.ColIndex(name)], outDf.Rows(), values[name]);
+            Missing.FillColStr(outDf.cols[i], outDf.Rows(), values[name]);
         }
         return outDf;
     }
 
-    // 用数值列有效值的 "mean" 或 "median" 填充缺失；若带小数则先将 Int 列升为 Float；全缺失列保持不变。
+    // 用数值列有效值的 "mean" 或 "median" 填充缺失；若带小数或超整数范围则先将 Int 列升为 Float；全缺失列保持不变。
     public static DataFrame FillNaStat(DataFrame df, string method, params string[] subset) {
+        if (df == null) { throw new ArgumentNullException("df"); }
+        if (method != "mean" && method != "median") {
+            throw new ArgumentException("fillna 的 method 只能是 \"mean\" 或 \"median\"");
+        }
         List<int> cols = Missing.ResolveCols(df, subset);
         DataFrame outDf = df.Copy();
         for (int i = 0; i < cols.Count; i = i + 1) {
@@ -96,17 +113,16 @@ public class Missing {
                 if (!df.cols[c].IsMissing(r)) { valid.Add(df.cols[c].GetDouble(r)); }
             }
             if (valid.Count == 0) { continue; }
-            double fill;
-            if (method == "median") {
-                fill = Stats.Median(valid);
-            } else if (method == "mean") {
-                fill = Stats.Mean(valid);
-            } else {
-                throw new ArgumentException("fillna 的 method 只能是 \"mean\" 或 \"median\"");
-            }
-            if (kind == ColKind.Int && fill != Math.Floor(fill)) {
-                outDf.CastColumn(outDf.cols[c].Name(), ColKind.Float);
-                c = outDf.ColIndex(outDf.cols[c].Name());
+            double fill = method == "median" ? Stats.Median(valid) : Stats.Mean(valid);
+            bool fitsInt64 = fill >= -9223372036854775808.0 && fill < 9223372036854775808.0 && fill == Math.Floor(fill);
+            if (kind == ColKind.Int && !fitsInt64) {
+                DataCol oldCol = outDf.cols[c];
+                DataCol promoted = DataCol.Create(oldCol.Name(), ColKind.Float);
+                for (int r = 0; r < oldCol.Count(); r = r + 1) {
+                    if (oldCol.IsMissing(r)) { promoted.AppendDouble(0.0); promoted.MarkMissing(r); }
+                    else { promoted.AppendDouble(oldCol.GetDouble(r)); }
+                }
+                outDf.cols[c] = promoted;
             }
             for (int r = 0; r < outDf.Rows(); r = r + 1) {
                 if (outDf.cols[c].IsMissing(r)) { outDf.cols[c].PutDouble(r, fill); }
@@ -115,10 +131,17 @@ public class Missing {
         return outDf;
     }
 
-    public static int ValidCount(DataFrame df, string col) { return df.Rows() - df.ColOrThrow(col).MissingCount(); }
-    public static int NaNCount(DataFrame df, string col) { return df.ColOrThrow(col).MissingCount(); }
+    public static int ValidCount(DataFrame df, string col) {
+        if (df == null) { throw new ArgumentNullException("df"); }
+        return df.Rows() - df.ColOrThrow(col).MissingCount();
+    }
+    public static int NaNCount(DataFrame df, string col) {
+        if (df == null) { throw new ArgumentNullException("df"); }
+        return df.ColOrThrow(col).MissingCount();
+    }
 
     public static int TotalNaNCount(DataFrame df) {
+        if (df == null) { throw new ArgumentNullException("df"); }
         int n = 0;
         for (int c = 0; c < df.ColCount(); c = c + 1) { n = n + df.cols[c].MissingCount(); }
         return n;

@@ -17,7 +17,9 @@ public class ConfigurationRoot : IConfiguration, IDisposable {
         this.providers = new List<IConfigurationProvider>();
         if (providers != null) {
             for (int i = 0; i < providers.Count; i = i + 1) {
-                this.providers.Add(providers[i]);
+                if (providers[i] != null) {
+                    this.providers.Add(providers[i]);
+                }
             }
         }
         this.reloadCallbacks = new List<Action>();
@@ -74,8 +76,10 @@ public class ConfigurationRoot : IConfiguration, IDisposable {
             if (this.disposed) { return null; }
             // 倒序遍历配置提供程序：后添加的源优先级更高
             for (int i = this.providers.Count - 1; i >= 0; i = i - 1) {
+                IConfigurationProvider p = this.providers[i];
+                if (p == null) { continue; }
                 string v;
-                if (this.providers[i].TryGet(key, out v)) {
+                if (p.TryGet(key, out v)) {
                     found = v;
                     hasFound = true;
                     break;
@@ -129,7 +133,10 @@ public class ConfigurationRoot : IConfiguration, IDisposable {
         lock (this.gate) {
             if (this.disposed) { return; }
             for (int i = 0; i < this.providers.Count; i = i + 1) {
-                this.providers[i].Set(key, value);
+                IConfigurationProvider p = this.providers[i];
+                if (p != null) {
+                    p.Set(key, value);
+                }
             }
         }
     }
@@ -144,10 +151,13 @@ public class ConfigurationRoot : IConfiguration, IDisposable {
         lock (this.gate) {
             if (this.disposed) { return result; }
             for (int i = 0; i < this.providers.Count; i = i + 1) {
-                List<string> pKeys = this.providers[i].GetKeys();
+                IConfigurationProvider p = this.providers[i];
+                if (p == null) { continue; }
+                List<string> pKeys = p.GetKeys();
+                if (pKeys == null) { continue; }
                 for (int j = 0; j < pKeys.Count; j = j + 1) {
                     string k = pKeys[j];
-                    if (!seen.Contains(k)) {
+                    if (k != null && !seen.Contains(k)) {
                         seen.Add(k);
                         result.Add(k);
                     }
@@ -158,15 +168,25 @@ public class ConfigurationRoot : IConfiguration, IDisposable {
     }
 
     public void Reload() {
+        List<IConfigurationProvider> provSnapshot = new List<IConfigurationProvider>();
         List<Action> snapshot = new List<Action>();
         lock (this.gate) {
             if (this.disposed) { return; }
             for (int i = 0; i < this.providers.Count; i = i + 1) {
-                this.providers[i].Load();
+                if (this.providers[i] != null) {
+                    provSnapshot.Add(this.providers[i]);
+                }
             }
             for (int i = 0; i < this.reloadCallbacks.Count; i = i + 1) {
-                snapshot.Add(this.reloadCallbacks[i]);
+                if (this.reloadCallbacks[i] != null) {
+                    snapshot.Add(this.reloadCallbacks[i]);
+                }
             }
+        }
+
+        // 在锁外执行提供程序加载，避免阻塞读请求或自定义 provider 重入死锁
+        for (int i = 0; i < provSnapshot.Count; i = i + 1) {
+            provSnapshot[i].Load();
         }
 
         for (int i = 0; i < snapshot.Count; i = i + 1) {

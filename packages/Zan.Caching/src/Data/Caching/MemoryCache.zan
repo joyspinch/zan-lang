@@ -163,6 +163,10 @@ public class MemoryCache<TValue> : IDisposable {
     }
 
     private TValue GetCore(string key) {
+        if (key == null) {
+            this.stats.misses = this.stats.misses + 1;
+            return null;
+        }
         int i = -1;
         if (!this.index.TryGetValue(key, out i)) {
             this.stats.misses = this.stats.misses + 1;
@@ -198,6 +202,7 @@ public class MemoryCache<TValue> : IDisposable {
 
     // 获取缓存项；若未命中则通过 factory 生成并按指定 ttlMs 回填缓存后返回。
     public TValue GetOrCreate(string key, long ttlMs, Func<TValue> factory) {
+        if (key == null) { return null; }
         TValue existing = this.Get(key);
         if (existing != null) {
             return existing;
@@ -219,6 +224,7 @@ public class MemoryCache<TValue> : IDisposable {
 
     // 异步获取缓存项；若未命中则通过异步 factory 生成并按指定 ttlMs 回填缓存后返回。
     public async TValue GetOrCreateAsync(string key, long ttlMs, CacheFactoryAsync<TValue> factory) {
+        if (key == null) { return null; }
         TValue existing = this.Get(key);
         if (existing != null) {
             return existing;
@@ -242,6 +248,7 @@ public class MemoryCache<TValue> : IDisposable {
     }
 
     private bool ContainsCore(string key) {
+        if (key == null) { return false; }
         int i = -1;
         if (!this.index.TryGetValue(key, out i)) { return false; }
         if (this.slots[i].expiresAtUs != 0L
@@ -253,26 +260,37 @@ public class MemoryCache<TValue> : IDisposable {
         return true;
     }
 
-    // 按构造时配置的 TTL 写入。
+    // 按构造时配置的 TTL 写入（单次加锁读取默认 TTL 并写入，消除竞态）。
     public void Set(string key, TValue value) {
-        this.Set(key, value, this.TtlMs());
+        if (this.locked) {
+            lock (this.gate) { this.SetCoreUs(key, value, this.ttlUs); }
+            return;
+        }
+        this.SetCoreUs(key, value, this.ttlUs);
     }
 
     // ttlMs <= 0 表示该条不过期（覆盖默认 TTL）。
     public void Set(string key, TValue value, long ttlMs) {
+        long deltaUs = MemoryCache<TValue>.ToTtlUs(ttlMs);
         if (this.locked) {
-            lock (this.gate) { this.SetCore(key, value, ttlMs); }
+            lock (this.gate) { this.SetCoreUs(key, value, deltaUs); }
             return;
         }
-        this.SetCore(key, value, ttlMs);
+        this.SetCoreUs(key, value, deltaUs);
     }
 
-    private void SetCore(string key, TValue value, long ttlMs) {
+    private void SetCoreUs(string key, TValue value, long deltaUs) {
+        if (key == null) { return; }
+        // null 是未命中哨兵：写入 null 视为移除，避免 Contains==true 与 Get==null 语义撕裂
+        if (value == null) {
+            this.RemoveCore(key);
+            return;
+        }
         long now = 0L;
         long expiresAt = 0L;
-        if (ttlMs > 0L) {
+        if (deltaUs > 0L) {
             now = MemoryCache<TValue>.NowUs();
-            expiresAt = MemoryCache<TValue>.AddTtlUs(now, MemoryCache<TValue>.ToTtlUs(ttlMs));
+            expiresAt = MemoryCache<TValue>.AddTtlUs(now, deltaUs);
         }
         int i = -1;
         if (this.index.TryGetValue(key, out i)) {
@@ -311,6 +329,7 @@ public class MemoryCache<TValue> : IDisposable {
     }
 
     private TValue TryRemoveCore(string key) {
+        if (key == null) { return null; }
         int i = -1;
         if (!this.index.TryGetValue(key, out i)) {
             return null;
@@ -336,6 +355,7 @@ public class MemoryCache<TValue> : IDisposable {
     }
 
     private bool RemoveCore(string key) {
+        if (key == null) { return false; }
         int i = -1;
         if (!this.index.TryGetValue(key, out i)) {
             return false;
@@ -361,18 +381,24 @@ public class MemoryCache<TValue> : IDisposable {
 
     private void ClearCore() {
         int n = this.slots.Count;
-        int i = 0;
-        while (i < n) {
-            this.slots[i].key = "";
-            this.slots[i].value = null;
-            this.slots[i].expiresAtUs = 0;
-            this.slots[i].touchedUs = 0;
-            this.slots[i].prev = -1;
-            this.slots[i].next = (i + 1 < n) ? i + 1 : -1;
-            i = i + 1;
-        }
         this.index.Clear();
-        this.freeHead = n > 0 ? 0 : -1;
+        if (this.capacity == 0 && n > 256) {
+            // 无界缓存在 Clear 时归还峰值槽位，防止内存长期滞留
+            this.slots.Clear();
+            this.freeHead = -1;
+        } else {
+            int i = 0;
+            while (i < n) {
+                this.slots[i].key = "";
+                this.slots[i].value = null;
+                this.slots[i].expiresAtUs = 0;
+                this.slots[i].touchedUs = 0;
+                this.slots[i].prev = -1;
+                this.slots[i].next = (i + 1 < n) ? i + 1 : -1;
+                i = i + 1;
+            }
+            this.freeHead = n > 0 ? 0 : -1;
+        }
         this.head = -1;
         this.tail = -1;
         this.used = 0;

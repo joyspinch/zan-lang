@@ -41,6 +41,13 @@ public class WeightFile {
     private Dictionary<string, WeightTensorInfo> tensorIndex;
 
     public static WeightFile Open(string path) {
+        if (path == null || path.Length == 0) {
+            throw new ArgumentException("WeightFile.Open: path cannot be empty");
+        }
+        long sz = File.GetSize64(path);
+        if (sz > 2147483647L) {
+            throw new Exception("WeightFile.Open: file exceeds 2 GiB in-memory limit");
+        }
         return Load(File.ReadAllBytes(path));
     }
 
@@ -57,6 +64,9 @@ public class WeightFile {
 
     // 从字节解析（测试与内存场景用；真实文件走 Open）。
     public static WeightFile Load(byte[] bytes) {
+        if (bytes == null) {
+            throw new ArgumentException("WeightFile.Load: bytes cannot be null");
+        }
         WeightFile w = new WeightFile();
         w.file = bytes;
         w.metadata = new Dictionary<string, string>();
@@ -140,6 +150,9 @@ public class WeightFile {
     }
 
     private int ValidateSlice(WeightTensorInfo info, long needBytes) {
+        if (this.file == null) {
+            throw new ArgumentException("weight file buffer is null");
+        }
         long fileLen = (long)this.file.Length;
         if (info == null || info.offset < 0L || info.byteLength < 0L || needBytes < 0L
             || this.dataStart < 0L || this.dataStart > fileLen
@@ -154,26 +167,47 @@ public class WeightFile {
         return (int)start;
     }
 
-    // 把一段权重数据解成 f32 张量（一次性边界校验 + 原始字节数组直读，消除逐元素 BinaryReader/Span 开销）。
+    private long RequiredBytesForDtype(WeightTensorInfo info, int n) {
+        string dt = info.dtype;
+        if (dt == "F32" || dt == "I32" || dt == "U32") { return (long)n * 4L; }
+        if (dt == "F16" || dt == "BF16" || dt == "I16" || dt == "U16") { return (long)n * 2L; }
+        if (dt == "F64" || dt == "I64" || dt == "U64") { return (long)n * 8L; }
+        if (dt == "I8" || dt == "U8" || dt == "BOOL") { return (long)n; }
+        if (dt == "Q4_0" || dt == "Q4_1" || dt == "Q5_0" || dt == "Q5_1" || dt == "Q8_0") {
+            if ((n % 32) != 0) {
+                throw new ArgumentException("quantized tensor '" + info.name + "' element count must be a multiple of 32");
+            }
+            long blocks = (long)(n / 32);
+            if (dt == "Q8_0") { return blocks * 34L; }
+            if (dt == "Q4_0") { return blocks * 18L; }
+            if (dt == "Q4_1") { return blocks * 20L; }
+            if (dt == "Q5_0") { return blocks * 22L; }
+            return blocks * 24L;
+        }
+        throw new ArgumentException("unsupported weight dtype '" + (dt != null ? dt : "")
+            + "' for tensor '" + (info.name != null ? info.name : "") + "'");
+    }
+
+    // 把一段权重数据解成 f32 张量（先做完整 dtype/边界校验再分配输出，防止畸形张量信息触发大内存分配）。
     public Tensor Materialize(WeightTensorInfo info) {
         if (info == null || info.count < 0L || info.count > 2147483647L) {
             throw new ArgumentException("weight tensor element count out of bounds");
         }
         int n = (int)info.count;
+        long needBytes = this.RequiredBytesForDtype(info, n);
+        int start = this.ValidateSlice(info, needBytes);
         float[] out2 = new float[n];
         string dt = info.dtype;
         byte[] raw = this.file;
 
         if (dt == "F32") {
-            long needBytes = (long)n * 4L;
-            int start = this.ValidateSlice(info, needBytes);
             if (n > 0) {
                 NativeMemory.Copy((nint)out2, (nint)raw + (nint)start, (nint)needBytes);
             }
             return new Tensor(info.shape, out2);
         }
         if (dt == "F16") {
-            int p = this.ValidateSlice(info, (long)n * 2L);
+            int p = start;
             for (int i = 0; i < n; i = i + 1) {
                 int bits = (raw[p] & 255) | ((raw[p + 1] & 255) << 8);
                 out2[i] = FloatBits.FromF16Bits(bits);
@@ -182,7 +216,7 @@ public class WeightFile {
             return new Tensor(info.shape, out2);
         }
         if (dt == "BF16") {
-            int p = this.ValidateSlice(info, (long)n * 2L);
+            int p = start;
             for (int i = 0; i < n; i = i + 1) {
                 int bits = (raw[p] & 255) | ((raw[p + 1] & 255) << 8);
                 out2[i] = NativeMemory.AsF32(bits << 16);
@@ -191,12 +225,12 @@ public class WeightFile {
             return new Tensor(info.shape, out2);
         }
         if (dt == "F64") {
-            BinaryReader r = this.ReaderAt(info.offset, info.byteLength);
+            BinaryReader r = this.ReaderAt(info.offset, needBytes);
             for (int i = 0; i < n; i = i + 1) { out2[i] = (float)r.F64(); }
             return new Tensor(info.shape, out2);
         }
         if (dt == "I8") {
-            int p = this.ValidateSlice(info, (long)n);
+            int p = start;
             for (int i = 0; i < n; i = i + 1) {
                 int v = raw[p + i] & 255;
                 if (v >= 128) { v = v - 256; }
@@ -205,14 +239,14 @@ public class WeightFile {
             return new Tensor(info.shape, out2);
         }
         if (dt == "U8" || dt == "BOOL") {
-            int p = this.ValidateSlice(info, (long)n);
+            int p = start;
             for (int i = 0; i < n; i = i + 1) {
                 out2[i] = (float)(raw[p + i] & 255);
             }
             return new Tensor(info.shape, out2);
         }
         if (dt == "I16") {
-            int p = this.ValidateSlice(info, (long)n * 2L);
+            int p = start;
             for (int i = 0; i < n; i = i + 1) {
                 int v = (raw[p] & 255) | ((raw[p + 1] & 255) << 8);
                 if (v >= 32768) { v = v - 65536; }
@@ -222,7 +256,7 @@ public class WeightFile {
             return new Tensor(info.shape, out2);
         }
         if (dt == "U16") {
-            int p = this.ValidateSlice(info, (long)n * 2L);
+            int p = start;
             for (int i = 0; i < n; i = i + 1) {
                 int v = (raw[p] & 255) | ((raw[p + 1] & 255) << 8);
                 out2[i] = (float)v;
@@ -231,7 +265,7 @@ public class WeightFile {
             return new Tensor(info.shape, out2);
         }
         if (dt == "I32") {
-            int p = this.ValidateSlice(info, (long)n * 4L);
+            int p = start;
             for (int i = 0; i < n; i = i + 1) {
                 int v = (raw[p] & 255) | ((raw[p + 1] & 255) << 8)
                       | ((raw[p + 2] & 255) << 16) | ((raw[p + 3] & 255) << 24);
@@ -241,7 +275,7 @@ public class WeightFile {
             return new Tensor(info.shape, out2);
         }
         if (dt == "U32") {
-            int p = this.ValidateSlice(info, (long)n * 4L);
+            int p = start;
             for (int i = 0; i < n; i = i + 1) {
                 long v = (long)(raw[p] & 255) | ((long)(raw[p + 1] & 255) << 8)
                        | ((long)(raw[p + 2] & 255) << 16) | ((long)(raw[p + 3] & 255) << 24);
@@ -251,7 +285,7 @@ public class WeightFile {
             return new Tensor(info.shape, out2);
         }
         if (dt == "I64") {
-            int p = this.ValidateSlice(info, (long)n * 8L);
+            int p = start;
             for (int i = 0; i < n; i = i + 1) {
                 long v = (long)(raw[p] & 255) | ((long)(raw[p + 1] & 255) << 8)
                        | ((long)(raw[p + 2] & 255) << 16) | ((long)(raw[p + 3] & 255) << 24)
@@ -263,7 +297,7 @@ public class WeightFile {
             return new Tensor(info.shape, out2);
         }
         if (dt == "U64") {
-            int p = this.ValidateSlice(info, (long)n * 8L);
+            int p = start;
             for (int i = 0; i < n; i = i + 1) {
                 long v = (long)(raw[p] & 255) | ((long)(raw[p + 1] & 255) << 8)
                        | ((long)(raw[p + 2] & 255) << 16) | ((long)(raw[p + 3] & 255) << 24)
@@ -275,13 +309,8 @@ public class WeightFile {
             }
             return new Tensor(info.shape, out2);
         }
-        if (dt == "Q4_0" || dt == "Q4_1" || dt == "Q5_0" || dt == "Q5_1"
-            || dt == "Q8_0") {
-            this.DecodeQuant(info, out2);
-            return new Tensor(info.shape, out2);
-        }
-        throw new ArgumentException("unsupported weight dtype '" + dt
-            + "' for tensor '" + info.name + "'");
+        this.DecodeQuant(info, out2);
+        return new Tensor(info.shape, out2);
     }
 
     // 数据区里某一段的读取器。

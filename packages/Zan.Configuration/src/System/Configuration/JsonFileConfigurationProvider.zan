@@ -35,30 +35,52 @@ public class JsonFileConfigurationProvider : ConfigurationProvider {
         this.rootSection = rootSection != null ? rootSection : "";
     }
 
+    private const long MAX_CONFIG_FILE_BYTES = 67108864L;
+
     // 读文件、解析 JSON、重建内容。文件缺失：optional 为真则跳过，
     // 否则抛 FileNotFoundException；JSON 格式错误由 JsonValue.Parse 抛
     // JsonException（配置写错是启动期错误，不该静默）。
     public override void Load() {
-        if (this.path == null || this.path.Length == 0) { return; }
-        if (!File.Exists(this.path)) {
+        if (this.path == null || this.path.Length == 0) {
             if (this.optional) {
-                this.data.Clear();
+                this.data = new Dictionary<string, string>();
                 return;
             }
-            throw new FileNotFoundException("Configuration file not found: " + this.path);
+            throw new FileNotFoundException("Configuration file path is empty");
         }
-        string text = File.ReadAllText(this.path);
+        string text = null;
+        try {
+            long sz = File.GetSize64(this.path);
+            if (sz > JsonFileConfigurationProvider.MAX_CONFIG_FILE_BYTES) {
+                throw new IOException("Configuration file exceeds 64 MiB limit: " + this.path);
+            }
+            text = File.ReadAllText(this.path);
+        } catch (FileNotFoundException e) {
+            if (this.optional) {
+                this.data = new Dictionary<string, string>();
+                return;
+            }
+            throw e;
+        }
         JsonDoc doc = JsonDoc.Parse(text);
-        this.data.Clear();
+        Dictionary<string, string> next = new Dictionary<string, string>();
         string basePrefix = "";
         if (this.rootSection != null && this.rootSection.Length > 0) {
             basePrefix = ConfigurationKeys.Canonical(this.rootSection);
         }
-        this.FlattenDoc(basePrefix, doc, doc.root);
+        this.FlattenDocInto(next, basePrefix, doc, doc.root);
+        // 原子替换整张字典，避免并发读看到半清空状态或解析失败破坏旧配置
+        this.data = next;
+    }
+
+    private static void SetInto(Dictionary<string, string> target, string key, string value) {
+        string canonical = ConfigurationKeys.Canonical(key);
+        if (canonical.Length == 0) { return; }
+        target[canonical] = value;
     }
 
     // 基于 JsonDoc 扁平磁带展开键值对（零 DOM 节点分配）。
-    private void FlattenDoc(string prefix, JsonDoc doc, int at) {
+    private void FlattenDocInto(Dictionary<string, string> target, string prefix, JsonDoc doc, int at) {
         if (doc == null || at < 0 || at >= doc.slotCount) { return; }
         int k = doc.KindAt(at);
         if (k == 5) {
@@ -69,7 +91,7 @@ public class JsonFileConfigurationProvider : ConfigurationProvider {
                 JsonPair pair = doc.pairs[p];
                 string key = pair.keyStart < 0 ? doc.escPool[pair.keyLen] : doc.src.Substring(pair.keyStart, pair.keyLen);
                 string child = prefix.Length > 0 ? prefix + ":" + key : key;
-                this.FlattenDoc(child, doc, pair.valueSlot);
+                this.FlattenDocInto(target, child, doc, pair.valueSlot);
                 p = pair.nextPair;
                 seen = seen + 1;
             }
@@ -81,21 +103,21 @@ public class JsonFileConfigurationProvider : ConfigurationProvider {
             for (int i = 0; i < n; i = i + 1) {
                 string idx = Convert.ToString(i);
                 string child = prefix.Length > 0 ? prefix + ":" + idx : idx;
-                this.FlattenDoc(child, doc, c);
+                this.FlattenDocInto(target, child, doc, c);
                 c = doc.NextSibling(c);
             }
             return;
         }
         if (k == 3) {
-            this.Set(prefix, doc.StrAt(at, ""));
+            JsonFileConfigurationProvider.SetInto(target, prefix, doc.StrAt(at, ""));
             return;
         }
         if (k == 2) {
-            this.Set(prefix, doc.StrAt(at, ""));
+            JsonFileConfigurationProvider.SetInto(target, prefix, doc.StrAt(at, ""));
             return;
         }
         if (k == 1) {
-            this.Set(prefix, doc.BoolAt(at, false) ? "true" : "false");
+            JsonFileConfigurationProvider.SetInto(target, prefix, doc.BoolAt(at, false) ? "true" : "false");
             return;
         }
     }

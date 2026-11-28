@@ -20,6 +20,7 @@ public class ResourcePack {
 
     // 写入 4 字节不透明 magic 与混淆后的版本字节（`1 ^ 165`）。
     public static void writeMagic(byte[] hdr) {
+        if (hdr == null || hdr.Length < 5) { return; }
         // 不透明的非 ASCII magic + 混淆后的版本字节
         hdr[0] = 199; hdr[1] = 17; hdr[2] = 158; hdr[3] = 66;
         hdr[4] = (byte)(1 ^ 165);
@@ -120,12 +121,19 @@ public class ResourcePack {
         if (path == null || masterKey == null || masterKey.Length < 32) { return null; }
         long fsz = File.GetSize64(path);
         if (fsz < 57L) { return null; }
-        byte[] hdr = File.ReadBytes(path, 0, 57);
+        byte[] hdr = null;
+        try {
+            hdr = File.ReadBytes(path, 0, 57);
+        } catch (Exception _) {
+            return null;
+        }
         if (hdr == null || hdr.Length < 57 || !checkMagic(hdr)) { return null; }
         int idxLen = loadBE32(hdr, 49);
         int sigLen = loadBE32(hdr, 53);
         long dataStartL = 57L + (long)idxLen + (long)sigLen;
-        if (idxLen < 4 || sigLen < 0 || dataStartL > fsz) { return null; }
+        // 认证前先卡索引上限（64 MiB）与记录对齐（4 + 61*N），并保证 dataStartL 不溢出 32 位偏移。
+        if (idxLen < 4 || idxLen > 67108864 || ((idxLen - 4) % 61) != 0
+            || sigLen < 0 || dataStartL > fsz || dataStartL > 2147483647L) { return null; }
 
         byte[] packId = new byte[17];
         byte[] idxIv = new byte[13];
@@ -134,7 +142,12 @@ public class ResourcePack {
         for (int i = 0; i < 12; i = i + 1) { idxIv[i] = hdr[21 + i]; }
         for (int i = 0; i < 16; i = i + 1) { idxTag[i] = hdr[33 + i]; }
 
-        byte[] idxCt = File.ReadBytes(path, 57, idxLen);
+        byte[] idxCt = null;
+        try {
+            idxCt = File.ReadBytes(path, 57, idxLen);
+        } catch (Exception _) {
+            return null;
+        }
         if (idxCt == null || idxCt.Length < idxLen) { return null; }
         byte[] ik = indexKey(masterKey, packId);
         if (ik == null) {
@@ -155,7 +168,12 @@ public class ResourcePack {
                 int eLen = eHex.Length / 2;
                 if (sigLen > 0 && k > 0 && eLen > 0 && sigLen == k
                     && (nHex.Length & 1) == 0 && (eHex.Length & 1) == 0) {
-                    byte[] sig = File.ReadBytes(path, 57 + idxLen, sigLen);
+                    byte[] sig = null;
+                    try {
+                        sig = File.ReadBytes(path, 57 + idxLen, sigLen);
+                    } catch (Exception _) {
+                        sig = null;
+                    }
                     if (sig != null && sig.Length >= sigLen) {
                         byte[] nBuf = Hex.Decode(nHex);
                         byte[] eBuf = Hex.Decode(eHex);
@@ -172,7 +190,7 @@ public class ResourcePack {
         }
 
         int cnt = loadBE32(idx, 0);
-        if (cnt < 0 || 4L + 61L * (long)cnt > (long)idxLen) {
+        if (cnt < 0 || 4L + 61L * (long)cnt != (long)idxLen) {
             err[0] = 2;
             return null;
         }
@@ -185,6 +203,10 @@ public class ResourcePack {
         p.indexMap = new Dictionary<string, int>();
         for (int i = 0; i < p.count; i = i + 1) {
             int rec = 4 + 61 * i;
+            if ((idx[rec + 32] & 255) != 0) {
+                err[0] = 2;
+                return null;
+            }
             long offL = ResourcePack.LoadBE64Long(idx, rec + 16);
             long szL = ResourcePack.LoadBE64Long(idx, rec + 24);
             if (offL < dataStartL || szL < 0L || offL > 2147483647L || szL > 2147483647L || offL + szL > fsz) {
@@ -199,11 +221,13 @@ public class ResourcePack {
             for (int j = 0; j < 16; j = j + 1) { nh[j] = idx[rec + j]; }
             for (int j = 0; j < 12; j = j + 1) { iv[j] = idx[rec + 33 + j]; }
             for (int j = 0; j < 16; j = j + 1) { tg[j] = idx[rec + 45 + j]; }
-            p.index.Add(new PackIndexEntry(nh, off, sz, iv, tg));
             string hk = Hex.Encode(nh, 16);
-            if (!p.indexMap.ContainsKey(hk)) {
-                p.indexMap.Add(hk, i);
+            if (p.indexMap.ContainsKey(hk)) {
+                err[0] = 2;
+                return null;
             }
+            p.index.Add(new PackIndexEntry(nh, off, sz, iv, tg));
+            p.indexMap.Add(hk, i);
         }
         err[0] = 0;
         return p;
@@ -256,7 +280,12 @@ public class ResourcePack {
         if (i < 0) { return null; }
         PackIndexEntry e = this.index[i];
         int sz = e.size;
-        byte[] ct = File.ReadBytes(this.path, e.off, sz);
+        byte[] ct = null;
+        try {
+            ct = File.ReadBytes(this.path, e.off, sz);
+        } catch (Exception _) {
+            return null;
+        }
         if (ct == null || ct.Length < sz) { return null; }
         byte[] ek = entryKey(this.masterKey, this.packId, e.hash);
         if (ek == null) { return null; }

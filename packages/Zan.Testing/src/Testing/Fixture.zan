@@ -57,6 +57,9 @@ public class Fixture {
     static string currentTest = "";
 
     public static void Register<T>(string name, TypedFactory<T> factory) {
+        if (factory == null) {
+            throw new FixtureException("fixture '" + (name == null ? "" : name) + "' 的工厂不能为空");
+        }
         TypedFactory<T> held = factory;
         Fixture.RegisterRaw(name, typeof(T).Name, () => { return (object)held(); });
     }
@@ -76,7 +79,7 @@ public class Fixture {
     }
 
     private static void RegisterRaw(string name, string typeName, FixtureFactory factory) {
-        if (name == "") { throw new FixtureException("fixture 名字不能为空"); }
+        if (name == null || name == "") { throw new FixtureException("fixture 名字不能为空"); }
         if (factory == null) { throw new FixtureException("fixture '" + name + "' 的工厂不能为空"); }
         if (Fixture.defs.ContainsKey(name)) {
             throw new FixtureException("fixture '" + name + "' 重复注册");
@@ -94,13 +97,20 @@ public class Fixture {
 
     public static bool Depends(string name, List<string> deps) {
         FixtureDef def = Fixture.Find(name);
+        if (deps == null) { return true; }
         foreach (string dep in deps) {
+            if (dep == null || dep == "") {
+                throw new FixtureException("fixture '" + name + "' 的依赖名字不能为空");
+            }
             def.deps.Add(dep);
         }
         return true;
     }
 
     public static bool Depends(string name, string dep) {
+        if (dep == null || dep == "") {
+            throw new FixtureException("fixture '" + (name == null ? "" : name) + "' 的依赖名字不能为空");
+        }
         Fixture.Find(name).deps.Add(dep);
         return true;
     }
@@ -133,7 +143,10 @@ public class Fixture {
         return Fixture.Require(name).value;
     }
 
-    public static bool Exists(string name) { return Fixture.defs.ContainsKey(name); }
+    public static bool Exists(string name) {
+        if (name == null || name == "") { return false; }
+        return Fixture.defs.ContainsKey(name);
+    }
     public static int Created() { return Fixture.created; }
     public static int Live() { return Fixture.live.Count; }
     public static string CurrentTest() { return Fixture.currentTest; }
@@ -168,11 +181,12 @@ public class Fixture {
         string err = "";
         for (int i = Fixture.liveOrder.Count - 1; i >= 0; i = i - 1) {
             string name = Fixture.liveOrder[i];
-            FixtureInstance inst = Fixture.live[name];
-            if (inst == null) {
-                if (includeModule) {
+            FixtureInstance inst = null;
+            bool hasInst = Fixture.live.TryGetValue(name, out inst);
+            if (!hasInst || inst == null) {
+                if (includeModule || !hasInst) {
                     Fixture.liveOrder.RemoveAt(i);
-                    Fixture.live.Remove(name);
+                    if (hasInst) { Fixture.live.Remove(name); }
                 }
                 continue;
             }
@@ -186,12 +200,13 @@ public class Fixture {
     }
 
     private static object Create(string name) {
-        if (Fixture.live.ContainsKey(name)) {
-            FixtureInstance inst = Fixture.live[name];
-            if (inst != null) { return inst.value; }
+        FixtureInstance existing = null;
+        if (Fixture.live.TryGetValue(name, out existing) && existing != null) {
+            return existing.value;
         }
         FixtureDef def = Fixture.Find(name);
-        if (Fixture.Reaches(name, name, 0)) {
+        HashSet<string> visited = new HashSet<string>();
+        if (Fixture.Reaches(name, name, visited, 0)) {
             throw new FixtureException("fixture 依赖成环：" + name);
         }
         for (int i = 0; i < def.deps.Count; i = i + 1) {
@@ -203,21 +218,22 @@ public class Fixture {
             def.typeName = "string";
         }
         FixtureInstance made = new FixtureInstance(def, value);
-        Fixture.live.Add(name, made);
+        Fixture.live[name] = made;
         Fixture.liveOrder.Add(name);
         Fixture.created = Fixture.created + 1;
         return value;
     }
 
-    // 纯读图判环（避免解析栈回卷 rethrow 丢失具体异常类型）。
-    private static bool Reaches(string from, string target, int depth) {
-        if (depth > 64) { return true; }
+    // 纯读图判环（visited 避免菱形 DAG 指数退化）。
+    private static bool Reaches(string from, string target, HashSet<string> visited, int depth) {
+        if (depth > 256) { return true; }
+        if (!visited.Add(from)) { return false; }
         FixtureDef def;
         if (!Fixture.defs.TryGetValue(from, out def) || def == null) { return false; }
         for (int i = 0; i < def.deps.Count; i = i + 1) {
             string dep = def.deps[i];
             if (dep == target) { return true; }
-            if (Fixture.Reaches(dep, target, depth + 1)) { return true; }
+            if (Fixture.Reaches(dep, target, visited, depth + 1)) { return true; }
         }
         return false;
     }
@@ -229,7 +245,7 @@ public class Fixture {
         } catch (Exception e) {
             if (err == "") {
                 err = "fixture teardown '" + inst.def.name + "': "
-                    + (e.Message == null ? "threw" : e.Message);
+                    + ((e == null || e.Message == null) ? "threw" : e.Message);
             }
         } catch {
             if (err == "") { err = "fixture teardown '" + inst.def.name + "': threw"; }
@@ -238,6 +254,9 @@ public class Fixture {
     }
 
     private static FixtureDef Find(string name) {
+        if (name == null || name == "") {
+            throw new FixtureException("fixture 名字不能为空");
+        }
         FixtureDef def;
         if (!Fixture.defs.TryGetValue(name, out def) || def == null) {
             throw new FixtureException("fixture '" + name + "' 未注册");

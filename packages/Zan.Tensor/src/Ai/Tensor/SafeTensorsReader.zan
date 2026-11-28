@@ -25,7 +25,7 @@ public class SafeTensorsReader {
     public long dataLength;
 
     public static SafeTensorsReader Parse(byte[] file) {
-        if (file.Length < 8) {
+        if (file == null || file.Length < 8) {
             throw new Exception("safetensors file too short");
         }
         BinaryReader r = new BinaryReader(file);
@@ -98,11 +98,15 @@ public class SafeTensorsReader {
         info.dtype = doc.StrAt(dtypeSlot, "");
         info.ggmlType = -1;
         info.shape = new List<int>();
-        long count = 1;
+        int rank = doc.Count(shapeSlot);
+        if (rank < 0 || rank > 32) {
+            throw new Exception("safetensors tensor '" + name + "' rank out of range");
+        }
+        long count = 1L;
         int child = doc.FirstChild(shapeSlot);
-        for (int i = 0; i < doc.Count(shapeSlot); i = i + 1) {
+        for (int i = 0; i < rank; i = i + 1) {
             long d = SafeTensorsReader.IntegerAt(doc, child);
-            if (d <= 0 || d > 2147483647L || count > 2147483647L / d) {
+            if (d <= 0L || d > 2147483647L || count > 2147483647L / d) {
                 throw new Exception("safetensors tensor '" + name + "' has invalid shape");
             }
             info.shape.Add((int)d);
@@ -115,12 +119,26 @@ public class SafeTensorsReader {
         int secondOff = doc.NextSibling(firstOff);
         long start = SafeTensorsReader.IntegerAt(doc, firstOff);
         long end = SafeTensorsReader.IntegerAt(doc, secondOff);
-        if (start < 0 || end < start || end > dataLength) {
+        if (start < 0L || end < start || end > dataLength) {
             throw new Exception("safetensors tensor '" + name + "' has out-of-range data_offsets");
         }
         info.offset = start;
         info.byteLength = end - start;
+        int elemBytes = SafeTensorsReader.DtypeBytes(info.dtype);
+        if (elemBytes > 0) {
+            if (count > 9223372036854775807L / (long)elemBytes || info.byteLength != count * (long)elemBytes) {
+                throw new Exception("safetensors tensor '" + name + "' byte length does not match dtype and shape");
+            }
+        }
         return info;
+    }
+
+    private static int DtypeBytes(string dt) {
+        if (dt == "F64" || dt == "I64" || dt == "U64") { return 8; }
+        if (dt == "F32" || dt == "I32" || dt == "U32") { return 4; }
+        if (dt == "F16" || dt == "BF16" || dt == "I16" || dt == "U16") { return 2; }
+        if (dt == "I8" || dt == "U8" || dt == "BOOL") { return 1; }
+        return 0;
     }
 
     private static long IntegerAt(JsonDoc doc, int slot) {

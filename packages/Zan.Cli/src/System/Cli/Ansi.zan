@@ -18,6 +18,7 @@ namespace System.Cli;
 public class Ansi {
     // 颜色开关：0 = 未判定，1 = 开，2 = 关。
     public static int colorMode = 0;
+    private static string colorLock = "System.Cli.Ansi.colorLock";
 
     // ESC[ 前缀。
     public static string Esc() {
@@ -26,7 +27,7 @@ public class Ansi {
 
     // 通用 SGR 序列：Sgr("1") → "\x1b[1m"。
     public static string Sgr(string params) {
-        return "\x1b[" + params + "m";
+        return "\x1b[" + (params == null ? "" : params) + "m";
     }
 
     public static string Reset() { return "\x1b[0m"; }
@@ -79,20 +80,30 @@ public class Ansi {
 
     // 颜色是否启用（首次调用时按环境判定）。
     public static bool Enabled() {
-        if (Ansi.colorMode == 0) {
-            Ansi.colorMode = Ansi.DetectEnabled() ? 1 : 2;
+        int m = 0;
+        lock (Ansi.colorLock) { m = Ansi.colorMode; }
+        if (m == 0) {
+            int detected = Ansi.DetectEnabled() ? 1 : 2;
+            lock (Ansi.colorLock) {
+                if (Ansi.colorMode == 0) { Ansi.colorMode = detected; }
+                m = Ansi.colorMode;
+            }
         }
-        return Ansi.colorMode == 1;
+        return m == 1;
     }
 
     // 显式开关颜色。
     public static void SetEnabled(bool on) {
-        Ansi.colorMode = on ? 1 : 2;
+        lock (Ansi.colorLock) {
+            Ansi.colorMode = on ? 1 : 2;
+        }
     }
 
     // 回到"按环境判定"的状态（测试用）。
     public static void ResetMode() {
-        Ansi.colorMode = 0;
+        lock (Ansi.colorLock) {
+            Ansi.colorMode = 0;
+        }
     }
 
     // 环境判定：ZAN_CLI_COLOR > NO_COLOR > TERM=dumb > stdout 不是终端。
@@ -101,7 +112,8 @@ public class Ansi {
         if (mode == "never" || mode == "off" || mode == "0") { return false; }
         if (mode == "always" || mode == "on" || mode == "1") { return true; }
         // NO_COLOR 标准：变量存在且非空时禁用颜色。
-        if (Environment.GetEnvironmentVariable("NO_COLOR") != "") { return false; }
+        string noColor = Environment.GetEnvironmentVariable("NO_COLOR");
+        if (noColor != null && noColor.Length > 0) { return false; }
         if (Environment.GetEnvironmentVariable("TERM") == "dumb") { return false; }
         // 输出被重定向到文件/管道 → 不写 ANSI 序列（否则日志被转义符污染）。
         if (Console.IsOutputRedirected()) { return false; }

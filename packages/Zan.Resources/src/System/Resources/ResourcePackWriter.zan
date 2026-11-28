@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Security.Cryptography;
 namespace System.Resources;
@@ -21,9 +22,11 @@ namespace System.Resources;
 // 用各自 HKDF 派生的密钥加密，因此一个条目密钥泄露
 // 不会波及其他条目或主密钥。
 public class ResourcePackWriter {
-    [DllImport("crt")] static extern nint fopen(string path, string mode);
+    [DllImport("crt", EntryPoint = "zan_file_fopen")] static extern nint fopen(string path, string mode);
     [DllImport("crt")] static extern long fwrite(string buf, long size, long count, nint fp);
     [DllImport("crt")] static extern int fclose(nint fp);
+    [DllImport("crt", EntryPoint = "zan_file_remove")] static extern int removeFile(string path);
+    [DllImport("crt", EntryPoint = "zan_file_rename")] static extern int renameFile(string oldname, string newname);
 
     public List<ResourceEntry> entries;
 
@@ -72,6 +75,7 @@ public class ResourcePackWriter {
         byte[] idx = new byte[idxLen + 1];
         ResourcePack.storeBE32(idx, 0, count);
         List<byte[]> cts = new List<byte[]>();
+        Dictionary<string, bool> seenNames = new Dictionary<string, bool>();
         long off = dataStartL;
         for (int i = 0; i < count; i = i + 1) {
             ResourceEntry entry = this.entries[i];
@@ -79,6 +83,9 @@ public class ResourcePackWriter {
             if (entry.len > 0 && (entry.data == null || entry.data.Length < entry.len)) { return false; }
             if (off + (long)entry.len > 2147483647L) { return false; }
             byte[] nh = ResourcePack.nameHash(entry.name);
+            string hk = Hex.Encode(nh, 16);
+            if (seenNames.ContainsKey(hk)) { return false; }
+            seenNames.Add(hk, true);
             byte[] iv = RandomNumberGenerator.GetBytes(12);
             if (iv == null) { return false; }
 
@@ -122,7 +129,8 @@ public class ResourcePackWriter {
         if (idxCt == null || idxCt.Length < idxLen) { return false; }
         for (int i = 0; i < 16; i = i + 1) { hdr[33 + i] = idxTag[i]; }
 
-        nint fp = fopen(path, "wb");
+        string tmpPath = path + ".tmp." + Hex.Encode(packId, 8);
+        nint fp = fopen(tmpPath, "wb");
         if (fp == 0) { return false; }
         bool writeOk = false;
         try {
@@ -137,6 +145,18 @@ public class ResourcePackWriter {
         } finally {
             if (fclose(fp) != 0) { writeOk = false; }
         }
-        return writeOk;
+        if (!writeOk) {
+            removeFile(tmpPath);
+            return false;
+        }
+        if (renameFile(tmpPath, path) != 0) {
+            // Windows 上目标已存在时 rename 可能失败，删除旧目标再重试一次。
+            removeFile(path);
+            if (renameFile(tmpPath, path) != 0) {
+                removeFile(tmpPath);
+                return false;
+            }
+        }
+        return true;
     }
 }

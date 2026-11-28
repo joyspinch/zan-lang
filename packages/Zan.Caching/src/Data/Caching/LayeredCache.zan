@@ -15,18 +15,25 @@ namespace Data.Caching;
 public class LayeredCache : IDisposable {
     private MemoryCache<string> l1;
     private IStringCache l2;
+    private object statsGate;
+    private long mutationEpoch;
     private long l1Hits;
     private long l2Hits;
     private long misses;
 
     public LayeredCache(IStringCache backend, int l1Capacity, long l1TtlMs) {
+        if (backend == null) {
+            throw new ArgumentNullException("backend");
+        }
         this.l1 = new MemoryCache<string>();
         this.l1.SetCapacity(l1Capacity);
         this.l1.SetTtl(l1TtlMs);
         this.l2 = backend;
-        this.l1Hits = 0;
-        this.l2Hits = 0;
-        this.misses = 0;
+        this.statsGate = new object();
+        this.mutationEpoch = 0L;
+        this.l1Hits = 0L;
+        this.l2Hits = 0L;
+        this.misses = 0L;
     }
 
     // 开启 L1 内部互斥锁，供跨线程共享实例使用；用完调用 Dispose() 释放锁句柄。
@@ -41,26 +48,44 @@ public class LayeredCache : IDisposable {
     }
 
     public string Get(string key) {
+        if (key == null) {
+            lock (this.statsGate) { this.misses = this.misses + 1L; }
+            return null;
+        }
         string v = this.l1.Get(key);
         if (v != null) {
-            lock (this) { this.l1Hits = this.l1Hits + 1; }
+            lock (this.statsGate) { this.l1Hits = this.l1Hits + 1L; }
             return v;
         }
+        long epochBefore = 0L;
+        lock (this.statsGate) { epochBefore = this.mutationEpoch; }
         string remote = this.l2.Get(key);
         if (remote != null) {
-            lock (this) { this.l2Hits = this.l2Hits + 1; }
-            this.l1.Set(key, remote);
+            lock (this.statsGate) {
+                this.l2Hits = this.l2Hits + 1L;
+                if (this.mutationEpoch == epochBefore) {
+                    this.l1.Set(key, remote);
+                }
+            }
             return remote;
         }
-        lock (this) { this.misses = this.misses + 1; }
+        lock (this.statsGate) { this.misses = this.misses + 1L; }
         return null;
     }
 
-    // ttlMs 同时作用于两层；l1TtlMs 传 0 时 L1 用构造时的默认 TTL。
+    // ttlMs 同时作用于两层；l1TtlMs 传 0 时 L1 用构造时的默认 TTL（若 L2 有 TTL，L1 TTL 不超过 L2 TTL）。
     public void Set(string key, string value, long ttlMs, long l1TtlMs) {
+        if (key == null) { return; }
         this.l2.Set(key, value, ttlMs);
-        if (l1TtlMs > 0) { this.l1.Set(key, value, l1TtlMs); }
-        else { this.l1.Set(key, value); }
+        long effL1Ttl = l1TtlMs > 0L ? l1TtlMs : this.l1.TtlMs();
+        if (ttlMs > 0L && (effL1Ttl <= 0L || effL1Ttl > ttlMs)) {
+            effL1Ttl = ttlMs;
+        }
+        lock (this.statsGate) {
+            this.mutationEpoch = this.mutationEpoch + 1L;
+            if (effL1Ttl > 0L) { this.l1.Set(key, value, effL1Ttl); }
+            else { this.l1.Set(key, value); }
+        }
     }
 
     public void Set(string key, string value, long ttlMs) {
@@ -68,10 +93,17 @@ public class LayeredCache : IDisposable {
     }
 
     // 只失效 L1（远端可能被别的进程改过，L2 交给 TTL）。
-    public void InvalidateLocal(string key) { this.l1.Remove(key); }
+    public void InvalidateLocal(string key) {
+        if (key == null) { return; }
+        lock (this.statsGate) {
+            this.mutationEpoch = this.mutationEpoch + 1L;
+            this.l1.Remove(key);
+        }
+    }
 
     // 获取缓存项；若未命中则通过 factory 生成并回填两层缓存后返回。
     public string GetOrCreate(string key, long ttlMs, Func<string> factory) {
+        if (key == null) { return null; }
         string existing = this.Get(key);
         if (existing != null) {
             return existing;
@@ -88,6 +120,7 @@ public class LayeredCache : IDisposable {
 
     // 异步获取缓存项；若未命中则通过异步 factory 生成并回填两层缓存后返回。
     public async string GetOrCreateAsync(string key, long ttlMs, CacheFactoryAsync<string> factory) {
+        if (key == null) { return null; }
         string existing = this.Get(key);
         if (existing != null) {
             return existing;
@@ -103,18 +136,27 @@ public class LayeredCache : IDisposable {
     }
 
     public bool Remove(string key) {
+        if (key == null) { return false; }
         // 先删 L2 再删 L1，防止并发读在删 L1 后从 L2 回填旧值
         bool removed = this.l2.Remove(key);
-        this.l1.Remove(key);
+        lock (this.statsGate) {
+            this.mutationEpoch = this.mutationEpoch + 1L;
+            this.l1.Remove(key);
+        }
         return removed;
     }
 
-    public void ClearLocal() { this.l1.Clear(); }
+    public void ClearLocal() {
+        lock (this.statsGate) {
+            this.mutationEpoch = this.mutationEpoch + 1L;
+            this.l1.Clear();
+        }
+    }
 
     public MemoryCache<string> Local() { return this.l1; }
     public IStringCache Remote() { return this.l2; }
 
-    public long L1Hits() { lock (this) { return this.l1Hits; } }
-    public long L2Hits() { lock (this) { return this.l2Hits; } }
-    public long Misses() { lock (this) { return this.misses; } }
+    public long L1Hits() { lock (this.statsGate) { return this.l1Hits; } }
+    public long L2Hits() { lock (this.statsGate) { return this.l2Hits; } }
+    public long Misses() { lock (this.statsGate) { return this.misses; } }
 }
