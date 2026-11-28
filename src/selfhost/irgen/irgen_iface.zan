@@ -281,9 +281,15 @@ partial class Irgen {
         Label(next);
     }
 
+    string ZeroValForLL(string ll) {
+        if (ll == "double" || ll == "float") { return "0.0"; }
+        if (IsPtrLL(ll)) { return "null"; }
+        if (ll.StartsWith("{") || ll.StartsWith("%") || ll.StartsWith("<")) { return "zeroinitializer"; }
+        return "0";
+    }
+
     void EmitClosedInterfaceDispatches() {
         if (closedInterfaceDispatches.Count == 0) { return; }
-        if (!ExternSeen("abort")) { externDecls.Add("abort"); H("declare void @abort()"); }
         int i = 0;
         while (i < closedInterfaceDispatches.Count) {
             ClosedInterfaceDispatch dispatch = closedInterfaceDispatches[i];
@@ -295,15 +301,41 @@ partial class Irgen {
             }
             tmp = 0; lbl = 0;
             L(sig + ") {"); L("entry:");
-            // Check boxed struct implementors via allocation header [-24] first so
-            // small/empty structs never load a non-existent vtable word at offset 0.
+            // Check whether any boxed struct implementor will inspect the
+            // allocation header at [-24]. If so, skip the negative offset read
+            // when %receiver is the page-aligned soft-null scratch buffer.
+            bool hasStructImpl = false;
             j = 0;
             while (j < binder.types.Count) {
                 Node cls = binder.types[j];
-                if (cls.kind == AK.StructDecl() && IndexOfStr(tidNames, cls.sval) >= 0) {
-                    EmitInterfaceTarget(dispatch, cls, null, "");
+                if (cls.kind == AK.StructDecl() && IndexOfStr(tidNames, cls.sval) >= 0
+                    && InterfaceImplementation(dispatch, cls, null) != null) {
+                    hasStructImpl = true;
+                    break;
                 }
                 j = j + 1;
+            }
+            int lfallback = NL();
+            if (hasStructImpl) {
+                if (!ExternSeen("zan_rt_soft_scratch")) {
+                    externDecls.Add("zan_rt_soft_scratch");
+                    H("declare i8* @zan_rt_soft_scratch()");
+                }
+                int lstructs = NL();
+                L("  %soft = call i8* @zan_rt_soft_scratch()");
+                L("  %is_soft = icmp eq i8* %receiver, %soft");
+                L("  br i1 %is_soft, label %L" + lfallback + ", label %L" + lstructs);
+                Label(lstructs);
+                // Check boxed struct implementors via allocation header [-24] first so
+                // small/empty structs never load a non-existent vtable word at offset 0.
+                j = 0;
+                while (j < binder.types.Count) {
+                    Node cls = binder.types[j];
+                    if (cls.kind == AK.StructDecl() && IndexOfStr(tidNames, cls.sval) >= 0) {
+                        EmitInterfaceTarget(dispatch, cls, null, "");
+                    }
+                    j = j + 1;
+                }
             }
             L("  %tagp = bitcast i8* %receiver to i8**");
             L("  %tag = load i8*, i8** %tagp");
@@ -320,8 +352,19 @@ partial class Irgen {
                 }
                 j = j + 1;
             }
-            L("  call void @abort()");
-            L("  unreachable"); L("}");
+            L("  br label %L" + lfallback);
+            Label(lfallback);
+            if (runtimeChecks) {
+                EnsureRtCheckFailHelper();
+                string noImplMsg = GenStrConst("interface dispatch has no implementation");
+                L("  call void @zrt_check_fail(i8* bitcast (i8** @__tid_Exception to i8*), i8* " + noImplMsg + ", i32 0, i32 0)");
+            }
+            if (dispatch.ret == "void") {
+                L("  ret void");
+            } else {
+                L("  ret " + dispatch.ret + " " + ZeroValForLL(dispatch.ret));
+            }
+            L("}");
             i = i + 1;
         }
     }
