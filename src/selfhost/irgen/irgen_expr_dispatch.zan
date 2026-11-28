@@ -516,14 +516,19 @@ partial class Irgen {
         L("  " + vtp + " = getelementptr %" + clsName + ", %" + clsName + "* " + recv.op + ", i32 0, i32 0");
         string vt = NT();
         L("  " + vt + " = load i8*, i8** " + vtp);
-        string vta = NT();
-        L("  " + vta + " = bitcast i8* " + vt + " to i8**");
-        string slotp = NT();
-        L("  " + slotp + " = getelementptr i8*, i8** " + vta + ", i64 " + slot);
-        string fni8 = NT();
-        L("  " + fni8 + " = load i8*, i8** " + slotp);
-        string fn = NT();
-        L("  " + fn + " = bitcast i8* " + fni8 + " to " + MethodFnTypeThis(m, clsName));
+        bool hasConcreteVt = (cls.kind == AK.ClassDecl() || cls.kind == AK.StructDecl())
+            && !HasMod(cls, MOD.Abstract()) && !HasMod(cls, MOD.Iface());
+        if (hasConcreteVt) {
+            List<Node> vms = new List<Node>();
+            CollectVSlotNodes(cls, vms);
+            string vtSym = SpecVtableSym(cls, recv.ty);
+            if (vtSym == "") { vtSym = clsName + "_vtable"; }
+            string vtnull = NT();
+            L("  " + vtnull + " = icmp eq i8* " + vt + ", null");
+            string vt2 = NT();
+            L("  " + vt2 + " = select i1 " + vtnull + ", i8* bitcast ([" + vms.Count + " x i8*]* @" + vtSym + " to i8*), i8* " + vt);
+            vt = vt2;
+        }
         string args = "%" + clsName + "* " + recv.op;
         List<Node> aargs = OrderArgs(m, e);
         int i = 0;
@@ -544,6 +549,61 @@ partial class Irgen {
             i = i + 1;
         }
         string demand = StaticDispatchMarker(cls, m, "");
+        if (!hasConcreteVt) {
+            string resSlot = "";
+            if (rt != "void") {
+                resSlot = NT();
+                L("  " + resSlot + " = alloca " + rt);
+                L("  store " + rt + " " + ZeroValForLL(rt) + ", " + rt + "* " + resSlot);
+            }
+            int lgo = NL();
+            int lcall = NL();
+            int ldone = NL();
+            string vtnull = NT();
+            L("  " + vtnull + " = icmp eq i8* " + vt + ", null");
+            L("  br i1 " + vtnull + ", label %L" + ldone + ", label %L" + lgo);
+            Label(lgo);
+            string vta0 = NT();
+            L("  " + vta0 + " = bitcast i8* " + vt + " to i8**");
+            string slotp0 = NT();
+            L("  " + slotp0 + " = getelementptr i8*, i8** " + vta0 + ", i64 " + slot);
+            string fni80 = NT();
+            L("  " + fni80 + " = load i8*, i8** " + slotp0);
+            string fnnull = NT();
+            L("  " + fnnull + " = icmp eq i8* " + fni80 + ", null");
+            L("  br i1 " + fnnull + ", label %L" + ldone + ", label %L" + lcall);
+            Label(lcall);
+            string fn0 = NT();
+            L("  " + fn0 + " = bitcast i8* " + fni80 + " to " + MethodFnTypeThis(m, clsName));
+            if (rt == "void") {
+                L("  call void " + fn0 + "(" + args + ")" + demand);
+            } else {
+                string t0 = NT();
+                L("  " + t0 + " = call " + rt + " " + fn0 + "(" + args + ")" + demand);
+                L("  store " + rt + " " + t0 + ", " + rt + "* " + resSlot);
+            }
+            L("  br label %L" + ldone);
+            Label(ldone);
+            if (rt == "void") { return new ExprVal("0", MkType("void")); }
+            string t = NT();
+            L("  " + t + " = load " + rt + ", " + rt + "* " + resSlot);
+            if (isAsyncCall) {
+                Node tt = MkType("__task"); tt.a = m.type;
+                return AsyncFrame(t, tt);
+            }
+            if (IsErasedTypeDecl(m.type, declCls) || (rt == "i64" && MentionsTypeParam(m.type))) { return FromSlot(t, ConcreteTP(m.type, recv.ty)); }
+            Node crt2 = ConcreteRetTy(m, recv.ty);
+            AddTemp(t, crt2);
+            return new ExprVal(t, crt2);
+        }
+        string vta = NT();
+        L("  " + vta + " = bitcast i8* " + vt + " to i8**");
+        string slotp = NT();
+        L("  " + slotp + " = getelementptr i8*, i8** " + vta + ", i64 " + slot);
+        string fni8 = NT();
+        L("  " + fni8 + " = load i8*, i8** " + slotp);
+        string fn = NT();
+        L("  " + fn + " = bitcast i8* " + fni8 + " to " + MethodFnTypeThis(m, clsName));
         if (rt == "void") {
             L("  call void " + fn + "(" + args + ")" + demand);
             return new ExprVal("0", MkType("void"));
