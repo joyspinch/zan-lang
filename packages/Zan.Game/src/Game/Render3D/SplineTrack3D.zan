@@ -1,0 +1,138 @@
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+
+namespace Game.Render3D;
+
+// 商业 3D Catmull-Rom 三次样条轨道（过场运镜轨 / 竞速赛道中心线 / Boss 飞行轨迹）：
+// - 支持开曲线与闭合环轨（ClosedLoop）
+// - 提供参数位置采样 EvaluatePosition(t)、一阶切线 EvaluateTangent(t) 与匀速弧长采样 SampleAtDistance(dist)
+public class SplineTrack3D {
+    private List<Vector3> points;
+    public bool ClosedLoop;
+
+    public SplineTrack3D(bool closedLoop) {
+        this.points = new List<Vector3>();
+        this.ClosedLoop = closedLoop;
+    }
+
+    public int PointCount { get { return this.points.Count; } }
+
+    public void AddPoint(Vector3 p) {
+        this.points.Add(p);
+    }
+
+    public void Clear() {
+        this.points.Clear();
+    }
+
+    private Vector3 PointAtWrapped(int idx) {
+        int n = this.points.Count;
+        if (n == 0) { return new Vector3(0.0f, 0.0f, 0.0f); }
+        if (this.ClosedLoop) {
+            int m = idx % n;
+            if (m < 0) { m = m + n; }
+            return this.points[m];
+        }
+        if (idx < 0) { idx = 0; }
+        if (idx >= n) { idx = n - 1; }
+        return this.points[idx];
+    }
+
+    private static Vector3 CatmullRom(Vector3 p0, Vector3 p1, Vector3 p2, Vector3 p3, float u) {
+        float u2 = u * u;
+        float u3 = u2 * u;
+        float x = 0.5f * ((2.0f * p1.X)
+            + (-p0.X + p2.X) * u
+            + (2.0f * p0.X - 5.0f * p1.X + 4.0f * p2.X - p3.X) * u2
+            + (-p0.X + 3.0f * p1.X - 3.0f * p2.X + p3.X) * u3);
+        float y = 0.5f * ((2.0f * p1.Y)
+            + (-p0.Y + p2.Y) * u
+            + (2.0f * p0.Y - 5.0f * p1.Y + 4.0f * p2.Y - p3.Y) * u2
+            + (-p0.Y + 3.0f * p1.Y - 3.0f * p2.Y + p3.Y) * u3);
+        float z = 0.5f * ((2.0f * p1.Z)
+            + (-p0.Z + p2.Z) * u
+            + (2.0f * p0.Z - 5.0f * p1.Z + 4.0f * p2.Z - p3.Z) * u2
+            + (-p0.Z + 3.0f * p1.Z - 3.0f * p2.Z + p3.Z) * u3);
+        return new Vector3(x, y, z);
+    }
+
+    // 归一化参数 t in [0..1] 采样轨道位置。
+    public Vector3 EvaluatePosition(float t) {
+        int n = this.points.Count;
+        if (n == 0) { return new Vector3(0.0f, 0.0f, 0.0f); }
+        if (n == 1) { return this.points[0]; }
+        int segCount = this.ClosedLoop ? n : (n - 1);
+        float clamped = t;
+        if (this.ClosedLoop) {
+            clamped = clamped - (float)Math.Floor((double)clamped);
+        } else {
+            if (clamped < 0.0f) { clamped = 0.0f; }
+            if (clamped > 1.0f) { clamped = 1.0f; }
+        }
+        float scaled = clamped * (float)segCount;
+        int seg = (int)Math.Floor((double)scaled);
+        if (seg >= segCount) { seg = segCount - 1; }
+        float u = scaled - (float)seg;
+        return CatmullRom(
+            this.PointAtWrapped(seg - 1),
+            this.PointAtWrapped(seg),
+            this.PointAtWrapped(seg + 1),
+            this.PointAtWrapped(seg + 2),
+            u);
+    }
+
+    // 计算归一化切线方向（用于相机前视或载具朝向对齐）。
+    public Vector3 EvaluateTangent(float t) {
+        float eps = 0.002f;
+        float t0 = t - eps;
+        float t1 = t + eps;
+        if (!this.ClosedLoop) {
+            if (t0 < 0.0f) { t0 = 0.0f; }
+            if (t1 > 1.0f) { t1 = 1.0f; }
+        }
+        Vector3 a = this.EvaluatePosition(t0);
+        Vector3 b = this.EvaluatePosition(t1);
+        Vector3 d = Vector3.Subtract(b, a);
+        float len = d.Length();
+        if (len < 0.00001f) { return new Vector3(0.0f, 0.0f, 1.0f); }
+        return new Vector3(d.X / len, d.Y / len, d.Z / len);
+    }
+
+    // 数值积分估算整条轨道总弧长（steps 推荐 32..128）。
+    public float EstimateLength(int steps) {
+        int s = steps >= 4 ? steps : 32;
+        if (this.points.Count < 2) { return 0.0f; }
+        float total = 0.0f;
+        Vector3 prev = this.EvaluatePosition(0.0f);
+        for (int i = 1; i <= s; i = i + 1) {
+            Vector3 cur = this.EvaluatePosition((float)i / (float)s);
+            total = total + Vector3.Subtract(cur, prev).Length();
+            prev = cur;
+        }
+        return total;
+    }
+
+    // 按实际世界弧长距离匀速采样轨道位置（杜绝控制点疏密导致的变速抽动）。
+    public Vector3 SampleAtDistance(float distance, int lutSteps) {
+        int s = lutSteps >= 8 ? lutSteps : 64;
+        if (this.points.Count < 2) { return this.EvaluatePosition(0.0f); }
+        if (distance <= 0.0f) { return this.EvaluatePosition(0.0f); }
+        float accum = 0.0f;
+        Vector3 prev = this.EvaluatePosition(0.0f);
+        for (int i = 1; i <= s; i = i + 1) {
+            Vector3 cur = this.EvaluatePosition((float)i / (float)s);
+            float segLen = Vector3.Subtract(cur, prev).Length();
+            if (accum + segLen >= distance && segLen > 0.00001f) {
+                float frac = (distance - accum) / segLen;
+                return new Vector3(
+                    prev.X + (cur.X - prev.X) * frac,
+                    prev.Y + (cur.Y - prev.Y) * frac,
+                    prev.Z + (cur.Z - prev.Z) * frac);
+            }
+            accum = accum + segLen;
+            prev = cur;
+        }
+        return this.EvaluatePosition(1.0f);
+    }
+}

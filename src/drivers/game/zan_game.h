@@ -175,6 +175,15 @@ ZAN_GAME_API void zan_game_set_rim_light3d(float r, float g, float b, float powe
 ZAN_GAME_API void zan_game_set_color_grade3d(float saturation, float contrast,
     float tint_r, float tint_g, float tint_b);
 
+/* GPU 风格化卡通/二次元色阶量化（Toon / Cel Shading）：
+ * bands >= 2.0 开启漫反射色阶量化（推荐 3..5 阶），< 2.0 关闭还原 PBR 连续着色；
+ * specular_step 控制高光硬边阈值（推荐 0.25..0.55）。 */
+ZAN_GAME_API void zan_game_set_toon_shading3d(float bands, float specular_step);
+
+/* GPU 后处理 FXAA 抗锯齿与径向色差镜头特效（零额外 Pass，在 zan_game_postprocess3d 中生效）：
+ * fxaa_strength [0..1] 控制边缘亮度抗锯齿强度；chromatic_strength [0..0.1] 控制径向红蓝分离强度。 */
+ZAN_GAME_API void zan_game_set_post_lens3d(float fxaa_strength, float chromatic_strength);
+
 #ifdef __cplusplus
 }
 #endif

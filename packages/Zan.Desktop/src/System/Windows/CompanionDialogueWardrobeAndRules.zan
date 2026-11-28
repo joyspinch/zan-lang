@@ -1,0 +1,302 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Windows;
+
+// 商业桌面陪伴前台应用上下文分类常量。
+public static class CompanionAppCategory {
+    public const int General = 0;
+    public const int Coding = 1;
+    public const int Gaming = 2;
+    public const int Meeting = 3;
+    public const int Media = 4;
+    public const int Browser = 5;
+}
+
+// 前台窗口标题/进程关键词规则项。
+public class CompanionAppContextRule {
+    public string KeywordLower;
+    public int Category;
+    public int Priority;
+    public bool SilentMode;
+    public bool LowPowerMode;
+    public string BehaviorTag;
+
+    public CompanionAppContextRule(string keyword, int category, int priority,
+                                   bool silentMode, bool lowPowerMode, string behaviorTag) {
+        this.KeywordLower = keyword != null ? keyword.ToLower() : "";
+        this.Category = category;
+        this.Priority = priority;
+        this.SilentMode = silentMode;
+        this.LowPowerMode = lowPowerMode;
+        this.BehaviorTag = behaviorTag != null ? behaviorTag : "idle";
+    }
+}
+
+// 商业桌面陪伴前台应用情景自动规则引擎：
+// 根据当前前台窗口标题/进程名自动切换桌宠情景（开会自动静音免打扰、玩游戏自动降帧省电、写代码自动进入伴学加油模式）。
+public class CompanionAppContextMatcher {
+    private List<CompanionAppContextRule> rules;
+    private CompanionAppContextRule fallbackRule;
+
+    public CompanionAppContextMatcher() {
+        this.rules = new List<CompanionAppContextRule>();
+        this.fallbackRule = new CompanionAppContextRule("", CompanionAppCategory.General, -1, false, false, "idle");
+    }
+
+    public void AddRule(string keyword, int category, int priority,
+                        bool silentMode, bool lowPowerMode, string behaviorTag) {
+        if (keyword == null || keyword == "") { return; }
+        this.rules.Add(new CompanionAppContextRule(keyword, category, priority, silentMode, lowPowerMode, behaviorTag));
+    }
+
+    // 预置商业桌面陪伴常用情景规则（会议 > 游戏 > 编程 > 影音 > 浏览器）。
+    public static CompanionAppContextMatcher CreateDefaultPresets() {
+        CompanionAppContextMatcher m = new CompanionAppContextMatcher();
+        m.AddRule("zoom", CompanionAppCategory.Meeting, 100, true, true, "mute_hide");
+        m.AddRule("teams", CompanionAppCategory.Meeting, 100, true, true, "mute_hide");
+        m.AddRule("tencent meeting", CompanionAppCategory.Meeting, 100, true, true, "mute_hide");
+        m.AddRule("steam", CompanionAppCategory.Gaming, 80, true, true, "sleep_low_fps");
+        m.AddRule("visual studio", CompanionAppCategory.Coding, 60, false, false, "coding_cheer");
+        m.AddRule("vscode", CompanionAppCategory.Coding, 60, false, false, "coding_cheer");
+        m.AddRule("zanide", CompanionAppCategory.Coding, 60, false, false, "coding_cheer");
+        m.AddRule("youtube", CompanionAppCategory.Media, 40, false, false, "watch_popcorn");
+        m.AddRule("chrome", CompanionAppCategory.Browser, 10, false, false, "browse_idle");
+        return m;
+    }
+
+    // 匹配优先级最高的情景规则；未命中任何关键词时返回 General 默认行为。
+    public CompanionAppContextRule MatchForeground(string windowTitle, string processName) {
+        string combined = ((windowTitle != null ? windowTitle : "") + " " + (processName != null ? processName : "")).ToLower();
+        CompanionAppContextRule best = null;
+        for (int i = 0; i < this.rules.Count; i = i + 1) {
+            CompanionAppContextRule r = this.rules[i];
+            if (r.KeywordLower != "" && combined.IndexOf(r.KeywordLower) >= 0) {
+                if (best == null || r.Priority > best.Priority) {
+                    best = r;
+                }
+            }
+        }
+        return best != null ? best : this.fallbackRule;
+    }
+}
+
+// 条件触发式气泡台词脚本条目。
+public class CompanionDialogueEntry {
+    public string Id;
+    public string Trigger;
+    public string Text;
+    public int MinHour;
+    public int MaxHour;
+    public int MinAffection;
+    public int Priority;
+    public float CooldownSec;
+    public float LastSpokenSec;
+
+    public CompanionDialogueEntry(string id, string trigger, string text,
+                                  int minHour, int maxHour, int minAffection,
+                                  int priority, float cooldownSec) {
+        this.Id = id != null ? id : "";
+        this.Trigger = trigger != null ? trigger : "";
+        this.Text = text != null ? text : "";
+        this.MinHour = minHour;
+        this.MaxHour = maxHour;
+        this.MinAffection = minAffection;
+        this.Priority = priority;
+        this.CooldownSec = cooldownSec >= 0.0f ? cooldownSec : 0.0f;
+        this.LastSpokenSec = -100000.0f;
+    }
+}
+
+// 商业桌面陪伴条件台词与气泡脚本调度引擎：
+// 按触发事件（poke/greet/pomodoro_done/late_night）、时段、好感度门槛、优先级与独立冷却挑选最自然且不复读的台词。
+public class CompanionDialogueEngine {
+    private List<CompanionDialogueEntry> entries;
+    private string lastSpokenId;
+
+    public CompanionDialogueEngine() {
+        this.entries = new List<CompanionDialogueEntry>();
+        this.lastSpokenId = "";
+    }
+
+    public int EntryCount { get { return this.entries.Count; } }
+
+    public void RegisterLine(string id, string trigger, string text,
+                             int minHour, int maxHour, int minAffection,
+                             int priority, float cooldownSec) {
+        this.entries.Add(new CompanionDialogueEntry(
+            id, trigger, text, minHour, maxHour, minAffection, priority, cooldownSec));
+    }
+
+    private static bool HourInRange(int hour, int minH, int maxH) {
+        if (minH <= maxH) { return hour >= minH && hour <= maxH; }
+        // 支持跨午夜区间，例如 22..4 表示 22:00 ~ 次日 04:00
+        return hour >= minH || hour <= maxH;
+    }
+
+    public CompanionDialogueEntry PickLine(string trigger, int hourOfDay, int affectionLevel, float nowSec) {
+        if (trigger == null || trigger == "") { return null; }
+        CompanionDialogueEntry best = null;
+        int bestScore = -100000;
+        for (int i = 0; i < this.entries.Count; i = i + 1) {
+            CompanionDialogueEntry e = this.entries[i];
+            if (e.Trigger != trigger) { continue; }
+            if (!HourInRange(hourOfDay, e.MinHour, e.MaxHour)) { continue; }
+            if (affectionLevel < e.MinAffection) { continue; }
+            if (nowSec - e.LastSpokenSec < e.CooldownSec) { continue; }
+
+            int score = e.Priority * 10;
+            if (e.Id == this.lastSpokenId) { score = score - 5; }
+            if (best == null || score > bestScore) {
+                best = e;
+                bestScore = score;
+            }
+        }
+        if (best != null) {
+            best.LastSpokenSec = nowSec;
+            this.lastSpokenId = best.Id;
+        }
+        return best;
+    }
+}
+
+// 桌宠装扮单品记录（帽子 / 服装 / 挂件 / 光环 / 桌面摆件）。
+public class CompanionCosmeticItem {
+    public string ItemId;
+    public string Slot;
+    public string DisplayName;
+    public int CoinCost;
+    public bool Unlocked;
+
+    public CompanionCosmeticItem(string itemId, string slot, string displayName, int coinCost, bool unlocked) {
+        this.ItemId = itemId != null ? itemId : "";
+        this.Slot = slot != null ? slot : "";
+        this.DisplayName = displayName != null ? displayName : "";
+        this.CoinCost = coinCost >= 0 ? coinCost : 0;
+        this.Unlocked = unlocked;
+    }
+}
+
+// 装扮槽位与当前穿戴映射。
+public class WardrobeSlotBinding {
+    public string Slot;
+    public string ItemId;
+
+    public WardrobeSlotBinding(string slot, string itemId) {
+        this.Slot = slot;
+        this.ItemId = itemId;
+    }
+}
+
+// 装扮方案预设（一键换装）。
+public class WardrobePreset {
+    public string PresetName;
+    public List<WardrobeSlotBinding> Bindings;
+
+    public WardrobePreset(string presetName) {
+        this.PresetName = presetName != null ? presetName : "";
+        this.Bindings = new List<WardrobeSlotBinding>();
+    }
+}
+
+// 商业桌面陪伴衣橱与外观装扮管理器：
+// - 支持金币解锁单品、按槽位穿脱（同槽位自动顶替）、命名套装一键保存/切换与稳定持久化串输出
+public class CompanionWardrobeManager {
+    public int Coins;
+    private List<CompanionCosmeticItem> catalog;
+    private List<WardrobeSlotBinding> equipped;
+    private List<WardrobePreset> presets;
+
+    public CompanionWardrobeManager(int initialCoins) {
+        this.Coins = initialCoins >= 0 ? initialCoins : 0;
+        this.catalog = new List<CompanionCosmeticItem>();
+        this.equipped = new List<WardrobeSlotBinding>();
+        this.presets = new List<WardrobePreset>();
+    }
+
+    public void RegisterItem(string itemId, string slot, string displayName, int coinCost, bool unlockedByDefault) {
+        if (itemId == null || itemId == "" || slot == null || slot == "") { return; }
+        this.catalog.Add(new CompanionCosmeticItem(itemId, slot, displayName, coinCost, unlockedByDefault));
+    }
+
+    public CompanionCosmeticItem FindItem(string itemId) {
+        for (int i = 0; i < this.catalog.Count; i = i + 1) {
+            if (this.catalog[i].ItemId == itemId) { return this.catalog[i]; }
+        }
+        return null;
+    }
+
+    public bool UnlockItem(string itemId) {
+        CompanionCosmeticItem it = this.FindItem(itemId);
+        if (it == null) { return false; }
+        if (it.Unlocked) { return true; }
+        if (this.Coins < it.CoinCost) { return false; }
+        this.Coins = this.Coins - it.CoinCost;
+        it.Unlocked = true;
+        return true;
+    }
+
+    public bool Equip(string itemId) {
+        CompanionCosmeticItem it = this.FindItem(itemId);
+        if (it == null || !it.Unlocked) { return false; }
+        for (int i = 0; i < this.equipped.Count; i = i + 1) {
+            if (this.equipped[i].Slot == it.Slot) {
+                this.equipped[i].ItemId = it.ItemId;
+                return true;
+            }
+        }
+        this.equipped.Add(new WardrobeSlotBinding(it.Slot, it.ItemId));
+        return true;
+    }
+
+    public string GetEquippedItem(string slot) {
+        for (int i = 0; i < this.equipped.Count; i = i + 1) {
+            if (this.equipped[i].Slot == slot) { return this.equipped[i].ItemId; }
+        }
+        return "";
+    }
+
+    public void SavePreset(string presetName) {
+        if (presetName == null || presetName == "") { return; }
+        WardrobePreset target = null;
+        for (int i = 0; i < this.presets.Count; i = i + 1) {
+            if (this.presets[i].PresetName == presetName) {
+                target = this.presets[i];
+                break;
+            }
+        }
+        if (target == null) {
+            target = new WardrobePreset(presetName);
+            this.presets.Add(target);
+        } else {
+            target.Bindings.Clear();
+        }
+        for (int i = 0; i < this.equipped.Count; i = i + 1) {
+            target.Bindings.Add(new WardrobeSlotBinding(this.equipped[i].Slot, this.equipped[i].ItemId));
+        }
+    }
+
+    public bool ApplyPreset(string presetName) {
+        for (int i = 0; i < this.presets.Count; i = i + 1) {
+            if (this.presets[i].PresetName == presetName) {
+                this.equipped.Clear();
+                List<WardrobeSlotBinding> list = this.presets[i].Bindings;
+                for (int k = 0; k < list.Count; k = k + 1) {
+                    this.Equip(list[k].ItemId);
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // 输出稳定格式 "slot=item;slot2=item2" 供存档持久化。
+    public string SerializeEquipped() {
+        string acc = "";
+        for (int i = 0; i < this.equipped.Count; i = i + 1) {
+            if (i > 0) { acc = acc + ";"; }
+            acc = acc + this.equipped[i].Slot + "=" + this.equipped[i].ItemId;
+        }
+        return acc;
+    }
+}

@@ -1,0 +1,329 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Net;
+
+// 小队成员信息记录。
+public class PartyMemberInfo {
+    public int PlayerId;
+    public string Role;
+    public int RatingMmr;
+    public bool Ready;
+
+    public PartyMemberInfo(int playerId, string role, int ratingMmr) {
+        this.PlayerId = playerId;
+        this.Role = role != null ? role : "flex";
+        this.RatingMmr = ratingMmr;
+        this.Ready = false;
+    }
+}
+
+// 商业联机小队/开黑编组协调器（Party / Squad Coordinator）：
+// - 管理队长权限、队长断线自动顺延选举、全员就绪共识、排位段位分差合规校验与小队均分计算
+public class NetPartyCoordinator {
+    public string PartyId;
+    public int MaxSize;
+    public int MaxRankSpreadMmr;
+    public int LeaderPlayerId;
+    private List<PartyMemberInfo> members;
+
+    public NetPartyCoordinator(string partyId, int maxSize, int maxRankSpreadMmr) {
+        this.PartyId = partyId != null ? partyId : "";
+        this.MaxSize = maxSize >= 2 ? maxSize : 4;
+        this.MaxRankSpreadMmr = maxRankSpreadMmr > 0 ? maxRankSpreadMmr : 400;
+        this.LeaderPlayerId = 0;
+        this.members = new List<PartyMemberInfo>();
+    }
+
+    public int MemberCount { get { return this.members.Count; } }
+
+    public PartyMemberInfo FindMember(int playerId) {
+        for (int i = 0; i < this.members.Count; i = i + 1) {
+            if (this.members[i].PlayerId == playerId) { return this.members[i]; }
+        }
+        return null;
+    }
+
+    public bool Join(int playerId, string role, int ratingMmr) {
+        if (playerId <= 0 || this.members.Count >= this.MaxSize) { return false; }
+        if (this.FindMember(playerId) != null) { return false; }
+        this.members.Add(new PartyMemberInfo(playerId, role, ratingMmr));
+        if (this.LeaderPlayerId == 0) {
+            this.LeaderPlayerId = playerId;
+        }
+        return true;
+    }
+
+    public bool Leave(int playerId) {
+        for (int i = 0; i < this.members.Count; i = i + 1) {
+            if (this.members[i].PlayerId == playerId) {
+                this.members.RemoveAt(i);
+                if (this.LeaderPlayerId == playerId) {
+                    this.LeaderPlayerId = this.members.Count > 0 ? this.members[0].PlayerId : 0;
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public bool SetReady(int playerId, bool ready) {
+        PartyMemberInfo m = this.FindMember(playerId);
+        if (m == null) { return false; }
+        m.Ready = ready;
+        return true;
+    }
+
+    public bool AllMembersReady {
+        get {
+            if (this.members.Count == 0) { return false; }
+            for (int i = 0; i < this.members.Count; i = i + 1) {
+                if (!this.members[i].Ready) { return false; }
+            }
+            return true;
+        }
+    }
+
+    public int AverageMmr {
+        get {
+            if (this.members.Count == 0) { return 0; }
+            int sum = 0;
+            for (int i = 0; i < this.members.Count; i = i + 1) {
+                sum = sum + this.members[i].RatingMmr;
+            }
+            return sum / this.members.Count;
+        }
+    }
+
+    public int MmrSpread {
+        get {
+            if (this.members.Count <= 1) { return 0; }
+            int minM = this.members[0].RatingMmr;
+            int maxM = this.members[0].RatingMmr;
+            for (int i = 1; i < this.members.Count; i = i + 1) {
+                int r = this.members[i].RatingMmr;
+                if (r < minM) { minM = r; }
+                if (r > maxM) { maxM = r; }
+            }
+            return maxM - minM;
+        }
+    }
+
+    // 排位开黑准入检查：至少 1 人、全员就绪且最高/最低段位差 <= MaxRankSpreadMmr。
+    public bool CanEnterRankedQueue() {
+        return this.AllMembersReady && this.MmrSpread <= this.MaxRankSpreadMmr;
+    }
+}
+
+// 单个玩家的聊天风控滑窗状态。
+public class ChatSenderState {
+    public int PlayerId;
+    public List<long> RecentSendTimesMs;
+    public string LastMessage;
+    public int Strikes;
+    public long MutedUntilMs;
+
+    public ChatSenderState(int playerId) {
+        this.PlayerId = playerId;
+        this.RecentSendTimesMs = new List<long>();
+        this.LastMessage = "";
+        this.Strikes = 0;
+        this.MutedUntilMs = 0;
+    }
+}
+
+// 聊天消息审核结果。
+public class ChatModerationResult {
+    public bool Allowed;
+    public bool WasMasked;
+    public string SanitizedText;
+    public string RejectReason;
+
+    public ChatModerationResult(bool allowed, bool wasMasked, string sanitizedText, string rejectReason) {
+        this.Allowed = allowed;
+        this.WasMasked = wasMasked;
+        this.SanitizedText = sanitizedText != null ? sanitizedText : "";
+        this.RejectReason = rejectReason != null ? rejectReason : "";
+    }
+}
+
+// 商业联机聊天风控与合规审核器（Anti-Spam + Profanity Filter + Progressive Mute）：
+// - 滑动时间窗频控（防止刷屏洪泛）
+// - 连续重复消息抑制
+// - 大小写不敏感敏感词星号脱敏（***）
+// - 违规累计触发渐进式自动禁言
+public class NetChatModerationGuard {
+    public int MaxMessagesPerWindow;
+    public long WindowMs;
+    public int StrikesBeforeMute;
+    public long MuteDurationMs;
+
+    private List<string> bannedWordsLower;
+    private List<ChatSenderState> senders;
+
+    public NetChatModerationGuard(int maxMessagesPerWindow, long windowMs, int strikesBeforeMute, long muteDurationMs) {
+        this.MaxMessagesPerWindow = maxMessagesPerWindow >= 1 ? maxMessagesPerWindow : 5;
+        this.WindowMs = windowMs >= 1000 ? windowMs : 10000;
+        this.StrikesBeforeMute = strikesBeforeMute >= 1 ? strikesBeforeMute : 3;
+        this.MuteDurationMs = muteDurationMs >= 1000 ? muteDurationMs : 60000;
+        this.bannedWordsLower = new List<string>();
+        this.senders = new List<ChatSenderState>();
+    }
+
+    public void AddBannedWord(string word) {
+        if (word == null || word == "") { return; }
+        this.bannedWordsLower.Add(word.ToLower());
+    }
+
+    private ChatSenderState GetOrCreateSender(int playerId) {
+        for (int i = 0; i < this.senders.Count; i = i + 1) {
+            if (this.senders[i].PlayerId == playerId) { return this.senders[i]; }
+        }
+        ChatSenderState st = new ChatSenderState(playerId);
+        this.senders.Add(st);
+        return st;
+    }
+
+    private void RecordStrike(ChatSenderState st, long nowMs) {
+        st.Strikes = st.Strikes + 1;
+        if (st.Strikes >= this.StrikesBeforeMute) {
+            st.MutedUntilMs = nowMs + this.MuteDurationMs;
+            st.Strikes = 0;
+        }
+    }
+
+    public ChatModerationResult EvaluateMessage(int playerId, string text, long nowMs) {
+        if (text == null || text == "") {
+            return new ChatModerationResult(false, false, "", "empty");
+        }
+        ChatSenderState st = this.GetOrCreateSender(playerId);
+        if (nowMs < st.MutedUntilMs) {
+            return new ChatModerationResult(false, false, "", "muted");
+        }
+
+        // 清理过期时间窗样本
+        while (st.RecentSendTimesMs.Count > 0 && nowMs - st.RecentSendTimesMs[0] > this.WindowMs) {
+            st.RecentSendTimesMs.RemoveAt(0);
+        }
+        if (st.RecentSendTimesMs.Count >= this.MaxMessagesPerWindow) {
+            this.RecordStrike(st, nowMs);
+            return new ChatModerationResult(false, false, "", "rate_limit");
+        }
+        if (st.LastMessage == text && st.RecentSendTimesMs.Count > 0) {
+            this.RecordStrike(st, nowMs);
+            return new ChatModerationResult(false, false, "", "duplicate_spam");
+        }
+
+        // 大小写不敏感敏感词脱敏
+        string current = text;
+        bool masked = false;
+        for (int w = 0; w < this.bannedWordsLower.Count; w = w + 1) {
+            string bad = this.bannedWordsLower[w];
+            int badLen = bad.Length;
+            if (badLen <= 0) { continue; }
+            string stars = "";
+            for (int k = 0; k < badLen; k = k + 1) { stars = stars + "*"; }
+            string lower = current.ToLower();
+            int pos = lower.IndexOf(bad);
+            while (pos >= 0) {
+                masked = true;
+                string prefix = current.Substring(0, pos);
+                string suffix = current.Substring(pos + badLen);
+                current = prefix + stars + suffix;
+                lower = current.ToLower();
+                pos = lower.IndexOf(bad);
+            }
+        }
+
+        st.RecentSendTimesMs.Add(nowMs);
+        st.LastMessage = text;
+        if (masked) { this.RecordStrike(st, nowMs); }
+        return new ChatModerationResult(true, masked, current, "");
+    }
+}
+
+// 跨服/无缝切区/房主迁移一次性签名票据。
+public class ServerMigrationTicket {
+    public string TicketId;
+    public int PlayerId;
+    public string TargetServerId;
+    public string StatePayload;
+    public long IssuedAtMs;
+    public long ExpiresAtMs;
+    public uint SignatureHash;
+    public bool Consumed;
+
+    public ServerMigrationTicket(string ticketId, int playerId, string targetServerId,
+                                 string statePayload, long issuedAtMs, long expiresAtMs, uint signatureHash) {
+        this.TicketId = ticketId;
+        this.PlayerId = playerId;
+        this.TargetServerId = targetServerId;
+        this.StatePayload = statePayload;
+        this.IssuedAtMs = issuedAtMs;
+        this.ExpiresAtMs = expiresAtMs;
+        this.SignatureHash = signatureHash;
+        this.Consumed = false;
+    }
+}
+
+// 商业联机跨服无缝迁移与断线重连票据签发/核销器：
+// - 基于共享密钥 + FNV-1a 32-bit 完整性签名防伪造
+// - 支持 TTL 过期控制与防重放一次性核销（RedeemTicket 仅首次有效）
+public class NetServerMigrationBroker {
+    private string sharedSecret;
+    private long defaultTtlMs;
+    private int nextNonce;
+    private List<ServerMigrationTicket> tickets;
+
+    public NetServerMigrationBroker(string sharedSecret, long defaultTtlMs) {
+        this.sharedSecret = sharedSecret != null ? sharedSecret : "default-secret";
+        this.defaultTtlMs = defaultTtlMs >= 1000 ? defaultTtlMs : 30000;
+        this.nextNonce = 1000;
+        this.tickets = new List<ServerMigrationTicket>();
+    }
+
+    private uint ComputeSignature(string ticketId, int playerId, string targetServerId, string payload, long expiresAtMs) {
+        string raw = this.sharedSecret + "|" + ticketId + "|" + Convert.ToString(playerId)
+            + "|" + targetServerId + "|" + payload + "|" + Convert.ToString(expiresAtMs);
+        uint h = 2166136261U;
+        for (int i = 0; i < raw.Length; i = i + 1) {
+            uint ch = (uint)raw[i];
+            h = h ^ ch;
+            h = unchecked(h * 16777619U);
+        }
+        return h;
+    }
+
+    public ServerMigrationTicket IssueTicket(int playerId, string targetServerId, string statePayload, long nowMs) {
+        if (playerId <= 0 || targetServerId == null || targetServerId == "") { return null; }
+        string payload = statePayload != null ? statePayload : "";
+        this.nextNonce = this.nextNonce + 1;
+        string id = "mig_" + Convert.ToString(playerId) + "_" + Convert.ToString(this.nextNonce);
+        long exp = nowMs + this.defaultTtlMs;
+        uint sig = this.ComputeSignature(id, playerId, targetServerId, payload, exp);
+        ServerMigrationTicket tk = new ServerMigrationTicket(id, playerId, targetServerId, payload, nowMs, exp, sig);
+        this.tickets.Add(tk);
+        return tk;
+    }
+
+    // 目标服核销迁移票据：校验目标服匹配、未过期、签名未被篡改、未被重放消费。
+    public bool RedeemTicket(string ticketId, int playerId, string expectedServerId,
+                             uint presentedSignature, long nowMs, out string outStatePayload) {
+        outStatePayload = "";
+        if (ticketId == null || ticketId == "") { return false; }
+        for (int i = 0; i < this.tickets.Count; i = i + 1) {
+            ServerMigrationTicket tk = this.tickets[i];
+            if (tk.TicketId == ticketId) {
+                if (tk.Consumed) { return false; }
+                if (nowMs > tk.ExpiresAtMs) { return false; }
+                if (tk.PlayerId != playerId || tk.TargetServerId != expectedServerId) { return false; }
+                uint expectedSig = this.ComputeSignature(tk.TicketId, tk.PlayerId, tk.TargetServerId, tk.StatePayload, tk.ExpiresAtMs);
+                if (presentedSignature != expectedSig || tk.SignatureHash != expectedSig) { return false; }
+                tk.Consumed = true;
+                outStatePayload = tk.StatePayload;
+                return true;
+            }
+        }
+        return false;
+    }
+}
