@@ -1,0 +1,72 @@
+using System;
+using System.Collections.Generic;
+using Game.Net;
+
+namespace Conf;
+
+class MultiplayerRateLimitPresenceVoteTest {
+    static void Main() {
+        // 1. 令牌桶限流器：突发消耗、耗尽拦截、随时间连续补充并钳位于容量上限
+        NetTokenBucketLimiter limiter = new NetTokenBucketLimiter(5.0, 2.0);
+        bool c1 = limiter.TryConsume(100, 3.0, 1000L);   // 剩 2.0
+        bool c2 = limiter.TryConsume(100, 2.0, 1000L);   // 剩 0.0
+        bool blocked = !limiter.TryConsume(100, 1.0, 1100L); // +0.2 -> 仅 0.2 < 1.0 拦截
+        bool afterRefill = limiter.TryConsume(100, 1.0, 1600L); // +1.0 -> 1.2 -> 消耗 1.0 剩 0.2
+        double clamped = limiter.AvailableTokens(100, 10000L);  // 长时间后封顶 5.0
+
+        bool limiterOk = c1 && c2 && blocked && afterRefill
+            && limiter.BlockedCount(100) == 1
+            && clamped >= 4.99 && clamped <= 5.01;
+        Console.WriteLine("net-token-bucket-limiter: " + Convert.ToString(limiterOk ? 1 : 0));
+
+        // 2. 好友在线状态目录：上报活动、心跳超时批量离线清扫与状态筛选
+        NetFriendPresenceDirectory dir = new NetFriendPresenceDirectory();
+        dir.ReportPresence(1, PresenceStatus.InMatch, "Ranked 5v5", 1000L);
+        dir.ReportPresence(2, PresenceStatus.InLobby, "Party #4", 5000L);
+        dir.ReportPresence(3, PresenceStatus.InMatch, "Arena", 6000L);
+
+        int swept = dir.SweepExpired(12000L, 10000L); // 仅玩家 1 超时 (12000-1000 > 10000)
+        List<FriendPresenceRecord> inMatch = dir.QueryByStatus(PresenceStatus.InMatch);
+        FriendPresenceRecord p1 = dir.GetPresence(1);
+
+        bool presenceOk = swept == 1
+            && dir.OnlineCount() == 2
+            && p1 != null && p1.Status == PresenceStatus.Offline
+            && inMatch.Count == 1 && inMatch[0].PlayerId == 3 && inMatch[0].Activity == "Arena";
+        Console.WriteLine("net-friend-presence-directory: " + Convert.ToString(presenceOk ? 1 : 0));
+
+        // 3. 对局表决会话：防重复投票、达标提前通过、数学无望提前否决与超时结案
+        NetMatchVoteSession passVote = new NetMatchVoteSession("surrender", 3, 20000L);
+        passVote.AddEligibleVoter(1);
+        passVote.AddEligibleVoter(2);
+        passVote.AddEligibleVoter(3);
+        passVote.AddEligibleVoter(4);
+
+        bool v1 = passVote.CastVote(1, true, 1000L);
+        bool dupIgnored = !passVote.CastVote(1, true, 1100L);
+        bool intruderIgnored = !passVote.CastVote(99, true, 1200L);
+        bool v2 = passVote.CastVote(2, true, 1300L);
+        bool v3 = passVote.CastVote(3, true, 1400L); // 3/4 达标立即 Passed
+        bool lateIgnored = !passVote.CastVote(4, false, 1500L);
+
+        NetMatchVoteSession rejectVote = new NetMatchVoteSession("remake", 3, 20000L);
+        rejectVote.AddEligibleVoter(1);
+        rejectVote.AddEligibleVoter(2);
+        rejectVote.AddEligibleVoter(3);
+        rejectVote.AddEligibleVoter(4);
+        rejectVote.CastVote(1, false, 1000L);
+        rejectVote.CastVote(2, false, 1100L); // 剩余最多 2 票 < 3，立即短路 Rejected
+
+        NetMatchVoteSession expireVote = new NetMatchVoteSession("pause", 2, 5000L);
+        expireVote.AddEligibleVoter(1);
+        expireVote.AddEligibleVoter(2);
+        expireVote.CastVote(1, true, 2000L);
+        VoteResolutionState expState = expireVote.UpdateClock(6000L);
+
+        bool voteOk = v1 && dupIgnored && intruderIgnored && v2 && v3 && lateIgnored
+            && passVote.State == VoteResolutionState.Passed && passVote.YesCount() == 3
+            && rejectVote.State == VoteResolutionState.Rejected && rejectVote.NoCount() == 2
+            && expState == VoteResolutionState.Expired;
+        Console.WriteLine("net-match-vote-session: " + Convert.ToString(voteOk ? 1 : 0));
+    }
+}

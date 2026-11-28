@@ -1,0 +1,274 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Net;
+
+internal class TokenBucketEntry {
+    public int PlayerId;
+    public double Tokens;
+    public long LastRefillMs;
+    public int BlockedCount;
+
+    public TokenBucketEntry(int playerId, double tokens, long nowMs) {
+        this.PlayerId = playerId;
+        this.Tokens = tokens;
+        this.LastRefillMs = nowMs;
+        this.BlockedCount = 0;
+    }
+}
+
+// 商用联机服务端令牌桶限流器：按玩家单调时间戳连续补充令牌、突发钳位与超限拦截统计。
+public class NetTokenBucketLimiter {
+    private double capacity;
+    private double refillPerSecond;
+    private List<TokenBucketEntry> buckets;
+
+    public NetTokenBucketLimiter(double capacity, double refillPerSecond) {
+        this.capacity = capacity > 0.1 ? capacity : 1.0;
+        this.refillPerSecond = refillPerSecond > 0.0 ? refillPerSecond : 1.0;
+        this.buckets = new List<TokenBucketEntry>();
+    }
+
+    public bool TryConsume(int playerId, double cost, long nowMs) {
+        if (cost <= 0.0) { return true; }
+        TokenBucketEntry entry = this.GetOrCreate(playerId, nowMs);
+        this.Refill(entry, nowMs);
+        if (entry.Tokens + 0.000001 >= cost) {
+            entry.Tokens = entry.Tokens - cost;
+            if (entry.Tokens < 0.0) { entry.Tokens = 0.0; }
+            return true;
+        }
+        entry.BlockedCount = entry.BlockedCount + 1;
+        return false;
+    }
+
+    public double AvailableTokens(int playerId, long nowMs) {
+        TokenBucketEntry entry = this.Find(playerId);
+        if (entry == null) { return this.capacity; }
+        this.Refill(entry, nowMs);
+        return entry.Tokens;
+    }
+
+    public int BlockedCount(int playerId) {
+        TokenBucketEntry entry = this.Find(playerId);
+        return entry == null ? 0 : entry.BlockedCount;
+    }
+
+    private TokenBucketEntry Find(int playerId) {
+        for (int i = 0; i < this.buckets.Count; i = i + 1) {
+            if (this.buckets[i].PlayerId == playerId) {
+                return this.buckets[i];
+            }
+        }
+        return null;
+    }
+
+    private TokenBucketEntry GetOrCreate(int playerId, long nowMs) {
+        TokenBucketEntry found = this.Find(playerId);
+        if (found != null) { return found; }
+        TokenBucketEntry created = new TokenBucketEntry(playerId, this.capacity, nowMs);
+        this.buckets.Add(created);
+        return created;
+    }
+
+    private void Refill(TokenBucketEntry entry, long nowMs) {
+        if (nowMs <= entry.LastRefillMs) { return; }
+        double elapsedSec = (double)(nowMs - entry.LastRefillMs) / 1000.0;
+        entry.Tokens = entry.Tokens + elapsedSec * this.refillPerSecond;
+        if (entry.Tokens > this.capacity) {
+            entry.Tokens = this.capacity;
+        }
+        entry.LastRefillMs = nowMs;
+    }
+}
+
+public enum PresenceStatus {
+    Offline = 0,
+    Online = 1,
+    InLobby = 2,
+    InMatch = 3,
+    Away = 4
+}
+
+public class FriendPresenceRecord {
+    public int PlayerId;
+    public PresenceStatus Status;
+    public string Activity;
+    public long LastHeartbeatMs;
+
+    public FriendPresenceRecord(int playerId, PresenceStatus status, string activity, long nowMs) {
+        this.PlayerId = playerId;
+        this.Status = status;
+        this.Activity = activity == null ? "" : activity;
+        this.LastHeartbeatMs = nowMs;
+    }
+}
+
+// 商用好友在线状态与大厅活动目录：支持心跳保活、超时批量离线清扫与状态筛选。
+public class NetFriendPresenceDirectory {
+    private List<FriendPresenceRecord> records;
+
+    public NetFriendPresenceDirectory() {
+        this.records = new List<FriendPresenceRecord>();
+    }
+
+    public void ReportPresence(int playerId, PresenceStatus status, string activity, long nowMs) {
+        for (int i = 0; i < this.records.Count; i = i + 1) {
+            FriendPresenceRecord rec = this.records[i];
+            if (rec.PlayerId == playerId) {
+                rec.Status = status;
+                rec.Activity = activity == null ? "" : activity;
+                rec.LastHeartbeatMs = nowMs;
+                return;
+            }
+        }
+        this.records.Add(new FriendPresenceRecord(playerId, status, activity, nowMs));
+    }
+
+    public FriendPresenceRecord GetPresence(int playerId) {
+        for (int i = 0; i < this.records.Count; i = i + 1) {
+            if (this.records[i].PlayerId == playerId) {
+                return this.records[i];
+            }
+        }
+        return null;
+    }
+
+    public int SweepExpired(long nowMs, long timeoutMs) {
+        long ttl = timeoutMs > 0L ? timeoutMs : 30000L;
+        int swept = 0;
+        for (int i = 0; i < this.records.Count; i = i + 1) {
+            FriendPresenceRecord rec = this.records[i];
+            if (rec.Status != PresenceStatus.Offline && (nowMs - rec.LastHeartbeatMs) > ttl) {
+                rec.Status = PresenceStatus.Offline;
+                rec.Activity = "";
+                swept = swept + 1;
+            }
+        }
+        return swept;
+    }
+
+    public int OnlineCount() {
+        int c = 0;
+        for (int i = 0; i < this.records.Count; i = i + 1) {
+            if (this.records[i].Status != PresenceStatus.Offline) {
+                c = c + 1;
+            }
+        }
+        return c;
+    }
+
+    public List<FriendPresenceRecord> QueryByStatus(PresenceStatus status) {
+        List<FriendPresenceRecord> list = new List<FriendPresenceRecord>();
+        for (int i = 0; i < this.records.Count; i = i + 1) {
+            if (this.records[i].Status == status) {
+                list.Add(this.records[i]);
+            }
+        }
+        return list;
+    }
+}
+
+public enum VoteResolutionState {
+    Pending = 0,
+    Passed = 1,
+    Rejected = 2,
+    Expired = 3
+}
+
+internal class VoteBallotEntry {
+    public int PlayerId;
+    public bool HasVoted;
+    public bool Approve;
+
+    public VoteBallotEntry(int playerId) {
+        this.PlayerId = playerId;
+        this.HasVoted = false;
+        this.Approve = false;
+    }
+}
+
+// 商用对局表决会话（投降/重开/踢人）：具备合法选民白名单、防重复投票、数学提前短路与超时结案。
+public class NetMatchVoteSession {
+    public string Topic;
+    public int RequiredYes;
+    public long DeadlineMs;
+    public VoteResolutionState State;
+    private List<VoteBallotEntry> voters;
+
+    public NetMatchVoteSession(string topic, int requiredYes, long deadlineMs) {
+        this.Topic = topic == null ? "" : topic;
+        this.RequiredYes = requiredYes < 1 ? 1 : requiredYes;
+        this.DeadlineMs = deadlineMs;
+        this.State = VoteResolutionState.Pending;
+        this.voters = new List<VoteBallotEntry>();
+    }
+
+    public bool AddEligibleVoter(int playerId) {
+        if (this.State != VoteResolutionState.Pending) { return false; }
+        for (int i = 0; i < this.voters.Count; i = i + 1) {
+            if (this.voters[i].PlayerId == playerId) { return false; }
+        }
+        this.voters.Add(new VoteBallotEntry(playerId));
+        return true;
+    }
+
+    public bool CastVote(int playerId, bool approve, long nowMs) {
+        this.UpdateClock(nowMs);
+        if (this.State != VoteResolutionState.Pending) { return false; }
+
+        VoteBallotEntry ballot = null;
+        for (int i = 0; i < this.voters.Count; i = i + 1) {
+            if (this.voters[i].PlayerId == playerId) {
+                ballot = this.voters[i];
+                break;
+            }
+        }
+        if (ballot == null || ballot.HasVoted) { return false; }
+
+        ballot.HasVoted = true;
+        ballot.Approve = approve;
+        this.EvaluateResolution();
+        return true;
+    }
+
+    public VoteResolutionState UpdateClock(long nowMs) {
+        if (this.State == VoteResolutionState.Pending && nowMs > this.DeadlineMs) {
+            this.State = VoteResolutionState.Expired;
+        }
+        return this.State;
+    }
+
+    public int YesCount() {
+        int c = 0;
+        for (int i = 0; i < this.voters.Count; i = i + 1) {
+            if (this.voters[i].HasVoted && this.voters[i].Approve) { c = c + 1; }
+        }
+        return c;
+    }
+
+    public int NoCount() {
+        int c = 0;
+        for (int i = 0; i < this.voters.Count; i = i + 1) {
+            if (this.voters[i].HasVoted && !this.voters[i].Approve) { c = c + 1; }
+        }
+        return c;
+    }
+
+    private void EvaluateResolution() {
+        int yes = 0;
+        int remaining = 0;
+        for (int i = 0; i < this.voters.Count; i = i + 1) {
+            if (!this.voters[i].HasVoted) {
+                remaining = remaining + 1;
+            } else if (this.voters[i].Approve) {
+                yes = yes + 1;
+            }
+        }
+        if (yes >= this.RequiredYes) {
+            this.State = VoteResolutionState.Passed;
+        } else if (yes + remaining < this.RequiredYes) {
+            this.State = VoteResolutionState.Rejected;
+        }
+    }
+}

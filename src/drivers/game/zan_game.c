@@ -151,6 +151,7 @@ typedef struct {
     zgl_int u_top_cover_params, u_top_cover_color;
     zgl_int u_wind_params, u_dist_fade;
     zgl_int u_world_grid_params, u_world_grid_color;
+    zgl_int u_caustics_params, u_caustics_color;
     zgl_int u_light_dir, u_light_color, u_light_count, u_ambient;
     zgl_int u_cam_pos, u_cam_valid, u_material, u_emissive;
     zgl_int u_point_pos, u_point_color, u_point_count;
@@ -233,6 +234,8 @@ static float g_game_wind_params[4] = { 0.0f, 1.5f, 0.0f, 1.0f }; /* amplitude, f
 static float g_game_dist_fade[3] = { 0.0f, 0.5f, 2.0f }; /* enabled, start_dist, end_dist */
 static float g_game_world_grid_params[4] = { 0.0f, 1.0f, 0.05f, 0.0f }; /* enabled, cell_size, line_width, strength */
 static float g_game_world_grid_color[3] = { 0.0f, 0.9f, 1.0f };
+static float g_game_caustics_params[4] = { 0.0f, 1.0f, 0.0f, 0.0f }; /* enabled, scale, phase, strength */
+static float g_game_caustics_color[3] = { 0.4f, 0.9f, 1.0f };
 static float g_game_color_grade[2] = { 1.0f, 1.0f }; /* saturation, contrast */
 static float g_game_color_tint[3] = { 1.0f, 1.0f, 1.0f };
 static float g_game_post_lens[2] = { 0.0f, 0.0f }; /* fxaa, chromatic */
@@ -243,6 +246,8 @@ static float g_game_post_pixelate[2] = { 0.0f, 0.0f }; /* pixel_size, posterize_
 static float g_game_post_duotone_dark[4] = { 0.0f, 0.05f, 0.0f, 0.0f }; /* dark_r, g, b, strength */
 static float g_game_post_duotone_light[3] = { 0.2f, 1.0f, 0.35f }; /* light_r, g, b */
 static float g_game_post_crt[4] = { 0.0f, 64.0f, 0.0f, 1.0f }; /* intensity, count, curvature, glow_boost */
+static float g_game_post_outline_params[2] = { 0.0f, 0.2f }; /* strength, threshold */
+static float g_game_post_outline_color[3] = { 0.0f, 0.0f, 0.0f };
 static uint32_t g_game_light_version = 1;
 
 static zan_game_mesh *g_game_meshes = NULL;
@@ -541,6 +546,8 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
 "uniform vec3 uDistFade;\n" \
 "uniform vec4 uWorldGridParams;\n" \
 "uniform vec3 uWorldGridColor;\n" \
+"uniform vec4 uCausticsParams;\n" \
+"uniform vec3 uCausticsColor;\n" \
 "uniform vec3 uCamPos;\n" \
 "uniform int uCamValid;\n" \
 "uniform vec2 uMaterial;\n" \
@@ -735,6 +742,17 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
     "        float gMask = max(gLine.x, gLine.y) * clamp(uWorldGridParams.w, 0.0, 1.0);\n" \
     "        rgb = mix(rgb, uWorldGridColor, gMask);\n" \
     "    }\n" \
+    "    if (uCausticsParams.x > 0.5 && uCausticsParams.w > 0.0005) {\n" \
+    "        float cUp = smoothstep(0.1, 0.7, normalize(v_normal).y);\n" \
+    "        if (cUp > 0.001) {\n" \
+    "            vec2 cp = v_world_pos.xz * max(uCausticsParams.y, 0.1);\n" \
+    "            float cPh = uCausticsParams.z;\n" \
+    "            float cw1 = sin(cp.x * 3.1 + cPh) * sin(cp.y * 3.1 - cPh * 0.8);\n" \
+    "            float cw2 = sin((cp.x * 0.7 + cp.y * 0.7) * 4.3 - cPh * 1.1) * sin((-cp.x * 0.7 + cp.y * 0.7) * 4.3 + cPh * 0.9);\n" \
+    "            float cNet = pow(clamp(1.0 - abs(cw1 + cw2) * 0.65, 0.0, 1.0), 3.0);\n" \
+    "            rgb += uCausticsColor * (cNet * cUp * clamp(uCausticsParams.w, 0.0, 2.0));\n" \
+    "        }\n" \
+    "    }\n" \
     "    if (uCamValid != 0) {\n" \
     "        float ndv = clamp(dot(N, V), 0.0, 1.0);\n" \
     "        if (uHemiOn != 0) {\n" \
@@ -871,6 +889,8 @@ static const char *const ZAN_GAME_POST_FS =
 "uniform vec4 uPostDuotoneDark;\n"
 "uniform vec3 uPostDuotoneLight;\n"
 "uniform vec4 uPostCrt;\n"
+"uniform vec2 uPostOutlineParams;\n"
+"uniform vec3 uPostOutlineColor;\n"
 "in vec2 v_uv;\n"
 "out vec4 frag;\n"
 "vec3 brightPass(vec3 c, float th) {\n"
@@ -981,6 +1001,18 @@ static const char *const ZAN_GAME_POST_FS =
     "        vec3 duo = mix(uPostDuotoneDark.rgb, uPostDuotoneLight, dLum);\n"
     "        col = mix(col, duo, clamp(uPostDuotoneDark.w, 0.0, 1.0));\n"
     "    }\n"
+    "    if (uPostOutlineParams.x > 0.0005) {\n"
+    "        vec3 oL = vec3(0.299, 0.587, 0.114);\n"
+    "        float lN = dot(texture(uScene, clamp(uv + vec2(0.0, -uTexelSize.y), vec2(0.0), vec2(1.0))).rgb, oL);\n"
+    "        float lS = dot(texture(uScene, clamp(uv + vec2(0.0,  uTexelSize.y), vec2(0.0), vec2(1.0))).rgb, oL);\n"
+    "        float lW = dot(texture(uScene, clamp(uv + vec2(-uTexelSize.x, 0.0), vec2(0.0), vec2(1.0))).rgb, oL);\n"
+    "        float lE = dot(texture(uScene, clamp(uv + vec2( uTexelSize.x, 0.0), vec2(0.0), vec2(1.0))).rgb, oL);\n"
+    "        float ogx = lE - lW;\n"
+    "        float ogy = lS - lN;\n"
+    "        float oMag = sqrt(ogx * ogx + ogy * ogy);\n"
+    "        float oMask = smoothstep(uPostOutlineParams.y, uPostOutlineParams.y + 0.08, oMag);\n"
+    "        col = mix(col, uPostOutlineColor, oMask * clamp(uPostOutlineParams.x, 0.0, 1.0));\n"
+    "    }\n"
     "    if (uVignette > 0.001) {\n"
     "        vec2 d = (v_uv - vec2(0.5)) * 2.0;\n"
     "        float vig = clamp(1.0 - uVignette * dot(d, d) * 0.5, 0.0, 1.0);\n"
@@ -1028,6 +1060,8 @@ typedef struct {
     zgl_int u_post_duotone_dark;
     zgl_int u_post_duotone_light;
     zgl_int u_post_crt;
+    zgl_int u_post_outline_params;
+    zgl_int u_post_outline_color;
 } zan_game_post_program;
 
 static const char *const ZAN_GAME_SKYBOX_FS =
@@ -1283,6 +1317,10 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
         : g_game_gl->GetUniformLocation(program, "uWorldGridParams");
     zgl_int world_grid_color = instanced ? -1
         : g_game_gl->GetUniformLocation(program, "uWorldGridColor");
+    zgl_int caustics_params = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uCausticsParams");
+    zgl_int caustics_color = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uCausticsColor");
     zgl_int color = instanced ? 0
         : g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
@@ -1361,6 +1399,8 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
     prog->u_dist_fade = dist_fade;
     prog->u_world_grid_params = world_grid_params;
     prog->u_world_grid_color = world_grid_color;
+    prog->u_caustics_params = caustics_params;
+    prog->u_caustics_color = caustics_color;
     prog->u_color = color;
     prog->u_light_dir = light_dir;
     prog->u_light_color = light_color;
@@ -1436,6 +1476,8 @@ static zan_game_program *zan_game_skin_program_get(void) {
     zgl_int dist_fade = g_game_gl->GetUniformLocation(program, "uDistFade");
     zgl_int world_grid_params = g_game_gl->GetUniformLocation(program, "uWorldGridParams");
     zgl_int world_grid_color = g_game_gl->GetUniformLocation(program, "uWorldGridColor");
+    zgl_int caustics_params = g_game_gl->GetUniformLocation(program, "uCausticsParams");
+    zgl_int caustics_color = g_game_gl->GetUniformLocation(program, "uCausticsColor");
     zgl_int color = g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
     zgl_int light_color = g_game_gl->GetUniformLocation(program, "uLightColor[0]");
@@ -1502,6 +1544,8 @@ static zan_game_program *zan_game_skin_program_get(void) {
     g_game_skin_prog.u_dist_fade = dist_fade;
     g_game_skin_prog.u_world_grid_params = world_grid_params;
     g_game_skin_prog.u_world_grid_color = world_grid_color;
+    g_game_skin_prog.u_caustics_params = caustics_params;
+    g_game_skin_prog.u_caustics_color = caustics_color;
     g_game_skin_prog.u_color = color;
     g_game_skin_prog.u_light_dir = light_dir;
     g_game_skin_prog.u_light_color = light_color;
@@ -1988,6 +2032,14 @@ static void zan_game_bind_shadow_uniforms(const zan_gl_api *gl, zan_game_program
     }
     if (prog->u_world_grid_color >= 0) {
         gl->Uniform3fv(prog->u_world_grid_color, 1, g_game_world_grid_color);
+    }
+    if (prog->u_caustics_params >= 0) {
+        gl->Uniform4f(prog->u_caustics_params,
+            g_game_caustics_params[0], g_game_caustics_params[1],
+            g_game_caustics_params[2], g_game_caustics_params[3]);
+    }
+    if (prog->u_caustics_color >= 0) {
+        gl->Uniform3fv(prog->u_caustics_color, 1, g_game_caustics_color);
     }
 }
 
@@ -2566,6 +2618,8 @@ static zan_game_post_program *zan_game_post_program_get(void) {
     g_game_post_prog.u_post_duotone_dark = g_game_gl->GetUniformLocation(prog, "uPostDuotoneDark");
     g_game_post_prog.u_post_duotone_light = g_game_gl->GetUniformLocation(prog, "uPostDuotoneLight");
     g_game_post_prog.u_post_crt = g_game_gl->GetUniformLocation(prog, "uPostCrt");
+    g_game_post_prog.u_post_outline_params = g_game_gl->GetUniformLocation(prog, "uPostOutlineParams");
+    g_game_post_prog.u_post_outline_color = g_game_gl->GetUniformLocation(prog, "uPostOutlineColor");
     return &g_game_post_prog;
 }
 
@@ -2695,6 +2749,13 @@ ZAN_GAME_API int32_t zan_game_postprocess3d(int32_t surface_id, float exposure,
         gl->Uniform4f(prog->u_post_crt,
             g_game_post_crt[0], g_game_post_crt[1],
             g_game_post_crt[2], g_game_post_crt[3]);
+    }
+    if (prog->u_post_outline_params >= 0) {
+        gl->Uniform2f(prog->u_post_outline_params,
+            g_game_post_outline_params[0], g_game_post_outline_params[1]);
+    }
+    if (prog->u_post_outline_color >= 0) {
+        gl->Uniform3fv(prog->u_post_outline_color, 1, g_game_post_outline_color);
     }
     gl->BindVertexArray(g_game_post_vao);
     gl->DrawArrays(ZGL_TRIANGLES, 0, 3);
@@ -3094,4 +3155,30 @@ ZAN_GAME_API void zan_game_set_post_crt_scanline3d(float scanline_intensity,
     g_game_post_crt[1] = scanline_count;
     g_game_post_crt[2] = curvature;
     g_game_post_crt[3] = glow_boost;
+}
+
+ZAN_GAME_API void zan_game_set_water_caustics3d(int32_t enabled, float scale,
+    float phase, float strength, float r, float g, float b) {
+    g_game_caustics_params[0] = enabled ? 1.0f : 0.0f;
+    g_game_caustics_params[1] = scale > 0.1f ? scale : 1.0f;
+    g_game_caustics_params[2] = phase;
+    if (strength < 0.0f) strength = 0.0f;
+    if (strength > 2.0f) strength = 2.0f;
+    g_game_caustics_params[3] = strength;
+    g_game_caustics_color[0] = r > 0.0f ? r : 0.0f;
+    g_game_caustics_color[1] = g > 0.0f ? g : 0.0f;
+    g_game_caustics_color[2] = b > 0.0f ? b : 0.0f;
+}
+
+ZAN_GAME_API void zan_game_set_post_edge_outline3d(float strength,
+    float threshold, float r, float g, float b) {
+    if (strength < 0.0f) strength = 0.0f;
+    if (strength > 1.0f) strength = 1.0f;
+    if (threshold < 0.02f) threshold = 0.02f;
+    if (threshold > 1.0f) threshold = 1.0f;
+    g_game_post_outline_params[0] = strength;
+    g_game_post_outline_params[1] = threshold;
+    g_game_post_outline_color[0] = r > 0.0f ? r : 0.0f;
+    g_game_post_outline_color[1] = g > 0.0f ? g : 0.0f;
+    g_game_post_outline_color[2] = b > 0.0f ? b : 0.0f;
 }

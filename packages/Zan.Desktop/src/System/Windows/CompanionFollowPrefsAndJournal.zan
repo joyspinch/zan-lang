@@ -1,0 +1,312 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Windows;
+
+// 桌面伴侣临界阻尼二阶弹簧光标跟随器：带死区抑制抖动与最大速度限幅，实现顺滑无过冲跟随。
+public class CompanionCursorSpringFollower {
+    public double PosX;
+    public double PosY;
+    public double VelX;
+    public double VelY;
+    public double SmoothTimeSec;
+    public double DeadzonePx;
+    public double MaxSpeedPxPerSec;
+
+    public CompanionCursorSpringFollower(double startX, double startY,
+        double smoothTimeSec, double deadzonePx, double maxSpeedPxPerSec) {
+        this.PosX = startX;
+        this.PosY = startY;
+        this.VelX = 0.0;
+        this.VelY = 0.0;
+        this.SmoothTimeSec = smoothTimeSec > 0.01 ? smoothTimeSec : 0.15;
+        this.DeadzonePx = deadzonePx >= 0.0 ? deadzonePx : 0.0;
+        this.MaxSpeedPxPerSec = maxSpeedPxPerSec > 1.0 ? maxSpeedPxPerSec : 2000.0;
+    }
+
+    public void Step(double targetX, double targetY, double dtSec) {
+        if (dtSec <= 0.0) { return; }
+        double dt = dtSec > 0.1 ? 0.1 : dtSec;
+        double dx = this.PosX - targetX;
+        double dy = this.PosY - targetY;
+        double dist = Math.Sqrt(dx * dx + dy * dy);
+        if (dist <= this.DeadzonePx) {
+            this.VelX = this.VelX * 0.5;
+            this.VelY = this.VelY * 0.5;
+            return;
+        }
+
+        double omega = 2.0 / this.SmoothTimeSec;
+        double x = omega * dt;
+        double expFactor = 1.0 / (1.0 + x + 0.48 * x * x + 0.235 * x * x * x);
+
+        double maxChange = this.MaxSpeedPxPerSec * this.SmoothTimeSec;
+        if (dist > maxChange) {
+            double scale = maxChange / dist;
+            dx = dx * scale;
+            dy = dy * scale;
+        }
+
+        double clampedTargetX = this.PosX - dx;
+        double clampedTargetY = this.PosY - dy;
+
+        double tempX = (this.VelX + omega * dx) * dt;
+        double tempY = (this.VelY + omega * dy) * dt;
+        this.VelX = (this.VelX - omega * tempX) * expFactor;
+        this.VelY = (this.VelY - omega * tempY) * expFactor;
+
+        this.PosX = clampedTargetX + (dx + tempX) * expFactor;
+        this.PosY = clampedTargetY + (dy + tempY) * expFactor;
+    }
+}
+
+public class PreferenceEntry {
+    public string Key;
+    public string Value;
+
+    public PreferenceEntry(string key, string value) {
+        this.Key = key == null ? "" : key;
+        this.Value = value == null ? "" : value;
+    }
+}
+
+// 桌面伴侣本地偏好配置仓库：支持 String/Int/Bool 强类型读写、脏标记与安全文本序列化持久化。
+public class CompanionPreferenceStore {
+    private List<PreferenceEntry> entries;
+    public bool IsDirty;
+
+    public CompanionPreferenceStore() {
+        this.entries = new List<PreferenceEntry>();
+        this.IsDirty = false;
+    }
+
+    public int Count() {
+        return this.entries.Count;
+    }
+
+    public void SetString(string key, string value) {
+        if (key == null || key == "") { return; }
+        string val = value == null ? "" : value;
+        for (int i = 0; i < this.entries.Count; i = i + 1) {
+            if (this.entries[i].Key == key) {
+                if (this.entries[i].Value != val) {
+                    this.entries[i].Value = val;
+                    this.IsDirty = true;
+                }
+                return;
+            }
+        }
+        this.entries.Add(new PreferenceEntry(key, val));
+        this.IsDirty = true;
+    }
+
+    public string GetString(string key, string fallback) {
+        if (key == null || key == "") { return fallback; }
+        for (int i = 0; i < this.entries.Count; i = i + 1) {
+            if (this.entries[i].Key == key) {
+                return this.entries[i].Value;
+            }
+        }
+        return fallback;
+    }
+
+    public void SetInt(string key, int value) {
+        this.SetString(key, Convert.ToString(value));
+    }
+
+    public int GetInt(string key, int fallback) {
+        string raw = this.GetString(key, "");
+        if (raw == "") { return fallback; }
+        int sign = 1;
+        int start = 0;
+        if (raw[0] == '-') {
+            sign = -1;
+            start = 1;
+        }
+        if (start >= raw.Length) { return fallback; }
+        int acc = 0;
+        for (int i = start; i < raw.Length; i = i + 1) {
+            char ch = raw[i];
+            if (ch < '0' || ch > '9') { return fallback; }
+            acc = acc * 10 + (int)(ch - '0');
+        }
+        return acc * sign;
+    }
+
+    public void SetBool(string key, bool value) {
+        this.SetString(key, value ? "1" : "0");
+    }
+
+    public bool GetBool(string key, bool fallback) {
+        string raw = this.GetString(key, "");
+        if (raw == "1" || raw == "true") { return true; }
+        if (raw == "0" || raw == "false") { return false; }
+        return fallback;
+    }
+
+    public string Serialize() {
+        string outStr = "";
+        for (int i = 0; i < this.entries.Count; i = i + 1) {
+            PreferenceEntry e = this.entries[i];
+            string line = EscapeField(e.Key) + "=" + EscapeField(e.Value);
+            outStr = i == 0 ? line : (outStr + "\n" + line);
+        }
+        this.IsDirty = false;
+        return outStr;
+    }
+
+    public int LoadSerialized(string payload) {
+        this.entries.Clear();
+        this.IsDirty = false;
+        if (payload == null || payload == "") { return 0; }
+        int loaded = 0;
+        int start = 0;
+        int len = payload.Length;
+        while (start <= len) {
+            int end = start;
+            while (end < len && payload[end] != '\n') {
+                end = end + 1;
+            }
+            if (end > start) {
+                string line = payload.Substring(start, end - start);
+                int eq = FindChar(line, '=');
+                if (eq > 0) {
+                    string k = UnescapeField(line.Substring(0, eq));
+                    string v = UnescapeField(line.Substring(eq + 1, line.Length - eq - 1));
+                    this.entries.Add(new PreferenceEntry(k, v));
+                    loaded = loaded + 1;
+                }
+            }
+            start = end + 1;
+            if (end >= len) { break; }
+        }
+        return loaded;
+    }
+
+    private static int FindChar(string s, char target) {
+        for (int i = 0; i < s.Length; i = i + 1) {
+            if (s[i] == target) { return i; }
+        }
+        return -1;
+    }
+
+    private static string EscapeField(string s) {
+        string res = "";
+        for (int i = 0; i < s.Length; i = i + 1) {
+            char ch = s[i];
+            if (ch == '\\') { res = res + "\\\\"; }
+            else if (ch == '\n') { res = res + "\\n"; }
+            else if (ch == '=') { res = res + "\\e"; }
+            else { res = res + ch.ToString(); }
+        }
+        return res;
+    }
+
+    private static string UnescapeField(string s) {
+        string res = "";
+        int i = 0;
+        while (i < s.Length) {
+            char ch = s[i];
+            if (ch == '\\' && i + 1 < s.Length) {
+                char nxt = s[i + 1];
+                if (nxt == 'n') { res = res + "\n"; }
+                else if (nxt == 'e') { res = res + "="; }
+                else { res = res + nxt.ToString(); }
+                i = i + 2;
+            } else {
+                res = res + ch.ToString();
+                i = i + 1;
+            }
+        }
+        return res;
+    }
+}
+
+public class MoodJournalEntry {
+    public int DayIndex;
+    public int MoodScore;
+    public string Note;
+
+    public MoodJournalEntry(int dayIndex, int moodScore, string note) {
+        this.DayIndex = dayIndex;
+        this.MoodScore = moodScore;
+        this.Note = note == null ? "" : note;
+    }
+}
+
+// 桌面伴侣情绪日记与状态趋势追踪器：每日打卡（1..5分）、区间均值、连续好心情连击与极值日查询。
+public class CompanionMoodJournalTracker {
+    private List<MoodJournalEntry> entries;
+
+    public CompanionMoodJournalTracker() {
+        this.entries = new List<MoodJournalEntry>();
+    }
+
+    public void RecordMood(int dayIndex, int moodScore, string note) {
+        int clamped = moodScore < 1 ? 1 : (moodScore > 5 ? 5 : moodScore);
+        for (int i = 0; i < this.entries.Count; i = i + 1) {
+            if (this.entries[i].DayIndex == dayIndex) {
+                this.entries[i].MoodScore = clamped;
+                this.entries[i].Note = note == null ? "" : note;
+                return;
+            }
+        }
+        this.entries.Add(new MoodJournalEntry(dayIndex, clamped, note));
+    }
+
+    public int EntryCount() {
+        return this.entries.Count;
+    }
+
+    public double AverageScore(int fromDay, int toDay) {
+        int sum = 0;
+        int count = 0;
+        for (int i = 0; i < this.entries.Count; i = i + 1) {
+            MoodJournalEntry e = this.entries[i];
+            if (e.DayIndex >= fromDay && e.DayIndex <= toDay) {
+                sum = sum + e.MoodScore;
+                count = count + 1;
+            }
+        }
+        return count == 0 ? 0.0 : ((double)sum / (double)count);
+    }
+
+    public int PositiveStreak(int minScore) {
+        if (this.entries.Count == 0) { return 0; }
+        int maxDay = this.entries[0].DayIndex;
+        for (int i = 1; i < this.entries.Count; i = i + 1) {
+            if (this.entries[i].DayIndex > maxDay) {
+                maxDay = this.entries[i].DayIndex;
+            }
+        }
+        int streak = 0;
+        int curDay = maxDay;
+        while (true) {
+            MoodJournalEntry e = this.FindDay(curDay);
+            if (e == null || e.MoodScore < minScore) { break; }
+            streak = streak + 1;
+            curDay = curDay - 1;
+        }
+        return streak;
+    }
+
+    public int LowestMoodDay() {
+        if (this.entries.Count == 0) { return -1; }
+        MoodJournalEntry low = this.entries[0];
+        for (int i = 1; i < this.entries.Count; i = i + 1) {
+            if (this.entries[i].MoodScore < low.MoodScore) {
+                low = this.entries[i];
+            }
+        }
+        return low.DayIndex;
+    }
+
+    private MoodJournalEntry FindDay(int dayIndex) {
+        for (int i = 0; i < this.entries.Count; i = i + 1) {
+            if (this.entries[i].DayIndex == dayIndex) {
+                return this.entries[i];
+            }
+        }
+        return null;
+    }
+}

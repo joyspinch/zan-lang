@@ -1,0 +1,284 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Render3D;
+
+// 3D 轴对齐包围盒（AABB），用于八叉树空间索引、视锥粗裁与射线求交。
+public class Aabb3D {
+    public float MinX;
+    public float MinY;
+    public float MinZ;
+    public float MaxX;
+    public float MaxY;
+    public float MaxZ;
+
+    public Aabb3D(float minX, float minY, float minZ, float maxX, float maxY, float maxZ) {
+        this.MinX = minX <= maxX ? minX : maxX;
+        this.MinY = minY <= maxY ? minY : maxY;
+        this.MinZ = minZ <= maxZ ? minZ : maxZ;
+        this.MaxX = maxX >= minX ? maxX : minX;
+        this.MaxY = maxY >= minY ? maxY : minY;
+        this.MaxZ = maxZ >= minZ ? maxZ : minZ;
+    }
+
+    public static Aabb3D FromCenterHalfExtents(Vector3 center, float hx, float hy, float hz) {
+        float ax = hx < 0.0f ? -hx : hx;
+        float ay = hy < 0.0f ? -hy : hy;
+        float az = hz < 0.0f ? -hz : hz;
+        return new Aabb3D(
+            center.X - ax, center.Y - ay, center.Z - az,
+            center.X + ax, center.Y + ay, center.Z + az);
+    }
+
+    public bool Intersects(Aabb3D other) {
+        if (other == null) { return false; }
+        return this.MinX <= other.MaxX && this.MaxX >= other.MinX
+            && this.MinY <= other.MaxY && this.MaxY >= other.MinY
+            && this.MinZ <= other.MaxZ && this.MaxZ >= other.MinZ;
+    }
+
+    public bool Contains(Aabb3D other) {
+        if (other == null) { return false; }
+        return other.MinX >= this.MinX && other.MaxX <= this.MaxX
+            && other.MinY >= this.MinY && other.MaxY <= this.MaxY
+            && other.MinZ >= this.MinZ && other.MaxZ <= this.MaxZ;
+    }
+
+    // Slab 射线求交：命中返回距离 t >= 0 且 <= maxDist，未命中返回 -1.0f。
+    public float IntersectRay(Vector3 origin, Vector3 dir, float maxDist) {
+        float tMin = 0.0f;
+        float tMax = maxDist > 0.0f ? maxDist : 1000000.0f;
+
+        if (!SlabAxis(origin.X, dir.X, this.MinX, this.MaxX, ref tMin, ref tMax)) { return -1.0f; }
+        if (!SlabAxis(origin.Y, dir.Y, this.MinY, this.MaxY, ref tMin, ref tMax)) { return -1.0f; }
+        if (!SlabAxis(origin.Z, dir.Z, this.MinZ, this.MaxZ, ref tMin, ref tMax)) { return -1.0f; }
+        return tMin >= 0.0f ? tMin : 0.0f;
+    }
+
+    private static bool SlabAxis(float o, float d, float lo, float hi, ref float tMin, ref float tMax) {
+        float ad = d < 0.0f ? -d : d;
+        if (ad < 0.000001f) {
+            return o >= lo && o <= hi;
+        }
+        float inv = 1.0f / d;
+        float t1 = (lo - o) * inv;
+        float t2 = (hi - o) * inv;
+        if (t1 > t2) {
+            float tmp = t1;
+            t1 = t2;
+            t2 = tmp;
+        }
+        if (t1 > tMin) { tMin = t1; }
+        if (t2 < tMax) { tMax = t2; }
+        return tMin <= tMax;
+    }
+}
+
+public class OctreeEntry3D {
+    public int EntityId;
+    public Aabb3D Bounds;
+
+    public OctreeEntry3D(int entityId, Aabb3D bounds) {
+        this.EntityId = entityId;
+        this.Bounds = bounds;
+    }
+}
+
+internal class OctreeNode3D {
+    public Aabb3D Bounds;
+    public int Depth;
+    public List<OctreeEntry3D> Items;
+    public List<OctreeNode3D> Children;
+
+    public OctreeNode3D(Aabb3D bounds, int depth) {
+        this.Bounds = bounds;
+        this.Depth = depth;
+        this.Items = new List<OctreeEntry3D>();
+        this.Children = null;
+    }
+}
+
+// 商用 3D 动态八叉树空间索引：支持自动八分、动态增删改、范围包围盒查询与射线最近命中拾取。
+public class OctreeIndex3D {
+    private OctreeNode3D root;
+    private int maxDepth;
+    private int maxLeafItems;
+    private int totalCount;
+
+    public OctreeIndex3D(Aabb3D worldBounds, int maxDepth, int maxLeafItems) {
+        Aabb3D wb = worldBounds != null ? worldBounds : new Aabb3D(-100.0f, -100.0f, -100.0f, 100.0f, 100.0f, 100.0f);
+        this.maxDepth = maxDepth < 1 ? 1 : (maxDepth > 8 ? 8 : maxDepth);
+        this.maxLeafItems = maxLeafItems < 2 ? 2 : maxLeafItems;
+        this.root = new OctreeNode3D(wb, 0);
+        this.totalCount = 0;
+    }
+
+    public int Count() {
+        return this.totalCount;
+    }
+
+    public bool Insert(int entityId, Aabb3D bounds) {
+        if (bounds == null || !this.root.Bounds.Intersects(bounds)) { return false; }
+        this.Remove(entityId);
+        OctreeEntry3D entry = new OctreeEntry3D(entityId, bounds);
+        this.InsertInto(this.root, entry);
+        this.totalCount = this.totalCount + 1;
+        return true;
+    }
+
+    public bool Remove(int entityId) {
+        if (this.RemoveFrom(this.root, entityId)) {
+            this.totalCount = this.totalCount - 1;
+            return true;
+        }
+        return false;
+    }
+
+    public bool Update(int entityId, Aabb3D newBounds) {
+        return this.Insert(entityId, newBounds);
+    }
+
+    public List<int> QueryBox(Aabb3D region) {
+        List<int> result = new List<int>();
+        if (region == null) { return result; }
+        this.QueryBoxNode(this.root, region, result);
+        return result;
+    }
+
+    // 射线拾取：返回最近命中实体 ID，未命中返回 -1。
+    public int RaycastNearest(Vector3 origin, Vector3 direction, float maxDist, out float hitDistance) {
+        hitDistance = -1.0f;
+        float lenSq = direction.X * direction.X + direction.Y * direction.Y + direction.Z * direction.Z;
+        if (lenSq < 0.0000001f) { return -1; }
+        Vector3 dir = Vector3.Normalize(direction);
+        float bestDist = maxDist > 0.0f ? maxDist : 1000000.0f;
+        int bestId = -1;
+        this.RaycastNode(this.root, origin, dir, ref bestDist, ref bestId);
+        if (bestId >= 0) {
+            hitDistance = bestDist;
+        }
+        return bestId;
+    }
+
+    public int NodeCount() {
+        return this.CountNodes(this.root);
+    }
+
+    private void InsertInto(OctreeNode3D node, OctreeEntry3D entry) {
+        if (node.Children != null) {
+            int childIdx = this.FitChildIndex(node, entry.Bounds);
+            if (childIdx >= 0) {
+                this.InsertInto(node.Children[childIdx], entry);
+                return;
+            }
+            node.Items.Add(entry);
+            return;
+        }
+
+        node.Items.Add(entry);
+        if (node.Items.Count > this.maxLeafItems && node.Depth < this.maxDepth) {
+            this.Subdivide(node);
+        }
+    }
+
+    private void Subdivide(OctreeNode3D node) {
+        Aabb3D b = node.Bounds;
+        float mx = (b.MinX + b.MaxX) * 0.5f;
+        float my = (b.MinY + b.MaxY) * 0.5f;
+        float mz = (b.MinZ + b.MaxZ) * 0.5f;
+        int nextDepth = node.Depth + 1;
+        List<OctreeNode3D> kids = new List<OctreeNode3D>();
+        for (int i = 0; i < 8; i = i + 1) {
+            float x0 = (i & 1) == 0 ? b.MinX : mx;
+            float x1 = (i & 1) == 0 ? mx : b.MaxX;
+            float y0 = (i & 2) == 0 ? b.MinY : my;
+            float y1 = (i & 2) == 0 ? my : b.MaxY;
+            float z0 = (i & 4) == 0 ? b.MinZ : mz;
+            float z1 = (i & 4) == 0 ? mz : b.MaxZ;
+            kids.Add(new OctreeNode3D(new Aabb3D(x0, y0, z0, x1, y1, z1), nextDepth));
+        }
+        node.Children = kids;
+
+        List<OctreeEntry3D> stay = new List<OctreeEntry3D>();
+        for (int i = 0; i < node.Items.Count; i = i + 1) {
+            OctreeEntry3D it = node.Items[i];
+            int idx = this.FitChildIndex(node, it.Bounds);
+            if (idx >= 0) {
+                this.InsertInto(node.Children[idx], it);
+            } else {
+                stay.Add(it);
+            }
+        }
+        node.Items = stay;
+    }
+
+    private int FitChildIndex(OctreeNode3D node, Aabb3D box) {
+        for (int i = 0; i < 8; i = i + 1) {
+            if (node.Children[i].Bounds.Contains(box)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private bool RemoveFrom(OctreeNode3D node, int entityId) {
+        for (int i = 0; i < node.Items.Count; i = i + 1) {
+            if (node.Items[i].EntityId == entityId) {
+                node.Items.RemoveAt(i);
+                return true;
+            }
+        }
+        if (node.Children != null) {
+            for (int i = 0; i < 8; i = i + 1) {
+                if (this.RemoveFrom(node.Children[i], entityId)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private void QueryBoxNode(OctreeNode3D node, Aabb3D region, List<int> result) {
+        if (!node.Bounds.Intersects(region)) { return; }
+        for (int i = 0; i < node.Items.Count; i = i + 1) {
+            OctreeEntry3D it = node.Items[i];
+            if (it.Bounds.Intersects(region)) {
+                result.Add(it.EntityId);
+            }
+        }
+        if (node.Children != null) {
+            for (int i = 0; i < 8; i = i + 1) {
+                this.QueryBoxNode(node.Children[i], region, result);
+            }
+        }
+    }
+
+    private void RaycastNode(OctreeNode3D node, Vector3 origin, Vector3 dir, ref float bestDist, ref int bestId) {
+        float boxT = node.Bounds.IntersectRay(origin, dir, bestDist);
+        if (boxT < 0.0f) { return; }
+
+        for (int i = 0; i < node.Items.Count; i = i + 1) {
+            OctreeEntry3D it = node.Items[i];
+            float t = it.Bounds.IntersectRay(origin, dir, bestDist);
+            if (t >= 0.0f && t < bestDist) {
+                bestDist = t;
+                bestId = it.EntityId;
+            }
+        }
+        if (node.Children != null) {
+            for (int i = 0; i < 8; i = i + 1) {
+                this.RaycastNode(node.Children[i], origin, dir, ref bestDist, ref bestId);
+            }
+        }
+    }
+
+    private int CountNodes(OctreeNode3D node) {
+        int c = 1;
+        if (node.Children != null) {
+            for (int i = 0; i < 8; i = i + 1) {
+                c = c + this.CountNodes(node.Children[i]);
+            }
+        }
+        return c;
+    }
+}

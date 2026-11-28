@@ -268,6 +268,16 @@ ZAN_GAME_API void zan_game_set_world_grid3d(int32_t enabled, float cell_size,
 ZAN_GAME_API void zan_game_set_post_crt_scanline3d(float scanline_intensity,
     float scanline_count, float curvature, float glow_boost);
 
+/* GPU 世界空间程序化水底焦散光斑（Water Caustics，仅投射在朝上表面，零贴图零额外 Pass）：
+ * enabled != 0 时按世界 XZ 坐标双层旋转正弦干涉叠加焦散光网，strength [0..2] 控制亮度。 */
+ZAN_GAME_API void zan_game_set_water_caustics3d(int32_t enabled, float scale,
+    float phase, float strength, float r, float g, float b);
+
+/* GPU 后处理屏幕空间 Sobel 边缘描边（Screen-Space Edge Outline，二次元/战术轮廓线，零额外 Pass）：
+ * strength [0..1] 控制描边混入强度，threshold [0.02..1] 控制亮度梯度边缘阈值，(r,g,b) 为描边色。 */
+ZAN_GAME_API void zan_game_set_post_edge_outline3d(float strength,
+    float threshold, float r, float g, float b);
+
 #ifdef __cplusplus
 }
 #endif

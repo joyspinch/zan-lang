@@ -1,0 +1,186 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Game.Graphics;
+using Game.Render3D;
+
+namespace Conf;
+
+class Game3DCausticsOutlineOctreeTest {
+    [DllImport("zan_gui")]
+    private static extern int zan_gui_read_pixel(int surfaceId, int x, int y);
+
+    static int RedOf(int argb) { return (argb >> 16) & 255; }
+    static int GreenOf(int argb) { return (argb >> 8) & 255; }
+    static int BlueOf(int argb) { return argb & 255; }
+
+    static void Main() {
+        Canvas.SetBackend(1);
+        Canvas cv = new Canvas(128, 128);
+        int sid = cv.SurfaceId();
+
+        // 1. GPU 世界空间水底焦散光斑：朝上平面产生空间干涉亮纹，且随 Phase 推进动态变化
+        Mesh3D planeMesh = new Mesh3D();
+        planeMesh.Vertex(-4.0f, 0.0f, -4.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f);
+        planeMesh.Vertex( 4.0f, 0.0f, -4.0f, 0.0f, 1.0f, 0.0f, 1.0f, 0.0f);
+        planeMesh.Vertex( 4.0f, 0.0f,  4.0f, 0.0f, 1.0f, 0.0f, 1.0f, 1.0f);
+        planeMesh.Vertex(-4.0f, 0.0f,  4.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f);
+        planeMesh.Triangle(0, 2, 1);
+        planeMesh.Triangle(0, 3, 2);
+        int planeKey = cv.MeshUpload(planeMesh);
+        Camera3D topCam = new Camera3D();
+        topCam.Position = new Vector3(0.0f, 4.0f, 0.001f);
+        topCam.Target = new Vector3(0.0f, 0.0f, 0.0f);
+        topCam.AspectRatio = 1.0f;
+        topCam.FieldOfView = 1.05f;
+
+        Material floorMat = Material.Solid(0.0f, 0.0f, 0.0f);
+        floorMat.EmissiveRed = 0.06f;
+        floorMat.EmissiveGreen = 0.06f;
+        floorMat.EmissiveBlue = 0.06f;
+
+        SceneNode root1 = new SceneNode("root1");
+        SceneNode floorNode = new SceneNode("floor");
+        floorNode.MeshKey = planeKey;
+        floorNode.BoundsRadius = 10.0f;
+        floorNode.Material = floorMat;
+        root1.AddChild(floorNode);
+
+        Renderer3D ren = new Renderer3D(16);
+        ren.UseCpuLighting = false;
+        RenderPlan plan1 = new RenderPlan(topCam);
+
+        // 1a. 关闭焦散基准
+        cv.Clear(unchecked((int)0xFF000000));
+        plan1.Build(root1);
+        ren.Draw(cv, plan1);
+        int baseMaxB = 0;
+        for (int x = 20; x <= 108; x = x + 2) {
+            int b = BlueOf(zan_gui_read_pixel(sid, x, 64));
+            if (b > baseMaxB) { baseMaxB = b; }
+        }
+
+        // 1b. 开启焦散 (phase = 0.4)
+        floorMat.WaterCausticsEnabled = true;
+        floorMat.WaterCausticsScale = 1.4f;
+        floorMat.WaterCausticsPhase = 0.4f;
+        floorMat.WaterCausticsStrength = 1.2f;
+        floorMat.WaterCausticsRed = 0.2f;
+        floorMat.WaterCausticsGreen = 0.9f;
+        floorMat.WaterCausticsBlue = 1.0f;
+
+        cv.Clear(unchecked((int)0xFF000000));
+        plan1.Build(root1);
+        ren.Draw(cv, plan1);
+        int[] rowPhaseA = new int[45];
+        int caustMinB = 255;
+        int caustMaxB = 0;
+        for (int i = 0; i < 45; i = i + 1) {
+            int b = BlueOf(zan_gui_read_pixel(sid, 20 + i * 2, 64));
+            rowPhaseA[i] = b;
+            if (b < caustMinB) { caustMinB = b; }
+            if (b > caustMaxB) { caustMaxB = b; }
+        }
+
+        // 1c. 推进 Phase (phase = 1.9) 应产生焦散波纹位移
+        floorMat.WaterCausticsPhase = 1.9f;
+        cv.Clear(unchecked((int)0xFF000000));
+        plan1.Build(root1);
+        ren.Draw(cv, plan1);
+        int shiftedPixels = 0;
+        for (int i = 0; i < 45; i = i + 1) {
+            int b = BlueOf(zan_gui_read_pixel(sid, 20 + i * 2, 64));
+            int diff = b - rowPhaseA[i];
+            if (diff < 0) { diff = -diff; }
+            if (diff > 15) { shiftedPixels = shiftedPixels + 1; }
+        }
+
+        bool causticsOk = baseMaxB < 40
+            && caustMaxB > baseMaxB + 80
+            && (caustMaxB - caustMinB) > 40
+            && shiftedPixels >= 8;
+        Console.WriteLine("gpu-water-caustics: " + Convert.ToString(causticsOk ? 1 : 0));
+
+        // 2. GPU 后处理屏幕空间 Sobel 边缘描边：亮色方块与黑底交界处描出纯红轮廓，内部保持纯白、角落保持纯黑
+        Mesh3D quadMesh = new Mesh3D();
+        quadMesh.Vertex(-1.0f, -1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        quadMesh.Vertex( 1.0f, -1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+        quadMesh.Vertex( 1.0f,  1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        quadMesh.Vertex(-1.0f,  1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f);
+        quadMesh.Triangle(0, 1, 2);
+        quadMesh.Triangle(0, 2, 3);
+        int quadKey = cv.MeshUpload(quadMesh);
+        Camera3D frontCam = new Camera3D();
+        frontCam.Position = new Vector3(0.0f, 0.0f, 4.0f);
+        frontCam.Target = new Vector3(0.0f, 0.0f, 0.0f);
+        frontCam.AspectRatio = 1.0f;
+        frontCam.FieldOfView = 1.0f;
+
+        Material whiteMat = Material.Solid(0.0f, 0.0f, 0.0f);
+        whiteMat.EmissiveRed = 1.0f;
+        whiteMat.EmissiveGreen = 1.0f;
+        whiteMat.EmissiveBlue = 1.0f;
+
+        SceneNode root2 = new SceneNode("root2");
+        SceneNode quadNode = new SceneNode("quad");
+        quadNode.MeshKey = quadKey;
+        quadNode.BoundsRadius = 3.0f;
+        quadNode.Material = whiteMat;
+        root2.AddChild(quadNode);
+
+        PostProcess post = new PostProcess();
+        post.OutlineStrength = 1.0f;
+        post.OutlineThreshold = 0.15f;
+        post.OutlineRed = 1.0f;
+        post.OutlineGreen = 0.0f;
+        post.OutlineBlue = 0.0f;
+        ren.PostProcess = post;
+
+        RenderPlan plan2 = new RenderPlan(frontCam);
+        cv.Clear(unchecked((int)0xFF000000));
+        plan2.Build(root2);
+        ren.Draw(cv, plan2);
+
+        int centerPx = zan_gui_read_pixel(sid, 64, 64);
+        int cornerPx = zan_gui_read_pixel(sid, 8, 8);
+        int redEdgeCount = 0;
+        for (int x = 4; x <= 123; x = x + 1) {
+            int px = zan_gui_read_pixel(sid, x, 64);
+            if (RedOf(px) > 180 && GreenOf(px) < 90 && BlueOf(px) < 90) {
+                redEdgeCount = redEdgeCount + 1;
+            }
+        }
+        bool outlineOk = RedOf(centerPx) > 200 && GreenOf(centerPx) > 200 && BlueOf(centerPx) > 200
+            && RedOf(cornerPx) < 20 && GreenOf(cornerPx) < 20 && BlueOf(cornerPx) < 20
+            && redEdgeCount >= 2;
+        Console.WriteLine("gpu-post-edge-outline: " + Convert.ToString(outlineOk ? 1 : 0));
+
+        ren.Dispose();
+
+        // 3. 3D 动态八叉树空间索引：自动分裂、范围框查询、射线最近命中与动态更新/移除
+        OctreeIndex3D tree = new OctreeIndex3D(new Aabb3D(-50.0f, -50.0f, -50.0f, 50.0f, 50.0f, 50.0f), 4, 2);
+        tree.Insert(1, Aabb3D.FromCenterHalfExtents(new Vector3(0.0f, 0.0f, -5.0f), 1.0f, 1.0f, 1.0f));
+        tree.Insert(2, Aabb3D.FromCenterHalfExtents(new Vector3(0.0f, 0.0f, 10.0f), 1.5f, 1.5f, 1.5f));
+        tree.Insert(3, Aabb3D.FromCenterHalfExtents(new Vector3(20.0f, 20.0f, 20.0f), 2.0f, 2.0f, 2.0f));
+        tree.Insert(4, Aabb3D.FromCenterHalfExtents(new Vector3(24.0f, 21.0f, 19.0f), 1.0f, 1.0f, 1.0f));
+        tree.Insert(5, Aabb3D.FromCenterHalfExtents(new Vector3(-30.0f, -20.0f, -15.0f), 2.0f, 2.0f, 2.0f));
+        tree.Insert(6, Aabb3D.FromCenterHalfExtents(new Vector3(-32.0f, -18.0f, -12.0f), 1.0f, 1.0f, 1.0f));
+
+        List<int> posOctant = tree.QueryBox(new Aabb3D(15.0f, 15.0f, 15.0f, 30.0f, 30.0f, 30.0f));
+        float hitDist1 = -1.0f;
+        int hit1 = tree.RaycastNearest(new Vector3(0.0f, 0.0f, -20.0f), new Vector3(0.0f, 0.0f, 1.0f), 100.0f, out hitDist1);
+
+        // 将实体 1 移离射线路径，再发射同一射线应命中后面的实体 2
+        tree.Update(1, Aabb3D.FromCenterHalfExtents(new Vector3(15.0f, 0.0f, -5.0f), 1.0f, 1.0f, 1.0f));
+        float hitDist2 = -1.0f;
+        int hit2 = tree.RaycastNearest(new Vector3(0.0f, 0.0f, -20.0f), new Vector3(0.0f, 0.0f, 1.0f), 100.0f, out hitDist2);
+        bool removed = tree.Remove(6);
+
+        bool octreeOk = tree.NodeCount() >= 9
+            && posOctant.Count == 2
+            && hit1 == 1 && hitDist1 > 13.5f && hitDist1 < 14.5f
+            && hit2 == 2 && hitDist2 > 28.0f && hitDist2 < 29.0f
+            && removed && tree.Count() == 5;
+        Console.WriteLine("octree-index-3d: " + Convert.ToString(octreeOk ? 1 : 0));
+    }
+}
