@@ -1,0 +1,152 @@
+using System;
+
+namespace System.Windows;
+
+// 跨平台桌面伴侣目标操作系统族（零 Win32 硬编码）。
+public enum DesktopOsFamily {
+    Windows = 0,
+    MacOS = 1,
+    Linux = 2,
+    HarmonyOS = 3,
+    Unknown = 4
+}
+
+// 统一跨平台桌面伴侣 OS 能力描述档案：
+// 屏蔽 Windows / macOS / Linux / OpenHarmony 在主修饰键、托盘交互、自启动机制、
+// 顶部菜单栏/底部任务栏安全边距与配置根目录上的差异。
+public class CompanionOsCapabilityProfile {
+    public DesktopOsFamily OsFamily;
+    public string PrimaryModifierKey;
+    public string TrayActivationMode;
+    public string AutostartBackend;
+    public string ConfigRootConvention;
+    public int TopBarInsetLogicalPx;
+    public int BottomBarInsetLogicalPx;
+    public int MaxToastTitleChars;
+    public int MaxToastActions;
+
+    public CompanionOsCapabilityProfile(DesktopOsFamily osFamily, string primaryModifierKey,
+    string trayActivationMode, string autostartBackend, string configRootConvention,
+    int topBarInset, int bottomBarInset, int maxToastTitleChars, int maxToastActions) {
+        this.OsFamily = osFamily;
+        this.PrimaryModifierKey = primaryModifierKey;
+        this.TrayActivationMode = trayActivationMode;
+        this.AutostartBackend = autostartBackend;
+        this.ConfigRootConvention = configRootConvention;
+        this.TopBarInsetLogicalPx = topBarInset;
+        this.BottomBarInsetLogicalPx = bottomBarInset;
+        this.MaxToastTitleChars = maxToastTitleChars;
+        this.MaxToastActions = maxToastActions;
+    }
+
+    public static DesktopOsFamily DetectCurrentOs() {
+        if (OperatingSystem.IsOhos()) { return DesktopOsFamily.HarmonyOS; }
+        if (OperatingSystem.IsMacOS()) { return DesktopOsFamily.MacOS; }
+        if (OperatingSystem.IsWindows()) { return DesktopOsFamily.Windows; }
+        if (OperatingSystem.IsLinux()) { return DesktopOsFamily.Linux; }
+        return DesktopOsFamily.Unknown;
+    }
+
+    public static CompanionOsCapabilityProfile ForOs(DesktopOsFamily os) {
+        if (os == DesktopOsFamily.MacOS) {
+            return new CompanionOsCapabilityProfile(os, "Cmd", "MenuBarPopover",
+                "LaunchAgentPlist", "~/Library/Application Support", 24, 64, 48, 2);
+        }
+        if (os == DesktopOsFamily.Linux) {
+            return new CompanionOsCapabilityProfile(os, "Ctrl", "StatusNotifierItem",
+                "XdgAutostartDesktop", "$XDG_CONFIG_HOME", 28, 0, 64, 3);
+        }
+        if (os == DesktopOsFamily.HarmonyOS) {
+            return new CompanionOsCapabilityProfile(os, "Ctrl", "DockBadgeCard",
+                "OhosAbilityKeepAlive", "/data/storage/el2/base/files", 36, 48, 40, 2);
+        }
+        return new CompanionOsCapabilityProfile(DesktopOsFamily.Windows, "Ctrl", "TrayLeftClick",
+            "RegistryRun", "%APPDATA%", 0, 48, 64, 3);
+    }
+
+    public string FormatShortcutLabel(string keyToken) {
+        string k = keyToken == null ? "" : keyToken;
+        return this.PrimaryModifierKey + "+" + k;
+    }
+}
+
+// 跨平台高分屏（HiDPI / Retina / Wayland 分数缩放）坐标与安全工作区钳位器。
+public class CompanionHiDpiCoordNormalizer {
+    private float scaleFactor;
+    private int screenLogicalWidth;
+    private int screenLogicalHeight;
+    private int topInset;
+    private int bottomInset;
+
+    public CompanionHiDpiCoordNormalizer(float scaleFactor, int screenLogicalWidth,
+    int screenLogicalHeight, CompanionOsCapabilityProfile osProfile) {
+        this.scaleFactor = scaleFactor < 0.75f ? 1.0f : (scaleFactor > 4.0f ? 4.0f : scaleFactor);
+        this.screenLogicalWidth = screenLogicalWidth < 320 ? 320 : screenLogicalWidth;
+        this.screenLogicalHeight = screenLogicalHeight < 240 ? 240 : screenLogicalHeight;
+        this.topInset = osProfile == null ? 0 : osProfile.TopBarInsetLogicalPx;
+        this.bottomInset = osProfile == null ? 0 : osProfile.BottomBarInsetLogicalPx;
+    }
+
+    public int LogicalToPhysical(int logicalPx) {
+        return (int)((float)logicalPx * this.scaleFactor + (logicalPx >= 0 ? 0.5f : -0.5f));
+    }
+
+    public int PhysicalToLogical(int physicalPx) {
+        return (int)((float)physicalPx / this.scaleFactor + (physicalPx >= 0 ? 0.5f : -0.5f));
+    }
+
+    // 将桌面宠物/挂件窗口逻辑坐标钳位至各平台可见工作区（避开顶部菜单栏与底部任务栏/Dock）。
+    public void ClampWidgetPosition(int x, int y, int widgetW, int widgetH,
+    out int clampedX, out int clampedY) {
+        int maxX = this.screenLogicalWidth - widgetW;
+        if (maxX < 0) { maxX = 0; }
+        int minY = this.topInset;
+        int maxY = this.screenLogicalHeight - this.bottomInset - widgetH;
+        if (maxY < minY) { maxY = minY; }
+        int rx = x < 0 ? 0 : (x > maxX ? maxX : x);
+        int ry = y < minY ? minY : (y > maxY ? maxY : y);
+        clampedX = rx;
+        clampedY = ry;
+    }
+}
+
+// 跨平台桌面伴侣通知降级与静默路由器：
+// 按目标 OS 的标题长度上限与操作按钮上限自动裁剪降级，并统一处理免打扰静默。
+public class CompanionPlatformNotificationRouter {
+    private CompanionOsCapabilityProfile profile;
+    public bool DoNotDisturb;
+    public int DispatchedCount;
+    public int SuppressedCount;
+    public string LastFormattedTitle;
+    public int LastActionCount;
+
+    public CompanionPlatformNotificationRouter(CompanionOsCapabilityProfile profile) {
+        this.profile = profile == null ? CompanionOsCapabilityProfile.ForOs(DesktopOsFamily.Windows) : profile;
+        this.DoNotDisturb = false;
+        this.DispatchedCount = 0;
+        this.SuppressedCount = 0;
+        this.LastFormattedTitle = "";
+        this.LastActionCount = 0;
+    }
+
+    public bool TryDispatch(string title, int requestedActions, bool bypassDnd) {
+        if (this.DoNotDisturb && !bypassDnd) {
+            this.SuppressedCount = this.SuppressedCount + 1;
+            return false;
+        }
+        string raw = title == null ? "" : title;
+        int maxChars = this.profile.MaxToastTitleChars;
+        if (raw.Length > maxChars && maxChars > 3) {
+            this.LastFormattedTitle = raw.Substring(0, maxChars - 3) + "...";
+        } else {
+            this.LastFormattedTitle = raw;
+        }
+        int acts = requestedActions < 0 ? 0 : requestedActions;
+        if (acts > this.profile.MaxToastActions) {
+            acts = this.profile.MaxToastActions;
+        }
+        this.LastActionCount = acts;
+        this.DispatchedCount = this.DispatchedCount + 1;
+        return true;
+    }
+}

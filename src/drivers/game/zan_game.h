@@ -402,6 +402,17 @@ ZAN_GAME_API void zan_game_set_crosshatch_ink3d(int32_t enabled, float density,
 ZAN_GAME_API void zan_game_set_post_scope_edge_blur3d(float strength,
     float clear_radius);
 
+/* GPU 3D 跨平台各向异性拉丝金属与微纹理高光（Anisotropic Brushed Metal，GLSL 330/GLES 3.00 统一）：
+ * enabled != 0 时沿表面切线方向生成拉丝沟槽与 Kajiya-Kay 各向异性高光带。 */
+ZAN_GAME_API void zan_game_set_aniso_brushed3d(int32_t enabled,
+    float grain_freq, float anisotropy, float strength,
+    float r, float g, float b);
+
+/* GPU 后处理跨平台无障碍色盲校正滤镜（LMS Daltonization，GLSL 330/GLES 3.00 统一）：
+ * mode: 0=关, 1=Protanopia(红色盲), 2=Deuteranopia(绿色盲), 3=Tritanopia(蓝色盲)；
+ * strength [0..1] 控制校正混合强度（中性灰保持无偏色）。 */
+ZAN_GAME_API void zan_game_set_post_daltonize3d(float mode, float strength);
+
 #ifdef __cplusplus
 }
 #endif

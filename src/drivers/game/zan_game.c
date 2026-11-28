@@ -164,6 +164,7 @@ typedef struct {
     zgl_int u_heat_haze_params, u_heat_haze_color;
     zgl_int u_pixel_dither_params;
     zgl_int u_crosshatch_params, u_crosshatch_color;
+    zgl_int u_aniso_brushed_params, u_aniso_brushed_color;
     zgl_int u_light_dir, u_light_color, u_light_count, u_ambient;
     zgl_int u_cam_pos, u_cam_valid, u_material, u_emissive;
     zgl_int u_point_pos, u_point_color, u_point_count;
@@ -271,6 +272,8 @@ static float g_game_heat_haze_color[3] = { 1.0f, 0.55f, 0.18f };
 static float g_game_pixel_dither_params[3] = { 0.0f, 1.0f, 1.0f }; /* enabled, opacity, pixel_scale */
 static float g_game_crosshatch_params[3] = { 0.0f, 8.0f, 0.0f }; /* enabled, density, ink_strength */
 static float g_game_crosshatch_color[3] = { 0.05f, 0.05f, 0.08f };
+static float g_game_aniso_brushed_params[4] = { 0.0f, 12.0f, 16.0f, 0.0f }; /* enabled, grain_freq, anisotropy, strength */
+static float g_game_aniso_brushed_color[3] = { 0.85f, 0.90f, 1.0f };
 static float g_game_color_grade[2] = { 1.0f, 1.0f }; /* saturation, contrast */
 static float g_game_color_tint[3] = { 1.0f, 1.0f, 1.0f };
 static float g_game_post_lens[2] = { 0.0f, 0.0f }; /* fxaa, chromatic */
@@ -300,6 +303,7 @@ static float g_game_post_split_shadow[3] = { 0.05f, 0.35f, 0.95f };
 static float g_game_post_split_high[3] = { 1.0f, 0.58f, 0.15f };
 static float g_game_post_oil_paint[2] = { 0.0f, 2.0f }; /* strength, radius */
 static float g_game_post_scope_blur[2] = { 0.0f, 0.45f }; /* strength, clear_radius */
+static float g_game_post_daltonize[2] = { 0.0f, 0.0f }; /* mode (0..3), strength (0..1) */
 static uint32_t g_game_light_version = 1;
 
 static zan_game_mesh *g_game_meshes = NULL;
@@ -623,6 +627,8 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
 "uniform vec3 uPixelDitherParams;\n" \
 "uniform vec3 uCrosshatchParams;\n" \
 "uniform vec3 uCrosshatchColor;\n" \
+"uniform vec4 uAnisoBrushedParams;\n" \
+"uniform vec3 uAnisoBrushedColor;\n" \
 "uniform vec3 uCamPos;\n" \
 "uniform int uCamValid;\n" \
 "uniform vec2 uMaterial;\n" \
@@ -940,6 +946,18 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
     "        if (chLum < 0.35) { chInk = max(chInk, smoothstep(0.18, 0.06, chD2)); }\n" \
     "        rgb = mix(rgb, uCrosshatchColor, chInk * clamp(uCrosshatchParams.z, 0.0, 1.0));\n" \
     "    }\n" \
+    "    if (uAnisoBrushedParams.x > 0.5 && uAnisoBrushedParams.w > 0.0005) {\n" \
+    "        vec3 abRef = (abs(N.y) < 0.92) ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);\n" \
+    "        vec3 abT = normalize(cross(abRef, N));\n" \
+    "        vec3 abB = cross(N, abT);\n" \
+    "        float abCoord = dot(v_world_pos, abB) * max(uAnisoBrushedParams.y, 1.0);\n" \
+    "        float abGroove = 0.5 + 0.5 * sin(abCoord * 6.2831853);\n" \
+    "        vec3 abH = (uCamValid != 0 && uLightCount > 0) ? normalize(normalize(-uLightDir[0]) + V) : normalize(N + vec3(0.25, 0.45, 0.85));\n" \
+    "        float abTdH = dot(abT, abH);\n" \
+    "        float abSinTH = sqrt(max(1.0 - abTdH * abTdH, 0.0));\n" \
+    "        float abSpec = pow(abSinTH, clamp(uAnisoBrushedParams.z, 2.0, 64.0));\n" \
+    "        rgb += uAnisoBrushedColor * ((0.25 + 0.75 * abGroove) * (0.35 + 0.65 * abSpec) * clamp(uAnisoBrushedParams.w, 0.0, 3.0));\n" \
+    "    }\n" \
     "    if (uCamValid != 0) {\n" \
     "        float ndv = clamp(dot(N, V), 0.0, 1.0);\n" \
     "        if (uXrayParams.x > 0.5 && uXrayParams.z > 0.0005) {\n" \
@@ -1099,6 +1117,7 @@ static const char *const ZAN_GAME_POST_FS =
 "uniform vec3 uPostSplitHigh;\n"
 "uniform vec2 uPostOilPaint;\n"
 "uniform vec2 uPostScopeBlur;\n"
+"uniform vec2 uPostDaltonize;\n"
 "in vec2 v_uv;\n"
 "out vec4 frag;\n"
 "vec3 brightPass(vec3 c, float th) {\n"
@@ -1406,6 +1425,29 @@ static const char *const ZAN_GAME_POST_FS =
     "            col = vec3(0.0);\n"
     "        }\n"
     "    }\n"
+    "    if (uPostDaltonize.x > 0.5 && uPostDaltonize.y > 0.0005) {\n"
+    "        vec3 dCol = clamp(col, 0.0, 1.0);\n"
+    "        float dL = 17.8824 * dCol.r + 43.5161 * dCol.g + 4.11935 * dCol.b;\n"
+    "        float dM = 3.45565 * dCol.r + 27.1554 * dCol.g + 3.86714 * dCol.b;\n"
+    "        float dS = 0.0299566 * dCol.r + 0.184309 * dCol.g + 1.46709 * dCol.b;\n"
+    "        float sL = dL;\n"
+    "        float sM = dM;\n"
+    "        float sS = dS;\n"
+    "        if (uPostDaltonize.x < 1.5) {\n"
+    "            sL = 2.02344 * dM - 2.52581 * dS;\n"
+    "        } else if (uPostDaltonize.x < 2.5) {\n"
+    "            sM = 0.494207 * dL + 1.24827 * dS;\n"
+    "        } else {\n"
+    "            sS = -0.395913 * dL + 0.801109 * dM;\n"
+    "        }\n"
+    "        vec3 simRgb;\n"
+    "        simRgb.r = 0.0809444 * sL - 0.130504 * sM + 0.116721 * sS;\n"
+    "        simRgb.g = -0.0102485 * sL + 0.0540193 * sM - 0.113615 * sS;\n"
+    "        simRgb.b = -0.000365297 * sL - 0.00412161 * sM + 0.693511 * sS;\n"
+    "        vec3 dErr = dCol - simRgb;\n"
+    "        vec3 dShift = vec3(0.0, 0.7 * dErr.r + dErr.g, 0.7 * dErr.r + dErr.b);\n"
+    "        col = mix(dCol, clamp(dCol + dShift, 0.0, 1.0), clamp(uPostDaltonize.y, 0.0, 1.0));\n"
+    "    }\n"
     "    frag = vec4(clamp(col, 0.0, 1.0), src.a);\n"
 "}\n";
 
@@ -1446,6 +1488,7 @@ typedef struct {
     zgl_int u_post_split_high;
     zgl_int u_post_oil_paint;
     zgl_int u_post_scope_blur;
+    zgl_int u_post_daltonize;
 } zan_game_post_program;
 
 static const char *const ZAN_GAME_SKYBOX_FS =
@@ -1751,6 +1794,10 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
         : g_game_gl->GetUniformLocation(program, "uCrosshatchParams");
     zgl_int crosshatch_color = instanced ? -1
         : g_game_gl->GetUniformLocation(program, "uCrosshatchColor");
+    zgl_int aniso_brushed_params = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uAnisoBrushedParams");
+    zgl_int aniso_brushed_color = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uAnisoBrushedColor");
     zgl_int color = instanced ? 0
         : g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
@@ -1854,6 +1901,8 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
     prog->u_pixel_dither_params = pixel_dither_params;
     prog->u_crosshatch_params = crosshatch_params;
     prog->u_crosshatch_color = crosshatch_color;
+    prog->u_aniso_brushed_params = aniso_brushed_params;
+    prog->u_aniso_brushed_color = aniso_brushed_color;
     prog->u_color = color;
     prog->u_light_dir = light_dir;
     prog->u_light_color = light_color;
@@ -1954,6 +2003,8 @@ static zan_game_program *zan_game_skin_program_get(void) {
     zgl_int pixel_dither_params = g_game_gl->GetUniformLocation(program, "uPixelDitherParams");
     zgl_int crosshatch_params = g_game_gl->GetUniformLocation(program, "uCrosshatchParams");
     zgl_int crosshatch_color = g_game_gl->GetUniformLocation(program, "uCrosshatchColor");
+    zgl_int aniso_brushed_params = g_game_gl->GetUniformLocation(program, "uAnisoBrushedParams");
+    zgl_int aniso_brushed_color = g_game_gl->GetUniformLocation(program, "uAnisoBrushedColor");
     zgl_int color = g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
     zgl_int light_color = g_game_gl->GetUniformLocation(program, "uLightColor[0]");
@@ -2045,6 +2096,8 @@ static zan_game_program *zan_game_skin_program_get(void) {
     g_game_skin_prog.u_pixel_dither_params = pixel_dither_params;
     g_game_skin_prog.u_crosshatch_params = crosshatch_params;
     g_game_skin_prog.u_crosshatch_color = crosshatch_color;
+    g_game_skin_prog.u_aniso_brushed_params = aniso_brushed_params;
+    g_game_skin_prog.u_aniso_brushed_color = aniso_brushed_color;
     g_game_skin_prog.u_color = color;
     g_game_skin_prog.u_light_dir = light_dir;
     g_game_skin_prog.u_light_color = light_color;
@@ -2630,6 +2683,14 @@ static void zan_game_bind_shadow_uniforms(const zan_gl_api *gl, zan_game_program
     }
     if (prog->u_crosshatch_color >= 0) {
         gl->Uniform3fv(prog->u_crosshatch_color, 1, g_game_crosshatch_color);
+    }
+    if (prog->u_aniso_brushed_params >= 0) {
+        gl->Uniform4f(prog->u_aniso_brushed_params,
+            g_game_aniso_brushed_params[0], g_game_aniso_brushed_params[1],
+            g_game_aniso_brushed_params[2], g_game_aniso_brushed_params[3]);
+    }
+    if (prog->u_aniso_brushed_color >= 0) {
+        gl->Uniform3fv(prog->u_aniso_brushed_color, 1, g_game_aniso_brushed_color);
     }
 }
 
@@ -3227,6 +3288,7 @@ static zan_game_post_program *zan_game_post_program_get(void) {
     g_game_post_prog.u_post_split_high = g_game_gl->GetUniformLocation(prog, "uPostSplitHigh");
     g_game_post_prog.u_post_oil_paint = g_game_gl->GetUniformLocation(prog, "uPostOilPaint");
     g_game_post_prog.u_post_scope_blur = g_game_gl->GetUniformLocation(prog, "uPostScopeBlur");
+    g_game_post_prog.u_post_daltonize = g_game_gl->GetUniformLocation(prog, "uPostDaltonize");
     return &g_game_post_prog;
 }
 
@@ -3422,6 +3484,10 @@ ZAN_GAME_API int32_t zan_game_postprocess3d(int32_t surface_id, float exposure,
     if (prog->u_post_scope_blur >= 0) {
         gl->Uniform2f(prog->u_post_scope_blur,
             g_game_post_scope_blur[0], g_game_post_scope_blur[1]);
+    }
+    if (prog->u_post_daltonize >= 0) {
+        gl->Uniform2f(prog->u_post_daltonize,
+            g_game_post_daltonize[0], g_game_post_daltonize[1]);
     }
     gl->BindVertexArray(g_game_post_vao);
     gl->DrawArrays(ZGL_TRIANGLES, 0, 3);
@@ -4167,3 +4233,29 @@ ZAN_GAME_API void zan_game_set_post_scope_edge_blur3d(float strength,
     g_game_post_scope_blur[0] = strength;
     g_game_post_scope_blur[1] = clear_radius;
 }
+
+ZAN_GAME_API void zan_game_set_aniso_brushed3d(int32_t enabled,
+    float grain_freq, float anisotropy, float strength,
+    float r, float g, float b) {
+    g_game_aniso_brushed_params[0] = enabled ? 1.0f : 0.0f;
+    g_game_aniso_brushed_params[1] = grain_freq > 1.0f ? grain_freq : 12.0f;
+    if (anisotropy < 2.0f) anisotropy = 2.0f;
+    if (anisotropy > 64.0f) anisotropy = 64.0f;
+    g_game_aniso_brushed_params[2] = anisotropy;
+    if (strength < 0.0f) strength = 0.0f;
+    if (strength > 3.0f) strength = 3.0f;
+    g_game_aniso_brushed_params[3] = strength;
+    g_game_aniso_brushed_color[0] = r > 0.0f ? r : 0.0f;
+    g_game_aniso_brushed_color[1] = g > 0.0f ? g : 0.0f;
+    g_game_aniso_brushed_color[2] = b > 0.0f ? b : 0.0f;
+}
+
+ZAN_GAME_API void zan_game_set_post_daltonize3d(float mode, float strength) {
+    if (mode < 0.0f) mode = 0.0f;
+    if (mode > 3.0f) mode = 3.0f;
+    if (strength < 0.0f) strength = 0.0f;
+    if (strength > 1.0f) strength = 1.0f;
+    g_game_post_daltonize[0] = mode;
+    g_game_post_daltonize[1] = strength;
+}
+
