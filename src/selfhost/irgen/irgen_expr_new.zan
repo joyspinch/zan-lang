@@ -371,8 +371,19 @@ partial class Irgen {
                 if (eaActive) { EnterCallArm(); }
             }
             if (e.ival == 2) {
-                // collection initializer: append each item
+                // `new List<T>(...) { ... }`: kids[0..e.op-1] are paren ctor
+                // args (copy source List/array or capacity hint), and
+                // kids[e.op..] are brace collection initializer items.
                 int j = 0;
+                if (e.op > 0) {
+                    if (e.op == 1) {
+                        ExprVal sv0 = GenExpr(e.kids[0]);
+                        CopyListSourceIfSeq(t, ty, sv0);
+                    } else {
+                        while (j < e.op) { GenExpr(e.kids[j]); j = j + 1; }
+                    }
+                    j = e.op;
+                }
                 while (j < e.kids.Count) {
                     ExprVal iv = GenExpr(e.kids[j]);
                     string sv = StructElemSlot(iv, ListElem(ty));
@@ -385,52 +396,8 @@ partial class Irgen {
                 // a 1D array argument copies each element into the new list,
                 // and any other argument is a single-item collection initializer.
                 ExprVal sv = GenExpr(e.kids[0]);
-                Node le = ListElem(ty);
-                if (IsListType(sv.ty)) {
-                    L("  call void @zlist_copy(i8* " + t + ", i8* " + sv.op + ")");
-                }
-                else if (sv.ty != null && sv.ty.ival >= 1 && ArrRankOf(sv.ty) == 1
-                         && (le == null || sv.ty.ival == le.ival + 1)) {
-                    Node arrElem = ArrElemOf(sv.ty);
-                    if (arrElem == null) { arrElem = le != null ? le : MkType("int"); }
-                    string astorage = ArrayStorage(arrElem);
-                    string isn = NT();
-                    L("  " + isn + " = icmp eq i64* " + sv.op + ", null");
-                    int lskip = NL(); int linit = NL(); int lcond = NL(); int lbody = NL();
-                    L("  br i1 " + isn + ", label %L" + lskip + ", label %L" + linit);
-                    Label(linit);
-                    string alen = NT();
-                    L("  " + alen + " = call i64 @zarr_len(i64* " + sv.op + ")");
-                    string aidx = NT();
-                    EA(aidx, "i64");
-                    L("  store i64 0, i64* " + aidx);
-                    L("  br label %L" + lcond);
-                    Label(lcond);
-                    string curi = NT();
-                    L("  " + curi + " = load i64, i64* " + aidx);
-                    string more = NT();
-                    L("  " + more + " = icmp slt i64 " + curi + ", " + alen);
-                    L("  br i1 " + more + ", label %L" + lbody + ", label %L" + lskip);
-                    Label(lbody);
-                    List<string> svT = stmtTemps; List<string> svTV = stmtTempValues;
-                    List<string> svTO = stmtTempOwners; List<Node> svTT = stmtTempTypes;
-                    stmtTemps = new List<string>(); stmtTempValues = new List<string>();
-                    stmtTempOwners = new List<string>(); stmtTempTypes = new List<Node>();
-                    string aplace = ArrayPlace(sv.op, curi, astorage);
-                    ExprVal aval = LoadArrayElement(aplace, arrElem, astorage);
-                    string aslot = StructElemSlot(aval, le);
-                    L("  call void @zlist_add(i8* " + t + ", i64 " + aslot + ")");
-                    EmitTempReleases();
-                    stmtTemps = svT; stmtTempValues = svTV;
-                    stmtTempOwners = svTO; stmtTempTypes = svTT;
-                    string nexti = NT();
-                    L("  " + nexti + " = add i64 " + curi + ", 1");
-                    L("  store i64 " + nexti + ", i64* " + aidx);
-                    L("  br label %L" + lcond);
-                    Label(lskip);
-                }
-                else {
-                    string ss = StructElemSlot(sv, le);
+                if (!CopyListSourceIfSeq(t, ty, sv)) {
+                    string ss = StructElemSlot(sv, ListElem(ty));
                     L("  call void @zlist_add(i8* " + t + ", i64 " + ss + ")");
                 }
             }
@@ -459,8 +426,12 @@ partial class Irgen {
             if (e.ival == 2) {
                 string dictGuard = ArmGuardSlot(t, ty, "i8*");
                 if (eaActive) { EnterCallArm(); }
-                // collection initializer: each item is a key/value pair.
+                // collection initializer: skip any paren ctor args (e.g. capacity)
+                // after evaluating them, then insert each brace key/value pair.
                 int j = 0;
+                if (e.op > 0) {
+                    while (j < e.op) { GenExpr(e.kids[j]); j = j + 1; }
+                }
                 while (j < e.kids.Count) {
                     Node item = e.kids[j];
                     if (item.kids.Count >= 2) {
@@ -547,7 +518,7 @@ partial class Irgen {
         // fill omitted trailing args). When no constructor matches, the
         // instance field initializers run at the allocation site -- that is
         // what the implicit parameterless constructor of the C host does.
-        if (e.ival == 2) {
+        if (e.ival == 2 && e.op == 0) {
             Node pctor = binder.FindCtorArity(cls, 0);
             if (pctor != null) {
                 L("  call void @" + CtorSym(cn, pctor) + "(%" + cn + "* " + obj + ")");
@@ -560,9 +531,10 @@ partial class Irgen {
             }
         }
         else {
-            Node ctor = ResolveCtor(cls, e);
+            Node ctorCall = e.ival == 2 ? SliceNewCtorArgs(e) : e;
+            Node ctor = ResolveCtor(cls, ctorCall);
             if (ctor != null) {
-                List<Node> cargs = OrderArgs(ctor, e);
+                List<Node> cargs = OrderArgs(ctor, ctorCall);
                 // A generic class's constructor sees the CONCRETE type
                 // arguments: a delegate-typed parameter (`LabelOf<T>`) must
                 // carry them, or the lambda handed in gets an erased
@@ -605,7 +577,7 @@ partial class Irgen {
                 L("  call void @" + ctorSym + "(" + args + ")");
             }
             else {
-                int argc = e.kids.Count;
+                int argc = ctorCall.kids.Count;
                 // The C host's checker accepts the call when a constructor's
                 // arity range covers the arguments; its code generator matches
                 // the parameter count exactly. A `params` array is the one
@@ -689,12 +661,78 @@ partial class Irgen {
         return new ExprVal(obj, ty);
     }
 
+    // Copy a `List<T>` or 1D `T[]` source into a newly allocated list `t`.
+    // Returns true when `sv` was a sequence source and copied.
+    bool CopyListSourceIfSeq(string t, Node ty, ExprVal sv) {
+        Node le = ListElem(ty);
+        if (IsListType(sv.ty)) {
+            L("  call void @zlist_copy(i8* " + t + ", i8* " + sv.op + ")");
+            return true;
+        }
+        if (sv.ty != null && sv.ty.ival >= 1 && ArrRankOf(sv.ty) == 1
+            && (le == null || sv.ty.ival == le.ival + 1)) {
+            Node arrElem = ArrElemOf(sv.ty);
+            if (arrElem == null) { arrElem = le != null ? le : MkType("int"); }
+            string astorage = ArrayStorage(arrElem);
+            string isn = NT();
+            L("  " + isn + " = icmp eq i64* " + sv.op + ", null");
+            int lskip = NL(); int linit = NL(); int lcond = NL(); int lbody = NL();
+            L("  br i1 " + isn + ", label %L" + lskip + ", label %L" + linit);
+            Label(linit);
+            string alen = NT();
+            L("  " + alen + " = call i64 @zarr_len(i64* " + sv.op + ")");
+            string aidx = NT();
+            EA(aidx, "i64");
+            L("  store i64 0, i64* " + aidx);
+            L("  br label %L" + lcond);
+            Label(lcond);
+            string curi = NT();
+            L("  " + curi + " = load i64, i64* " + aidx);
+            string more = NT();
+            L("  " + more + " = icmp slt i64 " + curi + ", " + alen);
+            L("  br i1 " + more + ", label %L" + lbody + ", label %L" + lskip);
+            Label(lbody);
+            List<string> svT = stmtTemps; List<string> svTV = stmtTempValues;
+            List<string> svTO = stmtTempOwners; List<Node> svTT = stmtTempTypes;
+            stmtTemps = new List<string>(); stmtTempValues = new List<string>();
+            stmtTempOwners = new List<string>(); stmtTempTypes = new List<Node>();
+            string aplace = ArrayPlace(sv.op, curi, astorage);
+            ExprVal aval = LoadArrayElement(aplace, arrElem, astorage);
+            string aslot = StructElemSlot(aval, le);
+            L("  call void @zlist_add(i8* " + t + ", i64 " + aslot + ")");
+            EmitTempReleases();
+            stmtTemps = svT; stmtTempValues = svTV;
+            stmtTempOwners = svTO; stmtTempTypes = svTT;
+            string nexti = NT();
+            L("  " + nexti + " = add i64 " + curi + ", 1");
+            L("  store i64 " + nexti + ", i64* " + aidx);
+            L("  br label %L" + lcond);
+            Label(lskip);
+            return true;
+        }
+        return false;
+    }
+
+    // Extract the leading `e.op` constructor arguments of `new T(args) { ... }`.
+    Node SliceNewCtorArgs(Node e) {
+        Node c = new Node(AK.NewExpr());
+        c.type = e.type;
+        c.line = e.line;
+        c.col = e.col;
+        int i = 0;
+        while (i < e.op && i < e.kids.Count) {
+            c.Add(e.kids[i]);
+            i = i + 1;
+        }
+        return c;
+    }
+
     // The `{ Field = value, Coll = { items } }` items of an initializer,
     // applied to the object `obj` (type `ty`, class `cls` named `cn`) --
     // shared by `new T { ... }` and the factory continuation
     // `T.Make() { ... }` (CallInit).
     void ApplyObjInit(Node e, string obj, Node ty, Node cls, string cn) {
-        int j = 0;
+        int j = (e.kind == AK.NewExpr() && e.ival == 2 && e.op > 0) ? e.op : 0;
         while (j < e.kids.Count) {
             Node it = e.kids[j];
             if (it.kind == AK.Assignment() && it.a != null

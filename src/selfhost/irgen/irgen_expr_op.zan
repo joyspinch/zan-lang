@@ -788,6 +788,12 @@ partial class Irgen {
             string r = NT(); L("  " + r + " = select i1 " + c + ", i8* " + ts.op + ", i8* " + fs.op);
             return r;
         }
+        // Guard pointer types (class/struct/array/list/dict/delegate/object):
+        // never emit `call i8* @zstr_from_i64(i64 <ptr>)` which is invalid IR.
+        string vlt = v.ty != null ? MapType(v.ty) : "i64";
+        if (IsPtrLL(vlt)) {
+            return GenStr("").op;
+        }
         // integer -> string (unsigned base-10 for ulong, signed base-10 otherwise)
         string rendered = NT();
         if (IsUlong(v.ty)) {
@@ -799,6 +805,19 @@ partial class Irgen {
         }
         OwnedString(rendered);
         return rendered;
+    }
+
+    // Returns the non-concatable type name if `v` cannot participate in string
+    // concatenation/interpolation (mirrors C host E2040 / type_is_concatable),
+    // or "" when allowed.
+    string StringConcatBadType(ExprVal v) {
+        if (v == null || v.op == "null" || v.ty == null) { return ""; }
+        if (IsStr(v.ty) || IsNullableValue(v.ty) || IsDecimal(v.ty)) { return ""; }
+        if (v.ty.sval == "TypeInfo" || v.ty.sval == "StringView") { return ""; }
+        if (IsPtrLL(MapType(v.ty))) {
+            return v.ty.ival >= 1 ? (v.ty.sval + "[]") : v.ty.sval;
+        }
+        return "";
     }
 
     // wrap a plain C string (a number formatted by snprintf, a file read, a
@@ -1259,7 +1278,15 @@ partial class Irgen {
         int i = 0;
         while (i < parts.Count) {
             ExprVal v = GenExpr(parts[i]);
-            vals.Add(multi ? ToCatStr(v) : ToCStr(v));
+            string bad = StringConcatBadType(v);
+            if (bad != "") {
+                diags.Error("[E2040] cannot concatenate 'string' and '" + bad
+                    + "' -- convert the operand explicitly (e.g. call .ToString()/read the field) instead of concatenating the reference",
+                    parts[i].line, parts[i].col);
+                vals.Add(GenStr("").op);
+            } else {
+                vals.Add(multi ? ToCatStr(v) : ToCStr(v));
+            }
             i = i + 1;
         }
         LeaveCallArm();

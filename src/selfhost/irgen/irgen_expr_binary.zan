@@ -203,10 +203,89 @@ partial class Irgen {
             CollectConcat(e, parts);
             if (parts.Count > 2) { return StrConcatN(parts); }
         }
-        EnterCallArm();
+        bool arm = eaActive;
+        if (arm) { EnterCallArm(); }
+        ExprVal res = GenBinaryEager(e, op);
+        if (arm) { LeaveCallArm(); }
+        return res;
+    }
+
+    ExprVal GenBinaryNullableArith(Node e, int op, ExprVal a, ExprVal b) {
+        bool ln = IsNullableValue(a.ty);
+        bool rn = IsNullableValue(b.ty);
+        Node resTy = ln ? a.ty : b.ty;
+        if (ln && rn && UnderLL(b.ty) == "double") {
+            resTy = b.ty;
+        } else if ((!ln && IsDbl(a.ty)) || (!rn && IsDbl(b.ty))) {
+            resTy = MkType("double"); resTy.op = 1;
+        }
+        int lnull = NL(); int lval = NL(); int ldone = NL();
+        string anyNull = "";
+        if (ln && rn) {
+            string aisn = NT();
+            L("  " + aisn + " = icmp eq i8* " + a.op + ", null");
+            string bisn = NT();
+            L("  " + bisn + " = icmp eq i8* " + b.op + ", null");
+            anyNull = NT();
+            L("  " + anyNull + " = or i1 " + aisn + ", " + bisn);
+        } else if (ln) {
+            anyNull = NT();
+            L("  " + anyNull + " = icmp eq i8* " + a.op + ", null");
+        } else {
+            anyNull = NT();
+            L("  " + anyNull + " = icmp eq i8* " + b.op + ", null");
+        }
+        L("  br i1 " + anyNull + ", label %L" + lnull + ", label %L" + lval);
+        Label(lnull);
+        L("  br label %L" + ldone);
+        string nullLbl = curLbl;
+        Label(lval);
+        string ault = UnderLL(resTy);
+        string av = "";
+        if (ln) {
+            string aul = UnderLL(a.ty);
+            string ap = NT();
+            L("  " + ap + " = bitcast i8* " + a.op + " to " + aul + "*");
+            string al = NT();
+            L("  " + al + " = load " + aul + ", " + aul + "* " + ap);
+            av = Coerce(new ExprVal(al, MkType(a.ty.sval)), ault);
+        } else {
+            av = Coerce(a, ault);
+        }
+        string bv = "";
+        if (rn) {
+            string bul = UnderLL(b.ty);
+            string bp = NT();
+            L("  " + bp + " = bitcast i8* " + b.op + " to " + bul + "*");
+            string bl = NT();
+            L("  " + bl + " = load " + bul + ", " + bul + "* " + bp);
+            bv = Coerce(new ExprVal(bl, MkType(b.ty.sval)), ault);
+        } else {
+            bv = Coerce(b, ault);
+        }
+        bool isF = ault == "double";
+        string opn2 = "add";
+        if (op == TK.Minus()) { opn2 = isF ? "fsub" : "sub"; }
+        else if (op == TK.Star()) { opn2 = isF ? "fmul" : "mul"; }
+        else if (op == TK.Slash()) { opn2 = isF ? "fdiv" : "sdiv"; }
+        else if (op == TK.Percent()) { opn2 = isF ? "frem" : "srem"; }
+        else { opn2 = isF ? "fadd" : "add"; }
+        string rv = NT();
+        L("  " + rv + " = " + opn2 + " " + ault + " " + av + ", " + bv);
+        ExprVal rvx = new ExprVal(rv, MkType(resTy.sval));
+        string rbox = BoxVal(rvx, resTy);
+        string valLbl = curLbl;
+        L("  br label %L" + ldone);
+        Label(ldone);
+        string rr = NT();
+        L("  " + rr + " = phi i8* [ null, %" + nullLbl + " ], [ " + rbox + ", %" + valLbl + " ]");
+        AddTemp(rr, resTy);
+        return new ExprVal(rr, resTy);
+    }
+
+    ExprVal GenBinaryEager(Node e, int op) {
         ExprVal a = GenExpr(e.a);
         ExprVal b = GenExpr(e.b);
-        LeaveCallArm();
         // ulong operands select unsigned div/rem/shift/compare and carry the
         // unsigned type through so results print with %llu.
         bool uns = IsUlong(a.ty) || IsUlong(b.ty);
@@ -224,76 +303,7 @@ partial class Irgen {
             || op == TK.Slash() || op == TK.Percent())
             && !(IsStr(a.ty) || IsStr(b.ty))
             && (IsNullableValue(a.ty) || IsNullableValue(b.ty))) {
-            bool ln = IsNullableValue(a.ty);
-            bool rn = IsNullableValue(b.ty);
-            Node resTy = ln ? a.ty : b.ty;
-            if (ln && rn && UnderLL(b.ty) == "double") {
-                resTy = b.ty;
-            } else if ((!ln && IsDbl(a.ty)) || (!rn && IsDbl(b.ty))) {
-                resTy = MkType("double"); resTy.op = 1;
-            }
-            int lnull = NL(); int lval = NL(); int ldone = NL();
-            string anyNull = "";
-            if (ln && rn) {
-                string aisn = NT();
-                L("  " + aisn + " = icmp eq i8* " + a.op + ", null");
-                string bisn = NT();
-                L("  " + bisn + " = icmp eq i8* " + b.op + ", null");
-                anyNull = NT();
-                L("  " + anyNull + " = or i1 " + aisn + ", " + bisn);
-            } else if (ln) {
-                anyNull = NT();
-                L("  " + anyNull + " = icmp eq i8* " + a.op + ", null");
-            } else {
-                anyNull = NT();
-                L("  " + anyNull + " = icmp eq i8* " + b.op + ", null");
-            }
-            L("  br i1 " + anyNull + ", label %L" + lnull + ", label %L" + lval);
-            Label(lnull);
-            L("  br label %L" + ldone);
-            string nullLbl = curLbl;
-            Label(lval);
-            string ault = UnderLL(resTy);
-            string av = "";
-            if (ln) {
-                string aul = UnderLL(a.ty);
-                string ap = NT();
-                L("  " + ap + " = bitcast i8* " + a.op + " to " + aul + "*");
-                string al = NT();
-                L("  " + al + " = load " + aul + ", " + aul + "* " + ap);
-                av = Coerce(new ExprVal(al, MkType(a.ty.sval)), ault);
-            } else {
-                av = Coerce(a, ault);
-            }
-            string bv = "";
-            if (rn) {
-                string bul = UnderLL(b.ty);
-                string bp = NT();
-                L("  " + bp + " = bitcast i8* " + b.op + " to " + bul + "*");
-                string bl = NT();
-                L("  " + bl + " = load " + bul + ", " + bul + "* " + bp);
-                bv = Coerce(new ExprVal(bl, MkType(b.ty.sval)), ault);
-            } else {
-                bv = Coerce(b, ault);
-            }
-            bool isF = ault == "double";
-            string opn2 = "add";
-            if (op == TK.Minus()) { opn2 = isF ? "fsub" : "sub"; }
-            else if (op == TK.Star()) { opn2 = isF ? "fmul" : "mul"; }
-            else if (op == TK.Slash()) { opn2 = isF ? "fdiv" : "sdiv"; }
-            else if (op == TK.Percent()) { opn2 = isF ? "frem" : "srem"; }
-            else { opn2 = isF ? "fadd" : "add"; }
-            string rv = NT();
-            L("  " + rv + " = " + opn2 + " " + ault + " " + av + ", " + bv);
-            ExprVal rvx = new ExprVal(rv, MkType(resTy.sval));
-            string rbox = BoxVal(rvx, resTy);
-            string valLbl = curLbl;
-            L("  br label %L" + ldone);
-            Label(ldone);
-            string rr = NT();
-            L("  " + rr + " = phi i8* [ null, %" + nullLbl + " ], [ " + rbox + ", %" + valLbl + " ]");
-            AddTemp(rr, resTy);
-            return new ExprVal(rr, resTy);
+            return GenBinaryNullableArith(e, op, a, b);
         }
         if ((IsDecimal(a.ty) || IsDecimal(b.ty)) && !(IsStr(a.ty) || IsStr(b.ty)) && !IsNullableValue(a.ty) && !IsNullableValue(b.ty)) {
             return DecimalBinary(op, a, b, e);
@@ -332,10 +342,17 @@ partial class Irgen {
         // addition: concatenate when either operand is a string, else integer add
         if (op == TK.Plus()) {
             if (IsStr(a.ty) || IsStr(b.ty)) {
-                EnterCallArm();
+                string badA = StringConcatBadType(a);
+                string badB = StringConcatBadType(b);
+                if (badA != "" || badB != "") {
+                    string bad = badA != "" ? badA : badB;
+                    diags.Error("[E2040] cannot concatenate 'string' and '" + bad
+                        + "' -- convert the operand explicitly (e.g. call .ToString()/read the field) instead of concatenating the reference",
+                        e.line, e.col);
+                    return GenStr("");
+                }
                 string sa = ToCatStr(a);
                 string sb = ToCatStr(b);
-                LeaveCallArm();
                 return StrConcat(sa, sb);
             }
             int aw = ArithWidth(e.a, a, e.b, b);
