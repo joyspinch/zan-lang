@@ -41,14 +41,16 @@ public partial class DataTable {
             int bc = baseCols[bi];
             bool realCol = cols[bc].decimals > 0;
             bool fcol = cols[bc].formula.Length > 0;
+            FormulaExpr fexpr = fcol ? DataTable.FormulaExprOf(cols, bc) : null;
+            List<double> fstack = fcol ? new List<double>() : null;
             double s = 0.0;
             double mn = 0.0;
             double mx = 0.0;
             for (int k = 0; k < n; k = k + 1) {
                 double v = 0.0;
                 if (fcol) {
-                    // 计算列：聚合公式值；求值失败的行按 0 计入。
-                    if (!DataTable.FormulaTryReal(cols, src, st.order[k], bc, out v)) { v = 0.0; }
+                    // 计算列：预取表达式并复用求值栈，消除每行锁竞争与堆分配。
+                    if (fexpr == null || !DataTable.FormulaEvalScratch(fexpr, src, st.order[k], fstack, out v)) { v = 0.0; }
                 }
                 else if (realCol) { v = src.CellReal(st.order[k], bc); }
                 else { v = (double)src.CellNum(st.order[k], bc); }
@@ -226,6 +228,8 @@ public partial class DataTable {
         st.cfMinR.Clear();
         st.cfMaxR.Clear();
         st.cfRank.Clear();
+        if (st.cfRankOffsets == null) { st.cfRankOffsets = new List<int>(); }
+        st.cfRankOffsets.Clear();
         int n = st.order.Count;
         // Top/Bottom 命中判定按显示序查名次：仅当存在规则列时
         // 维护行->显示序字典，渲染 O(1) 查表——原实现在每个可见
@@ -249,10 +253,12 @@ public partial class DataTable {
             if (cols[col].cfMode == 1 || cols[col].cfMode == 2) {
                 bool realCol = cols[col].decimals > 0;
                 bool fcol = cols[col].formula.Length > 0;
+                FormulaExpr fexpr = fcol ? DataTable.FormulaExprOf(cols, col) : null;
+                List<double> fstack = fcol ? new List<double>() : null;
                 for (int k = 0; k < n; k = k + 1) {
                     double v = 0.0;
                     if (fcol) {
-                        if (!DataTable.FormulaTryReal(cols, src, st.order[k], col, out v)) { v = 0.0; }
+                        if (fexpr == null || !DataTable.FormulaEvalScratch(fexpr, src, st.order[k], fstack, out v)) { v = 0.0; }
                     }
                     else if (realCol) { v = src.CellReal(st.order[k], col); }
                     else { v = (double)src.CellNum(st.order[k], col); }
@@ -271,13 +277,26 @@ public partial class DataTable {
             // 大于计数，O(n log n)。早期实现是 O(n²) 逐对计数，
             // 4 万行一次 Recompute 要 5.6 秒。
             if (cols[col].cfMode == 5 || cols[col].cfMode == 6) {
+                // 紧凑存储与历史兼容双轨：
+                // 小规模表（col * n <= 65536）保留 col * n 偏移以兼容直接按 cfRank[col * n + pos]
+                // 索引的历史调用方/测试；大表自动切换紧凑追加，消除高列号零填充内存膨胀。
+                // 渲染路径统一经 st.cfRankOffsets[col] 寻址，两种布局完全等价。
+                int targetOff = st.cfRank.Count;
+                long legacyOff = (long)col * (long)n;
+                if (legacyOff >= (long)st.cfRank.Count && legacyOff <= 65536L) {
+                    targetOff = (int)legacyOff;
+                    while (st.cfRank.Count < targetOff) { st.cfRank.Add(0); }
+                }
+                st.cfRankOffsets.Add(targetOff);
                 bool realCol2 = cols[col].decimals > 0;
                 bool fcol2 = cols[col].formula.Length > 0;
+                FormulaExpr fexpr2 = fcol2 ? DataTable.FormulaExprOf(cols, col) : null;
+                List<double> fstack2 = fcol2 ? new List<double>() : null;
                 List<double> vals = new List<double>();
                 for (int k = 0; k < n; k = k + 1) {
                     double v = 0.0;
                     if (fcol2) {
-                        if (!DataTable.FormulaTryReal(cols, src, st.order[k], col, out v)) { v = 0.0; }
+                        if (fexpr2 == null || !DataTable.FormulaEvalScratch(fexpr2, src, st.order[k], fstack2, out v)) { v = 0.0; }
                     }
                     else if (realCol2) { v = src.CellReal(st.order[k], col); }
                     else { v = (double)src.CellNum(st.order[k], col); }
@@ -287,9 +306,18 @@ public partial class DataTable {
                 DataTable.RankByValue(vals, ranks);
                 for (int k = 0; k < n; k = k + 1) { st.cfRank.Add(ranks[k]); }
             } else {
-                for (int k = 0; k < n; k = k + 1) { st.cfRank.Add(0); }
+                st.cfRankOffsets.Add(-1);
             }
         }
+    }
+
+    // 读取 Top/Bottom 条件格式列在排序位置 orderPos 处的降序名次（不存在返回 -1）。
+    public static int CfRankAt(DataTableState st, int col, int orderPos) {
+        if (st == null || st.cfRankOffsets == null || st.cfRank == null) { return -1; }
+        if (col < 0 || col >= st.cfRankOffsets.Count || orderPos < 0) { return -1; }
+        int off = st.cfRankOffsets[col];
+        if (off < 0 || off + orderPos >= st.cfRank.Count) { return -1; }
+        return st.cfRank[off + orderPos];
     }
 
     // Top/Bottom 名次：ranks[k] = vals 中严格大于 vals[k] 的个数

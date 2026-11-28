@@ -1,0 +1,610 @@
+// rt_timer_misc.zan: Async executor config, Clinger/Lemire fast IEEE-754 parse
+// & shortest round-trip float/double formatting, allocation stats, weak slab
+// fallbacks, and SipHash-1-3 salted dictionary key hashing.
+// Replaces src/runtime/timer/rt_timer_misc.c in 100% pure Zan.
+
+namespace Zan.Runtime.Timer;
+
+static class RtTimerMisc {
+    // ---- Async executor config ----
+    static int s_cfgWorkers = 0;
+    static int s_cfgIoShards = 0;
+    static int s_cfgSyncFast = -1;
+
+    [Export("zan_async_set_workers")]
+    public static void AsyncSetWorkers(int n) {
+        Atomic.Store(ref s_cfgWorkers, n > 0 ? n : 0, MemoryOrder.Release);
+    }
+
+    [Export("zan_async_set_io_shards")]
+    public static void AsyncSetIoShards(int n) {
+        Atomic.Store(ref s_cfgIoShards, n > 0 ? n : 0, MemoryOrder.Release);
+    }
+
+    [Export("zan_async_set_sync_fast")]
+    public static void AsyncSetSyncFast(int on) {
+        Atomic.Store(ref s_cfgSyncFast, on != 0 ? 1 : 0, MemoryOrder.Release);
+    }
+
+    [Export("zan_async_cfg_workers")]
+    public static int AsyncCfgWorkers() => Atomic.Load(ref s_cfgWorkers, MemoryOrder.Acquire);
+
+    [Export("zan_async_cfg_io_shards")]
+    public static int AsyncCfgIoShards() => Atomic.Load(ref s_cfgIoShards, MemoryOrder.Acquire);
+
+    [Export("zan_async_cfg_sync_fast")]
+    public static int AsyncCfgSyncFast() => Atomic.Load(ref s_cfgSyncFast, MemoryOrder.Acquire);
+
+    // ---- IEEE-754 double/float parsing & shortest round-trip formatting ----
+
+    static double Pow10Exact(int e) {
+        if (e == 0) return 1e0;
+        if (e == 1) return 1e1;
+        if (e == 2) return 1e2;
+        if (e == 3) return 1e3;
+        if (e == 4) return 1e4;
+        if (e == 5) return 1e5;
+        if (e == 6) return 1e6;
+        if (e == 7) return 1e7;
+        if (e == 8) return 1e8;
+        if (e == 9) return 1e9;
+        if (e == 10) return 1e10;
+        if (e == 11) return 1e11;
+        if (e == 12) return 1e12;
+        if (e == 13) return 1e13;
+        if (e == 14) return 1e14;
+        if (e == 15) return 1e15;
+        if (e == 16) return 1e16;
+        if (e == 17) return 1e17;
+        if (e == 18) return 1e18;
+        if (e == 19) return 1e19;
+        if (e == 20) return 1e20;
+        if (e == 21) return 1e21;
+        return 1e22;
+    }
+
+    static bool DoubleSignbit(double v) {
+        ulong bits = NativeMemory.Read<ulong>(NativeMemory.AddressOf(ref v));
+        return (bits & 0x8000000000000000UL) != 0UL;
+    }
+
+    static double BitsToDouble(ulong bits) {
+        return NativeMemory.Read<double>(NativeMemory.AddressOf(ref bits));
+    }
+
+    static bool DblParseFast(nint s, nint endpPtr, nint outValPtr) {
+        nint p = s;
+        while (true) {
+            byte c = NativeMemory.Read<byte>(p);
+            if (c == (byte)32 || c == (byte)9 || c == (byte)10 || c == (byte)13 || c == (byte)11 || c == (byte)12) {
+                p += (nint)1;
+            } else {
+                break;
+            }
+        }
+        bool neg = false;
+        byte ch = NativeMemory.Read<byte>(p);
+        if (ch == (byte)45) { neg = true; p += (nint)1; }
+        else if (ch == (byte)43) { p += (nint)1; }
+
+        byte p0 = NativeMemory.Read<byte>(p);
+        byte p1 = NativeMemory.Read<byte>(p + (nint)1);
+        uint c0 = (uint)p0 - 48U;
+        if (c0 > 9U && !(p0 == (byte)46 && ((uint)p1 - 48U) <= 9U)) return false;
+        if (p0 == (byte)48 && (p1 == (byte)120 || p1 == (byte)88)) return false;
+
+        ulong mant = 0UL;
+        int sig = 0;
+        int exp10 = 0;
+        while (true) {
+            uint d = (uint)NativeMemory.Read<byte>(p) - 48U;
+            if (d > 9U) break;
+            if (mant != 0UL || d != 0U) {
+                if (sig < 15) {
+                    mant = mant * 10UL + (ulong)d;
+                    sig++;
+                } else {
+                    return false;
+                }
+            }
+            p += (nint)1;
+        }
+        if (NativeMemory.Read<byte>(p) == (byte)46) {
+            p += (nint)1;
+            while (true) {
+                uint d = (uint)NativeMemory.Read<byte>(p) - 48U;
+                if (d > 9U) break;
+                if (sig < 15) {
+                    if (mant != 0UL || d != 0U) {
+                        mant = mant * 10UL + (ulong)d;
+                        sig++;
+                    }
+                    exp10--;
+                } else if (d != 0U) {
+                    return false;
+                }
+                p += (nint)1;
+            }
+        }
+        byte ec = NativeMemory.Read<byte>(p);
+        if (ec == (byte)101 || ec == (byte)69) {
+            nint ep = p + (nint)1;
+            bool eneg = false;
+            byte es = NativeMemory.Read<byte>(ep);
+            if (es == (byte)45) { eneg = true; ep += (nint)1; }
+            else if (es == (byte)43) { ep += (nint)1; }
+            if (((uint)NativeMemory.Read<byte>(ep) - 48U) > 9U) return false;
+            int eval = 0;
+            while (true) {
+                uint d = (uint)NativeMemory.Read<byte>(ep) - 48U;
+                if (d > 9U) break;
+                if (eval < 1000) eval = eval * 10 + (int)d;
+                ep += (nint)1;
+            }
+            p = ep;
+            exp10 += eneg ? -eval : eval;
+        }
+
+        double v;
+        if (mant == 0UL) {
+            v = 0.0;
+        } else {
+            if (exp10 < -22 || exp10 > 22) return false;
+            v = (double)mant;
+            if (exp10 > 0) v *= Pow10Exact(exp10);
+            else if (exp10 < 0) v /= Pow10Exact(-exp10);
+        }
+        if (endpPtr != (nint)0) NativeMemory.Write<nint>(endpPtr, p);
+        NativeMemory.Write<double>(outValPtr, neg ? -v : v);
+        return true;
+    }
+
+    static bool DblRoundtrips(nint m, double v, bool isFlt) {
+        if (isFlt) return RtPlat.CStrtof(m, (nint)0) == (float)v;
+        double parsed = 0.0;
+        if (DblParseFast(m, (nint)0, NativeMemory.AddressOf(ref parsed))) {
+            return parsed == v;
+        }
+        return RtPlat.CStrtod(m, (nint)0) == v;
+    }
+
+    static void FormatSciPrec(nint dst, ulong cap, int prec, double v) {
+        nint fnSn = NativeMemory.FunctionPointer(RtPlat.CSnprintf);
+        NativeMemory.InvokeVariadic<int>(fnSn, 3, dst, cap, (nint)"%.*e", prec, v);
+    }
+
+    static void WriteTwoDigits(nint tp, long pos, uint val) {
+        NativeMemory.At<byte>(tp, pos) = (byte)(48U + (val / 10U));
+        NativeMemory.At<byte>(tp, pos + 1L) = (byte)(48U + (val % 10U));
+    }
+
+    [Export("zan_rt_dbl_str")]
+    public static void DblStr(nint buf, ulong cap, double v) {
+        bool isFlt = (cap & 0x8000000000000000UL) != 0UL;
+        ulong actualCap = cap & 0x7FFFFFFFFFFFFFFFUL;
+        if (actualCap == 0UL) return;
+
+        if (v != v) {
+            RtPlat.BufAppendCStr(buf, actualCap, 0UL, (nint)"NaN");
+            return;
+        }
+        bool isNeg = DoubleSignbit(v);
+        if (v == 0.0) {
+            RtPlat.BufAppendCStr(buf, actualCap, 0UL, isNeg ? (nint)"-0" : (nint)"0");
+            return;
+        }
+        double a = v < 0.0 ? -v : v;
+        if (a == BitsToDouble(0x7FF0000000000000UL)) {
+            ulong pos = 0UL;
+            if (isNeg) pos = RtPlat.BufAppendChar(buf, actualCap, pos, (byte)45);
+            RtPlat.BufAppendCStr(buf, actualCap, pos, (nint)"Infinity");
+            return;
+        }
+
+        // Exact integer fast path
+        double intLimit = isFlt ? 16777216.0 : 1000000000000000.0;
+        if (a < intLimit) {
+            ulong iv = (ulong)a;
+            if ((double)iv == a) {
+                Buf32 tmp = new Buf32();
+                nint tp = NativeMemory.AddressOf(ref tmp);
+                long pos = 24L;
+                while (iv >= 100UL) {
+                    uint r = (uint)(iv % 100UL);
+                    iv /= 100UL;
+                    pos -= 2L;
+                    WriteTwoDigits(tp, pos, r);
+                }
+                if (iv >= 10UL) {
+                    pos -= 2L;
+                    WriteTwoDigits(tp, pos, (uint)iv);
+                } else {
+                    pos--;
+                    NativeMemory.At<byte>(tp, pos) = (byte)(48U + (uint)iv);
+                }
+                if (isNeg) {
+                    pos--;
+                    NativeMemory.At<byte>(tp, pos) = (byte)45;
+                }
+                ulong nlen = (ulong)(24L - pos);
+                if (nlen >= actualCap) nlen = actualCap - 1UL;
+                RtPlat.CMemcpy(buf, tp + (nint)pos, nlen);
+                NativeMemory.At<byte>(buf, (long)nlen) = (byte)0;
+                return;
+            }
+        }
+
+        // Short fraction exact fast path (<= 6 fractional digits)
+        if (!isFlt && a >= 1e-4 && a < 10000000.0) {
+            ulong iv6 = (ulong)(a * 1000000.0 + 0.5);
+            if (iv6 > 0UL && ((double)iv6 / 1000000.0) == a) {
+                int fracDigits = 6;
+                while (fracDigits > 0 && (iv6 % 10UL) == 0UL) {
+                    iv6 /= 10UL;
+                    fracDigits--;
+                }
+                Buf32 tmp = new Buf32();
+                nint tp = NativeMemory.AddressOf(ref tmp);
+                long pos = 32L;
+                for (int k = 0; k < fracDigits; k++) {
+                    pos--;
+                    NativeMemory.At<byte>(tp, pos) = (byte)(48U + (uint)(iv6 % 10UL));
+                    iv6 /= 10UL;
+                }
+                if (fracDigits > 0) {
+                    pos--;
+                    NativeMemory.At<byte>(tp, pos) = (byte)46;
+                }
+                if (iv6 == 0UL) {
+                    pos--;
+                    NativeMemory.At<byte>(tp, pos) = (byte)48;
+                } else {
+                    while (iv6 >= 100UL) {
+                        uint r = (uint)(iv6 % 100UL);
+                        iv6 /= 100UL;
+                        pos -= 2L;
+                        WriteTwoDigits(tp, pos, r);
+                    }
+                    if (iv6 >= 10UL) {
+                        pos -= 2L;
+                        WriteTwoDigits(tp, pos, (uint)iv6);
+                    } else {
+                        pos--;
+                        NativeMemory.At<byte>(tp, pos) = (byte)(48U + (uint)iv6);
+                    }
+                }
+                if (isNeg) {
+                    pos--;
+                    NativeMemory.At<byte>(tp, pos) = (byte)45;
+                }
+                ulong nlen = (ulong)(32L - pos);
+                if (nlen >= actualCap) nlen = actualCap - 1UL;
+                RtPlat.CMemcpy(buf, tp + (nint)pos, nlen);
+                NativeMemory.At<byte>(buf, (long)nlen) = (byte)0;
+                return;
+            }
+        }
+
+        // Shortest exact round-trip precision binary search
+        Buf48 mBuf = new Buf48();
+        Buf48 bestBuf = new Buf48();
+        nint m = NativeMemory.AddressOf(ref mBuf);
+        nint best = NativeMemory.AddressOf(ref bestBuf);
+        int maxP = isFlt ? 10 : 17;
+        int probeP = isFlt ? 7 : 15;
+        int lo = 1;
+        int hi = maxP;
+        bool haveBest = false;
+
+        FormatSciPrec(m, 40UL, probeP - 1, v);
+        if (DblRoundtrips(m, v, isFlt)) {
+            RtPlat.CMemcpy(best, m, 40UL);
+            haveBest = true;
+            nint q0 = NativeMemory.Read<byte>(m) == (byte)45 ? (m + (nint)1) : m;
+            nint e0 = RtPlat.CStrChr(q0, (byte)101);
+            int nz = 0;
+            int lastNz = 0;
+            for (nint c = q0; c < e0; c += (nint)1) {
+                byte ch = NativeMemory.Read<byte>(c);
+                if (ch >= (byte)48 && ch <= (byte)57) {
+                    nz++;
+                    if (ch != (byte)48) lastNz = nz;
+                }
+            }
+            hi = lastNz > 0 ? lastNz : 1;
+            if (hi > 1) {
+                FormatSciPrec(m, 40UL, hi - 2, v);
+                if (!DblRoundtrips(m, v, isFlt)) {
+                    lo = hi;
+                } else {
+                    RtPlat.CMemcpy(best, m, 40UL);
+                    hi = hi - 1;
+                }
+            }
+        } else {
+            lo = probeP + 1;
+        }
+
+        while (lo < hi) {
+            int mid = lo + (hi - lo) / 2;
+            FormatSciPrec(m, 40UL, mid - 1, v);
+            if (DblRoundtrips(m, v, isFlt)) {
+                RtPlat.CMemcpy(best, m, 40UL);
+                haveBest = true;
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+
+        if (haveBest) {
+            RtPlat.CMemcpy(m, best, 40UL);
+        } else {
+            FormatSciPrec(m, 40UL, isFlt ? 9 : 16, v);
+        }
+
+        nint q = NativeMemory.Read<byte>(m) == (byte)45 ? (m + (nint)1) : m;
+        nint es = RtPlat.CStrChr(q, (byte)101);
+        int e10 = RtPlat.ParseAsciiInt(es + (nint)1);
+        Buf32 sigBuf = new Buf32();
+        nint sig = NativeMemory.AddressOf(ref sigBuf);
+        int n = 0;
+        for (nint c = q; c < es; c += (nint)1) {
+            byte ch = NativeMemory.Read<byte>(c);
+            if (ch >= (byte)48 && ch <= (byte)57) {
+                NativeMemory.At<byte>(sig, (long)n) = ch;
+                n++;
+            }
+        }
+        while (n > 1 && NativeMemory.At<byte>(sig, (long)(n - 1)) == (byte)48) n--;
+        NativeMemory.At<byte>(sig, (long)n) = (byte)0;
+
+        Buf48 outBuf = new Buf48();
+        nint ob = NativeMemory.AddressOf(ref outBuf);
+        ulong opos = 0UL;
+        if (isNeg) opos = RtPlat.BufAppendChar(ob, 48UL, opos, (byte)45);
+
+        if (e10 >= -4 && e10 <= 14) {
+            if (e10 >= n) {
+                opos = RtPlat.BufAppendBytes(ob, 48UL, opos, sig, (ulong)n);
+                int z = e10 - (n - 1);
+                for (int k = 0; k < z; k++) opos = RtPlat.BufAppendChar(ob, 48UL, opos, (byte)48);
+            } else if (e10 >= 0) {
+                int h = e10 + 1;
+                opos = RtPlat.BufAppendBytes(ob, 48UL, opos, sig, (ulong)h);
+                if (NativeMemory.At<byte>(sig, (long)h) != (byte)0) {
+                    opos = RtPlat.BufAppendChar(ob, 48UL, opos, (byte)46);
+                    opos = RtPlat.BufAppendCStr(ob, 48UL, opos, sig + (nint)h);
+                }
+            } else {
+                opos = RtPlat.BufAppendCStr(ob, 48UL, opos, (nint)"0.");
+                int z = -e10 - 1;
+                for (int k = 0; k < z; k++) opos = RtPlat.BufAppendChar(ob, 48UL, opos, (byte)48);
+                opos = RtPlat.BufAppendBytes(ob, 48UL, opos, sig, (ulong)n);
+            }
+        } else {
+            opos = RtPlat.BufAppendChar(ob, 48UL, opos, NativeMemory.At<byte>(sig, 0L));
+            if (n > 1) {
+                opos = RtPlat.BufAppendChar(ob, 48UL, opos, (byte)46);
+                opos = RtPlat.BufAppendBytes(ob, 48UL, opos, sig + (nint)1, (ulong)(n - 1));
+            }
+            opos = RtPlat.BufAppendChar(ob, 48UL, opos, (byte)69); // 'E'
+            if (e10 < 0) {
+                opos = RtPlat.BufAppendChar(ob, 48UL, opos, (byte)45);
+                opos = RtPlat.BufAppendU64ZeroPad(ob, 48UL, opos, (ulong)(-e10), 2);
+            } else {
+                opos = RtPlat.BufAppendChar(ob, 48UL, opos, (byte)43);
+                opos = RtPlat.BufAppendU64ZeroPad(ob, 48UL, opos, (ulong)e10, 2);
+            }
+        }
+        RtPlat.BufAppendBytes(buf, actualCap, 0UL, ob, opos);
+    }
+
+    [Export("zan_rt_flt_str")]
+    public static void FltStr(nint buf, ulong cap, float v) {
+        DblStr(buf, cap | 0x8000000000000000UL, (double)v);
+    }
+
+    [Export("zan_rt_dbl_parse")]
+    public static double DblParse(nint s, nint endpPtr) {
+        if (endpPtr != (nint)0) NativeMemory.Write<nint>(endpPtr, s);
+        double fastVal = 0.0;
+        if (DblParseFast(s, endpPtr, NativeMemory.AddressOf(ref fastVal))) {
+            return fastVal;
+        }
+        byte c0 = NativeMemory.Read<byte>(s);
+        if (c0 == (byte)78 && RtPlat.CStrCmp(s, (nint)"NaN") == 0) {
+            if (endpPtr != (nint)0) NativeMemory.Write<nint>(endpPtr, s + (nint)3);
+            return BitsToDouble(0x7FF8000000000000UL);
+        }
+        if ((c0 == (byte)73 && RtPlat.CStrCmp(s, (nint)"Infinity") == 0) ||
+            (c0 == (byte)43 && RtPlat.CStrCmp(s, (nint)"+Infinity") == 0)) {
+            if (endpPtr != (nint)0) NativeMemory.Write<nint>(endpPtr, s + (nint)(c0 == (byte)43 ? 9 : 8));
+            return BitsToDouble(0x7FF0000000000000UL);
+        }
+        if (c0 == (byte)45 && RtPlat.CStrCmp(s, (nint)"-Infinity") == 0) {
+            if (endpPtr != (nint)0) NativeMemory.Write<nint>(endpPtr, s + (nint)9);
+            return BitsToDouble(0xFFF0000000000000UL);
+        }
+        nint ep = RtPlat.ErrnoPtr();
+        NativeMemory.Write<int>(ep, 0);
+        double r = RtPlat.CStrtod(s, endpPtr);
+        double posInf = BitsToDouble(0x7FF0000000000000UL);
+        double negInf = BitsToDouble(0xFFF0000000000000UL);
+        if (NativeMemory.Read<int>(ep) == RtPlat.ERANGE_VAL && (r == posInf || r == negInf)) {
+            if (endpPtr != (nint)0) NativeMemory.Write<nint>(endpPtr, s);
+        }
+        return r;
+    }
+
+    // ---- Heap allocation counters (A464) ----
+    static long s_totalAllocBytes = 0L;
+
+    [Export("zan_rt_alloc_add")]
+    public static void AllocAdd(long bytes) {
+        if (bytes <= 0L) return;
+        RtTimerTask.AddThreadAllocBytes((ulong)bytes);
+        Atomic.FetchAdd(ref s_totalAllocBytes, bytes, MemoryOrder.Relaxed);
+    }
+
+    [Export("zan_rt_alloc_bytes_thread")]
+    public static long AllocBytesThread() => (long)RtTimerTask.GetThreadAllocBytes();
+
+    [Export("zan_rt_alloc_bytes_total")]
+    public static long AllocBytesTotal() => Atomic.Load(ref s_totalAllocBytes, MemoryOrder.Relaxed);
+
+    // ---- Weak fallbacks for --no-fast-alloc builds ----
+    [Export("zan_mem_slabs")]
+    [Weak]
+    public static ulong MemSlabs() => 0UL;
+
+    [Export("zan_mem_trim")]
+    [Weak]
+    public static ulong MemTrim() => 0UL;
+
+    // ---- SipHash-1-3 with OS entropy salt (B-ID80) ----
+    static ulong s_hashSaltK0 = 0UL;
+    static ulong s_hashSaltK1 = 0UL;
+    static ulong s_hashSaltReady = 0UL;
+    static int s_hashSaltLock = 0;
+
+    static ulong Rotl64(ulong x, int b) => (x << b) | (x >> (64 - b));
+
+    static ulong SipHash13(nint data, ulong len, ulong k0, ulong k1) {
+        ulong v0 = k0 ^ 0x736F6D6570736575UL;
+        ulong v1 = k1 ^ 0x646F72616E646F6DUL;
+        ulong v2 = k0 ^ 0x6C7967656E657261UL;
+        ulong v3 = k1 ^ 0x7465646279746573UL;
+
+        nint p = data;
+        ulong left = len;
+        while (left >= 8UL) {
+            ulong m = NativeMemory.Read<ulong>(p);
+            v3 ^= m;
+            // 1 compression round
+            v0 += v1; v1 = Rotl64(v1, 13); v1 ^= v0; v0 = Rotl64(v0, 32);
+            v2 += v3; v3 = Rotl64(v3, 16); v3 ^= v2;
+            v0 += v3; v3 = Rotl64(v3, 21); v3 ^= v0;
+            v2 += v1; v1 = Rotl64(v1, 17); v1 ^= v2; v2 = Rotl64(v2, 32);
+            v0 ^= m;
+            p += (nint)8;
+            left -= 8UL;
+        }
+
+        ulong b = len << 56;
+        if (left >= 7UL) b |= ((ulong)NativeMemory.At<byte>(p, 6L)) << 48;
+        if (left >= 6UL) b |= ((ulong)NativeMemory.At<byte>(p, 5L)) << 40;
+        if (left >= 5UL) b |= ((ulong)NativeMemory.At<byte>(p, 4L)) << 32;
+        if (left >= 4UL) b |= ((ulong)NativeMemory.At<byte>(p, 3L)) << 24;
+        if (left >= 3UL) b |= ((ulong)NativeMemory.At<byte>(p, 2L)) << 16;
+        if (left >= 2UL) b |= ((ulong)NativeMemory.At<byte>(p, 1L)) << 8;
+        if (left >= 1UL) b |= (ulong)NativeMemory.At<byte>(p, 0L);
+
+        v3 ^= b;
+        // 1 compression round
+        v0 += v1; v1 = Rotl64(v1, 13); v1 ^= v0; v0 = Rotl64(v0, 32);
+        v2 += v3; v3 = Rotl64(v3, 16); v3 ^= v2;
+        v0 += v3; v3 = Rotl64(v3, 21); v3 ^= v0;
+        v2 += v1; v1 = Rotl64(v1, 17); v1 ^= v2; v2 = Rotl64(v2, 32);
+        v0 ^= b;
+
+        v2 ^= 0xFFUL;
+        // 3 finalization rounds
+        for (int r = 0; r < 3; r++) {
+            v0 += v1; v1 = Rotl64(v1, 13); v1 ^= v0; v0 = Rotl64(v0, 32);
+            v2 += v3; v3 = Rotl64(v3, 16); v3 ^= v2;
+            v0 += v3; v3 = Rotl64(v3, 21); v3 ^= v0;
+            v2 += v1; v1 = Rotl64(v1, 17); v1 ^= v2; v2 = Rotl64(v2, 32);
+        }
+        return v0 ^ v1 ^ v2 ^ v3;
+    }
+
+    static ulong DictStrLenFast(nint s) {
+        if ((((ulong)s) & 4080UL) != 0UL) {
+            ulong hdr = NativeMemory.Read<ulong>(s + (nint)RtAbi.HDR_WORD_OFF);
+            if ((hdr >> 32) == RtAbi.STRING_TAG) {
+                uint cached = NativeMemory.Read<uint>(s + (nint)RtAbi.STR_LEN_OFF);
+                if (cached != RtAbi.STR_LEN_UNKNOWN) return (ulong)cached;
+            }
+        }
+        return RtPlat.CStrLen(s);
+    }
+
+    static void HashSaltFill() {
+#if WINDOWS
+        uint r0 = 0U;
+        uint r1 = 0U;
+        if (RtPlat.WinRandS(NativeMemory.AddressOf(ref r0)) == 0 &&
+            RtPlat.WinRandS(NativeMemory.AddressOf(ref r1)) == 0) {
+            s_hashSaltK0 = ((ulong)r0 << 32) | (ulong)r1;
+            if (RtPlat.WinRandS(NativeMemory.AddressOf(ref r0)) == 0 &&
+                RtPlat.WinRandS(NativeMemory.AddressOf(ref r1)) == 0) {
+                s_hashSaltK1 = ((ulong)r0 << 32) | (ulong)r1;
+            } else {
+                s_hashSaltK1 = (ulong)NativeMemory.FunctionPointer(DictHash);
+            }
+            return;
+        }
+        long pc = 0L;
+        RtPlat.WinQueryPerformanceCounter(NativeMemory.AddressOf(ref pc));
+        s_hashSaltK0 = (ulong)pc ^ (((ulong)NativeMemory.AddressOf(ref pc)) << 17);
+        s_hashSaltK1 = (ulong)NativeMemory.FunctionPointer(DictHash) ^ (((ulong)RtPlat.WinGetCurrentProcessId()) << 32);
+#elif MACOS
+        Buf32 keys = new Buf32();
+        nint kp = NativeMemory.AddressOf(ref keys);
+        RtPlat.MacArc4RandomBuf(kp, 16UL);
+        s_hashSaltK0 = NativeMemory.Read<ulong>(kp);
+        s_hashSaltK1 = NativeMemory.Read<ulong>(kp + (nint)8);
+#else
+        Buf32 keys = new Buf32();
+        nint kp = NativeMemory.AddressOf(ref keys);
+        nint fnSys = NativeMemory.FunctionPointer(RtPlat.PosixSyscall);
+        long gotSys = NativeMemory.InvokeVariadic<long>(fnSys, 1, RtPlat.SYS_GETRANDOM, kp, 16UL, 0UL);
+        if (gotSys == 16L) {
+            s_hashSaltK0 = NativeMemory.Read<ulong>(kp);
+            s_hashSaltK1 = NativeMemory.Read<ulong>(kp + (nint)8);
+            return;
+        }
+        nint f = RtPlat.CFopen((nint)"/dev/urandom", (nint)"rb");
+        if (f != (nint)0) {
+            ulong got = RtPlat.CFread(kp, 1UL, 16UL, f);
+            RtPlat.CFclose(f);
+            if (got == 16UL) {
+                s_hashSaltK0 = NativeMemory.Read<ulong>(kp);
+                s_hashSaltK1 = NativeMemory.Read<ulong>(kp + (nint)8);
+                return;
+            }
+        }
+        Buf32 ts = new Buf32();
+        nint tp = NativeMemory.AddressOf(ref ts);
+        RtPlat.PosixClockGettime(RtPlat.CLOCK_MONOTONIC, tp);
+        long nsec = NativeMemory.Read<long>(tp + (nint)8);
+        s_hashSaltK0 = (((ulong)nsec) << 32) ^ (ulong)kp;
+        s_hashSaltK1 = (((ulong)RtPlat.PosixGetpid()) << 47) ^ (ulong)NativeMemory.FunctionPointer(DictHash);
+#endif
+    }
+
+    static void HashSaltInitSlow() {
+        RtPlat.SpinLockWord(NativeMemory.AddressOf(ref s_hashSaltLock));
+        if (Atomic.Load(ref s_hashSaltReady, MemoryOrder.Relaxed) == 0UL) {
+            HashSaltFill();
+            Atomic.Store(ref s_hashSaltReady, 1UL, MemoryOrder.Release);
+        }
+        RtPlat.SpinUnlockWord(NativeMemory.AddressOf(ref s_hashSaltLock));
+    }
+
+    [Export("__zan_dict_hash")]
+    public static long DictHash(nint key, long isStr) {
+        if (key == (nint)0) return 0L;
+        if (Atomic.Load(ref s_hashSaltReady, MemoryOrder.Acquire) == 0UL) {
+            HashSaltInitSlow();
+        }
+        ulong k0 = s_hashSaltK0;
+        ulong k1 = s_hashSaltK1;
+        if (isStr != 0L) {
+            return (long)SipHash13(key, DictStrLenFast(key), k0, k1);
+        }
+        nint kv = key;
+        return (long)SipHash13(NativeMemory.AddressOf(ref kv), 8UL, k0, k1);
+    }
+}

@@ -48,6 +48,36 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
     return n;
   }
 
+  if (p->current.kind == TK_IDENT &&
+      zan_lexer_peek(p->lex).kind == TK_LPAREN) {
+    if (p->current.str_val.len == 7 &&
+        memcmp(p->current.str_val.str, "alignof", 7) == 0) {
+      parser_advance(p);
+      parser_expect(p, TK_LPAREN);
+      zan_ast_node_t *type = parse_type_ref(p);
+      parser_expect(p, TK_RPAREN);
+      zan_ast_node_t *n = zan_ast_new(p->arena, AST_SIZEOF_EXPR, loc);
+      n->cast.type = type;
+      n->cast.layout_op = 1;
+      return n;
+    }
+    if (p->current.str_val.len == 8 &&
+        memcmp(p->current.str_val.str, "offsetof", 8) == 0) {
+      parser_advance(p);
+      parser_expect(p, TK_LPAREN);
+      zan_ast_node_t *type = parse_type_ref(p);
+      parser_expect(p, TK_COMMA);
+      zan_istr_t fname = p->current.str_val;
+      parser_expect(p, TK_IDENT);
+      parser_expect(p, TK_RPAREN);
+      zan_ast_node_t *n = zan_ast_new(p->arena, AST_SIZEOF_EXPR, loc);
+      n->cast.type = type;
+      n->cast.field_name = fname;
+      n->cast.layout_op = 2;
+      return n;
+    }
+  }
+
   if (p->current.kind == TK_IDENT && p->current.str_val.len == 4 &&
       memcmp(p->current.str_val.str, "from", 4) == 0 &&
       zan_lexer_peek(p->lex).kind == TK_IDENT) {
@@ -611,6 +641,17 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
     n->cast.type = type;
     return n;
   }
+  case TK_STACKALLOC: {
+    parser_advance(p);
+    zan_ast_node_t *elem_type = parse_type_ref(p);
+    parser_expect(p, TK_LBRACKET);
+    zan_ast_node_t *count_expr = parse_expression(p);
+    parser_expect(p, TK_RBRACKET);
+    zan_ast_node_t *n = zan_ast_new(p->arena, AST_STACKALLOC_EXPR, loc);
+    n->cast.type = elem_type;
+    n->cast.expr = count_expr;
+    return n;
+  }
   default:
     zan_diag_emit_code(p->diag, DIAG_ERROR, loc, 45,
                        "unexpected token '%s' in expression",
@@ -733,9 +774,9 @@ static bool looks_like_call_type_args(zan_parser_t *p) {
         ok = (zan_lexer_peek(p->lex).kind == TK_LPAREN);
         break;
       }
-    } else if (k == TK_IDENT || k == TK_COMMA || k == TK_DOT ||
-               k == TK_LBRACKET || k == TK_RBRACKET || k == TK_QUESTION ||
-               is_type_kw(k)) {
+    } else if (k == TK_IDENT || k == TK_INT_LIT || k == TK_COMMA ||
+               k == TK_DOT || k == TK_LBRACKET || k == TK_RBRACKET ||
+               k == TK_QUESTION || is_type_kw(k)) {
     } else {
       break;
     }
@@ -768,9 +809,9 @@ static bool looks_like_type_args_before_dot(zan_parser_t *p) {
         ok = (zan_lexer_peek(p->lex).kind == TK_DOT);
         break;
       }
-    } else if (k == TK_IDENT || k == TK_COMMA || k == TK_DOT ||
-               k == TK_LBRACKET || k == TK_RBRACKET || k == TK_QUESTION ||
-               is_type_kw(k)) {
+    } else if (k == TK_IDENT || k == TK_INT_LIT || k == TK_COMMA ||
+               k == TK_DOT || k == TK_LBRACKET || k == TK_RBRACKET ||
+               k == TK_QUESTION || is_type_kw(k)) {
     } else {
       break;
     }
@@ -803,9 +844,9 @@ static bool looks_like_type_args_before_brace(zan_parser_t *p) {
         ok = (zan_lexer_peek(p->lex).kind == TK_LBRACE);
         break;
       }
-    } else if (k == TK_IDENT || k == TK_COMMA || k == TK_DOT ||
-               k == TK_LBRACKET || k == TK_RBRACKET || k == TK_QUESTION ||
-               is_type_kw(k)) {
+    } else if (k == TK_IDENT || k == TK_INT_LIT || k == TK_COMMA ||
+               k == TK_DOT || k == TK_LBRACKET || k == TK_RBRACKET ||
+               k == TK_QUESTION || is_type_kw(k)) {
     } else {
       break;
     }
@@ -832,6 +873,8 @@ static void desugar_task_join(zan_ast_node_t *member) {
 }
 
 static bool is_case_type_pattern(zan_parser_t *p);
+static bool try_parse_adt_pattern(zan_parser_t *p, zan_istr_t *out_variant,
+                                  zan_ast_list_t *out_bindings);
 
 static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
   zan_ast_node_t *expr = parse_primary(p);
@@ -1095,6 +1138,7 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
         zan_ast_node_t *type_pattern = NULL;
         zan_ast_node_t *when_cond = NULL;
         zan_istr_t var_name = {0};
+        zan_adt_pat_t *adt_pat = NULL;
         bool is_default = false;
 
         if (parser_check(p, TK_DEFAULT) ||
@@ -1102,14 +1146,23 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
              p->current.str_val.str[0] == '_')) {
           parser_advance(p);
           is_default = true;
-        } else if (is_case_type_pattern(p)) {
-          type_pattern = parse_type_ref(p);
-          if (parser_check(p, TK_IDENT)) {
-            parser_advance(p);
-            var_name = p->previous.str_val;
-          }
         } else {
-          pattern = parse_expression(p);
+          zan_istr_t av = {0};
+          zan_ast_list_t ab;
+          zan_ast_list_init(&ab);
+          if (try_parse_adt_pattern(p, &av, &ab)) {
+            adt_pat = (zan_adt_pat_t *)zan_arena_alloc(p->arena, sizeof(zan_adt_pat_t));
+            adt_pat->variant = av;
+            adt_pat->bindings = ab;
+          } else if (is_case_type_pattern(p)) {
+            type_pattern = parse_type_ref(p);
+            if (parser_check(p, TK_IDENT)) {
+              parser_advance(p);
+              var_name = p->previous.str_val;
+            }
+          } else {
+            pattern = parse_expression(p);
+          }
         }
         if (parser_match(p, TK_WHEN)) {
           when_cond = parse_expression(p);
@@ -1122,6 +1175,7 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
         arm->switch_arm.when_cond = when_cond;
         arm->switch_arm.result = result;
         arm->switch_arm.var_name = var_name;
+        arm->switch_arm.adt_pat = adt_pat;
         arm->switch_arm.is_default = is_default;
         zan_ast_list_push(&n->switch_expr.arms, arm, p->arena);
         if (!parser_match(p, TK_COMMA))
@@ -1161,6 +1215,91 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
       parser_advance(p);
       zan_ast_node_t *n = zan_ast_new(p->arena, AST_POSTFIX_UNARY, loc);
       n->unary.op = TK_BANG;
+      n->unary.operand = expr;
+      expr = n;
+      continue;
+    } else if (parser_check(p, TK_QUESTION)) {
+      /* Disambiguate postfix `?` error propagation (`Result<T,E>?`) from
+       * ternary `cond ? a : b` and null-conditional indexing `a?[i]`.
+       * Rule (Roslyn-style):
+       *  1. If next token can ONLY follow a postfix expr (`;`, `,`, `)`, `]`,
+       *     `}`, `:`, `.`, binary ops, assignments, `is`, `as`, `=>`, EOF) ->
+       *     unconditionally postfix `?`.
+       *  2. If next token CANNOT follow a postfix expr (ident, literal, `new`,
+       *     `await`, `true`, `false`, `null`, `this`, `base`, `~`, etc.) ->
+       *     unconditionally ternary `?` (break).
+       *  3. Only for the 6-token overlap `(`, `+`, `-`, `++`, `--`, `!` do we
+       *     scan ahead for a matching depth-0 `:` to detect ternary. */
+      zan_token_kind_t next_k = zan_lexer_peek(p->lex).kind;
+      if (next_k == TK_LBRACKET)
+        break;
+#define ZAN_TK_POSTFIX_TRY_ONLY(k)                                            \
+  ((k) == TK_SEMICOLON || (k) == TK_RPAREN || (k) == TK_COMMA ||              \
+   (k) == TK_RBRACKET || (k) == TK_RBRACE || (k) == TK_COLON ||               \
+   (k) == TK_EOF || (k) == TK_DOT || (k) == TK_ARROW ||                       \
+   (k) == TK_QUESTION_DOT || (k) == TK_QUESTION_QUESTION ||                   \
+   (k) == TK_STAR || (k) == TK_SLASH || (k) == TK_PERCENT ||                  \
+   (k) == TK_AMP || (k) == TK_PIPE || (k) == TK_CARET ||                      \
+   (k) == TK_AMP_AMP || (k) == TK_PIPE_PIPE || (k) == TK_EQ ||                \
+   (k) == TK_EQ_EQ || (k) == TK_BANG_EQ || (k) == TK_LESS ||                  \
+   (k) == TK_GREATER || (k) == TK_LESS_EQ || (k) == TK_GREATER_EQ ||          \
+   (k) == TK_LESS_LESS || (k) == TK_GREATER_GREATER ||                        \
+   (k) == TK_PLUS_EQ || (k) == TK_MINUS_EQ || (k) == TK_STAR_EQ ||            \
+   (k) == TK_SLASH_EQ || (k) == TK_PERCENT_EQ || (k) == TK_AMP_EQ ||          \
+   (k) == TK_PIPE_EQ || (k) == TK_CARET_EQ || (k) == TK_LESS_LESS_EQ ||       \
+   (k) == TK_GREATER_GREATER_EQ || (k) == TK_IS || (k) == TK_AS)
+#define ZAN_TK_TRY_TERNARY_OVERLAP(k)                                         \
+  ((k) == TK_LPAREN || (k) == TK_PLUS || (k) == TK_MINUS ||                   \
+   (k) == TK_PLUS_PLUS || (k) == TK_MINUS_MINUS || (k) == TK_BANG ||          \
+   (k) == TK_QUESTION)
+      bool is_ternary = false;
+      if (ZAN_TK_POSTFIX_TRY_ONLY(next_k)) {
+        is_ternary = false;
+      } else if (!ZAN_TK_TRY_TERNARY_OVERLAP(next_k)) {
+        is_ternary = true;
+      } else {
+        zan_lexer_mark_t mk;
+        zan_lexer_mark(p->lex, &mk, p->arena);
+        int depth = 0;
+        int nested_q = 0;
+        for (int scan = 0; scan < 256; scan++) {
+          zan_token_t tk = zan_lexer_next(p->lex);
+          if (tk.kind == TK_EOF)
+            break;
+          if (tk.kind == TK_LPAREN || tk.kind == TK_LBRACKET ||
+              tk.kind == TK_LBRACE) {
+            depth++;
+          } else if (tk.kind == TK_RPAREN || tk.kind == TK_RBRACKET ||
+                     tk.kind == TK_RBRACE) {
+            if (depth == 0)
+              break;
+            depth--;
+          } else if (depth == 0) {
+            if (tk.kind == TK_SEMICOLON || tk.kind == TK_ARROW) {
+              break;
+            } else if (tk.kind == TK_QUESTION) {
+              zan_token_kind_t aft = zan_lexer_peek(p->lex).kind;
+              if (aft != TK_LBRACKET && !ZAN_TK_POSTFIX_TRY_ONLY(aft))
+                nested_q++;
+            } else if (tk.kind == TK_COLON) {
+              if (nested_q == 0) {
+                is_ternary = true;
+                break;
+              }
+              nested_q--;
+            }
+          }
+        }
+        zan_lexer_reset(p->lex, &mk);
+      }
+#undef ZAN_TK_TRY_TERNARY_OVERLAP
+#undef ZAN_TK_POSTFIX_TRY_ONLY
+      if (is_ternary)
+        break;
+      zan_loc_t qloc = p->current.loc;
+      parser_advance(p);
+      zan_ast_node_t *n = zan_ast_new(p->arena, AST_POSTFIX_UNARY, qloc);
+      n->unary.op = TK_QUESTION;
       n->unary.operand = expr;
       expr = n;
       continue;

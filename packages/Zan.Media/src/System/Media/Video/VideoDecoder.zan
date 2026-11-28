@@ -29,14 +29,20 @@ public class VideoDecoder : IDisposable {
         this.Info.FpsDen = VideoNative.zan_video_fps_den(handle);
         this.Info.Bitrate = VideoNative.zan_video_bitrate(handle);
         this.Info.FrameCount = VideoNative.zan_video_frame_count(handle);
-        this.Info.VideoCodec = VideoNative.zan_video_video_codec(handle);
-        this.Info.AudioCodec = VideoNative.zan_video_audio_codec(handle);
+        string vCodec = VideoNative.zan_video_video_codec(handle);
+        string aCodec = VideoNative.zan_video_audio_codec(handle);
+        this.Info.VideoCodec = vCodec == null ? "" : vCodec;
+        this.Info.AudioCodec = aCodec == null ? "" : aCodec;
         this.Info.AudioSampleRate = VideoNative.zan_video_audio_sample_rate(handle);
         this.Info.AudioChannels = VideoNative.zan_video_audio_channels(handle);
     }
 
     public bool IsValid {
-        get { return this.handle != 0; }
+        get {
+            lock (this) {
+                return this.handle != 0;
+            }
+        }
     }
 
     public static VideoDecoder Open(string url) {
@@ -47,46 +53,72 @@ public class VideoDecoder : IDisposable {
 
     // 推进一步解码，返回本步产出的帧类型（视频帧 / 音频帧 / 结束 / 错误）。
     public VideoStepKind Step() {
-        if (this.handle == 0) return VideoStepKind.Error;
-        int r = VideoNative.zan_video_step(this.handle);
-        if (r == 1) return VideoStepKind.VideoFrame;
-        if (r == 2) return VideoStepKind.AudioFrame;
-        if (r == 0) return VideoStepKind.EndOfStream;
-        return VideoStepKind.Error;
+        lock (this) {
+            if (this.handle == 0) return VideoStepKind.Error;
+            int r = VideoNative.zan_video_step(this.handle);
+            if (r == 1) return VideoStepKind.VideoFrame;
+            if (r == 2) return VideoStepKind.AudioFrame;
+            if (r == 0) return VideoStepKind.EndOfStream;
+            return VideoStepKind.Error;
+        }
     }
 
     // 将当前视频帧直接缩放/转色为 ARGB32 写入调用方的 ImageBuffer（零分配热路径）。
     public bool ReadVideoFrame(ImageBuffer dst) {
-        if (this.handle == 0 || dst == null || dst.IsEmpty) return false;
-        return VideoNative.zan_video_copy_video_argb(
-            this.handle, dst.Pixels, dst.Width, dst.Height, dst.Width) != 0;
+        if (dst == null || dst.IsEmpty || dst.Pixels == 0) return false;
+        long bytesL = (long)dst.Width * (long)dst.Height * 4L;
+        if (bytesL <= 0L || bytesL > 2147483591L) return false;
+        lock (this) {
+            if (this.handle == 0) return false;
+            return VideoNative.zan_video_copy_video_argb(
+                this.handle, dst.Pixels, dst.Width, dst.Height, dst.Width) != 0;
+        }
     }
 
     public long VideoPtsMs {
-        get { return this.handle == 0 ? 0 : VideoNative.zan_video_video_pts_ms(this.handle); }
+        get {
+            lock (this) {
+                return this.handle == 0 ? 0L : VideoNative.zan_video_video_pts_ms(this.handle);
+            }
+        }
     }
 
     // 当前音频帧原生 s16 立体声 PCM 指针（仅在下一次 Step/Seek/Dispose 前有效）。
     public nint AudioPcmPtr {
-        get { return this.handle == 0 ? 0 : VideoNative.zan_video_audio_pcm_ptr(this.handle); }
+        get {
+            lock (this) {
+                return this.handle == 0 ? 0 : VideoNative.zan_video_audio_pcm_ptr(this.handle);
+            }
+        }
     }
 
     public int AudioSamples {
-        get { return this.handle == 0 ? 0 : VideoNative.zan_video_audio_samples(this.handle); }
+        get {
+            lock (this) {
+                return this.handle == 0 ? 0 : VideoNative.zan_video_audio_samples(this.handle);
+            }
+        }
     }
 
     public long AudioPtsMs {
-        get { return this.handle == 0 ? 0 : VideoNative.zan_video_audio_pts_ms(this.handle); }
+        get {
+            lock (this) {
+                return this.handle == 0 ? 0L : VideoNative.zan_video_audio_pts_ms(this.handle);
+            }
+        }
     }
 
     public bool SeekMs(long targetMs) {
-        if (this.handle == 0) return false;
-        return VideoNative.zan_video_seek_ms(this.handle, targetMs) != 0;
+        lock (this) {
+            if (this.handle == 0) return false;
+            return VideoNative.zan_video_seek_ms(this.handle, targetMs) != 0;
+        }
     }
 
     // 一键抽取指定时间点的单帧图像（若 outWidth/outHeight <= 0 则使用原始视频分辨率）。
     public static ImageBuffer ExtractFrame(string url, long timestampMs, int outWidth, int outHeight) {
         if (url == null || url == "") return new ImageBuffer(0, 0);
+        if (timestampMs < 0L) timestampMs = 0L;
         int tw = outWidth;
         int th = outHeight;
         if (tw <= 0 || th <= 0) {
@@ -98,13 +130,19 @@ public class VideoDecoder : IDisposable {
                 tw = mi.Width;
                 th = mi.Height;
             } else if (tw <= 0) {
-                tw = (int)((long)mi.Width * (long)th / (long)mi.Height);
-                if (tw < 1) tw = 1;
+                long twL = (long)mi.Width * (long)th / (long)mi.Height;
+                if (twL < 1L) twL = 1L;
+                if (twL > 2147483647L) return new ImageBuffer(0, 0);
+                tw = (int)twL;
             } else {
-                th = (int)((long)mi.Height * (long)tw / (long)mi.Width);
-                if (th < 1) th = 1;
+                long thL = (long)mi.Height * (long)tw / (long)mi.Width;
+                if (thL < 1L) thL = 1L;
+                if (thL > 2147483647L) return new ImageBuffer(0, 0);
+                th = (int)thL;
             }
         }
+        long bytesL = (long)tw * (long)th * 4L;
+        if (bytesL <= 0L || bytesL > 2147483591L) return new ImageBuffer(0, 0);
         ImageBuffer buf = new ImageBuffer(tw, th);
         if (buf.IsEmpty) return buf;
         int ok = VideoNative.zan_video_extract_frame_argb(url, timestampMs, buf.Pixels, tw, th);
@@ -116,9 +154,11 @@ public class VideoDecoder : IDisposable {
     }
 
     public void Dispose() {
-        if (this.handle != 0) {
-            VideoNative.zan_video_close(this.handle);
-            this.handle = 0;
+        lock (this) {
+            if (this.handle != 0) {
+                VideoNative.zan_video_close(this.handle);
+                this.handle = 0;
+            }
         }
     }
 }

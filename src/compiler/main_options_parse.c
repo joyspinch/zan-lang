@@ -65,6 +65,8 @@ zan_options_status_t zan_options_parse(int argc, char **argv,
   bool do_dump_tokens = false;
   bool do_dump_ast = false;
   const char *emit_symbols_path = NULL; /* --emit-symbols <file> */
+  const char *emit_header_path = NULL;  /* --emit-header <file.h> */
+  bool freestanding = false;            /* --freestanding */
   bool do_summary = false;              /* S4 --summary */
   const char *emit_deps_path = NULL;    /* S3 --emit-deps <file> */
   const char *query_name = NULL;        /* S2 --query <symbol> */
@@ -397,6 +399,85 @@ zan_options_status_t zan_options_parse(int argc, char **argv,
       g_phase_start = now_ms();
     } else if (strcmp(argv[i], "--emit-lib") == 0) {
       emit_lib = true;
+    } else if (strcmp(argv[i], "--freestanding") == 0) {
+      freestanding = true;
+      emit_lib = true;
+    } else if (strcmp(argv[i], "--cpu") == 0 && i + 1 < argc) {
+      opts->target_cpu_override = argv[++i];
+    } else if (strcmp(argv[i], "--features") == 0 && i + 1 < argc) {
+      opts->target_features_override = argv[++i];
+    } else if (strcmp(argv[i], "--code-model") == 0) {
+      if (i + 1 >= argc ||
+          (strcmp(argv[i + 1], "default") != 0 &&
+           strcmp(argv[i + 1], "small") != 0 &&
+           strcmp(argv[i + 1], "kernel") != 0 &&
+           strcmp(argv[i + 1], "medium") != 0 &&
+           strcmp(argv[i + 1], "large") != 0)) {
+        fprintf(stderr, "error: --code-model requires default, small, kernel, medium, or large\n");
+        opts->exit_code = 1;
+        return ZAN_OPTIONS_ERROR;
+      }
+      opts->code_model = argv[++i];
+    } else if (strcmp(argv[i], "--reloc-model") == 0) {
+      if (i + 1 >= argc ||
+          (strcmp(argv[i + 1], "default") != 0 &&
+           strcmp(argv[i + 1], "static") != 0 &&
+           strcmp(argv[i + 1], "pic") != 0 &&
+           strcmp(argv[i + 1], "dynamic-no-pic") != 0)) {
+        fprintf(stderr, "error: --reloc-model requires default, static, pic, or dynamic-no-pic\n");
+        opts->exit_code = 1;
+        return ZAN_OPTIONS_ERROR;
+      }
+      opts->reloc_model = argv[++i];
+    } else if (strcmp(argv[i], "--no-red-zone") == 0) {
+      opts->no_red_zone = true;
+    } else if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--emit-obj") == 0) {
+      opts->emit_obj = true;
+      emit_lib = true;
+    } else if ((strcmp(argv[i], "--linker-script") == 0 ||
+                strcmp(argv[i], "-T") == 0) && i + 1 < argc) {
+      if (!zan_link_path_is_safe(argv[i + 1])) {
+        fprintf(stderr, "error: --linker-script/-T value may not contain double"
+                        " quotes or control characters\n");
+        opts->exit_code = 1;
+        return ZAN_OPTIONS_ERROR;
+      }
+      opts->linker_script = argv[++i];
+    } else if (strncmp(argv[i], "--linker-script=", 16) == 0) {
+      const char *ls = argv[i] + 16;
+      if (!ls[0] || !zan_link_path_is_safe(ls)) {
+        fprintf(stderr, "error: invalid --linker-script= value\n");
+        opts->exit_code = 1;
+        return ZAN_OPTIONS_ERROR;
+      }
+      opts->linker_script = ls;
+    } else if (strncmp(argv[i], "-T", 2) == 0 && argv[i][2] != '\0') {
+      const char *ls = argv[i] + 2;
+      if (!zan_link_path_is_safe(ls)) {
+        fprintf(stderr, "error: invalid -T value\n");
+        opts->exit_code = 1;
+        return ZAN_OPTIONS_ERROR;
+      }
+      opts->linker_script = ls;
+    } else if ((strcmp(argv[i], "--entry") == 0 ||
+                strcmp(argv[i], "-e") == 0) && i + 1 < argc) {
+      if (!zan_link_path_is_safe(argv[i + 1])) {
+        fprintf(stderr, "error: --entry value may not contain double"
+                        " quotes or control characters\n");
+        opts->exit_code = 1;
+        return ZAN_OPTIONS_ERROR;
+      }
+      opts->entry_symbol = argv[++i];
+    } else if (strncmp(argv[i], "--entry=", 8) == 0) {
+      const char *es = argv[i] + 8;
+      if (!es[0] || !zan_link_path_is_safe(es)) {
+        fprintf(stderr, "error: invalid --entry= value\n");
+        opts->exit_code = 1;
+        return ZAN_OPTIONS_ERROR;
+      }
+      opts->entry_symbol = es;
+    } else if (strcmp(argv[i], "--emit-header") == 0 && i + 1 < argc) {
+      emit_header_path = argv[++i];
     } else if (strcmp(argv[i], "--emit-apk") == 0 && i + 1 < argc) {
       emit_lib = true;
       apk_path = argv[++i];
@@ -641,6 +722,8 @@ zan_options_status_t zan_options_parse(int argc, char **argv,
   opts->default_icon_explicit = default_icon_explicit;
   opts->emit_lib = emit_lib;
   opts->lib_shared = lib_shared;
+  opts->freestanding = freestanding;
+  opts->emit_header_path = emit_header_path;
   opts->apk_path = apk_path;
   opts->apk_package = apk_package;
   opts->apk_label = apk_label;

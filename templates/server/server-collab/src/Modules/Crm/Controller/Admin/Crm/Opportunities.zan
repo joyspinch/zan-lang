@@ -1,14 +1,16 @@
 using System;
 using System.Data;
 using System.Data.Orm;
+using System.Json;
 using System.Web;
 using Zan.Web;
+using Zan.Web.AdminUi;
 using Zan.Web.Model.Crm;
 using Zan.Web.Dao.Crm;
 
 namespace Zan.Web.Admin.Crm;
 
-/* /admin/crm/opportunities 商机管理：列表、建、编、删、阶段推进。阶段推进只改 stage 字段，不删记录。 */
+/* /admin/crm/opportunities 商机管理：列表、建、编、删、阶段推进、报表生成。 */
 [Route("admin/crm/opportunities/[action]")]
 [Custom(Authorization = CustomAuthorization.Grant)]
 [Description("商机管理")]
@@ -16,98 +18,134 @@ public class Opportunities : AdminController {
     public CrmOpportunityDao CrmOpportunity { get { return new CrmOpportunityDao(this.Held()); } }
     public CrmCustomerDao CrmCustomer { get { return new CrmCustomerDao(this.Held()); } }
 
+    static ListPage ScreenDef() {
+        return ListPage.Of()
+            .Text("商机名称", "kw", "title", "搜索商机名称")
+            .Select("阶段", "stage", "stage", "1=初步接触,2=需求确认,3=方案报价,4=谈判,5=赢单,0=输单")
+            .TbarAdd("新增商机", "/admin/crm/opportunities/form")
+            .TbarCustom("生成报表", "/admin/crm/opportunities/mailexport", "确认生成商机 Excel 报表吗？")
+            .Col("id", "ID", "num", "75")
+            .Col("title", "商机名称", "text", "200")
+            .Col("customer", "所属客户", "text", "160")
+            .Col("amount", "金额(分)", "num", "120")
+            .Tag("stage", "当前阶段", "1=初步接触|warn,2=需求确认|warn,3=方案报价|warn,4=谈判|warn,5=赢单|ok,0=输单|off", "110")
+            .OpsEdit("/admin/crm/opportunities/form")
+            .Ops("推进阶段", "/admin/crm/opportunities/stage", "确认将所选商机推进到下一阶段吗？", "id={id}&stage={nextStage}", "u")
+            .OpsDel("/admin/crm/opportunities/delete", "确认删除该商机吗？");
+    }
+
     [HttpGet]
     [Route("/admin/crm/opportunities")]
     [Custom(IsMenu = true, Icon = "mdi:target", Perm = PermBit.View)]
     [Description("商机管理")]
-    async void Index() {
-        ViewData d = await this.Layout("商机管理");
-        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+    void Index() {
+        this.Conf();
+    }
 
-        ListQuery q = this.Paged("id", 20);
+    [HttpPut]
+    [Custom(Perm = PermBit.View)]
+    [Description("商机表格配置")]
+    public void Conf() {
+        CrudOps.Conf(this, Opportunities.ScreenDef());
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.View)]
+    [Description("商机列表数据")]
+    public async void List() {
+        if (!this.DataReady()) { return; }
+        ListQuery q = this.PagedAny("id", 20);
+        string kw = q.Kw();
+        string stageStr = this.InAny("stage");
+        bool hasStage = stageStr.Length > 0 && stageStr != "-1";
+        int stageVal = Filter.ToInt(stageStr, -1);
+
         /* 租户硬边（#34）：列表只出本租户行，外键解析的客户选项同链。 */
         List<CrmOpportunity> rows = await this.CrmOpportunity
             .Where(a => a.tenantId == Tenant.Cur())
+            .WhereIf(kw.Length > 0, a => a.title.Contains(kw))
+            .WhereIf(hasStage && stageVal >= 0, a => a.stage == stageVal)
             .OrderByDescending(a => a.id)
             .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
         int total = await this.CrmOpportunity
-            .Where(a => a.tenantId == Tenant.Cur()).CountAsync();
+            .Where(a => a.tenantId == Tenant.Cur())
+            .WhereIf(kw.Length > 0, a => a.title.Contains(kw))
+            .WhereIf(hasStage && stageVal >= 0, a => a.stage == stageVal)
+            .CountAsync();
         List<CrmCustomer> custs = await this.CrmCustomer
             .Where(a => a.tenantId == Tenant.Cur())
             .OrderBy(a => a.id).ToListAsync();
 
-        List<StrMap> items = d.AddList("rows");
+        JsonWriter w = new JsonWriter();
+        w.WriteStartArray();
         for (int i = 0; i < rows.Count; i = i + 1) {
             CrmOpportunity o = rows[i];
-            StrMap row = new StrMap();
-            row.Set("id", Convert.ToString(o.id));
-            row.Set("title", o.title);
-            row.Set("customer", Opportunities.CustName(custs, o.customerId));
-            row.Set("amount", Convert.ToString(o.amount));
-            row.Set("stageText", Opportunities.StageText(o.stage));
-            row.Set("stageClass", Opportunities.StageClass(o.stage));
-            row.Set("nextStage", Convert.ToString(Opportunities.NextStage(o.stage)));
-            row.Set("advanceText", Opportunities.AdvanceText(o.stage));
-            row.Set("canAdvance", (o.stage >= 1 && o.stage < 5) ? "1" : "");
-            items.Add(row);
+            w.WriteStartObject();
+            w.WriteProperty("id", o.id);
+            w.WriteProperty("customerId", Convert.ToString(o.customerId));
+            w.WriteProperty("title", o.title);
+            w.WriteProperty("customer", Opportunities.CustName(custs, o.customerId));
+            w.WriteProperty("amount", o.amount);
+            w.WriteProperty("stage", Convert.ToString(o.stage));
+            w.WriteProperty("nextStage", Opportunities.NextStage(o.stage));
+            w.WriteEndObject();
         }
-        this.Pager(d, q, total);
-        this.Page(d);
+        w.WriteEndArray();
+        AdminUiProtocol.WriteListData(this, total, w.ToString());
     }
 
-    [HttpGet]
+    [HttpPut]
     [Custom(Perm = PermBit.Create | PermBit.Update)]
-    [Description("商机表单")]
-    async void Form() {
-        int id = this.InInt("id", 0);
-        CrmOpportunity o = null;
-        if (id > 0) {
-            o = await this.CrmOpportunity
-                .Where(a => a.id == id && a.tenantId == Tenant.Cur())
-                .FirstAsync();
-            if (o == null) { this.Fail(404, "0404", "商机不存在"); }
-        }
-        ViewData d = new ViewData();
-        d.Set("id", Convert.ToString(id));
-        d.Set("dialogTitle", id > 0 ? "编辑商机" : "新增商机");
-        if (id <= 0) { d.Set("new", "1"); d.Set("stage1", "selected"); }
-        else { d.Set("edit", "1"); }
-
+    [Description("商机表单配置")]
+    public async void FormConf() {
         List<CrmCustomer> custs = await this.CrmCustomer
             .Where(a => a.tenantId == Tenant.Cur())
             .OrderBy(a => a.id).ToListAsync();
-        List<StrMap> copts = d.AddList("customers");
+        List<StrMap> copts = new List<StrMap>();
         for (int i = 0; i < custs.Count; i = i + 1) {
             StrMap opt = new StrMap();
             opt.Set("id", Convert.ToString(custs[i].id));
             opt.Set("name", custs[i].name);
-            if (o != null && custs[i].id == o.customerId) { opt.Set("selected", "selected"); }
             copts.Add(opt);
         }
-        if (o != null) {
-            d.Set("title", o.title);
-            d.Set("amount", Convert.ToString(o.amount));
-            d.Set("stage1", ""); d.Set("stage2", ""); d.Set("stage3", "");
-            d.Set("stage4", ""); d.Set("stage5", "");
-            if (o.stage == 1) { d.Set("stage1", "selected"); }
-            else if (o.stage == 2) { d.Set("stage2", "selected"); }
-            else if (o.stage == 3) { d.Set("stage3", "selected"); }
-            else if (o.stage == 4) { d.Set("stage4", "selected"); }
-            else if (o.stage == 5) { d.Set("stage5", "selected"); }
-        }
-        this.Dialog(d);
+        FormPage fp = FormPage.Of("/admin/crm/opportunities/save")
+            .SelectList("所属客户", "customerId", copts).Req()
+            .Text("商机名称", "title").Req().Ph("请输入商机名称")
+            .Num("预计金额(分)", "amount").Val("0")
+            .Select("商机阶段", "stage", "1=初步接触,2=需求确认,3=方案报价,4=谈判,5=赢单,0=输单").Val("1");
+        CrudOps.FormConf(this, fp, "商机");
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.View)]
+    [Description("商机编辑回显")]
+    public async void Edit() {
+        int id = this.InAnyInt("id", 0);
+        CrmOpportunity o = await this.CrmOpportunity
+            .Where(a => a.id == id && a.tenantId == Tenant.Cur())
+            .FirstAsync();
+        if (o == null) { this.Fail(404, "0404", "商机不存在"); return; }
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("id", o.id);
+        w.WriteProperty("customerId", Convert.ToString(o.customerId));
+        w.WriteProperty("title", o.title);
+        w.WriteProperty("amount", o.amount);
+        w.WriteProperty("stage", Convert.ToString(o.stage));
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(this, w.ToString());
     }
 
     [HttpPost]
     [Custom(Perm = PermBit.Create | PermBit.Update)]
     [Description("保存商机")]
     async void Save() {
-        int id = this.InInt("id", 0);
-        int customerId = this.InInt("customerId", 0);
-        string title = this.Need("title", "商机名称");
-        long amount = (long)this.InInt("amount", 0);
-        int stage = this.InInt("stage", 1);
-        if (customerId <= 0) { this.Fail(400, "0004", "请选择客户"); }
+        int id = this.InAnyInt("id", 0);
+        int customerId = this.InAnyInt("customerId", 0);
+        string title = this.NeedAny("title", "商机名称");
+        long amount = this.InAnyLong("amount", 0);
+        int stage = this.InAnyInt("stage", 1);
+        if (customerId <= 0) { this.Fail(400, "0004", "请选择客户"); return; }
 
         if (id > 0) {
             int n = await this.CrmOpportunity.Update()
@@ -139,12 +177,12 @@ public class Opportunities : AdminController {
     [Custom(Perm = PermBit.Update)]
     [Description("推进商机阶段")]
     async void Stage() {
-        int id = this.InInt("id", 0);
-        int stage = this.InInt("stage", 1);
+        int id = this.InAnyInt("id", 0);
+        int stage = this.InAnyInt("stage", 1);
         CrmOpportunity o = await this.CrmOpportunity
             .Where(a => a.id == id && a.tenantId == Tenant.Cur())
             .FirstAsync();
-        if (o == null) { this.Fail(404, "0404", "商机不存在"); }
+        if (o == null) { this.Fail(404, "0404", "商机不存在"); return; }
         int n = await this.CrmOpportunity.Update()
             .Set(a => a.stage, stage)
             .Set(a => a.updatedAt, WebApp.NowSeconds())
@@ -158,11 +196,11 @@ public class Opportunities : AdminController {
     [Custom(Perm = PermBit.Delete)]
     [Description("删除商机")]
     async void Delete() {
-        int id = this.InInt("id", 0);
+        int id = this.InAnyInt("id", 0);
         CrmOpportunity o = await this.CrmOpportunity
             .Where(a => a.id == id && a.tenantId == Tenant.Cur())
             .FirstAsync();
-        if (o == null) { this.Fail(404, "0404", "商机不存在"); }
+        if (o == null) { this.Fail(404, "0404", "商机不存在"); return; }
         int n = await this.CrmOpportunity.Delete()
             .Where(a => a.id == id && a.tenantId == Tenant.Cur())
             .ExecuteAffrowsAsync();
@@ -186,32 +224,16 @@ public class Opportunities : AdminController {
         return "输单";
     }
 
-    static string StageClass(int stage) {
-        if (stage == 5) { return "ok"; }
-        if (stage == 0) { return "off"; }
-        return "warn";
-    }
-
     static int NextStage(int stage) {
         if (stage >= 1 && stage < 5) { return stage + 1; }
         return stage;
     }
 
-    static string AdvanceText(int stage) {
-        if (stage >= 1 && stage < 5) { return "推进"; }
-        return "已结束";
-    }
-
-    /* ---- T7 商机报表发邮箱（验收场景）----------------------------------
-       xlsx 报表先落盘 data/exports/，SMTP 已配置且给了收件人则发通知邮件；
-       未配置走离线闭环（文件生成即证据）。偏差记录 ⑥：Mailer 为纯文本
-       SMTP 客户端，无 MIME 附件能力——邮件只告知报表位置，附件直发
-       留待引入 multipart 邮件后。 */
     [HttpPost]
     [Custom(Perm = PermBit.Export)]
     [Description("商机报表发邮箱")]
     async void MailExport() {
-        string to = Fmt.Text(this.In("to"), "");
+        string to = Fmt.Text(this.InAny("to"), "");
         List<CrmOpportunity> rows = await this.CrmOpportunity
             .Where(a => a.tenantId == Tenant.Cur())
             .OrderBy(a => a.id).ToListAsync();

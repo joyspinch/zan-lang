@@ -155,6 +155,18 @@ typedef struct {
     zgl_int u_ice_frost_params, u_ice_frost_color;
     zgl_int u_lava_crust_params, u_lava_crust_color;
     zgl_int u_iridescence_params;
+    zgl_int u_sonar_origin_radius, u_sonar_style, u_sonar_color;
+    zgl_int u_force_field_params, u_force_field_color;
+    zgl_int u_rain_ripples_params, u_rain_ripples_color;
+    zgl_int u_xray_params, u_xray_color;
+    zgl_int u_portal_vortex_params, u_portal_vortex_color;
+    zgl_int u_blueprint_wire_params, u_blueprint_wire_color;
+    zgl_int u_heat_haze_params, u_heat_haze_color;
+    zgl_int u_pixel_dither_params;
+    zgl_int u_crosshatch_params, u_crosshatch_color;
+    zgl_int u_aniso_brushed_params, u_aniso_brushed_color;
+    zgl_int u_velvet_sheen_params, u_velvet_sheen_color;
+    zgl_int u_subsurface_params, u_subsurface_color;
     zgl_int u_light_dir, u_light_color, u_light_count, u_ambient;
     zgl_int u_cam_pos, u_cam_valid, u_material, u_emissive;
     zgl_int u_point_pos, u_point_color, u_point_count;
@@ -244,6 +256,30 @@ static float g_game_ice_frost_color[3] = { 0.65f, 0.92f, 1.0f };
 static float g_game_lava_crust_params[4] = { 0.0f, 1.5f, 0.0f, 0.18f }; /* enabled, scale, phase, crack_width */
 static float g_game_lava_crust_color[4] = { 1.0f, 0.35f, 0.04f, 0.0f }; /* r, g, b, strength */
 static float g_game_iridescence_params[4] = { 0.0f, 2.0f, 0.0f, 0.0f }; /* enabled, film_thickness, phase_shift, strength */
+static float g_game_sonar_origin_radius[4] = { 0.0f, 0.0f, 0.0f, 1.0f }; /* ox, oy, oz, radius */
+static float g_game_sonar_style[3] = { 0.0f, 0.6f, 0.0f }; /* enabled, ring_width, strength */
+static float g_game_sonar_color[3] = { 0.1f, 0.9f, 1.0f };
+static float g_game_force_field_params[4] = { 0.0f, 2.0f, 0.0f, 0.10f }; /* enabled, scale, phase, edge_width */
+static float g_game_force_field_color[4] = { 0.1f, 0.75f, 1.0f, 0.0f }; /* r, g, b, strength */
+static float g_game_rain_ripples_params[4] = { 0.0f, 2.0f, 0.0f, 0.0f }; /* enabled, scale, phase, strength */
+static float g_game_rain_ripples_color[3] = { 0.75f, 0.88f, 1.0f };
+static float g_game_xray_params[3] = { 0.0f, 2.5f, 0.0f }; /* enabled, power, strength */
+static float g_game_xray_color[3] = { 0.2f, 0.85f, 1.0f };
+static float g_game_portal_vortex_params[4] = { 0.0f, 3.0f, 0.0f, 0.0f }; /* enabled, swirl_turns, phase, strength */
+static float g_game_portal_vortex_color[3] = { 0.55f, 0.25f, 1.0f };
+static float g_game_blueprint_wire_params[4] = { 0.0f, 2.0f, 0.06f, 0.0f }; /* enabled, density, line_width, strength */
+static float g_game_blueprint_wire_color[3] = { 0.15f, 0.78f, 1.0f };
+static float g_game_heat_haze_params[4] = { 0.0f, 4.0f, 0.0f, 0.0f }; /* enabled, freq, phase, strength */
+static float g_game_heat_haze_color[3] = { 1.0f, 0.55f, 0.18f };
+static float g_game_pixel_dither_params[3] = { 0.0f, 1.0f, 1.0f }; /* enabled, opacity, pixel_scale */
+static float g_game_crosshatch_params[3] = { 0.0f, 8.0f, 0.0f }; /* enabled, density, ink_strength */
+static float g_game_crosshatch_color[3] = { 0.05f, 0.05f, 0.08f };
+static float g_game_aniso_brushed_params[4] = { 0.0f, 12.0f, 16.0f, 0.0f }; /* enabled, grain_freq, anisotropy, strength */
+static float g_game_aniso_brushed_color[3] = { 0.85f, 0.90f, 1.0f };
+static float g_game_velvet_sheen_params[4] = { 0.0f, 0.35f, 16.0f, 0.0f }; /* enabled, roughness, weave_freq, strength */
+static float g_game_velvet_sheen_color[3] = { 0.95f, 0.78f, 1.0f };
+static float g_game_subsurface_params[4] = { 0.0f, 0.5f, 0.0f, 3.0f }; /* enabled, wrap, translucency, power */
+static float g_game_subsurface_color[3] = { 1.0f, 0.35f, 0.20f };
 static float g_game_color_grade[2] = { 1.0f, 1.0f }; /* saturation, contrast */
 static float g_game_color_tint[3] = { 1.0f, 1.0f, 1.0f };
 static float g_game_post_lens[2] = { 0.0f, 0.0f }; /* fxaa, chromatic */
@@ -260,6 +296,22 @@ static float g_game_post_thermal[3] = { 0.0f, 1.0f, 0.0f }; /* strength, sensiti
 static float g_game_post_flash_params[2] = { 0.0f, 0.0f }; /* edge_strength, flash_strength */
 static float g_game_post_flash_color[3] = { 1.0f, 0.05f, 0.05f };
 static float g_game_post_night_vision[4] = { 0.0f, 3.0f, 0.06f, 0.0f }; /* strength, gain, noise_amount, seed */
+static float g_game_post_halftone[3] = { 0.0f, 6.0f, 1.0f }; /* strength, dot_scale, contrast */
+static float g_game_post_glitch[3] = { 0.0f, 24.0f, 0.0f }; /* intensity, slice_count, seed */
+static float g_game_post_tilt_shift[3] = { 0.0f, 0.5f, 0.15f }; /* strength, focus_y, focus_band */
+static float g_game_post_frost_params[2] = { 0.0f, 0.45f }; /* intensity, radius */
+static float g_game_post_frost_color[3] = { 0.55f, 0.88f, 1.0f };
+static float g_game_post_sepia[3] = { 0.0f, 0.0f, 0.0f }; /* strength, scratch_amount, seed */
+static float g_game_post_streak_params[2] = { 0.0f, 0.75f }; /* strength, threshold */
+static float g_game_post_streak_color[3] = { 0.25f, 0.78f, 1.0f };
+static float g_game_post_split_params[2] = { 0.0f, 0.0f }; /* strength, balance */
+static float g_game_post_split_shadow[3] = { 0.05f, 0.35f, 0.95f };
+static float g_game_post_split_high[3] = { 1.0f, 0.58f, 0.15f };
+static float g_game_post_oil_paint[2] = { 0.0f, 2.0f }; /* strength, radius */
+static float g_game_post_scope_blur[2] = { 0.0f, 0.45f }; /* strength, clear_radius */
+static float g_game_post_daltonize[2] = { 0.0f, 0.0f }; /* mode (0..3), strength (0..1) */
+static float g_game_post_lens_distort[2] = { 0.0f, 1.0f }; /* k1 (-0.6..0.6), zoom (0.5..1.5) */
+static float g_game_post_god_rays[4] = { 0.0f, 0.92f, 0.5f, 0.5f }; /* strength, decay, light_x, light_y */
 static uint32_t g_game_light_version = 1;
 
 static zan_game_mesh *g_game_meshes = NULL;
@@ -565,6 +617,30 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
 "uniform vec4 uLavaCrustParams;\n" \
 "uniform vec4 uLavaCrustColor;\n" \
 "uniform vec4 uIridescenceParams;\n" \
+"uniform vec4 uSonarOriginRadius;\n" \
+"uniform vec3 uSonarStyle;\n" \
+"uniform vec3 uSonarColor;\n" \
+"uniform vec4 uForceFieldParams;\n" \
+"uniform vec4 uForceFieldColor;\n" \
+"uniform vec4 uRainRipplesParams;\n" \
+"uniform vec3 uRainRipplesColor;\n" \
+"uniform vec3 uXrayParams;\n" \
+"uniform vec3 uXrayColor;\n" \
+"uniform vec4 uPortalVortexParams;\n" \
+"uniform vec3 uPortalVortexColor;\n" \
+"uniform vec4 uBlueprintWireParams;\n" \
+"uniform vec3 uBlueprintWireColor;\n" \
+"uniform vec4 uHeatHazeParams;\n" \
+"uniform vec3 uHeatHazeColor;\n" \
+"uniform vec3 uPixelDitherParams;\n" \
+"uniform vec3 uCrosshatchParams;\n" \
+"uniform vec3 uCrosshatchColor;\n" \
+"uniform vec4 uAnisoBrushedParams;\n" \
+"uniform vec3 uAnisoBrushedColor;\n" \
+"uniform vec4 uVelvetSheenParams;\n" \
+"uniform vec3 uVelvetSheenColor;\n" \
+"uniform vec4 uSubsurfaceParams;\n" \
+"uniform vec3 uSubsurfaceColor;\n" \
 "uniform vec3 uCamPos;\n" \
 "uniform int uCamValid;\n" \
 "uniform vec2 uMaterial;\n" \
@@ -797,8 +873,129 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
     "        float irFres = 0.25 + 0.75 * pow(1.0 - irNdv, 1.5);\n" \
     "        rgb += irCol * (irFres * clamp(uIridescenceParams.w, 0.0, 2.0));\n" \
     "    }\n" \
+    "    if (uSonarStyle.x > 0.5 && uSonarStyle.z > 0.0005) {\n" \
+    "        float sDist = length(v_world_pos - uSonarOriginRadius.xyz);\n" \
+    "        float sRad = max(uSonarOriginRadius.w, 0.05);\n" \
+    "        float sW = max(uSonarStyle.y, 0.05);\n" \
+    "        float sBehind = sRad - sDist;\n" \
+    "        float sWave = (sBehind >= 0.0 && sBehind <= sW) ? pow(1.0 - (sBehind / sW), 1.6) : 0.0;\n" \
+    "        float sLead = smoothstep(sW * 0.25, 0.0, abs(sDist - sRad));\n" \
+    "        float sInt = clamp(sWave + sLead * 0.55, 0.0, 1.5);\n" \
+    "        rgb += uSonarColor * (sInt * clamp(uSonarStyle.z, 0.0, 3.0));\n" \
+    "    }\n" \
+    "    if (uForceFieldParams.x > 0.5 && uForceFieldColor.w > 0.0005) {\n" \
+    "        vec2 hp = ((abs(N.y) > 0.6) ? v_world_pos.xz : vec2(v_world_pos.x + v_world_pos.z, v_world_pos.y))\n" \
+    "            * max(uForceFieldParams.y, 0.25);\n" \
+    "        vec2 hS = vec2(1.0, 1.7320508);\n" \
+    "        vec2 hH = hS * 0.5;\n" \
+    "        vec2 hA = mod(hp, hS) - hH;\n" \
+    "        vec2 hB = mod(hp - hH, hS) - hH;\n" \
+    "        vec2 hGv = (dot(hA, hA) < dot(hB, hB)) ? hA : hB;\n" \
+    "        float hDist = max(abs(hGv.x), abs(hGv.x) * 0.5 + abs(hGv.y) * 0.8660254);\n" \
+    "        float hW = clamp(uForceFieldParams.w, 0.02, 0.35);\n" \
+    "        float hEdge = smoothstep(0.5 - hW, 0.5, hDist);\n" \
+    "        float hPulse = 0.72 + 0.28 * sin(hp.y * 1.4 - uForceFieldParams.z * 3.0);\n" \
+    "        rgb += uForceFieldColor.rgb * (hEdge * hPulse * clamp(uForceFieldColor.w, 0.0, 3.0));\n" \
+    "    }\n" \
+    "    if (uRainRipplesParams.x > 0.5 && uRainRipplesParams.w > 0.0005) {\n" \
+    "        float rrUp = smoothstep(0.35, 0.75, N.y);\n" \
+    "        if (rrUp > 0.001) {\n" \
+    "            vec2 rp = v_world_pos.xz * max(uRainRipplesParams.y, 0.25);\n" \
+    "            vec2 rCell = floor(rp);\n" \
+    "            vec2 rF = fract(rp) - vec2(0.5);\n" \
+    "            float rHash = fract(sin(dot(rCell, vec2(127.1, 311.7))) * 43758.5453);\n" \
+    "            float rAge = fract(uRainRipplesParams.z + rHash);\n" \
+    "            float rRad = rAge * 0.45;\n" \
+    "            float rRing = smoothstep(0.08, 0.0, abs(length(rF) - rRad)) * (1.0 - rAge);\n" \
+    "            rgb += uRainRipplesColor * (rRing * rrUp * clamp(uRainRipplesParams.w, 0.0, 3.0));\n" \
+    "        }\n" \
+    "    }\n" \
+    "    if (uPortalVortexParams.x > 0.5 && uPortalVortexParams.w > 0.0005) {\n" \
+    "        vec2 pv = v_uv - vec2(0.5);\n" \
+    "        float pRad = length(pv);\n" \
+    "        float pRing = smoothstep(0.50, 0.34, pRad) * smoothstep(0.05, 0.18, pRad);\n" \
+    "        if (pRing > 0.001) {\n" \
+    "            float pAng = atan(pv.y, pv.x);\n" \
+    "            float pArm = 0.5 + 0.5 * sin(pAng * 4.0 + pRad * uPortalVortexParams.y * 6.2831853 - uPortalVortexParams.z * 6.2831853);\n" \
+    "            rgb += uPortalVortexColor * (pRing * (0.25 + 0.75 * pArm * pArm) * clamp(uPortalVortexParams.w, 0.0, 3.0));\n" \
+    "        }\n" \
+    "    }\n" \
+    "    if (uBlueprintWireParams.x > 0.5 && uBlueprintWireParams.w > 0.0005) {\n" \
+    "        vec3 bp = abs(fract(v_world_pos * max(uBlueprintWireParams.y, 0.25) + vec3(0.5)) - vec3(0.5));\n" \
+    "        float bpW = clamp(uBlueprintWireParams.z, 0.01, 0.25);\n" \
+    "        vec3 bpMask = vec3(1.0) - abs(N);\n" \
+    "        float bpX = bpMask.x * smoothstep(bpW, 0.0, bp.x);\n" \
+    "        float bpY = bpMask.y * smoothstep(bpW, 0.0, bp.y);\n" \
+    "        float bpZ = bpMask.z * smoothstep(bpW, 0.0, bp.z);\n" \
+    "        float bpLine = max(bpX, max(bpY, bpZ));\n" \
+    "        rgb += uBlueprintWireColor * (bpLine * clamp(uBlueprintWireParams.w, 0.0, 3.0));\n" \
+    "    }\n" \
+    "    if (uHeatHazeParams.x > 0.5 && uHeatHazeParams.w > 0.0005) {\n" \
+    "        float hhFreq = max(uHeatHazeParams.y, 0.5);\n" \
+    "        float hhW1 = sin(v_world_pos.y * hhFreq - uHeatHazeParams.z + v_world_pos.x * (hhFreq * 0.65));\n" \
+    "        float hhW2 = sin(v_world_pos.y * (hhFreq * 1.6) - uHeatHazeParams.z * 1.45 - v_world_pos.z * (hhFreq * 0.75));\n" \
+    "        float hhCrest = pow(clamp(0.5 + 0.25 * (hhW1 + hhW2), 0.0, 1.0), 3.0);\n" \
+    "        rgb += uHeatHazeColor * (hhCrest * clamp(uHeatHazeParams.w, 0.0, 3.0));\n" \
+    "    }\n" \
+    "    if (uPixelDitherParams.x > 0.5) {\n" \
+    "        float pdScale = max(uPixelDitherParams.z, 1.0);\n" \
+    "        vec2 pdCell = mod(floor(gl_FragCoord.xy / pdScale), 4.0);\n" \
+    "        vec2 pdLo = mod(pdCell, 2.0);\n" \
+    "        vec2 pdHi = floor(pdCell * 0.5);\n" \
+    "        float pdIdx = (pdLo.x * 2.0 + mod(pdLo.x + pdLo.y, 2.0)) * 4.0 + (pdHi.x * 2.0 + mod(pdHi.x + pdHi.y, 2.0));\n" \
+    "        float pdThresh = (pdIdx + 0.5) / 16.0;\n" \
+    "        if (clamp(uPixelDitherParams.y, 0.0, 1.0) < pdThresh) {\n" \
+    "            discard;\n" \
+    "        }\n" \
+    "    }\n" \
+    "    if (uCrosshatchParams.x > 0.5 && uCrosshatchParams.z > 0.0005) {\n" \
+    "        float chLum = dot(rgb, vec3(0.2126, 0.7152, 0.0722));\n" \
+    "        float chStep = max(uCrosshatchParams.y, 2.0);\n" \
+    "        float chD1 = abs(fract((gl_FragCoord.x + gl_FragCoord.y) / chStep) - 0.5);\n" \
+    "        float chD2 = abs(fract((gl_FragCoord.x - gl_FragCoord.y) / chStep) - 0.5);\n" \
+    "        float chInk = 0.0;\n" \
+    "        if (chLum < 0.65) { chInk = max(chInk, smoothstep(0.18, 0.06, chD1)); }\n" \
+    "        if (chLum < 0.35) { chInk = max(chInk, smoothstep(0.18, 0.06, chD2)); }\n" \
+    "        rgb = mix(rgb, uCrosshatchColor, chInk * clamp(uCrosshatchParams.z, 0.0, 1.0));\n" \
+    "    }\n" \
+    "    if (uAnisoBrushedParams.x > 0.5 && uAnisoBrushedParams.w > 0.0005) {\n" \
+    "        vec3 abRef = (abs(N.y) < 0.92) ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);\n" \
+    "        vec3 abT = normalize(cross(abRef, N));\n" \
+    "        vec3 abB = cross(N, abT);\n" \
+    "        float abCoord = dot(v_world_pos, abB) * max(uAnisoBrushedParams.y, 1.0);\n" \
+    "        float abGroove = 0.5 + 0.5 * sin(abCoord * 6.2831853);\n" \
+    "        vec3 abH = (uCamValid != 0 && uLightCount > 0) ? normalize(normalize(-uLightDir[0]) + V) : normalize(N + vec3(0.25, 0.45, 0.85));\n" \
+    "        float abTdH = dot(abT, abH);\n" \
+    "        float abSinTH = sqrt(max(1.0 - abTdH * abTdH, 0.0));\n" \
+    "        float abSpec = pow(abSinTH, clamp(uAnisoBrushedParams.z, 2.0, 64.0));\n" \
+    "        rgb += uAnisoBrushedColor * ((0.25 + 0.75 * abGroove) * (0.35 + 0.65 * abSpec) * clamp(uAnisoBrushedParams.w, 0.0, 3.0));\n" \
+    "    }\n" \
+    "    if (uVelvetSheenParams.x > 0.5 && uVelvetSheenParams.w > 0.0005) {\n" \
+    "        vec3 vsV = (uCamValid != 0) ? V : vec3(0.0, 0.0, 1.0);\n" \
+    "        float vsNdv = clamp(abs(dot(N, vsV)), 0.0, 1.0);\n" \
+    "        float vsSin = sqrt(max(1.0 - vsNdv * vsNdv, 0.0));\n" \
+    "        float vsInvR = 1.0 / max(uVelvetSheenParams.y, 0.12);\n" \
+    "        float vsLobe = pow(vsSin, clamp(vsInvR, 1.0, 6.0));\n" \
+    "        float vsWf = max(uVelvetSheenParams.z, 2.0);\n" \
+    "        float vsWeave = 0.85 + 0.15 * sin(v_world_pos.x * vsWf * 6.2831853) * sin(v_world_pos.y * vsWf * 6.2831853);\n" \
+    "        rgb += uVelvetSheenColor * (vsLobe * vsWeave * clamp(uVelvetSheenParams.w, 0.0, 3.0));\n" \
+    "    }\n" \
+    "    if (uSubsurfaceParams.x > 0.5 && (uSubsurfaceParams.y > 0.0005 || uSubsurfaceParams.z > 0.0005)) {\n" \
+    "        vec3 ssL = (uLightCount > 0) ? normalize(-uLightDir[0]) : vec3(0.0, 0.35, -0.936);\n" \
+    "        vec3 ssV = (uCamValid != 0) ? V : vec3(0.0, 0.0, 1.0);\n" \
+    "        float ssW = clamp(uSubsurfaceParams.y, 0.0, 1.0);\n" \
+    "        float ssNdl = dot(N, ssL);\n" \
+    "        float ssWrap = max(0.0, (ssNdl + ssW) / (1.0 + ssW)) - max(0.0, ssNdl);\n" \
+    "        vec3 ssH = normalize(ssL + N * 0.35);\n" \
+    "        float ssBack = pow(clamp(dot(ssV, -ssH), 0.0, 1.0), clamp(uSubsurfaceParams.w, 1.0, 8.0));\n" \
+    "        rgb += uSubsurfaceColor * (max(ssWrap, 0.0) * 0.85 + ssBack * clamp(uSubsurfaceParams.z, 0.0, 2.0));\n" \
+    "    }\n" \
     "    if (uCamValid != 0) {\n" \
     "        float ndv = clamp(dot(N, V), 0.0, 1.0);\n" \
+    "        if (uXrayParams.x > 0.5 && uXrayParams.z > 0.0005) {\n" \
+    "            float xrRim = pow(clamp(1.0 - ndv, 0.0, 1.0), clamp(uXrayParams.y, 0.5, 8.0));\n" \
+    "            rgb += uXrayColor * (xrRim * clamp(uXrayParams.z, 0.0, 3.0));\n" \
+    "        }\n" \
     "        if (uHemiOn != 0) {\n" \
     "            vec3 R = reflect(-V, N);\n" \
     "            vec3 envSpec = mix(uHemiGround, uHemiSky, clamp(R.y * 0.5 + 0.5, 0.0, 1.0));\n" \
@@ -939,6 +1136,22 @@ static const char *const ZAN_GAME_POST_FS =
 "uniform vec2 uPostFlashParams;\n"
 "uniform vec3 uPostFlashColor;\n"
 "uniform vec4 uPostNightVision;\n"
+"uniform vec3 uPostHalftone;\n"
+"uniform vec3 uPostGlitch;\n"
+"uniform vec3 uPostTiltShift;\n"
+"uniform vec2 uPostFrostParams;\n"
+"uniform vec3 uPostFrostColor;\n"
+"uniform vec3 uPostSepia;\n"
+"uniform vec2 uPostStreakParams;\n"
+"uniform vec3 uPostStreakColor;\n"
+"uniform vec2 uPostSplitParams;\n"
+"uniform vec3 uPostSplitShadow;\n"
+"uniform vec3 uPostSplitHigh;\n"
+"uniform vec2 uPostOilPaint;\n"
+"uniform vec2 uPostScopeBlur;\n"
+"uniform vec2 uPostDaltonize;\n"
+"uniform vec2 uPostLensDistort;\n"
+"uniform vec4 uPostGodRays;\n"
 "in vec2 v_uv;\n"
 "out vec4 frag;\n"
 "vec3 brightPass(vec3 c, float th) {\n"
@@ -953,6 +1166,16 @@ static const char *const ZAN_GAME_POST_FS =
 "        uv = clamp(vec2(uv.x + wOff, uv.y), vec2(0.0), vec2(1.0));\n"
 "    }\n"
 "    bool crtOutOfBounds = false;\n"
+"    if (abs(uPostLensDistort.x) > 0.0005 || abs(uPostLensDistort.y - 1.0) > 0.0005) {\n"
+"        vec2 ld = (uv * 2.0 - vec2(1.0)) / max(uPostLensDistort.y, 0.25);\n"
+"        float ldR2 = dot(ld, ld);\n"
+"        ld = ld * (1.0 + uPostLensDistort.x * ldR2);\n"
+"        uv = ld * 0.5 + vec2(0.5);\n"
+"        if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {\n"
+"            crtOutOfBounds = true;\n"
+"        }\n"
+"        uv = clamp(uv, vec2(0.0), vec2(1.0));\n"
+"    }\n"
 "    if (uPostCrt.z > 0.0005) {\n"
 "        vec2 cc = uv * 2.0 - vec2(1.0);\n"
 "        float r2 = dot(cc, cc);\n"
@@ -967,9 +1190,94 @@ static const char *const ZAN_GAME_POST_FS =
 "        vec2 stepUv = uTexelSize * uPostPixelate.x;\n"
 "        uv = clamp((floor(uv / stepUv) + vec2(0.5)) * stepUv, vec2(0.0), vec2(1.0));\n"
 "    }\n"
-"    vec4 src = texture(uScene, uv);\n"
-"    vec3 col = src.rgb;\n"
-"    if (uPostRadialBlur.x > 0.0005) {\n"
+    "    vec4 src = texture(uScene, uv);\n"
+    "    vec3 col = src.rgb;\n"
+    "    if (uPostOilPaint.x > 0.0005) {\n"
+    "        float opR = clamp(uPostOilPaint.y, 1.0, 4.0);\n"
+    "        vec3 opBestMean = col;\n"
+    "        float opBestVar = 1000000.0;\n"
+    "        for (int qy = -1; qy <= 1; qy += 2) {\n"
+    "            for (int qx = -1; qx <= 1; qx += 2) {\n"
+    "                vec2 sx = vec2(float(qx) * uTexelSize.x * opR, 0.0);\n"
+    "                vec2 sy = vec2(0.0, float(qy) * uTexelSize.y * opR);\n"
+    "                vec3 c0 = texture(uScene, clamp(uv, vec2(0.0), vec2(1.0))).rgb;\n"
+    "                vec3 c1 = texture(uScene, clamp(uv + sx, vec2(0.0), vec2(1.0))).rgb;\n"
+    "                vec3 c2 = texture(uScene, clamp(uv + sy, vec2(0.0), vec2(1.0))).rgb;\n"
+    "                vec3 c3 = texture(uScene, clamp(uv + sx + sy, vec2(0.0), vec2(1.0))).rgb;\n"
+    "                vec3 qm = (c0 + c1 + c2 + c3) * 0.25;\n"
+    "                vec3 qs = (c0 * c0 + c1 * c1 + c2 * c2 + c3 * c3) * 0.25;\n"
+    "                float qv = dot(max(qs - qm * qm, vec3(0.0)), vec3(1.0));\n"
+    "                if (qv < opBestVar) {\n"
+    "                    opBestVar = qv;\n"
+    "                    opBestMean = qm;\n"
+    "                }\n"
+    "            }\n"
+    "        }\n"
+    "        col = mix(col, opBestMean, clamp(uPostOilPaint.x, 0.0, 1.0));\n"
+    "    }\n"
+    "    if (uPostScopeBlur.x > 0.0005) {\n"
+    "        float sbRad = length((uv - vec2(0.5)) * 2.0);\n"
+    "        float sbAmt = smoothstep(clamp(uPostScopeBlur.y, 0.1, 1.0), 1.15, sbRad) * clamp(uPostScopeBlur.x, 0.0, 1.0);\n"
+    "        if (sbAmt > 0.001) {\n"
+    "            vec2 sbStep = uTexelSize * (sbAmt * 4.0);\n"
+    "            vec3 sbAcc = col * 2.0;\n"
+    "            sbAcc += texture(uScene, clamp(uv + vec2( sbStep.x,  0.0), vec2(0.0), vec2(1.0))).rgb;\n"
+    "            sbAcc += texture(uScene, clamp(uv + vec2(-sbStep.x,  0.0), vec2(0.0), vec2(1.0))).rgb;\n"
+    "            sbAcc += texture(uScene, clamp(uv + vec2( 0.0,  sbStep.y), vec2(0.0), vec2(1.0))).rgb;\n"
+    "            sbAcc += texture(uScene, clamp(uv + vec2( 0.0, -sbStep.y), vec2(0.0), vec2(1.0))).rgb;\n"
+    "            sbAcc += texture(uScene, clamp(uv + vec2( sbStep.x,  sbStep.y), vec2(0.0), vec2(1.0))).rgb;\n"
+    "            sbAcc += texture(uScene, clamp(uv + vec2(-sbStep.x,  sbStep.y), vec2(0.0), vec2(1.0))).rgb;\n"
+    "            sbAcc += texture(uScene, clamp(uv + vec2( sbStep.x, -sbStep.y), vec2(0.0), vec2(1.0))).rgb;\n"
+    "            sbAcc += texture(uScene, clamp(uv + vec2(-sbStep.x, -sbStep.y), vec2(0.0), vec2(1.0))).rgb;\n"
+    "            col = mix(col, sbAcc * 0.1, sbAmt);\n"
+    "        }\n"
+    "    }\n"
+    "    if (uPostGodRays.x > 0.0005) {\n"
+    "        vec2 grLight = clamp(uPostGodRays.zw, vec2(0.0), vec2(1.0));\n"
+    "        vec2 grDelta = (uv - grLight) * (0.85 / 12.0);\n"
+    "        vec2 grUv = uv;\n"
+    "        float grDecay = clamp(uPostGodRays.y, 0.70, 0.99);\n"
+    "        float grIllum = 1.0;\n"
+    "        vec3 grAcc = vec3(0.0);\n"
+    "        for (int gri = 0; gri < 12; gri = gri + 1) {\n"
+    "            grUv -= grDelta;\n"
+    "            vec3 grS = texture(uScene, clamp(grUv, vec2(0.0), vec2(1.0))).rgb;\n"
+    "            grAcc += brightPass(grS, 0.55) * grIllum;\n"
+    "            grIllum *= grDecay;\n"
+    "        }\n"
+    "        col += grAcc * (clamp(uPostGodRays.x, 0.0, 2.0) / 12.0);\n"
+    "    }\n"
+    "    if (uPostGlitch.x > 0.0005) {\n"
+    "        float gBand = floor(uv.y * max(uPostGlitch.y, 4.0));\n"
+    "        float gHash = fract(sin(gBand * 127.1 + uPostGlitch.z * 311.7) * 43758.5453);\n"
+    "        if (gHash > (1.0 - clamp(uPostGlitch.x, 0.0, 1.0) * 0.65)) {\n"
+    "            float gDir = (fract(gHash * 19.3) > 0.5) ? 1.0 : -1.0;\n"
+    "            float gShift = gDir * clamp(uPostGlitch.x, 0.0, 1.0) * 0.08;\n"
+    "            float gSplit = clamp(uPostGlitch.x, 0.0, 1.0) * 0.045;\n"
+    "            vec2 gUv = vec2(clamp(uv.x + gShift, 0.0, 1.0), uv.y);\n"
+    "            col.r = texture(uScene, vec2(clamp(gUv.x + gSplit, 0.0, 1.0), gUv.y)).r;\n"
+    "            col.g = texture(uScene, gUv).g;\n"
+    "            col.b = texture(uScene, vec2(clamp(gUv.x - gSplit, 0.0, 1.0), gUv.y)).b;\n"
+    "        }\n"
+    "    }\n"
+    "    if (uPostTiltShift.x > 0.0005) {\n"
+    "        float tsDist = max(abs(uv.y - clamp(uPostTiltShift.y, 0.0, 1.0)) - clamp(uPostTiltShift.z, 0.02, 0.45), 0.0);\n"
+    "        float tsAmt = clamp(tsDist * 4.0, 0.0, 1.0) * clamp(uPostTiltShift.x, 0.0, 1.0);\n"
+    "        if (tsAmt > 0.001) {\n"
+    "            vec2 tsStep = uTexelSize * (tsAmt * 4.5);\n"
+    "            vec3 tsAcc = col * 2.0;\n"
+    "            tsAcc += texture(uScene, clamp(uv + vec2( tsStep.x,  0.0), vec2(0.0), vec2(1.0))).rgb;\n"
+    "            tsAcc += texture(uScene, clamp(uv + vec2(-tsStep.x,  0.0), vec2(0.0), vec2(1.0))).rgb;\n"
+    "            tsAcc += texture(uScene, clamp(uv + vec2( 0.0,  tsStep.y), vec2(0.0), vec2(1.0))).rgb;\n"
+    "            tsAcc += texture(uScene, clamp(uv + vec2( 0.0, -tsStep.y), vec2(0.0), vec2(1.0))).rgb;\n"
+    "            tsAcc += texture(uScene, clamp(uv + vec2( tsStep.x,  tsStep.y), vec2(0.0), vec2(1.0))).rgb;\n"
+    "            tsAcc += texture(uScene, clamp(uv + vec2(-tsStep.x,  tsStep.y), vec2(0.0), vec2(1.0))).rgb;\n"
+    "            tsAcc += texture(uScene, clamp(uv + vec2( tsStep.x, -tsStep.y), vec2(0.0), vec2(1.0))).rgb;\n"
+    "            tsAcc += texture(uScene, clamp(uv + vec2(-tsStep.x, -tsStep.y), vec2(0.0), vec2(1.0))).rgb;\n"
+    "            col = mix(col, tsAcc * 0.1, tsAmt);\n"
+    "        }\n"
+    "    }\n"
+    "    if (uPostRadialBlur.x > 0.0005) {\n"
 "        vec2 rDir = uv - uPostRadialBlur.yz;\n"
 "        vec3 rAcc = col;\n"
 "        for (int ri = 1; ri <= 4; ++ri) {\n"
@@ -1091,6 +1399,65 @@ static const char *const ZAN_GAME_POST_FS =
     "        float nvMask = smoothstep(0.96, 0.76, nvRad);\n"
     "        col = mix(col, nvPhos * nvMask, clamp(uPostNightVision.x, 0.0, 1.0));\n"
     "    }\n"
+    "    if (uPostHalftone.x > 0.0005) {\n"
+    "        vec2 htPx = uv / max(uTexelSize, vec2(0.0001));\n"
+    "        vec2 htRot = vec2(htPx.x + htPx.y, htPx.y - htPx.x) * 0.70710678;\n"
+    "        vec2 htCell = fract(htRot / max(uPostHalftone.y, 2.0)) - vec2(0.5);\n"
+    "        float htDist = length(htCell);\n"
+    "        float htLum = clamp(dot(col, vec3(0.299, 0.587, 0.114)), 0.0, 1.0);\n"
+    "        float htAdj = pow(htLum, clamp(uPostHalftone.z, 0.25, 3.0));\n"
+    "        float htDotRad = sqrt(clamp(1.0 - htAdj, 0.0, 1.0)) * 0.62;\n"
+    "        float htInk = smoothstep(htDotRad + 0.05, htDotRad - 0.05, htDist);\n"
+    "        vec3 htCol = mix(clamp(col * 1.15 + vec3(0.06), 0.0, 1.0), col * 0.08, htInk);\n"
+    "        col = mix(col, htCol, clamp(uPostHalftone.x, 0.0, 1.0));\n"
+    "    }\n"
+    "    if (uPostStreakParams.x > 0.0005) {\n"
+    "        vec3 stAcc = vec3(0.0);\n"
+    "        float stTh = clamp(uPostStreakParams.y, 0.0, 2.0);\n"
+    "        for (int si = 1; si <= 4; ++si) {\n"
+    "            float sf = float(si);\n"
+    "            float sw = 1.0 - sf * 0.18;\n"
+    "            float sOff = uTexelSize.x * (sf * 5.0);\n"
+    "            stAcc += brightPass(texture(uScene, clamp(vec2(uv.x + sOff, uv.y), vec2(0.0), vec2(1.0))).rgb, stTh) * sw;\n"
+    "            stAcc += brightPass(texture(uScene, clamp(vec2(uv.x - sOff, uv.y), vec2(0.0), vec2(1.0))).rgb, stTh) * sw;\n"
+    "        }\n"
+    "        float stLum = dot(stAcc, vec3(0.299, 0.587, 0.114));\n"
+    "        col += uPostStreakColor * (stLum * 0.35 * clamp(uPostStreakParams.x, 0.0, 3.0));\n"
+    "    }\n"
+    "    if (uPostSepia.x > 0.0005) {\n"
+    "        vec3 sepCol = vec3(\n"
+    "            dot(col, vec3(0.393, 0.769, 0.189)),\n"
+    "            dot(col, vec3(0.349, 0.686, 0.168)),\n"
+    "            dot(col, vec3(0.272, 0.534, 0.131)));\n"
+    "        if (uPostSepia.y > 0.0005) {\n"
+    "            float scBand = floor(uv.x * 180.0);\n"
+    "            float scHash = fract(sin(scBand * 91.7 + uPostSepia.z * 17.3) * 43758.5453);\n"
+    "            if (scHash > (1.0 - clamp(uPostSepia.y, 0.0, 1.0) * 0.12)) {\n"
+    "                sepCol = mix(sepCol, vec3(0.95, 0.90, 0.78), 0.55);\n"
+    "            }\n"
+    "        }\n"
+    "        col = mix(col, clamp(sepCol, 0.0, 1.0), clamp(uPostSepia.x, 0.0, 1.0));\n"
+    "    }\n"
+    "    if (uPostSplitParams.x > 0.0005) {\n"
+    "        float stLum = dot(col, vec3(0.2126, 0.7152, 0.0722));\n"
+    "        float stMask = smoothstep(0.01, 0.08, stLum);\n"
+    "        float stPivot = clamp(0.5 - uPostSplitParams.y * 0.35, 0.15, 0.85);\n"
+    "        float stHighW = smoothstep(stPivot - 0.18, stPivot + 0.18, stLum);\n"
+    "        vec3 stShadowCol = col + uPostSplitShadow * (0.45 * (1.0 - stLum) * stMask);\n"
+    "        vec3 stHighCol = col * mix(vec3(1.0), uPostSplitHigh * 1.4, 0.75);\n"
+    "        vec3 stShaded = mix(stShadowCol, stHighCol, stHighW);\n"
+    "        col = mix(col, clamp(stShaded, 0.0, 1.0), clamp(uPostSplitParams.x, 0.0, 1.0));\n"
+    "    }\n"
+    "    if (uPostFrostParams.x > 0.0005) {\n"
+    "        vec2 fd = (v_uv - vec2(0.5)) * 2.0;\n"
+    "        float fRad = length(fd);\n"
+    "        float fMask = smoothstep(clamp(uPostFrostParams.y, 0.15, 0.95), 1.35, fRad);\n"
+    "        if (fMask > 0.001) {\n"
+    "            float fCrystal = 0.72 + 0.28 * fract(sin(dot(floor(v_uv * 96.0), vec2(127.1, 311.7))) * 43758.5453);\n"
+    "            float fAmt = clamp(fMask * fCrystal * clamp(uPostFrostParams.x, 0.0, 1.0), 0.0, 1.0);\n"
+    "            col = mix(col, uPostFrostColor, fAmt);\n"
+    "        }\n"
+    "    }\n"
     "    if (uVignette > 0.001) {\n"
     "        vec2 d = (v_uv - vec2(0.5)) * 2.0;\n"
     "        float vig = clamp(1.0 - uVignette * dot(d, d) * 0.5, 0.0, 1.0);\n"
@@ -1116,6 +1483,29 @@ static const char *const ZAN_GAME_POST_FS =
     "        if (v_uv.y < uPostCinema.x || v_uv.y > (1.0 - uPostCinema.x)) {\n"
     "            col = vec3(0.0);\n"
     "        }\n"
+    "    }\n"
+    "    if (uPostDaltonize.x > 0.5 && uPostDaltonize.y > 0.0005) {\n"
+    "        vec3 dCol = clamp(col, 0.0, 1.0);\n"
+    "        float dL = 17.8824 * dCol.r + 43.5161 * dCol.g + 4.11935 * dCol.b;\n"
+    "        float dM = 3.45565 * dCol.r + 27.1554 * dCol.g + 3.86714 * dCol.b;\n"
+    "        float dS = 0.0299566 * dCol.r + 0.184309 * dCol.g + 1.46709 * dCol.b;\n"
+    "        float sL = dL;\n"
+    "        float sM = dM;\n"
+    "        float sS = dS;\n"
+    "        if (uPostDaltonize.x < 1.5) {\n"
+    "            sL = 2.02344 * dM - 2.52581 * dS;\n"
+    "        } else if (uPostDaltonize.x < 2.5) {\n"
+    "            sM = 0.494207 * dL + 1.24827 * dS;\n"
+    "        } else {\n"
+    "            sS = -0.395913 * dL + 0.801109 * dM;\n"
+    "        }\n"
+    "        vec3 simRgb;\n"
+    "        simRgb.r = 0.0809444 * sL - 0.130504 * sM + 0.116721 * sS;\n"
+    "        simRgb.g = -0.0102485 * sL + 0.0540193 * sM - 0.113615 * sS;\n"
+    "        simRgb.b = -0.000365297 * sL - 0.00412161 * sM + 0.693511 * sS;\n"
+    "        vec3 dErr = dCol - simRgb;\n"
+    "        vec3 dShift = vec3(0.0, 0.7 * dErr.r + dErr.g, 0.7 * dErr.r + dErr.b);\n"
+    "        col = mix(dCol, clamp(dCol + dShift, 0.0, 1.0), clamp(uPostDaltonize.y, 0.0, 1.0));\n"
     "    }\n"
     "    frag = vec4(clamp(col, 0.0, 1.0), src.a);\n"
 "}\n";
@@ -1144,6 +1534,22 @@ typedef struct {
     zgl_int u_post_flash_params;
     zgl_int u_post_flash_color;
     zgl_int u_post_night_vision;
+    zgl_int u_post_halftone;
+    zgl_int u_post_glitch;
+    zgl_int u_post_tilt_shift;
+    zgl_int u_post_frost_params;
+    zgl_int u_post_frost_color;
+    zgl_int u_post_sepia;
+    zgl_int u_post_streak_params;
+    zgl_int u_post_streak_color;
+    zgl_int u_post_split_params;
+    zgl_int u_post_split_shadow;
+    zgl_int u_post_split_high;
+    zgl_int u_post_oil_paint;
+    zgl_int u_post_scope_blur;
+    zgl_int u_post_daltonize;
+    zgl_int u_post_lens_distort;
+    zgl_int u_post_god_rays;
 } zan_game_post_program;
 
 static const char *const ZAN_GAME_SKYBOX_FS =
@@ -1323,7 +1729,7 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
         ? (colored ? ZAN_GAME_3D_FS_INST_COLOR : ZAN_GAME_3D_FS_INST)
         : (colored ? ZAN_GAME_3D_FS_COLOR : ZAN_GAME_3D_FS_PLAIN);
     char vs_src[4096];
-    char fs_src[24576];
+    char fs_src[32768];
     const char *head = zan_game_glsl_head();
     snprintf(vs_src, sizeof(vs_src), "%s%s", head, vs);
     snprintf(fs_src, sizeof(fs_src), "%s%s", head, fs);
@@ -1413,6 +1819,54 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
         : g_game_gl->GetUniformLocation(program, "uLavaCrustColor");
     zgl_int iridescence_params = instanced ? -1
         : g_game_gl->GetUniformLocation(program, "uIridescenceParams");
+    zgl_int sonar_origin_radius = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uSonarOriginRadius");
+    zgl_int sonar_style = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uSonarStyle");
+    zgl_int sonar_color = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uSonarColor");
+    zgl_int force_field_params = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uForceFieldParams");
+    zgl_int force_field_color = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uForceFieldColor");
+    zgl_int rain_ripples_params = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uRainRipplesParams");
+    zgl_int rain_ripples_color = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uRainRipplesColor");
+    zgl_int xray_params = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uXrayParams");
+    zgl_int xray_color = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uXrayColor");
+    zgl_int portal_vortex_params = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uPortalVortexParams");
+    zgl_int portal_vortex_color = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uPortalVortexColor");
+    zgl_int blueprint_wire_params = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uBlueprintWireParams");
+    zgl_int blueprint_wire_color = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uBlueprintWireColor");
+    zgl_int heat_haze_params = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uHeatHazeParams");
+    zgl_int heat_haze_color = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uHeatHazeColor");
+    zgl_int pixel_dither_params = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uPixelDitherParams");
+    zgl_int crosshatch_params = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uCrosshatchParams");
+    zgl_int crosshatch_color = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uCrosshatchColor");
+    zgl_int aniso_brushed_params = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uAnisoBrushedParams");
+    zgl_int aniso_brushed_color = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uAnisoBrushedColor");
+    zgl_int velvet_sheen_params = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uVelvetSheenParams");
+    zgl_int velvet_sheen_color = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uVelvetSheenColor");
+    zgl_int subsurface_params = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uSubsurfaceParams");
+    zgl_int subsurface_color = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uSubsurfaceColor");
     zgl_int color = instanced ? 0
         : g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
@@ -1498,6 +1952,30 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
     prog->u_lava_crust_params = lava_crust_params;
     prog->u_lava_crust_color = lava_crust_color;
     prog->u_iridescence_params = iridescence_params;
+    prog->u_sonar_origin_radius = sonar_origin_radius;
+    prog->u_sonar_style = sonar_style;
+    prog->u_sonar_color = sonar_color;
+    prog->u_force_field_params = force_field_params;
+    prog->u_force_field_color = force_field_color;
+    prog->u_rain_ripples_params = rain_ripples_params;
+    prog->u_rain_ripples_color = rain_ripples_color;
+    prog->u_xray_params = xray_params;
+    prog->u_xray_color = xray_color;
+    prog->u_portal_vortex_params = portal_vortex_params;
+    prog->u_portal_vortex_color = portal_vortex_color;
+    prog->u_blueprint_wire_params = blueprint_wire_params;
+    prog->u_blueprint_wire_color = blueprint_wire_color;
+    prog->u_heat_haze_params = heat_haze_params;
+    prog->u_heat_haze_color = heat_haze_color;
+    prog->u_pixel_dither_params = pixel_dither_params;
+    prog->u_crosshatch_params = crosshatch_params;
+    prog->u_crosshatch_color = crosshatch_color;
+    prog->u_aniso_brushed_params = aniso_brushed_params;
+    prog->u_aniso_brushed_color = aniso_brushed_color;
+    prog->u_velvet_sheen_params = velvet_sheen_params;
+    prog->u_velvet_sheen_color = velvet_sheen_color;
+    prog->u_subsurface_params = subsurface_params;
+    prog->u_subsurface_color = subsurface_color;
     prog->u_color = color;
     prog->u_light_dir = light_dir;
     prog->u_light_color = light_color;
@@ -1527,7 +2005,7 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
 static zan_game_program *zan_game_skin_program_get(void) {
     if (g_game_skin_prog.program) return &g_game_skin_prog;
     char vs_src[4096];
-    char fs_src[24576];
+    char fs_src[32768];
     const char *head = zan_game_glsl_head();
     snprintf(vs_src, sizeof(vs_src), "%s%s", head, ZAN_GAME_3D_VS_SKINNED);
     snprintf(fs_src, sizeof(fs_src), "%s%s", head, ZAN_GAME_3D_FS_PLAIN);
@@ -1580,6 +2058,30 @@ static zan_game_program *zan_game_skin_program_get(void) {
     zgl_int lava_crust_params = g_game_gl->GetUniformLocation(program, "uLavaCrustParams");
     zgl_int lava_crust_color = g_game_gl->GetUniformLocation(program, "uLavaCrustColor");
     zgl_int iridescence_params = g_game_gl->GetUniformLocation(program, "uIridescenceParams");
+    zgl_int sonar_origin_radius = g_game_gl->GetUniformLocation(program, "uSonarOriginRadius");
+    zgl_int sonar_style = g_game_gl->GetUniformLocation(program, "uSonarStyle");
+    zgl_int sonar_color = g_game_gl->GetUniformLocation(program, "uSonarColor");
+    zgl_int force_field_params = g_game_gl->GetUniformLocation(program, "uForceFieldParams");
+    zgl_int force_field_color = g_game_gl->GetUniformLocation(program, "uForceFieldColor");
+    zgl_int rain_ripples_params = g_game_gl->GetUniformLocation(program, "uRainRipplesParams");
+    zgl_int rain_ripples_color = g_game_gl->GetUniformLocation(program, "uRainRipplesColor");
+    zgl_int xray_params = g_game_gl->GetUniformLocation(program, "uXrayParams");
+    zgl_int xray_color = g_game_gl->GetUniformLocation(program, "uXrayColor");
+    zgl_int portal_vortex_params = g_game_gl->GetUniformLocation(program, "uPortalVortexParams");
+    zgl_int portal_vortex_color = g_game_gl->GetUniformLocation(program, "uPortalVortexColor");
+    zgl_int blueprint_wire_params = g_game_gl->GetUniformLocation(program, "uBlueprintWireParams");
+    zgl_int blueprint_wire_color = g_game_gl->GetUniformLocation(program, "uBlueprintWireColor");
+    zgl_int heat_haze_params = g_game_gl->GetUniformLocation(program, "uHeatHazeParams");
+    zgl_int heat_haze_color = g_game_gl->GetUniformLocation(program, "uHeatHazeColor");
+    zgl_int pixel_dither_params = g_game_gl->GetUniformLocation(program, "uPixelDitherParams");
+    zgl_int crosshatch_params = g_game_gl->GetUniformLocation(program, "uCrosshatchParams");
+    zgl_int crosshatch_color = g_game_gl->GetUniformLocation(program, "uCrosshatchColor");
+    zgl_int aniso_brushed_params = g_game_gl->GetUniformLocation(program, "uAnisoBrushedParams");
+    zgl_int aniso_brushed_color = g_game_gl->GetUniformLocation(program, "uAnisoBrushedColor");
+    zgl_int velvet_sheen_params = g_game_gl->GetUniformLocation(program, "uVelvetSheenParams");
+    zgl_int velvet_sheen_color = g_game_gl->GetUniformLocation(program, "uVelvetSheenColor");
+    zgl_int subsurface_params = g_game_gl->GetUniformLocation(program, "uSubsurfaceParams");
+    zgl_int subsurface_color = g_game_gl->GetUniformLocation(program, "uSubsurfaceColor");
     zgl_int color = g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
     zgl_int light_color = g_game_gl->GetUniformLocation(program, "uLightColor[0]");
@@ -1653,6 +2155,30 @@ static zan_game_program *zan_game_skin_program_get(void) {
     g_game_skin_prog.u_lava_crust_params = lava_crust_params;
     g_game_skin_prog.u_lava_crust_color = lava_crust_color;
     g_game_skin_prog.u_iridescence_params = iridescence_params;
+    g_game_skin_prog.u_sonar_origin_radius = sonar_origin_radius;
+    g_game_skin_prog.u_sonar_style = sonar_style;
+    g_game_skin_prog.u_sonar_color = sonar_color;
+    g_game_skin_prog.u_force_field_params = force_field_params;
+    g_game_skin_prog.u_force_field_color = force_field_color;
+    g_game_skin_prog.u_rain_ripples_params = rain_ripples_params;
+    g_game_skin_prog.u_rain_ripples_color = rain_ripples_color;
+    g_game_skin_prog.u_xray_params = xray_params;
+    g_game_skin_prog.u_xray_color = xray_color;
+    g_game_skin_prog.u_portal_vortex_params = portal_vortex_params;
+    g_game_skin_prog.u_portal_vortex_color = portal_vortex_color;
+    g_game_skin_prog.u_blueprint_wire_params = blueprint_wire_params;
+    g_game_skin_prog.u_blueprint_wire_color = blueprint_wire_color;
+    g_game_skin_prog.u_heat_haze_params = heat_haze_params;
+    g_game_skin_prog.u_heat_haze_color = heat_haze_color;
+    g_game_skin_prog.u_pixel_dither_params = pixel_dither_params;
+    g_game_skin_prog.u_crosshatch_params = crosshatch_params;
+    g_game_skin_prog.u_crosshatch_color = crosshatch_color;
+    g_game_skin_prog.u_aniso_brushed_params = aniso_brushed_params;
+    g_game_skin_prog.u_aniso_brushed_color = aniso_brushed_color;
+    g_game_skin_prog.u_velvet_sheen_params = velvet_sheen_params;
+    g_game_skin_prog.u_velvet_sheen_color = velvet_sheen_color;
+    g_game_skin_prog.u_subsurface_params = subsurface_params;
+    g_game_skin_prog.u_subsurface_color = subsurface_color;
     g_game_skin_prog.u_color = color;
     g_game_skin_prog.u_light_dir = light_dir;
     g_game_skin_prog.u_light_color = light_color;
@@ -2170,6 +2696,98 @@ static void zan_game_bind_shadow_uniforms(const zan_gl_api *gl, zan_game_program
         gl->Uniform4f(prog->u_iridescence_params,
             g_game_iridescence_params[0], g_game_iridescence_params[1],
             g_game_iridescence_params[2], g_game_iridescence_params[3]);
+    }
+    if (prog->u_sonar_origin_radius >= 0) {
+        gl->Uniform4f(prog->u_sonar_origin_radius,
+            g_game_sonar_origin_radius[0], g_game_sonar_origin_radius[1],
+            g_game_sonar_origin_radius[2], g_game_sonar_origin_radius[3]);
+    }
+    if (prog->u_sonar_style >= 0) {
+        gl->Uniform3fv(prog->u_sonar_style, 1, g_game_sonar_style);
+    }
+    if (prog->u_sonar_color >= 0) {
+        gl->Uniform3fv(prog->u_sonar_color, 1, g_game_sonar_color);
+    }
+    if (prog->u_force_field_params >= 0) {
+        gl->Uniform4f(prog->u_force_field_params,
+            g_game_force_field_params[0], g_game_force_field_params[1],
+            g_game_force_field_params[2], g_game_force_field_params[3]);
+    }
+    if (prog->u_force_field_color >= 0) {
+        gl->Uniform4f(prog->u_force_field_color,
+            g_game_force_field_color[0], g_game_force_field_color[1],
+            g_game_force_field_color[2], g_game_force_field_color[3]);
+    }
+    if (prog->u_rain_ripples_params >= 0) {
+        gl->Uniform4f(prog->u_rain_ripples_params,
+            g_game_rain_ripples_params[0], g_game_rain_ripples_params[1],
+            g_game_rain_ripples_params[2], g_game_rain_ripples_params[3]);
+    }
+    if (prog->u_rain_ripples_color >= 0) {
+        gl->Uniform3fv(prog->u_rain_ripples_color, 1, g_game_rain_ripples_color);
+    }
+    if (prog->u_xray_params >= 0) {
+        gl->Uniform3fv(prog->u_xray_params, 1, g_game_xray_params);
+    }
+    if (prog->u_xray_color >= 0) {
+        gl->Uniform3fv(prog->u_xray_color, 1, g_game_xray_color);
+    }
+    if (prog->u_portal_vortex_params >= 0) {
+        gl->Uniform4f(prog->u_portal_vortex_params,
+            g_game_portal_vortex_params[0], g_game_portal_vortex_params[1],
+            g_game_portal_vortex_params[2], g_game_portal_vortex_params[3]);
+    }
+    if (prog->u_portal_vortex_color >= 0) {
+        gl->Uniform3fv(prog->u_portal_vortex_color, 1, g_game_portal_vortex_color);
+    }
+    if (prog->u_blueprint_wire_params >= 0) {
+        gl->Uniform4f(prog->u_blueprint_wire_params,
+            g_game_blueprint_wire_params[0], g_game_blueprint_wire_params[1],
+            g_game_blueprint_wire_params[2], g_game_blueprint_wire_params[3]);
+    }
+    if (prog->u_blueprint_wire_color >= 0) {
+        gl->Uniform3fv(prog->u_blueprint_wire_color, 1, g_game_blueprint_wire_color);
+    }
+    if (prog->u_heat_haze_params >= 0) {
+        gl->Uniform4f(prog->u_heat_haze_params,
+            g_game_heat_haze_params[0], g_game_heat_haze_params[1],
+            g_game_heat_haze_params[2], g_game_heat_haze_params[3]);
+    }
+    if (prog->u_heat_haze_color >= 0) {
+        gl->Uniform3fv(prog->u_heat_haze_color, 1, g_game_heat_haze_color);
+    }
+    if (prog->u_pixel_dither_params >= 0) {
+        gl->Uniform3fv(prog->u_pixel_dither_params, 1, g_game_pixel_dither_params);
+    }
+    if (prog->u_crosshatch_params >= 0) {
+        gl->Uniform3fv(prog->u_crosshatch_params, 1, g_game_crosshatch_params);
+    }
+    if (prog->u_crosshatch_color >= 0) {
+        gl->Uniform3fv(prog->u_crosshatch_color, 1, g_game_crosshatch_color);
+    }
+    if (prog->u_aniso_brushed_params >= 0) {
+        gl->Uniform4f(prog->u_aniso_brushed_params,
+            g_game_aniso_brushed_params[0], g_game_aniso_brushed_params[1],
+            g_game_aniso_brushed_params[2], g_game_aniso_brushed_params[3]);
+    }
+    if (prog->u_aniso_brushed_color >= 0) {
+        gl->Uniform3fv(prog->u_aniso_brushed_color, 1, g_game_aniso_brushed_color);
+    }
+    if (prog->u_velvet_sheen_params >= 0) {
+        gl->Uniform4f(prog->u_velvet_sheen_params,
+            g_game_velvet_sheen_params[0], g_game_velvet_sheen_params[1],
+            g_game_velvet_sheen_params[2], g_game_velvet_sheen_params[3]);
+    }
+    if (prog->u_velvet_sheen_color >= 0) {
+        gl->Uniform3fv(prog->u_velvet_sheen_color, 1, g_game_velvet_sheen_color);
+    }
+    if (prog->u_subsurface_params >= 0) {
+        gl->Uniform4f(prog->u_subsurface_params,
+            g_game_subsurface_params[0], g_game_subsurface_params[1],
+            g_game_subsurface_params[2], g_game_subsurface_params[3]);
+    }
+    if (prog->u_subsurface_color >= 0) {
+        gl->Uniform3fv(prog->u_subsurface_color, 1, g_game_subsurface_color);
     }
 }
 
@@ -2725,7 +3343,7 @@ done:
 static zan_game_post_program *zan_game_post_program_get(void) {
     if (g_game_post_prog.program) return &g_game_post_prog;
     char vs_src[1024];
-    char fs_src[16384];
+    char fs_src[32768];
     const char *head = zan_game_glsl_head();
     snprintf(vs_src, sizeof(vs_src), "%s%s", head, ZAN_GAME_POST_VS);
     snprintf(fs_src, sizeof(fs_src), "%s%s", head, ZAN_GAME_POST_FS);
@@ -2754,6 +3372,22 @@ static zan_game_post_program *zan_game_post_program_get(void) {
     g_game_post_prog.u_post_flash_params = g_game_gl->GetUniformLocation(prog, "uPostFlashParams");
     g_game_post_prog.u_post_flash_color = g_game_gl->GetUniformLocation(prog, "uPostFlashColor");
     g_game_post_prog.u_post_night_vision = g_game_gl->GetUniformLocation(prog, "uPostNightVision");
+    g_game_post_prog.u_post_halftone = g_game_gl->GetUniformLocation(prog, "uPostHalftone");
+    g_game_post_prog.u_post_glitch = g_game_gl->GetUniformLocation(prog, "uPostGlitch");
+    g_game_post_prog.u_post_tilt_shift = g_game_gl->GetUniformLocation(prog, "uPostTiltShift");
+    g_game_post_prog.u_post_frost_params = g_game_gl->GetUniformLocation(prog, "uPostFrostParams");
+    g_game_post_prog.u_post_frost_color = g_game_gl->GetUniformLocation(prog, "uPostFrostColor");
+    g_game_post_prog.u_post_sepia = g_game_gl->GetUniformLocation(prog, "uPostSepia");
+    g_game_post_prog.u_post_streak_params = g_game_gl->GetUniformLocation(prog, "uPostStreakParams");
+    g_game_post_prog.u_post_streak_color = g_game_gl->GetUniformLocation(prog, "uPostStreakColor");
+    g_game_post_prog.u_post_split_params = g_game_gl->GetUniformLocation(prog, "uPostSplitParams");
+    g_game_post_prog.u_post_split_shadow = g_game_gl->GetUniformLocation(prog, "uPostSplitShadow");
+    g_game_post_prog.u_post_split_high = g_game_gl->GetUniformLocation(prog, "uPostSplitHigh");
+    g_game_post_prog.u_post_oil_paint = g_game_gl->GetUniformLocation(prog, "uPostOilPaint");
+    g_game_post_prog.u_post_scope_blur = g_game_gl->GetUniformLocation(prog, "uPostScopeBlur");
+    g_game_post_prog.u_post_daltonize = g_game_gl->GetUniformLocation(prog, "uPostDaltonize");
+    g_game_post_prog.u_post_lens_distort = g_game_gl->GetUniformLocation(prog, "uPostLensDistort");
+    g_game_post_prog.u_post_god_rays = g_game_gl->GetUniformLocation(prog, "uPostGodRays");
     return &g_game_post_prog;
 }
 
@@ -2905,6 +3539,63 @@ ZAN_GAME_API int32_t zan_game_postprocess3d(int32_t surface_id, float exposure,
         gl->Uniform4f(prog->u_post_night_vision,
             g_game_post_night_vision[0], g_game_post_night_vision[1],
             g_game_post_night_vision[2], g_game_post_night_vision[3]);
+    }
+    if (prog->u_post_halftone >= 0) {
+        gl->Uniform3fv(prog->u_post_halftone, 1, g_game_post_halftone);
+    }
+    if (prog->u_post_glitch >= 0) {
+        gl->Uniform3fv(prog->u_post_glitch, 1, g_game_post_glitch);
+    }
+    if (prog->u_post_tilt_shift >= 0) {
+        gl->Uniform3fv(prog->u_post_tilt_shift, 1, g_game_post_tilt_shift);
+    }
+    if (prog->u_post_frost_params >= 0) {
+        gl->Uniform2f(prog->u_post_frost_params,
+            g_game_post_frost_params[0], g_game_post_frost_params[1]);
+    }
+    if (prog->u_post_frost_color >= 0) {
+        gl->Uniform3fv(prog->u_post_frost_color, 1, g_game_post_frost_color);
+    }
+    if (prog->u_post_sepia >= 0) {
+        gl->Uniform3fv(prog->u_post_sepia, 1, g_game_post_sepia);
+    }
+    if (prog->u_post_streak_params >= 0) {
+        gl->Uniform2f(prog->u_post_streak_params,
+            g_game_post_streak_params[0], g_game_post_streak_params[1]);
+    }
+    if (prog->u_post_streak_color >= 0) {
+        gl->Uniform3fv(prog->u_post_streak_color, 1, g_game_post_streak_color);
+    }
+    if (prog->u_post_split_params >= 0) {
+        gl->Uniform2f(prog->u_post_split_params,
+            g_game_post_split_params[0], g_game_post_split_params[1]);
+    }
+    if (prog->u_post_split_shadow >= 0) {
+        gl->Uniform3fv(prog->u_post_split_shadow, 1, g_game_post_split_shadow);
+    }
+    if (prog->u_post_split_high >= 0) {
+        gl->Uniform3fv(prog->u_post_split_high, 1, g_game_post_split_high);
+    }
+    if (prog->u_post_oil_paint >= 0) {
+        gl->Uniform2f(prog->u_post_oil_paint,
+            g_game_post_oil_paint[0], g_game_post_oil_paint[1]);
+    }
+    if (prog->u_post_scope_blur >= 0) {
+        gl->Uniform2f(prog->u_post_scope_blur,
+            g_game_post_scope_blur[0], g_game_post_scope_blur[1]);
+    }
+    if (prog->u_post_daltonize >= 0) {
+        gl->Uniform2f(prog->u_post_daltonize,
+            g_game_post_daltonize[0], g_game_post_daltonize[1]);
+    }
+    if (prog->u_post_lens_distort >= 0) {
+        gl->Uniform2f(prog->u_post_lens_distort,
+            g_game_post_lens_distort[0], g_game_post_lens_distort[1]);
+    }
+    if (prog->u_post_god_rays >= 0) {
+        gl->Uniform4f(prog->u_post_god_rays,
+            g_game_post_god_rays[0], g_game_post_god_rays[1],
+            g_game_post_god_rays[2], g_game_post_god_rays[3]);
     }
     gl->BindVertexArray(g_game_post_vao);
     gl->DrawArrays(ZGL_TRIANGLES, 0, 3);
@@ -3414,3 +4105,326 @@ ZAN_GAME_API void zan_game_set_post_night_vision3d(float strength, float gain,
     g_game_post_night_vision[2] = noise_amount;
     g_game_post_night_vision[3] = seed;
 }
+
+ZAN_GAME_API void zan_game_set_sonar_pulse3d(int32_t enabled,
+    float origin_x, float origin_y, float origin_z,
+    float radius, float ring_width, float strength, float r, float g, float b) {
+    g_game_sonar_origin_radius[0] = origin_x;
+    g_game_sonar_origin_radius[1] = origin_y;
+    g_game_sonar_origin_radius[2] = origin_z;
+    g_game_sonar_origin_radius[3] = radius > 0.05f ? radius : 0.05f;
+    g_game_sonar_style[0] = enabled ? 1.0f : 0.0f;
+    g_game_sonar_style[1] = ring_width > 0.05f ? ring_width : 0.05f;
+    if (strength < 0.0f) strength = 0.0f;
+    if (strength > 3.0f) strength = 3.0f;
+    g_game_sonar_style[2] = strength;
+    g_game_sonar_color[0] = r > 0.0f ? r : 0.0f;
+    g_game_sonar_color[1] = g > 0.0f ? g : 0.0f;
+    g_game_sonar_color[2] = b > 0.0f ? b : 0.0f;
+}
+
+ZAN_GAME_API void zan_game_set_post_halftone_comic3d(float strength,
+    float dot_scale, float contrast) {
+    if (strength < 0.0f) strength = 0.0f;
+    if (strength > 1.0f) strength = 1.0f;
+    if (dot_scale < 2.0f) dot_scale = 2.0f;
+    if (dot_scale > 32.0f) dot_scale = 32.0f;
+    if (contrast < 0.25f) contrast = 0.25f;
+    if (contrast > 3.0f) contrast = 3.0f;
+    g_game_post_halftone[0] = strength;
+    g_game_post_halftone[1] = dot_scale;
+    g_game_post_halftone[2] = contrast;
+}
+
+ZAN_GAME_API void zan_game_set_force_field_hex3d(int32_t enabled,
+    float scale, float phase, float edge_width, float strength,
+    float r, float g, float b) {
+    g_game_force_field_params[0] = enabled ? 1.0f : 0.0f;
+    g_game_force_field_params[1] = scale > 0.25f ? scale : 2.0f;
+    g_game_force_field_params[2] = phase;
+    if (edge_width < 0.02f) edge_width = 0.02f;
+    if (edge_width > 0.35f) edge_width = 0.35f;
+    g_game_force_field_params[3] = edge_width;
+    g_game_force_field_color[0] = r > 0.0f ? r : 0.0f;
+    g_game_force_field_color[1] = g > 0.0f ? g : 0.0f;
+    g_game_force_field_color[2] = b > 0.0f ? b : 0.0f;
+    if (strength < 0.0f) strength = 0.0f;
+    if (strength > 3.0f) strength = 3.0f;
+    g_game_force_field_color[3] = strength;
+}
+
+ZAN_GAME_API void zan_game_set_post_glitch_rgb3d(float intensity,
+    float slice_count, float seed) {
+    if (intensity < 0.0f) intensity = 0.0f;
+    if (intensity > 1.0f) intensity = 1.0f;
+    if (slice_count < 4.0f) slice_count = 4.0f;
+    if (slice_count > 128.0f) slice_count = 128.0f;
+    g_game_post_glitch[0] = intensity;
+    g_game_post_glitch[1] = slice_count;
+    g_game_post_glitch[2] = seed;
+}
+
+ZAN_GAME_API void zan_game_set_rain_ripples3d(int32_t enabled, float scale,
+    float phase, float strength, float r, float g, float b) {
+    g_game_rain_ripples_params[0] = enabled ? 1.0f : 0.0f;
+    g_game_rain_ripples_params[1] = scale > 0.25f ? scale : 2.0f;
+    g_game_rain_ripples_params[2] = phase;
+    if (strength < 0.0f) strength = 0.0f;
+    if (strength > 3.0f) strength = 3.0f;
+    g_game_rain_ripples_params[3] = strength;
+    g_game_rain_ripples_color[0] = r > 0.0f ? r : 0.0f;
+    g_game_rain_ripples_color[1] = g > 0.0f ? g : 0.0f;
+    g_game_rain_ripples_color[2] = b > 0.0f ? b : 0.0f;
+}
+
+ZAN_GAME_API void zan_game_set_post_tilt_shift3d(float strength,
+    float focus_y, float focus_band) {
+    if (strength < 0.0f) strength = 0.0f;
+    if (strength > 1.0f) strength = 1.0f;
+    if (focus_y < 0.0f) focus_y = 0.0f;
+    if (focus_y > 1.0f) focus_y = 1.0f;
+    if (focus_band < 0.02f) focus_band = 0.02f;
+    if (focus_band > 0.45f) focus_band = 0.45f;
+    g_game_post_tilt_shift[0] = strength;
+    g_game_post_tilt_shift[1] = focus_y;
+    g_game_post_tilt_shift[2] = focus_band;
+}
+
+ZAN_GAME_API void zan_game_set_xray_silhouette3d(int32_t enabled, float power,
+    float strength, float r, float g, float b) {
+    g_game_xray_params[0] = enabled ? 1.0f : 0.0f;
+    if (power < 0.5f) power = 0.5f;
+    if (power > 8.0f) power = 8.0f;
+    g_game_xray_params[1] = power;
+    if (strength < 0.0f) strength = 0.0f;
+    if (strength > 3.0f) strength = 3.0f;
+    g_game_xray_params[2] = strength;
+    g_game_xray_color[0] = r > 0.0f ? r : 0.0f;
+    g_game_xray_color[1] = g > 0.0f ? g : 0.0f;
+    g_game_xray_color[2] = b > 0.0f ? b : 0.0f;
+}
+
+ZAN_GAME_API void zan_game_set_post_vignette_frost3d(float intensity,
+    float radius, float r, float g, float b) {
+    if (intensity < 0.0f) intensity = 0.0f;
+    if (intensity > 1.0f) intensity = 1.0f;
+    if (radius < 0.15f) radius = 0.15f;
+    if (radius > 0.95f) radius = 0.95f;
+    g_game_post_frost_params[0] = intensity;
+    g_game_post_frost_params[1] = radius;
+    g_game_post_frost_color[0] = r > 0.0f ? r : 0.0f;
+    g_game_post_frost_color[1] = g > 0.0f ? g : 0.0f;
+    g_game_post_frost_color[2] = b > 0.0f ? b : 0.0f;
+}
+
+ZAN_GAME_API void zan_game_set_portal_vortex3d(int32_t enabled,
+    float swirl_turns, float phase, float strength, float r, float g, float b) {
+    g_game_portal_vortex_params[0] = enabled ? 1.0f : 0.0f;
+    g_game_portal_vortex_params[1] = swirl_turns;
+    g_game_portal_vortex_params[2] = phase;
+    if (strength < 0.0f) strength = 0.0f;
+    if (strength > 3.0f) strength = 3.0f;
+    g_game_portal_vortex_params[3] = strength;
+    g_game_portal_vortex_color[0] = r > 0.0f ? r : 0.0f;
+    g_game_portal_vortex_color[1] = g > 0.0f ? g : 0.0f;
+    g_game_portal_vortex_color[2] = b > 0.0f ? b : 0.0f;
+}
+
+ZAN_GAME_API void zan_game_set_post_sepia_vintage3d(float strength,
+    float scratch_amount, float seed) {
+    if (strength < 0.0f) strength = 0.0f;
+    if (strength > 1.0f) strength = 1.0f;
+    if (scratch_amount < 0.0f) scratch_amount = 0.0f;
+    if (scratch_amount > 1.0f) scratch_amount = 1.0f;
+    g_game_post_sepia[0] = strength;
+    g_game_post_sepia[1] = scratch_amount;
+    g_game_post_sepia[2] = seed;
+}
+
+ZAN_GAME_API void zan_game_set_blueprint_wire3d(int32_t enabled,
+    float grid_density, float line_width, float strength,
+    float r, float g, float b) {
+    g_game_blueprint_wire_params[0] = enabled ? 1.0f : 0.0f;
+    g_game_blueprint_wire_params[1] = grid_density > 0.25f ? grid_density : 2.0f;
+    if (line_width < 0.01f) line_width = 0.01f;
+    if (line_width > 0.25f) line_width = 0.25f;
+    g_game_blueprint_wire_params[2] = line_width;
+    if (strength < 0.0f) strength = 0.0f;
+    if (strength > 3.0f) strength = 3.0f;
+    g_game_blueprint_wire_params[3] = strength;
+    g_game_blueprint_wire_color[0] = r > 0.0f ? r : 0.0f;
+    g_game_blueprint_wire_color[1] = g > 0.0f ? g : 0.0f;
+    g_game_blueprint_wire_color[2] = b > 0.0f ? b : 0.0f;
+}
+
+ZAN_GAME_API void zan_game_set_post_sun_bloom_streak3d(float strength,
+    float threshold, float r, float g, float b) {
+    if (strength < 0.0f) strength = 0.0f;
+    if (strength > 3.0f) strength = 3.0f;
+    if (threshold < 0.0f) threshold = 0.0f;
+    if (threshold > 2.0f) threshold = 2.0f;
+    g_game_post_streak_params[0] = strength;
+    g_game_post_streak_params[1] = threshold;
+    g_game_post_streak_color[0] = r > 0.0f ? r : 0.0f;
+    g_game_post_streak_color[1] = g > 0.0f ? g : 0.0f;
+    g_game_post_streak_color[2] = b > 0.0f ? b : 0.0f;
+}
+
+ZAN_GAME_API void zan_game_set_heat_haze_shimmer3d(int32_t enabled,
+    float freq, float phase, float strength, float r, float g, float b) {
+    g_game_heat_haze_params[0] = enabled ? 1.0f : 0.0f;
+    g_game_heat_haze_params[1] = freq > 0.5f ? freq : 4.0f;
+    g_game_heat_haze_params[2] = phase;
+    if (strength < 0.0f) strength = 0.0f;
+    if (strength > 3.0f) strength = 3.0f;
+    g_game_heat_haze_params[3] = strength;
+    g_game_heat_haze_color[0] = r > 0.0f ? r : 0.0f;
+    g_game_heat_haze_color[1] = g > 0.0f ? g : 0.0f;
+    g_game_heat_haze_color[2] = b > 0.0f ? b : 0.0f;
+}
+
+ZAN_GAME_API void zan_game_set_post_split_tone3d(float strength, float balance,
+    float shadow_r, float shadow_g, float shadow_b,
+    float high_r, float high_g, float high_b) {
+    if (strength < 0.0f) strength = 0.0f;
+    if (strength > 1.0f) strength = 1.0f;
+    if (balance < -1.0f) balance = -1.0f;
+    if (balance > 1.0f) balance = 1.0f;
+    g_game_post_split_params[0] = strength;
+    g_game_post_split_params[1] = balance;
+    g_game_post_split_shadow[0] = shadow_r > 0.0f ? shadow_r : 0.0f;
+    g_game_post_split_shadow[1] = shadow_g > 0.0f ? shadow_g : 0.0f;
+    g_game_post_split_shadow[2] = shadow_b > 0.0f ? shadow_b : 0.0f;
+    g_game_post_split_high[0] = high_r > 0.0f ? high_r : 0.0f;
+    g_game_post_split_high[1] = high_g > 0.0f ? high_g : 0.0f;
+    g_game_post_split_high[2] = high_b > 0.0f ? high_b : 0.0f;
+}
+
+ZAN_GAME_API void zan_game_set_pixel_dither_fade3d(int32_t enabled,
+    float opacity, float pixel_scale) {
+    g_game_pixel_dither_params[0] = enabled ? 1.0f : 0.0f;
+    if (opacity < 0.0f) opacity = 0.0f;
+    if (opacity > 1.0f) opacity = 1.0f;
+    g_game_pixel_dither_params[1] = opacity;
+    if (pixel_scale < 1.0f) pixel_scale = 1.0f;
+    if (pixel_scale > 8.0f) pixel_scale = 8.0f;
+    g_game_pixel_dither_params[2] = pixel_scale;
+}
+
+ZAN_GAME_API void zan_game_set_post_oil_paint3d(float strength, float radius) {
+    if (strength < 0.0f) strength = 0.0f;
+    if (strength > 1.0f) strength = 1.0f;
+    if (radius < 1.0f) radius = 1.0f;
+    if (radius > 4.0f) radius = 4.0f;
+    g_game_post_oil_paint[0] = strength;
+    g_game_post_oil_paint[1] = radius;
+}
+
+ZAN_GAME_API void zan_game_set_crosshatch_ink3d(int32_t enabled, float density,
+    float ink_strength, float r, float g, float b) {
+    g_game_crosshatch_params[0] = enabled ? 1.0f : 0.0f;
+    g_game_crosshatch_params[1] = density > 2.0f ? density : 8.0f;
+    if (ink_strength < 0.0f) ink_strength = 0.0f;
+    if (ink_strength > 1.0f) ink_strength = 1.0f;
+    g_game_crosshatch_params[2] = ink_strength;
+    g_game_crosshatch_color[0] = r > 0.0f ? r : 0.0f;
+    g_game_crosshatch_color[1] = g > 0.0f ? g : 0.0f;
+    g_game_crosshatch_color[2] = b > 0.0f ? b : 0.0f;
+}
+
+ZAN_GAME_API void zan_game_set_post_scope_edge_blur3d(float strength,
+    float clear_radius) {
+    if (strength < 0.0f) strength = 0.0f;
+    if (strength > 1.0f) strength = 1.0f;
+    if (clear_radius < 0.1f) clear_radius = 0.1f;
+    if (clear_radius > 1.0f) clear_radius = 1.0f;
+    g_game_post_scope_blur[0] = strength;
+    g_game_post_scope_blur[1] = clear_radius;
+}
+
+ZAN_GAME_API void zan_game_set_aniso_brushed3d(int32_t enabled,
+    float grain_freq, float anisotropy, float strength,
+    float r, float g, float b) {
+    g_game_aniso_brushed_params[0] = enabled ? 1.0f : 0.0f;
+    g_game_aniso_brushed_params[1] = grain_freq > 1.0f ? grain_freq : 12.0f;
+    if (anisotropy < 2.0f) anisotropy = 2.0f;
+    if (anisotropy > 64.0f) anisotropy = 64.0f;
+    g_game_aniso_brushed_params[2] = anisotropy;
+    if (strength < 0.0f) strength = 0.0f;
+    if (strength > 3.0f) strength = 3.0f;
+    g_game_aniso_brushed_params[3] = strength;
+    g_game_aniso_brushed_color[0] = r > 0.0f ? r : 0.0f;
+    g_game_aniso_brushed_color[1] = g > 0.0f ? g : 0.0f;
+    g_game_aniso_brushed_color[2] = b > 0.0f ? b : 0.0f;
+}
+
+ZAN_GAME_API void zan_game_set_post_daltonize3d(float mode, float strength) {
+    if (mode < 0.0f) mode = 0.0f;
+    if (mode > 3.0f) mode = 3.0f;
+    if (strength < 0.0f) strength = 0.0f;
+    if (strength > 1.0f) strength = 1.0f;
+    g_game_post_daltonize[0] = mode;
+    g_game_post_daltonize[1] = strength;
+}
+
+ZAN_GAME_API void zan_game_set_velvet_sheen3d(int32_t enabled,
+    float roughness, float weave_freq, float strength,
+    float r, float g, float b) {
+    g_game_velvet_sheen_params[0] = enabled ? 1.0f : 0.0f;
+    if (roughness < 0.12f) roughness = 0.12f;
+    if (roughness > 1.0f) roughness = 1.0f;
+    g_game_velvet_sheen_params[1] = roughness;
+    g_game_velvet_sheen_params[2] = weave_freq > 2.0f ? weave_freq : 16.0f;
+    if (strength < 0.0f) strength = 0.0f;
+    if (strength > 3.0f) strength = 3.0f;
+    g_game_velvet_sheen_params[3] = strength;
+    g_game_velvet_sheen_color[0] = r > 0.0f ? r : 0.0f;
+    g_game_velvet_sheen_color[1] = g > 0.0f ? g : 0.0f;
+    g_game_velvet_sheen_color[2] = b > 0.0f ? b : 0.0f;
+}
+
+ZAN_GAME_API void zan_game_set_post_lens_distort3d(float k1, float zoom) {
+    if (k1 < -0.6f) k1 = -0.6f;
+    if (k1 > 0.6f) k1 = 0.6f;
+    if (zoom < 0.5f) zoom = 0.5f;
+    if (zoom > 1.5f) zoom = 1.5f;
+    g_game_post_lens_distort[0] = k1;
+    g_game_post_lens_distort[1] = zoom;
+}
+
+ZAN_GAME_API void zan_game_set_subsurface_wrap3d(int32_t enabled,
+    float wrap, float translucency, float power,
+    float r, float g, float b) {
+    g_game_subsurface_params[0] = enabled ? 1.0f : 0.0f;
+    if (wrap < 0.0f) wrap = 0.0f;
+    if (wrap > 1.0f) wrap = 1.0f;
+    g_game_subsurface_params[1] = wrap;
+    if (translucency < 0.0f) translucency = 0.0f;
+    if (translucency > 2.0f) translucency = 2.0f;
+    g_game_subsurface_params[2] = translucency;
+    if (power < 1.0f) power = 1.0f;
+    if (power > 8.0f) power = 8.0f;
+    g_game_subsurface_params[3] = power;
+    g_game_subsurface_color[0] = r > 0.0f ? r : 0.0f;
+    g_game_subsurface_color[1] = g > 0.0f ? g : 0.0f;
+    g_game_subsurface_color[2] = b > 0.0f ? b : 0.0f;
+}
+
+ZAN_GAME_API void zan_game_set_post_god_rays3d(float strength, float decay,
+    float light_x, float light_y) {
+    if (strength < 0.0f) strength = 0.0f;
+    if (strength > 2.0f) strength = 2.0f;
+    if (decay < 0.70f) decay = 0.70f;
+    if (decay > 0.99f) decay = 0.99f;
+    if (light_x < 0.0f) light_x = 0.0f;
+    if (light_x > 1.0f) light_x = 1.0f;
+    if (light_y < 0.0f) light_y = 0.0f;
+    if (light_y > 1.0f) light_y = 1.0f;
+    g_game_post_god_rays[0] = strength;
+    g_game_post_god_rays[1] = decay;
+    g_game_post_god_rays[2] = light_x;
+    g_game_post_god_rays[3] = light_y;
+}
+
+
+

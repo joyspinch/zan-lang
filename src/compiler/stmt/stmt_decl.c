@@ -11,6 +11,27 @@
     }
 
     case AST_VAR_DECL: {
+        if (stmt->var_decl.is_ref && stmt->var_decl.initializer) {
+            zan_type_t *rtype = stmt->var_decl.type
+                ? resolve_type_ctx(g, stmt->var_decl.type)
+                : infer_expr_type(g, stmt->var_decl.initializer, locals);
+            if (!rtype) rtype = g->binder->type_int;
+            LLVMValueRef ptr = emit_ref_lvalue_ptr(
+                g, stmt->var_decl.initializer, locals);
+            LLVMTypeRef elem_llvm = map_type(g, rtype);
+            if (!ptr) {
+                /* Fallback scratch slot so IR stays valid on diagnostics */
+                ptr = emit_entry_alloca(g, elem_llvm, "ref.err");
+            } else if (LLVMTypeOf(ptr) != LLVMPointerType(elem_llvm, 0)) {
+                ptr = LLVMBuildBitCast(g->builder, ptr,
+                                       LLVMPointerType(elem_llvm, 0), "ref.loc");
+            }
+            local_add(locals, stmt->var_decl.name, ptr, rtype);
+            locals->vars[locals->count - 1].byref_slot = 1;
+            if (rtype->kind == TYPE_STRING)
+                locals->vars[locals->count - 1].opaque_string = 1;
+            return;
+        }
         if (stmt->var_decl.type && stmt->var_decl.initializer) {
             check_implicit_narrowing(g, resolve_type_ctx(g, stmt->var_decl.type),
                            infer_expr_type(g, stmt->var_decl.initializer, locals),
@@ -171,6 +192,10 @@
                         LLVMTypeRef st = get_struct_llvm_type(g, sym);
                         if (st) {
                             LLVMValueRef alloca = emit_entry_alloca(g, st, "var");
+                            int64_t sal = 0;
+                            if (sym->decl && zan_ast_attr_int(sym->decl, "Align", &sal) &&
+                                sal >= 1 && (sal & (sal - 1)) == 0)
+                                LLVMSetAlignment(alloca, (unsigned)sal);
                             zan_store_fit(g, LLVMConstNull(st), alloca);
 
                             bool ctor_called = false;
@@ -373,14 +398,18 @@
                                         } else {
                                             zan_store_fit(g, fval, fptr);
                                         }
+                                        emit_move_clear_drop_flag(g, arg->binary.right, locals);
                                     }
                                 }
                             }
                             local_add(locals, stmt->var_decl.name, alloca, type);
-                            if (type && type->kind == TYPE_STRUCT &&
-                                type_contains_collection_rc(g, type, 0)) {
-                                locals->vars[locals->count - 1].struct_rc = 1;
-                                lpad_register_local(g, &locals->vars[locals->count - 1]);
+                            if (type && type->kind == TYPE_STRUCT) {
+                                if (struct_needs_raii_drop(g, type, 0)) {
+                                    emit_arm_drop_flag(g, locals, locals->count - 1, true);
+                                } else if (type_contains_collection_rc(g, type, 0)) {
+                                    locals->vars[locals->count - 1].struct_rc = 1;
+                                    lpad_register_local(g, &locals->vars[locals->count - 1]);
+                                }
                             }
                             return;
                         }
@@ -504,7 +533,23 @@
                 arc_own_local(g, locals);
                 return;
             }
+            emit_move_clear_drop_flag(g, init, locals);
             local_add(locals, stmt->var_decl.name, alloca, type);
+            if (type && type->kind == TYPE_STRUCT &&
+                LLVMGetTypeKind(init_type) == LLVMStructTypeKind) {
+                if (struct_needs_raii_drop(g, type, 0)) {
+                    if (type_contains_collection_rc(g, type, 0) &&
+                        !expr_yields_owned_rc_value(g, init, locals) &&
+                        init->kind != AST_IDENTIFIER)
+                        emit_struct_local_retain(g, type, alloca);
+                    emit_arm_drop_flag(g, locals, locals->count - 1, true);
+                } else if (type_contains_collection_rc(g, type, 0)) {
+                    if (!expr_yields_owned_rc_value(g, init, locals))
+                        emit_struct_local_retain(g, type, alloca);
+                    locals->vars[locals->count - 1].struct_rc = 1;
+                    lpad_register_local(g, &locals->vars[locals->count - 1]);
+                }
+            }
             return;
         }
 
@@ -512,6 +557,12 @@
         LLVMValueRef alloca = (type && type->kind == TYPE_STRING)
             ? emit_entry_alloca(g, llvm_type, "var")
             : emit_entry_alloca(g, llvm_type, "var");
+        if (type && type->kind == TYPE_STRUCT && type->sym && type->sym->decl) {
+            int64_t sal = 0;
+            if (zan_ast_attr_int(type->sym->decl, "Align", &sal) &&
+                sal >= 1 && (sal & (sal - 1)) == 0)
+                LLVMSetAlignment(alloca, (unsigned)sal);
+        }
 
         int arc_own = (type && is_rc_managed_type(type) &&
                        LLVMGetTypeKind(llvm_type) == LLVMPointerTypeKind);
@@ -589,12 +640,15 @@
                 init_val = coerce_int_to(g, init_val, llvm_type);
                 zan_store_fit(g, init_val, alloca);
                 if (!expr_yields_owned_rc_value(g, init_src, locals) &&
-                    !conv_owned)
+                    !conv_owned &&
+                    !(struct_needs_raii_drop(g, type, 0) &&
+                      init_src->kind == AST_IDENTIFIER))
                     emit_struct_local_retain(g, type, alloca);
             } else {
                 init_val = coerce_int_to(g, init_val, llvm_type);
                 zan_store_fit(g, init_val, alloca);
             }
+            emit_move_clear_drop_flag(g, stmt->var_decl.initializer, locals);
         }
 
         if (type && type->kind == TYPE_ARRAY && stmt->var_decl.initializer) {
@@ -614,7 +668,12 @@
         if (type && type->kind == TYPE_STRING && stmt->var_decl.initializer &&
             call_targets_extern(g, stmt->var_decl.initializer))
             locals->vars[locals->count - 1].opaque_string = 1;
-        if (struct_own) {
+        if (type && type->kind == TYPE_STRUCT &&
+            LLVMGetTypeKind(llvm_type) == LLVMStructTypeKind &&
+            struct_needs_raii_drop(g, type, 0)) {
+            emit_arm_drop_flag(g, locals, locals->count - 1,
+                               stmt->var_decl.initializer != NULL);
+        } else if (struct_own) {
             locals->vars[locals->count - 1].struct_rc = 1;
             lpad_register_local(g, &locals->vars[locals->count - 1]);
         }
@@ -797,6 +856,22 @@
         LLVMValueRef ev = emit_expr(g, e, locals);
         if (ev && e->kind == AST_CALL && emit_detach_async_call(g, ev, false, call_is_async_callee(g, e, locals)))
             break;
+        if (ev && e->kind != AST_IDENTIFIER && e->kind != AST_ASSIGNMENT) {
+            zan_type_t *et = infer_expr_type(g, e, locals);
+            if (et && et->kind == TYPE_STRUCT &&
+                struct_needs_raii_drop(g, et, 0)) {
+                LLVMTypeKind evk = LLVMGetTypeKind(LLVMTypeOf(ev));
+                if (evk == LLVMPointerTypeKind) {
+                    emit_raii_drop_value_at(g, et, ev, false);
+                    break;
+                } else if (evk == LLVMStructTypeKind) {
+                    LLVMValueRef tmp = emit_entry_alloca(g, LLVMTypeOf(ev), "raii.tmp");
+                    zan_store_fit(g, ev, tmp);
+                    emit_raii_drop_value_at(g, et, tmp, false);
+                    break;
+                }
+            }
+        }
         if (ev && expr_yields_owned_rc_value(g, e, locals)) {
             zan_type_t *et = infer_expr_type(g, e, locals);
             if (et && is_rc_managed_type(et)) {

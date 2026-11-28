@@ -1,176 +1,203 @@
 using System;
 using System.Data;
 using System.Data.Orm;
+using System.Json;
 using System.Web;
+using Zan.Web.AdminUi;
 using Zan.Web.Model.Flow;
 using Zan.Web.Model;
 using Zan.Web.Modules.Flow;
 
 namespace Zan.Web.Admin.Flow;
 
-/* /admin/flow/tasks 我的待办：流程流转到我的任务，含进度汇报（流水）与完成推进。
-   完成即推进到下一节点并通知下一个责任人——「汇报进度 + 流转通知相关责任人」的闭环就在这里。 */
+/* /admin/flow/tasks 我的待办：待处理/已办页签 + 弹窗汇报并推进 + 汇报流水子表弹窗。 */
 [Route("admin/flow/tasks/[action]")]
 [Custom(Authorization = CustomAuthorization.Grant)]
 [Description("我的待办")]
 public class Tasks : CollabAdminController {
+    static ListPage ScreenDef() {
+        return ListPage.Of()
+            .Tab("待处理", "done", "0")
+            .Tab("已办任务", "done", "1")
+            .Col("id", "ID", "num", "75")
+            .Col("inst", "所属流程实例", "text", "220")
+            .Col("node", "当前节点", "text", "150")
+            .Tag("status", "状态", "0=待处理|warn,1=已完成|ok,2=已跳过|off", "100")
+            .Col("result", "最新汇报", "text", "240")
+            .Col("createdAt", "派发日期", "text", "125")
+            .OpsEdit("/admin/flow/tasks/form")
+            .Ops("汇报流水", "/admin/flow/tasks/logs", "", "taskId={id}", "");
+    }
+
+    static ListPage LogsDef() {
+        return ListPage.Of()
+            .Col("id", "ID", "num", "75")
+            .Col("who", "汇报人", "text", "130")
+            .Col("content", "汇报内容", "text", "340")
+            .Col("createdAt", "时间", "text", "140");
+    }
+
     [HttpGet]
     [Route("/admin/flow/tasks")]
     [Custom(IsMenu = true, Icon = "mdi:clipboard-check", Perm = PermBit.View)]
     [Description("我的待办")]
-    async void Index() {
-        SysUser me = await this.Admin();
-        ViewData d = await this.Layout("我的待办");
-        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
-        ListQuery q = this.Paged("id", 20);
+    void Index() {
+        this.Conf();
+    }
 
-        /* 我的待办 = 落在我头上的未完成任务；已办标签页看最近完成的。 */
-        int mine = this.InInt("done", 0);
-        d.Set("done", Convert.ToString(mine));
-        d.Set("doneOn", mine == 1 ? "pri" : "");
-        d.Set("doneOff", mine == 1 ? "" : "pri");
-        d.Set("tabTitle", mine == 1 ? "已办任务" : "我的待办");
-        d.Set("emptyText", mine == 1 ? "还没有已完成的任务" : "太棒了，没有待办任务");
+    [HttpPut]
+    [Custom(Perm = PermBit.View)]
+    [Description("我的待办表格配置")]
+    public void Conf() {
+        CrudOps.Conf(this, Tasks.ScreenDef());
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.View)]
+    [Description("我的待办列表数据")]
+    public async void List() {
+        if (!this.DataReady()) { return; }
+        SysUser me = await this.Admin();
+        ListQuery q = this.PagedAny("id", 20);
+        int mine = this.InAnyInt("done", 0);
+        int wantStatus = mine == 1 ? 1 : 0;
+
         List<FlowTask> rows = await this.FlowTask
-            .Where(a => a.assignUserId == me.id
-                && a.status == (mine == 1 ? 1 : 0))
+            .Where(a => a.assignUserId == me.id && a.status == wantStatus)
             .OrderByDescending(a => a.id)
             .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
         int total = await this.FlowTask
-            .Where(a => a.assignUserId == me.id
-                && a.status == (mine == 1 ? 1 : 0)).CountAsync();
+            .Where(a => a.assignUserId == me.id && a.status == wantStatus).CountAsync();
 
-        /* 实例标题只取本租户行（#34）；节点名经已闸任务可达。 */
-        List<FlowInst> insts = await this.FlowInst
-            .ToListAsync();
+        List<FlowInst> insts = await this.FlowInst.ToListAsync();
         List<FlowNode> nodes = await this.FlowNode.ToListAsync();
-        List<StrMap> items = d.AddList("rows");
+
+        JsonWriter w = new JsonWriter();
+        w.WriteStartArray();
         for (int i = 0; i < rows.Count; i = i + 1) {
             FlowTask t = rows[i];
-            StrMap m = new StrMap();
-            m.Set("id", Convert.ToString(t.id));
-            m.Set("inst", Zan.Web.Modules.Flow.Engine.InstTitle(insts, t.instId));
-            m.Set("node", Zan.Web.Modules.Flow.Engine.NodeName(nodes, t.nodeId));
-            m.Set("status", t.status == 0 ? "待处理"
-                : (t.status == 1 ? "已完成" : "已跳过"));
-            m.Set("result", t.result);
-            m.Set("createdAt", Fmt.Day(t.createdAt));
-            m.Set("canReport", t.status == 0 && await this.Can(PermBit.Update) ? "1" : "");
-            items.Add(m);
+            w.WriteStartObject();
+            w.WriteProperty("id", t.id);
+            w.WriteProperty("inst", Zan.Web.Modules.Flow.Engine.InstTitle(insts, t.instId));
+            w.WriteProperty("node", Zan.Web.Modules.Flow.Engine.NodeName(nodes, t.nodeId));
+            w.WriteProperty("status", Convert.ToString(t.status));
+            w.WriteProperty("result", Fmt.Dash(t.result));
+            w.WriteProperty("createdAt", Fmt.Day(t.createdAt));
+            w.WriteEndObject();
         }
-        d.Set("empty", total == 0 ? "1" : "");
-        this.Pager(d, q, total);
-        this.Page(d);
+        w.WriteEndArray();
+        AdminUiProtocol.WriteListData(this, total, w.ToString());
     }
 
-    /* Bug#3 租户闸（#34 起直读基列）：flow_inst 行带 tenantId——
-       实例不在本租户（含超管跨租户）一律按任务不存在处理，
-       与 Attachment.CanDownload 同语义：租户硬边先于任何角色豁免。 */
     private async bool OwnTask(FlowTask t) {
         if (t == null) { return false; }
         FlowInst inst = await this.FlowInst
-            .Where(a => a.id == t.instId
-               ).FirstAsync();
+            .Where(a => a.id == t.instId).FirstAsync();
         return inst != null;
     }
 
-    /* 任务详情：实例信息、节点、进度汇报流水（只增不改）。 */
-    [HttpGet]
-    [Custom(IsMenu = false, Perm = PermBit.View)]
-    [Description("任务详情")]
-    async void Detail() {
-        int id = this.InInt("id", 0);
-        FlowTask t = await this.FlowTask.Where(a => a.id == id).FirstAsync();
-        if (t == null) { this.Fail(404, "0404", "任务不存在"); return; }
-        if (!await this.OwnTask(t)) { this.Fail(404, "0404", "任务不存在"); return; }
-        FlowInst inst = await this.FlowInst
-            .Where(a => a.id == t.instId).FirstAsync();
-        FlowNode node = await this.FlowNode
-            .Where(a => a.id == t.nodeId).FirstAsync();
-        ViewData d = await this.Layout("任务详情");
-        d.Set("id", Convert.ToString(t.id));
-        d.Set("inst", inst != null ? inst.title : "-");
-        d.Set("node", node != null ? node.name : "-");
-        d.Set("status", t.status == 0 ? "待处理"
-            : (t.status == 1 ? "已完成" : "已跳过"));
-        d.Set("result", t.result);
+    /* 汇报并完成表单配置（直接走 FormModal → POST /admin/flow/tasks/report）。 */
+    [HttpPut]
+    [Custom(Perm = PermBit.Update)]
+    [Description("汇报表单配置")]
+    public async void FormConf() {
+        List<SysUser> users = await this.SysUser
+            .Where(a => a.status == 1).ToListAsync();
+        List<StrMap> uopts = new List<StrMap>();
+        StrMap u0 = new StrMap(); u0.Set("id", ""); u0.Set("name", "不额外通知"); uopts.Add(u0);
+        for (int i = 0; i < users.Count; i = i + 1) {
+            StrMap m = new StrMap();
+            m.Set("id", Convert.ToString(users[i].id));
+            m.Set("name", Fmt.Text(users[i].nickname, users[i].username));
+            uopts.Add(m);
+        }
+        FormPage fp = FormPage.Of("/admin/flow/tasks/report")
+            .Area("汇报内容", "report").Req().Span().Ph("填写本节点处理进展与结论，提交后自动流转下一节点")
+            .SelectList("@ 通知相关人", "mentions", uopts).Val("");
+        CrudOps.FormConf(this, fp, "汇报并完成");
+    }
 
+    [HttpPost]
+    [Custom(Perm = PermBit.View)]
+    [Description("任务回显")]
+    public async void Edit() {
+        int id = this.InAnyInt("id", 0);
+        FlowTask t = await this.FlowTask.Where(a => a.id == id).FirstAsync();
+        if (t == null || !await this.OwnTask(t)) {
+            this.Fail(404, "0404", "任务不存在"); return;
+        }
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("id", t.id);
+        w.WriteProperty("report", t.result);
+        w.WriteProperty("mentions", "");
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(this, w.ToString());
+    }
+
+    /* 汇报流水子表（SubTableModal） */
+    [HttpGet]
+    [Custom(Perm = PermBit.View)]
+    [Description("任务汇报流水")]
+    void Logs() {
+        this.LogsConf();
+    }
+
+    [HttpPut]
+    [Route("/admin/flow/tasks/logs/conf")]
+    [Custom(Perm = PermBit.View)]
+    [Description("汇报流水表格配置")]
+    public void LogsConf() {
+        CrudOps.Conf(this, Tasks.LogsDef());
+    }
+
+    [HttpPost]
+    [Route("/admin/flow/tasks/logs/list")]
+    [Custom(Perm = PermBit.View)]
+    [Description("汇报流水列表数据")]
+    public async void LogsList() {
+        if (!this.DataReady()) { return; }
+        int taskId = this.InAnyInt("taskId", 0);
+        FlowTask t = await this.FlowTask.Where(a => a.id == taskId).FirstAsync();
+        if (t == null || !await this.OwnTask(t)) {
+            this.Fail(404, "0404", "任务不存在"); return;
+        }
         List<FlowLog> logs = await this.FlowLog
-            .Where(a => a.taskId == t.id).ToListAsync();
-        /* 流水署名与 @ 候选同源：仅本租户账号（Bug#3 同源收敛）。 */
-        List<SysUser> users = await this.SysUser
-            .ToListAsync();
-        List<StrMap> items = d.AddList("logs");
+            .Where(a => a.taskId == t.id).OrderByDescending(a => a.id).ToListAsync();
+        List<SysUser> users = await this.SysUser.ToListAsync();
+        JsonWriter w = new JsonWriter();
+        w.WriteStartArray();
         for (int i = 0; i < logs.Count; i = i + 1) {
-            StrMap m = new StrMap();
-            m.Set("who", Zan.Web.Modules.Flow.Engine.UserName(users, logs[i].userId));
-            m.Set("content", logs[i].content);
-            m.Set("createdAt", Fmt.Day(logs[i].createdAt));
-            items.Add(m);
+            FlowLog l = logs[i];
+            w.WriteStartObject();
+            w.WriteProperty("id", l.id);
+            w.WriteProperty("who", Zan.Web.Modules.Flow.Engine.UserName(users, l.userId));
+            w.WriteProperty("content", l.content);
+            w.WriteProperty("createdAt", Fmt.Stamp(l.createdAt));
+            w.WriteEndObject();
         }
-        d.Set("logsEmpty", logs.Count == 0 ? "1" : "");
-        /* 候选 @ 对象：本部门同事 + 全体启用账号（模板规模小，直接全量）。 */
-        List<StrMap> cands = d.AddList("users");
-        for (int i = 0; i < users.Count; i = i + 1) {
-            if (users[i].status != 1) { continue; }
-            StrMap m = new StrMap();
-            m.Set("id", Convert.ToString(users[i].id));
-            m.Set("name", Fmt.Text(users[i].nickname, users[i].username));
-            cands.Add(m);
-        }
-        this.Dialog(d);
+        w.WriteEndArray();
+        AdminUiProtocol.WriteListData(this, logs.Count, w.ToString());
     }
 
-    /* 汇报表单：本任务信息 + @ 候选人。 */
-    [HttpGet]
-    [Custom(IsMenu = false, Perm = PermBit.View)]
-    [Description("汇报表单")]
-    async void Form() {
-        int id = this.InInt("id", 0);
-        FlowTask t = await this.FlowTask.Where(a => a.id == id).FirstAsync();
-        if (t == null) { this.Fail(404, "0404", "任务不存在"); return; }
-        if (!await this.OwnTask(t)) { this.Fail(404, "0404", "任务不存在"); return; }
-        FlowInst inst = await this.FlowInst
-            .Where(a => a.id == t.instId).FirstAsync();
-        FlowNode node = await this.FlowNode
-            .Where(a => a.id == t.nodeId).FirstAsync();
-        ViewData d = await this.Layout("汇报并完成");
-        d.Set("id", Convert.ToString(t.id));
-        d.Set("inst", inst != null ? inst.title : "-");
-        d.Set("node", node != null ? node.name : "-");
-        List<SysUser> users = await this.SysUser
-            .Where(a => a.status == 1)
-            .ToListAsync();
-        List<StrMap> cands = d.AddList("users");
-        for (int i = 0; i < users.Count; i = i + 1) {
-            StrMap m = new StrMap();
-            m.Set("id", Convert.ToString(users[i].id));
-            m.Set("name", Fmt.Text(users[i].nickname, users[i].username));
-            cands.Add(m);
-        }
-        this.Dialog(d);
-    }
-
-    /* 汇报并完成：写流水、@相关责任人（每人生成通知）、完成任务并推进到下一节点。 */
     [HttpPost]
     [Custom(Perm = PermBit.Update)]
     [Description("汇报完成")]
     async void Report() {
-        int id = this.InInt("id", 0);
+        int id = this.InAnyInt("id", 0);
         FlowTask t = await this.FlowTask.Where(a => a.id == id).FirstAsync();
-        if (t == null) { this.Fail(404, "0404", "任务不存在"); return; }
-        if (!await this.OwnTask(t)) { this.Fail(404, "0404", "任务不存在"); return; }
+        if (t == null || !await this.OwnTask(t)) {
+            this.Fail(404, "0404", "任务不存在"); return;
+        }
         if (t.status != 0) { this.Fail(400, "0004", "任务已处理"); return; }
         SysUser me = await this.Admin();
         if (t.assignUserId != me.id && !await this.Can(PermBit.Update)) {
             this.Fail(403, "0403", "不是你的任务"); return;
         }
-        /* Bug#8：汇报内容 textarea 多行语义，Need 内部走 In(Filter.Clean) 会剥
-           换行——InRaw + 同语义空检查（原 Need 文案不变）。 */
-        string report = this.InRaw("report");
+        string report = this.InAnyRaw("report");
         if (report.Length == 0) { this.Fail(400, "0003", "汇报内容不能为空"); return; }
         bool ok = await Zan.Web.Modules.Flow.Engine.Complete(
-            this.Held(), t, me, report, this.In("mentions"));
+            this.Held(), t, me, report, this.InAny("mentions"));
         if (!ok) { this.Fail(400, "0004", "流程不在进行中"); return; }
         await this.Note("汇报完成", report, true, "");
         this.Saved("已汇报，流程已流转");

@@ -1,0 +1,211 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Net;
+
+// 单败淘汰赛程树中的单场对阵槽位（1-based 二叉堆下标：1 为决赛，2/3 为半决赛，以此类推）。
+public class TournamentMatchSlot {
+    public int MatchId;
+    public int PlayerA;
+    public int PlayerB;
+    public int WinnerId;
+
+    public TournamentMatchSlot(int matchId) {
+        this.MatchId = matchId;
+        this.PlayerA = 0;
+        this.PlayerB = 0;
+        this.WinnerId = 0;
+    }
+}
+
+// 商业电竞单败淘汰锦标赛赛程引擎（支持 4/8/16 强，胜者自动晋级父对阵槽直至决出冠军）。
+public class NetSingleElimBracket {
+    private List<TournamentMatchSlot> slots; // 索引 0 占位，1..(teamCount-1) 为赛程树
+    public int TeamCount;
+    public int ChampionId;
+
+    public NetSingleElimBracket(int teamCount) {
+        int n = 4;
+        if (teamCount >= 16) { n = 16; }
+        else if (teamCount >= 8) { n = 8; }
+        this.TeamCount = n;
+        this.ChampionId = 0;
+        this.slots = new List<TournamentMatchSlot>();
+        for (int i = 0; i < n; i = i + 1) {
+            this.slots.Add(new TournamentMatchSlot(i));
+        }
+    }
+
+    public bool SeedFirstRound(List<int> teamIds) {
+        if (teamIds == null || teamIds.Count != this.TeamCount) { return false; }
+        int firstMatch = this.TeamCount / 2;
+        for (int i = 0; i < firstMatch; i = i + 1) {
+            TournamentMatchSlot m = this.slots[firstMatch + i];
+            m.PlayerA = teamIds[i * 2];
+            m.PlayerB = teamIds[i * 2 + 1];
+            m.WinnerId = 0;
+        }
+        return true;
+    }
+
+    public TournamentMatchSlot GetMatch(int matchId) {
+        if (matchId <= 0 || matchId >= this.TeamCount) { return null; }
+        return this.slots[matchId];
+    }
+
+    public bool ReportWinner(int matchId, int winnerId) {
+        TournamentMatchSlot m = this.GetMatch(matchId);
+        if (m == null || m.WinnerId != 0) { return false; }
+        if (winnerId == 0 || (winnerId != m.PlayerA && winnerId != m.PlayerB)) { return false; }
+        m.WinnerId = winnerId;
+        if (matchId == 1) {
+            this.ChampionId = winnerId;
+            return true;
+        }
+        int parentId = matchId / 2;
+        TournamentMatchSlot parent = this.slots[parentId];
+        if ((matchId % 2) == 0) {
+            parent.PlayerA = winnerId;
+        } else {
+            parent.PlayerB = winnerId;
+        }
+        return true;
+    }
+}
+
+// 限时组队邀请凭证。
+public class PartyInviteTicket {
+    public int InviteId;
+    public int SenderId;
+    public int TargetId;
+    public long ExpiresAtMs;
+    public bool Active;
+
+    public PartyInviteTicket(int inviteId, int senderId, int targetId, long expiresAtMs) {
+        this.InviteId = inviteId;
+        this.SenderId = senderId;
+        this.TargetId = targetId;
+        this.ExpiresAtMs = expiresAtMs;
+        this.Active = true;
+    }
+}
+
+// 商业联机组队邀请代理：限时有效、防重复发邀、接受校验人数上限、撤回与自动过期清理。
+public class NetPartyInviteBroker {
+    private List<PartyInviteTicket> tickets;
+    private int nextInviteId;
+    public int MaxPartySize;
+    public int CurrentPartySize;
+
+    public NetPartyInviteBroker(int maxPartySize, int currentPartySize) {
+        this.tickets = new List<PartyInviteTicket>();
+        this.nextInviteId = 1;
+        this.MaxPartySize = maxPartySize > 1 ? maxPartySize : 4;
+        this.CurrentPartySize = currentPartySize > 0 ? currentPartySize : 1;
+    }
+
+    public int SendInvite(int senderId, int targetId, long nowMs, long ttlMs) {
+        if (senderId == targetId || this.CurrentPartySize >= this.MaxPartySize) { return 0; }
+        for (int i = 0; i < this.tickets.Count; i = i + 1) {
+            PartyInviteTicket t = this.tickets[i];
+            if (t.Active && t.TargetId == targetId && nowMs < t.ExpiresAtMs) {
+                return 0; // 已存在有效待处理邀请，拒绝重复骚扰
+            }
+        }
+        int id = this.nextInviteId;
+        this.nextInviteId = this.nextInviteId + 1;
+        long dur = ttlMs > 0L ? ttlMs : 30000L;
+        this.tickets.Add(new PartyInviteTicket(id, senderId, targetId, nowMs + dur));
+        return id;
+    }
+
+    public bool AcceptInvite(int inviteId, int targetId, long nowMs) {
+        for (int i = 0; i < this.tickets.Count; i = i + 1) {
+            PartyInviteTicket t = this.tickets[i];
+            if (t.InviteId == inviteId) {
+                if (!t.Active || t.TargetId != targetId || nowMs >= t.ExpiresAtMs) {
+                    t.Active = false;
+                    return false;
+                }
+                if (this.CurrentPartySize >= this.MaxPartySize) { return false; }
+                t.Active = false;
+                this.CurrentPartySize = this.CurrentPartySize + 1;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public bool RevokeInvite(int inviteId, int senderId) {
+        for (int i = 0; i < this.tickets.Count; i = i + 1) {
+            PartyInviteTicket t = this.tickets[i];
+            if (t.InviteId == inviteId && t.SenderId == senderId && t.Active) {
+                t.Active = false;
+                return true;
+            }
+        }
+        return false;
+    }
+}
+
+// 战术小队 3D 地图标记条目。
+public class TacticalMapPing {
+    public int SenderId;
+    public string Kind; // "Danger", "Assist", "OnMyWay", "Loot"
+    public float WorldX;
+    public float WorldZ;
+    public long CreatedAtMs;
+
+    public TacticalMapPing(int senderId, string kind, float worldX, float worldZ, long createdAtMs) {
+        this.SenderId = senderId;
+        this.Kind = kind;
+        this.WorldX = worldX;
+        this.WorldZ = worldZ;
+        this.CreatedAtMs = createdAtMs;
+    }
+}
+
+// 商业战术地图标记通道：单人滑窗防刷屏限流 + 超时自动淡出清理。
+public class NetTacticalPingChannel {
+    private List<TacticalMapPing> pings;
+    public int MaxPingsPerWindow;
+    public long RateWindowMs;
+    public long PingLifetimeMs;
+
+    public NetTacticalPingChannel(int maxPingsPerWindow, long rateWindowMs, long pingLifetimeMs) {
+        this.pings = new List<TacticalMapPing>();
+        this.MaxPingsPerWindow = maxPingsPerWindow > 0 ? maxPingsPerWindow : 3;
+        this.RateWindowMs = rateWindowMs > 0L ? rateWindowMs : 5000L;
+        this.PingLifetimeMs = pingLifetimeMs > 0L ? pingLifetimeMs : 8000L;
+    }
+
+    public bool EmitPing(int senderId, string kind, float worldX, float worldZ, long nowMs) {
+        this.PruneExpired(nowMs);
+        int recent = 0;
+        for (int i = 0; i < this.pings.Count; i = i + 1) {
+            TacticalMapPing p = this.pings[i];
+            if (p.SenderId == senderId && (nowMs - p.CreatedAtMs) < this.RateWindowMs) {
+                recent = recent + 1;
+            }
+        }
+        if (recent >= this.MaxPingsPerWindow) { return false; }
+        this.pings.Add(new TacticalMapPing(senderId, kind, worldX, worldZ, nowMs));
+        return true;
+    }
+
+    public int PruneExpired(long nowMs) {
+        int removed = 0;
+        int i = 0;
+        while (i < this.pings.Count) {
+            if ((nowMs - this.pings[i].CreatedAtMs) >= this.PingLifetimeMs) {
+                this.pings.RemoveAt(i);
+                removed = removed + 1;
+            } else {
+                i = i + 1;
+            }
+        }
+        return removed;
+    }
+
+    public int ActiveCount() { return this.pings.Count; }
+}

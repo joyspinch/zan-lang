@@ -1,0 +1,1073 @@
+// rt_timer_task.zan: 64-shard task handle registry, await edges, incarnation-safe
+// cancellation chains, and coroutine task profiling.
+// Replaces src/runtime/timer/rt_timer_task.c in 100% pure Zan.
+
+namespace Zan.Runtime.Timer;
+
+// 64-byte cache-line aligned task shard:
+//  0: int Lock (+ 4B pad)
+//  8: nint Entries
+// 16: ulong Capacity
+// 24: nint Index
+// 32: ulong IndexCap
+// 40: nint FreeSlots
+// 48: ulong FreeN
+// 56: ulong NextIncarnation
+struct TaskShard {
+    public int Lock;
+    public int Pad;
+    public nint Entries;
+    public ulong Capacity;
+    public nint Index;
+    public ulong IndexCap;
+    public nint FreeSlots;
+    public ulong FreeN;
+    public ulong NextIncarnation;
+}
+
+struct TaskShard8 {
+    public TaskShard S0; public TaskShard S1; public TaskShard S2; public TaskShard S3;
+    public TaskShard S4; public TaskShard S5; public TaskShard S6; public TaskShard S7;
+}
+
+struct TaskShard64 {
+    public TaskShard8 G0; public TaskShard8 G1; public TaskShard8 G2; public TaskShard8 G3;
+    public TaskShard8 G4; public TaskShard8 G5; public TaskShard8 G6; public TaskShard8 G7;
+}
+
+// Stack-allocated profile slice (56 bytes)
+struct TaskProfileSlice {
+    public nint Frame;
+    public nint Profile;
+    public long CpuStart;
+    public long Start;
+    public ulong BytesStart;
+    public int Measuring;
+    public int InheritedStage;
+    public ulong OpenStages;
+}
+
+static class TaskOff {
+    internal const int MAX_WAITS = 32;
+    internal const int MAX_EXECUTION = 64;
+    internal const int MAX_STAGES = 48;
+
+    // TaskEntry (120 bytes)
+    internal const long E_SIZE = 120L;
+    internal const long E_GEN = 0L;
+    internal const long E_INC = 8L;
+    internal const long E_FRAME = 16L;
+    internal const long E_DONE = 24L;
+    internal const long E_CANCEL = 32L;
+    internal const long E_CHILD = 40L;
+    internal const long E_CHILD_INC = 48L;
+    internal const long E_PINS = 56L;
+    internal const long E_RETIRE = 64L;
+    internal const long E_ALLOC_REL = 72L;
+    internal const long E_DISCARD = 80L;
+    internal const long E_PROFILE = 88L;
+    internal const long E_PENDING_WAIT = 96L;
+    internal const long E_CONFIGURED = 100L;
+    internal const long E_INHERITED_STAGE = 104L;
+    internal const long E_OPEN_STAGES = 112L;
+
+    // TaskProfile (120 bytes)
+    internal const long P_SIZE = 120L;
+    internal const long P_REFS = 0L;
+    internal const long P_UNFINISHED = 8L;
+    internal const long P_CLOSED = 16L;
+    internal const long P_CPU_MISSING = 20L;
+    internal const long P_ROOT = 24L;
+    internal const long P_CPU = 32L;
+    internal const long P_BYTES = 40L;
+    internal const long P_SLICES = 48L;
+    internal const long P_OMITTED_WAITS = 56L;
+    internal const long P_WAIT_COUNT = 64L;
+    internal const long P_WAITS = 72L;
+    internal const long P_RECORD_EXEC = 80L;
+    internal const long P_EXEC_COUNT = 84L;
+    internal const long P_OMITTED_EXEC = 88L;
+    internal const long P_EXECUTION = 96L;
+    internal const long P_STAGE_ID = 104L;
+    internal const long P_STAGES = 112L;
+
+    // TaskWait (40 bytes): file(0), kind(8), line(16), col(20), start(24), elapsed(32)
+    internal const long W_SIZE = 40L;
+    // TaskExecution (40 bytes): tid(0), start(8), elapsed(16), cpu(24), bytes(32)
+    internal const long X_SIZE = 40L;
+    // TaskStageResources (24 bytes): cpu(0), bytes(8), recorded(16), cpu_missing(20)
+    internal const long S_SIZE = 24L;
+
+    // TaskProfileSlice offsets
+    internal const long SL_FRAME = 0L;
+    internal const long SL_PROFILE = 8L;
+    internal const long SL_CPU_START = 16L;
+    internal const long SL_START = 24L;
+    internal const long SL_BYTES_START = 32L;
+    internal const long SL_MEASURING = 40L;
+    internal const long SL_INHERITED_STAGE = 44L;
+    internal const long SL_OPEN_STAGES = 48L;
+}
+
+static class RtTimerTask {
+    const int TASK_SHARD_BITS = 6;
+    const ulong TASK_SHARDS = 64UL;
+    const ulong TASK_SHARD_MASK = 63UL;
+
+    static TaskShard64 s_shards;
+    static ulong s_generation = 0UL;
+
+    static Buf64 s_profileLockLine; // s_profileLock at offset 0 (isolated cache line)
+    static ulong s_profileCount = 0UL;
+    static int s_profileEnabled = 0;
+    static long s_profileStageId = 0L;
+
+    static nint GetProfileSlice() {
+        nint tls = RtPlat.TimerTlsPeek();
+        return tls != (nint)0 ? NativeMemory.AsRef<TimerTls>(tls).ProfileSlice : (nint)0;
+    }
+
+    static void SetProfileSlice(nint sp) {
+        if (sp == (nint)0) {
+            nint tls = RtPlat.TimerTlsPeek();
+            if (tls != (nint)0) NativeMemory.AsRef<TimerTls>(tls).ProfileSlice = (nint)0;
+            return;
+        }
+        nint tls2 = RtPlat.TimerTlsGet();
+        if (tls2 != (nint)0) NativeMemory.AsRef<TimerTls>(tls2).ProfileSlice = sp;
+    }
+
+    internal static ulong GetThreadAllocBytes() {
+        nint tls = RtPlat.TimerTlsPeek();
+        return tls != (nint)0 ? NativeMemory.AsRef<TimerTls>(tls).ThreadAllocBytes : 0UL;
+    }
+
+    internal static void AddThreadAllocBytes(ulong bytes) {
+        nint tls = RtPlat.TimerTlsGet();
+        if (tls != (nint)0) NativeMemory.AsRef<TimerTls>(tls).ThreadAllocBytes += bytes;
+    }
+
+    static void ProfileLock() { RtPlat.SpinLockWord(NativeMemory.AddressOf(ref s_profileLockLine)); }
+    static void ProfileUnlock() { RtPlat.SpinUnlockWord(NativeMemory.AddressOf(ref s_profileLockLine)); }
+
+    static void TaskLock(nint sh) { RtPlat.SpinLockWord(sh); }
+    static void TaskUnlock(nint sh) { RtPlat.SpinUnlockWord(sh); }
+
+    static ulong TaskMix(nint frame) {
+        ulong x = (ulong)frame;
+        x ^= x >> 33;
+        x *= 0xFF51AFD7ED558CCDUL;
+        x ^= x >> 33;
+        return x;
+    }
+
+    static nint ShardsBase() => NativeMemory.AddressOf(ref s_shards);
+
+    static nint ShardAt(ulong idx) => ShardsBase() + (nint)((long)idx * 64L);
+
+    static nint ShardOf(nint frame) => ShardAt(TaskMix(frame) >> (64 - TASK_SHARD_BITS));
+
+    static nint ShardOfToken(ulong token) => ShardAt(token & TASK_SHARD_MASK);
+
+    static ulong ShardIndexOf(nint sh) => (ulong)((long)(sh - ShardsBase()) / 64L);
+
+    // ---- Open-addressing frame index inside a shard (caller holds TaskLock) ----
+
+    static void TaskIndexInsert(nint sh, ulong slot) {
+        nint entries = NativeMemory.Read<nint>(sh + (nint)8);
+        nint index = NativeMemory.Read<nint>(sh + (nint)24);
+        ulong indexCap = NativeMemory.Read<ulong>(sh + (nint)32);
+        ulong mask = indexCap - 1UL;
+        nint frame = NativeMemory.Read<nint>(entries + (nint)((long)slot * TaskOff.E_SIZE) + (nint)TaskOff.E_FRAME);
+        ulong h = TaskMix(frame) & mask;
+        while (NativeMemory.At<uint>(index, (long)h) != 0U) {
+            h = (h + 1UL) & mask;
+        }
+        NativeMemory.At<uint>(index, (long)h) = (uint)(slot + 1UL);
+    }
+
+    static void TaskIndexRebuild(nint sh, ulong cap) {
+        nint idx = RtPlat.CCalloc(cap, 4UL);
+        if (idx == (nint)0) RtPlat.CAbort();
+        RtPlat.CFree(NativeMemory.Read<nint>(sh + (nint)24));
+        NativeMemory.Write<nint>(sh + (nint)24, idx);
+        NativeMemory.Write<ulong>(sh + (nint)32, cap);
+        nint entries = NativeMemory.Read<nint>(sh + (nint)8);
+        ulong sc = NativeMemory.Read<ulong>(sh + (nint)16);
+        for (ulong i = 0UL; i < sc; i++) {
+            if (NativeMemory.Read<nint>(entries + (nint)((long)i * TaskOff.E_SIZE) + (nint)TaskOff.E_FRAME) != (nint)0) {
+                TaskIndexInsert(sh, i);
+            }
+        }
+    }
+
+    static ulong TaskIndexPos(nint sh, nint frame) {
+        ulong indexCap = NativeMemory.Read<ulong>(sh + (nint)32);
+        if (indexCap == 0UL) return RtAbi.SIZE_MAX_U64;
+        nint entries = NativeMemory.Read<nint>(sh + (nint)8);
+        nint index = NativeMemory.Read<nint>(sh + (nint)24);
+        ulong mask = indexCap - 1UL;
+        ulong h = TaskMix(frame) & mask;
+        while (true) {
+            uint v = NativeMemory.At<uint>(index, (long)h);
+            if (v == 0U) return RtAbi.SIZE_MAX_U64;
+            nint e = entries + (nint)((long)(v - 1U) * TaskOff.E_SIZE);
+            if (NativeMemory.Read<nint>(e + (nint)TaskOff.E_FRAME) == frame) return h;
+            h = (h + 1UL) & mask;
+        }
+    }
+
+    static void TaskIndexRemove(nint sh, nint frame) {
+        ulong pos = TaskIndexPos(sh, frame);
+        if (pos == RtAbi.SIZE_MAX_U64) return;
+        nint entries = NativeMemory.Read<nint>(sh + (nint)8);
+        nint index = NativeMemory.Read<nint>(sh + (nint)24);
+        ulong mask = NativeMemory.Read<ulong>(sh + (nint)32) - 1UL;
+        NativeMemory.At<uint>(index, (long)pos) = 0U;
+        ulong j = (pos + 1UL) & mask;
+        while (true) {
+            uint v = NativeMemory.At<uint>(index, (long)j);
+            if (v == 0U) break;
+            NativeMemory.At<uint>(index, (long)j) = 0U;
+            nint ef = NativeMemory.Read<nint>(entries + (nint)((long)(v - 1U) * TaskOff.E_SIZE) + (nint)TaskOff.E_FRAME);
+            ulong h = TaskMix(ef) & mask;
+            while (NativeMemory.At<uint>(index, (long)h) != 0U) {
+                h = (h + 1UL) & mask;
+            }
+            NativeMemory.At<uint>(index, (long)h) = v;
+            j = (j + 1UL) & mask;
+        }
+    }
+
+    static nint TaskFind(nint sh, ulong generation) {
+        if (generation == 0UL) return (nint)0;
+        nint entries = NativeMemory.Read<nint>(sh + (nint)8);
+        ulong cap = NativeMemory.Read<ulong>(sh + (nint)16);
+        for (ulong i = 0UL; i < cap; i++) {
+            nint e = entries + (nint)((long)i * TaskOff.E_SIZE);
+            if (NativeMemory.Read<ulong>(e + (nint)TaskOff.E_GEN) == generation &&
+                NativeMemory.Read<nint>(e + (nint)TaskOff.E_FRAME) != (nint)0) {
+                return e;
+            }
+        }
+        return (nint)0;
+    }
+
+    static nint TaskFrame(nint sh, nint frame) {
+        if (frame == (nint)0) return (nint)0;
+        ulong pos = TaskIndexPos(sh, frame);
+        if (pos == RtAbi.SIZE_MAX_U64) return (nint)0;
+        nint index = NativeMemory.Read<nint>(sh + (nint)24);
+        nint entries = NativeMemory.Read<nint>(sh + (nint)8);
+        uint slot = NativeMemory.At<uint>(index, (long)pos) - 1U;
+        return entries + (nint)((long)slot * TaskOff.E_SIZE);
+    }
+
+    static nint TaskSlot(nint sh, nint frame) {
+        nint entry = TaskFrame(sh, frame);
+        if (entry != (nint)0) return entry;
+        ulong freeN = NativeMemory.Read<ulong>(sh + (nint)48);
+        if (freeN == 0UL) {
+            ulong cap = NativeMemory.Read<ulong>(sh + (nint)16);
+            ulong next = cap != 0UL ? cap * 2UL : 16UL;
+            if (next < cap || next > 0xFFFFFFFEUL || next > RtAbi.SIZE_MAX_U64 / (ulong)TaskOff.E_SIZE) {
+                RtPlat.CAbort();
+            }
+            nint oldEntries = NativeMemory.Read<nint>(sh + (nint)8);
+            nint entries = RtPlat.CRealloc(oldEntries, next * (ulong)TaskOff.E_SIZE);
+            if (entries == (nint)0) RtPlat.CAbort();
+            RtPlat.CMemset(entries + (nint)((long)cap * TaskOff.E_SIZE), 0, (next - cap) * (ulong)TaskOff.E_SIZE);
+            nint oldFl = NativeMemory.Read<nint>(sh + (nint)40);
+            nint fl = RtPlat.CRealloc(oldFl, next * 4UL);
+            if (fl == (nint)0) RtPlat.CAbort();
+            NativeMemory.Write<nint>(sh + (nint)40, fl);
+            ulong k = next;
+            while (k > cap) {
+                k--;
+                NativeMemory.At<uint>(fl, (long)freeN) = (uint)k;
+                freeN++;
+            }
+            NativeMemory.Write<ulong>(sh + (nint)48, freeN);
+            NativeMemory.Write<nint>(sh + (nint)8, entries);
+            Atomic.StoreAt<ulong>(sh + (nint)16, next, MemoryOrder.Relaxed);
+            TaskIndexRebuild(sh, next * 2UL);
+        }
+        freeN--;
+        NativeMemory.Write<ulong>(sh + (nint)48, freeN);
+        nint freeSlots = NativeMemory.Read<nint>(sh + (nint)40);
+        ulong slotIdx = (ulong)NativeMemory.At<uint>(freeSlots, (long)freeN);
+        nint entries2 = NativeMemory.Read<nint>(sh + (nint)8);
+        entry = entries2 + (nint)((long)slotIdx * TaskOff.E_SIZE);
+        NativeMemory.Write<nint>(entry + (nint)TaskOff.E_FRAME, frame);
+        ulong incSeq = NativeMemory.Read<ulong>(sh + (nint)56) + 1UL;
+        NativeMemory.Write<ulong>(sh + (nint)56, incSeq);
+        NativeMemory.Write<ulong>(entry + (nint)TaskOff.E_INC, incSeq * TASK_SHARDS + ShardIndexOf(sh));
+        TaskIndexInsert(sh, slotIdx);
+        return entry;
+    }
+
+    // ---- Task profiling ----
+
+    static int ProfileStageOf(nint slice) {
+        ulong open = NativeMemory.Read<ulong>(slice + (nint)TaskOff.SL_OPEN_STAGES);
+        if (open == 0UL) return NativeMemory.Read<int>(slice + (nint)TaskOff.SL_INHERITED_STAGE);
+        return 64 - RtPlat.Clz64(open);
+    }
+
+    static void ProfileReleaseLocked(nint profile) {
+        if (profile == (nint)0) return;
+        ulong refs = NativeMemory.Read<ulong>(profile + (nint)TaskOff.P_REFS) - 1UL;
+        NativeMemory.Write<ulong>(profile + (nint)TaskOff.P_REFS, refs);
+        if (refs == 0UL) {
+            RtPlat.CFree(NativeMemory.Read<nint>(profile + (nint)TaskOff.P_WAITS));
+            RtPlat.CFree(NativeMemory.Read<nint>(profile + (nint)TaskOff.P_EXECUTION));
+            RtPlat.CFree(NativeMemory.Read<nint>(profile + (nint)TaskOff.P_STAGES));
+            RtPlat.CFree(profile);
+        }
+    }
+
+    static long ProfileCpu() {
+#if WINDOWS
+        ulong cycles = 0UL;
+        if (RtPlat.WinQueryThreadCycleTime(RtPlat.WinGetCurrentThread(), NativeMemory.AddressOf(ref cycles)) != 0) {
+            return (long)cycles;
+        }
+        return -1L;
+#else
+        Buf32 ts = new Buf32();
+        nint tp = NativeMemory.AddressOf(ref ts);
+        if (RtPlat.PosixClockGettime(RtPlat.CLOCK_THREAD_CPUTIME_ID, tp) != 0) return -1L;
+        long sec = NativeMemory.Read<long>(tp);
+        long nsec = NativeMemory.Read<long>(tp + (nint)8);
+        return sec * 1000000000L + nsec;
+#endif
+    }
+
+    [Export("zan_task_profile_process_start_unix_ms")]
+    public static long ProfileProcessStartUnixMs() {
+#if WINDOWS
+        ulong created = 0UL;
+        ulong exited = 0UL;
+        ulong kernel = 0UL;
+        ulong user = 0UL;
+        if (RtPlat.WinGetProcessTimes(
+                RtPlat.WinGetCurrentProcess(),
+                NativeMemory.AddressOf(ref created),
+                NativeMemory.AddressOf(ref exited),
+                NativeMemory.AddressOf(ref kernel),
+                NativeMemory.AddressOf(ref user)) == 0) {
+            return 0L;
+        }
+        ulong unixEpoch = 116444736000000000UL;
+        return created >= unixEpoch ? (long)((created - unixEpoch) / 10000UL) : 0L;
+#else
+        return 0L;
+#endif
+    }
+
+    static void ProfileResume(nint slice) {
+        if (slice == (nint)0) return;
+        nint profile = NativeMemory.Read<nint>(slice + (nint)TaskOff.SL_PROFILE);
+        if (profile == (nint)0) return;
+        NativeMemory.Write<int>(slice + (nint)TaskOff.SL_MEASURING, 1);
+        NativeMemory.Write<ulong>(slice + (nint)TaskOff.SL_BYTES_START, GetThreadAllocBytes());
+        NativeMemory.Write<long>(slice + (nint)TaskOff.SL_CPU_START, ProfileCpu());
+        if (NativeMemory.Read<nint>(profile + (nint)TaskOff.P_EXECUTION) != (nint)0) {
+            NativeMemory.Write<long>(slice + (nint)TaskOff.SL_START, RtTimerCore.CoPreciseUs());
+        }
+    }
+
+    static void ProfilePause(nint slice) {
+        if (slice == (nint)0 || NativeMemory.Read<int>(slice + (nint)TaskOff.SL_MEASURING) == 0) return;
+        nint profile = NativeMemory.Read<nint>(slice + (nint)TaskOff.SL_PROFILE);
+        long endUs = NativeMemory.Read<nint>(profile + (nint)TaskOff.P_EXECUTION) != (nint)0
+            ? RtTimerCore.CoPreciseUs() : 0L;
+        long cpuEnd = ProfileCpu();
+        long cpuStart = NativeMemory.Read<long>(slice + (nint)TaskOff.SL_CPU_START);
+        long cpu = (cpuStart < 0L || cpuEnd < cpuStart) ? -1L : (cpuEnd - cpuStart);
+        long bytes = (long)(GetThreadAllocBytes() - NativeMemory.Read<ulong>(slice + (nint)TaskOff.SL_BYTES_START));
+
+        ProfileLock();
+        if (NativeMemory.Read<int>(profile + (nint)TaskOff.P_CLOSED) == 0) {
+            NativeMemory.Write<long>(profile + (nint)TaskOff.P_SLICES, NativeMemory.Read<long>(profile + (nint)TaskOff.P_SLICES) + 1L);
+            NativeMemory.Write<long>(profile + (nint)TaskOff.P_BYTES, NativeMemory.Read<long>(profile + (nint)TaskOff.P_BYTES) + bytes);
+            if (cpu < 0L) NativeMemory.Write<int>(profile + (nint)TaskOff.P_CPU_MISSING, 1);
+            else NativeMemory.Write<long>(profile + (nint)TaskOff.P_CPU, NativeMemory.Read<long>(profile + (nint)TaskOff.P_CPU) + cpu);
+
+            nint stages = NativeMemory.Read<nint>(profile + (nint)TaskOff.P_STAGES);
+            if (stages != (nint)0) {
+                nint st = stages + (nint)((long)ProfileStageOf(slice) * TaskOff.S_SIZE);
+                NativeMemory.Write<int>(st + (nint)16, 1);
+                NativeMemory.Write<long>(st + (nint)8, NativeMemory.Read<long>(st + (nint)8) + bytes);
+                if (cpu < 0L) NativeMemory.Write<int>(st + (nint)20, 1);
+                else NativeMemory.Write<long>(st, NativeMemory.Read<long>(st) + cpu);
+            }
+
+            if (NativeMemory.Read<int>(profile + (nint)TaskOff.P_RECORD_EXEC) != 0) {
+#if WINDOWS
+                nint execArr = NativeMemory.Read<nint>(profile + (nint)TaskOff.P_EXECUTION);
+                int ec = NativeMemory.Read<int>(profile + (nint)TaskOff.P_EXEC_COUNT);
+                if (execArr != (nint)0 && ec < TaskOff.MAX_EXECUTION) {
+                    nint ex = execArr + (nint)((long)ec * TaskOff.X_SIZE);
+                    long stUs = NativeMemory.Read<long>(slice + (nint)TaskOff.SL_START);
+                    NativeMemory.Write<long>(ex, (long)RtPlat.WinGetCurrentThreadId());
+                    NativeMemory.Write<long>(ex + (nint)8, stUs);
+                    NativeMemory.Write<long>(ex + (nint)16, endUs - stUs);
+                    NativeMemory.Write<long>(ex + (nint)24, cpu);
+                    NativeMemory.Write<long>(ex + (nint)32, bytes);
+                    NativeMemory.Write<int>(profile + (nint)TaskOff.P_EXEC_COUNT, ec + 1);
+                } else {
+                    NativeMemory.Write<long>(profile + (nint)TaskOff.P_OMITTED_EXEC,
+                        NativeMemory.Read<long>(profile + (nint)TaskOff.P_OMITTED_EXEC) + 1L);
+                }
+#else
+                NativeMemory.Write<long>(profile + (nint)TaskOff.P_OMITTED_EXEC,
+                    NativeMemory.Read<long>(profile + (nint)TaskOff.P_OMITTED_EXEC) + 1L);
+#endif
+            }
+        }
+        ProfileUnlock();
+        NativeMemory.Write<int>(slice + (nint)TaskOff.SL_MEASURING, 0);
+    }
+
+    [Export("zan_task_profile_enable")]
+    public static void ProfileEnable() {
+        Atomic.Store(ref s_profileEnabled, 1, MemoryOrder.Relaxed);
+    }
+
+    [Export("zan_task_profile_alloc_add")]
+    public static void ProfileAllocAdd(long bytes) {
+        if (Atomic.Load(ref s_profileEnabled, MemoryOrder.Relaxed) != 0 && bytes > 0L) {
+            nint tls = RtPlat.TimerTlsPeek();
+            if (tls != (nint)0) {
+                ref TimerTls tlsRef = ref NativeMemory.AsRef<TimerTls>(tls);
+                nint sl = tlsRef.ProfileSlice;
+                if (sl != (nint)0 && NativeMemory.Read<int>(sl + (nint)TaskOff.SL_MEASURING) != 0) {
+                    tlsRef.ThreadAllocBytes += (ulong)bytes;
+                }
+            }
+        }
+    }
+
+    [Export("zan_task_run_profiled")]
+    public static void RunProfiled(nint frame, nint step) {
+        if (Atomic.Load(ref s_profileEnabled, MemoryOrder.Relaxed) == 0) {
+            NativeMemory.InvokeVoidWithCC<nint>("c", step, frame);
+            return;
+        }
+        TaskProfileSlice slice = new TaskProfileSlice();
+        nint sp = NativeMemory.AddressOf(ref slice);
+        RtPlat.CMemset(sp, 0, 56UL);
+        NativeMemory.Write<nint>(sp + (nint)TaskOff.SL_FRAME, frame);
+
+        nint previous = GetProfileSlice();
+        ProfilePause(previous);
+        if (Atomic.Load(ref s_profileCount, MemoryOrder.Acquire) != 0UL) {
+            nint sh = ShardOf(frame);
+            TaskLock(sh);
+            nint entry = TaskFrame(sh, frame);
+            if (entry != (nint)0) {
+                nint ep = NativeMemory.Read<nint>(entry + (nint)TaskOff.E_PROFILE);
+                if (ep != (nint)0) {
+                    ProfileLock();
+                    if (NativeMemory.Read<int>(ep + (nint)TaskOff.P_CLOSED) == 0) {
+                        NativeMemory.Write<nint>(sp + (nint)TaskOff.SL_PROFILE, ep);
+                        NativeMemory.Write<int>(sp + (nint)TaskOff.SL_INHERITED_STAGE, NativeMemory.Read<int>(entry + (nint)TaskOff.E_INHERITED_STAGE));
+                        NativeMemory.Write<ulong>(sp + (nint)TaskOff.SL_OPEN_STAGES, NativeMemory.Read<ulong>(entry + (nint)TaskOff.E_OPEN_STAGES));
+                        NativeMemory.Write<ulong>(ep + (nint)TaskOff.P_REFS, NativeMemory.Read<ulong>(ep + (nint)TaskOff.P_REFS) + 1UL);
+                        int pw = NativeMemory.Read<int>(entry + (nint)TaskOff.E_PENDING_WAIT);
+                        if (pw != 0) {
+                            nint waits = NativeMemory.Read<nint>(ep + (nint)TaskOff.P_WAITS);
+                            nint w = waits + (nint)((long)(pw - 1) * TaskOff.W_SIZE);
+                            long startUs = NativeMemory.Read<long>(w + (nint)24);
+                            NativeMemory.Write<long>(w + (nint)32, RtTimerCore.CoPreciseUs() - startUs);
+                            NativeMemory.Write<int>(entry + (nint)TaskOff.E_PENDING_WAIT, 0);
+                        }
+                    }
+                    ProfileUnlock();
+                }
+            }
+            TaskUnlock(sh);
+        }
+
+        SetProfileSlice(sp);
+        ProfileResume(sp);
+        NativeMemory.InvokeVoidWithCC<nint>("c", step, frame);
+        ProfilePause(sp);
+        SetProfileSlice(previous);
+
+        nint prof = NativeMemory.Read<nint>(sp + (nint)TaskOff.SL_PROFILE);
+        if (prof != (nint)0) {
+            ProfileLock();
+            ProfileReleaseLocked(prof);
+            ProfileUnlock();
+        }
+        ProfileResume(previous);
+    }
+
+    static void ProfileDetachLocked(nint entry) {
+        nint profile = NativeMemory.Read<nint>(entry + (nint)TaskOff.E_PROFILE);
+        if (profile == (nint)0) return;
+        NativeMemory.Write<nint>(entry + (nint)TaskOff.E_PROFILE, (nint)0);
+        NativeMemory.Write<int>(entry + (nint)TaskOff.E_PENDING_WAIT, 0);
+        NativeMemory.Write<int>(entry + (nint)TaskOff.E_INHERITED_STAGE, 0);
+        NativeMemory.Write<ulong>(entry + (nint)TaskOff.E_OPEN_STAGES, 0UL);
+        if (NativeMemory.Read<nint>(profile + (nint)TaskOff.P_ROOT) == NativeMemory.Read<nint>(entry + (nint)TaskOff.E_FRAME)) {
+            NativeMemory.Write<int>(profile + (nint)TaskOff.P_CLOSED, 1);
+            Atomic.FetchAdd(ref s_profileCount, unchecked((ulong)(-1L)), MemoryOrder.Release);
+        } else {
+            NativeMemory.Write<long>(profile + (nint)TaskOff.P_UNFINISHED,
+                NativeMemory.Read<long>(profile + (nint)TaskOff.P_UNFINISHED) - 1L);
+        }
+        ProfileReleaseLocked(profile);
+    }
+
+    [Export("zan_task_profile_checkpoint")]
+    public static void ProfileCheckpoint(nint frame) {
+        nint slice = GetProfileSlice();
+        if (slice == (nint)0 || NativeMemory.Read<nint>(slice + (nint)TaskOff.SL_FRAME) != frame) return;
+        nint prof = NativeMemory.Read<nint>(slice + (nint)TaskOff.SL_PROFILE);
+        if (prof == (nint)0) return;
+        ProfilePause(slice);
+        nint sh = ShardOf(frame);
+        TaskLock(sh);
+        nint entry = TaskFrame(sh, frame);
+        ProfileLock();
+        if (entry != (nint)0 && NativeMemory.Read<nint>(entry + (nint)TaskOff.E_PROFILE) == prof) {
+            ProfileDetachLocked(entry);
+        }
+        ProfileReleaseLocked(prof);
+        NativeMemory.Write<nint>(slice + (nint)TaskOff.SL_PROFILE, (nint)0);
+        ProfileUnlock();
+        TaskUnlock(sh);
+    }
+
+    [Export("zan_task_profile_begin")]
+    public static int ProfileBegin(int flags) {
+        nint slice = GetProfileSlice();
+        if (slice == (nint)0) return 0;
+        nint frame = NativeMemory.Read<nint>(slice + (nint)TaskOff.SL_FRAME);
+        if (frame == (nint)0 || NativeMemory.Read<nint>(slice + (nint)TaskOff.SL_PROFILE) != (nint)0) return 0;
+
+        nint profile = RtPlat.CCalloc(1UL, (ulong)TaskOff.P_SIZE);
+        if (profile == (nint)0) return 0;
+        NativeMemory.Write<ulong>(profile + (nint)TaskOff.P_REFS, 1UL);
+        if ((flags & 2) != 0) {
+            NativeMemory.Write<nint>(profile + (nint)TaskOff.P_STAGES,
+                RtPlat.CCalloc((ulong)(TaskOff.MAX_STAGES + 1), (ulong)TaskOff.S_SIZE));
+        }
+#if WINDOWS
+        int recExec = flags & 1;
+        NativeMemory.Write<int>(profile + (nint)TaskOff.P_RECORD_EXEC, recExec);
+        if (recExec != 0) {
+            NativeMemory.Write<nint>(profile + (nint)TaskOff.P_EXECUTION,
+                RtPlat.CMalloc((ulong)TaskOff.MAX_EXECUTION * (ulong)TaskOff.X_SIZE));
+        }
+#endif
+        nint sh = ShardOf(frame);
+        TaskLock(sh);
+        nint entry = TaskFrame(sh, frame);
+        if (entry == (nint)0 ||
+            NativeMemory.Read<nint>(entry + (nint)TaskOff.E_RETIRE) != (nint)0 ||
+            NativeMemory.Read<nint>(entry + (nint)TaskOff.E_PROFILE) != (nint)0) {
+            TaskUnlock(sh);
+            ProfileReleaseLocked(profile);
+            return 0;
+        }
+        ProfileLock();
+        NativeMemory.Write<ulong>(profile + (nint)TaskOff.P_REFS, NativeMemory.Read<ulong>(profile + (nint)TaskOff.P_REFS) + 1UL);
+        NativeMemory.Write<nint>(profile + (nint)TaskOff.P_ROOT, frame);
+        if (NativeMemory.Read<nint>(profile + (nint)TaskOff.P_STAGES) != (nint)0) {
+            s_profileStageId++;
+            NativeMemory.Write<long>(profile + (nint)TaskOff.P_STAGE_ID, s_profileStageId);
+        }
+        NativeMemory.Write<nint>(entry + (nint)TaskOff.E_PROFILE, profile);
+        NativeMemory.Write<nint>(slice + (nint)TaskOff.SL_PROFILE, profile);
+        NativeMemory.Write<int>(slice + (nint)TaskOff.SL_INHERITED_STAGE, 0);
+        NativeMemory.Write<ulong>(slice + (nint)TaskOff.SL_OPEN_STAGES, 0UL);
+        Atomic.FetchAdd(ref s_profileCount, 1UL, MemoryOrder.Release);
+        ProfileUnlock();
+        TaskUnlock(sh);
+        ProfileResume(slice);
+        return 1;
+    }
+
+    [Export("zan_task_profile_stage_id")]
+    public static long ProfileStageId() {
+        nint slice = GetProfileSlice();
+        if (slice == (nint)0 || NativeMemory.Read<int>(slice + (nint)TaskOff.SL_MEASURING) == 0) return 0L;
+        nint prof = NativeMemory.Read<nint>(slice + (nint)TaskOff.SL_PROFILE);
+        return NativeMemory.Read<long>(prof + (nint)TaskOff.P_STAGE_ID);
+    }
+
+    [Export("zan_task_profile_stage_set")]
+    public static void ProfileStageSet(long id, int slot, int open) {
+        nint slice = GetProfileSlice();
+        if (id == 0L || slice == (nint)0 || NativeMemory.Read<int>(slice + (nint)TaskOff.SL_MEASURING) == 0 ||
+            slot < 0 || slot >= TaskOff.MAX_STAGES) {
+            return;
+        }
+        nint prof = NativeMemory.Read<nint>(slice + (nint)TaskOff.SL_PROFILE);
+        if (NativeMemory.Read<long>(prof + (nint)TaskOff.P_STAGE_ID) != id) return;
+        ulong bit = 1UL << slot;
+        ulong cur = NativeMemory.Read<ulong>(slice + (nint)TaskOff.SL_OPEN_STAGES);
+        ulong next = open != 0 ? (cur | bit) : (cur & ~bit);
+        if (next == cur) return;
+        ProfilePause(slice);
+        NativeMemory.Write<ulong>(slice + (nint)TaskOff.SL_OPEN_STAGES, next);
+        nint frame = NativeMemory.Read<nint>(slice + (nint)TaskOff.SL_FRAME);
+        nint sh = ShardOf(frame);
+        TaskLock(sh);
+        nint entry = TaskFrame(sh, frame);
+        if (entry != (nint)0 && NativeMemory.Read<nint>(entry + (nint)TaskOff.E_PROFILE) == prof) {
+            NativeMemory.Write<ulong>(entry + (nint)TaskOff.E_OPEN_STAGES, next);
+        }
+        TaskUnlock(sh);
+        ProfileResume(slice);
+    }
+
+    [Export("zan_task_profile_wait")]
+    public static void ProfileWait(nint frame, nint file, int line, int column, nint kind) {
+        if (Atomic.Load(ref s_profileEnabled, MemoryOrder.Relaxed) == 0) return;
+        nint slice = GetProfileSlice();
+        if (slice == (nint)0 ||
+            NativeMemory.Read<nint>(slice + (nint)TaskOff.SL_FRAME) != frame ||
+            NativeMemory.Read<int>(slice + (nint)TaskOff.SL_MEASURING) == 0) {
+            return;
+        }
+        nint profile = NativeMemory.Read<nint>(slice + (nint)TaskOff.SL_PROFILE);
+        long startUs = RtTimerCore.CoPreciseUs();
+        nint sh = ShardOf(frame);
+        TaskLock(sh);
+        nint entry = TaskFrame(sh, frame);
+        ProfileLock();
+        if (NativeMemory.Read<int>(profile + (nint)TaskOff.P_CLOSED) == 0 &&
+            entry != (nint)0 &&
+            NativeMemory.Read<nint>(entry + (nint)TaskOff.E_PROFILE) == profile &&
+            NativeMemory.Read<int>(entry + (nint)TaskOff.E_PENDING_WAIT) == 0) {
+            nint waits = NativeMemory.Read<nint>(profile + (nint)TaskOff.P_WAITS);
+            if (waits == (nint)0) {
+                waits = RtPlat.CMalloc((ulong)TaskOff.MAX_WAITS * (ulong)TaskOff.W_SIZE);
+                NativeMemory.Write<nint>(profile + (nint)TaskOff.P_WAITS, waits);
+            }
+            int wc = NativeMemory.Read<int>(profile + (nint)TaskOff.P_WAIT_COUNT);
+            if (waits != (nint)0 && wc < TaskOff.MAX_WAITS) {
+                nint w = waits + (nint)((long)wc * TaskOff.W_SIZE);
+                NativeMemory.Write<nint>(w, file);
+                NativeMemory.Write<nint>(w + (nint)8, kind);
+                NativeMemory.Write<int>(w + (nint)16, line);
+                NativeMemory.Write<int>(w + (nint)20, column);
+                NativeMemory.Write<long>(w + (nint)24, startUs);
+                NativeMemory.Write<long>(w + (nint)32, -1L);
+                wc++;
+                NativeMemory.Write<int>(profile + (nint)TaskOff.P_WAIT_COUNT, wc);
+                NativeMemory.Write<int>(entry + (nint)TaskOff.E_PENDING_WAIT, wc);
+            } else {
+                NativeMemory.Write<long>(profile + (nint)TaskOff.P_OMITTED_WAITS,
+                    NativeMemory.Read<long>(profile + (nint)TaskOff.P_OMITTED_WAITS) + 1L);
+            }
+        }
+        ProfileUnlock();
+        TaskUnlock(sh);
+    }
+
+    [Export("zan_task_profile_end")]
+    public static nint ProfileEnd(nint cpuPtr, nint bytesPtr, nint slicesPtr, nint unfinishedPtr) {
+        nint slice = GetProfileSlice();
+        if (slice == (nint)0) return (nint)0;
+        nint prof = NativeMemory.Read<nint>(slice + (nint)TaskOff.SL_PROFILE);
+        nint frame = NativeMemory.Read<nint>(slice + (nint)TaskOff.SL_FRAME);
+        if (prof == (nint)0 || NativeMemory.Read<nint>(prof + (nint)TaskOff.P_ROOT) != frame) return (nint)0;
+        ProfilePause(slice);
+        nint sh = ShardOf(frame);
+        TaskLock(sh);
+        nint entry = TaskFrame(sh, frame);
+        ProfileLock();
+        NativeMemory.Write<int>(prof + (nint)TaskOff.P_CLOSED, 1);
+        long cpuVal = NativeMemory.Read<int>(prof + (nint)TaskOff.P_CPU_MISSING) != 0
+            ? -1L : NativeMemory.Read<long>(prof + (nint)TaskOff.P_CPU);
+        NativeMemory.Write<long>(cpuPtr, cpuVal);
+        NativeMemory.Write<long>(bytesPtr, NativeMemory.Read<long>(prof + (nint)TaskOff.P_BYTES));
+        NativeMemory.Write<long>(slicesPtr, NativeMemory.Read<long>(prof + (nint)TaskOff.P_SLICES));
+        NativeMemory.Write<long>(unfinishedPtr, NativeMemory.Read<long>(prof + (nint)TaskOff.P_UNFINISHED));
+        if (entry != (nint)0 && NativeMemory.Read<nint>(entry + (nint)TaskOff.E_PROFILE) == prof) {
+            ProfileDetachLocked(entry);
+        }
+        NativeMemory.Write<nint>(slice + (nint)TaskOff.SL_PROFILE, (nint)0);
+        ProfileUnlock();
+        TaskUnlock(sh);
+        return prof;
+    }
+
+    [Export("zan_task_profile_read_stage")]
+    public static int ProfileReadStage(nint report, int slot, nint cpuPtr, nint bytesPtr) {
+        if (report == (nint)0 || slot < -1 || slot >= TaskOff.MAX_STAGES) return 0;
+        nint stages = NativeMemory.Read<nint>(report + (nint)TaskOff.P_STAGES);
+        if (stages == (nint)0) return 0;
+        nint st = stages + (nint)((long)(slot + 1) * TaskOff.S_SIZE);
+        if (NativeMemory.Read<int>(st + (nint)16) == 0) return 0;
+        long cpuVal = NativeMemory.Read<int>(st + (nint)20) != 0 ? -1L : NativeMemory.Read<long>(st);
+        NativeMemory.Write<long>(cpuPtr, cpuVal);
+        NativeMemory.Write<long>(bytesPtr, NativeMemory.Read<long>(st + (nint)8));
+        return 1;
+    }
+
+    [Export("zan_task_profile_read_execution")]
+    public static int ProfileReadExecution(nint report, int index, nint tidPtr, nint startPtr, nint elapsedPtr, nint cpuPtr, nint bytesPtr) {
+        if (report == (nint)0 || index < 0 || index >= NativeMemory.Read<int>(report + (nint)TaskOff.P_EXEC_COUNT)) return 0;
+        nint ex = NativeMemory.Read<nint>(report + (nint)TaskOff.P_EXECUTION) + (nint)((long)index * TaskOff.X_SIZE);
+        NativeMemory.Write<long>(tidPtr, NativeMemory.Read<long>(ex));
+        NativeMemory.Write<long>(startPtr, NativeMemory.Read<long>(ex + (nint)8));
+        NativeMemory.Write<long>(elapsedPtr, NativeMemory.Read<long>(ex + (nint)16));
+        NativeMemory.Write<long>(cpuPtr, NativeMemory.Read<long>(ex + (nint)24));
+        NativeMemory.Write<long>(bytesPtr, NativeMemory.Read<long>(ex + (nint)32));
+        return 1;
+    }
+
+    [Export("zan_task_profile_omitted_execution")]
+    public static long ProfileOmittedExecution(nint report) {
+        return report != (nint)0 ? NativeMemory.Read<long>(report + (nint)TaskOff.P_OMITTED_EXEC) : 0L;
+    }
+
+    [Export("zan_task_profile_read_wait")]
+    public static int ProfileReadWait(nint report, int index, nint filePtr, nint linePtr, nint columnPtr, nint kindPtr, nint startPtr, nint elapsedPtr) {
+        if (report == (nint)0 || index < 0 || index >= NativeMemory.Read<int>(report + (nint)TaskOff.P_WAIT_COUNT)) return 0;
+        nint w = NativeMemory.Read<nint>(report + (nint)TaskOff.P_WAITS) + (nint)((long)index * TaskOff.W_SIZE);
+        NativeMemory.Write<nint>(filePtr, NativeMemory.Read<nint>(w));
+        NativeMemory.Write<int>(linePtr, NativeMemory.Read<int>(w + (nint)16));
+        NativeMemory.Write<int>(columnPtr, NativeMemory.Read<int>(w + (nint)20));
+        NativeMemory.Write<nint>(kindPtr, NativeMemory.Read<nint>(w + (nint)8));
+        NativeMemory.Write<long>(startPtr, NativeMemory.Read<long>(w + (nint)24));
+        NativeMemory.Write<long>(elapsedPtr, NativeMemory.Read<long>(w + (nint)32));
+        return 1;
+    }
+
+    [Export("zan_task_profile_omitted_waits")]
+    public static long ProfileOmittedWaits(nint report) {
+        return report != (nint)0 ? NativeMemory.Read<long>(report + (nint)TaskOff.P_OMITTED_WAITS) : 0L;
+    }
+
+    [Export("zan_task_profile_release_report")]
+    public static void ProfileReleaseReport(nint report) {
+        ProfileLock();
+        ProfileReleaseLocked(report);
+        ProfileUnlock();
+    }
+
+    // ---- Registry lifecycle & cancellation ----
+
+    static void TaskDrop(nint sh, nint entry) {
+        if (NativeMemory.Read<nint>(entry + (nint)TaskOff.E_PROFILE) != (nint)0) {
+            ProfileLock();
+            ProfileDetachLocked(entry);
+            ProfileUnlock();
+        }
+        TaskIndexRemove(sh, NativeMemory.Read<nint>(entry + (nint)TaskOff.E_FRAME));
+        nint entries = NativeMemory.Read<nint>(sh + (nint)8);
+        ulong slot = (ulong)((long)(entry - entries) / TaskOff.E_SIZE);
+        RtPlat.CMemset(entry, 0, (ulong)TaskOff.E_SIZE);
+        ulong freeN = NativeMemory.Read<ulong>(sh + (nint)48);
+        nint freeSlots = NativeMemory.Read<nint>(sh + (nint)40);
+        NativeMemory.At<uint>(freeSlots, (long)freeN) = (uint)slot;
+        NativeMemory.Write<ulong>(sh + (nint)48, freeN + 1UL);
+    }
+
+    static ulong TaskCapacityBound() {
+        ulong total = 0UL;
+        for (ulong i = 0UL; i < TASK_SHARDS; i++) {
+            total += Atomic.LoadAt<ulong>(ShardAt(i) + (nint)16, MemoryOrder.Relaxed);
+        }
+        return total + 1UL;
+    }
+
+    [Export("zan_task_frame_config")]
+    public static void FrameConfig(nint frame, nint done, nint cancel) {
+        if (frame == (nint)0) RtPlat.CAbort();
+        nint sh = ShardOf(frame);
+        TaskLock(sh);
+        nint entry = TaskSlot(sh, frame);
+        if (NativeMemory.Read<nint>(entry + (nint)TaskOff.E_RETIRE) != (nint)0) {
+            TaskUnlock(sh);
+            RtPlat.CAbort();
+        }
+        if (done != (nint)0) NativeMemory.Write<nint>(entry + (nint)TaskOff.E_DONE, done);
+        if (cancel != (nint)0) NativeMemory.Write<nint>(entry + (nint)TaskOff.E_CANCEL, cancel);
+        nint curSlice = GetProfileSlice();
+        if (NativeMemory.Read<int>(entry + (nint)TaskOff.E_CONFIGURED) == 0 &&
+            Atomic.Load(ref s_profileEnabled, MemoryOrder.Relaxed) != 0 &&
+            curSlice != (nint)0 &&
+            NativeMemory.Read<int>(curSlice + (nint)TaskOff.SL_MEASURING) != 0 &&
+            NativeMemory.Read<nint>(entry + (nint)TaskOff.E_PROFILE) == (nint)0) {
+            nint sp = NativeMemory.Read<nint>(curSlice + (nint)TaskOff.SL_PROFILE);
+            ProfileLock();
+            if (NativeMemory.Read<int>(sp + (nint)TaskOff.P_CLOSED) == 0) {
+                NativeMemory.Write<nint>(entry + (nint)TaskOff.E_PROFILE, sp);
+                NativeMemory.Write<int>(entry + (nint)TaskOff.E_INHERITED_STAGE, ProfileStageOf(curSlice));
+                NativeMemory.Write<ulong>(sp + (nint)TaskOff.P_REFS, NativeMemory.Read<ulong>(sp + (nint)TaskOff.P_REFS) + 1UL);
+                NativeMemory.Write<long>(sp + (nint)TaskOff.P_UNFINISHED, NativeMemory.Read<long>(sp + (nint)TaskOff.P_UNFINISHED) + 1L);
+            }
+            ProfileUnlock();
+        }
+        NativeMemory.Write<int>(entry + (nint)TaskOff.E_CONFIGURED, 1);
+        TaskUnlock(sh);
+    }
+
+    [Export("zan_task_frame_allocator")]
+    public static void FrameAllocator(nint frame, nint release) {
+        if (frame == (nint)0 || release == (nint)0) RtPlat.CAbort();
+        nint sh = ShardOf(frame);
+        TaskLock(sh);
+        nint entry = TaskSlot(sh, frame);
+        if (NativeMemory.Read<nint>(entry + (nint)TaskOff.E_RETIRE) != (nint)0 ||
+            NativeMemory.Read<nint>(entry + (nint)TaskOff.E_ALLOC_REL) != (nint)0) {
+            TaskUnlock(sh);
+            RtPlat.CAbort();
+        }
+        NativeMemory.Write<nint>(entry + (nint)TaskOff.E_ALLOC_REL, release);
+        TaskUnlock(sh);
+    }
+
+    [Export("zan_task_discard_config")]
+    public static void DiscardConfig(nint frame, nint discard) {
+        if (frame == (nint)0 || discard == (nint)0) RtPlat.CAbort();
+        nint sh = ShardOf(frame);
+        TaskLock(sh);
+        nint entry = TaskSlot(sh, frame);
+        if (NativeMemory.Read<nint>(entry + (nint)TaskOff.E_RETIRE) != (nint)0) {
+            TaskUnlock(sh);
+            RtPlat.CAbort();
+        }
+        NativeMemory.Write<nint>(entry + (nint)TaskOff.E_DISCARD, discard);
+        TaskUnlock(sh);
+    }
+
+    [Export("zan_task_discard")]
+    public static void TaskDiscard(nint frame) {
+        nint sh = ShardOf(frame);
+        TaskLock(sh);
+        nint entry = TaskFrame(sh, frame);
+        if (entry == (nint)0 ||
+            NativeMemory.Read<ulong>(entry + (nint)TaskOff.E_GEN) != 0UL ||
+            NativeMemory.Read<ulong>(entry + (nint)TaskOff.E_PINS) == 0UL ||
+            NativeMemory.Read<nint>(entry + (nint)TaskOff.E_DISCARD) == (nint)0) {
+            TaskUnlock(sh);
+            RtPlat.CAbort();
+        }
+        nint discard = NativeMemory.Read<nint>(entry + (nint)TaskOff.E_DISCARD);
+        NativeMemory.Write<nint>(entry + (nint)TaskOff.E_DISCARD, (nint)0);
+        TaskUnlock(sh);
+        NativeMemory.InvokeVoidWithCC<nint>("c", discard, frame);
+    }
+
+    [Export("zan_task_register")]
+    public static ulong TaskRegister(nint frame, nint done) {
+        if (frame == (nint)0 || done == (nint)0) RtPlat.CAbort();
+        nint sh = ShardOf(frame);
+        ulong seq = Atomic.FetchAdd(ref s_generation, 1UL, MemoryOrder.Relaxed) + 1UL;
+        if (seq >= (ulong)RtAbi.LLONG_MAX_I64 / TASK_SHARDS) RtPlat.CAbort();
+        ulong token = seq * TASK_SHARDS + ShardIndexOf(sh);
+        TaskLock(sh);
+        nint entry = TaskSlot(sh, frame);
+        if (NativeMemory.Read<ulong>(entry + (nint)TaskOff.E_GEN) != 0UL ||
+            NativeMemory.Read<nint>(entry + (nint)TaskOff.E_RETIRE) != (nint)0) {
+            TaskUnlock(sh);
+            RtPlat.CAbort();
+        }
+        NativeMemory.Write<ulong>(entry + (nint)TaskOff.E_GEN, token);
+        NativeMemory.Write<nint>(entry + (nint)TaskOff.E_DONE, done);
+        TaskUnlock(sh);
+        return token;
+    }
+
+    [Export("zan_task_isdone")]
+    public static int TaskIsDone(ulong token) {
+        if (token == 0UL) return 1;
+        nint sh = ShardOfToken(token);
+        TaskLock(sh);
+        nint entry = TaskFind(sh, token);
+        int done = 1;
+        if (entry != (nint)0 && NativeMemory.Read<nint>(entry + (nint)TaskOff.E_RETIRE) == (nint)0) {
+            nint donePtr = NativeMemory.Read<nint>(entry + (nint)TaskOff.E_DONE);
+            done = Atomic.LoadAt<int>(donePtr, MemoryOrder.Acquire) != 0 ? 1 : 0;
+        }
+        TaskUnlock(sh);
+        return done;
+    }
+
+    [Export("zan_task_acquire")]
+    public static nint TaskAcquire(ulong token, int consume) {
+        if (token == 0UL) return (nint)0;
+        nint sh = ShardOfToken(token);
+        TaskLock(sh);
+        nint entry = TaskFind(sh, token);
+        nint frame = (nint)0;
+        if (entry != (nint)0 && NativeMemory.Read<nint>(entry + (nint)TaskOff.E_RETIRE) == (nint)0) {
+            NativeMemory.Write<ulong>(entry + (nint)TaskOff.E_PINS, NativeMemory.Read<ulong>(entry + (nint)TaskOff.E_PINS) + 1UL);
+            frame = NativeMemory.Read<nint>(entry + (nint)TaskOff.E_FRAME);
+            if (consume != 0) NativeMemory.Write<ulong>(entry + (nint)TaskOff.E_GEN, 0UL);
+        }
+        TaskUnlock(sh);
+        return frame;
+    }
+
+    [Export("zan_task_unpin")]
+    public static void TaskUnpin(nint frame) {
+        if (frame == (nint)0) return;
+        nint retire = (nint)0;
+        nint sh = ShardOf(frame);
+        TaskLock(sh);
+        nint entry = TaskFrame(sh, frame);
+        if (entry == (nint)0 || NativeMemory.Read<ulong>(entry + (nint)TaskOff.E_PINS) == 0UL) {
+            TaskUnlock(sh);
+            RtPlat.CAbort();
+        }
+        ulong pins = NativeMemory.Read<ulong>(entry + (nint)TaskOff.E_PINS) - 1UL;
+        NativeMemory.Write<ulong>(entry + (nint)TaskOff.E_PINS, pins);
+        if (pins == 0UL && NativeMemory.Read<nint>(entry + (nint)TaskOff.E_RETIRE) != (nint)0) {
+            retire = NativeMemory.Read<nint>(entry + (nint)TaskOff.E_RETIRE);
+            TaskDrop(sh, entry);
+        }
+        TaskUnlock(sh);
+        if (retire != (nint)0) {
+            NativeMemory.InvokeVoidWithCC<nint>("c", retire, frame);
+        }
+    }
+
+    static void CancelChainLocked(nint sh, nint entry) {
+        ulong remaining = TaskCapacityBound();
+        while (true) {
+            if (entry == (nint)0 || NativeMemory.Read<nint>(entry + (nint)TaskOff.E_RETIRE) != (nint)0) {
+                TaskUnlock(sh);
+                return;
+            }
+            nint cancelPtr = NativeMemory.Read<nint>(entry + (nint)TaskOff.E_CANCEL);
+            if (cancelPtr != (nint)0) {
+                Atomic.StoreAt<int>(cancelPtr, 1, MemoryOrder.Release);
+            }
+            nint child = NativeMemory.Read<nint>(entry + (nint)TaskOff.E_CHILD);
+            ulong inc = NativeMemory.Read<ulong>(entry + (nint)TaskOff.E_CHILD_INC);
+            TaskUnlock(sh);
+            if (child == (nint)0 || remaining == 0UL) return;
+            remaining--;
+            sh = ShardOf(child);
+            TaskLock(sh);
+            entry = TaskFrame(sh, child);
+            if (entry != (nint)0 && NativeMemory.Read<ulong>(entry + (nint)TaskOff.E_INC) != inc) {
+                entry = (nint)0;
+            }
+        }
+    }
+
+    [Export("zan_task_cancel")]
+    public static void TaskCancel(ulong token) {
+        if (token == 0UL) return;
+        nint sh = ShardOfToken(token);
+        TaskLock(sh);
+        CancelChainLocked(sh, TaskFind(sh, token));
+    }
+
+    [Export("zan_task_frame_cancel")]
+    public static void TaskFrameCancel(nint frame) {
+        if (frame == (nint)0) return;
+        nint sh = ShardOf(frame);
+        TaskLock(sh);
+        CancelChainLocked(sh, TaskFrame(sh, frame));
+    }
+
+    [Export("zan_task_child")]
+    public static void TaskChild(nint parent, nint child) {
+        ulong inc = 0UL;
+        nint cs = (nint)0;
+        if (child != (nint)0) {
+            cs = ShardOf(child);
+            TaskLock(cs);
+            nint c = TaskFrame(cs, child);
+            if (c == (nint)0 || NativeMemory.Read<nint>(c + (nint)TaskOff.E_RETIRE) != (nint)0) {
+                TaskUnlock(cs);
+                RtPlat.CAbort();
+            }
+            inc = NativeMemory.Read<ulong>(c + (nint)TaskOff.E_INC);
+            TaskUnlock(cs);
+        }
+        nint ps = ShardOf(parent);
+        TaskLock(ps);
+        nint p = TaskFrame(ps, parent);
+        if (p == (nint)0 || NativeMemory.Read<nint>(p + (nint)TaskOff.E_RETIRE) != (nint)0) {
+            TaskUnlock(ps);
+            RtPlat.CAbort();
+        }
+        NativeMemory.Write<nint>(p + (nint)TaskOff.E_CHILD, child);
+        NativeMemory.Write<ulong>(p + (nint)TaskOff.E_CHILD_INC, inc);
+        nint cancelPtr = NativeMemory.Read<nint>(p + (nint)TaskOff.E_CANCEL);
+        bool cancelled = cancelPtr != (nint)0 && Atomic.LoadAt<int>(cancelPtr, MemoryOrder.Acquire) != 0;
+        TaskUnlock(ps);
+        if (cancelled && child != (nint)0) {
+            TaskLock(cs);
+            nint c = TaskFrame(cs, child);
+            if (c != (nint)0 && NativeMemory.Read<ulong>(c + (nint)TaskOff.E_INC) != inc) {
+                c = (nint)0;
+            }
+            CancelChainLocked(cs, c);
+        }
+    }
+
+    [Export("zan_task_retire")]
+    public static void TaskRetire(nint frame, nint release) {
+        if (frame == (nint)0) return;
+        bool deferred = false;
+        nint sh = ShardOf(frame);
+        TaskLock(sh);
+        nint entry = TaskFrame(sh, frame);
+        if (entry != (nint)0) {
+            NativeMemory.Write<ulong>(entry + (nint)TaskOff.E_GEN, 0UL);
+            NativeMemory.Write<nint>(entry + (nint)TaskOff.E_CHILD, (nint)0);
+            NativeMemory.Write<ulong>(entry + (nint)TaskOff.E_CHILD_INC, 0UL);
+            if (NativeMemory.Read<nint>(entry + (nint)TaskOff.E_RETIRE) != (nint)0) {
+                TaskUnlock(sh);
+                return;
+            }
+            nint allocRel = NativeMemory.Read<nint>(entry + (nint)TaskOff.E_ALLOC_REL);
+            if (allocRel != (nint)0) release = allocRel;
+            if (NativeMemory.Read<ulong>(entry + (nint)TaskOff.E_PINS) != 0UL) {
+                NativeMemory.Write<nint>(entry + (nint)TaskOff.E_RETIRE, release);
+                deferred = true;
+            } else {
+                TaskDrop(sh, entry);
+            }
+        }
+        TaskUnlock(sh);
+        if (!deferred && release != (nint)0) {
+            NativeMemory.InvokeVoidWithCC<nint>("c", release, frame);
+        }
+    }
+
+    [Export("zan_task_live_count")]
+    public static ulong TaskLiveCount() {
+        ulong count = 0UL;
+        for (ulong k = 0UL; k < TASK_SHARDS; k++) {
+            nint sh = ShardAt(k);
+            TaskLock(sh);
+            nint entries = NativeMemory.Read<nint>(sh + (nint)8);
+            ulong cap = NativeMemory.Read<ulong>(sh + (nint)16);
+            for (ulong i = 0UL; i < cap; i++) {
+                if (NativeMemory.Read<nint>(entries + (nint)((long)i * TaskOff.E_SIZE) + (nint)TaskOff.E_FRAME) != (nint)0) {
+                    count++;
+                }
+            }
+            TaskUnlock(sh);
+        }
+        return count;
+    }
+
+    [Export("zan_task_slot_capacity")]
+    public static ulong TaskSlotCapacity() {
+        ulong cap = 0UL;
+        for (ulong k = 0UL; k < TASK_SHARDS; k++) {
+            nint sh = ShardAt(k);
+            TaskLock(sh);
+            cap += NativeMemory.Read<ulong>(sh + (nint)16);
+            TaskUnlock(sh);
+        }
+        return cap;
+    }
+}

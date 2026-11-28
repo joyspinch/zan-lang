@@ -42,6 +42,10 @@ public class Manifest {
     // 才是新库；已有槽全部损坏或发生读取错误时显式拒绝打开。
     public static Manifest Load(string basePath) {
         Manifest m = new Manifest();
+        if (basePath == null || basePath.Length == 0) {
+            m.lastError = "manifest path is empty";
+            return m;
+        }
         m.basePath = basePath;
         bool present = false;
         for (int slot = 0; slot < 2; slot = slot + 1) {
@@ -73,51 +77,52 @@ public class Manifest {
         gen = 0;
         seq = 0;
         nextId = 0;
+        if (path == null || path.Length == 0 || ids == null) { return false; }
         PageFile f = PageFile.OpenExisting(path);
-        if (!f.IsOpen()) {
-            this.lastError = "manifest open failed: " + f.GetError();
+        ByteBuffer b = null;
+        try {
+            if (!f.IsOpen()) {
+                this.lastError = "manifest open failed: " + f.GetError();
+                return false;
+            }
+            long size = f.Size();
+            if (size < 0) {
+                this.lastError = "manifest size failed: " + f.GetError();
+                return false;
+            }
+            if (size < Manifest.FIXED + 4 || size > LogFile.MAX_FRAME) { return false; }
+            b = ByteBuffer.Alloc((int)size);
+            int got = f.ReadAt(0, b, (int)size);
+            if (got != (int)size) {
+                this.lastError = "manifest read failed: " + f.GetError();
+                return false;
+            }
             f.Close();
-            return false;
-        }
-        long size = f.Size();
-        if (size < 0) {
-            this.lastError = "manifest size failed: " + f.GetError();
+            if (f.GetError() != "") {
+                this.lastError = "manifest close failed: " + f.GetError();
+                return false;
+            }
+            b.SeekRead(0);
+            if (b.Str(0, 4) != Manifest.MAGIC) { return false; }
+            b.SeekRead(4);
+            long ver = b.ReadU32();
+            if (ver != Manifest.VERSION) { return false; }
+            gen = b.ReadU64();
+            seq = b.ReadU64();
+            nextId = b.ReadU64();
+            long count = b.ReadU32();
+            if (count < 0 || Manifest.FIXED + 8 * count + 4 != size) { return false; }
+            ids.Clear();
+            for (long i = 0; i < count; i = i + 1) {
+                ids.Add(b.ReadU64());
+            }
+            long crc = b.ReadU32();
+            if (b.Crc32((int)size - 4) != crc) { return false; }
+            return gen > 0 && Manifest.ValidState(seq, nextId, ids);
+        } finally {
             f.Close();
-            return false;
+            if (b != null) { b.Free(); }
         }
-        if (size < Manifest.FIXED + 4 || size > LogFile.MAX_FRAME) { f.Close(); return false; }
-        ByteBuffer b = ByteBuffer.Alloc((int)size);
-        int got = f.ReadAt(0, b, (int)size);
-        if (got != (int)size) {
-            this.lastError = "manifest read failed: " + f.GetError();
-            f.Close();
-            b.Free();
-            return false;
-        }
-        f.Close();
-        if (f.GetError() != "") {
-            this.lastError = "manifest close failed: " + f.GetError();
-            b.Free();
-            return false;
-        }
-        b.SeekRead(0);
-        if (b.Str(0, 4) != Manifest.MAGIC) { b.Free(); return false; }
-        b.SeekRead(4);
-        long ver = b.ReadU32();
-        if (ver != Manifest.VERSION) { b.Free(); return false; }
-        gen = b.ReadU64();
-        seq = b.ReadU64();
-        nextId = b.ReadU64();
-        long count = b.ReadU32();
-        if (Manifest.FIXED + 8 * count + 4 != size) { b.Free(); return false; }
-        ids.Clear();
-        for (long i = 0; i < count; i = i + 1) {
-            ids.Add(b.ReadU64());
-        }
-        long crc = b.ReadU32();
-        if (b.Crc32((int)size - 4) != crc) { b.Free(); return false; }
-        b.Free();
-        return gen > 0 && Manifest.ValidState(seq, nextId, ids);
     }
 
     public static bool ValidState(long seq, long nextId, List<long> ids) {
@@ -149,6 +154,10 @@ public class Manifest {
     // 原子发布新代：payload 写到非当前槽、截断对齐、
     // fsync。失败时旧代清单仍然有效。
     public bool Save(long newLogStartSeq, long newNextSegId, List<long> ids) {
+        if (ids == null) {
+            this.lastError = "manifest segment list is null";
+            return false;
+        }
         int slot = this.curSlot == 0 ? 1 : 0;
         long newGen = this.gen + 1;
         int n = ids.Count;
@@ -159,24 +168,28 @@ public class Manifest {
         }
         int total = Manifest.FIXED + 8 * n + 4;
         ByteBuffer b = ByteBuffer.Alloc(total);
-        b.WriteRaw(Manifest.MAGIC, 4);
-        b.WriteU32(Manifest.VERSION);
-        b.WriteU64(newGen);
-        b.WriteU64(newLogStartSeq);
-        b.WriteU64(newNextSegId);
-        b.WriteU32(n);
-        for (int i = 0; i < n; i = i + 1) { b.WriteU64(ids[i]); }
-        b.WriteU32(b.Crc32(total - 4));
-        PageFile f = PageFile.Open(Manifest.SlotPath(this.basePath, slot));
-        if (!f.IsOpen()) {
-            this.lastError = f.GetError();
+        PageFile f = null;
+        bool ok = false;
+        try {
+            b.WriteRaw(Manifest.MAGIC, 4);
+            b.WriteU32(Manifest.VERSION);
+            b.WriteU64(newGen);
+            b.WriteU64(newLogStartSeq);
+            b.WriteU64(newNextSegId);
+            b.WriteU32(n);
+            for (int i = 0; i < n; i = i + 1) { b.WriteU64(ids[i]); }
+            b.WriteU32(b.Crc32(total - 4));
+            f = PageFile.Open(Manifest.SlotPath(this.basePath, slot));
+            if (!f.IsOpen()) {
+                this.lastError = f.GetError();
+                return false;
+            }
+            int w = f.WriteAt(0, b.Raw(), total);
+            ok = w == total && f.Truncate(total) && f.Sync();
+        } finally {
+            if (f != null) { f.Close(); }
             b.Free();
-            return false;
         }
-        int w = f.WriteAt(0, b.Raw(), total);
-        bool ok = w == total && f.Truncate(total) && f.Sync();
-        f.Close();
-        b.Free();
         if (!ok || f.GetError() != "") {
             this.lastError = "manifest save failed: " + f.GetError();
             return false;

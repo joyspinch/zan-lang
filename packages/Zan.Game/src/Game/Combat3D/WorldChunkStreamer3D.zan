@@ -1,0 +1,364 @@
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+
+namespace Game.Combat3D;
+
+// 开放世界空间区块驻留状态枚举常量。
+public static class WorldChunkState3D {
+    public const int Unloaded = 0;
+    public const int Resident = 1;
+}
+
+// 开放世界无缝分块迟滞流式调度器（对标 UE5 World Partition / Decima Streaming Grid）：
+// - 双半径迟滞环（LoadRadius < UnloadRadius）：彻底消除玩家在区块交界处反复横跳导致的抖动加载/卸载
+// - 运动前瞻 + 视线点积 + 重要度分级优先级评分：优先加载高速载具/冲刺角色正前方视野内的区块
+// - 严格帧预算闸门（MaxLoadsPerFrame / MaxUnloadsPerFrame）：杜绝单帧集中建树/卸载引发的帧时间尖峰
+// - 与 DynamicSceneTlas3D 自动联动：区块驻留时自动挂载碰撞实例，卸载时自动回收槽位
+public class WorldChunkStreamer3D {
+    public float LoadRadius;
+    public float UnloadRadius;
+    public float VelocityLookaheadSeconds;
+    public float ForwardPriorityWeight;
+    public int MaxLoadsPerFrame;
+    public int MaxUnloadsPerFrame;
+    public bool UseHorizontalDistanceOnly;
+
+    private int[] chunkIds;
+    private float[] chunkBounds;      // 6 float: minX, minY, minZ, maxX, maxY, maxZ
+    private StaticMeshBvh3D[] chunkBlas;
+    private Vector3[] chunkPos;
+    private Quaternion[] chunkRot;
+    private float[] chunkScale;
+    private int[] chunkLayerMask;
+    private int[] chunkImportance;
+    private byte[] chunkState;        // 0=Unloaded, 1=Resident
+    private bool[] chunkPinned;
+    private int[] chunkTlasInstId;    // 当前在 DynamicSceneTlas3D 中的实例句柄（无则为 -1）
+
+    private Dictionary<int, int> idToIndex;
+    private int count;
+    private int capacity;
+    private int residentCount;
+
+    // 复用评分工作区（零每帧堆分配）
+    private int[] candIndices;
+    private float[] candScores;
+
+    public WorldChunkStreamer3D(float loadRadius, float unloadRadius) {
+        float lr = loadRadius > 1.0f ? loadRadius : 128.0f;
+        float ur = unloadRadius > lr + 4.0f ? unloadRadius : (lr * 1.25f);
+        this.LoadRadius = lr;
+        this.UnloadRadius = ur;
+        this.VelocityLookaheadSeconds = 0.65f;
+        this.ForwardPriorityWeight = 0.45f;
+        this.MaxLoadsPerFrame = 4;
+        this.MaxUnloadsPerFrame = 6;
+        this.UseHorizontalDistanceOnly = true;
+
+        int cap = 64;
+        this.capacity = cap;
+        this.chunkIds = new int[cap];
+        this.chunkBounds = new float[cap * 6];
+        this.chunkBlas = new StaticMeshBvh3D[cap];
+        this.chunkPos = new Vector3[cap];
+        this.chunkRot = new Quaternion[cap];
+        this.chunkScale = new float[cap];
+        this.chunkLayerMask = new int[cap];
+        this.chunkImportance = new int[cap];
+        this.chunkState = new byte[cap];
+        this.chunkPinned = new bool[cap];
+        this.chunkTlasInstId = new int[cap];
+        this.idToIndex = new Dictionary<int, int>();
+        this.count = 0;
+        this.residentCount = 0;
+
+        this.candIndices = new int[cap];
+        this.candScores = new float[cap];
+    }
+
+    public int TotalChunkCount() { return this.count; }
+    public int ResidentChunkCount() { return this.residentCount; }
+
+    private void EnsureCapacity(int needed) {
+        if (needed <= this.capacity) { return; }
+        int newCap = this.capacity * 2;
+        while (newCap < needed) { newCap = newCap * 2; }
+
+        int[] nIds = new int[newCap];
+        Array.Copy(this.chunkIds, 0, nIds, 0, this.count);
+        this.chunkIds = nIds;
+
+        float[] nBounds = new float[newCap * 6];
+        Array.Copy(this.chunkBounds, 0, nBounds, 0, this.count * 6);
+        this.chunkBounds = nBounds;
+
+        StaticMeshBvh3D[] nBlas = new StaticMeshBvh3D[newCap];
+        Array.Copy(this.chunkBlas, 0, nBlas, 0, this.count);
+        this.chunkBlas = nBlas;
+
+        Vector3[] nPos = new Vector3[newCap];
+        Array.Copy(this.chunkPos, 0, nPos, 0, this.count);
+        this.chunkPos = nPos;
+
+        Quaternion[] nRot = new Quaternion[newCap];
+        Array.Copy(this.chunkRot, 0, nRot, 0, this.count);
+        this.chunkRot = nRot;
+
+        float[] nScale = new float[newCap];
+        Array.Copy(this.chunkScale, 0, nScale, 0, this.count);
+        this.chunkScale = nScale;
+
+        int[] nLayer = new int[newCap];
+        Array.Copy(this.chunkLayerMask, 0, nLayer, 0, this.count);
+        this.chunkLayerMask = nLayer;
+
+        int[] nImp = new int[newCap];
+        Array.Copy(this.chunkImportance, 0, nImp, 0, this.count);
+        this.chunkImportance = nImp;
+
+        byte[] nState = new byte[newCap];
+        Array.Copy(this.chunkState, 0, nState, 0, this.count);
+        this.chunkState = nState;
+
+        bool[] nPin = new bool[newCap];
+        Array.Copy(this.chunkPinned, 0, nPin, 0, this.count);
+        this.chunkPinned = nPin;
+
+        int[] nInst = new int[newCap];
+        Array.Copy(this.chunkTlasInstId, 0, nInst, 0, this.count);
+        this.chunkTlasInstId = nInst;
+
+        this.candIndices = new int[newCap];
+        this.candScores = new float[newCap];
+        this.capacity = newCap;
+    }
+
+    // 注册世界空间区块元数据（collisionBlas 可预构建传入，也可传 null 待流式命中后再由 AttachChunkCollision 绑定）。
+    public bool RegisterChunk(int chunkId, Vector3 worldMin, Vector3 worldMax,
+                              StaticMeshBvh3D collisionBlas, Vector3 instanceOrigin,
+                              Quaternion instanceRotation, float uniformScale,
+                              int layerMask, int importanceTier) {
+        if (this.idToIndex.ContainsKey(chunkId)) { return false; }
+        this.EnsureCapacity(this.count + 1);
+
+        int idx = this.count;
+        this.count = idx + 1;
+        this.idToIndex.Add(chunkId, idx);
+
+        this.chunkIds[idx] = chunkId;
+        int b = idx * 6;
+        this.chunkBounds[b + 0] = Math.Min(worldMin.X, worldMax.X);
+        this.chunkBounds[b + 1] = Math.Min(worldMin.Y, worldMax.Y);
+        this.chunkBounds[b + 2] = Math.Min(worldMin.Z, worldMax.Z);
+        this.chunkBounds[b + 3] = Math.Max(worldMin.X, worldMax.X);
+        this.chunkBounds[b + 4] = Math.Max(worldMin.Y, worldMax.Y);
+        this.chunkBounds[b + 5] = Math.Max(worldMin.Z, worldMax.Z);
+
+        this.chunkBlas[idx] = collisionBlas;
+        this.chunkPos[idx] = instanceOrigin;
+        this.chunkRot[idx] = instanceRotation;
+        this.chunkScale[idx] = uniformScale > 1e-4f ? uniformScale : 1.0f;
+        this.chunkLayerMask[idx] = layerMask;
+        this.chunkImportance[idx] = importanceTier;
+        this.chunkState[idx] = (byte)WorldChunkState3D.Unloaded;
+        this.chunkPinned[idx] = false;
+        this.chunkTlasInstId[idx] = -1;
+        return true;
+    }
+
+    // 为异步流式解码完成的区块动态注入碰撞 BLAS（若区块当前处于驻留态则立即挂载进 TLAS）。
+    public bool AttachChunkCollision(int chunkId, StaticMeshBvh3D collisionBlas, DynamicSceneTlas3D targetTlas) {
+        int idx;
+        if (!this.idToIndex.TryGetValue(chunkId, out idx)) { return false; }
+        this.chunkBlas[idx] = collisionBlas;
+        if (this.chunkState[idx] == (byte)WorldChunkState3D.Resident && targetTlas != null) {
+            if (this.chunkTlasInstId[idx] >= 0) {
+                targetTlas.RemoveInstance(this.chunkTlasInstId[idx]);
+                this.chunkTlasInstId[idx] = -1;
+            }
+            if (collisionBlas != null) {
+                this.chunkTlasInstId[idx] = targetTlas.AddInstance(
+                    collisionBlas, this.chunkPos[idx], this.chunkRot[idx],
+                    this.chunkScale[idx], this.chunkLayerMask[idx], chunkId);
+            }
+        }
+        return true;
+    }
+
+    // 强制常驻锁定/解锁关键剧情据点或出生基地（Pinned 区块绝不因距离远而卸载，且享有最高加载优先级）。
+    public bool SetChunkPinned(int chunkId, bool pinned) {
+        int idx;
+        if (!this.idToIndex.TryGetValue(chunkId, out idx)) { return false; }
+        this.chunkPinned[idx] = pinned;
+        return true;
+    }
+
+    public bool IsChunkResident(int chunkId) {
+        int idx;
+        if (!this.idToIndex.TryGetValue(chunkId, out idx)) { return false; }
+        return this.chunkState[idx] == (byte)WorldChunkState3D.Resident;
+    }
+
+    public int GetChunkTlasInstanceId(int chunkId) {
+        int idx;
+        if (!this.idToIndex.TryGetValue(chunkId, out idx)) { return -1; }
+        return this.chunkTlasInstId[idx];
+    }
+
+    // 执行单帧开放世界流式评估：按双半径迟滞与视野前瞻优先级裁剪，严格受控于每帧加载/卸载预算。
+    public void Update(Vector3 viewerPosition, Vector3 viewerVelocity, Vector3 viewForward,
+                       DynamicSceneTlas3D targetTlas,
+                       List<int> outLoadedChunkIds, List<int> outUnloadedChunkIds) {
+        if (outLoadedChunkIds != null) { outLoadedChunkIds.Clear(); }
+        if (outUnloadedChunkIds != null) { outUnloadedChunkIds.Clear(); }
+        if (this.count <= 0) { return; }
+
+        float loadR = Math.Max(1.0f, this.LoadRadius);
+        float unloadR = Math.Max(loadR + 2.0f, this.UnloadRadius);
+        float loadRSq = loadR * loadR;
+        float unloadRSq = unloadR * unloadR;
+
+        float lookahead = Math.Max(0.0f, this.VelocityLookaheadSeconds);
+        Vector3 focusPos = new Vector3(
+            viewerPosition.X + viewerVelocity.X * lookahead,
+            viewerPosition.Y + viewerVelocity.Y * lookahead,
+            viewerPosition.Z + viewerVelocity.Z * lookahead);
+
+        float fx = viewForward.X;
+        float fy = this.UseHorizontalDistanceOnly ? 0.0f : viewForward.Y;
+        float fz = viewForward.Z;
+        float fLenSq = fx * fx + fy * fy + fz * fz;
+        if (fLenSq > 1e-8f) {
+            float invF = 1.0f / MathF.Sqrt(fLenSq);
+            fx = fx * invF; fy = fy * invF; fz = fz * invF;
+        } else {
+            fx = 0.0f; fy = 0.0f; fz = -1.0f;
+        }
+
+        // 1. 收集超距待卸载区块（优先卸载距离最远的区块）
+        int unloadCandCnt = 0;
+        int maxUnloads = this.MaxUnloadsPerFrame > 0 ? this.MaxUnloadsPerFrame : 0;
+        if (maxUnloads > 0 && this.residentCount > 0) {
+            for (int i = 0; i < this.count; i = i + 1) {
+                if (this.chunkState[i] != (byte)WorldChunkState3D.Resident) { continue; }
+                if (this.chunkPinned[i]) { continue; }
+
+                // 同时检查当前真实坐标与前瞻坐标，两者皆超出 UnloadRadius 才允许卸载
+                float dCurSq = this.DistSqToChunk(viewerPosition, i);
+                if (dCurSq <= unloadRSq) { continue; }
+                float dFocSq = this.DistSqToChunk(focusPos, i);
+                if (dFocSq <= unloadRSq) { continue; }
+
+                this.candIndices[unloadCandCnt] = i;
+                this.candScores[unloadCandCnt] = dCurSq;
+                unloadCandCnt = unloadCandCnt + 1;
+            }
+
+            int toUnload = Math.Min(maxUnloads, unloadCandCnt);
+            for (int step = 0; step < toUnload; step = step + 1) {
+                int bestPos = step;
+                float bestDistSq = this.candScores[step];
+                for (int j = step + 1; j < unloadCandCnt; j = j + 1) {
+                    if (this.candScores[j] > bestDistSq) {
+                        bestDistSq = this.candScores[j];
+                        bestPos = j;
+                    }
+                }
+                int idx = this.candIndices[bestPos];
+                this.candIndices[bestPos] = this.candIndices[step];
+                this.candScores[bestPos] = this.candScores[step];
+
+                this.chunkState[idx] = (byte)WorldChunkState3D.Unloaded;
+                this.residentCount = this.residentCount - 1;
+                if (this.chunkTlasInstId[idx] >= 0 && targetTlas != null) {
+                    targetTlas.RemoveInstance(this.chunkTlasInstId[idx]);
+                }
+                this.chunkTlasInstId[idx] = -1;
+                if (outUnloadedChunkIds != null) {
+                    outUnloadedChunkIds.Add(this.chunkIds[idx]);
+                }
+            }
+        }
+
+        // 2. 收集进入加载半径（或强制常驻）的待加载区块并计算视线前瞻优先级得分
+        int loadCandCnt = 0;
+        int maxLoads = this.MaxLoadsPerFrame > 0 ? this.MaxLoadsPerFrame : 0;
+        if (maxLoads > 0 && this.residentCount < this.count) {
+            for (int i = 0; i < this.count; i = i + 1) {
+                if (this.chunkState[i] == (byte)WorldChunkState3D.Resident) { continue; }
+
+                bool pinned = this.chunkPinned[i];
+                float dCurSq = this.DistSqToChunk(viewerPosition, i);
+                float dFocSq = this.DistSqToChunk(focusPos, i);
+                float minDSq = Math.Min(dCurSq, dFocSq);
+                if (!pinned && minDSq > loadRSq) { continue; }
+
+                float dist = minDSq > 1e-8f ? MathF.Sqrt(minDSq) : 0.0f;
+                int b = i * 6;
+                float cx = (this.chunkBounds[b + 0] + this.chunkBounds[b + 3]) * 0.5f - viewerPosition.X;
+                float cy = this.UseHorizontalDistanceOnly ? 0.0f : ((this.chunkBounds[b + 1] + this.chunkBounds[b + 4]) * 0.5f - viewerPosition.Y);
+                float cz = (this.chunkBounds[b + 2] + this.chunkBounds[b + 5]) * 0.5f - viewerPosition.Z;
+                float cLenSq = cx * cx + cy * cy + cz * cz;
+                float fwdBonus = 0.0f;
+                if (cLenSq > 1e-6f) {
+                    float dot = (cx * fx + cy * fy + cz * fz) / MathF.Sqrt(cLenSq);
+                    if (dot > 0.0f) {
+                        fwdBonus = dot * this.ForwardPriorityWeight * loadR;
+                    }
+                }
+
+                float score = (loadR - dist) + fwdBonus + (float)this.chunkImportance[i] * 64.0f + (pinned ? 1e6f : 0.0f);
+                this.candIndices[loadCandCnt] = i;
+                this.candScores[loadCandCnt] = score;
+                loadCandCnt = loadCandCnt + 1;
+            }
+
+            int toLoad = Math.Min(maxLoads, loadCandCnt);
+            for (int step = 0; step < toLoad; step = step + 1) {
+                int bestPos = step;
+                float bestScore = this.candScores[step];
+                for (int j = step + 1; j < loadCandCnt; j = j + 1) {
+                    if (this.candScores[j] > bestScore) {
+                        bestScore = this.candScores[j];
+                        bestPos = j;
+                    }
+                }
+                int idx = this.candIndices[bestPos];
+                this.candIndices[bestPos] = this.candIndices[step];
+                this.candScores[bestPos] = this.candScores[step];
+
+                this.chunkState[idx] = (byte)WorldChunkState3D.Resident;
+                this.residentCount = this.residentCount + 1;
+                this.chunkTlasInstId[idx] = -1;
+                if (this.chunkBlas[idx] != null && targetTlas != null) {
+                    this.chunkTlasInstId[idx] = targetTlas.AddInstance(
+                        this.chunkBlas[idx], this.chunkPos[idx], this.chunkRot[idx],
+                        this.chunkScale[idx], this.chunkLayerMask[idx], this.chunkIds[idx]);
+                }
+                if (outLoadedChunkIds != null) {
+                    outLoadedChunkIds.Add(this.chunkIds[idx]);
+                }
+            }
+        }
+    }
+
+    private float DistSqToChunk(Vector3 pt, int idx) {
+        int b = idx * 6;
+        float dx = 0.0f;
+        if (pt.X < this.chunkBounds[b + 0]) { dx = this.chunkBounds[b + 0] - pt.X; }
+        else if (pt.X > this.chunkBounds[b + 3]) { dx = pt.X - this.chunkBounds[b + 3]; }
+
+        float dz = 0.0f;
+        if (pt.Z < this.chunkBounds[b + 2]) { dz = this.chunkBounds[b + 2] - pt.Z; }
+        else if (pt.Z > this.chunkBounds[b + 5]) { dz = pt.Z - this.chunkBounds[b + 5]; }
+
+        if (this.UseHorizontalDistanceOnly) {
+            return dx * dx + dz * dz;
+        }
+        float dy = 0.0f;
+        if (pt.Y < this.chunkBounds[b + 1]) { dy = this.chunkBounds[b + 1] - pt.Y; }
+        else if (pt.Y > this.chunkBounds[b + 4]) { dy = pt.Y - this.chunkBounds[b + 4]; }
+        return dx * dx + dy * dy + dz * dz;
+    }
+}

@@ -44,6 +44,27 @@ static void parse_where_clauses(zan_parser_t *p, zan_ast_list_t *out) {
   }
 }
 
+static int parser_is_param_ctx_mod(zan_parser_t *p, const char *kw, size_t len) {
+  if (!parser_check(p, TK_IDENT) || p->current.str_val.len != len ||
+      memcmp(p->current.str_val.str, kw, len) != 0)
+    return 0;
+  /* Contextual lookahead: only treat as modifier when followed by a type/modifier token,
+   * not by ',', ')', '=', or a bare parameter name that would make `kw` the type itself. */
+  zan_token_t nxt = zan_lexer_peek(p->lex);
+  if (nxt.kind == TK_COMMA || nxt.kind == TK_RPAREN || nxt.kind == TK_EQ ||
+      nxt.kind == TK_EOF || nxt.kind == TK_LBRACKET || nxt.kind == TK_LESS ||
+      nxt.kind == TK_DOT || nxt.kind == TK_QUESTION)
+    return 0;
+  /* If followed by an identifier, check one more token: `noalias Span<int> dst` has
+   * `Span` followed by `<` or `dst`; `noalias x` has `x` followed by `,` / `)` / `=`. */
+  if (nxt.kind == TK_IDENT) {
+    zan_token_t t2 = zan_lexer_peek2(p->lex);
+    if (t2.kind == TK_COMMA || t2.kind == TK_RPAREN || t2.kind == TK_EQ)
+      return 0;
+  }
+  return 1;
+}
+
 static zan_ast_node_t *parse_parameter(zan_parser_t *p) {
   zan_loc_t loc = p->current.loc;
 
@@ -53,21 +74,46 @@ static zan_ast_node_t *parse_parameter(zan_parser_t *p) {
     is_this = 1;
   }
 
-  /* Contextual `params` modifier: `params T[] rest` */
+  /* Contextual parameter modifiers: `params`, `noalias`, `scoped`, `noescape` */
   int is_params = 0;
-  if (parser_check(p, TK_IDENT) && p->current.str_val.len == 6 &&
-      memcmp(p->current.str_val.str, "params", 6) == 0) {
-    parser_advance(p);
-    is_params = 1;
-  }
-
+  uint8_t is_noalias = 0;
+  uint8_t is_scoped = 0;
+  uint8_t is_noescape = 0;
   int by_ref = 0;
-  if (parser_check(p, TK_REF)) {
-    parser_advance(p);
-    by_ref = 1;
-  } else if (parser_check(p, TK_OUT)) {
-    parser_advance(p);
-    by_ref = 2;
+  for (;;) {
+    if (!is_params && parser_check(p, TK_IDENT) &&
+        p->current.str_val.len == 6 &&
+        memcmp(p->current.str_val.str, "params", 6) == 0) {
+      parser_advance(p);
+      is_params = 1;
+      continue;
+    }
+    if (!is_noalias && parser_is_param_ctx_mod(p, "noalias", 7)) {
+      parser_advance(p);
+      is_noalias = 1;
+      continue;
+    }
+    if (!is_scoped && parser_is_param_ctx_mod(p, "scoped", 6)) {
+      parser_advance(p);
+      is_scoped = 1;
+      continue;
+    }
+    if (!is_noescape && parser_is_param_ctx_mod(p, "noescape", 8)) {
+      parser_advance(p);
+      is_noescape = 1;
+      continue;
+    }
+    if (!by_ref && parser_check(p, TK_REF)) {
+      parser_advance(p);
+      by_ref = 1;
+      continue;
+    }
+    if (!by_ref && parser_check(p, TK_OUT)) {
+      parser_advance(p);
+      by_ref = 2;
+      continue;
+    }
+    break;
   }
 
   zan_ast_node_t *type = parse_type_ref(p);
@@ -96,6 +142,9 @@ static zan_ast_node_t *parse_parameter(zan_parser_t *p) {
   param->param.is_params = is_params;
   param->param.by_ref = by_ref;
   param->param.is_this = is_this;
+  param->param.is_noalias = is_noalias;
+  param->param.is_scoped = is_scoped;
+  param->param.is_noescape = is_noescape;
   return param;
 }
 
@@ -240,8 +289,10 @@ static void desugar_yield_method(zan_parser_t *p, zan_ast_node_t *m) {
   /* A381 lazy iterators：IEnumerable<T> 返回 + yield 走 parse 后的
    * 迭代器类合成（iter_desugar_unit），真惰性；这里只保留 List<T>
    * 返回的急切改写（现网语义不变）。 */
-  if (rt->type_ref.name.len == 11 &&
-      memcmp(rt->type_ref.name.str, "IEnumerable", 11) == 0) {
+  if ((rt->type_ref.name.len == 11 &&
+       memcmp(rt->type_ref.name.str, "IEnumerable", 11) == 0) ||
+      (rt->type_ref.name.len == 16 &&
+       memcmp(rt->type_ref.name.str, "IAsyncEnumerable", 16) == 0)) {
     return;
   }
   rt->type_ref.name = (zan_istr_t){"List", 4};
@@ -479,17 +530,71 @@ static zan_ast_node_t *parse_member_decl_inner(zan_parser_t *p,
     return parse_delegate_decl(p, mods);
   }
 
+  /* Hygienic macro declaration inside a class/struct:
+   * `macro Name(a, b) => expr;` or `macro Name(a, b) { stmts }` */
+  if (parser_check(p, TK_IDENT) && p->current.str_val.len == 5 &&
+      memcmp(p->current.str_val.str, "macro", 5) == 0 &&
+      zan_lexer_peek(p->lex).kind == TK_IDENT) {
+    return parse_macro_decl(p, mods);
+  }
+
+  /* Associated type member: `type Item;` (abstract in interface) or
+   * `type Item = int;` (concrete binding in class/struct). */
+  if (parser_check(p, TK_IDENT) && p->current.str_val.len == 4 &&
+      memcmp(p->current.str_val.str, "type", 4) == 0 &&
+      zan_lexer_peek(p->lex).kind == TK_IDENT) {
+    zan_lexer_mark_t mk;
+    zan_lexer_mark(p->lex, &mk, p->arena);
+    zan_token_t saved_cur = p->current;
+    zan_token_t saved_prev = p->previous;
+    zan_loc_t tloc = p->current.loc;
+    parser_advance(p); /* consume 'type' */
+    zan_loc_t nloc = p->current.loc;
+    zan_istr_t aname = p->current.str_val;
+    parser_advance(p); /* consume assoc name */
+    if (parser_check(p, TK_SEMICOLON) || parser_check(p, TK_EQ)) {
+      zan_ast_node_t *target = NULL;
+      if (parser_match(p, TK_EQ)) {
+        target = parse_type_ref(p);
+      }
+      parser_expect(p, TK_SEMICOLON);
+      zan_ast_node_t *an = zan_ast_new(p->arena, AST_ASSOC_TYPE_DECL, tloc);
+      zan_ast_set_name_span(an, nloc, aname.len);
+      an->field_decl.name = aname;
+      an->field_decl.type = target;
+      an->field_decl.initializer = NULL;
+      an->field_decl.modifiers = mods;
+      return an;
+    }
+    zan_lexer_reset(p->lex, &mk);
+    p->current = saved_cur;
+    p->previous = saved_prev;
+  }
+
   zan_loc_t loc = p->current.loc;
 
-  /* destructor: ~ClassName() { } */
-  if (parser_check(p, TK_TILDE)) {
-    parser_advance(p);
+  /* destructor: ~StructName() { } or Swift-style `deinit { }` */
+  if (parser_check(p, TK_TILDE) ||
+      (parser_check(p, TK_IDENT) && p->current.str_val.len == 6 &&
+       memcmp(p->current.str_val.str, "deinit", 6) == 0 &&
+       zan_lexer_peek(p->lex).kind == TK_LBRACE)) {
+    bool is_deinit = !parser_check(p, TK_TILDE);
     zan_loc_t name_loc = p->current.loc;
-    uint32_t name_len = parser_check(p, TK_IDENT) ? p->current.str_val.len : 0;
-    parser_expect(p, TK_IDENT);
-    zan_istr_t name = p->previous.str_val;
-    parser_expect(p, TK_LPAREN);
-    parser_expect(p, TK_RPAREN);
+    zan_istr_t name;
+    uint32_t name_len;
+    if (is_deinit) {
+      parser_advance(p); /* consume 'deinit' */
+      name = p->previous.str_val;
+      name_len = name.len;
+    } else {
+      parser_advance(p); /* consume '~' */
+      name_loc = p->current.loc;
+      name_len = parser_check(p, TK_IDENT) ? p->current.str_val.len : 0;
+      parser_expect(p, TK_IDENT);
+      name = p->previous.str_val;
+      parser_expect(p, TK_LPAREN);
+      parser_expect(p, TK_RPAREN);
+    }
     zan_ast_node_t *body = parse_block(p);
 
     zan_ast_node_t *n = zan_ast_new(p->arena, AST_DESTRUCTOR_DECL, loc);
@@ -519,6 +624,14 @@ static zan_ast_node_t *parse_member_decl_inner(zan_parser_t *p,
     zan_ast_node_t *conv_body = NULL;
     if (parser_check(p, TK_LBRACE)) {
       conv_body = parse_block(p);
+    } else if (parser_match(p, TK_ARROW)) {
+      zan_ast_node_t *expr = parse_expression(p);
+      parser_expect(p, TK_SEMICOLON);
+      conv_body = zan_ast_new(p->arena, AST_BLOCK, expr->loc);
+      zan_ast_list_init(&conv_body->block.stmts);
+      zan_ast_node_t *ret = zan_ast_new(p->arena, AST_RETURN_STMT, expr->loc);
+      ret->ret.value = expr;
+      zan_ast_list_push(&conv_body->block.stmts, ret, p->arena);
     } else {
       parser_expect(p, TK_SEMICOLON);
     }
@@ -534,6 +647,8 @@ static zan_ast_node_t *parse_member_decl_inner(zan_parser_t *p,
     return cn;
   }
 ordinary_member:;
+  bool is_ref_return = ((mods & MOD_REF) != 0) || parser_match(p, TK_REF);
+  mods &= ~MOD_REF;
   zan_ast_node_t *type = parse_type_ref(p);
 
   /* constructor: ClassName(params) [: base(args)] { } */
@@ -643,6 +758,14 @@ ordinary_member:;
     zan_ast_node_t *body = NULL;
     if (parser_check(p, TK_LBRACE)) {
       body = parse_block(p);
+    } else if (parser_match(p, TK_ARROW)) {
+      zan_ast_node_t *expr = parse_expression(p);
+      parser_expect(p, TK_SEMICOLON);
+      body = zan_ast_new(p->arena, AST_BLOCK, expr->loc);
+      zan_ast_list_init(&body->block.stmts);
+      zan_ast_node_t *ret = zan_ast_new(p->arena, AST_RETURN_STMT, expr->loc);
+      ret->ret.value = expr;
+      zan_ast_list_push(&body->block.stmts, ret, p->arena);
     } else {
       parser_expect(p, TK_SEMICOLON);
     }
@@ -826,12 +949,20 @@ ordinary_member:;
     zan_ast_list_init(&type_params);
     if (parser_match(p, TK_LESS)) {
       while (!parser_check(p, TK_GREATER) && !parser_check(p, TK_EOF)) {
+        bool is_const_tp = false;
+        if (parser_match(p, TK_CONST)) {
+          is_const_tp = true;
+          if (parser_check(p, TK_INT) || parser_check(p, TK_LONG) ||
+              parser_check(p, TK_UINT) || parser_check(p, TK_ULONG))
+            parser_advance(p);
+        }
         if (parser_check(p, TK_IDENT)) {
           parser_advance(p);
           zan_ast_node_t *tp =
               zan_ast_new(p->arena, AST_IDENTIFIER, p->previous.loc);
           tp->ident.name = p->previous.str_val;
           zan_ast_set_name_span(tp, p->previous.loc, tp->ident.name.len);
+          tp->ident.is_const_param = is_const_tp;
           zan_ast_list_push(&type_params, tp, p->arena);
         }
         if (!parser_match(p, TK_COMMA))
@@ -850,12 +981,14 @@ ordinary_member:;
     if (parser_check(p, TK_LBRACE)) {
       body = parse_block(p);
     } else if (parser_match(p, TK_ARROW)) {
+      bool arrow_ref = parser_match(p, TK_REF);
       zan_ast_node_t *expr = parse_expression(p);
       parser_expect(p, TK_SEMICOLON);
       body = zan_ast_new(p->arena, AST_BLOCK, expr->loc);
       zan_ast_list_init(&body->block.stmts);
       zan_ast_node_t *ret = zan_ast_new(p->arena, AST_RETURN_STMT, expr->loc);
       ret->ret.value = expr;
+      ret->ret.is_ref = is_ref_return || arrow_ref;
       zan_ast_list_push(&body->block.stmts, ret, p->arena);
     } else {
       parser_expect(p, TK_SEMICOLON); /* abstract / extern */
@@ -870,6 +1003,7 @@ ordinary_member:;
     n->method_decl.body = body;
     n->method_decl.modifiers = mods;
     n->method_decl.is_variadic = dll_variadic;
+    n->method_decl.is_ref_return = is_ref_return;
     if (dll_import_lib.str || dll_entry_point.str || wheres.count > 0) {
       zan_method_ext_t *ext = zan_ast_ensure_method_ext(n, p->arena);
       ext->extern_lib = dll_import_lib;

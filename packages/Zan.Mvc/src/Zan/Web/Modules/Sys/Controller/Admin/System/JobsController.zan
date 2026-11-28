@@ -2,7 +2,9 @@ using System;
 using System.Data;
 using System.Data.Orm;
 using System.Diagnostics;
+using System.Json;
 using System.Web;
+using Zan.Web.AdminUi;
 using Zan.Web.Core;
 using Zan.Web.Model;
 using Zan.Web.Security;
@@ -123,7 +125,7 @@ public class JobsController : CrudScreenController {
     [Custom(Perm = PermBit.Update)]
     [Description("执行一次")]
     public async void Run() {
-        int id = this.InInt("id", 0);
+        int id = this.InAnyInt("id", 0);
         IDbConnection db = await this.Conn();
         if (db == null) { this.Fail(503, "2001", "数据库不可用"); }
         SysJob j = await this.SysJob.ById(id);
@@ -148,35 +150,126 @@ public class JobsController : CrudScreenController {
     [HttpGet]
     [Custom(Perm = PermBit.View)]
     [Description("运行历史")]
-    public async void Logs() {
-        int id = this.InInt("id", 0);
-        SysJob j = await this.SysJob.ById(id);
-        if (j == null) { this.Fail(404, "0404", "任务不存在"); }
-        ViewData d = await this.Layout(j.name + " · 运行历史");
-        d.Set("id", Convert.ToString(j.id));
-        d.Set("name", j.name);
-        d.Set("kindText", JobHost.KindName(j.kind));
-        d.Set("intervalText", JobHost.IntervalText(j.intervalSec));
-        d.Set("paramText", j.ParamText());
+    public void Logs() {
+        this.LogsConf();
+    }
 
-        ListQuery q = this.Paged("id", 20);
-        int total = await this.SysJobLog
-            .Where(a => a.jobId == j.id).CountAsync();
-        List<SysJobLog> rows = await this.SysJobLog
-            .Where(a => a.jobId == j.id)
-            .OrderByDescending(a => a.id)
-            .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
-        List<StrMap> items = d.AddList("logs");
-        Rows.Project(rows, items);
-        this.Pager(d, q, total);
-        this.Page(d);
+    [HttpPut]
+    [Route("/admin/system/jobs/logs/conf")]
+    [Custom(Perm = PermBit.View)]
+    [Description("任务运行历史表格配置")]
+    public void LogsConf() {
+        int id = this.InAnyInt("id", 0);
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("PageType", "table");
+
+        w.WritePropertyName("Conf");
+        w.WriteStartObject();
+        w.WriteProperty("showPages", true);
+        w.WriteProperty("pageSize", 20);
+        w.WriteProperty("pageSizes", "10,20,50,100");
+        w.WriteProperty("Local", false);
+        w.WriteProperty("TreeData", false);
+        w.WriteProperty("import", false);
+        w.WriteProperty("export", true);
+        w.WriteProperty("innerKey", "id");
+        w.WriteProperty("innerName", "运行记录");
+        w.WriteEndObject();
+
+        w.WritePropertyName("Columns");
+        w.WriteStartArray();
+        WriteJobLogCol(w, "ID", "id", "number", 75, "");
+        WriteJobLogCol(w, "任务名称", "jobName", "text", 150, "");
+        WriteJobLogCol(w, "结果", "ok", "dict", 90, "1=成功,0=失败");
+        WriteJobLogCol(w, "耗时(ms)", "ms", "number", 100, "");
+        WriteJobLogCol(w, "说明", "message", "text", 340, "");
+        WriteJobLogCol(w, "开始时间", "startedAt", "text", 160, "");
+        w.WriteEndArray();
+
+        w.WritePropertyName("Filters");
+        w.WriteStartArray();
+        w.WriteEndArray();
+
+        w.WritePropertyName("FilterRight");
+        w.WriteStartArray();
+        w.WriteEndArray();
+
+        w.WritePropertyName("Tools");
+        w.WriteStartArray();
+        if (id > 0) {
+            AdminUiProtocol.WriteConfirmAction(w, "清空运行历史", "Custom", "danger",
+                "/admin/system/jobs/clear", "确认清空该任务的全部运行历史吗？", false, false,
+                "{\"id\":" + Convert.ToString(id) + "}", "");
+        }
+        w.WriteEndArray();
+
+        w.WritePropertyName("MenuItems");
+        w.WriteStartArray();
+        AdminUiProtocol.WriteDetailAction(w, "查看详情", "");
+        w.WriteEndArray();
+
+        w.WritePropertyName("Tabs");
+        w.WriteStartArray();
+        w.WriteEndArray();
+
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(this, w.ToString());
+    }
+
+    private static void WriteJobLogCol(JsonWriter w, string header, string field, string type, int width, string opts) {
+        w.WriteStartObject();
+        w.WriteProperty("headerName", header);
+        w.WriteProperty("field", field);
+        w.WriteProperty("type", type);
+        w.WriteProperty("width", width);
+        if (opts.Length > 0) {
+            w.WritePropertyName("options");
+            AdminUiProtocol.WriteOptArray(w, opts);
+        }
+        w.WriteEndObject();
+    }
+
+    [HttpPost]
+    [Route("/admin/system/jobs/logs/list")]
+    [Custom(Perm = PermBit.View)]
+    [Description("任务运行历史数据")]
+    public async void LogsList() {
+        if (!this.DataReady()) { return; }
+        int id = this.InAnyInt("id", 0);
+        ListQuery q = this.PagedAny("id", 20);
+        int total = id > 0
+            ? await this.SysJobLog.Where(a => a.jobId == id).CountAsync()
+            : await this.SysJobLog.CountAsync();
+        List<SysJobLog> rows = id > 0
+            ? await this.SysJobLog.Where(a => a.jobId == id)
+                .OrderByDescending(a => a.id).Skip(q.Skip()).Take(q.Limit()).ToListAsync()
+            : await this.SysJobLog.OrderByDescending(a => a.id)
+                .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
+
+        JsonWriter w = new JsonWriter();
+        w.WriteStartArray();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            SysJobLog r = rows[i];
+            w.WriteStartObject();
+            w.WriteProperty("id", r.id);
+            w.WriteProperty("jobId", r.jobId);
+            w.WriteProperty("jobName", r.jobName);
+            w.WriteProperty("ok", Convert.ToString(r.ok));
+            w.WriteProperty("ms", r.ms);
+            w.WriteProperty("message", r.message);
+            w.WriteProperty("startedAt", Fmt.Stamp(r.startedAt));
+            w.WriteEndObject();
+        }
+        w.WriteEndArray();
+        AdminUiProtocol.WriteListData(this, total, w.ToString());
     }
 
     [HttpPost]
     [Custom(Perm = PermBit.Delete)]
     [Description("清空运行历史")]
     public async void Clear() {
-        int id = this.InInt("id", 0);
+        int id = this.InAnyInt("id", 0);
         SysJob j = await this.SysJob.ById(id);
         if (j == null) { this.Fail(404, "0404", "任务不存在"); }
         int n = await this.SysJobLog.Delete()

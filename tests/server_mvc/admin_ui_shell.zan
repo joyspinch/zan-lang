@@ -1,0 +1,483 @@
+// 通用前端壳（adminUI）协议与 SPA 静态托管端到端回归测试：
+// 1) /api/shell/meta 能力发现；
+// 2) /api/shell/login 登录签发 Token + Cookie；
+// 3) /api/shell/me、/api/shell/prefs 读写个人配置；
+// 4) /api/shell/menu 自动区分 view.vlist（含 PUT {path}/conf）与 view.iframe-page；
+// 5) /api/shell/dict 与 /api/shell/route-exists；
+// 6) CrudScreenController（DoConf/DoFormConf/DoSave JSON 唯一性校验/DoListData/DoBatch 行对象数组删除）；
+// 7) Boot.MountAdminSpa 静态资产 + History API 回退 + SAMEORIGIN 条件放行。
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Data.Orm;
+using System.Data.Sqlite;
+using System.IO;
+using System.Json;
+using System.Web;
+using Zan.Web;
+using Zan.Web.Admin;
+using Zan.Web.Core;
+using Zan.Web.Model;
+using Zan.Web.Security;
+
+[Table("app_shell_item")]
+class ShellItem {
+    [Column(IsIdentity = true)]
+    public int id;
+
+    [Column(StringLength = 64)]
+    public string code;
+
+    [Column(StringLength = 128)]
+    public string title;
+
+    public int status;
+}
+
+[Route("/admin/shell/items")]
+[Custom(Authorization = CustomAuthorization.Grant, IsMenu = true, Group = "测试业务", GroupOrder = 1, Order = 1, Icon = "mdi:table")]
+[Description("壳联调清单")]
+class ShellItemsController : CrudScreenController {
+    override protected CrudConf Def() {
+        return CrudConf.Of("app_shell_item", "壳联调清单", "admin/shell/items")
+            .Col("id", "ID").Int().Ro().W("70px")
+            .Col("code", "编码").Req().Max(64).Search("搜索编码").Unique("编码已存在").W("120px")
+            .Col("title", "标题").Req().Max(128).Search("搜索标题").Inline().W("160px")
+            .Col("status", "状态").Opts("1=启用|ok,0=禁用|err").Def("1").Inline().W("90px")
+            .Label("title")
+            .Order("id", true)
+            .TbarAdd("新增")
+            .TbarEnable()
+            .TbarDisable()
+            .TbarDelete()
+            .OpsCustom("运行日志", "logs", "", "id={id}", "r")
+            .OpsCustom("立即触发", "trigger", "确定立即执行该条目？", "id={id}", "u");
+    }
+}
+
+class Program {
+    static int failures;
+
+    static void Check(bool ok, string label) {
+        if (!ok) {
+            Program.failures = Program.failures + 1;
+            Console.WriteLine("FAIL " + label);
+        }
+    }
+
+    static async string Dispatch(WebApp app, string rawHttp, string uid, out int statusOut, out string wireOut) {
+        HttpRequest req = HttpRequest.Parse(rawHttp);
+        HttpContext ctx = new HttpContext(req, "127.0.0.1");
+        if (uid != null && uid.Length > 0) {
+            ctx.SetUid(uid);
+        }
+        try {
+            Route hit = app.Router().Match(ctx);
+            if (hit == null) {
+                statusOut = 404;
+                wireOut = "";
+                return "";
+            }
+            ctx.SetRouteAction(hit.Action());
+            HttpHandler h = hit.Handler();
+            try {
+                await h(ctx);
+            } catch (ApiError ae) {
+                ctx.Status(ae.Status(), "Error");
+                ctx.Api(ae.Code(), ae.Message, "null");
+            }
+            statusOut = ctx.GetStatus();
+            wireOut = ctx.BuildResponse(false);
+            return ctx.ResponseBody();
+        } finally {
+            ctx.Dispose();
+        }
+    }
+
+    static string JsonReq(string method, string path, string body) {
+        return method + " " + path + " HTTP/1.1\r\n"
+            + "Host: test\r\n"
+            + "Content-Type: application/json\r\n"
+            + "Content-Length: " + Convert.ToString(body.Length) + "\r\n\r\n"
+            + body;
+    }
+
+    static async void CheckShellProtocol(WebApp app, string adminId) {
+        int st = 0;
+        string wire = "";
+
+        /* 1. 能力自描述 (v1.2: 零 iframe 全原生 JSON) */
+        string metaBody = await Dispatch(app, "GET /api/shell/meta HTTP/1.1\r\nHost: test\r\n\r\n", "", out st, out wire);
+        JsonDoc metaDoc = JsonDoc.Parse(metaBody);
+        Program.Check(st == 200
+            && metaDoc != null
+            && metaDoc.PathStr("resp_code", "") == "0000"
+            && metaDoc.PathStr("data.protocolVersion", "") == "1.2"
+            && metaDoc.PathStr("data.backend", "") == "zan-mvc"
+            && metaDoc.PathBool("data.capabilities.vlist", false)
+            && metaDoc.PathBool("data.capabilities.confirmAction", false)
+            && metaDoc.PathBool("data.capabilities.detailView", false)
+            && !metaDoc.PathBool("data.capabilities.iframeModal", true)
+            && !metaDoc.PathBool("data.capabilities.iframeFallback", true)
+            && metaDoc.PathBool("data.capabilities.leftPanel", false)
+            && metaDoc.PathBool("data.capabilities.permMatrix", false)
+            && metaDoc.PathBool("data.capabilities.pageTypeDispatch", false)
+            && metaDoc.PathBool("data.capabilities.logout", false),
+            "GET /api/shell/meta returns zan-mvc v1.2 zero-iframe capabilities");
+
+        /* 2. 规范登录 + 兼容别名登录（同时写 Cookie） */
+        string loginPayload = "{\"userName\":\"admin\",\"password\":\"shell-test-bootstrap-pw\"}";
+        string loginBody = await Dispatch(app, JsonReq("POST", "/api/shell/login", loginPayload), "", out st, out wire);
+        JsonDoc loginDoc = JsonDoc.Parse(loginBody);
+        string tok = loginDoc != null ? loginDoc.PathStr("data.AccessToken", "") : "";
+        Program.Check(st == 200 && tok.Length > 40
+            && loginDoc.PathStr("data.UserName", "") == "admin"
+            && wire.Contains("Set-Cookie: " + Cfg.Auth.cookieName + "="),
+            "POST /api/shell/login issues AccessToken and same-origin auth cookie");
+
+        /* 3. 用户信息 & 个人偏好读写 */
+        string meBody = await Dispatch(app, "GET /api/shell/me HTTP/1.1\r\nHost: test\r\n\r\n", adminId, out st, out wire);
+        JsonDoc meDoc = JsonDoc.Parse(meBody);
+        Program.Check(st == 200 && meDoc != null && meDoc.PathStr("data.UserName", "") == "admin",
+            "GET /api/shell/me returns current admin profile");
+
+        string savePref = await Dispatch(app,
+            JsonReq("POST", "/api/shell/prefs", "{\"field\":\"Theme\",\"value\":\"{\\\"themeScheme\\\":\\\"dark\\\"}\"}"),
+            adminId, out st, out wire);
+        Program.Check(st == 200 && savePref.Contains("\"resp_code\":\"0000\""),
+            "POST /api/shell/prefs persists user theme setting");
+
+        string getPref = await Dispatch(app, "GET /api/shell/prefs HTTP/1.1\r\nHost: test\r\n\r\n", adminId, out st, out wire);
+        JsonDoc prefDoc = JsonDoc.Parse(getPref);
+        Program.Check(st == 200 && prefDoc != null
+            && prefDoc.PathStr("data.Theme", "").Contains("dark"),
+            "GET /api/shell/prefs reads back persisted Theme preference");
+
+        /* 4. 动态菜单树：全量路由统一 view.vlist（零 view.iframe-page），含隐式内置页 */
+        string menuBody = await Dispatch(app, "GET /api/shell/menu HTTP/1.1\r\nHost: test\r\n\r\n", adminId, out st, out wire);
+        Program.Check(st == 200
+            && menuBody.Contains("\"resp_code\":\"0000\"")
+            && menuBody.Contains("\"component\":\"layout.base\"")
+            && menuBody.Contains("\"path\":\"/admin/shell/items\"")
+            && menuBody.Contains("\"component\":\"view.vlist\"")
+            && menuBody.Contains("\"path\":\"/admin/profile\"")
+            && menuBody.Contains("\"path\":\"/admin/system/jobs/logs\"")
+            && !menuBody.Contains("view.iframe-page"),
+            "GET /api/shell/menu emits unified view.vlist with zero iframe-page");
+
+        /* 5. 全局字典 & 路由存在性 */
+        string dictBody = await Dispatch(app, "GET /api/shell/dict HTTP/1.1\r\nHost: test\r\n\r\n", adminId, out st, out wire);
+        JsonDoc dictDoc = JsonDoc.Parse(dictBody);
+        Program.Check(st == 200 && dictDoc != null
+            && dictDoc.PathStr("data.Status.Content.1", "") == "启用",
+            "GET /api/shell/dict returns dictionary map with default Status");
+
+        string existsHome = await Dispatch(app, "GET /api/shell/route-exists?routeName=home HTTP/1.1\r\nHost: test\r\n\r\n", adminId, out st, out wire);
+        string existsMiss = await Dispatch(app, "GET /api/shell/route-exists?routeName=no_such_route HTTP/1.1\r\nHost: test\r\n\r\n", adminId, out st, out wire);
+        Program.Check(existsHome.Contains("\"data\":true") && existsMiss.Contains("\"data\":false"),
+            "GET /api/shell/route-exists returns accurate boolean");
+
+        /* 6. 退出登录（吊销会话 + 清 Cookie） */
+        string logoutBody = await Dispatch(app, JsonReq("POST", "/api/shell/logout", "{}"), adminId, out st, out wire);
+        Program.Check(st == 200 && logoutBody.Contains("\"resp_code\":\"0000\"")
+            && wire.Contains("Set-Cookie: " + Cfg.Auth.cookieName + "="),
+            "POST /api/shell/logout revokes tokenVersion and clears auth cookie");
+    }
+
+    static async void CheckM1SystemJsonEndpoints(WebApp app, string adminId) {
+        int st = 0;
+        string wire = "";
+
+        /* Users: PUT conf + POST list + PUT formconf + PUT rolesconf */
+        string uConf = await Dispatch(app, "PUT /admin/system/users/conf HTTP/1.1\r\nHost: test\r\n\r\n", adminId, out st, out wire);
+        Program.Check(st == 200 && uConf.Contains("\"PageType\":\"table\"") && uConf.Contains("\"confUrl\":\"rolesconf\"") && !uConf.Contains("\"mode\":\"iframe\""),
+            "Users PUT /conf emits zero-iframe table config");
+        string uList = await Dispatch(app, JsonReq("POST", "/admin/system/users/list", "{\"page\":1,\"pageSize\":20}"), adminId, out st, out wire);
+        JsonDoc uDoc = JsonDoc.Parse(uList);
+        Program.Check(st == 200 && uDoc != null && uDoc.PathInt("data.total", 0) >= 1,
+            "Users POST /list returns bootstrap admin");
+
+        /* Roles: PUT conf + POST list + PUT grantconf (perm-matrix) */
+        string rConf = await Dispatch(app, "PUT /admin/system/roles/conf HTTP/1.1\r\nHost: test\r\n\r\n", adminId, out st, out wire);
+        string rGrant = await Dispatch(app, "PUT /admin/system/roles/grantconf HTTP/1.1\r\nHost: test\r\n\r\n", adminId, out st, out wire);
+        Program.Check(st == 200 && rConf.Contains("\"confUrl\":\"grantconf\"") && rGrant.Contains("\"customType\":\"perm-matrix\""),
+            "Roles PUT /conf + /grantconf emit perm-matrix schema");
+
+        /* Departments: PUT conf (LeftPanel tree) + POST tree + POST list */
+        string dConf = await Dispatch(app, "PUT /admin/system/departments/conf HTTP/1.1\r\nHost: test\r\n\r\n", adminId, out st, out wire);
+        string dTree = await Dispatch(app, JsonReq("POST", "/admin/system/departments/tree", "{}"), adminId, out st, out wire);
+        Program.Check(st == 200 && dConf.Contains("\"LeftPanel\"") && dConf.Contains("\"mode\":\"tree\"") && dTree.Contains("\"resp_code\":\"0000\""),
+            "Departments PUT /conf + POST /tree emit LeftPanel tree");
+
+        /* Dicts: PUT conf (LeftPanel list) + POST types + POST list */
+        string diConf = await Dispatch(app, "PUT /admin/system/dicts/conf HTTP/1.1\r\nHost: test\r\n\r\n", adminId, out st, out wire);
+        string diTypes = await Dispatch(app, JsonReq("POST", "/admin/system/dicts/types", "{}"), adminId, out st, out wire);
+        Program.Check(st == 200 && diConf.Contains("\"LeftPanel\"") && diConf.Contains("\"mode\":\"list\"") && diTypes.Contains("\"resp_code\":\"0000\""),
+            "Dicts PUT /conf + POST /types emit LeftPanel list");
+
+        /* Logs (op + login) + Jobs Logs */
+        string lConf = await Dispatch(app, "PUT /admin/system/logs/conf HTTP/1.1\r\nHost: test\r\n\r\n", adminId, out st, out wire);
+        string llConf = await Dispatch(app, "PUT /admin/system/logs/login/conf HTTP/1.1\r\nHost: test\r\n\r\n", adminId, out st, out wire);
+        string jlConf = await Dispatch(app, "PUT /admin/system/jobs/logs/conf HTTP/1.1\r\nHost: test\r\n\r\n", adminId, out st, out wire);
+        string jlList = await Dispatch(app, JsonReq("POST", "/admin/system/jobs/logs/list", "{\"page\":1,\"pageSize\":20}"), adminId, out st, out wire);
+        Program.Check(st == 200 && lConf.Contains("\"PageType\":\"table\"") && llConf.Contains("\"PageType\":\"table\"")
+            && jlConf.Contains("\"PageType\":\"table\"") && jlList.Contains("\"resp_code\":\"0000\""),
+            "Logs + LoginLogs + Jobs.Logs PUT /conf & POST /list return valid JSON");
+
+        /* M2: Settings (PageType=form), Profile (PageType=form), Docs (PageType=table), Media (PageType=media) */
+        string setConf = await Dispatch(app, "PUT /admin/system/settings/conf HTTP/1.1\r\nHost: test\r\n\r\n", adminId, out st, out wire);
+        Program.Check(st == 200 && setConf.Contains("\"PageType\":\"form\"") && setConf.Contains("\"tabs\""),
+            "Settings PUT /conf emits PageType=form schema");
+
+        string profConf = await Dispatch(app, "PUT /admin/profile/conf HTTP/1.1\r\nHost: test\r\n\r\n", adminId, out st, out wire);
+        Program.Check(st == 200 && profConf.Contains("\"PageType\":\"form\"") && profConf.Contains("\"submitUrl\":\"password\""),
+            "Profile PUT /conf emits PageType=form with basic + password tabs");
+
+        string docsConf = await Dispatch(app, "PUT /admin/system/docs/conf HTTP/1.1\r\nHost: test\r\n\r\n", adminId, out st, out wire);
+        string docsList = await Dispatch(app, JsonReq("POST", "/admin/system/docs/list", "{\"page\":1,\"pageSize\":20}"), adminId, out st, out wire);
+        JsonDoc docsDoc = JsonDoc.Parse(docsList);
+        Program.Check(st == 200 && docsConf.Contains("\"mode\":\"download\"") && docsDoc != null && docsDoc.PathInt("data.total", 0) > 10,
+            "Docs PUT /conf + POST /list return route documentation table");
+
+        int stMedConf = 0;
+        string medConf = await Dispatch(app, "PUT /admin/media/media/conf HTTP/1.1\r\nHost: test\r\n\r\n", adminId, out stMedConf, out wire);
+        string medList = await Dispatch(app, JsonReq("POST", "/admin/media/media/list", "{\"page\":1,\"pageSize\":20}"), adminId, out st, out wire);
+        Program.Check(stMedConf == 200 && st == 200 && medConf.Contains("\"PageType\":\"media\"") && medList.Contains("\"resp_code\":\"0000\""),
+            "Media PUT /admin/media/media/conf + POST /list emit PageType=media");
+
+        /* M3: Dashboard + Monitor (5 screens: Index/History/Errors/Sql/Tables) */
+        string dashConf = await Dispatch(app, "PUT /admin/dashboard/conf HTTP/1.1\r\nHost: test\r\n\r\n", adminId, out st, out wire);
+        string dashSum = await Dispatch(app, "GET /admin/dashboard/summary HTTP/1.1\r\nHost: test\r\n\r\n", adminId, out st, out wire);
+        Program.Check(st == 200 && dashConf.Contains("\"PageType\":\"dashboard\"") && dashConf.Contains("\"mode\":\"overview\"") && dashSum.Contains("\"requests\""),
+            "Dashboard PUT /conf + GET /summary emit overview dashboard JSON");
+
+        string monConf = await Dispatch(app, "PUT /admin/monitor/monitor/conf HTTP/1.1\r\nHost: test\r\n\r\n", adminId, out st, out wire);
+        string histConf = await Dispatch(app, "PUT /admin/monitor/monitor/history/conf HTTP/1.1\r\nHost: test\r\n\r\n", adminId, out st, out wire);
+        string histData = await Dispatch(app, JsonReq("POST", "/admin/monitor/monitor/history/data", "{\"h\":24}"), adminId, out st, out wire);
+        Program.Check(st == 200 && monConf.Contains("\"mode\":\"monitor\"") && histConf.Contains("\"mode\":\"history\"") && histData.Contains("\"rows\""),
+            "Monitor Index + History PUT /conf & POST /data emit dashboard JSON");
+
+        string errConf = await Dispatch(app, "PUT /admin/monitor/monitor/errors/conf HTTP/1.1\r\nHost: test\r\n\r\n", adminId, out st, out wire);
+        string errList = await Dispatch(app, JsonReq("POST", "/admin/monitor/monitor/errors/list", "{\"h\":24,\"page\":1,\"pageSize\":20}"), adminId, out st, out wire);
+        string sqlConf = await Dispatch(app, "PUT /admin/monitor/monitor/sql/conf HTTP/1.1\r\nHost: test\r\n\r\n", adminId, out st, out wire);
+        string sqlList = await Dispatch(app, JsonReq("POST", "/admin/monitor/monitor/sql/list", "{\"h\":24,\"page\":1,\"pageSize\":20}"), adminId, out st, out wire);
+        string tblConf = await Dispatch(app, "PUT /admin/monitor/monitor/tables/conf HTTP/1.1\r\nHost: test\r\n\r\n", adminId, out st, out wire);
+        string tblList = await Dispatch(app, JsonReq("POST", "/admin/monitor/monitor/tables/list", "{}"), adminId, out st, out wire);
+        Program.Check(st == 200 && errConf.Contains("\"PageType\":\"table\"") && errList.Contains("\"resp_code\":\"0000\"")
+            && sqlConf.Contains("\"PageType\":\"table\"") && sqlList.Contains("\"resp_code\":\"0000\"")
+            && tblConf.Contains("\"PageType\":\"table\"") && tblList.Contains("\"Summary\""),
+            "Monitor Errors + Sql + Tables PUT /conf & POST /list emit pure JSON tables");
+
+        /* M4: Wiki (PageType=wiki) + Coder (PageType=coder) */
+        string wikiConf = await Dispatch(app, "PUT /admin/wiki/wiki/conf HTTP/1.1\r\nHost: test\r\n\r\n", adminId, out st, out wire);
+        string wikiSpaces = await Dispatch(app, JsonReq("POST", "/admin/wiki/wiki/spaces", "{}"), adminId, out st, out wire);
+        Program.Check(st == 200 && wikiConf.Contains("\"PageType\":\"wiki\"") && wikiSpaces.Contains("\"resp_code\":\"0000\""),
+            "Wiki PUT /conf + POST /spaces emit PageType=wiki JSON");
+
+        string coderConf = await Dispatch(app, "PUT /admin/dev/coder/conf HTTP/1.1\r\nHost: test\r\n\r\n", adminId, out st, out wire);
+        string coderTables = await Dispatch(app, JsonReq("POST", "/admin/dev/coder/tables", "{}"), adminId, out st, out wire);
+        Program.Check(st == 200 && coderConf.Contains("\"PageType\":\"coder\"") && coderTables.Contains("\"resp_code\":\"0000\""),
+            "Coder PUT /conf + POST /tables emit PageType=coder JSON");
+    }
+
+    static async void CheckCrudJsonLifecycle(WebApp app, string adminId) {
+        int st = 0;
+        string wire = "";
+
+        /* 1. PUT /admin/shell/items/conf (v1.1 全量动作模式 + MenuItems) */
+        string confBody = await Dispatch(app, "PUT /admin/shell/items/conf HTTP/1.1\r\nHost: test\r\n\r\n", adminId, out st, out wire);
+        JsonDoc confDoc = JsonDoc.Parse(confBody);
+        Program.Check(st == 200 && confDoc != null
+            && confDoc.PathStr("resp_code", "") == "0000"
+            && confDoc.PathBool("data.Conf.showPages", false)
+            && confBody.Contains("\"mode\":\"form\"")
+            && confBody.Contains("\"confUrl\":\"formconf\"")
+            && confBody.Contains("\"saveUrl\":\"save\"")
+            && confBody.Contains("\"mode\":\"confirm\"")
+            && confBody.Contains("\"dangerGuard\":true")
+            && confBody.Contains("\"payload\":{\"value\":\"0\"}")
+            && confBody.Contains("\"payload\":{\"value\":\"1\"}")
+            && confBody.Contains("\"mode\":\"navigate\"")
+            && confBody.Contains("\"argsTemplate\":\"id={id}\"")
+            && confBody.Contains("\"mode\":\"detail\"")
+            && confBody.Contains("\"Name\":\"查看详情\"")
+            && confBody.Contains("\"label\":\"启用\""),
+            "PUT /conf emits v1.2 Action Mode descriptors (form/confirm/navigate/detail) and MenuItems");
+
+        /* 2. PUT /admin/shell/items/formconf */
+        string fconfBody = await Dispatch(app, "PUT /admin/shell/items/formconf HTTP/1.1\r\nHost: test\r\n\r\n", adminId, out st, out wire);
+        Program.Check(st == 200
+            && fconfBody.Contains("\"resp_code\":\"0000\"")
+            && fconfBody.Contains("\"formItems\"")
+            && fconfBody.Contains("\"field\":\"code\""),
+            "PUT /formconf emits formItems schema");
+
+        /* 3. POST /admin/shell/items/save (JSON 新增 + JSON 唯一性拦截) */
+        string createBody = await Dispatch(app,
+            JsonReq("POST", "/admin/shell/items/save", "{\"code\":\"A001\",\"title\":\"Alpha\",\"status\":1}"),
+            adminId, out st, out wire);
+        Program.Check(st == 200 && createBody.Contains("\"0000\""),
+            "POST /save inserts row from JSON body (st=" + Convert.ToString(st) + " body=" + createBody + ")");
+
+        string dupBody = await Dispatch(app,
+            JsonReq("POST", "/admin/shell/items/save", "{\"code\":\"A001\",\"title\":\"Dup\",\"status\":1}"),
+            adminId, out st, out wire);
+        Program.Check(st == 400 && dupBody.Contains("编码已存在"),
+            "POST /save enforces Unique() constraint on JSON payload");
+
+        /* 4. POST /admin/shell/items/list */
+        string listBody = await Dispatch(app,
+            JsonReq("POST", "/admin/shell/items/list", "{\"page\":1,\"pageSize\":20}"),
+            adminId, out st, out wire);
+        JsonDoc listDoc = JsonDoc.Parse(listBody);
+        int firstId = listDoc != null ? Filter.ToInt(listDoc.PathStr("data.data[0].id", "0"), 0) : 0;
+        Program.Check(st == 200 && listDoc != null
+            && listDoc.PathInt("data.total", 0) == 1
+            && firstId > 0
+            && listDoc.PathStr("data.data[0].code", "") == "A001",
+            "POST /list returns {total,data} with inserted row");
+
+        /* 5. POST /admin/shell/items/batch (v1.1 ConfirmActionModal 批量停用 payload) */
+        string disableBody = await Dispatch(app,
+            JsonReq("POST", "/admin/shell/items/batch", "{\"value\":\"0\",\"ids\":\"" + Convert.ToString(firstId) + "\",\"data\":[{\"id\":" + Convert.ToString(firstId) + "}]}"),
+            adminId, out st, out wire);
+        Program.Check(st == 200 && disableBody.Contains("\"0000\""),
+            "POST /batch updates toggle field via v1.1 ConfirmActionModal payload");
+
+        string afterDisable = await Dispatch(app,
+            JsonReq("POST", "/admin/shell/items/list", "{\"page\":1,\"pageSize\":20}"),
+            adminId, out st, out wire);
+        JsonDoc disDoc = JsonDoc.Parse(afterDisable);
+        Program.Check(disDoc != null && disDoc.PathInt("data.data[0].status", -1) == 0,
+            "POST /list confirms status toggled to 0");
+
+        /* 6. POST /admin/shell/items/batch (v1.1 ConfirmActionModal 批量删除 payload) */
+        string delBody = await Dispatch(app,
+            JsonReq("POST", "/admin/shell/items/batch", "{\"op\":\"delete\",\"ids\":\"" + Convert.ToString(firstId) + "\",\"data\":[{\"id\":" + Convert.ToString(firstId) + "}]}"),
+            adminId, out st, out wire);
+        Program.Check(st == 200 && delBody.Contains("\"0000\""),
+            "POST /batch deletes rows via v1.1 ConfirmActionModal payload");
+
+        string afterDel = await Dispatch(app,
+            JsonReq("POST", "/admin/shell/items/list", "{\"page\":1,\"pageSize\":20}"),
+            adminId, out st, out wire);
+        JsonDoc afterDoc = JsonDoc.Parse(afterDel);
+        Program.Check(afterDoc != null && afterDoc.PathInt("data.total", -1) == 0,
+            "POST /list confirms row deleted");
+    }
+
+    static void CheckSpaHosting(string fixtureDir) {
+        string spaDir = Path.Combine(fixtureDir, "spa-dist");
+        Directory.CreateDirectoryRecursive(Path.Combine(spaDir, "assets"));
+        File.WriteAllText(Path.Combine(spaDir, "index.html"), "<!doctype html><html><body>ZAN_ADMIN_SPA</body></html>");
+        File.WriteAllText(Path.Combine(Path.Combine(spaDir, "assets"), "app.js"), "console.log('zan-spa');");
+
+        Cfg.Server.spaUrl = "/ui";
+        Cfg.Server.spaDir = spaDir;
+        WebApp spaApp = new WebApp("127.0.0.1", 0);
+        try {
+            Boot.MountAdminSpa(spaApp);
+
+            /* 1. SPA 虚拟路由回退 index.html */
+            HttpContext cIdx = new HttpContext(HttpRequest.Parse("GET /ui/admin/shell/items HTTP/1.1\r\nHost: test\r\n\r\n"), "127.0.0.1");
+            try {
+                bool next = Boot.AdminSpaHook(cIdx);
+                string body = cIdx.BodyBytes() != null ? cIdx.BodyBytes().ToStr(0, cIdx.BodyLength()) : "";
+                string wire = cIdx.BuildResponse(false);
+                Program.Check(!next && cIdx.GetStatus() == 200
+                    && body.Contains("ZAN_ADMIN_SPA")
+                    && wire.Contains("Cache-Control: no-cache"),
+                    "SPA history fallback serves index.html with no-cache");
+            } finally { cIdx.Dispose(); }
+
+            /* 2. 真实静态资产直接命中且带长缓存 */
+            HttpContext cJs = new HttpContext(HttpRequest.Parse("GET /ui/assets/app.js HTTP/1.1\r\nHost: test\r\n\r\n"), "127.0.0.1");
+            try {
+                bool next = Boot.AdminSpaHook(cJs);
+                string body = cJs.BodyBytes() != null ? cJs.BodyBytes().ToStr(0, cJs.BodyLength()) : "";
+                Program.Check(!next && cJs.GetStatus() == 200 && body.Contains("zan-spa"),
+                    "SPA static asset serves directly from spaDir");
+            } finally { cJs.Dispose(); }
+
+            /* 3. 不存在的静态资产答 404，不错误回退 index.html */
+            HttpContext cMiss = new HttpContext(HttpRequest.Parse("GET /ui/assets/missing.js HTTP/1.1\r\nHost: test\r\n\r\n"), "127.0.0.1");
+            try {
+                bool next = Boot.AdminSpaHook(cMiss);
+                Program.Check(!next && cMiss.GetStatus() == 404,
+                    "missing SPA asset returns 404 instead of index.html");
+            } finally { cMiss.Dispose(); }
+
+            /* 4. 挂载 SPA 后 GET /admin 自动 302 重定向到 /ui */
+            HttpContext cAdm = new HttpContext(HttpRequest.Parse("GET /admin HTTP/1.1\r\nHost: test\r\n\r\n"), "127.0.0.1");
+            try {
+                bool next = Boot.AdminSpaHook(cAdm);
+                string wire = cAdm.BuildResponse(false);
+                Program.Check(!next && cAdm.GetStatus() == 302 && wire.Contains("Location: /ui"),
+                    "GET /admin redirects to /ui when spaDir is mounted");
+            } finally { cAdm.Dispose(); }
+        } finally {
+            Cfg.Server.spaDir = "";
+            spaApp.Dispose();
+        }
+    }
+
+    static async void Main() {
+        Log.EchoToConsole(false);
+        string cwd = Directory.GetCurrentDirectory();
+        string fixture = Path.Combine(cwd, "_scratch/server-mvc-admin-ui-shell");
+        if (Directory.Exists(fixture)) {
+            Directory.DeleteRecursive(fixture);
+        }
+        Directory.CreateDirectoryRecursive(fixture);
+        string dbPath = Path.Combine(fixture, "shell.db");
+
+        Cfg.Auth.secret = "0123456789abcdef0123456789abcdef";
+        Cfg.Auth.iter = 1000;
+        Cfg.Auth.bootstrapPassword = "shell-test-bootstrap-pw";
+
+        DbPool pool = SqliteConnector.Pool(dbPath, 1);
+        DbContext dbCtx = DbContext.Of(pool);
+        WebApp app = new WebApp("127.0.0.1", 0);
+        try {
+            bool ready = await Schema.Ensure(dbCtx);
+            Program.Check(ready, "Schema.Ensure ready");
+            AppServices services = new AppServices(dbCtx, null);
+            AppServices.Use(services);
+            IZanSql orm = services.Orm();
+
+            IDbConnection conn = await dbCtx.Acquire();
+            try {
+                Schema.AddModel(Meta.For<ShellItem>());
+                bool applied = await Schema.Apply(conn);
+                Program.Check(applied, "Schema.Apply creates app_shell_item");
+            } finally {
+                dbCtx.Release(conn);
+            }
+
+            MvcRoutes.RegisterFramework(app);
+            MvcRoutes.Register(app);
+            WebHost.Use(app);
+            Perm.Index(app);
+            PermTable.Open();
+
+            string adminId = await orm.ExecuteScalarAsync("SELECT id FROM sys_user WHERE username = 'admin'");
+            Program.Check(adminId.Length > 0, "bootstrap admin exists");
+
+            await Program.CheckShellProtocol(app, adminId);
+            await Program.CheckM1SystemJsonEndpoints(app, adminId);
+            await Program.CheckCrudJsonLifecycle(app, adminId);
+            Program.CheckSpaHosting(fixture);
+        } finally {
+            WebHost.Use(null);
+            AppServices.Use(null);
+            app.Dispose();
+            pool.Close();
+            if (Directory.Exists(fixture)) {
+                Directory.DeleteRecursive(fixture);
+            }
+        }
+
+        Console.WriteLine("failures=" + Convert.ToString(Program.failures));
+        if (Program.failures != 0) { throw new Exception("admin_ui_shell regression"); }
+    }
+}

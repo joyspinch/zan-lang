@@ -33,21 +33,31 @@ public class PgWire {
             neg = true;
             i = i + 1;
         }
+        long limit = neg ? (-9223372036854775807L - 1L) : -9223372036854775807L;
+        long multmin = limit / 10L;
         while (i < end) {
             int d = (pay[i] & 255) - 48;
             if (d >= 0 && d <= 9) {
-                acc = acc * 10 + (long)d;
+                if (acc < multmin) { return neg ? limit : 9223372036854775807L; }
+                acc = acc * 10L;
+                if (acc < limit + (long)d) { return neg ? limit : 9223372036854775807L; }
+                acc = acc - (long)d;
             }
             i = i + 1;
         }
-        return neg ? (0 - acc) : acc;
+        return neg ? acc : (0L - acc);
     }
 
     // 把字符串的前 len 字节拷入新 byte[]，末尾追加 '\0'（C 字符串哨兵）。
     // PostgreSQL 文本协议查询与命令以 NUL 结尾。
     public static byte[] strToBytes(string s, int len) {
+        if (s == null || len <= 0) {
+            byte[] empty = new byte[2];
+            return empty;
+        }
+        if (len > s.Length) { len = s.Length; }
         byte[] b = new byte[len + 2];
-        if (len > 0) { NativeMemory.PutString((nint)b, 0, s, len); }
+        NativeMemory.PutString((nint)b, 0, s, len);
         b[len] = (byte)0;
         return b;
     }
@@ -55,12 +65,14 @@ public class PgWire {
     // 复制 4 字节切片（MD5 认证的盐）。
     public static byte[] slice4(byte[] b, int off) {
         byte[] r = new byte[5];
+        if (b == null || off < 0 || off + 4 > b.Length) { return r; }
         NativeMemory.Copy((nint)r, (nint)b + off, 4);
         return r;
     }
 
     // 字节前缀判断（SCRAM 服务器随机数须以客户端随机数开头）。
     public static bool hasPrefix(string b, string pre) {
+        if (b == null || pre == null) { return false; }
         int n = pre.Length;
         if (b.Length < n) { return false; }
         for (int i = 0; i < n; i = i + 1) {
@@ -84,6 +96,7 @@ public class PgWire {
     // 未知键忽略（application_name/options 等无害参数由此容错）。
     // 返回 0 成功；-1 语法错误。
     public static int parseConninfo(string s, List<string> outs) {
+        if (s == null || outs == null || outs.Count < 8) { return -1; }
         int i = 0;
         int n = s.Length;
         while (i < n) {
@@ -102,6 +115,7 @@ public class PgWire {
             if (i < n && (s[i] & 255) == 39) {
                 i = i + 1;
                 StringBuilder sb = new StringBuilder();
+                bool closed = false;
                 while (i < n) {
                     int c = s[i] & 255;
                     if (c == 92 && i + 1 < n) {
@@ -109,10 +123,11 @@ public class PgWire {
                         i = i + 2;
                         continue;
                     }
-                    if (c == 39) { i = i + 1; break; }
+                    if (c == 39) { i = i + 1; closed = true; break; }
                     sb.Append(s.Substring(i, 1));
                     i = i + 1;
                 }
+                if (!closed) { return -1; }
                 val = sb.ToString();
             } else {
                 int vs = i;
@@ -216,6 +231,8 @@ public class PgWire {
     // （字节代码 + NUL 结尾值，空值终止）格式化为标准错误消息：
     // "ERROR:  消息"，DETAIL/HINT 存在时追加独立行。
     public static string formatError(byte[] pay, int len) {
+        if (pay == null || len <= 0) { return ":  "; }
+        if (len > pay.Length) { len = pay.Length; }
         string sev = "";
         string msg = "";
         string detail = "";
@@ -244,6 +261,7 @@ public class PgWire {
     // "UPDATE 3"/"INSERT 0 1"/"DELETE 5" 取末尾整数；无数字标签
     // （CREATE TABLE/BEGIN 等）返回 0。
     public static int parseCommandTag(string tag) {
+        if (tag == null) { return 0; }
         int n = tag.Length;
         int e = n;
         while (e > 0 && tag[e - 1] >= 48 && tag[e - 1] <= 57) { e = e - 1; }
@@ -348,8 +366,11 @@ public class PgWire {
     // MD5 认证的口令令牌："md5" + hex(md5(hex(md5(口令+用户))
     // . 盐4))。salt 为 AuthenticationMD5Password 里的 4 字节盐。
     public static string md5PasswordToken(string password, string user, byte[] salt) {
+        string safePw = password != null ? password : "";
+        string safeUser = user != null ? user : "";
+        if (salt == null || salt.Length < 4) { return ""; }
         string inner = Hex.Encode(
-            Md5.Hash(password + user, password.Length + user.Length), 16);
+            Md5.Hash(safePw + safeUser, safePw.Length + safeUser.Length), 16);
         byte[] mid = new byte[37];
         NativeMemory.PutString((nint)mid, 0, inner, 32);
         NativeMemory.Copy((nint)mid + 32, (nint)salt, 4);
@@ -366,6 +387,7 @@ public class PgWire {
     // 从 "k=v,k=v" 形式的 SCRAM 消息取指定键的值；键缺失
     // 返回空串。base64 盐的 '=' 填充在值尾，不干扰分段扫描。
     public static string scramField(string msg, string key) {
+        if (msg == null || key == null) { return ""; }
         int i = 0;
         int n = msg.Length;
         while (i < n) {
@@ -387,6 +409,8 @@ public class PgWire {
     public static byte[] pbkdf2Sha256(string password, byte[] salt, int saltLen,
             int iters) {
         if (iters < 1) { iters = 1; }
+        if (salt == null || saltLen < 0) { saltLen = 0; }
+        else if (saltLen > salt.Length) { saltLen = salt.Length; }
         int passLen = password != null ? password.Length : 0;
         int msgMax = saltLen + 4;
         if (msgMax < 32) { msgMax = 32; }
@@ -440,11 +464,11 @@ public class PgWire {
         byte[] block = new byte[saltLen + 5];
         if (saltLen > 0) { NativeMemory.Copy((nint)block, (nint)salt, saltLen); }
         block[saltLen + 3] = 1;
-        byte[] u = Hmac.Sha256(pw, pw.Length, block, saltLen + 4);
+        byte[] u = Hmac.Sha256(pw, passLen, block, saltLen + 4);
         NativeMemory.Copy((nint)acc, (nint)u, 32);
         int k = 1;
         while (k < iters) {
-            u = Hmac.Sha256(pw, pw.Length, u, 32);
+            u = Hmac.Sha256(pw, passLen, u, 32);
             Vector256.Store(acc, 0, Vector256.Xor(Vector256.Load(acc, 0), Vector256.Load(u, 0)));
             k = k + 1;
         }
@@ -454,6 +478,7 @@ public class PgWire {
     // 32 字节按位异或（ClientKey ⊕ ClientSignature → proof）。
     public static byte[] xor32(byte[] a, byte[] b) {
         byte[] r = new byte[33];
+        if (a == null || b == null || a.Length < 32 || b.Length < 32) { return r; }
         Vector256.Store(r, 0, Vector256.Xor(Vector256.Load(a, 0), Vector256.Load(b, 0)));
         return r;
     }

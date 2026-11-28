@@ -1,0 +1,176 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Net;
+
+// 全球多 PoP 中继节点健康记录。
+public class RelayRegionNode {
+    public string RegionCode;
+    public int RttMs;
+    public int LossPermille; // 0..1000
+    public bool Healthy;
+
+    public RelayRegionNode(string regionCode, int rttMs, int lossPermille, bool healthy) {
+        this.RegionCode = regionCode == null ? "" : regionCode;
+        this.RttMs = rttMs < 1 ? 1 : rttMs;
+        this.LossPermille = lossPermille < 0 ? 0 : (lossPermille > 1000 ? 1000 : lossPermille);
+        this.Healthy = healthy;
+    }
+
+    public int CostScore() {
+        if (!this.Healthy) { return 1000000; }
+        return this.RttMs + this.LossPermille * 4;
+    }
+}
+
+// 商业跨区中继节点自动故障转移路由器（含滞后阈值，防止 RTT 微幅波动导致频繁切线抖动）。
+public class NetRelayRegionFailover {
+    private List<RelayRegionNode> nodes;
+    private string activeRegion;
+    private int switchMarginScore;
+    public int SwitchCount;
+
+    public NetRelayRegionFailover(int switchMarginScore) {
+        this.nodes = new List<RelayRegionNode>();
+        this.activeRegion = "";
+        this.switchMarginScore = switchMarginScore < 10 ? 10 : switchMarginScore;
+        this.SwitchCount = 0;
+    }
+
+    public string ActiveRegion { get { return this.activeRegion; } }
+
+    public void UpsertNode(string regionCode, int rttMs, int lossPermille, bool healthy) {
+        string code = regionCode == null ? "" : regionCode;
+        for (int i = 0; i < this.nodes.Count; i = i + 1) {
+            RelayRegionNode n = this.nodes[i];
+            if (n.RegionCode == code) {
+                n.RttMs = rttMs < 1 ? 1 : rttMs;
+                n.LossPermille = lossPermille < 0 ? 0 : (lossPermille > 1000 ? 1000 : lossPermille);
+                n.Healthy = healthy;
+                return;
+            }
+        }
+        this.nodes.Add(new RelayRegionNode(code, rttMs, lossPermille, healthy));
+    }
+
+    public string EvaluateBestRegion() {
+        RelayRegionNode best = null;
+        RelayRegionNode current = null;
+        for (int i = 0; i < this.nodes.Count; i = i + 1) {
+            RelayRegionNode n = this.nodes[i];
+            if (n.RegionCode == this.activeRegion) { current = n; }
+            if (!n.Healthy) { continue; }
+            if (best == null || n.CostScore() < best.CostScore()) {
+                best = n;
+            }
+        }
+        if (best == null) { return this.activeRegion; }
+        if (current == null || !current.Healthy) {
+            if (this.activeRegion != best.RegionCode) {
+                if (this.activeRegion.Length > 0) { this.SwitchCount = this.SwitchCount + 1; }
+                this.activeRegion = best.RegionCode;
+            }
+            return this.activeRegion;
+        }
+        if (best.RegionCode != current.RegionCode
+            && (current.CostScore() - best.CostScore()) >= this.switchMarginScore) {
+            this.activeRegion = best.RegionCode;
+            this.SwitchCount = this.SwitchCount + 1;
+        }
+        return this.activeRegion;
+    }
+}
+
+// GGPO 风格格斗/动作游戏回滚输入预测器：
+// 未收到远端帧输入时沿用最近确认输入继续预测；远端到达后比对，若有偏差精确返回需回滚重演的帧号。
+public class NetRollbackInputPredictor {
+    private int[] predictedFrame;
+    private int[] predictedMask;
+    private bool[] confirmed;
+    private int windowSize;
+    private int lastConfirmedInput;
+    public int MispredictionCount;
+
+    public NetRollbackInputPredictor(int windowSize) {
+        this.windowSize = windowSize < 8 ? 8 : windowSize;
+        this.predictedFrame = new int[this.windowSize];
+        this.predictedMask = new int[this.windowSize];
+        this.confirmed = new bool[this.windowSize];
+        for (int i = 0; i < this.windowSize; i = i + 1) {
+            this.predictedFrame[i] = -1;
+        }
+        this.lastConfirmedInput = 0;
+        this.MispredictionCount = 0;
+    }
+
+    public int PredictFrame(int frame) {
+        int slot = ModSlot(frame);
+        this.predictedFrame[slot] = frame;
+        this.predictedMask[slot] = this.lastConfirmedInput;
+        this.confirmed[slot] = false;
+        return this.lastConfirmedInput;
+    }
+
+    // 收到远端真实输入；仅当该帧此前被本地预测且预测值不符时返回需回滚帧号，否则返回 -1。
+    public int ReceiveRemoteInput(int frame, int actualInputMask) {
+        int slot = ModSlot(frame);
+        bool wasPredicted = this.predictedFrame[slot] == frame && !this.confirmed[slot];
+        bool wasMispredicted = wasPredicted && this.predictedMask[slot] != actualInputMask;
+        this.predictedFrame[slot] = frame;
+        this.predictedMask[slot] = actualInputMask;
+        this.confirmed[slot] = true;
+        this.lastConfirmedInput = actualInputMask;
+        if (wasMispredicted) {
+            this.MispredictionCount = this.MispredictionCount + 1;
+            return frame;
+        }
+        return -1;
+    }
+
+    private int ModSlot(int frame) {
+        int s = frame % this.windowSize;
+        if (s < 0) { s = s + this.windowSize; }
+        return s;
+    }
+}
+
+// 跨平台实时语音自适应抗抖动播放缓冲器（平滑 Wi-Fi/5G 抖动并统计 PLC 丢包隐藏帧）。
+public class NetVoiceJitterDejitterBuffer {
+    private int minDelayMs;
+    private int maxDelayMs;
+    private int currentTargetMs;
+    private int jitterEstimateMs;
+    public int ConcealedFrames;
+    public int PlayedFrames;
+
+    public NetVoiceJitterDejitterBuffer(int minDelayMs, int maxDelayMs) {
+        this.minDelayMs = minDelayMs < 20 ? 20 : minDelayMs;
+        this.maxDelayMs = maxDelayMs < this.minDelayMs ? this.minDelayMs : maxDelayMs;
+        this.currentTargetMs = this.minDelayMs;
+        this.jitterEstimateMs = 0;
+        this.ConcealedFrames = 0;
+        this.PlayedFrames = 0;
+    }
+
+    public int TargetPlayoutDelayMs { get { return this.currentTargetMs; } }
+
+    // 采样相邻语音包到达间隔抖动（ms），RFC 3550 EWMA 风格平滑调整目标播放延迟。
+    public int ObserveArrivalJitter(int transitDeltaAbsMs) {
+        int d = transitDeltaAbsMs < 0 ? -transitDeltaAbsMs : transitDeltaAbsMs;
+        this.jitterEstimateMs = (this.jitterEstimateMs * 3 + d) / 4;
+        int desired = this.minDelayMs + this.jitterEstimateMs * 2;
+        if (desired < this.minDelayMs) { desired = this.minDelayMs; }
+        if (desired > this.maxDelayMs) { desired = this.maxDelayMs; }
+        this.currentTargetMs = desired;
+        return this.currentTargetMs;
+    }
+
+    public bool ConsumeNextAudioFrame(bool packetAvailable) {
+        if (packetAvailable) {
+            this.PlayedFrames = this.PlayedFrames + 1;
+            return true;
+        }
+        this.ConcealedFrames = this.ConcealedFrames + 1;
+        return false;
+    }
+}

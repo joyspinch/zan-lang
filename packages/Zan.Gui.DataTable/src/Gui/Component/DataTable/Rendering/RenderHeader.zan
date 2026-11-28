@@ -151,13 +151,14 @@ public partial class DataTable {
         int groupPanelH = f.groupPanelH;
         List<FrameColumn> frameColumns = f.columns;
 
-        StyleBox sHeader = Style.Part(app, "datatable", "header", "", "", "", Style.SNormal());
-        StyleBox sHeaderHover = Style.Part(app, "datatable", "header", "", "", "", Style.SHover());
-        StyleBox sIcon = Style.Part(app, "datatable", "icon", "", "", "", Style.SNormal());
-        StyleBox sIconHover = Style.Part(app, "datatable", "icon", "", "", "", Style.SHover());
-        StyleBox sIconSel = Style.Part(app, "datatable", "icon", "", "", "", Style.SSelected());
-        StyleBox sBandHdr = Style.Part(app, "datatable", "band", "", "", "", Style.SNormal());
-        StyleBox sAccent = Style.Part(app, "datatable", "accent", "", "", "", Style.SNormal());
+        DataTableStyleSnapshot ss = f.styles != null ? f.styles : DataTableStyleSnapshot.Create(app);
+        StyleBox sHeader = ss.header;
+        StyleBox sHeaderHover = ss.headerHover;
+        StyleBox sIcon = ss.icon;
+        StyleBox sIconHover = ss.iconHover;
+        StyleBox sIconSel = ss.iconSel;
+        StyleBox sBandHdr = ss.bandHdr;
+        StyleBox sAccent = ss.accent;
 
         // ---------------- 表头背景 ----------------
         c.FillRect(x, y, viewW, headerH, sHeader.BgOr(0));
@@ -169,15 +170,10 @@ public partial class DataTable {
             c.FillRect(hx, y, 1, headerH, gridColor);
         }
         if (st.showSelect) {
-            // 全选复选框
-
-            bool allChecked = st.order.Count > 0;
+            // 全选复选框（走 O(1) 缓存快路径，避免大表每帧扫描百万行）
+            bool allChecked = false;
             bool anyChecked = false;
-            for (int oi = 0; oi < st.order.Count; oi = oi + 1) {
-                if (DataTable.IsSelected(st, src, st.order[oi])) { anyChecked = true; }
-                else { allChecked = false; }
-                if (anyChecked && !allChecked) { break; }
-            }
+            DataTable.ResolveHeaderSelectState(st, src, out allChecked, out anyChecked);
             int box = app.Scale(16);
             int bx = hx + (selW - box) / 2;
             int by = y + (headerH - box) / 2;
@@ -248,12 +244,14 @@ public partial class DataTable {
         bool colDragging = st.dragCol >= 0 && st.dragColMoved;
         int dropVisLocal = -1;
         int dropX = -1;
+        int lastVisRight = firstDataX;
 
+        List<FrameColumn> headerCols = f.viewportColumns != null ? f.viewportColumns : frameColumns;
         int hoi = 0;
         int hcl = firstDataX;
         int hBand = -1;
-        while (hoi < frameColumns.Count) {
-            FrameColumn headerColumn = frameColumns[hoi];
+        while (hoi < headerCols.Count) {
+            FrameColumn headerColumn = headerCols[hoi];
             int i = headerColumn.column;
             DataColumn col = cols[i];
             int cw = st.dispW[i];
@@ -268,7 +266,7 @@ public partial class DataTable {
             int effTitleH = (col.band == "" && bandLevels > 0) ? headerH : titleRowH;
 
             int menuId = -1;
-            if (col.filterable || col.sortable) { menuId = i; }
+            if (DataTable.HasHeaderPanel(st, col)) { menuId = i; }
 
             int bandL = DataTable.BandLeft(headerColumn.band, firstDataX, bandX, rightX);
             int bandR = DataTable.BandRight(headerColumn.band, firstDataX, bandX, bandW,
@@ -282,6 +280,7 @@ public partial class DataTable {
                 int visR = hx + cw;
                 if (visR > bandR) { visR = bandR; }
                 int visW = visR - visX;
+                lastVisRight = visR;
                 if (colDragging && dropVisLocal < 0 && app.mouseX < hx + cw / 2) {
                     dropVisLocal = hoi;
                     dropX = visX;
@@ -333,7 +332,8 @@ public partial class DataTable {
                         int mColor = sIcon.FgOr(0);
                         if (active) { mColor = sIconSel.FgOr(0); }
 
-                        c.DrawGlyphIn("filter", mIx, effTitleTop, menuIconW, effTitleH, app.Scale(10), mColor);
+                        string hdrIcon = (col.filterable || col.sortable) ? "filter" : "chevron-down";
+                        c.DrawGlyphIn(hdrIcon, mIx, effTitleTop, menuIconW, effTitleH, app.Scale(10), mColor);
 
                     }
                 }
@@ -362,17 +362,35 @@ public partial class DataTable {
                 int rzCursor = 4;
                 if (!col.resizable) { rzCursor = 6; }
 
-                c.FillRect(hx + cw, titleTop, 1, titleRowH, gridColor);
+                c.FillRect(hx + cw, effTitleTop, 1, effTitleH, gridColor);
                 hoi = hoi + 1;
             }
         }
         if (hBand >= 0) { c.PopClip(); }
 
+        if (st.allowAddColumn && f.addColW > 0) {
+            int addL = DataTable.BandLeft(1, firstDataX, bandX, rightX);
+            int addR = DataTable.BandRight(1, firstDataX, bandX, bandW, rightX, pinnedW, pinnedRW, clipRight);
+            if (f.addColX + f.addColW > addL && f.addColX < addR) {
+                DataTable.PushBandClip(c, 1, firstDataX, bandX, bandW, rightX,
+                pinnedW, pinnedRW, y, headerH, clipRight);
+                bool addHover = DataTable.PointerEligible(app, st)
+                && app.mouseX >= f.addColX && app.mouseX < f.addColX + f.addColW
+                && app.mouseY >= titleTop && app.mouseY < titleTop + titleRowH;
+                if (addHover) { c.FillRect(f.addColX, titleTop, f.addColW, titleRowH, sHeaderHover.BgOr(0)); }
+                string addLbl = st.addColumnLabel != null && st.addColumnLabel.Length > 0 ? st.addColumnLabel : "+";
+                int addFg = addHover ? sIconSel.FgOr(0) : sIcon.FgOr(0);
+                c.DrawTextCentered(f.addColX, titleTop, f.addColW, titleRowH, addLbl, addFg, fs);
+                c.FillRect(f.addColX + f.addColW - 1, titleTop, 1, titleRowH, gridColor);
+                c.PopClip();
+            }
+        }
+
         c.FillRect(x, y + headerH - 1, viewW, 1, gridColor);
 
         // 列拖拽反馈与放置
         if (colDragging) {
-            if (dropVisLocal < 0) { dropX = hx; }
+            if (dropVisLocal < 0) { dropX = lastVisRight; }
             int indCol = sAccent.BgOr(0);
             int lineW = app.Scale(2);
             c.FillRect(dropX - lineW / 2, y, lineW, headerH, indCol);

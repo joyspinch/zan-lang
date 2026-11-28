@@ -1,29 +1,69 @@
 using System;
+using Formats.Csv;
 using System.Data;
 using System.Data.Orm;
+using System.Json;
 using System.Web;
 using Zan.Web;
+using Zan.Web.AdminUi;
 using Zan.Web.Dao.Crm;
 using Zan.Web.Model.Crm;
 
 namespace Zan.Web.Admin.Crm;
 
-/* /admin/crm/customers 客户管理：搜索、建、编、删。 */
+/* /admin/crm/customers 客户管理：搜索、建、编、删、导入导出。 */
 [Route("admin/crm/customers/[action]")]
 [Custom(Authorization = CustomAuthorization.Grant)]
 [Description("客户管理")]
 public class Customers : AdminController {
     public CrmCustomerDao CrmCustomer { get { return new CrmCustomerDao(this.Held()); } }
 
+    static ListPage ScreenDef() {
+        return ListPage.Of()
+            .Text("客户名称", "kw", "name", "按客户名称搜索")
+            .TbarAdd("新增客户", "/admin/crm/customers/form")
+            .TbarDownload("导出 Excel", "/admin/crm/customers/export?xlsx=1")
+            .TbarDownload("下载模板", "/admin/crm/customers/template")
+            .Col("id", "ID", "num", "75")
+            .Col("name", "客户名称", "text", "200")
+            .Col("contact", "联系人", "text", "120")
+            .Col("phone", "电话", "text", "140")
+            .Tag("level", "客户等级", "1=重要|ok,2=普通|warn,3=潜在|off", "100")
+            .Col("remark", "备注", "text", "200")
+            .OpsEdit("/admin/crm/customers/form")
+            .OpsDel("/admin/crm/customers/delete", "确认删除该客户吗？");
+    }
+
+    static FormPage FormDef() {
+        return FormPage.Of("/admin/crm/customers/save")
+            .Text("客户名称", "name").Req().Ph("请输入客户名称")
+            .Text("联系人", "contact").Ph("主联系人姓名")
+            .Text("电话", "phone").Ph("联系电话")
+            .Select("客户等级", "level", "1=重要,2=普通,3=潜在").Val("2")
+            .Area("备注", "remark").Span().Ph("客户说明或跟进备注");
+    }
+
     [HttpGet]
     [Route("/admin/crm/customers")]
     [Custom(IsMenu = true, Icon = "mdi:account-group", Perm = PermBit.View)]
     [Description("客户管理")]
-    async void Index() {
-        ViewData d = await this.Layout("客户管理");
-        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+    void Index() {
+        this.Conf();
+    }
 
-        ListQuery q = this.Paged("id", 20);
+    [HttpPut]
+    [Custom(Perm = PermBit.View)]
+    [Description("客户表格配置")]
+    public void Conf() {
+        CrudOps.Conf(this, Customers.ScreenDef());
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.View)]
+    [Description("客户列表数据")]
+    public async void List() {
+        if (!this.DataReady()) { return; }
+        ListQuery q = this.PagedAny("id", 20);
         string kw = q.Kw();
         /* 租户硬边（#34）：列表与计数复用同一 SQL 条件。 */
         SelectQuery<CrmCustomer> query = this.CrmCustomer.Select()
@@ -32,7 +72,6 @@ public class Customers : AdminController {
         if (kw.Length > 0) {
             string name = sql.RequireCol(nameof(Zan.Web.Model.Crm.CrmCustomer.name));
             int provider = sql.Provider();
-            // 保留 string.Contains 的区分大小写、按字面搜索语义。
             if (provider == DbProvider.MySQL || provider == DbProvider.MariaDB) {
                 sql.Where("INSTR(CAST(CONVERT(" + name + " USING utf8mb4) AS BINARY), CAST(? AS BINARY)) > 0");
             } else if (provider == DbProvider.PostgreSQL) {
@@ -46,63 +85,61 @@ public class Customers : AdminController {
         List<CrmCustomer> rows = await query.Skip(q.Skip()).Take(q.Limit()).ToListAsync();
         int total = await query.CountAsync();
 
-        List<StrMap> items = d.AddList("rows");
+        JsonWriter w = new JsonWriter();
+        w.WriteStartArray();
         for (int i = 0; i < rows.Count; i = i + 1) {
             CrmCustomer c = rows[i];
-            StrMap row = new StrMap();
-            row.Set("id", Convert.ToString(c.id));
-            row.Set("name", c.name);
-            row.Set("contact", Fmt.Dash(c.contact));
-            row.Set("phone", Fmt.Dash(c.phone));
-            row.Set("levelText", Customers.LevelText(c.level));
-            items.Add(row);
+            w.WriteStartObject();
+            w.WriteProperty("id", c.id);
+            w.WriteProperty("name", c.name);
+            w.WriteProperty("contact", Fmt.Dash(c.contact));
+            w.WriteProperty("phone", Fmt.Dash(c.phone));
+            w.WriteProperty("level", Convert.ToString(c.level));
+            w.WriteProperty("remark", Fmt.Dash(c.remark));
+            w.WriteEndObject();
         }
-        this.Pager(d, q, total);
-        this.Page(d);
+        w.WriteEndArray();
+        AdminUiProtocol.WriteListData(this, total, w.ToString());
     }
 
-    [HttpGet]
+    [HttpPut]
     [Custom(Perm = PermBit.Create | PermBit.Update)]
-    [Description("客户表单")]
-    async void Form() {
-        int id = this.InInt("id", 0);
-        ViewData d = new ViewData();
-        d.Set("id", Convert.ToString(id));
-        d.Set("dialogTitle", "新增客户");
-        d.Set("new", "1");
-        d.Set("level2", "selected");
-        if (id > 0) {
-            CrmCustomer c = await this.CrmCustomer
-                .Where(a => a.id == id && a.tenantId == Tenant.Cur())
-                .FirstAsync();
-            if (c == null) { this.Fail(404, "0404", "客户不存在"); }
-            d.Set("dialogTitle", "编辑客户");
-            d.Set("name", c.name);
-            d.Set("contact", c.contact);
-            d.Set("phone", c.phone);
-            d.Set("remark", c.remark);
-            d.Set("edit", "1");
-            d.Set("new", "");
-            d.Set("level1", "");
-            d.Set("level2", "");
-            d.Set("level3", "");
-            if (c.level == 1) { d.Set("level1", "selected"); }
-            else if (c.level == 3) { d.Set("level3", "selected"); }
-            else { d.Set("level2", "selected"); }
-        }
-        this.Dialog(d);
+    [Description("客户表单配置")]
+    public void FormConf() {
+        CrudOps.FormConf(this, Customers.FormDef(), "客户");
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.View)]
+    [Description("客户编辑回显")]
+    public async void Edit() {
+        int id = this.InAnyInt("id", 0);
+        CrmCustomer c = await this.CrmCustomer
+            .Where(a => a.id == id && a.tenantId == Tenant.Cur())
+            .FirstAsync();
+        if (c == null) { this.Fail(404, "0404", "客户不存在"); return; }
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("id", c.id);
+        w.WriteProperty("name", c.name);
+        w.WriteProperty("contact", c.contact);
+        w.WriteProperty("phone", c.phone);
+        w.WriteProperty("level", Convert.ToString(c.level));
+        w.WriteProperty("remark", c.remark);
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(this, w.ToString());
     }
 
     [HttpPost]
     [Custom(Perm = PermBit.Create | PermBit.Update)]
     [Description("保存客户")]
     async void Save() {
-        int id = this.InInt("id", 0);
-        string name = this.Need("name", "客户名称");
-        string contact = this.In("contact");
-        string phone = this.In("phone");
-        int level = this.InInt("level", 2);
-        string remark = this.In("remark");
+        int id = this.InAnyInt("id", 0);
+        string name = this.NeedAny("name", "客户名称");
+        string contact = this.InAny("contact");
+        string phone = this.InAny("phone");
+        int level = this.InAnyInt("level", 2);
+        string remark = this.InAny("remark");
 
         if (id > 0) {
             int n = await this.CrmCustomer.Update()
@@ -136,11 +173,11 @@ public class Customers : AdminController {
     [Custom(Perm = PermBit.Delete)]
     [Description("删除客户")]
     async void Delete() {
-        int id = this.InInt("id", 0);
+        int id = this.InAnyInt("id", 0);
         CrmCustomer c = await this.CrmCustomer
             .Where(a => a.id == id && a.tenantId == Tenant.Cur())
             .FirstAsync();
-        if (c == null) { this.Fail(404, "0404", "客户不存在"); }
+        if (c == null) { this.Fail(404, "0404", "客户不存在"); return; }
         int n = await this.CrmCustomer.Delete()
             .Where(a => a.id == id && a.tenantId == Tenant.Cur())
             .ExecuteAffrowsAsync();
@@ -179,7 +216,6 @@ public class Customers : AdminController {
         return 2;
     }
 
-    /* ImportRow 处理器：同步函数 + 强类型 ImportRecord 容器；同步 ORM 终端 Count/ExecuteAffrows。 */
     static string SaveRow(IDbConnection db, int tenantId, SysUser me,
                           ImportRecord rec) {
         string name = ExcelIo.Rec(rec, "名称");
@@ -203,7 +239,7 @@ public class Customers : AdminController {
     [Custom(Perm = PermBit.Export)]
     [Description("导出客户")]
     async void Export() {
-        bool xlsx = this.InInt("xlsx", 0) == 1;
+        bool xlsx = this.InAnyInt("xlsx", 0) == 1;
         List<CrmCustomer> rows = await this.CrmCustomer
             .Where(a => a.tenantId == Tenant.Cur())
             .OrderBy(a => a.id).ToListAsync();
@@ -237,6 +273,7 @@ public class Customers : AdminController {
         SysUser me = await this.Admin();
         if (this.ctx.UploadPath().Length == 0) {
             this.Fail(400, "1002", "没有上传内容");
+            return;
         }
         string text = File.ReadAllText(this.ctx.UploadPath());
         int batchId = await ExcelIo.Import(this.Held(), Tenant.Cur(),

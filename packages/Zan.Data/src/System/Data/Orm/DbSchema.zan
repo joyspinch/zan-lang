@@ -19,6 +19,7 @@ public class DbSchema {
 
     // 表的列名，顺序同表定义；表不存在时是空列表。
     public static async List<string> ColumnsAsync(IDbExecutor db, string table) {
+        if (db == null) { throw new ArgumentNullException("db"); }
         List<string> cols = new List<string>();
         string t = QueryBuilder.RequireIdent(table);
         int p = db.GetProvider();
@@ -48,6 +49,7 @@ public class DbSchema {
                 "SELECT column_name FROM information_schema.columns "
                 + "WHERE table_name = ?", new DbParams().Add(t));
         }
+        if (r == null) { return cols; }
         for (int i = 0; i < r.RowCount(); i = i + 1) {
             cols.Add(r.GetString(i, nameCol));
         }
@@ -57,6 +59,7 @@ public class DbSchema {
     // 该表是否有这一列。
     public static async bool HasColumnAsync(IDbExecutor db, string table,
                                      string column) {
+        if (column == null || column.Length == 0) { return false; }
         List<string> cols = await DbSchema.ColumnsAsync(db, table);
         for (int i = 0; i < cols.Count; i = i + 1) {
             if (cols[i] == column) { return true; }
@@ -68,6 +71,7 @@ public class DbSchema {
     // 来的：它带着新实体里已经没有的列。
     public static async bool HasAnyColumnAsync(IDbExecutor db, string table,
                                         List<string> columns) {
+        if (columns == null || columns.Count == 0) { return false; }
         List<string> cols = await DbSchema.ColumnsAsync(db, table);
         for (int i = 0; i < cols.Count; i = i + 1) {
             for (int k = 0; k < columns.Count; k = k + 1) {
@@ -79,6 +83,7 @@ public class DbSchema {
 
     // 表是否存在。
     public static async bool TableExistsAsync(IDbExecutor db, string table) {
+        if (db == null) { throw new ArgumentNullException("db"); }
         int p = db.GetProvider();
         string sql = "SELECT COUNT(*) FROM information_schema.tables "
             + "WHERE table_name = ?";
@@ -97,7 +102,7 @@ public class DbSchema {
                 + "WHERE table_schema = SCHEMA_NAME() AND table_name = ?";
         }
         DbResult r = await db.QueryAsync(sql, new DbParams().Add(table));
-        if (r.RowCount() == 0) { return false; }
+        if (r == null || r.RowCount() == 0) { return false; }
         return r.GetInt(0, 0) > 0;
     }
 
@@ -162,6 +167,7 @@ public class DbSchema {
     }
 
     public static string DefaultLiteral(DbColumnDef c, int provider) {
+        if (c == null) { return ""; }
         string v = c.defText;
         if (v == null || v.Length == 0) { return ""; }
         if (c.kind == "int" || c.kind == "long" || c.kind == "bool"
@@ -175,6 +181,7 @@ public class DbSchema {
 
     // 一列的 DDL 片段。
     public static string ColumnSql(DbColumnDef c, int provider) {
+        if (c == null) { throw new ArgumentNullException("c"); }
         string colName = DbSchema.QuoteIdent(c.name, provider);
         if (c.identity) {
             if (provider == DbProvider.SQLite) {
@@ -197,6 +204,9 @@ public class DbSchema {
     // 建表语句（列顺序即给定顺序；表已存在时不报错）。
     public static string CreateTableSql(string table, List<DbColumnDef> cols,
                                  int provider) {
+        if (cols == null || cols.Count == 0) {
+            throw new Exception("create table without columns");
+        }
         string t = DbSchema.QuoteIdent(table, provider);
         StringBuilder b = new StringBuilder();
         b.Append("CREATE TABLE IF NOT EXISTS ");
@@ -214,7 +224,8 @@ public class DbSchema {
     // 数据字典）走这里，业务代码不必拼 DDL，也不必分方言。
     public static async void CreateTableAsync(IDbExecutor db, string table,
                                        List<DbColumnDef> cols) {
-        if (cols.Count == 0) { throw new Exception("create table without columns"); }
+        if (db == null) { throw new ArgumentNullException("db"); }
+        if (cols == null || cols.Count == 0) { throw new Exception("create table without columns"); }
         int _n = await db.ExecuteAsync(
             DbSchema.CreateTableSql(table, cols, db.GetProvider()));
     }
@@ -222,6 +233,8 @@ public class DbSchema {
     // 给已有表加一列（不改类型、不删列 —— 那会丢数据）。
     public static async void AddColumnAsync(IDbExecutor db, string table,
                                      DbColumnDef col) {
+        if (db == null) { throw new ArgumentNullException("db"); }
+        if (col == null) { throw new ArgumentNullException("col"); }
         int p = db.GetProvider();
         string t = DbSchema.QuoteIdent(table, p);
         int _n = await db.ExecuteAsync("ALTER TABLE " + t + " ADD COLUMN "
@@ -232,6 +245,8 @@ public class DbSchema {
     // 存在时先建表，返回列数。列永不删除、永不改类型。
     public static async int MigrateAsync(IDbExecutor db, string table,
                                   List<DbColumnDef> cols) {
+        if (db == null) { throw new ArgumentNullException("db"); }
+        if (cols == null || cols.Count == 0) { throw new Exception("create table without columns"); }
         List<string> have = await DbSchema.ColumnsAsync(db, table);
         if (have.Count == 0) {
             await DbSchema.CreateTableAsync(db, table, cols);
@@ -240,6 +255,7 @@ public class DbSchema {
         int added = 0;
         for (int i = 0; i < cols.Count; i = i + 1) {
             DbColumnDef c = cols[i];
+            if (c == null) { continue; }
             bool found = false;
             for (int j = 0; j < have.Count; j = j + 1) {
                 if (have[j] == c.name) { found = true; }
@@ -251,18 +267,21 @@ public class DbSchema {
         return added;
     }
 
-    // 把一张表改名（目标名已被占用时先丢掉目标）。
+    // 把一张表改名（目标名已被占用时先丢掉目标；同名视为空操作）。
     public static async void RenameTableAsync(IDbExecutor db, string from,
                                        string to) {
+        if (db == null) { throw new ArgumentNullException("db"); }
         int p = db.GetProvider();
         string a = DbSchema.QuoteIdent(from, p);
         string b = DbSchema.QuoteIdent(to, p);
+        if (a == b) { return; }
         await DbSchema.DropTableAsync(db, to);
         int _n = await db.ExecuteAsync("ALTER TABLE " + a + " RENAME TO " + b);
     }
 
     // 丢掉一张表（不存在也不报错）。
     public static async void DropTableAsync(IDbExecutor db, string table) {
+        if (db == null) { throw new ArgumentNullException("db"); }
         int p = db.GetProvider();
         string t = DbSchema.QuoteIdent(table, p);
         int _n = await db.ExecuteAsync("DROP TABLE IF EXISTS " + t);
@@ -271,6 +290,7 @@ public class DbSchema {
     // SQLite 的写前日志：写的人不再挡住读的人。别的 provider
     // 上是空操作 —— 日志形态是它们自己的服务端配置，不是连接属性。
     public static async void UseWriteAheadLogAsync(IDbExecutor db) {
+        if (db == null) { throw new ArgumentNullException("db"); }
         if (db.GetProvider() != DbProvider.SQLite) { return; }
         // journal_mode / synchronous 都是「赋值并回显新值」的 PRAGMA：
         // 各回一行结果。ExecuteAsync 对返回行的语句会抛

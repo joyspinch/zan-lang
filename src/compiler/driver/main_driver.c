@@ -1542,6 +1542,8 @@ static void zan_request_live_registry(zan_irgen_t *g) {
    * 用 GC API 的程序编译期置 1；否则在保留检测钩子的模块（--check-leaks /
    * --emit-lib）由启动构造器按 ZAN_DETECT_LEAKS 置位；普通模块已剪除
    * 全部登记调用，直接返回。 */
+  if (g->freestanding)
+    return;
   LLVMValueRef flag = LLVMGetNamedGlobal(g->mod, "__zan_live_on");
   if (uses && flag)
     LLVMSetInitializer(flag, LLVMConstInt(LLVMInt8TypeInContext(g->ctx), 1, 0));
@@ -1704,8 +1706,11 @@ static void zan_prepare_static_runtime(zan_irgen_t *g,
                            use_comdat);
   }
 
+  LLVMValueRef legacy_pump = LLVMGetNamedFunction(g->mod, "zan_io_pump");
+  if (legacy_pump && LLVMGetLinkage(legacy_pump) != LLVMWeakAnyLinkage)
+    legacy_pump = NULL;
   LLVMValueRef io_fallbacks[] = {g->rt_io_pump_timeout, g->rt_io_has_pending,
-                                 LLVMGetNamedFunction(g->mod, "zan_io_pump")};
+                                 legacy_pump};
   for (size_t i = 0; i < sizeof(io_fallbacks) / sizeof(io_fallbacks[0]); i++)
     zan_runtime_fallback(g, io_fallbacks[i], use_comdat);
 

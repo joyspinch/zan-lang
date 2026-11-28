@@ -1,0 +1,84 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Render3D;
+
+// LOD 档位配置：对应网格键与最大可视距离（升序排列）。
+public class LodTierSpec3D {
+    public int MeshKey;
+    public float MaxDistance;
+
+    public LodTierSpec3D(int meshKey, float maxDistance) {
+        this.MeshKey = meshKey;
+        this.MaxDistance = maxDistance > 0.1f ? maxDistance : 10.0f;
+    }
+}
+
+// 单个 3D 角色的 LOD 运行态（记录当前档位用于滞回防闪烁判定）。
+public class LodActorState3D {
+    public int ActorId;
+    public int CurrentTier; // -1 表示已剔除
+
+    public LodActorState3D(int actorId) {
+        this.ActorId = actorId;
+        this.CurrentTier = 0;
+    }
+}
+
+// 商业 3D 距离 LOD 选择器：内置滞回边界（Hysteresis）防止相机微移导致模型反复跳变，并支持全局画质偏置 LodBias。
+public class FrustumLodSelector3D {
+    private List<LodTierSpec3D> tiers;
+    public float HysteresisMargin;
+    public float LodBias; // >1 更早降级省算力，<1 更高画质
+
+    public FrustumLodSelector3D(float hysteresisMargin, float lodBias) {
+        this.tiers = new List<LodTierSpec3D>();
+        this.HysteresisMargin = hysteresisMargin >= 0.0f ? hysteresisMargin : 1.5f;
+        this.LodBias = lodBias > 0.1f ? lodBias : 1.0f;
+    }
+
+    public void AddTier(int meshKey, float maxDistance) {
+        LodTierSpec3D spec = new LodTierSpec3D(meshKey, maxDistance);
+        int pos = this.tiers.Count;
+        while (pos > 0 && this.tiers[pos - 1].MaxDistance > spec.MaxDistance) {
+            pos = pos - 1;
+        }
+        this.tiers.Insert(pos, spec);
+    }
+
+    public int TierCount() { return this.tiers.Count; }
+
+    // 返回选中的 MeshKey（超出最远档位则剔除返回 -1），并更新 state.CurrentTier。
+    public int SelectMesh(LodActorState3D state, float rawDistance) {
+        int n = this.tiers.Count;
+        if (n == 0 || state == null) { return -1; }
+        float dist = (rawDistance > 0.0f ? rawDistance : 0.0f) * this.LodBias;
+
+        int rawTier = -1;
+        for (int i = 0; i < n; i = i + 1) {
+            if (dist <= this.tiers[i].MaxDistance) {
+                rawTier = i;
+                break;
+            }
+        }
+
+        int prev = state.CurrentTier;
+        if (prev >= 0 && prev < n && rawTier != prev) {
+            // 往更低精细度降级（或剔除）：需超过 prev 边界 + HysteresisMargin 才切换
+            if (rawTier < 0 || rawTier > prev) {
+                if (dist <= this.tiers[prev].MaxDistance + this.HysteresisMargin) {
+                    rawTier = prev;
+                }
+            } else {
+                // 往更高精细度升级：需深入 rawTier 边界 - HysteresisMargin 才切回
+                if (dist > this.tiers[rawTier].MaxDistance - this.HysteresisMargin) {
+                    rawTier = prev;
+                }
+            }
+        }
+
+        state.CurrentTier = rawTier;
+        if (rawTier < 0 || rawTier >= n) { return -1; }
+        return this.tiers[rawTier].MeshKey;
+    }
+}

@@ -474,7 +474,8 @@ static bool sinit_type_has_init_work(zan_symbol_t *sym) {
     if (sinit_is_cctor(m))
       return true;
     if ((m->kind != AST_FIELD_DECL && m->kind != AST_PROPERTY_DECL) ||
-        !(m->field_decl.modifiers & MOD_STATIC) || !m->field_decl.initializer)
+        !(m->field_decl.modifiers & MOD_STATIC) || !m->field_decl.initializer ||
+        zan_ast_has_attr(m, "ThreadStatic"))
       continue;
     if (m->kind == AST_PROPERTY_DECL &&
         (m->field_decl.getter_body || m->field_decl.setter_body))
@@ -579,6 +580,7 @@ static void emit_static_type_initializer(zan_irgen_t *g, int index) {
   di_clear(g);
   local_scope_t *locals = local_scope_new(g->arena);
   zan_ast_node_t *cctor_decl = NULL;
+  bool seen_runtime_init = false;
   for (int mi = 0; mi < decl->type_decl.members.count; mi++) {
     zan_ast_node_t *m = decl->type_decl.members.items[mi];
     if (sinit_is_cctor(m)) {
@@ -586,7 +588,9 @@ static void emit_static_type_initializer(zan_irgen_t *g, int index) {
       continue;
     }
     if ((m->kind != AST_FIELD_DECL && m->kind != AST_PROPERTY_DECL) ||
-        !(m->field_decl.modifiers & MOD_STATIC) || !m->field_decl.initializer)
+        !(m->field_decl.modifiers & MOD_STATIC) || !m->field_decl.initializer ||
+        zan_ast_has_attr(m, "ThreadStatic") ||
+        zan_ast_has_attr(m, "Extern"))
       continue;
     if (m->kind == AST_PROPERTY_DECL &&
         (m->field_decl.getter_body || m->field_decl.setter_body))
@@ -595,7 +599,28 @@ static void emit_static_type_initializer(zan_irgen_t *g, int index) {
     LLVMValueRef gv = get_static_field_global(g, entry.sym, field, entry.inst);
     if (!gv)
       continue;
+    if (LLVMIsGlobalConstant(gv))
+      continue;
     zan_type_t *field_type = field_store_type(g, field, entry.inst);
+    /* Static fields with CTFE constant initializers are already initialized in
+     * .data/.bss; skip redundant runtime stores (so [Init] / C mutations aren't
+     * clobbered) unless an earlier field ran a runtime initializer in the same
+     * class (preserving strict textual init order). */
+    bool is_linker_field = zan_ast_has_attr(m, "Export") ||
+                           zan_ast_has_attr(m, "Used") ||
+                           zan_ast_has_attr(m, "Section") ||
+                           zan_ast_has_attr(m, "Weak");
+    if ((!seen_runtime_init || is_linker_field) &&
+        (!field_type || (!is_rc_managed_type(field_type) &&
+                         field_type->kind != TYPE_OBJECT &&
+                         field_type->kind != TYPE_DELEGATE))) {
+      LLVMValueRef ctfe_chk = NULL;
+      if (zan_ctfe_eval_to_llvm_const(g, entry.sym, m->field_decl.initializer,
+                                      field_type, &ctfe_chk) &&
+          ctfe_chk && LLVMTypeOf(ctfe_chk) == LLVMGlobalGetValueType(gv))
+        continue;
+    }
+    seen_runtime_init = true;
     zan_type_t *source = infer_expr_type(g, m->field_decl.initializer, locals);
     check_implicit_narrowing(g, field_type, source, m->field_decl.initializer,
                              "field initializer");
@@ -798,23 +823,24 @@ static void sinit_emit_ordered(zan_irgen_t *g, int t, const uint8_t *deps,
     zan_call2(g->builder, LLVMGlobalGetValueType(fn), fn, NULL, 0, "");
 }
 
-static void sinit_register_library_startup(zan_irgen_t *g, LLVMValueRef fn) {
-  if (!g->emit_lib || LLVMGetNamedFunction(g->mod, "main"))
-    return;
+static void zan_append_global_ctor_dtor(zan_irgen_t *g, bool is_dtor,
+                                        LLVMValueRef fn, uint32_t priority) {
+  const char *gname = is_dtor ? "llvm.global_dtors" : "llvm.global_ctors";
+  size_t gname_len = 17;
   LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
   LLVMTypeRef ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
   LLVMValueRef record = LLVMConstStructInContext(
       g->ctx,
-      (LLVMValueRef[]){LLVMConstInt(i32, 65535, 0), fn, LLVMConstNull(ptr)}, 3,
-      0);
+      (LLVMValueRef[]){LLVMConstInt(i32, priority, 0), fn, LLVMConstNull(ptr)},
+      3, 0);
   LLVMValueRef *records = NULL;
   LLVMValueRef *old_globals = NULL;
   int count = 0, cap = 0, old_count = 0, old_cap = 0;
   for (LLVMValueRef gv = LLVMGetFirstGlobal(g->mod); gv;
        gv = LLVMGetNextGlobal(gv)) {
     const char *name = LLVMGetValueName(gv);
-    if (!name || (strcmp(name, "llvm.global_ctors") != 0 &&
-                  strncmp(name, "llvm.global_ctors.", 18) != 0))
+    if (!name || (strcmp(name, gname) != 0 &&
+                  !(strncmp(name, gname, gname_len) == 0 && name[gname_len] == '.')))
       continue;
     LLVMValueRef initializer = LLVMGetInitializer(gv);
     unsigned n = initializer ? LLVMGetArrayLength(LLVMTypeOf(initializer)) : 0;
@@ -830,16 +856,22 @@ static void sinit_register_library_startup(zan_irgen_t *g, LLVMValueRef fn) {
   LLVMTypeRef ty = LLVMTypeOf(record);
   for (int i = 0; i < old_count; i++)
     LLVMSetValueName2(old_globals[i], "", 0);
-  LLVMValueRef ctors = LLVMAddGlobal(g->mod, LLVMArrayType(ty, (unsigned)count),
-                                     "llvm.global_ctors");
-  LLVMSetLinkage(ctors, LLVMAppendingLinkage);
-  LLVMSetInitializer(ctors, LLVMConstArray(ty, records, (unsigned)count));
+  LLVMValueRef arr_gv = LLVMAddGlobal(g->mod, LLVMArrayType(ty, (unsigned)count),
+                                      gname);
+  LLVMSetLinkage(arr_gv, LLVMAppendingLinkage);
+  LLVMSetInitializer(arr_gv, LLVMConstArray(ty, records, (unsigned)count));
   for (int i = 0; i < old_count; i++) {
-    LLVMReplaceAllUsesWith(old_globals[i], ctors);
+    LLVMReplaceAllUsesWith(old_globals[i], arr_gv);
     LLVMDeleteGlobal(old_globals[i]);
   }
   free(records);
   free(old_globals);
+}
+
+static void sinit_register_library_startup(zan_irgen_t *g, LLVMValueRef fn) {
+  if (g->freestanding || !g->emit_lib || LLVMGetNamedFunction(g->mod, "main"))
+    return;
+  zan_append_global_ctor_dtor(g, false, fn, 65535);
 }
 
 static void finalize_static_initializers(zan_irgen_t *g, zan_ast_node_t *unit,

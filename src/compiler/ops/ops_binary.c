@@ -57,6 +57,68 @@ LLVMValueRef emit_expr_binary(zan_irgen_t *g, zan_ast_node_t *expr,
         LLVMValueRef left = emit_expr(g, expr->binary.left, locals);
         LLVMValueRef right = emit_expr(g, expr->binary.right, locals);
 
+        /* Portable SIMD Vec<N, T> native <N x T> arithmetic & bitwise lowering */
+        if (LLVMGetTypeKind(LLVMTypeOf(left)) == LLVMVectorTypeKind) {
+            LLVMTypeRef vt = LLVMTypeOf(left);
+            LLVMTypeRef et = LLVMGetElementType(vt);
+            LLVMTypeKind etk = LLVMGetTypeKind(et);
+            bool is_fp = (etk == LLVMFloatTypeKind || etk == LLVMDoubleTypeKind);
+            zan_type_t *ltype = infer_expr_type(g, expr->binary.left, locals);
+            zan_type_t *vel = is_vec_type(ltype) ? vec_elem(ltype) : NULL;
+            bool is_unsigned = vel && (vel->kind == TYPE_BYTE || vel->kind == TYPE_USHORT ||
+                                       vel->kind == TYPE_UINT || vel->kind == TYPE_ULONG);
+            if (LLVMGetTypeKind(LLVMTypeOf(right)) != LLVMVectorTypeKind &&
+                (expr->binary.op == TK_LESS_LESS ||
+                 expr->binary.op == TK_GREATER_GREATER ||
+                 expr->binary.op == TK_GREATER_GREATER_GREATER)) {
+                LLVMValueRef s = coerce_int_to(g, right, et);
+                unsigned nlanes = LLVMGetVectorSize(vt);
+                LLVMValueRef splat = LLVMBuildInsertElement(
+                    g->builder, LLVMGetUndef(vt), s,
+                    LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0), "vsh.ins");
+                LLVMValueRef *z = (LLVMValueRef *)calloc(nlanes, sizeof(LLVMValueRef));
+                LLVMValueRef z0 = LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
+                for (unsigned li = 0; li < nlanes; li++) z[li] = z0;
+                right = LLVMBuildShuffleVector(g->builder, splat, LLVMGetUndef(vt),
+                                               LLVMConstVector(z, nlanes), "vsh.splat");
+                free(z);
+            }
+            switch (expr->binary.op) {
+            case TK_PLUS:
+                return is_fp ? LLVMBuildFAdd(g->builder, left, right, "vadd")
+                             : LLVMBuildAdd(g->builder, left, right, "vadd");
+            case TK_MINUS:
+                return is_fp ? LLVMBuildFSub(g->builder, left, right, "vsub")
+                             : LLVMBuildSub(g->builder, left, right, "vsub");
+            case TK_STAR:
+                return is_fp ? LLVMBuildFMul(g->builder, left, right, "vmul")
+                             : LLVMBuildMul(g->builder, left, right, "vmul");
+            case TK_SLASH:
+                if (is_fp) return LLVMBuildFDiv(g->builder, left, right, "vdiv");
+                return is_unsigned ? LLVMBuildUDiv(g->builder, left, right, "vudiv")
+                                   : LLVMBuildSDiv(g->builder, left, right, "vsdiv");
+            case TK_PERCENT:
+                if (is_fp) return LLVMBuildFRem(g->builder, left, right, "vrem");
+                return is_unsigned ? LLVMBuildURem(g->builder, left, right, "vurem")
+                                   : LLVMBuildSRem(g->builder, left, right, "vsrem");
+            case TK_AMP:
+                return LLVMBuildAnd(g->builder, left, right, "vand");
+            case TK_PIPE:
+                return LLVMBuildOr(g->builder, left, right, "vor");
+            case TK_CARET:
+                return LLVMBuildXor(g->builder, left, right, "vxor");
+            case TK_LESS_LESS:
+                return LLVMBuildShl(g->builder, left, right, "vshl");
+            case TK_GREATER_GREATER:
+                return is_unsigned ? LLVMBuildLShr(g->builder, left, right, "vlshr")
+                                   : LLVMBuildAShr(g->builder, left, right, "vashr");
+            case TK_GREATER_GREATER_GREATER:
+                return LLVMBuildLShr(g->builder, left, right, "vlshr");
+            default:
+                break;
+            }
+        }
+
         {
             zan_type_t *ltype = infer_expr_type(g, expr->binary.left, locals);
             /* 与 null 比较保留引用指针判空，防止递归调用重载操作符 */

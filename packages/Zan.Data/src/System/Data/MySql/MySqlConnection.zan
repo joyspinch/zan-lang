@@ -51,9 +51,28 @@ public partial class MySqlConnection : IDbConnection {
             if (this.waiters == null) { this.waiters = new Queue<AsyncGate>(); }
             this.waiters.Enqueue(g);
         }
-        await g.Wait();
-        g.Close();
-        return true;
+        bool acquired = false;
+        try {
+            await g.Wait();
+            acquired = true;
+            return true;
+        } finally {
+            g.Close();
+            if (!acquired) {
+                bool foundInQueue = false;
+                lock (this) {
+                    if (this.waiters != null) {
+                        int n = this.waiters.Count();
+                        for (int i = 0; i < n; i = i + 1) {
+                            AsyncGate cur = this.waiters.Dequeue();
+                            if (cur == g) { foundInQueue = true; }
+                            else { this.waiters.Enqueue(cur); }
+                        }
+                    }
+                }
+                if (!foundInQueue) { this.ReleaseLock(); }
+            }
+        }
     }
 
     private void ReleaseLock() {
@@ -219,7 +238,7 @@ public partial class MySqlConnection : IDbConnection {
     }
 
     static byte[] authToken(string plugin, string pw, string nonce20, List<int> outLen) {
-        if (pw.Length == 0) { outLen[0] = 0; return new byte[1]; }
+        if (pw == null || pw.Length == 0) { outLen[0] = 0; return new byte[1]; }
         if (plugin == "caching_sha2_password") { outLen[0] = 32; return scramble41(pw, nonce20); }
         if (plugin == "mysql_native_password") { outLen[0] = 20; return scrambleNative(pw, nonce20); }
         outLen[0] = -1;
@@ -296,18 +315,21 @@ public partial class MySqlConnection : IDbConnection {
             string database, string user, string password) {
         Socket.Initialize();
         MySqlConnection conn = new MySqlConnection();
-        conn.connected = await conn.doConnect(host, port, database, user, password, false, "");
+        bool ok = await conn.doConnect(host, port, database, user, password, false, "");
+        conn.connected = ok;
+        if (!ok) { conn.Close(); }
         return conn;
     }
 
+    private static string stateLock = "System.Data.MySql.MySqlConnection.stateLock";
     private static bool defaultVerifyTls = true;
     public static bool verifyTls {
-        get { return MySqlConnection.defaultVerifyTls; }
-        set { MySqlConnection.defaultVerifyTls = value; }
+        get { lock (MySqlConnection.stateLock) { return MySqlConnection.defaultVerifyTls; } }
+        set { lock (MySqlConnection.stateLock) { MySqlConnection.defaultVerifyTls = value; } }
     }
 
     public static void SetTlsVerify(bool verify) {
-        MySqlConnection.defaultVerifyTls = verify;
+        lock (MySqlConnection.stateLock) { MySqlConnection.defaultVerifyTls = verify; }
     }
 
     public static async MySqlConnection OpenSecureParamsAsync(string host, int port,
@@ -319,7 +341,9 @@ public partial class MySqlConnection : IDbConnection {
             string database, string user, string password, string sslCa) {
         Socket.Initialize();
         MySqlConnection conn = new MySqlConnection();
-        conn.connected = await conn.doConnect(host, port, database, user, password, true, sslCa);
+        bool ok = await conn.doConnect(host, port, database, user, password, true, sslCa);
+        conn.connected = ok;
+        if (!ok) { conn.Close(); }
         return conn;
     }
 
@@ -331,14 +355,17 @@ public partial class MySqlConnection : IDbConnection {
         sslreq[3] = (byte)((caps >> 24) & 255);
         MySqlPacketBounds.Advertise(sslreq, 4);
         sslreq[8] = (byte)45;
-        await this.writePacket(sslreq.ToStr(0, 32), 32, 1);
+        if (await this.writePacket(sslreq.ToStr(0, 32), 32, 1) <= 0) {
+            this.lastError = "failed to send SSLRequest";
+            return false;
+        }
         TlsContext tlsCtx = TlsContext.CreateClient();
         if (tlsCtx == null) {
             this.lastError = "TLS init failed: " + TlsStream.LastError();
             return false;
         }
-        if (!this.tlsVerify || !MySqlConnection.defaultVerifyTls) { tlsCtx.DisableVerify(); }
-        if (sslCa.Length > 0 && !tlsCtx.AddTrustedCert(sslCa)) {
+        if (!this.tlsVerify || !MySqlConnection.verifyTls) { tlsCtx.DisableVerify(); }
+        if (sslCa != null && sslCa.Length > 0 && !tlsCtx.AddTrustedCert(sslCa)) {
             this.lastError = "TLS CA bundle unreadable: " + sslCa;
             return false;
         }
@@ -381,42 +408,51 @@ public partial class MySqlConnection : IDbConnection {
     }
 
     private async bool RunAuthLoopAsync(string pw, byte[] nonce) {
+        string safePw = pw != null ? pw : "";
         while (true) {
             byte[] r = await this.readPacket();
-            if (r == null) { this.lastError = "connection closed during auth"; return false; }
+            if (r == null || this.lastLen < 1) { this.lastError = "connection closed during auth"; return false; }
             int b0 = r[0] & 255;
             if (b0 == 0) { return true; }
             if (b0 == 255) {
-                int code = (r[1] & 255) | ((r[2] & 255) << 8);
+                int code = this.lastLen >= 3 ? ((r[1] & 255) | ((r[2] & 255) << 8)) : 0;
                 this.lastError = "auth err " + Convert.ToString(code) + ": "
-                    + MySqlWire.bytesToStr(r, 9, this.lastLen - 9);
+                    + (this.lastLen > 9 ? MySqlWire.bytesToStr(r, 9, this.lastLen - 9) : "");
                 return false;
             }
             if (b0 == 1) {
+                if (this.lastLen < 2) { this.lastError = "truncated auth-more-data packet"; return false; }
                 int more = r[1] & 255;
                 if (more == 3) { continue; }
                 if (more == 4) {
                     if (this.tls != null) {
-                        byte[] pwresp = new byte[pw.Length + 2];
-                        for (int i = 0; i < pw.Length; i = i + 1) { pwresp[i] = (byte)(pw[i] & 255); }
-                        await this.writePacket(pwresp.ToStr(0, pw.Length + 1), pw.Length + 1, this.lastSeq + 1);
+                        byte[] pwresp = new byte[safePw.Length + 2];
+                        for (int i = 0; i < safePw.Length; i = i + 1) { pwresp[i] = (byte)(safePw[i] & 255); }
+                        if (await this.writePacket(pwresp.ToStr(0, safePw.Length + 1), safePw.Length + 1, this.lastSeq + 1) <= 0) {
+                            this.lastError = "failed to send password over TLS";
+                            return false;
+                        }
                         continue;
                     }
                     byte[] req = new byte[2];
                     req[0] = 2;
-                    await this.writePacket(req, 1, this.lastSeq + 1);
+                    if (await this.writePacket(req, 1, this.lastSeq + 1) <= 0) {
+                        this.lastError = "failed to request RSA public key";
+                        return false;
+                    }
                     byte[] pk = await this.readPacket();
-                    if (pk == null) { this.lastError = "no RSA public key from server"; return false; }
+                    if (pk == null || this.lastLen < 2) { this.lastError = "no RSA public key from server"; return false; }
                     int pemLen = this.lastLen - 1;
                     byte[] pem = new byte[pemLen + 1];
                     for (int i = 0; i < pemLen; i = i + 1) { pem[i] = (byte)(pk[1 + i] & 255); }
                     List<int> derLen = new List<int>(); derLen.Add(0);
                     byte[] der = pemToDer(pem, pemLen, derLen);
-                    if (der == null) { this.lastError = "bad RSA public key PEM"; return false; }
-                    int obfLen = pw.Length + 1;
+                    if (der == null || derLen[0] <= 0) { this.lastError = "bad RSA public key PEM"; return false; }
+                    int obfLen = safePw.Length + 1;
                     byte[] obf = new byte[obfLen + 1];
                     for (int i = 0; i < obfLen; i = i + 1) {
-                        obf[i] = (byte)((pw[i] & 255) ^ (nonce[i % 20] & 255));
+                        int pb = i < safePw.Length ? (safePw[i] & 255) : 0;
+                        obf[i] = (byte)(pb ^ (nonce[i % 20] & 255));
                     }
                     byte[] seed = RandomNumberGenerator.GetBytes(20);
                     if (seed == null) {
@@ -425,7 +461,14 @@ public partial class MySqlConnection : IDbConnection {
                     }
                     List<int> kOut = new List<int>(); kOut.Add(0);
                     byte[] cipher = fullAuthCipher(der, derLen[0], obf, obfLen, seed, kOut);
-                    await this.writePacket(cipher, kOut[0], this.lastSeq + 1);
+                    if (cipher == null || kOut[0] <= 0) {
+                        this.lastError = "RSA full-auth encryption failed";
+                        return false;
+                    }
+                    if (await this.writePacket(cipher, kOut[0], this.lastSeq + 1) <= 0) {
+                        this.lastError = "failed to send RSA full-auth payload";
+                        return false;
+                    }
                     continue;
                 }
                 this.lastError = "unexpected auth-more-data " + Convert.ToString(more);
@@ -437,20 +480,24 @@ public partial class MySqlConnection : IDbConnection {
                 string switchPlugin = MySqlWire.bytesToStr(r, 1, pluginEnd - 1);
                 int nonceStart = pluginEnd + 1;
                 int switchNonceLen = this.lastLen - nonceStart;
+                if (switchNonceLen < 0) { switchNonceLen = 0; }
                 if (switchNonceLen > 20) { switchNonceLen = 20; }
                 byte[] switchNonce = new byte[21];
                 for (int i = 0; i < switchNonceLen; i = i + 1) {
                     switchNonce[i] = (byte)(r[nonceStart + i] & 255);
                 }
                 List<int> switchLenOut = new List<int>(); switchLenOut.Add(0);
-                byte[] switchToken = authToken(switchPlugin, pw, switchNonce, switchLenOut);
+                byte[] switchToken = authToken(switchPlugin, safePw, switchNonce, switchLenOut);
                 int switchLen = switchLenOut[0];
                 if (switchToken == null || switchLen < 0) {
                     this.lastError = "unsupported auth-switch plugin: " + switchPlugin;
                     return false;
                 }
                 nonce = switchNonce;
-                await this.writePacket(switchToken, switchLen, this.lastSeq + 1);
+                if (await this.writePacket(switchToken, switchLen, this.lastSeq + 1) <= 0) {
+                    this.lastError = "failed to send auth-switch response";
+                    return false;
+                }
                 continue;
             }
             this.lastError = "unexpected auth packet " + Convert.ToString(b0);
@@ -460,21 +507,34 @@ public partial class MySqlConnection : IDbConnection {
     }
 
     internal async bool doConnect(string host, int port, string db, string user, string pw, bool secure, string sslCa) {
+        if (host == null || host.Length == 0 || port <= 0 || port > 65535) {
+            this.lastError = "invalid MySQL host or port";
+            return false;
+        }
+        string safeDb = db != null ? db : "";
+        string safeUser = user != null ? user : "";
+        string safePw = pw != null ? pw : "";
+        string safeCa = sslCa != null ? sslCa : "";
         this.sock = Socket.CreateTcp();
         if (this.sock < 0) { this.lastError = "socket create failed"; return false; }
         Socket.SetNonBlocking(this.sock);
-        await Socket.ConnectAsync(this.sock, host, port);
+        int cr = await Socket.ConnectAsync(this.sock, host, port);
+        if (cr < 0) { this.lastError = "connect failed: " + Convert.ToString(cr); return false; }
 
         byte[] hs = await this.readPacket();
-        if (hs == null) { this.lastError = "no handshake from server"; return false; }
+        if (hs == null || this.lastLen < 1) { this.lastError = "no handshake from server"; return false; }
         if ((hs[0] & 255) == 255) {
-            int code = (hs[1] & 255) | ((hs[2] & 255) << 8);
+            int code = this.lastLen >= 3 ? ((hs[1] & 255) | ((hs[2] & 255) << 8)) : 0;
             this.lastError = "handshake err " + Convert.ToString(code) + ": "
-                + MySqlWire.bytesToStr(hs, 3, this.lastLen - 3);
+                + (this.lastLen > 3 ? MySqlWire.bytesToStr(hs, 3, this.lastLen - 3) : "");
             return false;
         }
         int p = 1;
-        while ((hs[p] & 255) != 0) { p = p + 1; }
+        while (p < this.lastLen && (hs[p] & 255) != 0) { p = p + 1; }
+        if (p + 32 > this.lastLen) {
+            this.lastError = "truncated MySQL handshake packet";
+            return false;
+        }
         p = p + 5;
         byte[] nonce = new byte[21];
         for (int i = 0; i < 8; i = i + 1) { nonce[i] = (byte)(hs[p + i] & 255); }
@@ -489,7 +549,11 @@ public partial class MySqlConnection : IDbConnection {
         int part2 = authlen - 8;
         if (part2 < 13) { part2 = 13; }
         int copy2 = part2 > 12 ? 12 : part2;
-        for (int i = 0; i < copy2; i = i + 1) { nonce[8 + i] = (byte)(hs[p + i] & 255); }
+        if (p < this.lastLen) {
+            int avail = this.lastLen - p;
+            if (copy2 > avail) { copy2 = avail; }
+            for (int i = 0; i < copy2; i = i + 1) { nonce[8 + i] = (byte)(hs[p + i] & 255); }
+        }
         p = p + part2;
         string plugin = "mysql_native_password";
         if ((serverCaps & 524288) != 0 && p < this.lastLen) {
@@ -500,7 +564,7 @@ public partial class MySqlConnection : IDbConnection {
 
         // SSLRequest 与 HandshakeResponse41 须通告一致的能力标志。
         int caps = 1 | 2 | 4 | 512 | 8192 | 32768 | 524288;
-        if (db.Length > 0) { caps = caps | 8; }
+        if (safeDb.Length > 0) { caps = caps | 8; }
         if (secure) { caps = caps | 2048; }
         int loginSeq = 1;
         if (secure) {
@@ -508,22 +572,26 @@ public partial class MySqlConnection : IDbConnection {
                 this.lastError = "server does not support TLS (no CLIENT_SSL)";
                 return false;
             }
-            if (!await this.UpgradeTlsAsync(host, caps, sslCa)) { return false; }
+            if (!await this.UpgradeTlsAsync(host, caps, safeCa)) { return false; }
             loginSeq = 2;
         }
         List<int> tokenLenOut = new List<int>(); tokenLenOut.Add(0);
-        byte[] token = authToken(plugin, pw, nonce, tokenLenOut);
+        byte[] token = authToken(plugin, safePw, nonce, tokenLenOut);
         if (token == null || tokenLenOut[0] < 0) {
             this.lastError = "unsupported auth plugin: " + plugin;
             return false;
         }
         int respLen = 0;
-        byte[] resp = MySqlConnection.BuildHandshakeResponse(caps, db, user, plugin, token, tokenLenOut[0], out respLen);
-        await this.writePacket(resp, respLen, loginSeq);
-        return await this.RunAuthLoopAsync(pw, nonce);
+        byte[] resp = MySqlConnection.BuildHandshakeResponse(caps, safeDb, safeUser, plugin, token, tokenLenOut[0], out respLen);
+        if (await this.writePacket(resp, respLen, loginSeq) <= 0) {
+            this.lastError = "failed to send handshake response";
+            return false;
+        }
+        return await this.RunAuthLoopAsync(safePw, nonce);
     }
 
     internal async int comQuery(string sql) {
+        if (sql == null) { return -1; }
         int len = sql.Length + 1;
         byte[] pay = new byte[len + 1];
         pay[0] = (byte)3;

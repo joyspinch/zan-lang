@@ -11,6 +11,7 @@ public class SparseServerDataSource : DataSource {
     int knownTotal;
     int generation;
     List<SparseServerPage> pages;
+    Dict<int, SparseServerPage> pageMap;
     bool loading;
     bool pageDone;
     SparseServerPage pendingPage;
@@ -21,6 +22,9 @@ public class SparseServerDataSource : DataSource {
     int pendingPageId;
     int nextPageId;
     int activePageId;
+    int maxCachedPages;  // LRU 缓存上限（默认 64 页；<=0 表示不限制）
+    int accessClock;
+    int highestRow;
 
     // 以页大小创建稀疏页数据源；之后可 SetKnownTotal 固定总数。
     SparseServerDataSource(int size) { this.Setup(size); }
@@ -32,6 +36,7 @@ public class SparseServerDataSource : DataSource {
         this.knownTotal = -1;
         this.generation = 1;
         this.pages = new List<SparseServerPage>();
+        this.pageMap = new Dict<int, SparseServerPage>();
         this.loading = false;
         this.pageDone = false;
         this.pendingPage = null;
@@ -42,6 +47,56 @@ public class SparseServerDataSource : DataSource {
         this.pendingPageId = 0;
         this.nextPageId = 0;
         this.activePageId = 0;
+        this.maxCachedPages = 64;
+        this.accessClock = 0;
+        this.highestRow = 0;
+    }
+
+    // 配置最大缓存就绪页数（LRU 淘汰）；传 <=0 表示不设上限。
+    public void SetMaxCachedPages(int limit) {
+        this.maxCachedPages = limit;
+        if (this.maxCachedPages > 0) { this.EvictExcessPages(null); }
+    }
+
+    public int MaxCachedPages() { return this.maxCachedPages; }
+
+    // 当前缓存中处于 Ready (state==2) 且属于本 generation 的页数。
+    public int CachedPageCount() {
+        int n = 0;
+        for (int i = 0; i < this.pages.Count; i = i + 1) {
+            SparseServerPage p = this.pages[i];
+            if (p.state == 2 && p.generation == this.generation) { n = n + 1; }
+        }
+        return n;
+    }
+
+    private void TouchPage(SparseServerPage p) {
+        if (p == null) { return; }
+        this.accessClock = this.accessClock + 1;
+        p.lastAccessSeq = this.accessClock;
+    }
+
+    private void EvictExcessPages(SparseServerPage keepPage) {
+        if (this.maxCachedPages <= 0) { return; }
+        while (true) {
+            int readyCount = 0;
+            int victimIdx = -1;
+            int victimSeq = 0;
+            for (int i = 0; i < this.pages.Count; i = i + 1) {
+                SparseServerPage p = this.pages[i];
+                if (p.state == 2 && p.generation == this.generation) {
+                    readyCount = readyCount + 1;
+                    if (p != keepPage && (victimIdx < 0 || p.lastAccessSeq < victimSeq)) {
+                        victimIdx = i;
+                        victimSeq = p.lastAccessSeq;
+                    }
+                }
+            }
+            if (readyCount <= this.maxCachedPages || victimIdx < 0) { break; }
+            SparseServerPage victim = this.pages[victimIdx];
+            if (this.pageMap != null) { this.pageMap.Remove(victim.start); }
+            this.pages.RemoveAt(victimIdx);
+        }
     }
 
     // 服务器总数已知时固定 RowCount，使中部/尾部可直接定位。
@@ -64,7 +119,9 @@ public class SparseServerDataSource : DataSource {
     public void Invalidate() {
         this.generation = this.generation + 1;
         this.knownTotal = -1;
+        this.highestRow = 0;
         this.pages.Clear();
+        if (this.pageMap != null) { this.pageMap.Clear(); }
         this.loading = false;
         this.pageDone = false;
         this.pendingPage = null;
@@ -76,13 +133,21 @@ public class SparseServerDataSource : DataSource {
         this.activePageId = this.activePageId + 1;
     }
 
+    // 显式允许重试此前处于 Error (state==3) 状态的页，
+    // 而不触发整表 Invalidate；常规每帧视口重绘不自动重试 Error 页以防风暴。
+    public void RetryFailedPages() {
+        for (int i = 0; i < this.pages.Count; i = i + 1) {
+            if (this.pages[i].state == 3) { this.pages[i].state = 0; }
+        }
+    }
+
     // 当前 generation（Invalidate 递增）。
     int Generation() { return this.generation; }
 
-    // 总数已知时为其值，否则为已就绪页的最大尾部。
+    // 总数已知时为其值，否则为已就绪页的历史最大尾部（LRU 淘汰页后不回缩）。
     override int RowCount() {
         if (this.knownTotal >= 0) { return this.knownTotal; }
-        int high = 0;
+        int high = this.highestRow;
         for (int i = 0; i < this.pages.Count; i = i + 1) {
             SparseServerPage p = this.pages[i];
             if (p.state == 2 && p.start + p.count > high) { high = p.start + p.count; }
@@ -93,8 +158,13 @@ public class SparseServerDataSource : DataSource {
     // 行序归服务器掌控：网格不做本地排序/筛选。
     override bool ServerControlled() { return true; }
 
-    // 起始行为 start 的页；不存在返回 null。
+    // 起始行为 start 的页；不存在返回 null（O(1) 哈希索引）。
     public SparseServerPage PageAt(int start) {
+        if (this.pageMap != null) {
+            SparseServerPage found = null;
+            if (this.pageMap.TryGetValue(start, out found)) { return found; }
+            return null;
+        }
         for (int i = 0; i < this.pages.Count; i = i + 1) {
             if (this.pages[i].start == start) { return this.pages[i]; }
         }
@@ -108,6 +178,8 @@ public class SparseServerDataSource : DataSource {
         if (p == null) {
             p = new SparseServerPage(start, this.generation);
             this.pages.Add(p);
+            if (this.pageMap == null) { this.pageMap = new Dict<int, SparseServerPage>(); }
+            this.pageMap[start] = p;
         }
         return p;
     }
@@ -142,14 +214,14 @@ public class SparseServerDataSource : DataSource {
         return false;
     }
 
-    // 请求 row 所属页：页已就绪/加载中、总数已知且越界、或有请求
-    // 在途时忽略；否则启动该页获取。
+    // 请求 row 所属页：页已就绪/加载中/出错、总数已知且越界、或有请求
+    // 在途时忽略；否则启动该页获取（出错页需显式 RetryFailedPages 或 Invalidate）。
     override void RequestBlock(int row) {
         if (row < 0) { return; }
         if (this.knownTotal >= 0 && row >= this.knownTotal) { return; }
         if (this.loading) { return; }
         SparseServerPage p = this.PageFor(row);
-        if (p.state == 2 || p.state == 1) { return; }
+        if (p.state == 2 || p.state == 1 || p.state == 3) { return; }
         this.StartPage(p);
     }
 
@@ -171,7 +243,7 @@ public class SparseServerDataSource : DataSource {
     }
 
     // 找到第一个未就绪/过期的页发起获取：总数已知时按页序扫描，
-    // 未知时从已就绪连续前缀的末端继续；无缺口时不请求。
+    // 未知时从已就绪连续前缀的末端继续；跳过已出错页防重试风暴。
     override void RequestNextBlock() {
         if (this.loading) { return; }
         int start = 0;
@@ -180,7 +252,7 @@ public class SparseServerDataSource : DataSource {
             for (int page = 0; page < pageCount; page = page + 1) {
                 int candidate = page * this.pageSize;
                 SparseServerPage p = this.PageAt(candidate);
-                if (p == null || p.state != 2 || p.generation != this.generation) {
+                if (p == null || p.generation != this.generation || p.state == 0) {
                     start = candidate;
                     break;
                 }
@@ -192,14 +264,14 @@ public class SparseServerDataSource : DataSource {
             start = 0;
             while (start < high) {
                 SparseServerPage p = this.PageAt(start);
-                if (p == null || p.state != 2 || p.generation != this.generation) {
+                if (p == null || p.generation != this.generation || p.state == 0) {
                     break;
                 }
                 start = start + this.pageSize;
             }
         }
         SparseServerPage next = this.PageFor(start);
-        if (next.state != 2 && next.state != 1) { this.StartPage(next); }
+        if (next.state == 0) { this.StartPage(next); }
     }
 
     // 每帧并入完成的页结果：nonce/generation 匹配时校验行数
@@ -231,6 +303,8 @@ public class SparseServerDataSource : DataSource {
                 p.count = this.pendingCount;
                 p.total = this.pendingTotal;
                 p.state = 2;
+                this.TouchPage(p);
+                if (p.start + p.count > this.highestRow) { this.highestRow = p.start + p.count; }
                 if (p.total >= 0) {
                     int total = p.total;
                     if (total < p.start + p.count) { total = p.start + p.count; }
@@ -238,6 +312,7 @@ public class SparseServerDataSource : DataSource {
                 } else if (this.knownTotal < 0 && p.count < this.pageSize) {
                     this.SetKnownTotal(p.start + p.count);
                 }
+                this.EvictExcessPages(p);
             }
         }
         this.pendingPage = null;
@@ -291,12 +366,14 @@ public class SparseServerDataSource : DataSource {
     // 视为尾页（未知总数模式下由此固定总数）。同步子类只需实现此方法。
     virtual int FillPage(int start, int count, List<DataRow> dst) { return 0; }
 
-    // 覆盖 row 且属于当前 generation 的就绪页；没有返回 null。
+    // 覆盖 row 且属于当前 generation 的就绪页；O(1) 页起止索引查找，没有返回 null。
     public SparseServerPage ReadyPage(int row) {
-        for (int i = 0; i < this.pages.Count; i = i + 1) {
-            if (this.pages[i].Covers(row) && this.pages[i].generation == this.generation) {
-                return this.pages[i];
-            }
+        if (row < 0 || this.pageSize <= 0) { return null; }
+        int pageStart = (row / this.pageSize) * this.pageSize;
+        SparseServerPage p = this.PageAt(pageStart);
+        if (p != null && p.Covers(row) && p.generation == this.generation) {
+            this.TouchPage(p);
+            return p;
         }
         return null;
     }

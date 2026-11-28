@@ -73,9 +73,28 @@ public partial class PgConnection : IDbConnection {
             if (this.waiters == null) { this.waiters = new Queue<AsyncGate>(); }
             this.waiters.Enqueue(g);
         }
-        await g.Wait();
-        g.Close();
-        return true;
+        bool acquired = false;
+        try {
+            await g.Wait();
+            acquired = true;
+            return true;
+        } finally {
+            g.Close();
+            if (!acquired) {
+                bool foundInQueue = false;
+                lock (this) {
+                    if (this.waiters != null) {
+                        int n = this.waiters.Count();
+                        for (int i = 0; i < n; i = i + 1) {
+                            AsyncGate cur = this.waiters.Dequeue();
+                            if (cur == g) { foundInQueue = true; }
+                            else { this.waiters.Enqueue(cur); }
+                        }
+                    }
+                }
+                if (!foundInQueue) { this.ReleaseLock(); }
+            }
+        }
     }
 
     void ReleaseLock() {
@@ -94,16 +113,17 @@ public partial class PgConnection : IDbConnection {
     // 可经 SetTlsVerify(false) 放宽（只加密不校验），与 HttpClient 的
     // verifyTls 开关同一语义；非 Windows 无系统信任根，须配
     // sslrootcert 或关校验。
+    private static string stateLock = "System.Data.Postgres.PgConnection.stateLock";
     private static bool defaultVerifyTls = true;
     public static bool verifyTls {
-        get { return PgConnection.defaultVerifyTls; }
-        set { PgConnection.defaultVerifyTls = value; }
+        get { lock (PgConnection.stateLock) { return PgConnection.defaultVerifyTls; } }
+        set { lock (PgConnection.stateLock) { PgConnection.defaultVerifyTls = value; } }
     }
 
     // 切换后续 Open/OpenAsync 的证书与主机名校验。
     // 仅测试/开发自签场景关闭；生产保持默认开启。
     public static void SetTlsVerify(bool verify) {
-        PgConnection.defaultVerifyTls = verify;
+        lock (PgConnection.stateLock) { PgConnection.defaultVerifyTls = verify; }
     }
 
     // 统一经 <see cref="Open"/>/<see cref="OpenAsync"/> 创建。
@@ -237,6 +257,7 @@ public partial class PgConnection : IDbConnection {
 
     // 恰好读取 need 字节到 dst 的 off 处；对端关闭或致命错误返回不足。
     int recvExactSync(byte[] dst, int off, int need) {
+        if (need <= 0) { return 0; }
         if (this.syncTls == null && this.tls != null) {
             this.lastError = "cannot perform sync I/O on async TLS connection";
             return 0;
@@ -283,6 +304,7 @@ public partial class PgConnection : IDbConnection {
 
     // 发一条前端消息：类型字节 + 大端长度（含自身，不含类型）。
     int sendMessageSync(int type, byte[] pay, int len) {
+        if (len < 0 || (len > 0 && pay == null)) { return -1; }
         byte[] buf = new byte[len + 6];
         buf[0] = (byte)(type & 255);
         int total = len + 4;
@@ -323,6 +345,7 @@ public partial class PgConnection : IDbConnection {
     // 异步 IO（IO reactor 挂起；TLS 经 TlsStream）
 
     async int recvExactAsync(byte[] dst, int off, int need) {
+        if (need <= 0) { return 0; }
         if (this.tls != null) {
             int have = 0;
             while (have < need) {
@@ -344,13 +367,21 @@ public partial class PgConnection : IDbConnection {
     }
 
     async int sendRawAsync(byte[] buf, int len) {
+        if (len <= 0) { return 0; }
         if (this.tls != null) {
             return await this.tls.SendBytesAsync(buf, 0, len);
         }
-        return await Socket.SendAsync(this.sock, buf, len);
+        int off = 0;
+        while (off < len) {
+            int sent = await Socket.SendBytesAsync(this.sock, buf, off, len - off);
+            if (sent <= 0) { return -1; }
+            off = off + sent;
+        }
+        return len;
     }
 
     async int sendMessageAsync(int type, byte[] pay, int len) {
+        if (len < 0 || (len > 0 && pay == null)) { return -1; }
         byte[] buf = new byte[len + 6];
         buf[0] = (byte)(type & 255);
         int total = len + 4;
@@ -388,6 +419,15 @@ public partial class PgConnection : IDbConnection {
 
     // 连接建立
 
+    private static bool IsAllDigits(string s) {
+        if (s == null || s.Length == 0) { return false; }
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i] & 255;
+            if (c < 48 || c > 57) { return false; }
+        }
+        return true;
+    }
+
     // 解析 conninfo 并套用到本连接的参数字段；
     // 语法或必填项问题写入 lastError 并返回 -1。
     int applyConninfo(string conninfo) {
@@ -402,7 +442,7 @@ public partial class PgConnection : IDbConnection {
         }
         if (outs[0].Length > 0) { this.host = outs[0]; }
         if (outs[1].Length > 0) {
-            int p = outs[1].ToInt32();
+            int p = PgConnection.IsAllDigits(outs[1]) ? outs[1].ToInt32() : -1;
             if (p <= 0 || p > 65535) {
                 this.lastError = "invalid port: " + outs[1];
                 return -1;
@@ -425,7 +465,7 @@ public partial class PgConnection : IDbConnection {
             }
         }
         if (outs[6].Length > 0) {
-            int t = outs[6].ToInt32();
+            int t = PgConnection.IsAllDigits(outs[6]) ? outs[6].ToInt32() : -1;
             if (t < 0 || t > 86400) {
                 this.lastError = "invalid connect_timeout: " + outs[6];
                 return -1;
@@ -448,6 +488,7 @@ public partial class PgConnection : IDbConnection {
         req[0] = 0; req[1] = 0; req[2] = 0; req[3] = 8;
         req[4] = 4; req[5] = 210; req[6] = 22; req[7] = 47;  // 80877103
         int sn = Socket.Send(this.sock, req, 8);
+        if (sn < 8) { return 0; }
         byte[] rsp = new byte[2];
         int got = this.recvExactSync(rsp, 0, 1);
         if (got < 1) { return 0; }
@@ -479,7 +520,7 @@ public partial class PgConnection : IDbConnection {
                 return false;
             }
         }
-        this.syncTls = TlsEngine.CreateClient(this.host, !this.tlsVerify || !PgConnection.defaultVerifyTls, false,
+        this.syncTls = TlsEngine.CreateClient(this.host, !this.tlsVerify || !PgConnection.verifyTls, false,
             null, false, null, trust);
         this.syncTls.StartHandshake();
         if (this.tlsIn == null) { this.tlsIn = new byte[65537]; }
@@ -583,7 +624,7 @@ public partial class PgConnection : IDbConnection {
             }
             if (this.msgType == 83) {  // 'S' ParameterStatus
                 this.recordParamStatus(pay);
-            } else if (this.msgType == 75) {  // 'K' BackendKeyData
+            } else if (this.msgType == 75 && this.msgLen - 4 >= 8) {  // 'K' BackendKeyData
                 this.backendPid = PgWire.be32(pay, 0);
                 this.backendSecret = PgWire.be32(pay, 4);
             } else if (this.msgType == 90) {  // 'Z' ReadyForQuery
@@ -623,7 +664,7 @@ public partial class PgConnection : IDbConnection {
                     this.lastError = "TLS init failed: " + TlsStream.LastError();
                     return false;
                 }
-                if (!this.tlsVerify || !PgConnection.defaultVerifyTls) { ctx.DisableVerify(); }
+                if (!this.tlsVerify || !PgConnection.verifyTls) { ctx.DisableVerify(); }
                 if (this.sslRootCert.Length > 0 && !ctx.AddTrustedCert(this.sslRootCert)) {
                     this.lastError = "sslrootcert could not be read: " + this.sslRootCert;
                     return false;
@@ -698,6 +739,8 @@ public partial class PgConnection : IDbConnection {
         string clientFirstBare = "";
         byte[] serverKey = null;
         string authMessage = "";
+        bool scramActive = false;
+        bool scramVerified = false;
         while (true) {
             byte[] pay = this.recvMessageSync();
             if (pay == null) {
@@ -712,9 +755,17 @@ public partial class PgConnection : IDbConnection {
                 this.lastError = "unexpected message during authentication";
                 return false;
             }
-            int code = PgWire.be32(pay, 0);
             int plen = this.msgLen - 4;
+            if (plen < 4) {
+                this.lastError = "truncated authentication message";
+                return false;
+            }
+            int code = PgWire.be32(pay, 0);
             if (code == 0) {  // AuthenticationOk
+                if (scramActive && !scramVerified) {
+                    this.lastError = "SCRAM authentication completed without server verification";
+                    return false;
+                }
                 return true;
             }
             if (code == 3) {  // CleartextPassword
@@ -725,6 +776,10 @@ public partial class PgConnection : IDbConnection {
                 continue;
             }
             if (code == 5) {  // MD5Password
+                if (plen < 8) {
+                    this.lastError = "truncated MD5 salt";
+                    return false;
+                }
                 if (this.sendPasswordSync(
                         PgWire.md5PasswordToken(this.password, this.user,
                             PgWire.slice4(pay, 4))) <= 0) {
@@ -749,6 +804,12 @@ public partial class PgConnection : IDbConnection {
                     return false;
                 }
                 clientNonceB64 = PgWire.clientNonce();
+                if (clientNonceB64.Length == 0) {
+                    this.lastError = "secure RNG unavailable for SCRAM";
+                    return false;
+                }
+                scramActive = true;
+                scramVerified = false;
                 clientFirstBare = "n=,r=" + clientNonceB64;
                 string clientFirst = "n,," + clientFirstBare;
                 this.begin(13 + 1 + 4 + clientFirst.Length + 8);
@@ -762,17 +823,23 @@ public partial class PgConnection : IDbConnection {
                 continue;
             }
             if (code == 11) {  // AuthenticationSASLContinue
+                if (!scramActive || clientNonceB64.Length == 0) {
+                    this.lastError = "unexpected SCRAM server-first-message";
+                    return false;
+                }
                 string serverFirst = PgWire.bytesToStr(pay, 4, plen - 4);
                 string serverNonce = PgWire.scramField(serverFirst, "r");
                 string saltB64 = PgWire.scramField(serverFirst, "s");
-                int iters = PgWire.scramField(serverFirst, "i").ToInt32();
+                string iterStr = PgWire.scramField(serverFirst, "i");
+                int iters = PgConnection.IsAllDigits(iterStr) ? iterStr.ToInt32() : -1;
                 if (!PgWire.hasPrefix(serverNonce, clientNonceB64)
+                        || serverNonce.Length <= clientNonceB64.Length
                         || saltB64.Length == 0 || iters < 1 || iters > 10000000) {
                     this.lastError = "invalid SCRAM server-first-message";
                     return false;
                 }
                 byte[] salt = Base64.Decode(saltB64);
-                if (salt == null) {
+                if (salt == null || salt.Length == 0) {
                     this.lastError = "invalid SCRAM salt";
                     return false;
                 }
@@ -800,6 +867,10 @@ public partial class PgConnection : IDbConnection {
                 continue;
             }
             if (code == 12) {  // AuthenticationSASLFinal
+                if (!scramActive || serverKey == null || authMessage.Length == 0) {
+                    this.lastError = "unexpected SCRAM final message";
+                    return false;
+                }
                 string verifier = PgWire.bytesToStr(pay, 4, plen - 4);
                 byte[] authBytes2 = PgWire.strToBytes(authMessage,
                     authMessage.Length);
@@ -810,6 +881,7 @@ public partial class PgConnection : IDbConnection {
                     this.lastError = "SCRAM server signature mismatch";
                     return false;
                 }
+                scramVerified = true;
                 continue;  // AuthenticationOk 随后到达
             }
             // 2=KerberosV5 6=SCM 7=GSS 8=GSSContinue 9=SSPI——纯 Zan
@@ -827,6 +899,8 @@ public partial class PgConnection : IDbConnection {
         string clientFirstBare = "";
         byte[] serverKey = null;
         string authMessage = "";
+        bool scramActive = false;
+        bool scramVerified = false;
         while (true) {
             byte[] pay = await this.recvMessageAsync();
             if (pay == null) {
@@ -841,9 +915,19 @@ public partial class PgConnection : IDbConnection {
                 this.lastError = "unexpected message during authentication";
                 return false;
             }
-            int code = PgWire.be32(pay, 0);
             int plen = this.msgLen - 4;
-            if (code == 0) { return true; }
+            if (plen < 4) {
+                this.lastError = "truncated authentication message";
+                return false;
+            }
+            int code = PgWire.be32(pay, 0);
+            if (code == 0) {
+                if (scramActive && !scramVerified) {
+                    this.lastError = "SCRAM authentication completed without server verification";
+                    return false;
+                }
+                return true;
+            }
             if (code == 3) {
                 if (await this.sendPasswordAsync(this.password) <= 0) {
                     this.lastError = "could not send password";
@@ -852,6 +936,10 @@ public partial class PgConnection : IDbConnection {
                 continue;
             }
             if (code == 5) {
+                if (plen < 8) {
+                    this.lastError = "truncated MD5 salt";
+                    return false;
+                }
                 if (await this.sendPasswordAsync(
                         PgWire.md5PasswordToken(this.password, this.user,
                             PgWire.slice4(pay, 4))) <= 0) {
@@ -876,6 +964,12 @@ public partial class PgConnection : IDbConnection {
                     return false;
                 }
                 clientNonceB64 = PgWire.clientNonce();
+                if (clientNonceB64.Length == 0) {
+                    this.lastError = "secure RNG unavailable for SCRAM";
+                    return false;
+                }
+                scramActive = true;
+                scramVerified = false;
                 clientFirstBare = "n=,r=" + clientNonceB64;
                 string clientFirst = "n,," + clientFirstBare;
                 this.begin(13 + 1 + 4 + clientFirst.Length + 8);
@@ -889,17 +983,23 @@ public partial class PgConnection : IDbConnection {
                 continue;
             }
             if (code == 11) {
+                if (!scramActive || clientNonceB64.Length == 0) {
+                    this.lastError = "unexpected SCRAM server-first-message";
+                    return false;
+                }
                 string serverFirst = PgWire.bytesToStr(pay, 4, plen - 4);
                 string serverNonce = PgWire.scramField(serverFirst, "r");
                 string saltB64 = PgWire.scramField(serverFirst, "s");
-                int iters = PgWire.scramField(serverFirst, "i").ToInt32();
+                string iterStr = PgWire.scramField(serverFirst, "i");
+                int iters = PgConnection.IsAllDigits(iterStr) ? iterStr.ToInt32() : -1;
                 if (!PgWire.hasPrefix(serverNonce, clientNonceB64)
+                        || serverNonce.Length <= clientNonceB64.Length
                         || saltB64.Length == 0 || iters < 1 || iters > 10000000) {
                     this.lastError = "invalid SCRAM server-first-message";
                     return false;
                 }
                 byte[] salt = Base64.Decode(saltB64);
-                if (salt == null) {
+                if (salt == null || salt.Length == 0) {
                     this.lastError = "invalid SCRAM salt";
                     return false;
                 }
@@ -927,6 +1027,10 @@ public partial class PgConnection : IDbConnection {
                 continue;
             }
             if (code == 12) {
+                if (!scramActive || serverKey == null || authMessage.Length == 0) {
+                    this.lastError = "unexpected SCRAM final message";
+                    return false;
+                }
                 string verifier = PgWire.bytesToStr(pay, 4, plen - 4);
                 byte[] authBytes2 = PgWire.strToBytes(authMessage,
                     authMessage.Length);
@@ -937,6 +1041,7 @@ public partial class PgConnection : IDbConnection {
                     this.lastError = "SCRAM server signature mismatch";
                     return false;
                 }
+                scramVerified = true;
                 continue;
             }
             this.lastError = "unsupported authentication method "

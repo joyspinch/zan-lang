@@ -1,0 +1,663 @@
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+
+namespace Game.Combat3D;
+
+// DynamicSceneTlas3D 查询平面：4-Wide SIMD QBVH 顶层空间剪枝 + 局部空间 BLAS 精确射线/弹道/胶囊扫掠/重叠解穿插。
+public partial class DynamicSceneTlas3D {
+    private static float SafeInvDir(float d) {
+        if (d >= 0.0f) { return d < 1e-9f ? 1e9f : (1.0f / d); }
+        return d > -1e-9f ? -1e9f : (1.0f / d);
+    }
+
+    // 双层加速射线检测（任意方向向量，自动归一化）。
+    public bool Raycast(Vector3 origin, Vector3 direction, float maxDistance,
+                        int layerMask, bool cullBackface, out SceneRayHit3D hit) {
+        float dLenSq = direction.LengthSquared();
+        if (dLenSq <= 1e-12f || maxDistance <= 0.0f) {
+            hit = new SceneRayHit3D();
+            hit.InstanceId = -1;
+            hit.TriangleIndex = -1;
+            return false;
+        }
+        float invLen = Math.Abs(dLenSq - 1.0f) > 1e-5f ? (1.0f / MathF.Sqrt(dLenSq)) : 1.0f;
+        return this.RaycastUnitDir(origin, direction.X * invLen, direction.Y * invLen, direction.Z * invLen,
+                                   maxDistance, layerMask, cullBackface, out hit);
+    }
+
+    // 4-Wide SIMD QBVH 顶层从近到远有序遍历 + 紧致盒精筛 + 局部空间 BLAS 求交。
+    public bool RaycastUnitDir(Vector3 origin, float dx, float dy, float dz, float maxDistance,
+                               int layerMask, bool cullBackface, out SceneRayHit3D hit) {
+        hit = new SceneRayHit3D();
+        hit.Hit = false;
+        hit.InstanceId = -1;
+        hit.TriangleIndex = -1;
+
+        this.EnsureReady();
+        if (this.qNodeCount <= 0 || maxDistance <= 0.0f || layerMask == 0) { return false; }
+
+        float ox = origin.X; float oy = origin.Y; float oz = origin.Z;
+        float invDx = DynamicSceneTlas3D.SafeInvDir(dx);
+        float invDy = DynamicSceneTlas3D.SafeInvDir(dy);
+        float invDz = DynamicSceneTlas3D.SafeInvDir(dz);
+
+        int nearX = invDx >= 0.0f ? 0 : 12; int farX = 12 - nearX;
+        int nearY = invDy >= 0.0f ? 4 : 16; int farY = 20 - nearY;
+        int nearZ = invDz >= 0.0f ? 8 : 20; int farZ = 28 - nearZ;
+
+        int tNearX = invDx >= 0.0f ? 0 : 3; int tFarX = 3 - tNearX;
+        int tNearY = invDy >= 0.0f ? 1 : 4; int tFarY = 5 - tNearY;
+        int tNearZ = invDz >= 0.0f ? 2 : 5; int tFarZ = 7 - tNearZ;
+
+        Vec<4, float> vOx = Vec<4, float>.Splat(ox);
+        Vec<4, float> vOy = Vec<4, float>.Splat(oy);
+        Vec<4, float> vOz = Vec<4, float>.Splat(oz);
+        Vec<4, float> vInvDx = Vec<4, float>.Splat(invDx);
+        Vec<4, float> vInvDy = Vec<4, float>.Splat(invDy);
+        Vec<4, float> vInvDz = Vec<4, float>.Splat(invDz);
+        Vec<4, float> vZero = Vec<4, float>.Zero();
+
+        float[] qBounds = this.qBounds;
+        int[] qChildren = this.qChildren;
+        int[] leafFirst = this.leafFirst;
+        int[] leafCount = this.leafCount;
+        int[] leafInst = this.leafInstances;
+        float[] tb = this.tightBounds;
+        float[] rm = this.instRotMat;
+        float[] ip = this.instPos;
+
+        [64]int stackNode = new InlineArray<64, int>();
+        [64]float stackDist = new InlineArray<64, float>();
+        int sp = 0;
+
+        float bestT = maxDistance;
+        int bestInst = -1;
+        MeshRayHit3D bestLocal = new MeshRayHit3D();
+
+        int curRef = 0;
+        float curDist = 0.0f;
+
+        while (true) {
+            if (curDist <= bestT) {
+                if (curRef < 0) {
+                    int lid = -2 - curRef;
+                    int first = leafFirst[lid];
+                    int end = first + leafCount[lid];
+                    for (int s = first; s < end; s = s + 1) {
+                        int id = leafInst[s];
+                        if (this.instState[id] != (byte)2) { continue; }
+                        if ((this.instLayers[id] & layerMask) == 0) { continue; }
+
+                        int b = id * 6;
+                        float tn = Math.Max(0.0f, Math.Max((tb[b + tNearX] - ox) * invDx,
+                                   Math.Max((tb[b + tNearY] - oy) * invDy, (tb[b + tNearZ] - oz) * invDz)));
+                        float tf = Math.Min(bestT, Math.Min((tb[b + tFarX] - ox) * invDx,
+                                   Math.Min((tb[b + tFarY] - oy) * invDy, (tb[b + tFarZ] - oz) * invDz)));
+                        if (tn > tf) { continue; }
+
+                        int p3 = id * 3;
+                        int m9 = id * 9;
+                        float invS = this.instInvScale[id];
+                        float relX = (ox - ip[p3 + 0]) * invS;
+                        float relY = (oy - ip[p3 + 1]) * invS;
+                        float relZ = (oz - ip[p3 + 2]) * invS;
+
+                        Vector3 lOrig = new Vector3(
+                            rm[m9 + 0] * relX + rm[m9 + 1] * relY + rm[m9 + 2] * relZ,
+                            rm[m9 + 3] * relX + rm[m9 + 4] * relY + rm[m9 + 5] * relZ,
+                            rm[m9 + 6] * relX + rm[m9 + 7] * relY + rm[m9 + 8] * relZ);
+                        float ldx = rm[m9 + 0] * dx + rm[m9 + 1] * dy + rm[m9 + 2] * dz;
+                        float ldy = rm[m9 + 3] * dx + rm[m9 + 4] * dy + rm[m9 + 5] * dz;
+                        float ldz = rm[m9 + 6] * dx + rm[m9 + 7] * dy + rm[m9 + 8] * dz;
+
+                        MeshRayHit3D lHit;
+                        if (this.instBlas[id].RaycastUnitDir(lOrig, ldx, ldy, ldz, bestT * invS, cullBackface, out lHit)) {
+                            float wDist = lHit.Distance * this.instScale[id];
+                            if (wDist <= bestT) {
+                                bestT = wDist;
+                                bestInst = id;
+                                bestLocal = lHit;
+                            }
+                        }
+                    }
+                } else {
+                    int qb = curRef * 24;
+                    Vec<4, float> tMinX = (Vec<4, float>.Load(qBounds, qb + nearX) - vOx) * vInvDx;
+                    Vec<4, float> tMaxX = (Vec<4, float>.Load(qBounds, qb + farX)  - vOx) * vInvDx;
+                    Vec<4, float> tMinY = (Vec<4, float>.Load(qBounds, qb + nearY) - vOy) * vInvDy;
+                    Vec<4, float> tMaxY = (Vec<4, float>.Load(qBounds, qb + farY)  - vOy) * vInvDy;
+                    Vec<4, float> tMinZ = (Vec<4, float>.Load(qBounds, qb + nearZ) - vOz) * vInvDz;
+                    Vec<4, float> tMaxZ = (Vec<4, float>.Load(qBounds, qb + farZ)  - vOz) * vInvDz;
+
+                    Vec<4, float> tNear = Vec<4, float>.Max(Vec<4, float>.Max(tMinX, tMinY), Vec<4, float>.Max(tMinZ, vZero));
+                    Vec<4, float> tFar  = Vec<4, float>.Min(Vec<4, float>.Min(tMaxX, tMaxY), Vec<4, float>.Min(tMaxZ, Vec<4, float>.Splat(bestT)));
+
+                    int qc = curRef * 4;
+                    [4]int hRef = new InlineArray<4, int>();
+                    [4]float hDist = new InlineArray<4, float>();
+                    int hCnt = 0;
+
+                    float n0 = tNear[0]; if (n0 <= tFar[0]) { hRef[hCnt] = qChildren[qc + 0]; hDist[hCnt] = n0; hCnt = hCnt + 1; }
+                    float n1 = tNear[1]; if (n1 <= tFar[1]) { hRef[hCnt] = qChildren[qc + 1]; hDist[hCnt] = n1; hCnt = hCnt + 1; }
+                    float n2 = tNear[2]; if (n2 <= tFar[2]) { hRef[hCnt] = qChildren[qc + 2]; hDist[hCnt] = n2; hCnt = hCnt + 1; }
+                    float n3 = tNear[3]; if (n3 <= tFar[3]) { hRef[hCnt] = qChildren[qc + 3]; hDist[hCnt] = n3; hCnt = hCnt + 1; }
+
+                    if (hCnt == 1) {
+                        curRef = hRef[0];
+                        curDist = hDist[0];
+                        continue;
+                    }
+                    if (hCnt >= 2) {
+                        for (int a = 1; a < hCnt; a = a + 1) {
+                            float kd = hDist[a];
+                            int kr = hRef[a];
+                            int b = a - 1;
+                            while (b >= 0 && hDist[b] > kd) {
+                                hDist[b + 1] = hDist[b];
+                                hRef[b + 1] = hRef[b];
+                                b = b - 1;
+                            }
+                            hDist[b + 1] = kd;
+                            hRef[b + 1] = kr;
+                        }
+                        for (int k = hCnt - 1; k >= 1; k = k - 1) {
+                            if (sp < 64) {
+                                stackNode[sp] = hRef[k];
+                                stackDist[sp] = hDist[k];
+                                sp = sp + 1;
+                            }
+                        }
+                        curRef = hRef[0];
+                        curDist = hDist[0];
+                        continue;
+                    }
+                }
+            }
+
+            bool popped = false;
+            while (sp > 0) {
+                sp = sp - 1;
+                float nd = stackDist[sp];
+                if (nd <= bestT) {
+                    curRef = stackNode[sp];
+                    curDist = nd;
+                    popped = true;
+                    break;
+                }
+            }
+            if (!popped) { break; }
+        }
+
+        if (bestInst < 0) { return false; }
+
+        int bm = bestInst * 9;
+        Vector3 ln = bestLocal.Normal;
+        Vector3 wn = new Vector3(
+            rm[bm + 0] * ln.X + rm[bm + 3] * ln.Y + rm[bm + 6] * ln.Z,
+            rm[bm + 1] * ln.X + rm[bm + 4] * ln.Y + rm[bm + 7] * ln.Z,
+            rm[bm + 2] * ln.X + rm[bm + 5] * ln.Y + rm[bm + 8] * ln.Z);
+
+        hit.Hit = true;
+        hit.Distance = bestT;
+        hit.Point = new Vector3(ox + dx * bestT, oy + dy * bestT, oz + dz * bestT);
+        hit.Normal = wn;
+        hit.InstanceId = bestInst;
+        hit.UserTag = this.instUserTags[bestInst];
+        hit.TriangleIndex = bestLocal.TriangleIndex;
+        hit.MaterialId = bestLocal.MaterialId;
+        return true;
+    }
+
+    // 跨实例多介质穿墙弹道追踪（子弹可依次穿透木板实例、玻璃窗实例直至被混凝土建筑区块阻停）。
+    public float TraceBallisticPenetration(Vector3 origin, Vector3 direction, float maxRange, int layerMask,
+                                           float initialEnergy, float[] materialCostTable,
+                                           List<SceneBallisticImpact3D> outImpacts) {
+        if (outImpacts != null) { outImpacts.Clear(); }
+        if (initialEnergy <= 0.0f || maxRange <= 0.0f || layerMask == 0) { return 0.0f; }
+
+        float dLenSq = direction.LengthSquared();
+        if (dLenSq <= 1e-12f) { return initialEnergy; }
+        float invLen = 1.0f / MathF.Sqrt(dLenSq);
+        float dx = direction.X * invLen;
+        float dy = direction.Y * invLen;
+        float dz = direction.Z * invLen;
+
+        float energy = initialEnergy;
+        float traveled = 0.0f;
+        int safetySteps = 0;
+
+        while (energy > 0.0f && traveled < maxRange && safetySteps < 16) {
+            safetySteps = safetySteps + 1;
+            Vector3 curOrigin = new Vector3(origin.X + dx * traveled, origin.Y + dy * traveled, origin.Z + dz * traveled);
+            SceneRayHit3D segHit;
+            if (!this.RaycastUnitDir(curOrigin, dx, dy, dz, maxRange - traveled, layerMask, false, out segHit)) {
+                break;
+            }
+            float totalDist = traveled + segHit.Distance;
+            int matId = segHit.MaterialId;
+            float cost = initialEnergy;
+            if (materialCostTable != null && matId >= 0 && matId < materialCostTable.Length) {
+                cost = materialCostTable[matId];
+            }
+            float after = Math.Max(0.0f, energy - cost);
+
+            if (outImpacts != null) {
+                SceneBallisticImpact3D imp = new SceneBallisticImpact3D();
+                imp.Distance = totalDist;
+                imp.Point = segHit.Point;
+                imp.Normal = segHit.Normal;
+                imp.InstanceId = segHit.InstanceId;
+                imp.UserTag = segHit.UserTag;
+                imp.TriangleIndex = segHit.TriangleIndex;
+                imp.MaterialId = matId;
+                imp.EnergyBefore = energy;
+                imp.EnergyAfter = after;
+                outImpacts.Add(imp);
+            }
+
+            energy = after;
+            traveled = totalDist + 0.002f;
+        }
+        return energy;
+    }
+
+    // 双层加速胶囊体连续扫掠（Minkowski 4-Wide SIMD QBVH 剪枝 + bestFrac 双向收紧局部空间 BLAS 扫掠）。
+    public bool SweepCapsule(Vector3 p0, Vector3 p1, float radius, Vector3 delta,
+                             int layerMask, out SceneSweepHit3D hit) {
+        hit = new SceneSweepHit3D();
+        hit.Hit = false;
+        hit.Fraction = 1.0f;
+        hit.InstanceId = -1;
+        hit.TriangleIndex = -1;
+
+        this.EnsureReady();
+        if (this.qNodeCount <= 0 || radius < 0.0f || layerMask == 0) { return false; }
+
+        float moveLenSq = delta.LengthSquared();
+        float moveLen = moveLenSq > 1e-16f ? MathF.Sqrt(moveLenSq) : 0.0f;
+
+        float midX = (p0.X + p1.X) * 0.5f;
+        float midY = (p0.Y + p1.Y) * 0.5f;
+        float midZ = (p0.Z + p1.Z) * 0.5f;
+        float extX = Math.Abs(p1.X - p0.X) * 0.5f + radius + 1e-4f;
+        float extY = Math.Abs(p1.Y - p0.Y) * 0.5f + radius + 1e-4f;
+        float extZ = Math.Abs(p1.Z - p0.Z) * 0.5f + radius + 1e-4f;
+
+        float invDx = DynamicSceneTlas3D.SafeInvDir(delta.X);
+        float invDy = DynamicSceneTlas3D.SafeInvDir(delta.Y);
+        float invDz = DynamicSceneTlas3D.SafeInvDir(delta.Z);
+
+        int nearX = invDx >= 0.0f ? 0 : 12; int farX = 12 - nearX;
+        int nearY = invDy >= 0.0f ? 4 : 16; int farY = 20 - nearY;
+        int nearZ = invDz >= 0.0f ? 8 : 20; int farZ = 28 - nearZ;
+        float sgnX = invDx >= 0.0f ? -extX : extX;
+        float sgnY = invDy >= 0.0f ? -extY : extY;
+        float sgnZ = invDz >= 0.0f ? -extZ : extZ;
+
+        Vec<4, float> vMidX = Vec<4, float>.Splat(midX);
+        Vec<4, float> vMidY = Vec<4, float>.Splat(midY);
+        Vec<4, float> vMidZ = Vec<4, float>.Splat(midZ);
+        Vec<4, float> vSgnX = Vec<4, float>.Splat(sgnX);
+        Vec<4, float> vSgnY = Vec<4, float>.Splat(sgnY);
+        Vec<4, float> vSgnZ = Vec<4, float>.Splat(sgnZ);
+        Vec<4, float> vInvDx = Vec<4, float>.Splat(invDx);
+        Vec<4, float> vInvDy = Vec<4, float>.Splat(invDy);
+        Vec<4, float> vInvDz = Vec<4, float>.Splat(invDz);
+        Vec<4, float> vZero = Vec<4, float>.Zero();
+
+        float sMinX = Math.Min(midX, midX + delta.X) - extX;
+        float sMinY = Math.Min(midY, midY + delta.Y) - extY;
+        float sMinZ = Math.Min(midZ, midZ + delta.Z) - extZ;
+        float sMaxX = Math.Max(midX, midX + delta.X) + extX;
+        float sMaxY = Math.Max(midY, midY + delta.Y) + extY;
+        float sMaxZ = Math.Max(midZ, midZ + delta.Z) + extZ;
+
+        float[] qBounds = this.qBounds;
+        int[] qChildren = this.qChildren;
+        int[] leafFirst = this.leafFirst;
+        int[] leafCount = this.leafCount;
+        int[] leafInst = this.leafInstances;
+        float[] tb = this.tightBounds;
+        float[] rm = this.instRotMat;
+        float[] ip = this.instPos;
+
+        [64]int stackNode = new InlineArray<64, int>();
+        [64]float stackFrac = new InlineArray<64, float>();
+        int sp = 0;
+
+        float bestFrac = 1.0f;
+        int bestInst = -1;
+        SweepHit3D bestLocal = new SweepHit3D();
+
+        int curRef = 0;
+        float curFrac = 0.0f;
+
+        while (true) {
+            if (curFrac <= bestFrac) {
+                if (curRef < 0) {
+                    int lid = -2 - curRef;
+                    int first = leafFirst[lid];
+                    int end = first + leafCount[lid];
+                    for (int s = first; s < end; s = s + 1) {
+                        int id = leafInst[s];
+                        if (this.instState[id] != (byte)2) { continue; }
+                        if ((this.instLayers[id] & layerMask) == 0) { continue; }
+
+                        int b = id * 6;
+                        if (tb[b + 3] < sMinX || tb[b + 0] > sMaxX ||
+                            tb[b + 4] < sMinY || tb[b + 1] > sMaxY ||
+                            tb[b + 5] < sMinZ || tb[b + 2] > sMaxZ) {
+                            continue;
+                        }
+
+                        int p3 = id * 3;
+                        int m9 = id * 9;
+                        float invS = this.instInvScale[id];
+                        float px = ip[p3 + 0]; float py = ip[p3 + 1]; float pz = ip[p3 + 2];
+
+                        float r0x = (p0.X - px) * invS; float r0y = (p0.Y - py) * invS; float r0z = (p0.Z - pz) * invS;
+                        float r1x = (p1.X - px) * invS; float r1y = (p1.Y - py) * invS; float r1z = (p1.Z - pz) * invS;
+
+                        Vector3 lp0 = new Vector3(
+                            rm[m9 + 0] * r0x + rm[m9 + 1] * r0y + rm[m9 + 2] * r0z,
+                            rm[m9 + 3] * r0x + rm[m9 + 4] * r0y + rm[m9 + 5] * r0z,
+                            rm[m9 + 6] * r0x + rm[m9 + 7] * r0y + rm[m9 + 8] * r0z);
+                        Vector3 lp1 = new Vector3(
+                            rm[m9 + 0] * r1x + rm[m9 + 1] * r1y + rm[m9 + 2] * r1z,
+                            rm[m9 + 3] * r1x + rm[m9 + 4] * r1y + rm[m9 + 5] * r1z,
+                            rm[m9 + 6] * r1x + rm[m9 + 7] * r1y + rm[m9 + 8] * r1z);
+
+                        float dScale = invS * (bestFrac > 1e-5f ? bestFrac : 1.0f);
+                        Vector3 lDelta = new Vector3(
+                            (rm[m9 + 0] * delta.X + rm[m9 + 1] * delta.Y + rm[m9 + 2] * delta.Z) * dScale,
+                            (rm[m9 + 3] * delta.X + rm[m9 + 4] * delta.Y + rm[m9 + 5] * delta.Z) * dScale,
+                            (rm[m9 + 6] * delta.X + rm[m9 + 7] * delta.Y + rm[m9 + 8] * delta.Z) * dScale);
+
+                        SweepHit3D lHit;
+                        if (this.instBlas[id].SweepCapsuleEx(lp0, lp1, radius * invS, lDelta, null, out lHit)) {
+                            float wFrac = bestFrac > 1e-5f ? (lHit.Fraction * bestFrac) : lHit.Fraction;
+                            if (wFrac < bestFrac || bestInst < 0) {
+                                bestFrac = wFrac;
+                                bestInst = id;
+                                bestLocal = lHit;
+                                if (lHit.StartedPenetrating && bestFrac <= 0.0f) {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if (bestInst >= 0 && bestLocal.StartedPenetrating && bestFrac <= 0.0f) {
+                        break;
+                    }
+                } else {
+                    int qb = curRef * 24;
+                    Vec<4, float> tMinX = (Vec<4, float>.Load(qBounds, qb + nearX) + vSgnX - vMidX) * vInvDx;
+                    Vec<4, float> tMaxX = (Vec<4, float>.Load(qBounds, qb + farX)  - vSgnX - vMidX) * vInvDx;
+                    Vec<4, float> tMinY = (Vec<4, float>.Load(qBounds, qb + nearY) + vSgnY - vMidY) * vInvDy;
+                    Vec<4, float> tMaxY = (Vec<4, float>.Load(qBounds, qb + farY)  - vSgnY - vMidY) * vInvDy;
+                    Vec<4, float> tMinZ = (Vec<4, float>.Load(qBounds, qb + nearZ) + vSgnZ - vMidZ) * vInvDz;
+                    Vec<4, float> tMaxZ = (Vec<4, float>.Load(qBounds, qb + farZ)  - vSgnZ - vMidZ) * vInvDz;
+
+                    Vec<4, float> tNear = Vec<4, float>.Max(Vec<4, float>.Max(tMinX, tMinY), Vec<4, float>.Max(tMinZ, vZero));
+                    Vec<4, float> tFar  = Vec<4, float>.Min(Vec<4, float>.Min(tMaxX, tMaxY), Vec<4, float>.Min(tMaxZ, Vec<4, float>.Splat(bestFrac)));
+
+                    int qc = curRef * 4;
+                    [4]int hRef = new InlineArray<4, int>();
+                    [4]float hFrac = new InlineArray<4, float>();
+                    int hCnt = 0;
+
+                    float n0 = tNear[0]; if (n0 <= tFar[0]) { hRef[hCnt] = qChildren[qc + 0]; hFrac[hCnt] = n0; hCnt = hCnt + 1; }
+                    float n1 = tNear[1]; if (n1 <= tFar[1]) { hRef[hCnt] = qChildren[qc + 1]; hFrac[hCnt] = n1; hCnt = hCnt + 1; }
+                    float n2 = tNear[2]; if (n2 <= tFar[2]) { hRef[hCnt] = qChildren[qc + 2]; hFrac[hCnt] = n2; hCnt = hCnt + 1; }
+                    float n3 = tNear[3]; if (n3 <= tFar[3]) { hRef[hCnt] = qChildren[qc + 3]; hFrac[hCnt] = n3; hCnt = hCnt + 1; }
+
+                    if (hCnt == 1) {
+                        curRef = hRef[0];
+                        curFrac = hFrac[0];
+                        continue;
+                    }
+                    if (hCnt >= 2) {
+                        for (int a = 1; a < hCnt; a = a + 1) {
+                            float kf = hFrac[a];
+                            int kr = hRef[a];
+                            int b = a - 1;
+                            while (b >= 0 && hFrac[b] > kf) {
+                                hFrac[b + 1] = hFrac[b];
+                                hRef[b + 1] = hRef[b];
+                                b = b - 1;
+                            }
+                            hFrac[b + 1] = kf;
+                            hRef[b + 1] = kr;
+                        }
+                        for (int k = hCnt - 1; k >= 1; k = k - 1) {
+                            if (sp < 64) {
+                                stackNode[sp] = hRef[k];
+                                stackFrac[sp] = hFrac[k];
+                                sp = sp + 1;
+                            }
+                        }
+                        curRef = hRef[0];
+                        curFrac = hFrac[0];
+                        continue;
+                    }
+                }
+            }
+
+            bool popped = false;
+            while (sp > 0) {
+                sp = sp - 1;
+                float nf = stackFrac[sp];
+                if (nf <= bestFrac) {
+                    curRef = stackNode[sp];
+                    curFrac = nf;
+                    popped = true;
+                    break;
+                }
+            }
+            if (!popped) { break; }
+        }
+
+        if (bestInst < 0) { return false; }
+
+        int bm = bestInst * 9;
+        int bp = bestInst * 3;
+        float bs = this.instScale[bestInst];
+        Vector3 lpt = bestLocal.Point;
+        Vector3 ln = bestLocal.Normal;
+        Vector3 lsn = bestLocal.SurfaceNormal;
+
+        hit.Hit = true;
+        hit.Fraction = bestFrac;
+        hit.Distance = moveLen * bestFrac;
+        hit.Point = new Vector3(
+            ip[bp + 0] + (rm[bm + 0] * lpt.X + rm[bm + 3] * lpt.Y + rm[bm + 6] * lpt.Z) * bs,
+            ip[bp + 1] + (rm[bm + 1] * lpt.X + rm[bm + 4] * lpt.Y + rm[bm + 7] * lpt.Z) * bs,
+            ip[bp + 2] + (rm[bm + 2] * lpt.X + rm[bm + 5] * lpt.Y + rm[bm + 8] * lpt.Z) * bs);
+        hit.Normal = new Vector3(
+            rm[bm + 0] * ln.X + rm[bm + 3] * ln.Y + rm[bm + 6] * ln.Z,
+            rm[bm + 1] * ln.X + rm[bm + 4] * ln.Y + rm[bm + 7] * ln.Z,
+            rm[bm + 2] * ln.X + rm[bm + 5] * ln.Y + rm[bm + 8] * ln.Z);
+        hit.SurfaceNormal = new Vector3(
+            rm[bm + 0] * lsn.X + rm[bm + 3] * lsn.Y + rm[bm + 6] * lsn.Z,
+            rm[bm + 1] * lsn.X + rm[bm + 4] * lsn.Y + rm[bm + 7] * lsn.Z,
+            rm[bm + 2] * lsn.X + rm[bm + 5] * lsn.Y + rm[bm + 8] * lsn.Z);
+        hit.InstanceId = bestInst;
+        hit.UserTag = this.instUserTags[bestInst];
+        hit.TriangleIndex = bestLocal.TriangleIndex;
+        hit.MaterialId = bestLocal.MaterialId;
+        hit.StartedPenetrating = bestLocal.StartedPenetrating;
+        return true;
+    }
+
+    // 跨实例重叠解穿插：用 4-Wide SIMD QBVH 剪枝重叠实例，将局部排斥向量正交变换回世界空间迭代推出。
+    public bool OverlapCapsuleDepenetrate(Vector3 p0, Vector3 p1, float radius,
+                                          int layerMask, out Vector3 totalPushOut) {
+        totalPushOut = Vector3.Zero;
+        this.EnsureReady();
+        if (this.qNodeCount <= 0 || radius <= 0.0f || layerMask == 0) { return false; }
+
+        [32]int candIds = new InlineArray<32, int>();
+        Vector3 cur0 = p0;
+        Vector3 cur1 = p1;
+        bool anyPushed = false;
+
+        for (int iter = 0; iter < 3; iter = iter + 1) {
+            float minX = Math.Min(cur0.X, cur1.X) - radius;
+            float minY = Math.Min(cur0.Y, cur1.Y) - radius;
+            float minZ = Math.Min(cur0.Z, cur1.Z) - radius;
+            float maxX = Math.Max(cur0.X, cur1.X) + radius;
+            float maxY = Math.Max(cur0.Y, cur1.Y) + radius;
+            float maxZ = Math.Max(cur0.Z, cur1.Z) + radius;
+
+            int candCnt = this.CollectOverlappingInstances(minX, minY, minZ, maxX, maxY, maxZ, layerMask, ref candIds, 32);
+            if (candCnt <= 0) { break; }
+
+            bool iterMoved = false;
+            for (int c = 0; c < candCnt; c = c + 1) {
+                int id = candIds[c];
+                int p3 = id * 3;
+                int m9 = id * 9;
+                float s = this.instScale[id];
+                float invS = this.instInvScale[id];
+                float px = this.instPos[p3 + 0]; float py = this.instPos[p3 + 1]; float pz = this.instPos[p3 + 2];
+                float[] rm = this.instRotMat;
+
+                float r0x = (cur0.X - px) * invS; float r0y = (cur0.Y - py) * invS; float r0z = (cur0.Z - pz) * invS;
+                float r1x = (cur1.X - px) * invS; float r1y = (cur1.Y - py) * invS; float r1z = (cur1.Z - pz) * invS;
+
+                Vector3 lp0 = new Vector3(
+                    rm[m9 + 0] * r0x + rm[m9 + 1] * r0y + rm[m9 + 2] * r0z,
+                    rm[m9 + 3] * r0x + rm[m9 + 4] * r0y + rm[m9 + 5] * r0z,
+                    rm[m9 + 6] * r0x + rm[m9 + 7] * r0y + rm[m9 + 8] * r0z);
+                Vector3 lp1 = new Vector3(
+                    rm[m9 + 0] * r1x + rm[m9 + 1] * r1y + rm[m9 + 2] * r1z,
+                    rm[m9 + 3] * r1x + rm[m9 + 4] * r1y + rm[m9 + 5] * r1z,
+                    rm[m9 + 6] * r1x + rm[m9 + 7] * r1y + rm[m9 + 8] * r1z);
+
+                Vector3 lPush;
+                if (this.instBlas[id].OverlapCapsuleDepenetrate(lp0, lp1, radius * invS, null, out lPush)) {
+                    Vector3 wPush = new Vector3(
+                        (rm[m9 + 0] * lPush.X + rm[m9 + 3] * lPush.Y + rm[m9 + 6] * lPush.Z) * s,
+                        (rm[m9 + 1] * lPush.X + rm[m9 + 4] * lPush.Y + rm[m9 + 7] * lPush.Z) * s,
+                        (rm[m9 + 2] * lPush.X + rm[m9 + 5] * lPush.Y + rm[m9 + 8] * lPush.Z) * s);
+                    cur0 = Vector3.Add(cur0, wPush);
+                    cur1 = Vector3.Add(cur1, wPush);
+                    totalPushOut = Vector3.Add(totalPushOut, wPush);
+                    anyPushed = true;
+                    iterMoved = true;
+                }
+            }
+            if (!iterMoved) { break; }
+        }
+        return anyPushed;
+    }
+
+    // 供爆炸冲击波、区域触发器或载具广义裁剪查询重叠实例句柄。
+    public int QueryAabbInstances(Vector3 minCorner, Vector3 maxCorner, int layerMask, List<int> outInstanceIds) {
+        if (outInstanceIds != null) { outInstanceIds.Clear(); }
+        this.EnsureReady();
+        if (this.qNodeCount <= 0 || layerMask == 0) { return 0; }
+
+        [64]int stack = new InlineArray<64, int>();
+        int sp = 0;
+        stack[sp] = 0;
+        sp = sp + 1;
+
+        Vec<4, float> qMinX = Vec<4, float>.Splat(minCorner.X);
+        Vec<4, float> qMinY = Vec<4, float>.Splat(minCorner.Y);
+        Vec<4, float> qMinZ = Vec<4, float>.Splat(minCorner.Z);
+        Vec<4, float> qMaxX = Vec<4, float>.Splat(maxCorner.X);
+        Vec<4, float> qMaxY = Vec<4, float>.Splat(maxCorner.Y);
+        Vec<4, float> qMaxZ = Vec<4, float>.Splat(maxCorner.Z);
+
+        int found = 0;
+        while (sp > 0) {
+            sp = sp - 1;
+            int r = stack[sp];
+            if (r < 0) {
+                int lid = -2 - r;
+                int first = this.leafFirst[lid];
+                int end = first + this.leafCount[lid];
+                for (int s = first; s < end; s = s + 1) {
+                    int id = this.leafInstances[s];
+                    if (this.instState[id] != (byte)2 || (this.instLayers[id] & layerMask) == 0) { continue; }
+                    int b = id * 6;
+                    if (this.tightBounds[b + 3] < minCorner.X || this.tightBounds[b + 0] > maxCorner.X ||
+                        this.tightBounds[b + 4] < minCorner.Y || this.tightBounds[b + 1] > maxCorner.Y ||
+                        this.tightBounds[b + 5] < minCorner.Z || this.tightBounds[b + 2] > maxCorner.Z) {
+                        continue;
+                    }
+                    if (outInstanceIds != null) { outInstanceIds.Add(id); }
+                    found = found + 1;
+                }
+            } else {
+                int qb = r * 24;
+                int qc = r * 4;
+                Vec<4, float> bMinX = Vec<4, float>.Load(this.qBounds, qb + 0);
+                Vec<4, float> bMinY = Vec<4, float>.Load(this.qBounds, qb + 4);
+                Vec<4, float> bMinZ = Vec<4, float>.Load(this.qBounds, qb + 8);
+                Vec<4, float> bMaxX = Vec<4, float>.Load(this.qBounds, qb + 12);
+                Vec<4, float> bMaxY = Vec<4, float>.Load(this.qBounds, qb + 16);
+                Vec<4, float> bMaxZ = Vec<4, float>.Load(this.qBounds, qb + 20);
+
+                for (int k = 0; k < 4; k = k + 1) {
+                    int child = this.qChildren[qc + k];
+                    if (child == -1) { continue; }
+                    if (bMaxX[k] >= qMinX[k] && bMinX[k] <= qMaxX[k] &&
+                        bMaxY[k] >= qMinY[k] && bMinY[k] <= qMaxY[k] &&
+                        bMaxZ[k] >= qMinZ[k] && bMinZ[k] <= qMaxZ[k]) {
+                        if (sp < 64) { stack[sp] = child; sp = sp + 1; }
+                    }
+                }
+            }
+        }
+        return found;
+    }
+
+    private int CollectOverlappingInstances(float minX, float minY, float minZ,
+                                            float maxX, float maxY, float maxZ,
+                                            int layerMask, ref [32]int outBuf, int maxOut) {
+        [64]int stack = new InlineArray<64, int>();
+        int sp = 0;
+        stack[sp] = 0;
+        sp = sp + 1;
+        int count = 0;
+
+        while (sp > 0 && count < maxOut) {
+            sp = sp - 1;
+            int r = stack[sp];
+            if (r < 0) {
+                int lid = -2 - r;
+                int first = this.leafFirst[lid];
+                int end = first + this.leafCount[lid];
+                for (int s = first; s < end; s = s + 1) {
+                    int id = this.leafInstances[s];
+                    if (this.instState[id] != (byte)2 || (this.instLayers[id] & layerMask) == 0) { continue; }
+                    int b = id * 6;
+                    if (this.tightBounds[b + 3] < minX || this.tightBounds[b + 0] > maxX ||
+                        this.tightBounds[b + 4] < minY || this.tightBounds[b + 1] > maxY ||
+                        this.tightBounds[b + 5] < minZ || this.tightBounds[b + 2] > maxZ) {
+                        continue;
+                    }
+                    outBuf[count] = id;
+                    count = count + 1;
+                    if (count >= maxOut) { break; }
+                }
+            } else {
+                int qb = r * 24;
+                int qc = r * 4;
+                for (int k = 0; k < 4; k = k + 1) {
+                    int child = this.qChildren[qc + k];
+                    if (child == -1) { continue; }
+                    if (this.qBounds[qb + 12 + k] >= minX && this.qBounds[qb + 0 + k] <= maxX &&
+                        this.qBounds[qb + 16 + k] >= minY && this.qBounds[qb + 4 + k] <= maxY &&
+                        this.qBounds[qb + 20 + k] >= minZ && this.qBounds[qb + 8 + k] <= maxZ) {
+                        if (sp < 64) { stack[sp] = child; sp = sp + 1; }
+                    }
+                }
+            }
+        }
+        return count;
+    }
+}

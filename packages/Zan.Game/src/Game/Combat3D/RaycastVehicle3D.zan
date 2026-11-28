@@ -1,0 +1,514 @@
+using System;
+using System.Numerics;
+
+namespace Game.Combat3D;
+
+// 6-DOF 载具单帧操控输入（值类型，支持客户端预测与权威物理回滚）。
+public struct VehicleInput3D {
+    public float Throttle;   // [-1..+1]：>0 前进油门，<0 倒车油门
+    public float Steer;      // [-1..+1]：>0 向右打方向盘，<0 向左打方向盘
+    public float Brake;      // [0..1]：脚刹制动强度
+    public bool Handbrake;   // 手刹抱死后轮（触发可控甩尾漂移）
+}
+
+// 单个车轮的几何挂载与悬挂物理参数。
+public struct WheelConfig3D {
+    public Vector3 LocalMountPoint;   // 悬挂上锚点（车体局部空间：+X 右，+Y 上，-Z 前）
+    public float SuspensionRestLength;
+    public float MaxSuspensionTravel;
+    public float WheelRadius;
+    public float SpringStiffness;     // 胡克弹簧刚度 (N/m)
+    public float DamperCompression;   // 压缩阻尼系数 (N·s/m)
+    public float DamperRelaxation;    // 回弹阻尼系数 (N·s/m)
+    public bool IsSteerable;
+    public bool IsDriven;
+    public bool HasHandbrake;
+}
+
+// 单个车轮的实时物理遥测与视觉姿态输出（供车轮网格绑定、胎烟粒子与轮胎抓地音效读取）。
+public struct WheelState3D {
+    public bool IsGrounded;
+    public float Compression;         // 悬挂当前压缩量 (m)
+    public float SuspensionLength;    // 当前弹簧实际长度 (m)
+    public float NormalForce;         // 地面法向支撑力 (N)
+    public float SteerAngleRadians;   // 当前转向角 (rad)
+    public float SpinAngleRadians;    // 车轮滚动累计角 (rad)
+    public float SkidSlipRatio;       // [0..1+] 轮胎突破摩擦圆打滑比（>0.25 可触发胎痕/胎烟）
+    public Vector3 WorldWheelCenter;  // 车轮轮毂世界空间中心坐标
+    public Vector3 ContactPoint;
+    public Vector3 ContactNormal;
+    public int GroundInstanceId;
+    public int GroundMaterialId;
+}
+
+// 工业级六自由度射线悬挂载具动力学控制器（对标 Bullet btRaycastVehicle / Jolt WheeledVehicleController）：
+// - 车体坐标系约定：右手系局部 +X 右、+Y 上、-Z 正前（与 Camera3D / glTF 严格一致）
+// - 胡克弹簧 + 压缩/回弹非对称阻尼射线悬挂 + 防侧翻力臂折减（RollInfluence）
+// - 纵向驱动/制动冲量 + 横向侧偏刚度 + 手刹后轮降附着漂移 + 库仑摩擦椭圆限幅（Friction Circle）
+// - 底盘胶囊体连续扫掠防穿墙（Anti-Tunneling Sweep）+ 可选自动同步自身 TLAS 车壳碰撞体（支持站车顶作战与移动掩体）
+public class RaycastVehicle3D {
+    // 刚体质量与底盘几何尺寸
+    public float Mass;
+    public Vector3 ChassisDimensions; // (widthX, heightY, lengthZ)
+    public Vector3 CenterOfMassOffset;
+    public float Gravity;
+    public float LinearDrag;
+    public float AngularDamping;
+
+    // 动力总成与操控调校参数
+    public float EngineForce;         // 驱动总推力 (N)
+    public float BrakeForce;          // 脚刹总制动力 (N)
+    public float HandbrakeForce;      // 手刹锁死制动力 (N)
+    public float MaxForwardSpeed;     // 最高前进车速 (m/s)
+    public float MaxReverseSpeed;     // 最高倒车车速 (m/s)
+    public float MaxSteerAngleRadians;
+    public float HighSpeedSteerFactor;// 高速转向衰减系数 [0.2..1.0]，防止高速急打方向翻车
+    public float SteeringSpeed;       // 方向盘回正/转向角速率 (rad/s)
+    public float TireFriction;        // 综合轮胎摩擦系数 mu
+    public float LateralGrip;         // 横向抓地消除率 [0..1]
+    public float HandbrakeRearGrip;   // 拉手刹时后轮横向抓地保留率（默认 0.30 形成顺滑甩尾）
+    public float RollInfluence;       // 侧倾力矩影响因子 [0..1]（越小越不易在急弯侧翻）
+    public float MaxSuspensionForce;
+
+    // 可选：该载具自身在 DynamicSceneTlas3D 中注册的车壳实例 ID（>=0 时自动屏蔽自碰撞并在帧末同步位姿与速度）
+    public int SelfTlasInstanceId;
+
+    // 6-DOF 实时物理状态
+    public Vector3 Position;
+    public Quaternion Rotation;
+    public Vector3 LinearVelocity;
+    public Vector3 AngularVelocity;
+    public float CurrentSteerAngle;
+
+    private float invMass;
+    private Vector3 invLocalInertia;
+
+    private WheelConfig3D[] wheelConfigs;
+    private WheelState3D[] wheelStates;
+    private int wheelCount;
+    private int drivenWheelCount;
+
+    public RaycastVehicle3D() : this(1500.0f, new Vector3(1.90f, 1.45f, 4.40f)) {
+    }
+
+    public RaycastVehicle3D(float massKg, Vector3 chassisDimensions) {
+        this.Mass = massKg > 20.0f ? massKg : 1500.0f;
+        this.ChassisDimensions = new Vector3(
+            Math.Max(0.6f, chassisDimensions.X),
+            Math.Max(0.4f, chassisDimensions.Y),
+            Math.Max(1.0f, chassisDimensions.Z));
+        this.CenterOfMassOffset = new Vector3(0.0f, -0.20f, 0.0f);
+        this.Gravity = 9.81f;
+        this.LinearDrag = 0.08f;
+        this.AngularDamping = 2.2f;
+
+        this.EngineForce = 13500.0f;
+        this.BrakeForce = 18000.0f;
+        this.HandbrakeForce = 22000.0f;
+        this.MaxForwardSpeed = 38.0f;
+        this.MaxReverseSpeed = 14.0f;
+        this.MaxSteerAngleRadians = 0.58f;
+        this.HighSpeedSteerFactor = 0.35f;
+        this.SteeringSpeed = 4.5f;
+        this.TireFriction = 1.35f;
+        this.LateralGrip = 0.82f;
+        this.HandbrakeRearGrip = 0.28f;
+        this.RollInfluence = 0.25f;
+        this.MaxSuspensionForce = massKg * 45.0f;
+        this.SelfTlasInstanceId = -1;
+
+        this.Position = Vector3.Zero;
+        this.Rotation = Quaternion.Identity;
+        this.LinearVelocity = Vector3.Zero;
+        this.AngularVelocity = Vector3.Zero;
+        this.CurrentSteerAngle = 0.0f;
+
+        this.wheelConfigs = new WheelConfig3D[8];
+        this.wheelStates = new WheelState3D[8];
+        this.wheelCount = 0;
+        this.drivenWheelCount = 0;
+        this.RecomputeMassProperties();
+    }
+
+    // 根据刚体盒尺寸重算逆质量与主轴逆转动惯量张量。
+    public void RecomputeMassProperties() {
+        float m = Math.Max(20.0f, this.Mass);
+        this.Mass = m;
+        this.invMass = 1.0f / m;
+        float wx = this.ChassisDimensions.X;
+        float hy = this.ChassisDimensions.Y;
+        float lz = this.ChassisDimensions.Z;
+        float ix = (m / 12.0f) * (hy * hy + lz * lz);
+        float iy = (m / 12.0f) * (wx * wx + lz * lz);
+        float iz = (m / 12.0f) * (wx * wx + hy * hy);
+        this.invLocalInertia = new Vector3(1.0f / ix, 1.0f / iy, 1.0f / iz);
+    }
+
+    public int WheelCount() { return this.wheelCount; }
+
+    public WheelState3D GetWheelState(int index) {
+        if (index < 0 || index >= this.wheelCount) { return new WheelState3D(); }
+        return this.wheelStates[index];
+    }
+
+    public int GroundedWheelCount() {
+        int c = 0;
+        for (int i = 0; i < this.wheelCount; i = i + 1) {
+            if (this.wheelStates[i].IsGrounded) { c = c + 1; }
+        }
+        return c;
+    }
+
+    // 当前车体正前向速度分量（m/s，前进为正，倒车为负）。
+    public float ForwardSpeed() {
+        Vector3 fwd = Quaternion.Rotate(new Vector3(0.0f, 0.0f, -1.0f), this.Rotation);
+        return Vector3.Dot(this.LinearVelocity, fwd);
+    }
+
+    public int AddWheel(WheelConfig3D config) {
+        if (this.wheelCount >= this.wheelConfigs.Length) {
+            int nCap = this.wheelConfigs.Length * 2;
+            WheelConfig3D[] nc = new WheelConfig3D[nCap];
+            WheelState3D[] ns = new WheelState3D[nCap];
+            Array.Copy(this.wheelConfigs, 0, nc, 0, this.wheelCount);
+            Array.Copy(this.wheelStates, 0, ns, 0, this.wheelCount);
+            this.wheelConfigs = nc;
+            this.wheelStates = ns;
+        }
+        int id = this.wheelCount;
+        this.wheelCount = id + 1;
+        this.wheelConfigs[id] = config;
+        WheelState3D st = new WheelState3D();
+        st.SuspensionLength = config.SuspensionRestLength;
+        st.GroundInstanceId = -1;
+        this.wheelStates[id] = st;
+        if (config.IsDriven) {
+            this.drivenWheelCount = this.drivenWheelCount + 1;
+        }
+        return id;
+    }
+
+    // 一键配置标准四驱战术越野车/装甲车悬挂布局（前轮转向 + 四轮驱动 + 后轮手刹）。
+    public static RaycastVehicle3D CreateStandard4Wheel(float massKg, Vector3 chassisDims, float wheelRadius, float restLen) {
+        RaycastVehicle3D v = new RaycastVehicle3D(massKg, chassisDims);
+        float halfTrack = chassisDims.X * 0.46f;
+        float halfWheelbase = chassisDims.Z * 0.36f;
+        float mountY = -chassisDims.Y * 0.25f;
+        float kSpring = massKg * 28.0f;
+        float cComp = 2.0f * MathF.Sqrt(kSpring * (massKg * 0.25f)) * 0.38f;
+        float cRelax = 2.0f * MathF.Sqrt(kSpring * (massKg * 0.25f)) * 0.48f;
+
+        for (int i = 0; i < 4; i = i + 1) {
+            bool isFront = i < 2;
+            bool isRight = (i & 1) == 1;
+            WheelConfig3D wc = new WheelConfig3D();
+            wc.LocalMountPoint = new Vector3(
+                isRight ? halfTrack : -halfTrack,
+                mountY,
+                isFront ? -halfWheelbase : halfWheelbase);
+            wc.SuspensionRestLength = restLen;
+            wc.MaxSuspensionTravel = restLen * 0.55f;
+            wc.WheelRadius = wheelRadius;
+            wc.SpringStiffness = kSpring;
+            wc.DamperCompression = cComp;
+            wc.DamperRelaxation = cRelax;
+            wc.IsSteerable = isFront;
+            wc.IsDriven = true;
+            wc.HasHandbrake = !isFront;
+            v.AddWheel(wc);
+        }
+        return v;
+    }
+
+    // 执行单步 6-DOF 载具动力学积分与底盘连续防穿模扫掠。
+    public void Step(DynamicSceneTlas3D world, int groundLayerMask, VehicleInput3D input, float dt) {
+        if (dt <= 0.0f || dt > 0.1f) {
+            if (dt > 0.1f) { dt = 0.1f; } else { return; }
+        }
+
+        bool restoreSelf = false;
+        if (world != null && this.SelfTlasInstanceId >= 0 && world.IsInstanceEnabled(this.SelfTlasInstanceId)) {
+            world.SetInstanceEnabled(this.SelfTlasInstanceId, false);
+            restoreSelf = true;
+        }
+
+        float throttle = Math.Max(-1.0f, Math.Min(1.0f, input.Throttle));
+        float steerIn = Math.Max(-1.0f, Math.Min(1.0f, input.Steer));
+        float brakeIn = Math.Max(0.0f, Math.Min(1.0f, input.Brake));
+
+        // 1. 车体世界空间正交基与逆转动惯量矩阵 I_world^-1 = R * I_local^-1 * R^T
+        Vector3 cRight = Quaternion.Rotate(new Vector3(1.0f, 0.0f, 0.0f), this.Rotation);
+        Vector3 cUp    = Quaternion.Rotate(new Vector3(0.0f, 1.0f, 0.0f), this.Rotation);
+        Vector3 cFwd   = Quaternion.Rotate(new Vector3(0.0f, 0.0f, -1.0f), this.Rotation);
+        Vector3 worldCom = Vector3.Add(this.Position, Quaternion.Rotate(this.CenterOfMassOffset, this.Rotation));
+
+        // 2. 速度敏感平滑方向盘转向
+        float curSpeed = MathF.Sqrt(this.LinearVelocity.LengthSquared());
+        float speedRatio = Math.Min(1.0f, curSpeed / Math.Max(1.0f, this.MaxForwardSpeed));
+        float steerScale = 1.0f - (1.0f - this.HighSpeedSteerFactor) * speedRatio;
+        float targetSteer = steerIn * this.MaxSteerAngleRadians * steerScale;
+        float maxSteerDelta = this.SteeringSpeed * dt;
+        float steerDiff = targetSteer - this.CurrentSteerAngle;
+        if (Math.Abs(steerDiff) <= maxSteerDelta) {
+            this.CurrentSteerAngle = targetSteer;
+        } else {
+            this.CurrentSteerAngle = this.CurrentSteerAngle + (steerDiff > 0.0f ? maxSteerDelta : -maxSteerDelta);
+        }
+
+        // 3. 施加重力与空气阻力预积分
+        this.LinearVelocity = new Vector3(
+            this.LinearVelocity.X * Math.Max(0.0f, 1.0f - this.LinearDrag * dt),
+            this.LinearVelocity.Y - this.Gravity * dt,
+            this.LinearVelocity.Z * Math.Max(0.0f, 1.0f - this.LinearDrag * dt));
+        float angDamp = Math.Max(0.0f, 1.0f - this.AngularDamping * dt);
+        this.AngularVelocity = Vector3.Multiply(this.AngularVelocity, angDamp);
+
+        // 4. 逐轮发射悬挂射线并解算垂直支撑冲量
+        Vector3 downDir = new Vector3(-cUp.X, -cUp.Y, -cUp.Z);
+        for (int i = 0; i < this.wheelCount; i = i + 1) {
+            WheelConfig3D wc = this.wheelConfigs[i];
+            WheelState3D ws = this.wheelStates[i];
+            ws.SteerAngleRadians = wc.IsSteerable ? this.CurrentSteerAngle : 0.0f;
+
+            Vector3 worldMount = Vector3.Add(this.Position,
+                new Vector3(
+                    cRight.X * wc.LocalMountPoint.X + cUp.X * wc.LocalMountPoint.Y - cFwd.X * wc.LocalMountPoint.Z,
+                    cRight.Y * wc.LocalMountPoint.X + cUp.Y * wc.LocalMountPoint.Y - cFwd.Y * wc.LocalMountPoint.Z,
+                    cRight.Z * wc.LocalMountPoint.X + cUp.Z * wc.LocalMountPoint.Y - cFwd.Z * wc.LocalMountPoint.Z));
+
+            float maxRayLen = wc.SuspensionRestLength + wc.MaxSuspensionTravel + wc.WheelRadius;
+            SceneRayHit3D hit;
+            bool hitGround = false;
+            if (world != null && groundLayerMask != 0) {
+                hitGround = world.RaycastUnitDir(worldMount, downDir.X, downDir.Y, downDir.Z, maxRayLen, groundLayerMask, false, out hit);
+            } else {
+                hit = new SceneRayHit3D();
+            }
+
+            if (hitGround && Vector3.Dot(hit.Normal, cUp) > 0.25f) {
+                float curSuspLen = Math.Max(0.0f, hit.Distance - wc.WheelRadius);
+                float minLen = Math.Max(0.02f, wc.SuspensionRestLength - wc.MaxSuspensionTravel);
+                if (curSuspLen < minLen) { curSuspLen = minLen; }
+
+                float compression = wc.SuspensionRestLength - curSuspLen;
+                Vector3 groundVel = world.GetInstancePointVelocity(hit.InstanceId, hit.Point);
+                Vector3 wheelPointVel = this.GetPointVelocity(hit.Point, worldCom);
+                Vector3 relVel = Vector3.Subtract(wheelPointVel, groundVel);
+
+                float normalAlignment = Math.Max(0.35f, Vector3.Dot(hit.Normal, cUp));
+                float projVel = Vector3.Dot(hit.Normal, relVel);
+                float suspVel = -projVel / normalAlignment;
+                float damp = suspVel >= 0.0f ? wc.DamperCompression : wc.DamperRelaxation;
+
+                float force = wc.SpringStiffness * compression + damp * suspVel;
+                if (force < 0.0f) { force = 0.0f; }
+                if (force > this.MaxSuspensionForce) { force = this.MaxSuspensionForce; }
+
+                ws.IsGrounded = true;
+                ws.Compression = compression;
+                ws.SuspensionLength = curSuspLen;
+                ws.NormalForce = force;
+                ws.ContactPoint = hit.Point;
+                ws.ContactNormal = hit.Normal;
+                ws.GroundInstanceId = hit.InstanceId;
+                ws.GroundMaterialId = hit.MaterialId;
+                ws.WorldWheelCenter = Vector3.Add(worldMount, Vector3.Multiply(downDir, curSuspLen));
+
+                if (force > 0.0f) {
+                    Vector3 suspImpulse = Vector3.Multiply(hit.Normal, force * dt);
+                    Vector3 forcePoint = this.ComputeRollAdjustedPoint(hit.Point, worldCom, cUp);
+                    this.ApplyWorldImpulse(suspImpulse, forcePoint, worldCom, cRight, cUp, cFwd);
+                }
+            } else {
+                ws.IsGrounded = false;
+                ws.Compression = 0.0f;
+                ws.SuspensionLength = wc.SuspensionRestLength;
+                ws.NormalForce = 0.0f;
+                ws.SkidSlipRatio = 0.0f;
+                ws.GroundInstanceId = -1;
+                ws.WorldWheelCenter = Vector3.Add(worldMount, Vector3.Multiply(downDir, wc.SuspensionRestLength));
+            }
+            this.wheelStates[i] = ws;
+        }
+
+        // 5. 逐轮解算纵向驱动/刹车冲量与横向侧滑摩擦椭圆
+        float perWheelDrive = this.drivenWheelCount > 0 ? (this.EngineForce / (float)this.drivenWheelCount) : 0.0f;
+        float perWheelBrake = this.wheelCount > 0 ? (this.BrakeForce / (float)this.wheelCount) : 0.0f;
+
+        for (int i = 0; i < this.wheelCount; i = i + 1) {
+            WheelConfig3D wc = this.wheelConfigs[i];
+            WheelState3D ws = this.wheelStates[i];
+            if (!ws.IsGrounded) {
+                ws.SpinAngleRadians = ws.SpinAngleRadians + (this.ForwardSpeed() / Math.Max(0.1f, wc.WheelRadius)) * dt;
+                this.wheelStates[i] = ws;
+                continue;
+            }
+
+            float sa = ws.SteerAngleRadians;
+            float ca = (float)Math.Cos((double)sa);
+            float sna = (float)Math.Sin((double)sa);
+
+            // 局部转向轮前向 (sin, 0, -cos)，变换到世界空间：cRight * sin + cFwd * cos
+            Vector3 wFwdRaw = new Vector3(
+                cRight.X * sna + cFwd.X * ca,
+                cRight.Y * sna + cFwd.Y * ca,
+                cRight.Z * sna + cFwd.Z * ca);
+            Vector3 nrm = ws.ContactNormal;
+            Vector3 wRight = Vector3.Cross(wFwdRaw, nrm);
+            float wrLenSq = wRight.LengthSquared();
+            if (wrLenSq <= 1e-8f) { continue; }
+            wRight = Vector3.Multiply(wRight, 1.0f / MathF.Sqrt(wrLenSq));
+            Vector3 wFwd = Vector3.Cross(nrm, wRight);
+
+            Vector3 groundVel = world != null ? world.GetInstancePointVelocity(ws.GroundInstanceId, ws.ContactPoint) : Vector3.Zero;
+            Vector3 contactVel = Vector3.Subtract(this.GetPointVelocity(ws.ContactPoint, worldCom), groundVel);
+            float vLong = Vector3.Dot(contactVel, wFwd);
+            float vLat  = Vector3.Dot(contactVel, wRight);
+
+            float jLong = 0.0f;
+            if (wc.IsDriven && Math.Abs(throttle) > 1e-3f) {
+                bool allowTorque = (throttle > 0.0f && vLong < this.MaxForwardSpeed) ||
+                                   (throttle < 0.0f && vLong > -this.MaxReverseSpeed);
+                if (allowTorque) {
+                    float taper = throttle > 0.0f
+                        ? Math.Max(0.0f, 1.0f - Math.Max(0.0f, vLong) / Math.Max(1.0f, this.MaxForwardSpeed))
+                        : Math.Max(0.0f, 1.0f - Math.Max(0.0f, -vLong) / Math.Max(1.0f, this.MaxReverseSpeed));
+                    jLong = jLong + throttle * perWheelDrive * (0.35f + 0.65f * taper) * dt;
+                }
+            }
+
+            float brakeStrength = brakeIn * perWheelBrake;
+            if (input.Handbrake && wc.HasHandbrake) {
+                brakeStrength = Math.Max(brakeStrength, this.HandbrakeForce * 0.5f);
+            }
+            if (brakeStrength > 0.0f) {
+                float maxStopImpulse = Math.Abs(vLong) * (this.Mass / (float)Math.Max(1, this.wheelCount));
+                float bImp = Math.Min(brakeStrength * dt, maxStopImpulse);
+                jLong = jLong + (vLong >= 0.0f ? -bImp : bImp);
+            }
+
+            Vector3 forcePt = this.ComputeRollAdjustedPoint(ws.ContactPoint, worldCom, cUp);
+            float effMassLat = this.ComputeEffectiveMassAlong(forcePt, worldCom, wRight, cRight, cUp, cFwd);
+            float grip = (input.Handbrake && wc.HasHandbrake) ? this.HandbrakeRearGrip : this.LateralGrip;
+            float jLat = -vLat * effMassLat * grip;
+
+            // 库仑摩擦圆限幅：sqrt(jLong^2 + jLat^2) <= mu * Fn * dt
+            float maxFrictionImpulse = Math.Max(0.0f, this.TireFriction * ws.NormalForce * dt);
+            float totalImpSq = jLong * jLong + jLat * jLat;
+            if (totalImpSq > maxFrictionImpulse * maxFrictionImpulse && totalImpSq > 1e-12f) {
+                float totalImp = MathF.Sqrt(totalImpSq);
+                float clampScale = maxFrictionImpulse / totalImp;
+                ws.SkidSlipRatio = Math.Min(2.0f, (totalImp - maxFrictionImpulse) / Math.Max(1.0f, maxFrictionImpulse));
+                jLong = jLong * clampScale;
+                jLat = jLat * clampScale;
+            } else {
+                ws.SkidSlipRatio = (input.Handbrake && wc.HasHandbrake && Math.Abs(vLat) > 1.5f) ? 0.6f : 0.0f;
+            }
+
+            Vector3 tireImpulse = new Vector3(
+                wFwd.X * jLong + wRight.X * jLat,
+                wFwd.Y * jLong + wRight.Y * jLat,
+                wFwd.Z * jLong + wRight.Z * jLat);
+            this.ApplyWorldImpulse(tireImpulse, forcePt, worldCom, cRight, cUp, cFwd);
+
+            float rollSpeed = (input.Handbrake && wc.HasHandbrake) ? 0.0f : vLong;
+            ws.SpinAngleRadians = ws.SpinAngleRadians + (rollSpeed / Math.Max(0.1f, wc.WheelRadius)) * dt;
+            this.wheelStates[i] = ws;
+        }
+
+        // 6. 底盘胶囊连续防穿墙扫掠（保护高速撞击混凝土护栏/建筑立面不穿模）
+        Vector3 moveDelta = Vector3.Multiply(this.LinearVelocity, dt);
+        if (world != null && groundLayerMask != 0 && moveDelta.LengthSquared() > 1e-10f) {
+            float capRadius = Math.Min(this.ChassisDimensions.X, this.ChassisDimensions.Y) * 0.42f;
+            float halfSeg = Math.Max(0.05f, this.ChassisDimensions.Z * 0.5f - capRadius);
+            Vector3 chCenter = Vector3.Add(this.Position, Vector3.Multiply(cUp, this.ChassisDimensions.Y * 0.28f));
+            Vector3 p0 = Vector3.Subtract(chCenter, Vector3.Multiply(cFwd, halfSeg));
+            Vector3 p1 = Vector3.Add(chCenter, Vector3.Multiply(cFwd, halfSeg));
+
+            SceneSweepHit3D bodyHit;
+            if (world.SweepCapsule(p0, p1, capRadius, moveDelta, groundLayerMask, out bodyHit)) {
+                float moveLen = MathF.Sqrt(moveDelta.LengthSquared());
+                float safeDist = Math.Max(0.0f, bodyHit.Distance - 0.01f);
+                float frac = moveLen > 1e-6f ? (safeDist / moveLen) : 0.0f;
+                this.Position = Vector3.Add(this.Position, Vector3.Multiply(moveDelta, frac));
+
+                float vn = Vector3.Dot(this.LinearVelocity, bodyHit.Normal);
+                if (vn < 0.0f) {
+                    // 15% 弹性反弹 + 沿墙切向摩擦衰减
+                    this.LinearVelocity = Vector3.Subtract(this.LinearVelocity, Vector3.Multiply(bodyHit.Normal, vn * 1.15f));
+                    this.LinearVelocity = Vector3.Multiply(this.LinearVelocity, 0.88f);
+                }
+            } else {
+                this.Position = Vector3.Add(this.Position, moveDelta);
+            }
+        } else {
+            this.Position = Vector3.Add(this.Position, moveDelta);
+        }
+
+        // 7. 四元数角速度积分（一阶指数映射并重新正交归一化）
+        float wLenSq = this.AngularVelocity.LengthSquared();
+        if (wLenSq > 1e-12f) {
+            float wLen = MathF.Sqrt(wLenSq);
+            float halfTheta = wLen * dt * 0.5f;
+            float s = (float)Math.Sin((double)halfTheta) / wLen;
+            Quaternion dq = new Quaternion(
+                this.AngularVelocity.X * s,
+                this.AngularVelocity.Y * s,
+                this.AngularVelocity.Z * s,
+                (float)Math.Cos((double)halfTheta));
+            Quaternion nextQ = Quaternion.Multiply(dq, this.Rotation);
+            float qLen = MathF.Sqrt(nextQ.X * nextQ.X + nextQ.Y * nextQ.Y + nextQ.Z * nextQ.Z + nextQ.W * nextQ.W);
+            if (qLen > 1e-8f) {
+                float invQ = 1.0f / qLen;
+                this.Rotation = new Quaternion(nextQ.X * invQ, nextQ.Y * invQ, nextQ.Z * invQ, nextQ.W * invQ);
+            }
+        }
+
+        if (restoreSelf) {
+            world.SetInstanceEnabled(this.SelfTlasInstanceId, true);
+            world.SetInstanceTransform(this.SelfTlasInstanceId, this.Position, this.Rotation, 1.0f);
+            world.SetInstanceVelocity(this.SelfTlasInstanceId, this.LinearVelocity, this.AngularVelocity);
+        }
+    }
+
+    private Vector3 GetPointVelocity(Vector3 worldPt, Vector3 worldCom) {
+        Vector3 r = Vector3.Subtract(worldPt, worldCom);
+        return Vector3.Add(this.LinearVelocity, Vector3.Cross(this.AngularVelocity, r));
+    }
+
+    private Vector3 ComputeRollAdjustedPoint(Vector3 contactPt, Vector3 worldCom, Vector3 chassisUp) {
+        Vector3 rel = Vector3.Subtract(contactPt, worldCom);
+        float upProj = Vector3.Dot(rel, chassisUp);
+        Vector3 reducedRel = Vector3.Subtract(rel, Vector3.Multiply(chassisUp, upProj * (1.0f - this.RollInfluence)));
+        return Vector3.Add(worldCom, reducedRel);
+    }
+
+    private Vector3 MultiplyInvInertiaWorld(Vector3 worldVec, Vector3 cRight, Vector3 cUp, Vector3 cFwd) {
+        // R 列向量为 [cRight, cUp, -cFwd]
+        Vector3 col2 = new Vector3(-cFwd.X, -cFwd.Y, -cFwd.Z);
+        float lx = Vector3.Dot(cRight, worldVec) * this.invLocalInertia.X;
+        float ly = Vector3.Dot(cUp, worldVec) * this.invLocalInertia.Y;
+        float lz = Vector3.Dot(col2, worldVec) * this.invLocalInertia.Z;
+        return new Vector3(
+            cRight.X * lx + cUp.X * ly + col2.X * lz,
+            cRight.Y * lx + cUp.Y * ly + col2.Y * lz,
+            cRight.Z * lx + cUp.Z * ly + col2.Z * lz);
+    }
+
+    private float ComputeEffectiveMassAlong(Vector3 worldPt, Vector3 worldCom, Vector3 dir,
+                                            Vector3 cRight, Vector3 cUp, Vector3 cFwd) {
+        Vector3 r = Vector3.Subtract(worldPt, worldCom);
+        Vector3 rCrossD = Vector3.Cross(r, dir);
+        Vector3 iInvRCrossD = this.MultiplyInvInertiaWorld(rCrossD, cRight, cUp, cFwd);
+        float denom = this.invMass + Vector3.Dot(Vector3.Cross(iInvRCrossD, r), dir);
+        return denom > 1e-6f ? (1.0f / denom) : this.Mass;
+    }
+
+    private void ApplyWorldImpulse(Vector3 impulse, Vector3 worldPt, Vector3 worldCom,
+                                   Vector3 cRight, Vector3 cUp, Vector3 cFwd) {
+        this.LinearVelocity = Vector3.Add(this.LinearVelocity, Vector3.Multiply(impulse, this.invMass));
+        Vector3 torqueImp = Vector3.Cross(Vector3.Subtract(worldPt, worldCom), impulse);
+        this.AngularVelocity = Vector3.Add(this.AngularVelocity,
+            this.MultiplyInvInertiaWorld(torqueImp, cRight, cUp, cFwd));
+    }
+}

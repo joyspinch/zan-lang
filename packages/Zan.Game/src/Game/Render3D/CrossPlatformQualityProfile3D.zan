@@ -1,0 +1,131 @@
+using System;
+
+namespace Game.Render3D;
+
+// 跨平台 3D 设备渲染档位（覆盖桌面 GL 3.3、移动端 GLES 3.0 与 OpenHarmony）。
+public enum RenderDeviceTier3D {
+    DesktopHigh = 0,
+    DesktopBalanced = 1,
+    LaptopIntegrated = 2,
+    MobileHigh = 3,
+    MobileLow = 4,
+    HarmonyHandheld = 5
+}
+
+// 统一跨平台 3D 渲染画质预算快照。
+public class RenderQualityBudget3D {
+    public RenderDeviceTier3D Tier;
+    public string GlslDialect;
+    public float RenderScale;
+    public float MinRenderScale;
+    public float MaxRenderScale;
+    public int ShadowMapSize;
+    public int MaxDynamicLights;
+    public int MsaaSamples;
+    public float TargetFrameMs;
+    public bool PostProcessEnabled;
+
+    public RenderQualityBudget3D(RenderDeviceTier3D tier, string glslDialect,
+    float renderScale, float minScale, float maxScale, int shadowMapSize,
+    int maxDynamicLights, int msaaSamples, float targetFrameMs, bool postProcessEnabled) {
+        this.Tier = tier;
+        this.GlslDialect = glslDialect;
+        this.RenderScale = renderScale;
+        this.MinRenderScale = minScale;
+        this.MaxRenderScale = maxScale;
+        this.ShadowMapSize = shadowMapSize;
+        this.MaxDynamicLights = maxDynamicLights;
+        this.MsaaSamples = msaaSamples;
+        this.TargetFrameMs = targetFrameMs;
+        this.PostProcessEnabled = postProcessEnabled;
+    }
+}
+
+// 跨平台 3D 画质档位管理与动态分辨率缩放（DRS）闭环控制器：
+// - 自动识别当前运行平台（先判 OHOS/Android/iOS 再判 Windows/macOS/Linux）；
+// - 连续过载帧自动下调渲染比例，帧耗宽裕后平滑回升，避免跨平台硬件掉帧抖动。
+public class CrossPlatformQualityProfile3D {
+    private RenderQualityBudget3D budget;
+    private int consecutiveOverBudget;
+    private int consecutiveHeadroom;
+    private int downTriggerFrames;
+    private int upTriggerFrames;
+    private float scaleStep;
+
+    public CrossPlatformQualityProfile3D(RenderDeviceTier3D tier) {
+        this.budget = BuildPreset(tier);
+        this.consecutiveOverBudget = 0;
+        this.consecutiveHeadroom = 0;
+        this.downTriggerFrames = 2;
+        this.upTriggerFrames = 3;
+        this.scaleStep = 0.10f;
+    }
+
+    public RenderQualityBudget3D CurrentBudget {
+        get { return this.budget; }
+    }
+
+    public static RenderDeviceTier3D DetectDefaultTier() {
+        if (OperatingSystem.IsOhos()) { return RenderDeviceTier3D.HarmonyHandheld; }
+        if (OperatingSystem.IsAndroid() || OperatingSystem.IsIos()) { return RenderDeviceTier3D.MobileHigh; }
+        if (OperatingSystem.IsMacOS()) { return RenderDeviceTier3D.DesktopBalanced; }
+        if (OperatingSystem.IsWindows() || OperatingSystem.IsLinux()) { return RenderDeviceTier3D.DesktopHigh; }
+        return RenderDeviceTier3D.DesktopBalanced;
+    }
+
+    public static RenderQualityBudget3D BuildPreset(RenderDeviceTier3D tier) {
+        if (tier == RenderDeviceTier3D.DesktopHigh) {
+            return new RenderQualityBudget3D(tier, "glsl330", 1.0f, 0.70f, 1.0f, 2048, 8, 4, 16.6f, true);
+        }
+        if (tier == RenderDeviceTier3D.DesktopBalanced) {
+            return new RenderQualityBudget3D(tier, "glsl330", 1.0f, 0.65f, 1.0f, 1024, 6, 2, 16.6f, true);
+        }
+        if (tier == RenderDeviceTier3D.LaptopIntegrated) {
+            return new RenderQualityBudget3D(tier, "glsl330", 0.85f, 0.60f, 1.0f, 1024, 4, 0, 16.6f, true);
+        }
+        if (tier == RenderDeviceTier3D.MobileHigh) {
+            return new RenderQualityBudget3D(tier, "gles300", 0.85f, 0.55f, 1.0f, 1024, 4, 0, 16.6f, true);
+        }
+        if (tier == RenderDeviceTier3D.HarmonyHandheld) {
+            return new RenderQualityBudget3D(tier, "gles300", 0.80f, 0.55f, 0.95f, 1024, 4, 0, 16.6f, true);
+        }
+        return new RenderQualityBudget3D(RenderDeviceTier3D.MobileLow, "gles300", 0.65f, 0.50f, 0.85f, 512, 2, 0, 33.3f, false);
+    }
+
+    // 采样单帧 GPU 耗时（毫秒）并返回最新渲染缩放比例（DRS 闭环）。
+    public float SampleGpuFrameMs(float gpuMs) {
+        float target = this.budget.TargetFrameMs;
+        if (gpuMs > target * 1.05f) {
+            this.consecutiveOverBudget = this.consecutiveOverBudget + 1;
+            this.consecutiveHeadroom = 0;
+            if (this.consecutiveOverBudget >= this.downTriggerFrames) {
+                float next = this.budget.RenderScale - this.scaleStep;
+                if (next < this.budget.MinRenderScale) { next = this.budget.MinRenderScale; }
+                this.budget.RenderScale = next;
+                this.consecutiveOverBudget = 0;
+            }
+        } else if (gpuMs < target * 0.72f) {
+            this.consecutiveHeadroom = this.consecutiveHeadroom + 1;
+            this.consecutiveOverBudget = 0;
+            if (this.consecutiveHeadroom >= this.upTriggerFrames) {
+                float next = this.budget.RenderScale + this.scaleStep;
+                if (next > this.budget.MaxRenderScale) { next = this.budget.MaxRenderScale; }
+                this.budget.RenderScale = next;
+                this.consecutiveHeadroom = 0;
+            }
+        } else {
+            this.consecutiveOverBudget = 0;
+            this.consecutiveHeadroom = 0;
+        }
+        return this.budget.RenderScale;
+    }
+
+    // 根据当前 DRS 渲染比例计算有效离屏渲染宽高（保证 8 像素对齐且不低于 64）。
+    public int ScaledDimension(int nativePixels) {
+        if (nativePixels <= 0) { return 64; }
+        int scaled = (int)((float)nativePixels * this.budget.RenderScale + 0.5f);
+        scaled = (scaled / 8) * 8;
+        if (scaled < 64) { scaled = 64; }
+        return scaled;
+    }
+}

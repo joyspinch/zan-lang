@@ -189,6 +189,17 @@ LLVMValueRef emit_hold_call_receiver(zan_irgen_t *g, zan_ast_node_t *object,
 LLVMValueRef emit_call_member_object(zan_irgen_t *g, zan_ast_node_t *member,
                                      local_scope_t *locals, bool async_gate,
                                      LLVMValueRef *borrowed_owner) {
+  zan_type_t *ot = infer_expr_type(g, member->member.object, locals);
+  if (ot && ot->kind == TYPE_STRUCT && !ot->is_nullable &&
+      !is_span_type(ot) && !is_inline_array_type(ot) &&
+      !is_vec_type(ot) &&
+      !(ot->name.len == 7 && memcmp(ot->name.str, "decimal", 7) == 0)) {
+    LLVMValueRef lval = emit_ref_lvalue_ptr(g, member->member.object, locals);
+    if (lval) {
+      *borrowed_owner = NULL;
+      return lval;
+    }
+  }
   LLVMValueRef value = emit_expr(g, member->member.object, locals);
   *borrowed_owner =
       emit_hold_call_receiver(g, member->member.object, value, locals);

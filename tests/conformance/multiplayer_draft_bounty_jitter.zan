@@ -1,0 +1,61 @@
+using System;
+using System.Collections.Generic;
+using Game.Net;
+
+namespace Conf;
+
+class MultiplayerDraftBountyJitterTest {
+    static void Main() {
+        // 1. 排位 BP 交替禁选状态机：顺序校验、被禁英雄不可复选、跨队重复拦截、自然进入 Completed
+        NetHeroDraftSession draft = new NetHeroDraftSession();
+        draft.AddStep(1, DraftPhaseKind.Ban);
+        draft.AddStep(2, DraftPhaseKind.Ban);
+        draft.AddStep(1, DraftPhaseKind.Pick);
+        draft.AddStep(2, DraftPhaseKind.Pick);
+
+        bool ban1 = draft.LockHero(1, 101);
+        bool wrongTeamBlocked = !draft.LockHero(1, 102);
+        bool ban2 = draft.LockHero(2, 102);
+        bool bannedHeroBlocked = !draft.LockHero(1, 101);
+        bool pick1 = draft.LockHero(1, 201);
+        bool dupPickBlocked = !draft.LockHero(2, 201);
+        bool pick2 = draft.LockHero(2, 202);
+        List<int> team1Picks = draft.GetTeamPicks(1);
+
+        bool draftOk = ban1 && wrongTeamBlocked && ban2 && bannedHeroBlocked
+            && pick1 && dupPickBlocked && pick2
+            && draft.CurrentPhase() == DraftPhaseKind.Completed
+            && team1Picks.Count == 1 && team1Picks[0] == 201;
+        Console.WriteLine("net-hero-draft-session: " + Convert.ToString(draftOk ? 1 : 0));
+
+        // 2. 连杀终结与劣势翻盘赏金账本：3 连杀积累 300 赏金，劣势方终结获得 300+300+150=750
+        NetMatchBountyTracker bt = new NetMatchBountyTracker(300, 150, 1000);
+        bt.RecordKill(10, 20, false); // streak 1, shutdown 0
+        bt.RecordKill(10, 21, false); // streak 2, shutdown 150
+        bt.RecordKill(10, 22, false); // streak 3, shutdown 300
+        int comebackPayout = bt.RecordKill(20, 10, true); // 300 base + 300 shutdown + 150 trailing bonus = 750
+        BountyContractRecord victimAfter = bt.EnsurePlayer(10);
+
+        bool bountyOk = comebackPayout == 750 && victimAfter.KillStreak == 0 && victimAfter.ShutdownGold == 0;
+        Console.WriteLine("net-match-bounty-tracker: " + Convert.ToString(bountyOk ? 1 : 0));
+
+        // 3. 客户端快照抖动缓冲：乱序自动升序、重复包过滤、达目标深度开始出队、迟到过旧包计数
+        NetSnapshotJitterBuffer jb = new NetSnapshotJitterBuffer(3);
+        jb.Push(12, 1200);
+        jb.Push(10, 1000);
+        bool notReadyYet = jb.PopNextReady() == null; // 仅 2 帧 < 目标深度 3
+        bool dupDropped = !jb.Push(10, 1000);
+        jb.Push(11, 1100);
+
+        JitterSnapshotFrame f1 = jb.PopNextReady(); // tick 10
+        JitterSnapshotFrame f2 = jb.PopNextReady(); // tick 11
+        bool lateDropped = !jb.Push(10, 1000);      // <= LastPoppedTick(11)
+
+        bool jitterOk = notReadyYet && dupDropped && lateDropped
+            && f1 != null && f1.Tick == 10
+            && f2 != null && f2.Tick == 11
+            && jb.DroppedDuplicateCount == 1 && jb.DroppedLateCount == 1
+            && jb.BufferedCount() == 1;
+        Console.WriteLine("net-snapshot-jitter-buffer: " + Convert.ToString(jitterOk ? 1 : 0));
+    }
+}

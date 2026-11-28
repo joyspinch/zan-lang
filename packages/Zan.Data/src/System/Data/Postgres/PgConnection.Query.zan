@@ -105,6 +105,7 @@ public partial class PgConnection : IDbConnection {
     }
 
     bool sendSimpleQuerySync(string sql) {
+        if (sql == null) { this.lastError = "sql is null"; this.hadError = true; return false; }
         if (!this.connected) { this.lastError = "not connected"; return false; }
         this.lastError = "";
         this.lastAffected = 0;
@@ -134,6 +135,7 @@ public partial class PgConnection : IDbConnection {
     }
 
     public int Execute(string sql, DbParams prms) {
+        if (sql == null) { this.lastError = "sql is null"; this.hadError = true; return -1; }
         if (!this.connected) { this.lastError = "not connected"; return -1; }
         this.lastError = "";
         this.lastAffected = 0;
@@ -143,6 +145,7 @@ public partial class PgConnection : IDbConnection {
     }
 
     public DbResult Query(string sql, DbParams prms) {
+        if (sql == null) { this.lastError = "sql is null"; this.hadError = true; return new DbResult(); }
         if (!this.connected) { this.lastError = "not connected"; return new DbResult(); }
         this.lastError = "";
         this.lastAffected = 0;
@@ -162,16 +165,24 @@ public partial class PgConnection : IDbConnection {
         this.put16(0);
     }
 
-    void buildBindFrame(DbParams prms) {
+    bool buildBindFrame(DbParams prms) {
         List<string> vals = new List<string>();
-        int size = 64;
-        int n = prms.Count();
+        long sizeL = 64L;
+        int n = prms != null ? prms.Count() : 0;
+        if (n > 65535) {
+            this.lastError = "too many parameters for PostgreSQL Bind";
+            return false;
+        }
         for (int i = 0; i < n; i = i + 1) {
             string t = prms.IsNull(i) ? "" : prms.AsText(i);
             vals.Add(t);
-            size = size + t.Length + 4;
+            sizeL = sizeL + (long)t.Length + 4L;
+            if (sizeL > 2147483600L) {
+                this.lastError = "PostgreSQL Bind payload too large";
+                return false;
+            }
         }
-        this.begin(size);
+        this.begin((int)sizeL);
         this.putCstr("");
         this.putCstr("");
         this.put16(1);
@@ -187,6 +198,7 @@ public partial class PgConnection : IDbConnection {
             }
         }
         this.put16(0);
+        return true;
     }
 
     void buildDescribePortalFrame() {
@@ -204,7 +216,7 @@ public partial class PgConnection : IDbConnection {
     bool sendExtendedSync(string dollarSql, DbParams prms) {
         this.buildParseFrame(dollarSql);
         if (this.sendMessageSync(80, this.bb, this.bp) <= 0) { this.die("cannot send Parse"); return false; }
-        this.buildBindFrame(prms);
+        if (!this.buildBindFrame(prms)) { return false; }
         if (this.sendMessageSync(66, this.bb, this.bp) <= 0) { this.die("cannot send Bind"); return false; }
         this.buildDescribePortalFrame();
         if (this.sendMessageSync(68, this.bb, this.bp) <= 0) { this.die("cannot send Describe"); return false; }
@@ -222,6 +234,7 @@ public partial class PgConnection : IDbConnection {
     async DbResult runSimpleAsync(string sql, string sendErr) {
         await this.AcquireLock();
         try {
+            if (sql == null) { this.lastError = "sql is null"; this.fail(); }
             if (!this.connected) { this.lastError = "not connected"; this.fail(); }
             this.lastError = "";
             this.lastAffected = 0;
@@ -240,6 +253,7 @@ public partial class PgConnection : IDbConnection {
     async DbResult runExtendedAsync(string sql, DbParams prms) {
         await this.AcquireLock();
         try {
+            if (sql == null) { this.lastError = "sql is null"; this.fail(); }
             if (!this.connected) { this.lastError = "not connected"; this.fail(); }
             this.lastError = "";
             this.lastAffected = 0;
@@ -257,6 +271,7 @@ public partial class PgConnection : IDbConnection {
     public async int ExecuteAsync(string sql) {
         await this.AcquireLock();
         try {
+            if (sql == null) { this.lastError = "sql is null"; this.fail(); }
             if (!this.connected) { this.lastError = "not connected"; this.fail(); }
             this.lastError = "";
             this.lastAffected = 0;
@@ -277,6 +292,7 @@ public partial class PgConnection : IDbConnection {
     public async int ExecuteParamsAsync(string sql, DbParams prms) {
         await this.AcquireLock();
         try {
+            if (sql == null) { this.lastError = "sql is null"; this.fail(); }
             if (!this.connected) { this.lastError = "not connected"; this.fail(); }
             this.lastError = "";
             this.lastAffected = 0;
@@ -290,7 +306,7 @@ public partial class PgConnection : IDbConnection {
     async bool sendExtendedAsync(string dollarSql, DbParams prms) {
         this.buildParseFrame(dollarSql);
         if (await this.sendMessageAsync(80, this.bb, this.bp) <= 0) { this.die("cannot send Parse"); return false; }
-        this.buildBindFrame(prms);
+        if (!this.buildBindFrame(prms)) { return false; }
         if (await this.sendMessageAsync(66, this.bb, this.bp) <= 0) { this.die("cannot send Bind"); return false; }
         this.buildDescribePortalFrame();
         if (await this.sendMessageAsync(68, this.bb, this.bp) <= 0) { this.die("cannot send Describe"); return false; }
@@ -369,24 +385,31 @@ public partial class PgConnection : IDbConnection {
     public void Close() {
         bool wasConnected = this.connected;
         this.connected = false;
-        if (this.sock >= 0) {
-            if (wasConnected && this.syncTls != null) {
-                this.sendMessageSync(88, this.bb, 0);  // 'X' Terminate
-            } else if (wasConnected && this.tls == null) {
-                byte[] bye = new byte[6];
-                bye[0] = 88;
-                bye[1] = 0; bye[2] = 0; bye[3] = 0; bye[4] = 4;
-                Socket.Send(this.sock, bye, 5);
+        nint s = this.sock;
+        TlsStream t = this.tls;
+        TlsEngine st = this.syncTls;
+        this.tls = null;
+        this.syncTls = null;
+        if (s >= 0) {
+            try {
+                if (wasConnected && st != null) {
+                    this.syncTls = st;
+                    try { this.sendMessageSync(88, this.bb, 0); } catch (Exception _ex) { }
+                    this.syncTls = null;
+                } else if (wasConnected && t == null) {
+                    byte[] bye = new byte[6];
+                    bye[0] = 88;
+                    bye[1] = 0; bye[2] = 0; bye[3] = 0; bye[4] = 4;
+                    Socket.Send(s, bye, 5);
+                }
+                if (t != null) {
+                    t.Close();  // 不拥有底层 fd
+                }
+            } finally {
+                this.sock = -1;
+                Socket.Close(s);
             }
-            if (this.tls != null) {
-                this.tls.Close();  // 不拥有底层 fd
-                this.tls = null;
-            }
-            this.syncTls = null;
-            Socket.Close(this.sock);
-            this.sock = -1;
         }
-        this.connected = false;
     }
 
     public bool IsConnected() { return this.connected; }

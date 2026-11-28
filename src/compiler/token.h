@@ -74,6 +74,7 @@ typedef enum {
     TK_SET,
     TK_SHORT,
     TK_SIZEOF,
+    TK_STACKALLOC,
     TK_STATIC,
     TK_STRING,
     TK_STRUCT,

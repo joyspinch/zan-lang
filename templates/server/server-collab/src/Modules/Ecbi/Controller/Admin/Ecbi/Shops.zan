@@ -1,8 +1,10 @@
 using System;
 using System.Data;
 using System.Data.Orm;
+using System.Json;
 using System.Web;
 using Zan.Web;
+using Zan.Web.AdminUi;
 using Zan.Web.Model.Ecbi;
 
 namespace Zan.Web.Admin.Ecbi;
@@ -12,90 +14,113 @@ namespace Zan.Web.Admin.Ecbi;
 [Custom(Authorization = CustomAuthorization.Grant)]
 [Description("店铺管理")]
 public class Shops : CollabAdminController {
+    static ListPage ScreenDef() {
+        return ListPage.Of()
+            .TbarAdd("新增店铺", "/admin/ecbi/shops/form")
+            .Col("id", "ID", "num", "75")
+            .Col("name", "店铺名称", "text", "200")
+            .Col("platform", "所属平台", "text", "150")
+            .Tag("status", "状态", "1=启用|ok,0=禁用|off", "90")
+            .OpsEdit("/admin/ecbi/shops/form")
+            .Ops("切换状态", "/admin/ecbi/shops/status", "确认切换该店铺启停状态吗？", "id={id}&status={nextStatus}", "u");
+    }
+
     [HttpGet]
     [Route("/admin/ecbi/shops")]
     [Custom(IsMenu = true, Icon = "mdi:store", Perm = PermBit.View)]
     [Description("店铺管理")]
-    async void Index() {
-        ViewData d = await this.Layout("店铺管理");
-        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+    void Index() {
+        this.Conf();
+    }
 
+    [HttpPut]
+    [Custom(Perm = PermBit.View)]
+    [Description("店铺表格配置")]
+    public void Conf() {
+        CrudOps.Conf(this, Shops.ScreenDef());
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.View)]
+    [Description("店铺列表数据")]
+    public async void List() {
+        if (!this.DataReady()) { return; }
         /* 租户硬边（#34）：列表只出本租户店铺，平台下拉同链。 */
         List<OdsShop> rows = await this.OdsShop
             .Where(a => a.tenantId == Tenant.Cur()).OrderBy(a => a.id).ToListAsync();
         List<OdsPlatform> plats = await this.OdsPlatform
             .Where(a => a.tenantId == Tenant.Cur()).OrderBy(a => a.id).ToListAsync();
 
-        List<StrMap> items = d.AddList("rows");
+        JsonWriter w = new JsonWriter();
+        w.WriteStartArray();
         for (int i = 0; i < rows.Count; i = i + 1) {
             OdsShop s = rows[i];
-            StrMap row = new StrMap();
-            row.Set("id", Convert.ToString(s.id));
-            row.Set("name", s.name);
-            row.Set("platform", Shops.PlatName(plats, s.platformId));
-            row.Set("statusText", s.status == 1 ? "启用" : "禁用");
-            row.Set("statusClass", s.status == 1 ? "ok" : "off");
-            row.Set("nextStatus", s.status == 1 ? "0" : "1");
-            row.Set("toggleText", s.status == 1 ? "禁用" : "启用");
-            items.Add(row);
+            w.WriteStartObject();
+            w.WriteProperty("id", s.id);
+            w.WriteProperty("platformId", Convert.ToString(s.platformId));
+            w.WriteProperty("name", s.name);
+            w.WriteProperty("platform", Shops.PlatName(plats, s.platformId));
+            w.WriteProperty("status", Convert.ToString(s.status));
+            w.WriteProperty("nextStatus", s.status == 1 ? 0 : 1);
+            w.WriteEndObject();
         }
-        d.Set("total", Convert.ToString(rows.Count));
-        this.Page(d);
+        w.WriteEndArray();
+        AdminUiProtocol.WriteListData(this, rows.Count, w.ToString());
     }
 
-    [HttpGet]
+    [HttpPut]
     [Custom(Perm = PermBit.Create | PermBit.Update)]
-    [Description("店铺表单")]
-    async void Form() {
-        int id = this.InInt("id", 0);
-        OdsShop s = null;
-        if (id > 0) {
-            /* 租户硬边（#34）：跨租户店铺按不存在处理。 */
-            s = await this.OdsShop
-                .Where(a => a.id == id && a.tenantId == Tenant.Cur()).FirstAsync();
-            if (s == null) { this.Fail(404, "0404", "店铺不存在"); }
-        }
-        ViewData d = new ViewData();
-        d.Set("id", Convert.ToString(id));
-        d.Set("dialogTitle", id > 0 ? "编辑店铺" : "新增店铺");
-        if (id <= 0) { d.Set("new", "1"); }
-
+    [Description("店铺表单配置")]
+    public async void FormConf() {
         List<OdsPlatform> plats = await this.OdsPlatform
             .Where(a => a.status == 1 && a.tenantId == Tenant.Cur())
             .OrderBy(a => a.id).ToListAsync();
-        List<StrMap> popts = d.AddList("platforms");
+        List<StrMap> popts = new List<StrMap>();
         for (int i = 0; i < plats.Count; i = i + 1) {
             StrMap opt = new StrMap();
             opt.Set("id", Convert.ToString(plats[i].id));
             opt.Set("name", plats[i].name);
-            if (s != null && plats[i].id == s.platformId) { opt.Set("selected", "selected"); }
             popts.Add(opt);
         }
-        if (s != null) {
-            d.Set("name", s.name);
-            d.Set("edit", "1");
-            d.Set("new", "");
-        }
-        this.Dialog(d);
+        FormPage fp = FormPage.Of("/admin/ecbi/shops/save")
+            .SelectList("所属平台", "platformId", popts).Req()
+            .Text("店铺名称", "name").Req().Ph("请输入店铺名称");
+        CrudOps.FormConf(this, fp, "店铺");
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.View)]
+    [Description("店铺编辑回显")]
+    public async void Edit() {
+        int id = this.InAnyInt("id", 0);
+        OdsShop s = await this.OdsShop
+            .Where(a => a.id == id && a.tenantId == Tenant.Cur()).FirstAsync();
+        if (s == null) { this.Fail(404, "0404", "店铺不存在"); return; }
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("id", s.id);
+        w.WriteProperty("platformId", Convert.ToString(s.platformId));
+        w.WriteProperty("name", s.name);
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(this, w.ToString());
     }
 
     [HttpPost]
     [Custom(Perm = PermBit.Create | PermBit.Update)]
     [Description("保存店铺")]
     async void Save() {
-        int id = this.InInt("id", 0);
-        string name = this.Need("name", "店铺名称");
-        int platformId = this.InInt("platformId", 0);
-        if (platformId <= 0) { this.Fail(400, "0004", "请选择所属平台"); }
+        int id = this.InAnyInt("id", 0);
+        string name = this.NeedAny("name", "店铺名称");
+        int platformId = this.InAnyInt("platformId", 0);
+        if (platformId <= 0) { this.Fail(400, "0004", "请选择所属平台"); return; }
 
         if (id > 0) {
-            /* 租户硬边（#34）：跨租户店铺更新落空即 404。 */
             int n = await this.OdsShop.Update()
                 .Set(a => a.name, name)
                 .Set(a => a.platformId, platformId)
                 .Where(a => a.id == id && a.tenantId == Tenant.Cur())
                 .ExecuteAffrowsAsync();
-            if (n <= 0) { this.Fail(404, "0404", "店铺不存在"); }
+            if (n <= 0) { this.Fail(404, "0404", "店铺不存在"); return; }
             await this.Note("编辑店铺", "#" + Convert.ToString(id) + " " + name, n > 0, "");
             this.Saved("店铺已保存");
             return;
@@ -115,14 +140,14 @@ public class Shops : CollabAdminController {
     [Custom(Perm = PermBit.Update)]
     [Description("启用或禁用店铺")]
     async void Status() {
-        int id = this.InInt("id", 0);
-        int status = this.InInt("status", 1);
+        int id = this.InAnyInt("id", 0);
+        int status = this.InAnyInt("status", 1);
         if (status != 1) { status = 0; }
         int n = await this.OdsShop.Update()
             .Set(a => a.status, status)
             .Where(a => a.id == id && a.tenantId == Tenant.Cur())
             .ExecuteAffrowsAsync();
-        if (n <= 0) { this.Fail(404, "0404", "店铺不存在"); }
+        if (n <= 0) { this.Fail(404, "0404", "店铺不存在"); return; }
         await this.Note("启用或禁用店铺", "#" + Convert.ToString(id), n > 0,
             status == 1 ? "启用" : "禁用");
         this.Saved(status == 1 ? "店铺已启用" : "店铺已禁用");

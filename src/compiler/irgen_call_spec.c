@@ -25,6 +25,83 @@ local_var_t *receiver_local(zan_ast_node_t *e, local_scope_t *locals) {
     return NULL;
   return local_find(locals, e->ident.name);
 }
+zan_type_t *resolve_tp_ident_type(zan_irgen_t *g, zan_ast_node_t *e) {
+  if (!g || !e || e->kind != AST_IDENTIFIER)
+    return NULL;
+  zan_istr_t nm = e->ident.name;
+  if (g->cur_mtps && g->cur_mbind) {
+    for (int i = 0; i < g->cur_mtps->count; i++) {
+      zan_ast_node_t *tp = g->cur_mtps->items[i];
+      if (tp && tp->kind == AST_IDENTIFIER && tp->ident.name.len == nm.len &&
+          memcmp(tp->ident.name.str, nm.str, (size_t)nm.len) == 0) {
+        if (g->cur_mbind[i])
+          return g->cur_mbind[i];
+      }
+    }
+  }
+  if (g->cur_inst && g->cur_inst->sym && g->cur_inst->sym->decl &&
+      (g->cur_inst->sym->decl->kind == AST_CLASS_DECL ||
+       g->cur_inst->sym->decl->kind == AST_STRUCT_DECL)) {
+    zan_ast_list_t *tps = &g->cur_inst->sym->decl->type_decl.type_params;
+    for (int i = 0; i < tps->count && i < g->cur_inst->type_arg_count; i++) {
+      zan_ast_node_t *tp = tps->items[i];
+      if (tp && tp->kind == AST_IDENTIFIER && tp->ident.name.len == nm.len &&
+          memcmp(tp->ident.name.str, nm.str, (size_t)nm.len) == 0) {
+        if (g->cur_inst->type_args[i])
+          return g->cur_inst->type_args[i];
+      }
+    }
+  }
+  return NULL;
+}
+
+static bool iface_has_static_abstract_or_assoc(zan_symbol_t *isym, int depth) {
+  if (!isym || isym->kind != SYM_INTERFACE || !isym->decl || depth > 8)
+    return false;
+  zan_ast_node_t *d = isym->decl;
+  for (int i = 0; i < d->type_decl.members.count; i++) {
+    zan_ast_node_t *m = d->type_decl.members.items[i];
+    if (m->kind == AST_ASSOC_TYPE_DECL)
+      return true;
+    if (m->kind == AST_PROPERTY_DECL &&
+        (m->field_decl.modifiers & (MOD_STATIC | MOD_ABSTRACT)) ==
+            (MOD_STATIC | MOD_ABSTRACT))
+      return true;
+    if (m->kind == AST_METHOD_DECL &&
+        (m->method_decl.modifiers & (MOD_STATIC | MOD_ABSTRACT)) ==
+            (MOD_STATIC | MOD_ABSTRACT))
+      return true;
+  }
+  if (isym->type) {
+    for (int i = 0; i < isym->type->interface_count; i++) {
+      if (isym->type->interfaces[i] &&
+          iface_has_static_abstract_or_assoc(isym->type->interfaces[i]->sym,
+                                             depth + 1))
+        return true;
+    }
+  }
+  return false;
+}
+
+bool decl_uses_static_abstract_or_assoc(zan_irgen_t *g, zan_ast_list_t *wcs) {
+  if (!g || !g->binder || !wcs)
+    return false;
+  for (int w = 0; w < wcs->count; w++) {
+    zan_ast_node_t *wc = wcs->items[w];
+    if (!wc || wc->kind != AST_WHERE_CLAUSE)
+      continue;
+    for (int k = 0; k < wc->where_clause.constraints.count; k++) {
+      zan_ast_node_t *cr = wc->where_clause.constraints.items[k];
+      if (!cr || cr->kind != AST_TYPE_REF)
+        continue;
+      zan_symbol_t *cs = zan_binder_lookup(g->binder, cr->type_ref.name);
+      if (cs && iface_has_static_abstract_or_assoc(cs, 0))
+        return true;
+    }
+  }
+  return false;
+}
+
 zan_symbol_t *receiver_type_symbol(zan_irgen_t *g, zan_ast_node_t *e,
                                    local_scope_t *locals) {
   if (!g || !g->binder || !e || e->kind != AST_IDENTIFIER)
@@ -33,6 +110,10 @@ zan_symbol_t *receiver_type_symbol(zan_irgen_t *g, zan_ast_node_t *e,
     return zan_binder_type_receiver(g->binder, e);
   if (receiver_local(e, locals))
     return NULL;
+  zan_type_t *tp_ct = resolve_tp_ident_type(g, e);
+  if (tp_ct && tp_ct->sym &&
+      (tp_ct->kind == TYPE_CLASS || tp_ct->kind == TYPE_STRUCT))
+    return tp_ct->sym;
   zan_symbol_t *sym = zan_binder_lookup(g->binder, e->ident.name);
   if (ident_names_own_field(g, e)) {
     zan_symbol_t *member = get_field_sym(g->current_type_sym, e->ident.name);
@@ -167,9 +248,6 @@ int try_method_spec(zan_irgen_t *g, zan_symbol_t *msym, zan_ast_node_t *call,
     else if (g->cur_inst && (!rt->sym || rt->sym == g->cur_inst->sym))
       owner_inst = g->cur_inst;
   }
-  for (int j = 0; j < msym->decl->method_decl.params.count; j++)
-    if (msym->decl->method_decl.params.items[j]->param.by_ref)
-      return -1;
   zan_type_t *bind[8] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL};
   infer_method_tp_bindings(g, msym, call, recv_expr, locals, bind);
   zan_compile_trace("method spec %.*s.%.*s bindc=%d bind0=%d bind0args=%d",
@@ -248,6 +326,7 @@ LLVMValueRef emit_method_spec_call(zan_irgen_t *g, int idx,
     }
   }
   for (int j = 0; j < pcount; j++) {
+    bool is_byref = sp.msym->decl->method_decl.params.items[j]->param.by_ref != 0;
     aexprs[j + this_off] = (arg_base == 1 && j == 0)
                                ? recv_expr
                                : call->call.args.items[j - arg_base];
@@ -255,11 +334,25 @@ LLVMValueRef emit_method_spec_call(zan_irgen_t *g, int idx,
                                      concrete_bind);
     if (concrete_owner)
       pt = subst_type_param_deep(g, pt, concrete_owner);
-    call_args[j + this_off] =
-        emit_arg_typed(g, aexprs[j + this_off], pt, locals);
-    zan_ast_node_t *arg = aexprs[j + this_off];
-    arg_eh_pushed[j + this_off] =
-        emit_call_arg_eh_push(g, arg, call_args[j + this_off], locals);
+    if (is_byref) {
+      LLVMValueRef rptr = emit_expr(g, aexprs[j + this_off], locals);
+      LLVMTypeRef want_p = LLVMTypeOf(LLVMGetParam(sp.fn, (unsigned)(j + this_off)));
+      if (LLVMTypeOf(rptr) != want_p &&
+          LLVMGetTypeKind(LLVMTypeOf(rptr)) == LLVMPointerTypeKind &&
+          LLVMGetTypeKind(want_p) == LLVMPointerTypeKind)
+        rptr = LLVMBuildBitCast(g->builder, rptr, want_p, "ref.bc");
+      call_args[j + this_off] = rptr;
+      aexprs[j + this_off] = NULL;
+    } else {
+      zan_ast_node_t *arg = aexprs[j + this_off];
+      if (arg && arg->kind == AST_LAMBDA &&
+          method_param_is_noescape(sp.msym, j))
+        arg->lambda.is_noescape = 1;
+      call_args[j + this_off] =
+          emit_arg_typed(g, arg, pt, locals);
+      arg_eh_pushed[j + this_off] =
+          emit_call_arg_eh_push(g, arg, call_args[j + this_off], locals);
+    }
   }
   LLVMValueRef gctx_arg =
       sp.has_gctx ? resolve_gctx_arg_for_inst(g, true, sp.msym, concrete_owner,

@@ -1,0 +1,173 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Render3D;
+
+// 样条轨道控制点。
+public class SplinePoint3D {
+    public float X;
+    public float Y;
+    public float Z;
+
+    public SplinePoint3D(float x, float y, float z) {
+        this.X = x;
+        this.Y = y;
+        this.Z = z;
+    }
+}
+
+// 样条轨道采样结果（世界位置 + 单位切线方向）。
+public class SplineSample3D {
+    public float PosX;
+    public float PosY;
+    public float PosZ;
+    public float TanX;
+    public float TanY;
+    public float TanZ;
+
+    public SplineSample3D(float px, float py, float pz, float tx, float ty, float tz) {
+        this.PosX = px;
+        this.PosY = py;
+        this.PosZ = pz;
+        this.TanX = tx;
+        this.TanY = ty;
+        this.TanZ = tz;
+    }
+}
+
+// 商业 3D 镜头导轨/巡逻路径 Catmull-Rom 样条：支持开/闭环曲线、等弧长距离采样与切线朝向。
+public class SplinePathTrack3D {
+    private List<SplinePoint3D> points;
+    private List<float> lutDist;
+    private List<float> lutT;
+    public bool ClosedLoop;
+    public float TotalLength;
+
+    public SplinePathTrack3D(bool closedLoop) {
+        this.points = new List<SplinePoint3D>();
+        this.lutDist = new List<float>();
+        this.lutT = new List<float>();
+        this.ClosedLoop = closedLoop;
+        this.TotalLength = 0.0f;
+    }
+
+    public void AddPoint(float x, float y, float z) {
+        this.points.Add(new SplinePoint3D(x, y, z));
+    }
+
+    public int PointCount() { return this.points.Count; }
+
+    private SplinePoint3D FetchPoint(int idx) {
+        int n = this.points.Count;
+        if (this.ClosedLoop) {
+            int m = idx % n;
+            if (m < 0) { m = m + n; }
+            return this.points[m];
+        }
+        if (idx < 0) { idx = 0; }
+        if (idx >= n) { idx = n - 1; }
+        return this.points[idx];
+    }
+
+    private float CatmullScalar(float p0, float p1, float p2, float p3, float u) {
+        float u2 = u * u;
+        float u3 = u2 * u;
+        return 0.5f * ((2.0f * p1)
+            + (-p0 + p2) * u
+            + (2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3) * u2
+            + (-p0 + 3.0f * p1 - 3.0f * p2 + p3) * u3);
+    }
+
+    private SplinePoint3D EvaluateRaw(float normT) {
+        int n = this.points.Count;
+        if (n == 0) { return new SplinePoint3D(0.0f, 0.0f, 0.0f); }
+        if (n == 1) { return new SplinePoint3D(this.points[0].X, this.points[0].Y, this.points[0].Z); }
+        int segs = this.ClosedLoop ? n : (n - 1);
+        float t = normT;
+        if (this.ClosedLoop) {
+            t = t - (float)Math.Floor((double)t);
+        } else {
+            if (t < 0.0f) { t = 0.0f; }
+            if (t > 1.0f) { t = 1.0f; }
+        }
+        float scaled = t * (float)segs;
+        int seg = (int)Math.Floor((double)scaled);
+        if (seg >= segs) { seg = segs - 1; }
+        float u = scaled - (float)seg;
+
+        SplinePoint3D p0 = this.FetchPoint(seg - 1);
+        SplinePoint3D p1 = this.FetchPoint(seg);
+        SplinePoint3D p2 = this.FetchPoint(seg + 1);
+        SplinePoint3D p3 = this.FetchPoint(seg + 2);
+        return new SplinePoint3D(
+            this.CatmullScalar(p0.X, p1.X, p2.X, p3.X, u),
+            this.CatmullScalar(p0.Y, p1.Y, p2.Y, p3.Y, u),
+            this.CatmullScalar(p0.Z, p1.Z, p2.Z, p3.Z, u));
+    }
+
+    // 预烘焙等弧长查找表，避免变速运动导致的镜头/巡逻速度忽快忽慢。
+    public void RebuildArcLengthTable(int subdivisions) {
+        this.lutDist.Clear();
+        this.lutT.Clear();
+        this.TotalLength = 0.0f;
+        if (this.points.Count < 2) { return; }
+        int steps = subdivisions >= 8 ? subdivisions : 64;
+        SplinePoint3D prev = this.EvaluateRaw(0.0f);
+        this.lutDist.Add(0.0f);
+        this.lutT.Add(0.0f);
+        float acc = 0.0f;
+        for (int i = 1; i <= steps; i = i + 1) {
+            float t = (float)i / (float)steps;
+            SplinePoint3D cur = this.EvaluateRaw(t);
+            float dx = cur.X - prev.X;
+            float dy = cur.Y - prev.Y;
+            float dz = cur.Z - prev.Z;
+            acc = acc + (float)Math.Sqrt((double)(dx * dx + dy * dy + dz * dz));
+            this.lutDist.Add(acc);
+            this.lutT.Add(t);
+            prev = cur;
+        }
+        this.TotalLength = acc;
+    }
+
+    public SplineSample3D SampleAtDistance(float distance) {
+        if (this.points.Count < 2 || this.lutDist.Count < 2 || this.TotalLength <= 0.0001f) {
+            return new SplineSample3D(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f);
+        }
+        float d = distance;
+        if (this.ClosedLoop) {
+            d = d - (float)Math.Floor((double)(d / this.TotalLength)) * this.TotalLength;
+        } else {
+            if (d < 0.0f) { d = 0.0f; }
+            if (d > this.TotalLength) { d = this.TotalLength; }
+        }
+
+        int hi = this.lutDist.Count - 1;
+        int lo = 0;
+        while (lo + 1 < hi) {
+            int mid = (lo + hi) / 2;
+            if (this.lutDist[mid] <= d) { lo = mid; }
+            else { hi = mid; }
+        }
+        float segLen = this.lutDist[hi] - this.lutDist[lo];
+        float frac = segLen > 0.00001f ? (d - this.lutDist[lo]) / segLen : 0.0f;
+        float t = this.lutT[lo] + (this.lutT[hi] - this.lutT[lo]) * frac;
+
+        SplinePoint3D p = this.EvaluateRaw(t);
+        float eps = 0.002f;
+        SplinePoint3D pA = this.EvaluateRaw(t - eps);
+        SplinePoint3D pB = this.EvaluateRaw(t + eps);
+        float tx = pB.X - pA.X;
+        float ty = pB.Y - pA.Y;
+        float tz = pB.Z - pA.Z;
+        float len = (float)Math.Sqrt((double)(tx * tx + ty * ty + tz * tz));
+        if (len > 0.00001f) {
+            tx = tx / len;
+            ty = ty / len;
+            tz = tz / len;
+        } else {
+            tx = 0.0f; ty = 0.0f; tz = 1.0f;
+        }
+        return new SplineSample3D(p.X, p.Y, p.Z, tx, ty, tz);
+    }
+}

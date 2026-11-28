@@ -1,0 +1,78 @@
+using System;
+using System.Numerics;
+
+class Program {
+    [NoAlloc]
+    [Export("add128_u64")]
+    static ulong Add128(ulong aLo, ulong aHi, ulong bLo, ulong bHi, ref ulong outHi, ref bool outCarry) {
+        bool c = false;
+        ulong lo = BitOperations.AddWithCarry(aLo, bLo, false, ref c);
+        outHi = BitOperations.AddWithCarry(aHi, bHi, c, ref outCarry);
+        return lo;
+    }
+
+    [NoAlloc]
+    [Export("sub128_u64")]
+    static ulong Sub128(ulong aLo, ulong aHi, ulong bLo, ulong bHi, ref ulong outHi, ref bool outBorrow) {
+        bool b = false;
+        ulong lo = BitOperations.SubWithBorrow(aLo, bLo, false, ref b);
+        outHi = BitOperations.SubWithBorrow(aHi, bHi, b, ref outBorrow);
+        return lo;
+    }
+
+    [NoAlloc]
+    [Export("cas128_step")]
+    static bool Cas128Step(nint p, ref long eLo, ref long eHi, long dLo, long dHi) {
+        return Atomic.CompareExchange128At(p, ref eLo, ref eHi, dLo, dHi,
+                                           MemoryOrder.AcqRel, MemoryOrder.Acquire);
+    }
+
+    static int Main() {
+        // 1. 64-bit AddWithCarry: (0xFFFF..FF, 0xFFFF..FF) + (1, 0) => (0, 0) with carry=true
+        ulong hi1 = 0UL;
+        bool cy1 = false;
+        ulong lo1 = Add128(0xFFFFFFFFFFFFFFFFUL, 0xFFFFFFFFFFFFFFFFUL, 1UL, 0UL, ref hi1, ref cy1);
+
+        // 2. 64-bit AddWithCarry with carryIn=true: (0xFFFF..FE, 10) + (1, 20) + 1 => (0, 31), cy=false
+        bool c2 = false;
+        ulong lo2 = BitOperations.AddWithCarry(0xFFFFFFFFFFFFFFFEUL, 1UL, true, ref c2);
+        bool cy2 = false;
+        ulong hi2 = BitOperations.AddWithCarry(10UL, 20UL, c2, ref cy2);
+
+        // 3. 32-bit AddWithCarry & SubWithBorrow
+        bool c32 = false;
+        uint s32 = BitOperations.AddWithCarry(0xFFFFFFFFU, 5U, true, ref c32); // 5, c=true
+        bool b32 = false;
+        uint d32 = BitOperations.SubWithBorrow(0U, 1U, false, ref b32); // 0xFFFFFFFF, b=true
+        bool b32b = false;
+        uint d32b = BitOperations.SubWithBorrow(10U, 3U, b32, ref b32b); // 6, b=false
+
+        // 4. 128-bit SubWithBorrow: (0, 5) - (1, 2) => (0xFFFF..FF, 2), borrow=false
+        ulong subHi = 0UL;
+        bool subBrw = false;
+        ulong subLo = Sub128(0UL, 5UL, 1UL, 2UL, ref subHi, ref subBrw);
+
+        // 5. 128-bit lock-free CAS (cmpxchg16b)
+        nint buf = NativeMemory.AlignedAlloc(32L, 16L);
+        NativeMemory.Write<long>(buf, 111L);
+        NativeMemory.Write<long>(buf + (nint)8, 222L);
+
+        long expLo = 999L;
+        long expHi = 888L;
+        bool failOk = !Cas128Step(buf, ref expLo, ref expHi, 333L, 444L);
+        // On failure, expLo/expHi must be updated to observed (111, 222)
+        bool observedOk = (expLo == 111L && expHi == 222L);
+        bool succOk = Cas128Step(buf, ref expLo, ref expHi, 333L, 444L);
+        long finalLo = NativeMemory.Read<long>(buf);
+        long finalHi = NativeMemory.Read<long>(buf + (nint)8);
+        NativeMemory.AlignedFree(buf);
+
+        Console.WriteLine(
+            $"add={(lo1 == 0UL && hi1 == 0UL && cy1 ? 1 : 0)} " +
+            $"add2={(lo2 == 0UL && hi2 == 31UL && !cy2 ? 1 : 0)} " +
+            $"u32={(s32 == 5U && c32 && d32 == 0xFFFFFFFFU && b32 && d32b == 6U && !b32b ? 1 : 0)} " +
+            $"sub={(subLo == 0xFFFFFFFFFFFFFFFFUL && subHi == 2UL && !subBrw ? 1 : 0)} " +
+            $"cas={(failOk && observedOk && succOk && finalLo == 333L && finalHi == 444L ? 1 : 0)}");
+        return 0;
+    }
+}

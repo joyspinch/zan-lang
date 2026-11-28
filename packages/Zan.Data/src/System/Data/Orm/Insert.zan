@@ -25,6 +25,7 @@ public class Insert {
 
     // 私有构造；统一经 <see cref="Create"/> 创建。
     public Insert(IDbExecutor db, Meta meta) {
+        if (meta == null) { throw new ArgumentNullException("meta"); }
         this.db = db;
         this.meta = meta;
         this.tbl = meta.Table;
@@ -57,6 +58,7 @@ public class Insert {
 
     // 追加一行动态列（列名经元数据校验，未知列抛异常）。
     public void AddDict(DbValues v) {
+        if (v == null) { throw new ArgumentNullException("v"); }
         List<DbValue> vItems = v.items;
         int vc = vItems.Count;
         if (this.dicts.Count > 0) {
@@ -401,11 +403,20 @@ public class Insert {
         return pos;
     }
 
+    private int Provider() {
+        return this.db != null ? this.db.GetProvider() : DbProvider.SQLite;
+    }
+
+    private IDbExecutor RequireDb() {
+        if (this.db == null) { throw new InvalidOperationException("Insert executor is null"); }
+        return this.db;
+    }
+
     // 冲突子句。键列缺省取实体主键；方言差异
     // （excluded 对 VALUES()、GREATEST 对 max）在 Dialect 里解决。
     public string Conflict() {
         if (!this.upsert) { return ""; }
-        int p = this.db.GetProvider();
+        int p = this.Provider();
         List<string> keys = null;
         int[] modes = null;
         int updateCount = 0;
@@ -420,7 +431,7 @@ public class Insert {
     // 动态列写入（指定行范围）：所有行按第一行的列形状对齐，缺的列写
     // NULL，值按列声明类型绑定。
     public int BuildDictsRange(int start, int count) {
-        if (count <= 0) { return 0; }
+        if (count <= 0 || start < 0 || start > this.dicts.Count - count) { return 0; }
         List<DbValue> headItems = this.dicts[0].items;
         int hc = headItems.Count;
         if (hc == 0) { return 0; }
@@ -430,7 +441,7 @@ public class Insert {
         int[] headIdx = new int[hc];
         int[] kinds = new int[hc];
         int colCount = 0;
-        int p = this.db.GetProvider();
+        int p = this.Provider();
         bool tmpSimple = false;
         int colsSqlLen = 0;
         for (int c = 0; c < hc; c = c + 1) {
@@ -452,10 +463,12 @@ public class Insert {
         int confLen = this.MeasureConflict(p, out confKeys, out confModes, out confUpdates);
 
         int tblLen = Insert.QuotedLen(p, this.tbl, out tmpSimple);
-        int tupleLen = colCount * 3;
-        int tuplesLen = tupleLen + (count - 1) * (tupleLen + 2);
+        long tupleLen64 = (long)colCount * 3L;
+        long tuplesLen64 = tupleLen64 + (long)(count - 1) * (tupleLen64 + 2L);
         // "INSERT INTO " (12) + tbl + " (" (2) + cols + ") VALUES " (9) + tuples + conflict
-        int totalLen = 23 + tblLen + colsSqlLen + tuplesLen + confLen;
+        long totalLen64 = 23L + (long)tblLen + (long)colsSqlLen + tuplesLen64 + (long)confLen;
+        if (totalLen64 > 2147483647L) { throw new ArgumentException("INSERT SQL buffer size overflow"); }
+        int totalLen = (int)totalLen64;
         byte[] buf = new byte[totalLen];
         nint bp = (nint)buf;
         int pos = 0;
@@ -512,11 +525,11 @@ public class Insert {
 
     // 实体行写入（指定行范围）：列集合成形一次，每行按同一集合绑定。
     public int BuildRowsRange(int start, int count) {
-        if (count <= 0) { return 0; }
+        if (this.rows == null || count <= 0 || start < 0 || start > this.RowCount() - count) { return 0; }
         List<Col> cols = this.Used();
         int colCount = cols.Count;
         if (colCount == 0) { return 0; }
-        int p = this.db.GetProvider();
+        int p = this.Provider();
         bool tmpSimple = false;
         int colsSqlLen = 0;
         for (int c = 0; c < colCount; c = c + 1) {
@@ -529,9 +542,11 @@ public class Insert {
         int confLen = this.MeasureConflict(p, out confKeys, out confModes, out confUpdates);
 
         int tblLen = Insert.QuotedLen(p, this.tbl, out tmpSimple);
-        int tupleLen = colCount * 3;
-        int tuplesLen = tupleLen + (count - 1) * (tupleLen + 2);
-        int totalLen = 23 + tblLen + colsSqlLen + tuplesLen + confLen;
+        long tupleLen64 = (long)colCount * 3L;
+        long tuplesLen64 = tupleLen64 + (long)(count - 1) * (tupleLen64 + 2L);
+        long totalLen64 = 23L + (long)tblLen + (long)colsSqlLen + tuplesLen64 + (long)confLen;
+        if (totalLen64 > 2147483647L) { throw new ArgumentException("INSERT SQL buffer size overflow"); }
+        int totalLen = (int)totalLen64;
         byte[] buf = new byte[totalLen];
         nint bp = (nint)buf;
         int pos = 0;
@@ -570,7 +585,7 @@ public class Insert {
     // 计算当前数据库引擎下安全的分批行数，防止超大批量参数溢出与 SQL 膨胀。
     private int SafeBatchRows(int colCount) {
         if (colCount <= 0) { return 500; }
-        int p = this.db.GetProvider();
+        int p = this.Provider();
         int maxParams = 1000;
         if (p == DbProvider.SQLite) { maxParams = 500; }
         else if (p == DbProvider.SqlServer) { maxParams = 1000; }
@@ -584,11 +599,12 @@ public class Insert {
     public int ExecuteDicts() {
         int total = this.dicts.Count;
         if (total == 0) { return 0; }
+        IDbExecutor exec = this.RequireDb();
         int cols = this.dicts[0].Count();
         int batch = this.SafeBatchRows(cols);
         if (total <= batch) {
             if (this.BuildDicts() == 0) { return 0; }
-            return this.db.Execute(this.sql, this.bound);
+            return exec.Execute(this.sql, this.bound);
         }
         int aff = 0;
         int off = 0;
@@ -596,7 +612,7 @@ public class Insert {
             int take = total - off;
             if (take > batch) { take = batch; }
             if (this.BuildDictsRange(off, take) > 0) {
-                aff = aff + this.db.Execute(this.sql, this.bound);
+                aff = aff + exec.Execute(this.sql, this.bound);
             }
             off = off + take;
         }
@@ -607,11 +623,12 @@ public class Insert {
     public async int ExecuteDictsAsync() {
         int total = this.dicts.Count;
         if (total == 0) { return 0; }
+        IDbExecutor exec = this.RequireDb();
         int cols = this.dicts[0].Count();
         int batch = this.SafeBatchRows(cols);
         if (total <= batch) {
             if (this.BuildDicts() == 0) { return 0; }
-            return await this.db.ExecuteAsync(this.sql, this.bound);
+            return await exec.ExecuteAsync(this.sql, this.bound);
         }
         int aff = 0;
         int off = 0;
@@ -619,7 +636,7 @@ public class Insert {
             int take = total - off;
             if (take > batch) { take = batch; }
             if (this.BuildDictsRange(off, take) > 0) {
-                aff = aff + await this.db.ExecuteAsync(this.sql, this.bound);
+                aff = aff + await exec.ExecuteAsync(this.sql, this.bound);
             }
             off = off + take;
         }
@@ -630,12 +647,13 @@ public class Insert {
     public int ExecuteRows() {
         int total = this.RowCount();
         if (total == 0) { return 0; }
+        IDbExecutor exec = this.RequireDb();
         List<Col> cols = this.Used();
         if (cols.Count == 0) { return 0; }
         int batch = this.SafeBatchRows(cols.Count);
         if (total <= batch) {
             if (this.BuildRows() == 0) { return 0; }
-            return this.db.Execute(this.sql, this.bound);
+            return exec.Execute(this.sql, this.bound);
         }
         int aff = 0;
         int off = 0;
@@ -643,7 +661,7 @@ public class Insert {
             int take = total - off;
             if (take > batch) { take = batch; }
             if (this.BuildRowsRange(off, take) > 0) {
-                aff = aff + this.db.Execute(this.sql, this.bound);
+                aff = aff + exec.Execute(this.sql, this.bound);
             }
             off = off + take;
         }
@@ -654,12 +672,13 @@ public class Insert {
     public async int ExecuteRowsAsync() {
         int total = this.RowCount();
         if (total == 0) { return 0; }
+        IDbExecutor exec = this.RequireDb();
         List<Col> cols = this.Used();
         if (cols.Count == 0) { return 0; }
         int batch = this.SafeBatchRows(cols.Count);
         if (total <= batch) {
             if (this.BuildRows() == 0) { return 0; }
-            return await this.db.ExecuteAsync(this.sql, this.bound);
+            return await exec.ExecuteAsync(this.sql, this.bound);
         }
         int aff = 0;
         int off = 0;
@@ -667,7 +686,7 @@ public class Insert {
             int take = total - off;
             if (take > batch) { take = batch; }
             if (this.BuildRowsRange(off, take) > 0) {
-                aff = aff + await this.db.ExecuteAsync(this.sql, this.bound);
+                aff = aff + await exec.ExecuteAsync(this.sql, this.bound);
             }
             off = off + take;
         }

@@ -1,0 +1,160 @@
+using System;
+using Gui;
+using Game.Graphics;
+using Game.Render3D;
+
+namespace Conf;
+
+class Game3DCrosshatchScopeBlurProbesTest {
+    [DllImport("zan_gui")]
+    private static extern int zan_gui_read_pixel(int surfaceId, int x, int y);
+
+    static int RedOf(int argb) { return (argb >> 16) & 255; }
+    static int BlueOf(int argb) { return argb & 255; }
+
+    static void Main() {
+        Canvas.SetBackend(1);
+        Canvas cv = new Canvas(128, 128);
+        int sid = cv.SurfaceId();
+        Renderer3D ren = new Renderer3D(16);
+        ren.UseCpuLighting = false;
+
+        Camera3D cam = new Camera3D();
+        cam.Position = new Vector3(0.0f, 0.0f, 3.2f);
+        cam.Target = new Vector3(0.0f, 0.0f, 0.0f);
+        cam.AspectRatio = 1.0f;
+        cam.FieldOfView = 1.1f;
+
+        // 1. GPU 3D 屏幕空间漫画/钢笔交叉排线着色：左侧暗灰区域出现明显墨线交替，右侧亮白区域保持纯净零墨线
+        Mesh3D leftQuad = new Mesh3D();
+        leftQuad.Vertex(-2.0f, -2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        leftQuad.Vertex( 0.0f, -2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+        leftQuad.Vertex( 0.0f,  2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        leftQuad.Vertex(-2.0f,  2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f);
+        leftQuad.Triangle(0, 1, 2);
+        leftQuad.Triangle(0, 2, 3);
+        int leftKey = cv.MeshUpload(leftQuad);
+
+        Mesh3D rightQuad = new Mesh3D();
+        rightQuad.Vertex(0.0f, -2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        rightQuad.Vertex(2.0f, -2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+        rightQuad.Vertex(2.0f,  2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        rightQuad.Vertex(0.0f,  2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f);
+        rightQuad.Triangle(0, 1, 2);
+        rightQuad.Triangle(0, 2, 3);
+        int rightKey = cv.MeshUpload(rightQuad);
+
+        Material darkHatch = Material.Solid(0.0f, 0.0f, 0.0f);
+        darkHatch.EmissiveRed = 0.28f; darkHatch.EmissiveGreen = 0.28f; darkHatch.EmissiveBlue = 0.28f;
+        darkHatch.CrosshatchEnabled = true;
+        darkHatch.CrosshatchDensity = 8.0f;
+        darkHatch.CrosshatchStrength = 1.0f;
+        darkHatch.CrosshatchRed = 0.0f; darkHatch.CrosshatchGreen = 0.0f; darkHatch.CrosshatchBlue = 0.0f;
+
+        Material brightHatch = Material.Solid(0.0f, 0.0f, 0.0f);
+        brightHatch.EmissiveRed = 0.95f; brightHatch.EmissiveGreen = 0.95f; brightHatch.EmissiveBlue = 0.95f;
+        brightHatch.CrosshatchEnabled = true;
+        brightHatch.CrosshatchDensity = 8.0f;
+        brightHatch.CrosshatchStrength = 1.0f;
+        brightHatch.CrosshatchRed = 0.0f; brightHatch.CrosshatchGreen = 0.0f; brightHatch.CrosshatchBlue = 0.0f;
+
+        SceneNode root1 = new SceneNode("root1");
+        SceneNode ln1 = new SceneNode("left1");
+        ln1.MeshKey = leftKey; ln1.BoundsRadius = 6.0f; ln1.Material = darkHatch;
+        SceneNode rn1 = new SceneNode("right1");
+        rn1.MeshKey = rightKey; rn1.BoundsRadius = 6.0f; rn1.Material = brightHatch;
+        root1.AddChild(ln1);
+        root1.AddChild(rn1);
+
+        RenderPlan plan1 = new RenderPlan(cam);
+        cv.Clear(unchecked((int)0xFF000000));
+        plan1.Build(root1);
+        ren.Draw(cv, plan1);
+
+        int darkMin = 255;
+        int darkMax = 0;
+        int inkHits = 0;
+        int gapHits = 0;
+        for (int x = 16; x <= 52; x = x + 1) {
+            int r = RedOf(zan_gui_read_pixel(sid, x, 64));
+            if (r < darkMin) { darkMin = r; }
+            if (r > darkMax) { darkMax = r; }
+            if (r <= 18) { inkHits = inkHits + 1; }
+            if (r >= 62) { gapHits = gapHits + 1; }
+        }
+        int brightMin = 255;
+        for (int x = 76; x <= 112; x = x + 2) {
+            int r = RedOf(zan_gui_read_pixel(sid, x, 64));
+            if (r < brightMin) { brightMin = r; }
+        }
+        bool hatchOk = (darkMax - darkMin) >= 45 && inkHits >= 4 && gapHits >= 8 && brightMin >= 235;
+        Console.WriteLine("crosshatch_ink_ok=" + Convert.ToString(hatchOk ? 1 : 0));
+
+        // 2. GPU 后处理瞄准镜/专注外围景深虚化：中心 (63,64)/(64,64) 保持绝对锐利，边角 (16,16) 红蓝接缝明显混合变紫
+        Mesh3D edgeRed = new Mesh3D();
+        edgeRed.Vertex(-2.0f, -2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        edgeRed.Vertex(-1.4713f, -2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+        edgeRed.Vertex(-1.4713f,  2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        edgeRed.Vertex(-2.0f,  2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f);
+        edgeRed.Triangle(0, 1, 2);
+        edgeRed.Triangle(0, 2, 3);
+        int edgeRedKey = cv.MeshUpload(edgeRed);
+
+        Mesh3D midBlue = new Mesh3D();
+        midBlue.Vertex(-1.4713f, -2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        midBlue.Vertex( 0.0f, -2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+        midBlue.Vertex( 0.0f,  2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        midBlue.Vertex(-1.4713f,  2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f);
+        midBlue.Triangle(0, 1, 2);
+        midBlue.Triangle(0, 2, 3);
+        int midBlueKey = cv.MeshUpload(midBlue);
+
+        Material redMat = Material.Solid(0.0f, 0.0f, 0.0f); redMat.EmissiveRed = 1.0f;
+        Material blueMat = Material.Solid(0.0f, 0.0f, 0.0f); blueMat.EmissiveBlue = 1.0f;
+
+        SceneNode root2 = new SceneNode("root2");
+        SceneNode er = new SceneNode("er"); er.MeshKey = edgeRedKey; er.BoundsRadius = 6.0f; er.Material = redMat;
+        SceneNode mb = new SceneNode("mb"); mb.MeshKey = midBlueKey; mb.BoundsRadius = 6.0f; mb.Material = blueMat;
+        SceneNode rr = new SceneNode("rr"); rr.MeshKey = rightKey; rr.BoundsRadius = 6.0f; rr.Material = redMat;
+        root2.AddChild(er);
+        root2.AddChild(mb);
+        root2.AddChild(rr);
+
+        PostProcess post = new PostProcess();
+        post.ScopeEdgeBlurStrength = 1.0f;
+        post.ScopeEdgeClearRadius = 0.45f;
+        ren.PostProcess = post;
+
+        RenderPlan plan2 = new RenderPlan(cam);
+        cv.Clear(unchecked((int)0xFF000000));
+        plan2.Build(root2);
+        ren.Draw(cv, plan2);
+
+        int centerL = zan_gui_read_pixel(sid, 63, 64);
+        int centerR = zan_gui_read_pixel(sid, 64, 64);
+        int cornerSeam = zan_gui_read_pixel(sid, 16, 16);
+
+        bool scopeOk = BlueOf(centerL) >= 240 && RedOf(centerL) <= 5
+            && RedOf(centerR) >= 240 && BlueOf(centerR) <= 5
+            && RedOf(cornerSeam) >= 55 && BlueOf(cornerSeam) >= 110;
+        Console.WriteLine("scope_edge_blur_ok=" + Convert.ToString(scopeOk ? 1 : 0));
+
+        ren.Dispose();
+
+        // 3. LightProbeVolume3D：8 角点三线性插值与边界钳位验证
+        LightProbeVolume3D vol = new LightProbeVolume3D(2, 2, 2, 0.0f, 0.0f, 0.0f, 10.0f, 10.0f, 10.0f);
+        for (int z = 0; z < 2; z = z + 1) {
+            for (int y = 0; y < 2; y = y + 1) {
+                vol.SetProbe(0, y, z, new LightProbeSample3D(0.0f, 0.2f, 1.0f, 0.1f, 0.1f, 0.2f));
+                vol.SetProbe(1, y, z, new LightProbeSample3D(1.0f, 0.6f, 0.0f, 0.9f, 0.5f, 0.2f));
+            }
+        }
+        LightProbeSample3D mid = vol.SampleTrilinear(5.0f, 5.0f, 5.0f);
+        LightProbeSample3D clamped = vol.SampleTrilinear(99.0f, 5.0f, 5.0f);
+        bool probeOk = mid.SkyRed > 0.49f && mid.SkyRed < 0.51f
+            && mid.SkyBlue > 0.49f && mid.SkyBlue < 0.51f
+            && mid.BounceRed > 0.49f && mid.BounceRed < 0.51f
+            && clamped.SkyRed > 0.99f;
+        Console.WriteLine("light_probe_volume_ok=" + Convert.ToString(probeOk ? 1 : 0));
+    }
+}

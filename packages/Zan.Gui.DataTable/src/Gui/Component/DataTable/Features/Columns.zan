@@ -190,6 +190,24 @@ public partial class DataTable {
         DataTable.InvalidateQuery(st);
     }
 
+    // 读取列当前的合计聚合模式（0 无，1 求和，2 平均，3 最小，4 最大，5 计数，6 派生）。
+    public static int GetAggregate(DataTableState st, int col) {
+        if (st == null || col < 0 || col >= st.aggMode.Count) { return 0; }
+        return st.aggMode[col];
+    }
+
+    // 读取列当前有效宽度（逻辑像素）；越界返回 0。
+    public static int ColumnWidth(DataTableState st, int col) {
+        if (st == null || col < 0 || col >= st.colWidths.Count) { return 0; }
+        return st.colWidths[col];
+    }
+
+    // 读取第 index 层分组列的索引；越界返回 -1。
+    public static int GroupColAt(DataTableState st, int index) {
+        if (st == null || index < 0 || index >= st.groupCols.Count) { return -1; }
+        return st.groupCols[index];
+    }
+
     // ---------- 列固定 / 冻结 ----------
     // 冻结代码：0 随滚动，1 固定左缘，2 固定右缘。
     // 冻结列完全脱离滚动 band——不只是
@@ -575,15 +593,16 @@ public partial class DataTable {
                                DataTableState st, int col) {
         int fs = Style.FontFallback(app, "medium");
         int w = Canvas.MeasureText(cols[col].title, fs);
-        // 计算列：autofit 度量公式显示文本（与渲染一致）。
+        // 计算列：autofit 度量公式显示文本（与渲染一致）；循环外预取编译结果并复用求值栈。
         bool fcol = DataTable.IsFormula(cols, col);
+        FormulaExpr fExpr = fcol ? DataTable.FormulaExprOf(cols, col) : null;
+        List<double> fStack = fcol ? new List<double>() : null;
         int totalRows = st.order.Count;
         int maxHeadScan = totalRows < 200 ? totalRows : 200;
         for (int i = 0; i < maxHeadScan; i = i + 1) {
             string cell = src.CellText(st.order[i], col);
             if (fcol) {
-                string fv = DataTable.FormulaText(cols, src, st.order[i], col);
-                if (fv != null) { cell = fv; }
+                cell = DataTable.FormulaTextScratch(fExpr, cols[col], src, st.order[i], fStack);
             }
             int cw = Canvas.MeasureText(DataTable.FormatCell(cols[col], cell), fs);
             if (cw > w) { w = cw; }
@@ -595,8 +614,7 @@ public partial class DataTable {
             for (int i = vStart; i < vEnd; i = i + 1) {
                 string cell = src.CellText(st.order[i], col);
                 if (fcol) {
-                    string fv = DataTable.FormulaText(cols, src, st.order[i], col);
-                    if (fv != null) { cell = fv; }
+                    cell = DataTable.FormulaTextScratch(fExpr, cols[col], src, st.order[i], fStack);
                 }
                 int cw = Canvas.MeasureText(DataTable.FormatCell(cols[col], cell), fs);
                 if (cw > w) { w = cw; }
@@ -622,6 +640,7 @@ public partial class DataTable {
             app = st != null && st.ownerControl != null ? st.ownerControl.ResolveApp(null) : App.FrameApp();
         }
         st.colWidths[col] = DataTable.MeasureColWidth(app, cols, src, st, col);
+        DataTable.InvalidateView(st);
     }
 
     // 对全部未隐藏列执行自动适配。
@@ -635,11 +654,14 @@ public partial class DataTable {
         if (app == null) {
             app = st != null && st.ownerControl != null ? st.ownerControl.ResolveApp(null) : App.FrameApp();
         }
+        bool changed = false;
         for (int i = 0; i < cols.Count && i < st.colWidths.Count; i = i + 1) {
             if (!st.colHidden[i]) {
                 st.colWidths[i] = DataTable.MeasureColWidth(app, cols, src, st, i);
+                changed = true;
             }
         }
+        if (changed) { DataTable.InvalidateView(st); }
     }
 
     // 行是否通过筛选行快速筛选（逐列不区分大小写的 Contains

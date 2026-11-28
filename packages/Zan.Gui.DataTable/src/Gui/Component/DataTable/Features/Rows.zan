@@ -168,8 +168,18 @@ public partial class DataTable {
         e.group = st.undoGroup;
         st.undoLog.Add(e);
         if (st.redoLog.Count > 0) { st.redoLog.Clear(); }
-        while (st.undoLog.Count > st.undoLimit && st.undoLog.Count > 0) {
-            st.undoLog.RemoveAt(0);
+        // 按完整撤销组淘汰最旧历史，避免多单元格粘贴/批量删除超出 undoLimit 时
+        // 被截断为半成品组；且绝不淘汰当前正在写入的活动组。
+        while (st.undoLimit > 0 && DataTable.UndoDepth(st) > st.undoLimit && st.undoLog.Count > 0) {
+            int oldestG = st.undoLog[0].group;
+            if (st.undoGroup != 0 && oldestG == st.undoGroup) { break; }
+            if (oldestG == 0) {
+                st.undoLog.RemoveAt(0);
+            } else {
+                while (st.undoLog.Count > 0 && st.undoLog[0].group == oldestG) {
+                    st.undoLog.RemoveAt(0);
+                }
+            }
         }
     }
 
@@ -256,11 +266,18 @@ public partial class DataTable {
     public static bool DeleteRow(DataTableState st, List<DataColumn> cols, DataSource src, int at) {
         if (!src.CanInsert()) { return false; }
         if (at < 0 || at >= src.RowCount()) { return false; }
+        RowKey deletedKey = DataTable.RowKeyAt(st, src, at);
+        return DataTable.DeleteRowCore(st, cols, src, at, deletedKey, true);
+    }
+
+    private static bool DeleteRowCore(DataTableState st, List<DataColumn> cols, DataSource src,
+                                      int at, RowKey deletedKey, bool invalidateNow) {
+        if (!src.CanInsert()) { return false; }
+        if (at < 0 || at >= src.RowCount()) { return false; }
 
         // 在源丢弃行之前快照——RemoveRow 之后单元格
         // 已不存在，这是让删除可撤销的唯一机会。
         List<string> cells = DataTable.RowCells(src, cols, at);
-        RowKey deletedKey = DataTable.RowKeyAt(st, src, at);
         if (!src.RemoveRow(at)) { return false; }
 
         // 已删除的业务键从选择模型中移除；全选模式不新增排除项
@@ -270,7 +287,7 @@ public partial class DataTable {
         }
         DataTable.ShiftExpandedOnDelete(st, at);
         if (at < st.selected.Count) { st.selected.RemoveAt(at); }
-        DataTable.InvalidateData(st);
+        if (invalidateNow) { DataTable.InvalidateData(st); }
 
         // 被删行上打开的编辑器现在指向已不存在的行
         // （更糟的是指向后继行）；将其关闭，而不是让
@@ -282,25 +299,40 @@ public partial class DataTable {
         else if (st.lastAddedRow > at) { st.lastAddedRow = st.lastAddedRow - 1; }
 
         DataTable.Journal(st, RowEdit.Delete(at, cells));
-        st.hitRow = at;
+        int remaining = src.RowCount();
+        st.hitRow = remaining > 0 ? (at < remaining ? at : remaining - 1) : -1;
+        st.hitOrder = -1;
+        st.selAnchor = -1;
+        DataTable.ClearRange(st);
         st.dirty = true;
         st.RowDeleted.Raise(st.host);
         return true;
     }
 
     // 删除所有选中的行。返回删除的数量。
-    // 行从后往前删除：从前删会重新编号
-    // 尚未删除的行，导致每次删错对象。
+    // 先单遍快照选中行索引与行键，再从后往前批量删除，最后统一
+    // InvalidateData，避免每删一行触发 O(N) RebuildRowKeys 导致 O(K*N)。
     public static int DeleteSelectedRows(DataTableState st, List<DataColumn> cols, DataSource src) {
+        if (!src.CanInsert()) { return 0; }
+        int total = src.RowCount();
+        if (total <= 0) { return 0; }
+        List<int> toDelete = new List<int>();
+        List<RowKey> toDeleteKeys = new List<RowKey>();
+        for (int i = 0; i < total; i = i + 1) {
+            if (DataTable.IsSelected(st, src, i)) {
+                toDelete.Add(i);
+                toDeleteKeys.Add(DataTable.RowKeyAt(st, src, i));
+            }
+        }
+        if (toDelete.Count == 0) { return 0; }
         DataTable.BeginUndoGroup(st);
         int gone = 0;
-        int i = src.RowCount() - 1;
-        while (i >= 0) {
-            if (i < st.selected.Count && DataTable.IsSelected(st, src, i)) {
-                if (DataTable.DeleteRow(st, cols, src, i)) { gone = gone + 1; }
+        for (int j = toDelete.Count - 1; j >= 0; j = j - 1) {
+            if (DataTable.DeleteRowCore(st, cols, src, toDelete[j], toDeleteKeys[j], false)) {
+                gone = gone + 1;
             }
-            i = i - 1;
         }
+        if (gone > 0) { DataTable.InvalidateData(st); }
         DataTable.EndUndoGroup(st);
         return gone;
     }
@@ -354,17 +386,20 @@ public partial class DataTable {
         // 逐个弹出即恢复原始写入顺序。
         int grp = st.undoLog[st.undoLog.Count - 1].group;
         bool more = true;
+        bool needsRecompute = false;
         while (more && st.undoLog.Count > 0) {
             RowEdit e = st.undoLog[st.undoLog.Count - 1];
             st.undoLog.RemoveAt(st.undoLog.Count - 1);
             st.redoLog.Add(e);
+            if (e.kind != 3) { needsRecompute = true; }
             DataTable.UndoOne(st, cols, src, e);
             more = grp != 0 && st.undoLog.Count > 0
                    && st.undoLog[st.undoLog.Count - 1].group == grp;
         }
 
         st.undoing = false;
-        st.dirty = true;
+        if (needsRecompute) { st.dirty = true; }
+        else { DataTable.InvalidateDisplay(st); }
         return true;
     }
 
@@ -381,17 +416,20 @@ public partial class DataTable {
         // 即原始写入顺序），逐条重新应用。
         int grp = st.redoLog[st.redoLog.Count - 1].group;
         bool more = true;
+        bool needsRecompute = false;
         while (more && st.redoLog.Count > 0) {
             RowEdit e = st.redoLog[st.redoLog.Count - 1];
             st.redoLog.RemoveAt(st.redoLog.Count - 1);
             st.undoLog.Add(e);
+            if (e.kind != 3) { needsRecompute = true; }
             DataTable.RedoOne(st, cols, src, e);
             more = grp != 0 && st.redoLog.Count > 0
                    && st.redoLog[st.redoLog.Count - 1].group == grp;
         }
 
         st.undoing = false;
-        st.dirty = true;
+        if (needsRecompute) { st.dirty = true; }
+        else { DataTable.InvalidateDisplay(st); }
         return true;
     }
 
@@ -409,6 +447,9 @@ public partial class DataTable {
         } else if (e.kind == 2) {
             // 重做删除 = 再次删除该行
             DataTable.DeleteRow(st, cols, src, e.row);
+        } else if (e.kind == 3) {
+            // 重做行重排 = 再次把 from 移到 to
+            DataTable.MoveOrder(st, e.row, e.col);
         }
     }
 
@@ -431,6 +472,9 @@ public partial class DataTable {
                     src.SetCell(at, c, e.cells[c]);
                 }
             }
+        } else if (e.kind == 3) {
+            // 撤销行重排 = 把 to 移回 from
+            DataTable.MoveOrder(st, e.col, e.row);
         }
     }
 

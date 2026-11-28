@@ -63,97 +63,28 @@ partial class Irgen {
             r.wbits = 64;
             return r;
         }
-        // lifted operators on a nullable left arm (C# lifted semantics, the
-        // host's emit_nullable_binary): either arm null -> null; else the
-        // payloads operate and the result reboxes. `x = x + 3` on an int?
-        // used to feed the BOX POINTER into `add i64` -- clang rejected the
-        // module ("'%t45' defined with type 'ptr' but expected 'i64'").
-        ExprVal la = null;
-        if (op == TK.Plus() || op == TK.Minus() || op == TK.Star()
-            || op == TK.Slash() || op == TK.Percent()) {
-            Node lat = ArgTypeNode(e.a);
-            if (lat == null || IsNullableValue(lat)) {
-                la = GenExpr(e.a);
-                if (IsNullableValue(la.ty) && !DecimalValueType(la.ty)
-                    && !DecimalValueType(ArgTypeNode(e.b))) {
-                    int lnb = NL(); int lrhs = NL(); int ldone = NL();
-                    string aisn = NT();
-                    L("  " + aisn + " = icmp eq i8* " + la.op + ", null");
-                    L("  br i1 " + aisn + ", label %L" + lnb + ", label %L" + lrhs);
-                    Label(lnb);
-                    L("  br label %L" + ldone);
-                    string anullLbl = curLbl;
-                    Label(lrhs);
-                    List<string> svT4 = stmtTemps; List<Node> svTT4 = stmtTempTypes;
-                    stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
-                    ExprVal lb = GenExpr(e.b);
-                    string bnullLbl = "";
-                    if (lb.ty != null && IsNullable(lb.ty)) {
-                        // right arm null propagates too: branch to the merge null
-                        int lbnull = NL();
-                        string bisn = NT();
-                        L("  " + bisn + " = icmp eq i8* " + lb.op + ", null");
-                        L("  br i1 " + bisn + ", label %L" + lbnull + ", label %L" + ldone);
-                        Label(lbnull);
-                        L("  br label %L" + ldone);
-                        bnullLbl = curLbl;
-                    }
-                    string ault = UnderLL(la.ty);
-                    string ap = NT();
-                    L("  " + ap + " = bitcast i8* " + la.op + " to " + ault + "*");
-                    string av = NT();
-                    L("  " + av + " = load " + ault + ", " + ault + "* " + ap);
-                    string bv = Coerce(lb, ault);
-                    bool isF = ault == "double";
-                    string opn2 = "add";
-                    if (op == TK.Minus()) { opn2 = isF ? "fsub" : "sub"; }
-                    else if (op == TK.Star()) { opn2 = isF ? "fmul" : "mul"; }
-                    else if (op == TK.Slash()) { opn2 = isF ? "fdiv" : "sdiv"; }
-                    else if (op == TK.Percent()) { opn2 = isF ? "frem" : "srem"; }
-                    else { opn2 = isF ? "fadd" : "add"; }
-                    string rv = NT();
-                    L("  " + rv + " = " + opn2 + " " + ault + " " + av + ", " + bv);
-                    ExprVal rvx = new ExprVal(rv, MkType(la.ty.sval));
-                    string rbox = BoxVal(rvx, la.ty);
-                    EmitTempReleases();
-                    stmtTemps = svT4; stmtTempTypes = svTT4;
-                    L("  br label %L" + ldone);
-                    string bvalLbl = curLbl;
-                    Label(ldone);
-                    string rr = NT();
-                    if (bnullLbl != "") {
-                        L("  " + rr + " = phi i8* [ null, %" + anullLbl + " ], [ null, %" + bnullLbl + " ], [ " + rbox + ", %" + bvalLbl + " ]");
-                    } else {
-                        L("  " + rr + " = phi i8* [ null, %" + anullLbl + " ], [ " + rbox + ", %" + bvalLbl + " ]");
-                    }
-                    AddTemp(rr, la.ty);
-                    return new ExprVal(rr, la.ty);
-                }
-            }
-        }
         if (op == TK.AmpAmp() || op == TK.PipePipe()) {
-            List<string> svT = stmtTemps; List<Node> svTT = stmtTempTypes;
-            stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
             bool isAnd = (op == TK.AmpAmp());
             int lrhs = NL(); int lend = NL();
+            BranchTempScope btsA = EnterBranchTempScope();
             string la = GenCond(e.a);
-            // Each operand's condition is now an i1 value. Drop its owned
-            // temporaries on the path that evaluated it, before discarding
-            // this private list; the RHS must never release skipped SSA values.
-            EmitTempReleases();
+            // Each operand's condition is now an i1 value. Retire and drop its
+            // owned temporaries on the path that evaluated it, before branching;
+            // the RHS must never release or retire skipped values.
+            LeaveBranchTempScope(btsA);
             string bpre = curLbl;
             if (isAnd) { L("  br i1 " + la + ", label %L" + lrhs + ", label %L" + lend); }
             else { L("  br i1 " + la + ", label %L" + lend + ", label %L" + lrhs); }
             Label(lrhs);
+            BranchTempScope btsB = EnterBranchTempScope();
             string lb = GenCond(e.b);
-            EmitTempReleases();
+            LeaveBranchTempScope(btsB);
             string bpost = curLbl;
             L("  br label %L" + lend);
             Label(lend);
             string r = NT();
             string dflt = "true"; if (isAnd) { dflt = "false"; }
             L("  " + r + " = phi i1 [ " + dflt + ", %" + bpre + " ], [ " + lb + ", %" + bpost + " ]");
-            stmtTemps = svT; stmtTempTypes = svTT;
             return BoolVal(e, r);
         }
         // null-coalescing "a ?? b": if a is non-null use a, else b. Result is
@@ -180,8 +111,7 @@ partial class Irgen {
                 L("  br label %L" + ulend);
                 string uapost = curLbl;
                 Label(ulb);
-                List<string> svT3 = stmtTemps; List<Node> svTT3 = stmtTempTypes;
-                stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
+                BranchTempScope btsU = EnterBranchTempScope();
                 ExprVal ub = GenExpr(e.b);
                 string ubc = ub.op;
                 if (ub.ty != null && IsNullableValue(ub.ty)) {
@@ -193,8 +123,7 @@ partial class Irgen {
                 } else {
                     ubc = Coerce(ub, uult);
                 }
-                EmitTempReleases();
-                stmtTemps = svT3; stmtTempTypes = svTT3;
+                LeaveBranchTempScope(btsU);
                 string ubpost = curLbl;
                 L("  br label %L" + ulend);
                 Label(ulend);
@@ -218,8 +147,7 @@ partial class Irgen {
             // a null: evaluate b in an isolated temp scope, retain the chosen
             // value, release bs own temporaries within the branch.
             Label(lb);
-            List<string> svT = stmtTemps; List<Node> svTT = stmtTempTypes;
-            stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
+            BranchTempScope btsR = EnterBranchTempScope();
             ExprVal b = GenExpr(e.b);
             EmitArcRetain(b.op, b.ty);
             string bop = b.op;
@@ -228,8 +156,7 @@ partial class Irgen {
                 L("  " + bc + " = bitcast " + MapType(b.ty) + " " + bop + " to " + at);
                 bop = bc;
             }
-            EmitTempReleases();
-            stmtTemps = svT; stmtTempTypes = svTT;
+            LeaveBranchTempScope(btsR);
             string bpost = curLbl;
             L("  br label %L" + lend);
             Label(lend);
@@ -273,8 +200,7 @@ partial class Irgen {
             if (parts.Count > 2) { return StrConcatN(parts); }
         }
         EnterCallArm();
-        ExprVal a;
-        if (la != null) { a = la; } else { a = GenExpr(e.a); }
+        ExprVal a = GenExpr(e.a);
         ExprVal b = GenExpr(e.b);
         LeaveCallArm();
         // ulong operands select unsigned div/rem/shift/compare and carry the
@@ -286,6 +212,84 @@ partial class Irgen {
         if ((op == TK.Plus() || op == TK.Minus() || op == TK.Star()
             || op == TK.Slash() || op == TK.Percent()) && DecimalLiftNeeded(a.ty, b.ty)) {
             return DecimalLifted(op, a, b, e);
+        }
+        // Lifted nullable arithmetic (matches C host emit_nullable_binary):
+        // both operands are already evaluated eagerly inside EnterCallArm;
+        // either null -> null, else operate on unboxed payloads and rebox.
+        if ((op == TK.Plus() || op == TK.Minus() || op == TK.Star()
+            || op == TK.Slash() || op == TK.Percent())
+            && !(IsStr(a.ty) || IsStr(b.ty))
+            && (IsNullableValue(a.ty) || IsNullableValue(b.ty))) {
+            bool ln = IsNullableValue(a.ty);
+            bool rn = IsNullableValue(b.ty);
+            Node resTy = ln ? a.ty : b.ty;
+            if (ln && rn && UnderLL(b.ty) == "double") {
+                resTy = b.ty;
+            } else if ((!ln && IsDbl(a.ty)) || (!rn && IsDbl(b.ty))) {
+                resTy = MkType("double"); resTy.op = 1;
+            }
+            int lnull = NL(); int lval = NL(); int ldone = NL();
+            string anyNull = "";
+            if (ln && rn) {
+                string aisn = NT();
+                L("  " + aisn + " = icmp eq i8* " + a.op + ", null");
+                string bisn = NT();
+                L("  " + bisn + " = icmp eq i8* " + b.op + ", null");
+                anyNull = NT();
+                L("  " + anyNull + " = or i1 " + aisn + ", " + bisn);
+            } else if (ln) {
+                anyNull = NT();
+                L("  " + anyNull + " = icmp eq i8* " + a.op + ", null");
+            } else {
+                anyNull = NT();
+                L("  " + anyNull + " = icmp eq i8* " + b.op + ", null");
+            }
+            L("  br i1 " + anyNull + ", label %L" + lnull + ", label %L" + lval);
+            Label(lnull);
+            L("  br label %L" + ldone);
+            string nullLbl = curLbl;
+            Label(lval);
+            string ault = UnderLL(resTy);
+            string av = "";
+            if (ln) {
+                string aul = UnderLL(a.ty);
+                string ap = NT();
+                L("  " + ap + " = bitcast i8* " + a.op + " to " + aul + "*");
+                string al = NT();
+                L("  " + al + " = load " + aul + ", " + aul + "* " + ap);
+                av = Coerce(new ExprVal(al, MkType(a.ty.sval)), ault);
+            } else {
+                av = Coerce(a, ault);
+            }
+            string bv = "";
+            if (rn) {
+                string bul = UnderLL(b.ty);
+                string bp = NT();
+                L("  " + bp + " = bitcast i8* " + b.op + " to " + bul + "*");
+                string bl = NT();
+                L("  " + bl + " = load " + bul + ", " + bul + "* " + bp);
+                bv = Coerce(new ExprVal(bl, MkType(b.ty.sval)), ault);
+            } else {
+                bv = Coerce(b, ault);
+            }
+            bool isF = ault == "double";
+            string opn2 = "add";
+            if (op == TK.Minus()) { opn2 = isF ? "fsub" : "sub"; }
+            else if (op == TK.Star()) { opn2 = isF ? "fmul" : "mul"; }
+            else if (op == TK.Slash()) { opn2 = isF ? "fdiv" : "sdiv"; }
+            else if (op == TK.Percent()) { opn2 = isF ? "frem" : "srem"; }
+            else { opn2 = isF ? "fadd" : "add"; }
+            string rv = NT();
+            L("  " + rv + " = " + opn2 + " " + ault + " " + av + ", " + bv);
+            ExprVal rvx = new ExprVal(rv, MkType(resTy.sval));
+            string rbox = BoxVal(rvx, resTy);
+            string valLbl = curLbl;
+            L("  br label %L" + ldone);
+            Label(ldone);
+            string rr = NT();
+            L("  " + rr + " = phi i8* [ null, %" + nullLbl + " ], [ " + rbox + ", %" + valLbl + " ]");
+            AddTemp(rr, resTy);
+            return new ExprVal(rr, resTy);
         }
         if ((IsDecimal(a.ty) || IsDecimal(b.ty)) && !(IsStr(a.ty) || IsStr(b.ty)) && !IsNullableValue(a.ty) && !IsNullableValue(b.ty)) {
             return DecimalBinary(op, a, b, e);

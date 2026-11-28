@@ -20,8 +20,6 @@ public class Pinyin {
     private static string initLock = "Zan.Pinyin.Init";
 
     private static PinyinTables EnsureTables() {
-        PinyinTables cached = Pinyin.s_tables;
-        if (cached != null) { return cached; }
         lock (Pinyin.initLock) {
             if (Pinyin.s_tables != null) { return Pinyin.s_tables; }
             string[] tbl = new string[20992];
@@ -99,21 +97,38 @@ public class Pinyin {
         }
     }
 
-    private static byte[] GrowBuf(byte[] buf, int used, int need, out nint bp) {
-        int cap = buf.Length * 2;
-        if (cap < 64) { cap = 64; }
-        while (cap < need) { cap = cap * 2; }
-        byte[] grown = new byte[cap];
+    private static byte[] GrowBuf(byte[] buf, int used, long need, out nint bp) {
+        if (need > 2147483591L) {
+            throw new InvalidOperationException("Pinyin buffer capacity overflow");
+        }
+        long capL = (long)buf.Length * 2L;
+        if (capL < 64L) { capL = 64L; }
+        while (capL < need) {
+            capL = capL * 2L;
+            if (capL > 2147483591L) { capL = 2147483591L; break; }
+        }
+        if (capL > 2147483591L) { capL = 2147483591L; }
+        byte[] grown = new byte[(int)capL];
         nint gp = (nint)grown;
         if (used > 0) { NativeMemory.Copy(gp, (nint)buf, used); }
         bp = gp;
         return grown;
     }
 
+    private static int InitialOutCap(int len, int segLen, int pyLen) {
+        long minNeed = (long)segLen + (long)pyLen + 16L;
+        long capL = (long)len * 2L + 16L;
+        if (capL < minNeed) { capL = minNeed; }
+        if (capL > 2147483591L) { capL = 2147483591L; }
+        if (minNeed - 16L > 2147483591L) {
+            throw new InvalidOperationException("Pinyin output exceeds maximum length");
+        }
+        return (int)capL;
+    }
+
     public static string ToPinyin(string text) {
         if (text == null || text.Length == 0) { return ""; }
-        PinyinTables tables = Pinyin.s_tables;
-        if (tables == null) { tables = Pinyin.EnsureTables(); }
+        PinyinTables tables = Pinyin.EnsureTables();
         byte[] blob = tables.bmpBlob;
         int[] offLen = tables.bmpOffLen;
         string[] tbl = tables.bmpTable;
@@ -146,13 +161,12 @@ public class Pinyin {
                         int pyOff = entry >> 4;
                         int segLen = i - nonHanStart;
                         if (outBuf == null) {
-                            outCap = len * 2 + 16;
-                            if (outCap < segLen + pyLen) { outCap = segLen + pyLen + 16; }
+                            outCap = Pinyin.InitialOutCap(len, segLen, pyLen);
                             outBuf = new byte[outCap];
                             outPtr = (nint)outBuf;
                             outSp = new Span<byte>(outPtr, outCap);
-                        } else if (di + segLen + pyLen > outCap) {
-                            outBuf = Pinyin.GrowBuf(outBuf, di, di + segLen + pyLen, out outPtr);
+                        } else if ((long)di + (long)segLen + (long)pyLen > (long)outCap) {
+                            outBuf = Pinyin.GrowBuf(outBuf, di, (long)di + (long)segLen + (long)pyLen, out outPtr);
                             outCap = outBuf.Length;
                             outSp = new Span<byte>(outPtr, outCap);
                         }
@@ -179,13 +193,12 @@ public class Pinyin {
                         int segLen = i - nonHanStart;
                         int pyLen = py.Length;
                         if (outBuf == null) {
-                            outCap = len * 2 + 16;
-                            if (outCap < segLen + pyLen) { outCap = segLen + pyLen + 16; }
+                            outCap = Pinyin.InitialOutCap(len, segLen, pyLen);
                             outBuf = new byte[outCap];
                             outPtr = (nint)outBuf;
                             outSp = new Span<byte>(outPtr, outCap);
-                        } else if (di + segLen + pyLen > outCap) {
-                            outBuf = Pinyin.GrowBuf(outBuf, di, di + segLen + pyLen, out outPtr);
+                        } else if ((long)di + (long)segLen + (long)pyLen > (long)outCap) {
+                            outBuf = Pinyin.GrowBuf(outBuf, di, (long)di + (long)segLen + (long)pyLen, out outPtr);
                             outCap = outBuf.Length;
                             outSp = new Span<byte>(outPtr, outCap);
                         }
@@ -207,13 +220,12 @@ public class Pinyin {
                         int segLen = i - nonHanStart;
                         int pyLen = py.Length;
                         if (outBuf == null) {
-                            outCap = len * 2 + 16;
-                            if (outCap < segLen + pyLen) { outCap = segLen + pyLen + 16; }
+                            outCap = Pinyin.InitialOutCap(len, segLen, pyLen);
                             outBuf = new byte[outCap];
                             outPtr = (nint)outBuf;
                             outSp = new Span<byte>(outPtr, outCap);
-                        } else if (di + segLen + pyLen > outCap) {
-                            outBuf = Pinyin.GrowBuf(outBuf, di, di + segLen + pyLen, out outPtr);
+                        } else if ((long)di + (long)segLen + (long)pyLen > (long)outCap) {
+                            outBuf = Pinyin.GrowBuf(outBuf, di, (long)di + (long)segLen + (long)pyLen, out outPtr);
                             outCap = outBuf.Length;
                             outSp = new Span<byte>(outPtr, outCap);
                         }
@@ -238,8 +250,8 @@ public class Pinyin {
         if (outBuf == null) { return text; }
         int tail = len - nonHanStart;
         if (tail > 0) {
-            if (di + tail > outCap) {
-                outBuf = Pinyin.GrowBuf(outBuf, di, di + tail, out outPtr);
+            if ((long)di + (long)tail > (long)outCap) {
+                outBuf = Pinyin.GrowBuf(outBuf, di, (long)di + (long)tail, out outPtr);
             }
             NativeMemory.Copy(outPtr + (nint)di, tPtr + (nint)nonHanStart, tail);
             di = di + tail;
@@ -250,8 +262,7 @@ public class Pinyin {
     // characters pass through. "中文" -> "ZW", "hello 世界" -> "hello SJ".
     public static string Initials(string text) {
         if (text == null || text.Length == 0) { return ""; }
-        PinyinTables tables = Pinyin.s_tables;
-        if (tables == null) { tables = Pinyin.EnsureTables(); }
+        PinyinTables tables = Pinyin.EnsureTables();
         byte[] ini = tables.bmpInitial;
         string[] tbl = tables.bmpTable;
         Dictionary<string, string> extra = tables.extraCache;
@@ -378,8 +389,7 @@ public class Pinyin {
 
     public static string Lookup(string han) {
         if (han == null || han.Length == 0) { return ""; }
-        PinyinTables tables = Pinyin.s_tables;
-        if (tables == null) { tables = Pinyin.EnsureTables(); }
+        PinyinTables tables = Pinyin.EnsureTables();
         if (han.Length == 3) {
             Span<byte> sp = new Span<byte>((nint)han, 3);
             int c0 = sp[0] & 255;
@@ -399,14 +409,11 @@ public class Pinyin {
         return "";
     }
 
-    // 拆卸拼音静态缓存表，便于泄漏检查与按需释放。
+    // 拆卸拼音静态缓存表，便于泄漏检查与按需释放（仅置空引用不原地 Clear，避免破坏已返回 Table() 快照）。
     public static void Teardown() {
         lock (Pinyin.initLock) {
             Pinyin.s_tables = null;
-            if (Pinyin.cache != null) {
-                Pinyin.cache.Clear();
-                Pinyin.cache = null;
-            }
+            Pinyin.cache = null;
         }
     }
 

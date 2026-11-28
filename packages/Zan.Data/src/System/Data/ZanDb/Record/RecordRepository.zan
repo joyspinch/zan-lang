@@ -14,6 +14,7 @@ public class RecordRepository<T> {
 
     // 构造：从物理表直接绑定
     public RecordRepository(RecordTable table) {
+        if (table == null) { throw new ArgumentNullException("table"); }
         this.Table = table;
         this.Binding = new RecordBinding<T>(table.schema);
         this.dbPath = table.basePath;
@@ -23,17 +24,21 @@ public class RecordRepository<T> {
     // 构造：自动从实体元数据建立/打开表
     public RecordRepository(string dbPath, string tableName = "") {
         this.dbPath = dbPath;
-        this.Binding = RecordBindingCache<T>.Get();
-        this.tableName = (tableName != null && tableName.Length > 0) ? tableName : this.Binding.tableName;
+        RecordBinding<T> defaults = RecordBindingCache<T>.Get();
+        this.tableName = (tableName != null && tableName.Length > 0) ? tableName : defaults.tableName;
         // 尝试按已有元数据自适应加载，若为全新库则自动按 Schema 创建
-        this.Table = RecordTable.Open(dbPath, this.tableName, this.Binding.schema);
-        // 将字段绑定刷新为真实打开的表 Schema（确保 offset 与 column 精准对齐）
-        this.Binding.BindToSchema(this.Table.schema);
+        this.Table = RecordTable.Open(dbPath, this.tableName, defaults.schema);
+        // 独立构建本仓储实例的字段绑定，绝不原地修改共享全局 RecordBindingCache<T> 单例
+        if (this.Table != null && this.Table.schema != null) {
+            this.Binding = new RecordBinding<T>(this.Table.schema);
+        } else {
+            this.Binding = new RecordBinding<T>();
+        }
     }
 
     // 确保二级索引存在（如 EnsureIndex("dept") 或 EnsureIndex((ExprNode x) => x.Dept)）
     public void EnsureIndex(string col) {
-        if (this.Table != null) {
+        if (this.Table != null && this.Binding != null) {
             this.Table.EnsureIndex(this.Binding.FindColName(col));
         }
     }
@@ -46,7 +51,7 @@ public class RecordRepository<T> {
     }
 
     public string ExtractCol(ExprNode expr) {
-        if (expr == null) { return ""; }
+        if (expr == null || this.Binding == null) { return ""; }
         if (expr.Kind == 0) {
             return this.Binding.FindColName(expr.Name);
         }
@@ -62,10 +67,11 @@ public class RecordRepository<T> {
 
     // 插入单条实体，返回自增主键 ID，并自动回写到实体的 Id 字段
     public int Insert(T entity) {
-        if (entity == null || this.Table == null) { return 0; }
+        if (entity == null || this.Table == null || this.Binding == null) { return 0; }
         RecordRow row = this.Binding.ToRow(entity, this.Table);
+        if (row == null) { return 0; }
         int newId = this.Table.Add(row);
-        if (this.Binding.pkField != null) {
+        if (newId > 0 && this.Binding.pkField != null) {
             ((object)entity).SetFieldInt(this.Binding.pkField.fieldName, newId);
         }
         return newId;
@@ -73,18 +79,23 @@ public class RecordRepository<T> {
 
     // 批量插入实体列表
     public int InsertBatch(List<T> entities) {
-        if (entities == null || entities.Count == 0 || this.Table == null) { return 0; }
+        if (entities == null || entities.Count == 0 || this.Table == null || this.Binding == null) { return 0; }
         List<RecordRow> rows = new List<RecordRow>();
+        List<T> validEntities = new List<T>();
         for (int i = 0; i < entities.Count; i = i + 1) {
-            RecordRow row = this.Binding.ToRow(entities[i], this.Table);
+            T entity = entities[i];
+            if (entity == null) { continue; }
+            RecordRow row = this.Binding.ToRow(entity, this.Table);
             if (row != null) {
                 rows.Add(row);
+                validEntities.Add(entity);
             }
         }
+        if (rows.Count == 0) { return 0; }
         int firstId = this.Table.AddBulk(rows);
-        if (this.Binding.pkField != null) {
-            for (int i = 0; i < entities.Count; i = i + 1) {
-                ((object)entities[i]).SetFieldInt(this.Binding.pkField.fieldName, firstId + i);
+        if (firstId > 0 && this.Binding.pkField != null) {
+            for (int i = 0; i < validEntities.Count; i = i + 1) {
+                ((object)validEntities[i]).SetFieldInt(this.Binding.pkField.fieldName, firstId + i);
             }
         }
         return rows.Count;
@@ -92,7 +103,7 @@ public class RecordRepository<T> {
 
     // 按主键更新实体
     public bool Update(T entity) {
-        if (entity == null || this.Table == null) { return false; }
+        if (entity == null || this.Table == null || this.Binding == null) { return false; }
         int id = 0;
         if (this.Binding.pkField != null) {
             id = ((object)entity).GetFieldInt(this.Binding.pkField.fieldName);
@@ -101,6 +112,7 @@ public class RecordRepository<T> {
             throw new ArgumentException("Update requires a positive primary key Id");
         }
         RecordRow row = this.Binding.ToRow(entity, this.Table);
+        if (row == null) { return false; }
         row.id = id;
         return this.Table.Update(row);
     }

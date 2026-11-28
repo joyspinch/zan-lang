@@ -1,0 +1,1045 @@
+// rt_sync_net_proc.zan: Network interface enumeration, raw ICMP ping,
+// cross-platform safe process run/capture/detached launch, and Linux
+// managed spawn + cgroup v2 / Landlock / seccomp-BPF sandbox.
+// Replaces rt_sync_net.c, rt_sync_proc.c, and rt_sync_proc_sandbox.c in 100% pure Zan.
+
+namespace Zan.Runtime.Sync;
+
+static class RtSyncNet {
+#if !WINDOWS
+    const ulong PLAT_TEXT_MAX = 65536UL;
+    static int s_platTextState = 0;
+#if MACOS
+    static ulong s_platTextKey = 0UL;
+#else
+    static uint s_platTextKey = 0U;
+#endif
+
+    [Export("__zan_sync_plat_text_dtor")]
+    [Visibility("hidden")]
+    static void PlatTextDtor(nint buf) {
+        if (buf != (nint)0) SyncPlat.CFree(buf);
+    }
+
+    static nint GetPlatText() {
+        int st = Atomic.Load(ref s_platTextState, MemoryOrder.Acquire);
+        if (st != 2) {
+            if (st == 3) SyncPlat.RtFatal((nint)"oom", (nint)"sync: text TLS init failed");
+            if (Atomic.CompareExchange(ref s_platTextState, 0, 1, MemoryOrder.AcqRel, MemoryOrder.Acquire) == 0) {
+                bool ok = SyncPlat.PosixKeyCreate(NativeMemory.AddressOf(ref s_platTextKey),
+                                                  NativeMemory.FunctionPointer(PlatTextDtor)) == 0;
+                Atomic.Store(ref s_platTextState, ok ? 2 : 3, MemoryOrder.Release);
+                if (!ok) SyncPlat.RtFatal((nint)"oom", (nint)"sync: text TLS init failed");
+            } else {
+                while (Atomic.Load(ref s_platTextState, MemoryOrder.Acquire) == 1) SyncPlat.OsYield();
+                if (Atomic.Load(ref s_platTextState, MemoryOrder.Acquire) != 2) {
+                    SyncPlat.RtFatal((nint)"oom", (nint)"sync: text TLS init failed");
+                }
+            }
+        }
+        nint buf = SyncPlat.PosixGetSpecific(s_platTextKey);
+        if (buf == (nint)0) {
+            buf = SyncPlat.CCalloc(PLAT_TEXT_MAX, 1UL);
+            if (buf == (nint)0) SyncPlat.RtFatal((nint)"oom", (nint)"sync: text TLS alloc failed");
+            if (SyncPlat.PosixSetSpecific(s_platTextKey, buf) != 0) {
+                SyncPlat.CFree(buf);
+                SyncPlat.RtFatal((nint)"oom", (nint)"sync: text TLS set failed");
+            }
+        }
+        return buf;
+    }
+
+    static void MacFromSockaddr(nint sa, nint outBuf, ulong outCap) {
+        NativeMemory.Write<byte>(outBuf, (byte)0);
+        if (sa == (nint)0) return;
+#if MACOS
+        // Darwin struct sockaddr_dl: sdl_len @ 0 (u8), sdl_family @ 1 (u8 = AF_LINK=18),
+        // sdl_nlen @ 5 (u8), sdl_alen @ 6 (u8), sdl_data @ 8
+        int fam = (int)NativeMemory.At<byte>(sa, 1L);
+        if (fam != SyncPlat.AF_LINK) return;
+        int nlen = (int)NativeMemory.At<byte>(sa, 5L);
+        int alen = (int)NativeMemory.At<byte>(sa, 6L);
+        if (alen <= 0 || alen > 8) return;
+        ulong pos = 0UL;
+        nint addrBase = sa + (nint)(8 + nlen);
+        for (int i = 0; i < alen && pos + 3UL < outCap; i++) {
+            if (i > 0) pos = SyncPlat.BufAppendChar(outBuf, outCap, pos, (byte)58); // ':'
+            pos = SyncPlat.BufAppendHex2Upper(outBuf, outCap, pos, NativeMemory.At<byte>(addrBase, (long)i));
+        }
+#else
+        ushort fam = NativeMemory.Read<ushort>(sa);
+        if ((int)fam != SyncPlat.AF_PACKET) return;
+        // Linux struct sockaddr_ll: sll_halen @ 11 (u8), sll_addr @ 12 (8 bytes)
+        int len = (int)NativeMemory.At<byte>(sa, 11L);
+        if (len <= 0 || len > 8) return;
+        ulong pos = 0UL;
+        for (int i = 0; i < len && pos + 3UL < outCap; i++) {
+            if (i > 0) pos = SyncPlat.BufAppendChar(outBuf, outCap, pos, (byte)58); // ':'
+            pos = SyncPlat.BufAppendHex2Upper(outBuf, outCap, pos, NativeMemory.At<byte>(sa + (nint)12, (long)i));
+        }
+#endif
+    }
+
+    static ushort IcmpChecksum(nint data, ulong len) {
+        uint sum = 0U;
+        long idx = 0L;
+        while (len > 1UL) {
+            uint hi = (uint)NativeMemory.At<byte>(data, idx);
+            uint lo = (uint)NativeMemory.At<byte>(data, idx + 1L);
+            sum += (hi << 8) | lo;
+            idx += 2L;
+            len -= 2UL;
+        }
+        if (len > 0UL) {
+            sum += ((uint)NativeMemory.At<byte>(data, idx)) << 8;
+        }
+        while ((sum >> 16) != 0U) {
+            sum = (sum & 0xFFFFU) + (sum >> 16);
+        }
+        return (ushort)(~sum);
+    }
+#endif
+
+    [Export("zan_plat_net_interfaces")]
+    public static nint NetInterfaces() {
+#if WINDOWS
+        return (nint)"";
+#else
+        nint outText = GetPlatText();
+        NativeMemory.Write<byte>(outText, (byte)0);
+        nint list = (nint)0;
+        if (SyncPlat.PosixGetifaddrs(NativeMemory.AddressOf(ref list)) != 0) return outText;
+
+        ulong used = 0UL;
+        nint it = list;
+        while (it != (nint)0) {
+            // Linux struct ifaddrs: ifa_next @ 0, ifa_name @ 8, ifa_flags @ 16 (u32), ifa_addr @ 24
+            nint name = NativeMemory.Read<nint>(it + (nint)8);
+            if (name != (nint)0) {
+                bool seen = false;
+                nint p = list;
+                while (p != it) {
+                    nint pname = NativeMemory.Read<nint>(p + (nint)8);
+                    if (pname != (nint)0 && SyncPlat.CStrCmp(pname, name) == 0) {
+                        seen = true;
+                        break;
+                    }
+                    p = NativeMemory.Read<nint>(p);
+                }
+                if (!seen) {
+                    SyncBuf32 macBuf = new SyncBuf32();
+                    nint mac = NativeMemory.AddressOf(ref macBuf);
+                    NativeMemory.Write<byte>(mac, (byte)0);
+                    uint flags = NativeMemory.Read<uint>(it + (nint)16);
+                    int up = ((flags & SyncPlat.IFF_UP) != 0U && (flags & SyncPlat.IFF_RUNNING) != 0U) ? 1 : 0;
+
+                    SyncBuf2048 addrBuf = new SyncBuf2048();
+                    nint addrs = NativeMemory.AddressOf(ref addrBuf);
+                    NativeMemory.Write<byte>(addrs, (byte)0);
+                    ulong addrUsed = 0UL;
+
+                    nint q = list;
+                    while (q != (nint)0) {
+                        nint qname = NativeMemory.Read<nint>(q + (nint)8);
+                        nint qaddr = NativeMemory.Read<nint>(q + (nint)24);
+                        if (qname != (nint)0 && qaddr != (nint)0 && SyncPlat.CStrCmp(qname, name) == 0) {
+                            if (NativeMemory.Read<byte>(mac) == (byte)0) MacFromSockaddr(qaddr, mac, 32UL);
+                            SyncBuf64 txtBuf = new SyncBuf64();
+                            nint txt = NativeMemory.AddressOf(ref txtBuf);
+                            NativeMemory.Write<byte>(txt, (byte)0);
+#if MACOS
+                            int af = (int)NativeMemory.At<byte>(qaddr, 1L);
+#else
+                            int af = (int)NativeMemory.Read<ushort>(qaddr);
+#endif
+                            if (af == SyncPlat.AF_INET) {
+                                SyncPlat.PosixInetNtop(SyncPlat.AF_INET, qaddr + (nint)4, txt, 64U);
+                            } else if (af == SyncPlat.AF_INET6) {
+                                SyncPlat.PosixInetNtop(SyncPlat.AF_INET6, qaddr + (nint)8, txt, 64U);
+                            }
+                            if (NativeMemory.Read<byte>(txt) != (byte)0) {
+                                ulong tlen = SyncPlat.CStrLen(txt);
+                                if (addrUsed + tlen + 2UL < 2048UL) {
+                                    if (addrUsed > 0UL) addrUsed = SyncPlat.BufAppendChar(addrs, 2048UL, addrUsed, (byte)44); // ','
+                                    addrUsed = SyncPlat.BufAppendBytes(addrs, 2048UL, addrUsed, txt, tlen);
+                                }
+                            }
+                        }
+                        q = NativeMemory.Read<nint>(q);
+                    }
+
+                    uint idx = SyncPlat.PosixIfNametoindex(name);
+                    SyncBuf2048 lineBuf = new SyncBuf2048();
+                    nint lp = NativeMemory.AddressOf(ref lineBuf);
+                    ulong lpos = SyncPlat.BufAppendCStr(lp, 2048UL, 0UL, name);
+                    lpos = SyncPlat.BufAppendChar(lp, 2048UL, lpos, (byte)9);
+                    lpos = SyncPlat.BufAppendU64(lp, 2048UL, lpos, (ulong)idx);
+                    lpos = SyncPlat.BufAppendChar(lp, 2048UL, lpos, (byte)9);
+                    lpos = SyncPlat.BufAppendI64(lp, 2048UL, lpos, (long)up);
+                    lpos = SyncPlat.BufAppendChar(lp, 2048UL, lpos, (byte)9);
+                    lpos = SyncPlat.BufAppendCStr(lp, 2048UL, lpos, mac);
+                    lpos = SyncPlat.BufAppendChar(lp, 2048UL, lpos, (byte)9);
+                    lpos = SyncPlat.BufAppendCStr(lp, 2048UL, lpos, addrs);
+                    lpos = SyncPlat.BufAppendChar(lp, 2048UL, lpos, (byte)10);
+
+                    if (lpos >= PLAT_TEXT_MAX - used) break;
+                    SyncPlat.CMemcpy(outText + (nint)used, lp, lpos + 1UL);
+                    used += lpos;
+                }
+            }
+            it = NativeMemory.Read<nint>(it);
+        }
+        SyncPlat.PosixFreeifaddrs(list);
+        return outText;
+#endif
+    }
+
+    [Export("zan_plat_icmp_ping")]
+    public static int IcmpPing(nint address, int timeoutMs) {
+#if WINDOWS
+        return -3;
+#else
+        if (address == (nint)0 || NativeMemory.Read<byte>(address) == (byte)0) return -4;
+        SyncBuf16 dstBuf = new SyncBuf16();
+        nint dst = NativeMemory.AddressOf(ref dstBuf);
+        SyncPlat.CMemset(dst, 0, 16UL);
+#if MACOS
+        NativeMemory.At<byte>(dst, 0L) = (byte)16;
+        NativeMemory.At<byte>(dst, 1L) = (byte)SyncPlat.AF_INET;
+#else
+        NativeMemory.Write<ushort>(dst, (ushort)SyncPlat.AF_INET);
+#endif
+        if (SyncPlat.PosixInetPton(SyncPlat.AF_INET, address, dst + (nint)4) != 1) return -4;
+        if (timeoutMs < 0) timeoutMs = 0;
+
+        int fd = SyncPlat.PosixSocket(SyncPlat.AF_INET, SyncPlat.SOCK_DGRAM, SyncPlat.IPPROTO_ICMP);
+        bool datagram = fd >= 0;
+        if (fd < 0) fd = SyncPlat.PosixSocket(SyncPlat.AF_INET, SyncPlat.SOCK_RAW, SyncPlat.IPPROTO_ICMP);
+        if (fd < 0) return -3;
+
+        SyncBuf16 pktBuf = new SyncBuf16();
+        nint pkt = NativeMemory.AddressOf(ref pktBuf);
+        SyncPlat.CMemset(pkt, 0, 16UL);
+        NativeMemory.At<byte>(pkt, 0L) = (byte)8; // ICMP_ECHO
+        ushort ident = (ushort)(SyncPlat.PosixGetpid() & 0xFFFF);
+        NativeMemory.At<byte>(pkt, 4L) = (byte)(ident >> 8);
+        NativeMemory.At<byte>(pkt, 5L) = (byte)(ident & 0xFF);
+        NativeMemory.At<byte>(pkt, 6L) = (byte)0;
+        NativeMemory.At<byte>(pkt, 7L) = (byte)1;
+        SyncPlat.CMemcpy(pkt + (nint)8, (nint)"zan-ping", 8UL);
+        ushort sum = IcmpChecksum(pkt, 16UL);
+        NativeMemory.At<byte>(pkt, 2L) = (byte)(sum >> 8);
+        NativeMemory.At<byte>(pkt, 3L) = (byte)(sum & 0xFF);
+
+        long start = RtSyncTime.MonotonicUs();
+        if (SyncPlat.PosixSendto(fd, pkt, 16UL, 0, dst, 16U) < 0L) {
+            int err = SyncPlat.GetErrno();
+            SyncPlat.PosixClose(fd);
+            if (err == SyncPlat.EHOSTUNREACH || err == SyncPlat.ENETUNREACH) return -2;
+            return -3;
+        }
+
+        SyncBuf1024 replyBuf = new SyncBuf1024();
+        nint reply = NativeMemory.AddressOf(ref replyBuf);
+        SyncBuf16 fromBuf = new SyncBuf16();
+        nint from = NativeMemory.AddressOf(ref fromBuf);
+
+        while (true) {
+            long elapsedMs = (RtSyncTime.MonotonicUs() - start) / 1000L;
+            int remain = (int)((long)timeoutMs - elapsedMs);
+            if (remain <= 0) {
+                SyncPlat.PosixClose(fd);
+                return -1;
+            }
+            SyncBuf16 pfdBuf = new SyncBuf16();
+            nint pfd = NativeMemory.AddressOf(ref pfdBuf);
+            NativeMemory.Write<int>(pfd, fd);
+            NativeMemory.Write<short>(pfd + (nint)4, SyncPlat.POLLIN);
+            NativeMemory.Write<short>(pfd + (nint)6, (short)0);
+            int ready = SyncPlat.PosixPoll(pfd, 1UL, remain);
+            if (ready == 0) {
+                SyncPlat.PosixClose(fd);
+                return -1;
+            }
+            if (ready < 0) {
+                if (SyncPlat.GetErrno() == SyncPlat.EINTR) continue;
+                SyncPlat.PosixClose(fd);
+                return -3;
+            }
+            uint fromLen = 16U;
+            long got = SyncPlat.PosixRecvfrom(fd, reply, 1024UL, 0, from, NativeMemory.AddressOf(ref fromLen));
+            if (got < 0L) {
+                if (SyncPlat.GetErrno() == SyncPlat.EINTR) continue;
+                SyncPlat.PosixClose(fd);
+                return -3;
+            }
+            ulong off = 0UL;
+            if (!datagram) {
+                if (got < 20L) continue;
+                off = (ulong)((NativeMemory.At<byte>(reply, 0L) & 0x0F) * 4);
+                if ((ulong)got < off + 8UL) continue;
+            } else if (got < 8L) {
+                continue;
+            }
+            byte rtype = NativeMemory.At<byte>(reply, (long)off);
+            if (rtype == (byte)0) {
+                long rttMs = (RtSyncTime.MonotonicUs() - start) / 1000L;
+                SyncPlat.PosixClose(fd);
+                return rttMs > 0x7FFFFFFFL ? 0x7FFFFFFF : (int)rttMs;
+            }
+            if (rtype == (byte)3 || rtype == (byte)11) {
+                SyncPlat.PosixClose(fd);
+                return -2;
+            }
+        }
+#endif
+    }
+}
+
+static partial class RtSyncProc {
+    const int WAIT_OWNED_ERROR = -259;
+
+#if WINDOWS
+    static void WinBufAppend(nint buf, ulong cap, ref ulong len, nint s) {
+        if (s == (nint)0) return;
+        ulong slen = SyncPlat.CStrLen(s);
+        if (len + slen >= cap) return;
+        SyncPlat.CMemcpy(buf + (nint)len, s, slen);
+        len += slen;
+        NativeMemory.At<byte>(buf, (long)len) = (byte)0;
+    }
+
+    static void WinBufAppendByte(nint buf, ulong cap, ref ulong len, byte b) {
+        if (len + 1UL >= cap) return;
+        NativeMemory.At<byte>(buf, (long)len) = b;
+        len++;
+        NativeMemory.At<byte>(buf, (long)len) = (byte)0;
+    }
+
+    static void WinAppendArg(nint buf, ulong cap, ref ulong len, nint a) {
+        if (a == (nint)0 || NativeMemory.Read<byte>(a) == (byte)0) {
+            WinBufAppend(buf, cap, ref len, (nint)"\"\"");
+            return;
+        }
+        bool needQ = false;
+        long idx = 0L;
+        while (true) {
+            byte ch = NativeMemory.At<byte>(a, idx);
+            if (ch == (byte)0) break;
+            if (ch == (byte)32 || ch == (byte)9 || ch == (byte)34 || ch == (byte)10 || ch == (byte)13) {
+                needQ = true;
+                break;
+            }
+            idx++;
+        }
+        if (!needQ) {
+            WinBufAppend(buf, cap, ref len, a);
+            return;
+        }
+        WinBufAppendByte(buf, cap, ref len, (byte)34); // '"'
+        int bs = 0;
+        idx = 0L;
+        while (true) {
+            byte ch = NativeMemory.At<byte>(a, idx);
+            if (ch == (byte)0) break;
+            if (ch == (byte)92) { // '\\'
+                bs++;
+            } else if (ch == (byte)34) { // '"'
+                for (int b = 0; b < bs * 2 + 1; b++) WinBufAppendByte(buf, cap, ref len, (byte)92);
+                WinBufAppendByte(buf, cap, ref len, (byte)34);
+                bs = 0;
+            } else {
+                for (int b = 0; b < bs; b++) WinBufAppendByte(buf, cap, ref len, (byte)92);
+                bs = 0;
+                WinBufAppendByte(buf, cap, ref len, ch);
+            }
+            idx++;
+        }
+        for (int b = 0; b < bs * 2; b++) WinBufAppendByte(buf, cap, ref len, (byte)92);
+        WinBufAppendByte(buf, cap, ref len, (byte)34);
+    }
+
+    static nint WinQuoteCmdline(nint exe, nint args, int argc) {
+        ulong cap = 256UL;
+        for (int i = 0; i < argc; i++) {
+            nint a = NativeMemory.At<nint>(args, (long)i);
+            if (a != (nint)0) cap += SyncPlat.CStrLen(a) * 2UL + 8UL;
+        }
+        if (exe != (nint)0) cap += SyncPlat.CStrLen(exe) * 2UL + 8UL;
+        nint buf = SyncPlat.CMalloc(cap);
+        if (buf == (nint)0) return (nint)0;
+        NativeMemory.Write<byte>(buf, (byte)0);
+        ulong len = 0UL;
+        WinAppendArg(buf, cap, ref len, exe);
+        for (int i = 0; i < argc; i++) {
+            WinBufAppendByte(buf, cap, ref len, (byte)32);
+            WinAppendArg(buf, cap, ref len, NativeMemory.At<nint>(args, (long)i));
+        }
+        return buf;
+    }
+#else
+    static bool WIfExited(int st) { return (st & 0x7F) == 0; }
+    static int WExitStatus(int st) { return (st >> 8) & 0xFF; }
+    static int WTermSig(int st) { return st & 0x7F; }
+    static bool WIfSignaled(int st) { int sig = st & 0x7F; return sig != 0 && sig != 0x7F; }
+
+    static void SleepUs(long us) {
+        SyncBuf16 ts = new SyncBuf16();
+        nint tp = NativeMemory.AddressOf(ref ts);
+        NativeMemory.Write<long>(tp, 0L);
+        NativeMemory.Write<long>(tp + (nint)8, us * 1000L);
+        SyncPlat.PosixNanosleep(tp, (nint)0);
+    }
+
+    static void CloseFdPtr(nint fdPtr) {
+        int fd = NativeMemory.Read<int>(fdPtr);
+        if (fd >= 0) SyncPlat.PosixClose(fd);
+        NativeMemory.Write<int>(fdPtr, -1);
+    }
+
+    static int LaunchPipe(nint fds) {
+#if MACOS
+        if (SyncPlat.PosixPipe(fds) < 0) return -1;
+        for (int i = 0; i < 2; i++) {
+            int fd = NativeMemory.At<int>(fds, (long)i);
+            if (SyncPlat.PosixFcntl(fd, SyncPlat.F_SETFD, SyncPlat.FD_CLOEXEC) < 0) {
+                SyncPlat.PosixClose(NativeMemory.At<int>(fds, 0L));
+                SyncPlat.PosixClose(NativeMemory.At<int>(fds, 1L));
+                return -1;
+            }
+        }
+#else
+        if (SyncPlat.PosixPipe2(fds, SyncPlat.O_CLOEXEC) < 0) return -1;
+#endif
+        for (int i = 0; i < 2; i++) {
+            int fd = NativeMemory.At<int>(fds, (long)i);
+            if (fd >= 3) continue;
+            int moved = SyncPlat.PosixFcntl(fd, SyncPlat.F_DUPFD_CLOEXEC, 3);
+            if (moved < 0) {
+                SyncPlat.PosixClose(NativeMemory.At<int>(fds, 0L));
+                SyncPlat.PosixClose(NativeMemory.At<int>(fds, 1L));
+                return -1;
+            }
+            SyncPlat.PosixClose(fd);
+            NativeMemory.At<int>(fds, (long)i) = moved;
+        }
+        return 0;
+    }
+
+    static void SpawnExec(nint argv, nint path, nint candidate, nint env) {
+        nint exe = NativeMemory.At<nint>(argv, 0L);
+        if (path == (nint)0) {
+            if (env != (nint)0) SyncPlat.PosixExecve(exe, argv, env);
+            else SyncPlat.PosixExecv(exe, argv);
+            return;
+        }
+        ulong exeLen = SyncPlat.CStrLen(exe) + 1UL;
+        nint dir = path;
+        while (true) {
+            ulong len = SyncPlat.CStrCSpn(dir, (nint)":");
+            nint file = exe;
+            if (len > 0UL) {
+                SyncPlat.CMemcpy(candidate, dir, len);
+                NativeMemory.At<byte>(candidate, (long)len) = (byte)47; // '/'
+                SyncPlat.CMemcpy(candidate + (nint)(len + 1UL), exe, exeLen);
+                file = candidate;
+            }
+            if (env != (nint)0) SyncPlat.PosixExecve(file, argv, env);
+            else SyncPlat.PosixExecv(file, argv);
+            int err = SyncPlat.GetErrno();
+            if (err != SyncPlat.ENOENT && err != SyncPlat.ENOTDIR && err != SyncPlat.EACCES) return;
+            if (NativeMemory.At<byte>(dir, (long)len) == (byte)0) return;
+            dir = dir + (nint)(len + 1UL);
+        }
+    }
+
+    // ---- Linux strict sandbox (cgroup v2 + Landlock ABI 6 + seccomp-BPF) ----
+    // zan_proc_sandbox_group layout (24 bytes):
+    //  0: int dir
+    //  4: int join
+    //  8: int kill
+    // 12: int events
+    // 16: nint path
+    const long SBG_DIR = 0L;
+    const long SBG_JOIN = 4L;
+    const long SBG_KILL = 8L;
+    const long SBG_EVENTS = 12L;
+    const long SBG_PATH = 16L;
+    const ulong SBG_SIZE = 24UL;
+
+    const long LANDLOCK_ABI = 6L;
+    const ulong LANDLOCK_CREATE_RULESET_VERSION = 1UL;
+    const ulong LANDLOCK_RULE_PATH_BENEATH = 1UL;
+
+    const ulong LL_FS_EXECUTE = 1UL << 0;
+    const ulong LL_FS_WRITE_FILE = 1UL << 1;
+    const ulong LL_FS_READ_FILE = 1UL << 2;
+    const ulong LL_FS_READ_DIR = 1UL << 3;
+    const ulong LL_FS_REMOVE_DIR = 1UL << 4;
+    const ulong LL_FS_REMOVE_FILE = 1UL << 5;
+    const ulong LL_FS_MAKE_CHAR = 1UL << 6;
+    const ulong LL_FS_MAKE_DIR = 1UL << 7;
+    const ulong LL_FS_MAKE_REG = 1UL << 8;
+    const ulong LL_FS_MAKE_SOCK = 1UL << 9;
+    const ulong LL_FS_MAKE_FIFO = 1UL << 10;
+    const ulong LL_FS_MAKE_BLOCK = 1UL << 11;
+    const ulong LL_FS_MAKE_SYM = 1UL << 12;
+    const ulong LL_FS_TRUNCATE = 1UL << 14;
+    const ulong LL_FS_IOCTL_DEV = 1UL << 15;
+    const ulong LL_SCOPE_SIGNAL = 1UL << 1;
+
+    static int SandboxWrite(int fd, nint text, ulong size) {
+        long n = -1L;
+        while (true) {
+            n = SyncPlat.PosixWrite(fd, text, size);
+            if (n < 0L && SyncPlat.GetErrno() == SyncPlat.EINTR) continue;
+            break;
+        }
+        return n == (long)size ? 0 : -1;
+    }
+
+    static int SandboxController(int dir, nint key, nint val) {
+        int fd = SyncPlat.PosixOpenat(dir, key, SyncPlat.O_WRONLY | SyncPlat.O_CLOEXEC, 0U);
+        if (fd < 0) return -1;
+        int rc = SandboxWrite(fd, val, SyncPlat.CStrLen(val));
+        SyncPlat.PosixClose(fd);
+        return rc;
+    }
+
+    static bool SandboxGroupEmpty(nint grp) {
+        SyncBuf256 evBuf = new SyncBuf256();
+        nint ev = NativeMemory.AddressOf(ref evBuf);
+        long n = -1L;
+        int evFd = NativeMemory.Read<int>(grp + (nint)SBG_EVENTS);
+        while (true) {
+            n = SyncPlat.PosixPread(evFd, ev, 255UL, 0L);
+            if (n < 0L && SyncPlat.GetErrno() == SyncPlat.EINTR) continue;
+            break;
+        }
+        if (n <= 0L) return false;
+        NativeMemory.At<byte>(ev, n) = (byte)0;
+        return SyncPlat.CStrStr(ev, (nint)"populated 0\n") != (nint)0;
+    }
+
+    static bool SandboxGroupRemove(nint grp) {
+        nint p = NativeMemory.Read<nint>(grp + (nint)SBG_PATH);
+        return SyncPlat.PosixRmdir(p) == 0 || SyncPlat.GetErrno() == SyncPlat.ENOENT;
+    }
+
+    static void SandboxGroupFree(nint grp) {
+        CloseFdPtr(grp + (nint)SBG_JOIN);
+        CloseFdPtr(grp + (nint)SBG_KILL);
+        CloseFdPtr(grp + (nint)SBG_EVENTS);
+        CloseFdPtr(grp + (nint)SBG_DIR);
+        SyncPlat.CFree(NativeMemory.Read<nint>(grp + (nint)SBG_PATH));
+        SyncPlat.CFree(grp);
+    }
+
+    static bool SandboxCgroupRoot(nint root) {
+#if MACOS
+        return false;
+#else
+        if (root == (nint)0 || NativeMemory.Read<byte>(root) != (byte)47) return false;
+        SyncBuf128 sfs = new SyncBuf128();
+        nint sp = NativeMemory.AddressOf(ref sfs);
+        if (SyncPlat.PosixStatfs(root, sp) != 0) return false;
+        return NativeMemory.Read<long>(sp) == SyncPlat.CGROUP2_SUPER_MAGIC &&
+               SyncPlat.PosixAccess(root, SyncPlat.W_OK_X_OK) == 0;
+#endif
+    }
+
+    static nint SandboxGroupCreate(nint root) {
+        if (!SandboxCgroupRoot(root)) return (nint)0;
+        ulong rlen = SyncPlat.CStrLen(root);
+        nint grp = SyncPlat.CMalloc(SBG_SIZE);
+        if (grp == (nint)0) return (nint)0;
+        NativeMemory.Write<int>(grp + (nint)SBG_DIR, -1);
+        NativeMemory.Write<int>(grp + (nint)SBG_JOIN, -1);
+        NativeMemory.Write<int>(grp + (nint)SBG_KILL, -1);
+        NativeMemory.Write<int>(grp + (nint)SBG_EVENTS, -1);
+        nint path = SyncPlat.CMalloc(rlen + 16UL);
+        if (path == (nint)0) {
+            SyncPlat.CFree(grp);
+            return (nint)0;
+        }
+        SyncPlat.CMemcpy(path, root, rlen);
+        SyncPlat.CMemcpy(path + (nint)rlen, (nint)"/zan-mcp-XXXXXX", 16UL);
+        if (SyncPlat.PosixMkdtemp(path) == (nint)0) {
+            SyncPlat.CFree(path);
+            SyncPlat.CFree(grp);
+            return (nint)0;
+        }
+        NativeMemory.Write<nint>(grp + (nint)SBG_PATH, path);
+        int dir = SyncPlat.PosixOpen3(path, SyncPlat.O_DIRECTORY | SyncPlat.O_RDONLY | SyncPlat.O_CLOEXEC, 0U);
+        NativeMemory.Write<int>(grp + (nint)SBG_DIR, dir);
+        if (dir < 0 ||
+            SandboxController(dir, (nint)"cpu.max", (nint)"100000 100000") != 0 ||
+            SandboxController(dir, (nint)"memory.max", (nint)"1073741824") != 0 ||
+            SandboxController(dir, (nint)"memory.swap.max", (nint)"0") != 0 ||
+            SandboxController(dir, (nint)"pids.max", (nint)"64") != 0) {
+            SandboxGroupRemove(grp);
+            SandboxGroupFree(grp);
+            return (nint)0;
+        }
+        int killFd = SyncPlat.PosixOpenat(dir, (nint)"cgroup.kill", SyncPlat.O_WRONLY | SyncPlat.O_CLOEXEC, 0U);
+        int evFd = SyncPlat.PosixOpenat(dir, (nint)"cgroup.events", SyncPlat.O_RDONLY | SyncPlat.O_CLOEXEC, 0U);
+        int joinFd = SyncPlat.PosixOpenat(dir, (nint)"cgroup.procs", SyncPlat.O_WRONLY | SyncPlat.O_CLOEXEC, 0U);
+        NativeMemory.Write<int>(grp + (nint)SBG_KILL, killFd);
+        NativeMemory.Write<int>(grp + (nint)SBG_EVENTS, evFd);
+        NativeMemory.Write<int>(grp + (nint)SBG_JOIN, joinFd);
+        if (killFd < 0 || evFd < 0 || joinFd < 0) {
+            SandboxGroupRemove(grp);
+            SandboxGroupFree(grp);
+            return (nint)0;
+        }
+        return grp;
+    }
+
+#if !MACOS
+    static int SandboxPathRule(int ruleset, nint path, ulong access) {
+        int fd = SyncPlat.PosixOpen3(path, SyncPlat.O_PATH | SyncPlat.O_CLOEXEC, 0U);
+        if (fd < 0) return -1;
+        SyncBuf160 stBuf = new SyncBuf160();
+        nint st = NativeMemory.AddressOf(ref stBuf);
+        int rc = SyncPlat.PosixFstat(fd, st);
+        if (rc == 0) {
+#if X86_64
+            uint mode = NativeMemory.Read<uint>(st + (nint)24);
+#else
+            uint mode = NativeMemory.Read<uint>(st + (nint)16);
+#endif
+            // S_IFMT = 0xF000, S_IFDIR = 0x4000
+            if ((mode & 0xF000U) != 0x4000U) {
+                access &= LL_FS_EXECUTE | LL_FS_READ_FILE | LL_FS_WRITE_FILE | LL_FS_TRUNCATE | LL_FS_IOCTL_DEV;
+            }
+            // packed struct landlock_path_beneath_attr: allowed_access (u64) @ 0, parent_fd (i32) @ 8
+            SyncBuf16 ruleBuf = new SyncBuf16();
+            nint rp = NativeMemory.AddressOf(ref ruleBuf);
+            NativeMemory.Write<ulong>(rp, access);
+            NativeMemory.Write<int>(rp + (nint)8, fd);
+            rc = (int)SyncPlat.PosixSyscall4(SyncPlat.SYS_LANDLOCK_ADD_RULE, (ulong)ruleset,
+                                             LANDLOCK_RULE_PATH_BENEATH, (ulong)rp, 0UL);
+        }
+        SyncPlat.PosixClose(fd);
+        return rc;
+    }
+
+    static int SandboxRuleset(nint readRoots, nint writeRoot) {
+        if (readRoots == (nint)0 || NativeMemory.Read<byte>(readRoots) == (byte)0 ||
+            writeRoot == (nint)0 || NativeMemory.Read<byte>(writeRoot) != (byte)47) {
+            return -1;
+        }
+        ulong rd = LL_FS_EXECUTE | LL_FS_READ_FILE | LL_FS_READ_DIR;
+        ulong wr = LL_FS_WRITE_FILE | LL_FS_REMOVE_DIR | LL_FS_REMOVE_FILE | LL_FS_MAKE_DIR |
+                   LL_FS_MAKE_REG | LL_FS_MAKE_SYM | LL_FS_MAKE_FIFO | LL_FS_TRUNCATE;
+        SyncBuf24 polBuf = new SyncBuf24();
+        nint pp = NativeMemory.AddressOf(ref polBuf);
+        NativeMemory.Write<ulong>(pp, rd | wr | LL_FS_MAKE_CHAR | LL_FS_MAKE_BLOCK | LL_FS_MAKE_SOCK | LL_FS_IOCTL_DEV);
+        NativeMemory.Write<ulong>(pp + (nint)8, 0UL);
+        NativeMemory.Write<ulong>(pp + (nint)16, LL_SCOPE_SIGNAL);
+        int ruleset = (int)SyncPlat.PosixSyscall3(SyncPlat.SYS_LANDLOCK_CREATE_RULESET, (ulong)pp, 24UL, 0UL);
+        if (ruleset < 0) return -1;
+
+        nint roots = SyncPlat.StrDup(readRoots);
+        if (roots == (nint)0) {
+            SyncPlat.PosixClose(ruleset);
+            return -1;
+        }
+        bool ok = true;
+        nint cur = roots;
+        while (true) {
+            nint nl = SyncPlat.CStrChr(cur, 10);
+            if (nl != (nint)0) NativeMemory.Write<byte>(nl, (byte)0);
+            if (NativeMemory.Read<byte>(cur) != (byte)47 || SandboxPathRule(ruleset, cur, rd) < 0) {
+                ok = false;
+                break;
+            }
+            if (nl == (nint)0) break;
+            cur = nl + (nint)1;
+        }
+        if (ok) {
+            if (SandboxPathRule(ruleset, writeRoot, rd | wr) < 0 ||
+                SandboxPathRule(ruleset, (nint)"/dev/null", LL_FS_READ_FILE | LL_FS_WRITE_FILE) < 0) {
+                ok = false;
+            }
+        }
+        SyncPlat.CFree(roots);
+        if (!ok) {
+            SyncPlat.PosixClose(ruleset);
+            return -1;
+        }
+        return ruleset;
+    }
+
+    static void BpfEmit(nint arr, ref int idx, ushort code, byte jt, byte jf, uint k) {
+        nint ins = arr + (nint)((long)idx * 8L);
+        NativeMemory.Write<ushort>(ins, code);
+        NativeMemory.At<byte>(ins, 2L) = jt;
+        NativeMemory.At<byte>(ins, 3L) = jf;
+        NativeMemory.Write<uint>(ins + (nint)4, k);
+        idx++;
+    }
+
+    static void BpfDeny(nint arr, ref int idx, uint nr, uint err) {
+        BpfEmit(arr, ref idx, 0x15, (byte)0, (byte)1, nr);
+        BpfEmit(arr, ref idx, 0x06, (byte)0, (byte)0, 0x00050000U | err);
+    }
+
+    static int SandboxFilter() {
+        // Up to 32 sock_filter instructions * 8 bytes = 256 bytes
+        SyncBuf256 fBuf = new SyncBuf256();
+        nint fp = NativeMemory.AddressOf(ref fBuf);
+        int n = 0;
+        // Load arch (offset 4)
+        BpfEmit(fp, ref n, 0x20, (byte)0, (byte)0, 4U);
+#if ARM64
+        BpfEmit(fp, ref n, 0x15, (byte)1, (byte)0, 0xC00000B7U); // AUDIT_ARCH_AARCH64
+        BpfEmit(fp, ref n, 0x06, (byte)0, (byte)0, 0x80000000U); // SECCOMP_RET_KILL_PROCESS
+        // Load nr (offset 0)
+        BpfEmit(fp, ref n, 0x20, (byte)0, (byte)0, 0U);
+        // Deny list (Linux aarch64 asm-generic syscall numbers)
+        BpfDeny(fp, ref n, 198U, (uint)SyncPlat.EPERM);  // socket
+        BpfDeny(fp, ref n, 199U, (uint)SyncPlat.EPERM);  // socketpair
+        BpfDeny(fp, ref n, 117U, (uint)SyncPlat.EPERM);  // ptrace
+        BpfDeny(fp, ref n, 270U, (uint)SyncPlat.EPERM);  // process_vm_readv
+        BpfDeny(fp, ref n, 271U, (uint)SyncPlat.EPERM);  // process_vm_writev
+        BpfDeny(fp, ref n, 97U,  (uint)SyncPlat.EPERM);  // unshare
+        BpfDeny(fp, ref n, 268U, (uint)SyncPlat.EPERM);  // setns
+        BpfDeny(fp, ref n, 438U, (uint)SyncPlat.EPERM);  // pidfd_getfd
+        BpfDeny(fp, ref n, 425U, (uint)SyncPlat.EPERM);  // io_uring_setup
+        BpfDeny(fp, ref n, 435U, 38U);                   // clone3 -> ENOSYS
+        // clone (220) with CLONE_NEW* (0x7e020080) -> EPERM
+        BpfEmit(fp, ref n, 0x15, (byte)0, (byte)3, 220U);
+#else
+        BpfEmit(fp, ref n, 0x15, (byte)1, (byte)0, 0xC000003EU); // AUDIT_ARCH_X86_64
+        BpfEmit(fp, ref n, 0x06, (byte)0, (byte)0, 0x80000000U); // SECCOMP_RET_KILL_PROCESS
+        // Load nr (offset 0), kill x32 ABI (>= 0x40000000)
+        BpfEmit(fp, ref n, 0x20, (byte)0, (byte)0, 0U);
+        BpfEmit(fp, ref n, 0x35, (byte)0, (byte)1, 0x40000000U);
+        BpfEmit(fp, ref n, 0x06, (byte)0, (byte)0, 0x80000000U);
+        // Deny list (Linux x86_64 syscall numbers)
+        BpfDeny(fp, ref n, 41U, (uint)SyncPlat.EPERM);   // socket
+        BpfDeny(fp, ref n, 53U, (uint)SyncPlat.EPERM);   // socketpair
+        BpfDeny(fp, ref n, 101U, (uint)SyncPlat.EPERM);  // ptrace
+        BpfDeny(fp, ref n, 310U, (uint)SyncPlat.EPERM);  // process_vm_readv
+        BpfDeny(fp, ref n, 311U, (uint)SyncPlat.EPERM);  // process_vm_writev
+        BpfDeny(fp, ref n, 272U, (uint)SyncPlat.EPERM);  // unshare
+        BpfDeny(fp, ref n, 308U, (uint)SyncPlat.EPERM);  // setns
+        BpfDeny(fp, ref n, 438U, (uint)SyncPlat.EPERM);  // pidfd_getfd
+        BpfDeny(fp, ref n, 425U, (uint)SyncPlat.EPERM);  // io_uring_setup
+        BpfDeny(fp, ref n, 435U, 38U);                   // clone3 -> ENOSYS
+        // clone (56) with CLONE_NEW* (0x7e020080) -> EPERM
+        BpfEmit(fp, ref n, 0x15, (byte)0, (byte)3, 56U);
+#endif
+        BpfEmit(fp, ref n, 0x20, (byte)0, (byte)0, 16U); // args[0]
+        BpfEmit(fp, ref n, 0x45, (byte)0, (byte)1, 0x7E020080U);
+        BpfEmit(fp, ref n, 0x06, (byte)0, (byte)0, 0x00050000U | (uint)SyncPlat.EPERM);
+        // Allow
+        BpfEmit(fp, ref n, 0x06, (byte)0, (byte)0, 0x7FFF0000U); // SECCOMP_RET_ALLOW
+
+        SyncBuf16 progBuf = new SyncBuf16();
+        nint pp = NativeMemory.AddressOf(ref progBuf);
+        SyncPlat.CMemset(pp, 0, 16UL);
+        NativeMemory.Write<ushort>(pp, (ushort)n);
+        NativeMemory.Write<nint>(pp + (nint)8, fp);
+        return SyncPlat.PosixPrctl(SyncPlat.PR_SET_SECCOMP, (ulong)SyncPlat.SECCOMP_MODE_FILTER, (ulong)pp, 0UL, 0UL);
+    }
+
+    static bool SandboxUnprivileged() {
+        if (SyncPlat.PosixGetuid() == 0U || SyncPlat.PosixGeteuid() == 0U) return false;
+        SyncBuf16 hdrBuf = new SyncBuf16();
+        nint hp = NativeMemory.AddressOf(ref hdrBuf);
+        NativeMemory.Write<uint>(hp, 0x20080522U); // _LINUX_CAPABILITY_VERSION_3
+        NativeMemory.Write<int>(hp + (nint)4, 0);
+        SyncBuf32 capBuf = new SyncBuf32();
+        nint cp = NativeMemory.AddressOf(ref capBuf);
+        SyncPlat.CMemset(cp, 0, 32UL);
+        if (SyncPlat.PosixSyscall2(SyncPlat.SYS_CAPGET, hp, cp) != 0L) return false;
+        return NativeMemory.Read<uint>(cp + (nint)4) == 0U && NativeMemory.Read<uint>(cp + (nint)16) == 0U;
+    }
+
+    static int SandboxEnter(nint grp, int ruleset, int launchFd) {
+        int joinFd = NativeMemory.Read<int>(grp + (nint)SBG_JOIN);
+        if (SandboxWrite(joinFd, (nint)"0", 1UL) != 0 ||
+            SyncPlat.PosixPrctl(SyncPlat.PR_SET_NO_NEW_PRIVS, 1UL, 0UL, 0UL, 0UL) != 0 ||
+            SyncPlat.PosixSyscall2(SyncPlat.SYS_LANDLOCK_RESTRICT_SELF, (nint)ruleset, (nint)0) != 0L) {
+            return -1;
+        }
+        if ((launchFd > 3 && SyncPlat.PosixSyscall3(SyncPlat.SYS_CLOSE_RANGE, 3UL, (ulong)(launchFd - 1), 0UL) != 0L) ||
+            SyncPlat.PosixSyscall3(SyncPlat.SYS_CLOSE_RANGE, (ulong)(launchFd + 1), 0xFFFFFFFFUL, 0UL) != 0L) {
+            return -1;
+        }
+        return SandboxFilter();
+    }
+#else
+    static int SandboxRuleset(nint readRoots, nint writeRoot) { return -1; }
+    static int SandboxEnter(nint grp, int ruleset, int launchFd) { return -1; }
+#endif
+
+    static int ProcSpawnCore(nint argv, nint cwd, nint fds, bool managed, nint sandboxGroup, int ruleset) {
+        if (argv == (nint)0 || fds == (nint)0) return -1;
+        nint argv0 = NativeMemory.At<nint>(argv, 0L);
+        if (argv0 == (nint)0 || NativeMemory.Read<byte>(argv0) == (byte)0) return -1;
+
+        nint path = (nint)0;
+        nint candidate = (nint)0;
+        int result = -1;
+        // 3 pipes * 2 ints = 6 ints = 24 bytes
+        SyncBuf32 pipesBuf = new SyncBuf32();
+        nint pipes = NativeMemory.AddressOf(ref pipesBuf);
+        int opened = 0;
+
+        bool setupOk = true;
+        if (SyncPlat.CStrChr(argv0, 47) == (nint)0) { // '/'
+            nint envPath = sandboxGroup != (nint)0 ? (nint)"/usr/bin:/bin" : SyncPlat.CGetenv((nint)"PATH");
+            path = SyncPlat.StrDup(envPath != (nint)0 ? envPath : (nint)"/bin:/usr/bin");
+            if (path == (nint)0) setupOk = false;
+            if (setupOk) {
+                candidate = SyncPlat.CMalloc(SyncPlat.CStrLen(path) + SyncPlat.CStrLen(argv0) + 2UL);
+                if (candidate == (nint)0) setupOk = false;
+            }
+        }
+        if (setupOk) {
+            while (opened < 3) {
+                if (LaunchPipe(pipes + (nint)((long)opened * 8L)) < 0) {
+                    setupOk = false;
+                    break;
+                }
+                opened++;
+            }
+        }
+
+        nint inPipe = pipes;
+        nint outPipe = pipes + (nint)8;
+        nint launchPipe = pipes + (nint)16;
+        if (setupOk) {
+            int outRd = NativeMemory.At<int>(outPipe, 0L);
+            int fl = SyncPlat.PosixFcntl(outRd, SyncPlat.F_GETFL, 0);
+            if (fl < 0 || SyncPlat.PosixFcntl(outRd, SyncPlat.F_SETFL, fl | SyncPlat.O_NONBLOCK) < 0) {
+                setupOk = false;
+            }
+        }
+
+        if (setupOk) {
+            int pid = SyncPlat.PosixFork();
+            if (pid == 0) {
+                SyncPlat.PosixClose(NativeMemory.At<int>(launchPipe, 0L));
+                int inRd = NativeMemory.At<int>(inPipe, 0L);
+                int inWr = NativeMemory.At<int>(inPipe, 1L);
+                int outRd = NativeMemory.At<int>(outPipe, 0L);
+                int outWr = NativeMemory.At<int>(outPipe, 1L);
+                int launchWr = NativeMemory.At<int>(launchPipe, 1L);
+                if ((!managed || SyncPlat.PosixSetpgid(0, 0) == 0) &&
+                    (cwd == (nint)0 || NativeMemory.Read<byte>(cwd) == (byte)0 || SyncPlat.PosixChdir(cwd) == 0) &&
+                    SyncPlat.PosixDup2(inRd, 0) >= 0 &&
+                    SyncPlat.PosixDup2(outWr, 1) >= 0 &&
+                    SyncPlat.PosixDup2(outWr, 2) >= 0) {
+                    SyncPlat.PosixClose(inRd);
+                    SyncPlat.PosixClose(inWr);
+                    SyncPlat.PosixClose(outRd);
+                    SyncPlat.PosixClose(outWr);
+                    if (sandboxGroup != (nint)0) {
+                        if (SandboxEnter(sandboxGroup, ruleset, launchWr) == 0) {
+                            SyncBuf32 envBuf = new SyncBuf32();
+                            nint ep = NativeMemory.AddressOf(ref envBuf);
+                            NativeMemory.At<nint>(ep, 0L) = (nint)"PATH=/usr/bin:/bin";
+                            NativeMemory.At<nint>(ep, 1L) = (nint)"LANG=C";
+                            NativeMemory.At<nint>(ep, 2L) = (nint)"TMPDIR=.";
+                            NativeMemory.At<nint>(ep, 3L) = (nint)0;
+                            SpawnExec(argv, path, candidate, ep);
+                        }
+                    } else {
+                        SpawnExec(argv, path, candidate, (nint)0);
+                    }
+                }
+                byte failedByte = (byte)1;
+                while (SyncPlat.PosixWrite(launchWr, NativeMemory.AddressOf(ref failedByte), 1UL) < 0L &&
+                       SyncPlat.GetErrno() == SyncPlat.EINTR) {
+                }
+                SyncPlat.PosixExit(127);
+            } else if (pid > 0) {
+                CloseFdPtr(inPipe);
+                CloseFdPtr(outPipe + (nint)4);
+                CloseFdPtr(launchPipe + (nint)4);
+                byte failedByte = (byte)0;
+                long received = -1L;
+                int launchRd = NativeMemory.At<int>(launchPipe, 0L);
+                while (true) {
+                    received = SyncPlat.PosixRead(launchRd, NativeMemory.AddressOf(ref failedByte), 1UL);
+                    if (received < 0L && SyncPlat.GetErrno() == SyncPlat.EINTR) continue;
+                    break;
+                }
+                if (received == 0L) {
+                    NativeMemory.At<int>(fds, 0L) = NativeMemory.At<int>(inPipe, 1L);
+                    NativeMemory.At<int>(fds, 1L) = NativeMemory.At<int>(outPipe, 0L);
+                    NativeMemory.At<int>(inPipe, 1L) = -1;
+                    NativeMemory.At<int>(outPipe, 0L) = -1;
+                    result = pid;
+                } else {
+                    if (received < 0L) {
+                        if (managed) SyncPlat.PosixKill(-pid, SyncPlat.SIGKILL);
+                        SyncPlat.PosixKill(pid, SyncPlat.SIGKILL);
+                    }
+                    while (SyncPlat.PosixWaitpid(pid, (nint)0, 0) < 0 && SyncPlat.GetErrno() == SyncPlat.EINTR) {
+                    }
+                }
+            }
+        }
+
+        for (int i = 0; i < opened; i++) {
+            CloseFdPtr(pipes + (nint)((long)i * 8L));
+            CloseFdPtr(pipes + (nint)((long)i * 8L + 4L));
+        }
+        SyncPlat.CFree(candidate);
+        SyncPlat.CFree(path);
+        return result;
+    }
+
+    static bool ProcSignalGroup(int pid) {
+        return SyncPlat.PosixKill(-pid, SyncPlat.SIGKILL) == 0 || SyncPlat.GetErrno() == SyncPlat.ESRCH;
+    }
+
+    static int ProcWaitCore(int pid, int timeoutMs, bool managed) {
+        if (pid <= 0) return -1;
+        long deadline = timeoutMs > 0 ? RtSyncTime.MonotonicUs() + (long)timeoutMs * 1000L : 0L;
+        while (true) {
+            int status = 0;
+            int flags = deadline != 0L ? SyncPlat.WNOHANG : 0;
+            bool needDelay = false;
+            if (managed) {
+                SyncBuf128 infoBuf = new SyncBuf128();
+                nint ip = NativeMemory.AddressOf(ref infoBuf);
+                SyncPlat.CMemset(ip, 0, 128UL);
+                if (SyncPlat.PosixWaitid(SyncPlat.P_PID, (uint)pid, ip, SyncPlat.WEXITED | SyncPlat.WNOWAIT | flags) < 0) {
+                    int err = SyncPlat.GetErrno();
+                    if (err == SyncPlat.EINTR) {
+                        needDelay = true;
+                    } else {
+                        return err == SyncPlat.ECHILD ? -1 : WAIT_OWNED_ERROR;
+                    }
+                } else if (NativeMemory.Read<int>(ip + (nint)16) == 0) { // si_pid @ 16
+                    needDelay = true;
+                } else {
+                    if (!ProcSignalGroup(pid)) return WAIT_OWNED_ERROR;
+                    flags = 0;
+                }
+            }
+            if (!needDelay) {
+                int waited = SyncPlat.PosixWaitpid(pid, NativeMemory.AddressOf(ref status), flags);
+                if (waited == pid) {
+                    if (WIfExited(status)) return WExitStatus(status);
+                    if (WIfSignaled(status)) return 128 + WTermSig(status);
+                }
+                if (waited < 0) {
+                    int err = SyncPlat.GetErrno();
+                    if (err != SyncPlat.EINTR) {
+                        return (managed && err != SyncPlat.ECHILD) ? WAIT_OWNED_ERROR : -1;
+                    }
+                }
+            }
+            if (deadline == 0L) continue;
+            long left = deadline - RtSyncTime.MonotonicUs();
+            if (left <= 0L) return -258;
+            SleepUs(left < 1000L ? left : 1000L);
+        }
+    }
+
+    static int LaunchDetached(nint exe, nint argv, nint logPath) {
+        SyncBuf16 lpBuf = new SyncBuf16();
+        nint lp = NativeMemory.AddressOf(ref lpBuf);
+        if (LaunchPipe(lp) < 0) return -1;
+        int lpRd = NativeMemory.At<int>(lp, 0L);
+        int lpWr = NativeMemory.At<int>(lp, 1L);
+        int pid = SyncPlat.PosixFork();
+        if (pid < 0) {
+            SyncPlat.PosixClose(lpRd);
+            SyncPlat.PosixClose(lpWr);
+            return -1;
+        }
+        if (pid == 0) {
+            SyncPlat.PosixClose(lpRd);
+            if (SyncPlat.PosixSetsid() >= 0) {
+                int gc = SyncPlat.PosixFork();
+                if (gc > 0) {
+                    SyncPlat.PosixClose(lpWr);
+                    SyncPlat.PosixExit(0);
+                } else if (gc == 0) {
+                    int inp = SyncPlat.PosixOpen3((nint)"/dev/null", SyncPlat.O_RDONLY, 0U);
+                    if (inp >= 0) {
+                        int ok = SyncPlat.PosixDup2(inp, 0);
+                        if (inp > 2) SyncPlat.PosixClose(inp);
+                        if (ok >= 0) {
+                            int outp = (logPath != (nint)0 && NativeMemory.Read<byte>(logPath) != (byte)0)
+                                ? SyncPlat.PosixOpen3(logPath, SyncPlat.O_WRONLY | SyncPlat.O_CREAT | SyncPlat.O_APPEND, 0x1A4U) // 0644
+                                : SyncPlat.PosixOpen3((nint)"/dev/null", SyncPlat.O_WRONLY, 0U);
+                            if (outp >= 0) {
+                                int o1 = SyncPlat.PosixDup2(outp, 1);
+                                int o2 = SyncPlat.PosixDup2(outp, 2);
+                                if (outp > 2) SyncPlat.PosixClose(outp);
+                                if (o1 >= 0 && o2 >= 0) {
+                                    SyncPlat.PosixExecvp(exe, argv);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            byte fb = (byte)1;
+            while (SyncPlat.PosixWrite(lpWr, NativeMemory.AddressOf(ref fb), 1UL) < 0L &&
+                   SyncPlat.GetErrno() == SyncPlat.EINTR) {
+            }
+            SyncPlat.PosixExit(127);
+        }
+        SyncPlat.PosixClose(lpWr);
+        byte fb2 = (byte)0;
+        long res = -1L;
+        while (true) {
+            res = SyncPlat.PosixRead(lpRd, NativeMemory.AddressOf(ref fb2), 1UL);
+            if (res < 0L && SyncPlat.GetErrno() == SyncPlat.EINTR) continue;
+            break;
+        }
+        SyncPlat.PosixClose(lpRd);
+        int st = 0;
+        while (SyncPlat.PosixWaitpid(pid, NativeMemory.AddressOf(ref st), 0) < 0) {
+            if (SyncPlat.GetErrno() != SyncPlat.EINTR) return -1;
+        }
+        return (res == 0L && WIfExited(st) && WExitStatus(st) == 0) ? 0 : -1;
+    }
+
+    static int CaptureAppend(ref nint buf, ref ulong cap, ref ulong len, nint bytes, ulong count) {
+        if (count > 2147483647UL - len) return -1;
+        ulong need = len + count + 1UL;
+        if (need > cap) {
+            ulong grown = cap;
+            while (grown < need) grown *= 2UL;
+            nint next = SyncPlat.CRealloc(buf, grown);
+            if (next == (nint)0) return -1;
+            buf = next;
+            cap = grown;
+        }
+        SyncPlat.CMemcpy(buf + (nint)len, bytes, count);
+        len += count;
+        return 0;
+    }
+
+    [Export("__zan_sync_proc_sandbox_reap")]
+    [Visibility("hidden")]
+    static nint ProcSandboxReap(nint arg) {
+        for (int retry = 0; retry < 50; retry++) {
+            if (SandboxGroupEmpty(arg) && SandboxGroupRemove(arg)) break;
+            SandboxKill(arg);
+            SleepUs(100000L);
+        }
+        SandboxGroupFree(arg);
+        return (nint)0;
+    }
+
+    [Export("__zan_sync_proc_reap_child")]
+    [Visibility("hidden")]
+    static nint ProcReapChild(nint arg) {
+        SpawnWait((int)(long)arg, 0);
+        return (nint)0;
+    }
+#endif
+
+}

@@ -4,82 +4,96 @@ using System.Data.Orm;
 using System.Json;
 using System.Threading;
 using System.Web;
+using Zan.Web.AdminUi;
 using Zan.Web.Model.Oa;
 using Zan.Web.Model;
 
 namespace Zan.Web.Admin.Oa;
 
-/* 通知中心 canonical 页（架构 §2.2 WP-2 / T3）：跨模块通知统一落到 Oa 域——
-   读写 sys_notify，WS/SSE 实时通道挂 NotifyHub。Flow 域旧路由
-   /admin/flow/notifies 保留为兼容层：页面 301 到本页，铃铛 API（unread/
-   stream/read）原路径照常服务（命名空间焊死纪律：URL 变更必留重定向）。
-   免打扰开关走 sys_notify_pref：muted=1 的模块只落库不推（Notify.Muted）。 */
+/* 通知中心 canonical 页（架构 §2.2 WP-2 / T3）：AdminUI 列表 + WS/SSE 实时通知 + 免打扰开关。 */
 [Route("admin/oa/notifies/[action]")]
 [Custom(Authorization = CustomAuthorization.Grant)]
 [Description("通知中心")]
 public class Notifies : CollabAdminController {
-    /* 流存活时长；标签整夜开着不应永远占协程，EventSource 会自连。 */
     static int StreamSeconds = 1800;
+
+    static ListPage ScreenDef() {
+        return ListPage.Of()
+            .Tab("全部通知", "onlyUnread", "0")
+            .Tab("仅看未读", "onlyUnread", "1")
+            .TbarCustom("全部标为已读", "/admin/oa/notifies/read", "确认将所有未读通知标记为已读吗？")
+            .TbarCustom("开启流程免打扰", "/admin/oa/notifies/mute?module=flow&on=1", "开启后流程通知将仅落库不推送，确认吗？")
+            .TbarCustom("恢复流程提醒", "/admin/oa/notifies/mute?module=flow&on=0", "确认恢复流程实时推送提醒吗？")
+            .Col("id", "ID", "num", "75")
+            .Tag("kind", "类型", "assign=派工|warn,mention=提及|warn,done=流程|ok,alert=告警|off,message=私信|ok", "95")
+            .Col("content", "通知内容", "text", "340")
+            .Col("link", "关联入口", "text", "180")
+            .Tag("isRead", "状态", "0=未读|warn,1=已读|ok", "85")
+            .Col("createdAt", "时间", "text", "140")
+            .Ops("标为已读", "/admin/oa/notifies/read", "确认将该通知标为已读吗？", "id={id}", "u");
+    }
 
     [HttpGet]
     [Route("/admin/oa/notifies")]
     [Custom(IsMenu = true, Icon = "mdi:bell", Perm = PermBit.View)]
     [Description("通知中心")]
-    public async void Index() {
+    public void Index() {
+        this.Conf();
+    }
+
+    [HttpPut]
+    [Custom(Perm = PermBit.View)]
+    [Description("通知中心表格配置")]
+    public void Conf() {
+        CrudOps.Conf(this, Notifies.ScreenDef());
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.View)]
+    [Description("通知中心列表数据")]
+    public async void List() {
+        if (!this.DataReady()) { return; }
         SysUser me = await this.Admin();
-        ViewData d = await this.Layout("通知中心");
-        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
-        ListQuery q = this.Paged("id", 20);
-        /* Bug#6（本体 B）：sys_notify 历史脏数据（跨租户提及等）按 userId
-           可见即死信泄漏——读面统一补 tenantId 双闸。 */
+        ListQuery q = this.PagedAny("id", 20);
+        int onlyUnread = this.InAnyInt("onlyUnread", 0);
+
         List<SysNotify> rows = await this.SysNotify
             .Where(a => a.tenantId == Tenant.Cur() && a.userId == me.id)
+            .WhereIf(onlyUnread == 1, a => a.isRead == 0)
             .OrderByDescending(a => a.id)
             .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
         int total = await this.SysNotify
-            .Where(a => a.tenantId == Tenant.Cur() && a.userId == me.id).CountAsync();
-        /* 免打扰现状（flow 域开关即页面上的示范位；其余模块开关随迁移渐次加入）。 */
-        SysNotifyPref pref = await this.SysNotifyPref
-            .Where(a => a.tenantId == Tenant.Cur() && a.userId == me.id
-                && a.module == "flow").FirstAsync();
-        bool muted = pref != null && pref.muted == 1;
-        if (muted) { d.Set("muted", "1"); } else { d.Set("mutedOff", "1"); }
-        List<StrMap> items = d.AddList("rows");
+            .Where(a => a.tenantId == Tenant.Cur() && a.userId == me.id)
+            .WhereIf(onlyUnread == 1, a => a.isRead == 0)
+            .CountAsync();
+
+        JsonWriter w = new JsonWriter();
+        w.WriteStartArray();
         for (int i = 0; i < rows.Count; i = i + 1) {
             SysNotify n = rows[i];
-            StrMap m = new StrMap();
-            m.Set("id", n.id.ToString());
-            m.Set("kind", n.kind);
-            m.Set("kindText", n.kind == "assign" ? "派工"
-                : (n.kind == "mention" ? "提及"
-                : (n.kind == "done" ? "流程"
-                : (n.kind == "alert" ? "告警"
-                : (n.kind == "message" ? "私信" : "通知")))));
-            m.Set("content", n.content);
-            m.Set("link", n.link);
-            m.Set("unread", n.isRead == 0 ? "1" : "");
-            m.Set("createdAt", Fmt.Day(n.createdAt));
-            items.Add(m);
+            w.WriteStartObject();
+            w.WriteProperty("id", n.id);
+            w.WriteProperty("kind", n.kind);
+            w.WriteProperty("content", n.content);
+            w.WriteProperty("link", Fmt.Dash(n.link));
+            w.WriteProperty("isRead", Convert.ToString(n.isRead));
+            w.WriteProperty("createdAt", Fmt.Stamp(n.createdAt));
+            w.WriteEndObject();
         }
-        d.Set("empty", total == 0 ? "1" : "");
-        this.Pager(d, q, total);
-        this.Page(d);
+        w.WriteEndArray();
+        AdminUiProtocol.WriteListData(this, total, w.ToString());
     }
 
-    /* 未读数与最新未读列表：顶栏铃铛的轻量数据源，由前端定时拉取（SSE 只推在线实时增量）。 */
     [HttpGet]
     [Custom(IsMenu = false, Perm = PermBit.View)]
     [Description("未读通知")]
     public async void Unread() {
         SysUser me = await this.Admin();
-        /* Bug#6（本体 B）：未读数与未读列表同补租户闸（铃铛数据源）。 */
         List<SysNotify> rows = await this.SysNotify
-            .Where(a => a.tenantId == Tenant.Cur() && a.userId == me.id
-                && a.isRead == 0)
+            .Where(a => a.tenantId == Tenant.Cur() && a.userId == me.id && a.isRead == 0)
             .OrderByDescending(a => a.id).Take(8).ToListAsync();
         int total = await this.SysNotify
-            .Where(a => a.tenantId == Tenant.Cur() && a.userId == me.id
-                && a.isRead == 0).CountAsync();
+            .Where(a => a.tenantId == Tenant.Cur() && a.userId == me.id && a.isRead == 0).CountAsync();
         JsonWriter w = new JsonWriter();
         w.WriteStartObject();
         w.WriteProperty("count", total.ToString());
@@ -96,11 +110,6 @@ public class Notifies : CollabAdminController {
         this.Ctx().Json(w.ToJson());
     }
 
-    /* 实时通知通道：WebSocket 长连接为主——ctx.WsUpgrade() 在路由/权限之后升级，
-       会话直接继承本路由的授权语义，升级前收到的管道帧由框架切进 WsReader。
-       非 WS 请求（老代理/老客户端）回落 SSE，同一端点按 Upgrade 头自动分流。
-       写方只有 NotifyHub.Push：会话循环只读，客户端 20s 文本心跳唤醒 Recv 即自动
-       续期；服务端 30 分钟收口一次，前端断开后自动重连（重连重新过一遍鉴权）。 */
     [HttpGet]
     [Custom(IsMenu = false, Perm = PermBit.View)]
     [Description("通知事件流")]
@@ -109,11 +118,8 @@ public class Notifies : CollabAdminController {
         HttpContext ctx = this.Ctx();
         WsSession ws = await WebWs.Upgrade(ctx);
         if (ws != null) {
-            /* 首帧同步未读数——此刻尚未登记进 NotifyHub，无并发写方，安全。
-               Bug#6（本体 B）：WS 订阅首帧未读数补租户闸。 */
             int unread = await this.SysNotify
-                .Where(a => a.tenantId == Tenant.Cur() && a.userId == me.id
-                    && a.isRead == 0).CountAsync();
+                .Where(a => a.tenantId == Tenant.Cur() && a.userId == me.id && a.isRead == 0).CountAsync();
             JsonWriter first = new JsonWriter();
             first.WriteStartObject();
             first.WriteProperty("type", "unread");
@@ -129,18 +135,14 @@ public class Notifies : CollabAdminController {
                     await ws.Close(1000);
                     break;
                 }
-                /* 入站文本（心跳 ping 等）一律忽略；协议级 ping/pong 在 Recv 内已答。 */
             }
             Zan.Web.NotifyHub.LeaveWs(ws);
             return;
         }
-        /* SSE 回退通道：与 WS 同一端点，老代理/老客户端走原路。 */
         if (!await ctx.SseOpen()) { return; }
         Zan.Web.NotifyHub.JoinSse(me.id, ctx);
-        /* 首帧同步一次未读数，页面打开即为最新。Bug#6（本体 B）：SSE 同补。 */
         int unread2 = await this.SysNotify
-            .Where(a => a.tenantId == Tenant.Cur() && a.userId == me.id
-                && a.isRead == 0).CountAsync();
+            .Where(a => a.tenantId == Tenant.Cur() && a.userId == me.id && a.isRead == 0).CountAsync();
         JsonWriter firstSse = new JsonWriter();
         firstSse.WriteStartObject();
         firstSse.WriteProperty("count", unread2);
@@ -153,7 +155,6 @@ public class Notifies : CollabAdminController {
         while (elapsed < Notifies.StreamSeconds) {
             await Task.Delay(15000);
             elapsed = elapsed + 15;
-            /* 保活注释行：空闲时让代理不误判断连；NotifyHub.Push 的事件不受此影响。 */
             if (!await ctx.SseSend("", ": keep-alive")) {
                 break;
             }
@@ -166,18 +167,13 @@ public class Notifies : CollabAdminController {
     [Description("标记已读")]
     public async void Read() {
         SysUser me = await this.Admin();
-        int id = this.InInt("id", 0);
-        long now = WebApp.NowSeconds();
+        int id = this.InAnyInt("id", 0);
         if (id > 0) {
-            /* Bug#6（本体 B）：标记已读与读面同数据面，随读面补租户闸——
-               脏死信已被读面隐藏，写面保持一致防复活路径。 */
             int _n = await this.SysNotify.Update()
                 .Set(a => a.isRead, 1)
-                .Where(a => a.id == id && a.tenantId == Tenant.Cur()
-                    && a.userId == me.id)
+                .Where(a => a.id == id && a.tenantId == Tenant.Cur() && a.userId == me.id)
                 .ExecuteAffrowsAsync();
         } else {
-            /* Bug#6（本体 B）：全部已读随读面补租户闸。 */
             int _n = await this.SysNotify.Update()
                 .Set(a => a.isRead, 1)
                 .Where(a => a.tenantId == Tenant.Cur() && a.userId == me.id)
@@ -186,20 +182,17 @@ public class Notifies : CollabAdminController {
         this.Saved("已标记");
     }
 
-    /* 免打扰开关：按 module 逐个控制（一期只暴露 flow；Notify.Muted 发送侧判定，
-       muted=1 只落库不推）。行存在改 muted，不存在插行——偏好是稀疏数据，
-       等值谓词查无即默认放行，无需为每个用户预建全模块行。 */
     [HttpPost]
     [Custom(Perm = PermBit.Update)]
     [Description("免打扰开关")]
     public async void Mute() {
         SysUser me = await this.Admin();
-        string module = Fmt.Text(this.In("module"), "flow");
-        int on = this.InInt("on", 0);
+        string module = Fmt.Text(this.InAny("module"), "flow");
+        int on = this.InAnyInt("on", 0);
         long now = WebApp.NowSeconds();
         SysNotifyPref row = await this.SysNotifyPref
-            .Where(a => a.tenantId == Tenant.Cur() && a.userId == me.id
-                && a.module == module).FirstAsync();
+            .Where(a => a.tenantId == Tenant.Cur() && a.userId == me.id && a.module == module)
+            .FirstAsync();
         if (row != null) {
             int _u = await this.SysNotifyPref.Update()
                 .Set(a => a.muted, on)

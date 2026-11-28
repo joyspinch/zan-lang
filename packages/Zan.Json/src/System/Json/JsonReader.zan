@@ -25,6 +25,7 @@ public class JsonReader {
     // 首个语法错误的字节位置；无错误为 -1。
     public int errPos;
     private StringBuilder escapedString;
+    private string[] keyCache;
 
     public JsonReader() {
         this.s = "";
@@ -34,16 +35,18 @@ public class JsonReader {
         this.len = 0;
         this.strict = false;
         this.errPos = -1;
+        this.keyCache = null;
     }
 
     // 创建宽松模式游标。
     public static JsonReader Of(string src) {
+        string safe = src != null ? src : "";
         JsonReader r = new JsonReader();
-        r.s = src;
-        r.ptr = (nint)src;
+        r.s = safe;
+        r.ptr = safe.Length > 0 ? (nint)safe : (nint)0;
         r.buf = null;
         r.pos = 0;
-        r.len = src.Length;
+        r.len = safe.Length;
         r.strict = false;
         r.errPos = -1;
         return r;
@@ -66,31 +69,52 @@ public class JsonReader {
 
     // 游标处的字节，输入结束时为 -1。
     public int CurB() {
-        if (pos >= len) { return -1; }
-        return s[pos] & 255;
+        int p = this.pos;
+        if (p >= this.len) { return -1; }
+        if (this.ptr != (nint)0) {
+            Span<byte> sp = new Span<byte>(this.ptr, this.len);
+            return sp[p] & 255;
+        }
+        return s[p] & 255;
     }
 
     // 跳过空白（空格/制表/换行/回车）。
     // 针对 JSON 中大部分非空白字符首字节快速直接跳出；
     // 较长的空白游程走向量扫描。
     public void SkipWs() {
-        if (pos >= len) { return; }
-        int c0 = s[pos] & 255;
+        int p = this.pos;
+        int n = this.len;
+        if (p >= n) { return; }
+        if (this.ptr != (nint)0) {
+            Span<byte> sp = new Span<byte>(this.ptr, n);
+            int c0 = sp[p];
+            if (c0 > 32 || (c0 != 32 && c0 != 9 && c0 != 10 && c0 != 13)) {
+                return;
+            }
+            p = p + 1;
+            if (p < n) {
+                int c1 = sp[p];
+                if (c1 > 32 || (c1 != 32 && c1 != 9 && c1 != 10 && c1 != 13)) {
+                    this.pos = p;
+                    return;
+                }
+            }
+            this.pos = JsonScan.SkipWhitespace(this.ptr, p, n);
+            return;
+        }
+        int c0 = s[p] & 255;
         if (c0 != 32 && c0 != 9 && c0 != 10 && c0 != 13) {
             return;
         }
-        if (this.ptr != (nint)0) {
-            pos = JsonScan.SkipWhitespace(this.ptr, pos, len);
-            return;
-        }
-        while (pos < len) {
-            int c = s[pos] & 255;
+        while (p < n) {
+            int c = s[p] & 255;
             if (c == 32 || c == 9 || c == 10 || c == 13) {
-                pos = pos + 1;
+                p = p + 1;
             } else {
-                return;
+                break;
             }
         }
+        this.pos = p;
     }
 
     // 从游标读一个任意 JSON 值（顶层入口）。
@@ -105,24 +129,77 @@ public class JsonReader {
             if (strict) { Fail(); }
             return JsonValue.NewNull();
         }
+        int n = this.len;
+        if (this.ptr != (nint)0) {
+            Span<byte> sp = new Span<byte>(this.ptr, n);
+            int p = this.pos;
+            if (p < n && sp[p] <= 32) {
+                SkipWs();
+                p = this.pos;
+            }
+            if (p >= n) { return ReadNumber(); }
+            int c = sp[p];
+            if (c == 123) { return ReadObjectAt(depth); }  // '{'
+            if (c == 91) { return ReadArrayAt(depth); }  // '['
+            if (c == 34) { return JsonValue.NewStr(ReadString()); }
+            if (c == 116) {  // 't'
+                if (strict) {
+                    if (p + 4 <= n && sp[p + 1] == 114 && sp[p + 2] == 117 && sp[p + 3] == 101) {
+                        this.pos = p + 4;
+                        return JsonValue.NewBool(true);
+                    }
+                    Fail();
+                    return JsonValue.NewNull();
+                }
+                this.pos = p + 4;
+                return JsonValue.NewBool(true);
+            }
+            if (c == 102) {  // 'f'
+                if (strict) {
+                    if (p + 5 <= n && sp[p + 1] == 97 && sp[p + 2] == 108 && sp[p + 3] == 115 && sp[p + 4] == 101) {
+                        this.pos = p + 5;
+                        return JsonValue.NewBool(false);
+                    }
+                    Fail();
+                    return JsonValue.NewNull();
+                }
+                this.pos = p + 5;
+                return JsonValue.NewBool(false);
+            }
+            if (c == 110) {  // 'n'
+                if (strict) {
+                    if (p + 4 <= n && sp[p + 1] == 117 && sp[p + 2] == 108 && sp[p + 3] == 108) {
+                        this.pos = p + 4;
+                    } else {
+                        Fail();
+                    }
+                } else {
+                    this.pos = p + 4;
+                }
+                return JsonValue.NewNull();
+            }
+            return ReadNumber();
+        }
         SkipWs();
-        int c = CurB();
-        if (c == 123) { return ReadObjectAt(depth); }  // '{'
-        if (c == 91) { return ReadArrayAt(depth); }  // '['
-        if (c == 34) { return JsonValue.NewStr(ReadString()); }
-        if (c == 116 || c == 102) {  // 't' / 'f'
+        int p0 = this.pos;
+        if (p0 >= n) { return ReadNumber(); }
+        int c0 = s[p0] & 255;
+        if (c0 == 123) { return ReadObjectAt(depth); }  // '{'
+        if (c0 == 91) { return ReadArrayAt(depth); }  // '['
+        if (c0 == 34) { return JsonValue.NewStr(ReadString()); }
+        if (c0 == 116 || c0 == 102) {  // 't' / 'f'
             if (strict) {
                 string lit = "false";
-                if (c == 116) { lit = "true"; }
+                if (c0 == 116) { lit = "true"; }
                 if (!ValidLiteral(lit)) {
                     Fail();
                     return JsonValue.NewNull();
                 }
-                return JsonValue.NewBool(c == 116);
+                return JsonValue.NewBool(c0 == 116);
             }
             return ReadBool();
         }
-        if (c == 110) {
+        if (c0 == 110) {
             if (strict) {
                 if (!ValidLiteral("null")) { Fail(); }
             } else {
@@ -133,14 +210,101 @@ public class JsonReader {
         return ReadNumber();
     }
 
+    // 读对象键名：内联 Span 短键扫描 + 本地 128 槽去重缓存，免 JsonScan 调用与重复 Substring 分配。
+    private string ReadKey() {
+        if (this.ptr == (nint)0) { return ReadString(); }
+        int p = this.pos;
+        int n = this.len;
+        Span<byte> sp = new Span<byte>(this.ptr, n);
+        if (p >= n || sp[p] != 34) {
+            if (strict) { Fail(); }
+            return "";
+        }
+        int start = p + 1;
+        int scan = start;
+        int lim = start + 48;
+        if (lim > n) { lim = n; }
+        int foundEnd = -1;
+        while (scan < lim) {
+            int b = sp[scan];
+            if (b == 34) { foundEnd = scan; break; }
+            if (b == 92 || b < 32) { return ReadString(); }
+            scan = scan + 1;
+        }
+        if (foundEnd < 0) {
+            long longEnd = JsonScan.StringEnd(this.ptr, start, n);
+            if (longEnd < 0L || longEnd >= (long)n) { return ReadString(); }
+            int le = (int)longEnd;
+            this.pos = le + 1;
+            return s.Substring(start, le - start);
+        }
+        int klen = foundEnd - start;
+        this.pos = foundEnd + 1;
+        if (klen == 0) { return ""; }
+        string[] pool = this.keyCache;
+        if (pool == null) {
+            pool = new string[128];
+            this.keyCache = pool;
+        }
+        int first = sp[start];
+        int last = sp[foundEnd - 1];
+        int h = (klen * 33 + first * 17 + last) & 127;
+        string cached = pool[h];
+        if (cached != null && cached.Length == klen) {
+            Span<byte> cb = new Span<byte>((nint)cached, klen);
+            bool eq = true;
+            for (int i = 0; i < klen; i = i + 1) {
+                if (sp[start + i] != cb[i]) { eq = false; break; }
+            }
+            if (eq) { return cached; }
+        }
+        string fresh = s.Substring(start, klen);
+        pool[h] = fresh;
+        return fresh;
+    }
+
     // 游标处为 '{' 时读对象；strict 下逐 token 校验，
     // 错误语义同 ReadValueAt。
     public JsonValue ReadObjectAt(int depth) {
         JsonValue obj = JsonValue.NewObject();
         pos = pos + 1;  // 消费 '{'
+        int n = this.len;
+        if (this.ptr != (nint)0) {
+            Span<byte> sp = new Span<byte>(this.ptr, n);
+            if (pos < n && sp[pos] <= 32) { SkipWs(); }
+            if (pos < n && sp[pos] == 125) { pos = pos + 1; return obj; }  // '}'
+            while (pos < n) {
+                if (sp[pos] <= 32) { SkipWs(); }
+                if (strict && (pos >= n || sp[pos] != 34)) { Fail(); return obj; }
+                string key = ReadKey();
+                if (pos < n && sp[pos] <= 32) { SkipWs(); }
+                if (pos < n && sp[pos] == 58) { pos = pos + 1; }  // ':'
+                else if (strict) { Fail(); return obj; }
+                JsonValue v = ReadValueAt(depth + 1);
+                if (strict && Failed()) { return obj; }
+                // The parser owns both nodes. The fresh child cannot reference its parent.
+                obj.keys.Add(key);
+                obj.vals.Add(v);
+                if (pos < n && sp[pos] <= 32) { SkipWs(); }
+                if (pos < n) {
+                    int c = sp[pos];
+                    if (c == 44) { pos = pos + 1; }  // ','
+                    else if (c == 125) { pos = pos + 1; return obj; }  // '}'
+                    else {
+                        if (strict) { Fail(); }
+                        return obj;
+                    }
+                } else {
+                    if (strict) { Fail(); }
+                    return obj;
+                }
+            }
+            if (strict) { Fail(); }  // 未闭合
+            return obj;
+        }
         SkipWs();
         if (CurB() == 125) { pos = pos + 1; return obj; }  // '}'
-        while (pos < len) {
+        while (pos < n) {
             SkipWs();
             if (strict && CurB() != 34) { Fail(); return obj; }
             string key = ReadString();
@@ -169,9 +333,36 @@ public class JsonReader {
     public JsonValue ReadArrayAt(int depth) {
         JsonValue arr = JsonValue.NewArray();
         pos = pos + 1;  // 消费 '['
+        int n = this.len;
+        if (this.ptr != (nint)0) {
+            Span<byte> sp = new Span<byte>(this.ptr, n);
+            if (pos < n && sp[pos] <= 32) { SkipWs(); }
+            if (pos < n && sp[pos] == 93) { pos = pos + 1; return arr; }  // ']'
+            while (pos < n) {
+                JsonValue v = ReadValueAt(depth + 1);
+                if (strict && Failed()) { return arr; }
+                // Only parser-created values enter this list.
+                arr.items.Add(v);
+                if (pos < n && sp[pos] <= 32) { SkipWs(); }
+                if (pos < n) {
+                    int c = sp[pos];
+                    if (c == 44) { pos = pos + 1; }  // ','
+                    else if (c == 93) { pos = pos + 1; return arr; }  // ']'
+                    else {
+                        if (strict) { Fail(); }
+                        return arr;
+                    }
+                } else {
+                    if (strict) { Fail(); }
+                    return arr;
+                }
+            }
+            if (strict) { Fail(); }  // 未闭合
+            return arr;
+        }
         SkipWs();
         if (CurB() == 93) { pos = pos + 1; return arr; }  // ']'
-        while (pos < len) {
+        while (pos < n) {
             JsonValue v = ReadValueAt(depth + 1);
             if (strict && Failed()) { return arr; }
             // Only parser-created values enter this list.
@@ -204,13 +395,34 @@ public class JsonReader {
         if (this.ptr != (nint)0) {
             int scan = JsonScan.StringEnd(this.ptr, pos, len);
             if (scan >= 0L && scan < (long)len) {
-                string plain = s.Substring(start, (int)scan - start);
-                pos = (int)scan + 1;
+                int endIdx = (int)scan;
+                if (strict) {
+                    Span<byte> sp = new Span<byte>(this.ptr, len);
+                    for (int ci = start; ci < endIdx; ci = ci + 1) {
+                        if ((sp[ci] & 255) < 32) {
+                            pos = ci;
+                            Fail();
+                            return "";
+                        }
+                    }
+                }
+                string plain = s.Substring(start, endIdx - start);
+                pos = endIdx + 1;
                 return plain;
             } else if (scan < 0L) {
                 pos = (int)(-scan - 1L);
             } else {
                 pos = len;
+            }
+            if (strict && pos > start) {
+                Span<byte> sp = new Span<byte>(this.ptr, len);
+                for (int ci = start; ci < pos; ci = ci + 1) {
+                    if ((sp[ci] & 255) < 32) {
+                        pos = ci;
+                        Fail();
+                        return "";
+                    }
+                }
             }
         } else {
             while (pos < len) {
@@ -223,16 +435,24 @@ public class JsonReader {
                 if (c == 92) {
                     break;
                 }
+                if (strict && c < 32) {
+                    Fail();
+                    return "";
+                }
                 pos = pos + 1;
             }
         }
         if (this.escapedString == null) { this.escapedString = new StringBuilder(); }
         StringBuilder sb = this.escapedString;
         sb.Clear();
-        if (pos > start) { sb.Append(s.Substring(start, pos - start)); }
+        if (pos > start) {
+            if (this.ptr != (nint)0) { sb.Append(new StringView(this.ptr + (nint)start, pos - start)); }
+            else { sb.Append(s.Substring(start, pos - start)); }
+        }
         while (pos < len) {
             int c = s[pos] & 255;
             if (c == 34) { pos = pos + 1; return this.FinishEscapedString(sb); }
+            if (strict && c < 32) { Fail(); return this.FinishEscapedString(sb); }
             if (c == 92 && pos + 1 < len) {
                 int n = s[pos + 1] & 255;
                 if (n == 110) { sb.Append("\n"); }
@@ -283,7 +503,8 @@ public class JsonReader {
                 else {
                     // \" \\ \/ \b \f \n \r \t \u 之外的转义在 JSON 里非法。
                     if (strict) { Fail(); return this.FinishEscapedString(sb); }
-                    sb.Append(s.Substring(pos + 1, 1));
+                    if (this.ptr != (nint)0) { sb.Append(new StringView(this.ptr + (nint)(pos + 1), 1)); }
+                    else { sb.Append(s.Substring(pos + 1, 1)); }
                 }
                 pos = pos + 2;
             } else {
@@ -305,15 +526,31 @@ public class JsonReader {
                     } else if (scan2 < 0L) {
                         stop2 = (int)(-scan2 - 1L);
                     }
+                    if (strict) {
+                        Span<byte> sp2 = new Span<byte>(this.ptr, len);
+                        for (int ci = pos; ci < stop2; ci = ci + 1) {
+                            if ((sp2[ci] & 255) < 32) {
+                                pos = ci;
+                                Fail();
+                                return this.FinishEscapedString(sb);
+                            }
+                        }
+                    }
+                    sb.Append(new StringView(this.ptr + (nint)pos, stop2 - pos));
                 } else {
                     stop2 = pos;
                     while (stop2 < len) {
                         int sc = s[stop2] & 255;
                         if (sc == 34 || sc == 92) { break; }
+                        if (strict && sc < 32) {
+                            pos = stop2;
+                            Fail();
+                            return this.FinishEscapedString(sb);
+                        }
                         stop2 = stop2 + 1;
                     }
+                    sb.Append(s.Substring(pos, stop2 - pos));
                 }
-                sb.Append(s.Substring(pos, stop2 - pos));
                 pos = stop2;
             }
         }
@@ -346,7 +583,59 @@ public class JsonReader {
     // 的输出文本按需生成），每 token 少一次分配、读取侧免二次解析。
     public JsonValue ReadNumber() {
         int start = pos;
-        while (pos < len) {
+        int n = this.len;
+        if (this.ptr != (nint)0 && start < n) {
+            Span<byte> sp = new Span<byte>(this.ptr, n);
+            int p = start;
+            bool neg = false;
+            if (sp[p] == 45) {
+                neg = true;
+                p = p + 1;
+            }
+            int dstart = p;
+            long acc = 0L;
+            while (p < n) {
+                int d = (sp[p] & 255) - 48;
+                if (d < 0 || d > 9) { break; }
+                acc = acc * 10L + (long)d;
+                p = p + 1;
+            }
+            int dcnt = p - dstart;
+            if (dcnt > 0 && dcnt <= 18) {
+                bool isSimpleInt = true;
+                if (p < n) {
+                    int nextC = sp[p];
+                    if (nextC == 46 || nextC == 101 || nextC == 69 || nextC == 45 || nextC == 43) {
+                        isSimpleInt = false;
+                    }
+                }
+                if (isSimpleInt) {
+                    this.pos = p;
+                    if (neg) { acc = 0L - acc; }
+                    return JsonValue.NewInt(acc);
+                }
+            }
+            while (p < n) {
+                int c = sp[p];
+                if ((c >= 48 && c <= 57) || c == 45 || c == 43 || c == 46
+                    || c == 101 || c == 69) {
+                    p = p + 1;
+                } else {
+                    break;
+                }
+            }
+            this.pos = p;
+            if (p == start) {
+                if (strict) { Fail(); return JsonValue.NewNull(); }
+                return JsonValue.NewInt(0);
+            }
+            if (strict && !ValidNumberAt(start, p)) {
+                Fail();
+                return JsonValue.NewNull();
+            }
+            return JsonValue.ParseNumberToken(s, start, p);
+        }
+        while (pos < n) {
             int c = s[pos] & 255;
             if ((c >= 48 && c <= 57) || c == 45 || c == 43 || c == 46
                 || c == 101 || c == 69) {  // digits - + . e E
@@ -372,12 +661,23 @@ public class JsonReader {
     // 校验游标处是字面量 `lit`（"true"/"false"/"null"）并推进；
     // 不匹配时不推进返回 false。
     public bool ValidLiteral(string lit) {
+        if (lit == null) { return false; }
         int n = lit.Length;
-        if (pos + n > len) { return false; }
-        for (int i = 0; i < n; i = i + 1) {
-            if ((s[pos + i] & 255) != (lit[i] & 255)) { return false; }
+        int p = this.pos;
+        if ((long)p + (long)n > (long)this.len) { return false; }
+        if (this.ptr != (nint)0 && n > 0) {
+            Span<byte> sp = new Span<byte>(this.ptr, this.len);
+            Span<byte> lb = new Span<byte>((nint)lit, n);
+            for (int i = 0; i < n; i = i + 1) {
+                if (sp[p + i] != lb[i]) { return false; }
+            }
+            this.pos = p + n;
+            return true;
         }
-        pos = pos + n;
+        for (int i = 0; i < n; i = i + 1) {
+            if ((s[p + i] & 255) != (lit[i] & 255)) { return false; }
+        }
+        this.pos = p + n;
         return true;
     }
 
@@ -386,6 +686,42 @@ public class JsonReader {
     // 游标已由 ReadNumber 的字节循环吃满 token 游程）。
     public bool ValidNumberAt(int from, int to) {
         int i = from;
+        if (this.ptr != (nint)0 && to <= this.len) {
+            Span<byte> sp = new Span<byte>(this.ptr, this.len);
+            if (i < to && sp[i] == 45) { i = i + 1; }
+            if (i >= to) { return false; }
+            int d = (sp[i] & 255) - 48;
+            if (d < 0 || d > 9) { return false; }
+            while (i < to) {
+                int c = (sp[i] & 255) - 48;
+                if (c < 0 || c > 9) { break; }
+                i = i + 1;
+            }
+            if (i < to && sp[i] == 46) {
+                i = i + 1;
+                if (i >= to) { return false; }
+                int d2 = (sp[i] & 255) - 48;
+                if (d2 < 0 || d2 > 9) { return false; }
+                while (i < to) {
+                    int c2 = (sp[i] & 255) - 48;
+                    if (c2 < 0 || c2 > 9) { break; }
+                    i = i + 1;
+                }
+            }
+            if (i < to && (sp[i] == 101 || sp[i] == 69)) {
+                i = i + 1;
+                if (i < to && (sp[i] == 43 || sp[i] == 45)) { i = i + 1; }
+                if (i >= to) { return false; }
+                int d3 = (sp[i] & 255) - 48;
+                if (d3 < 0 || d3 > 9) { return false; }
+                while (i < to) {
+                    int c3 = (sp[i] & 255) - 48;
+                    if (c3 < 0 || c3 > 9) { break; }
+                    i = i + 1;
+                }
+            }
+            return i == to;
+        }
         if (i < to && (s[i] & 255) == 45) { i = i + 1; }
         if (i >= to) { return false; }
         int d = (s[i] & 255) - 48;

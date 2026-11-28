@@ -42,8 +42,10 @@ public partial class Collection {
 
     // 在单个原子提交中批量插入（整批只做一次 WAL 刷新），返回第一个分配的 id。
     public int InsertBulk(List<JsonValue> docs) {
+        if (docs == null) { throw new ArgumentNullException("docs"); }
         this.tlock.EnterWrite();
         try {
+            if (docs.Count == 0) { return 0; }
             SyncMeta();
             for (int i = 0; i < docs.Count; i = i + 1) { PrepareDoc(docs[i]); }
             this.kv.Begin();
@@ -73,8 +75,14 @@ public partial class Collection {
             if (names == null || vectors == null || names.Count != vectors.Count) {
                 throw new ArgumentException("InsertVectorBulk: names and vectors must be same non-null length");
             }
+            if (nameField == null || nameField.Length == 0 || vecField == null || vecField.Length == 0) {
+                throw new ArgumentException("InsertVectorBulk: field names must be non-empty");
+            }
             int dims = 0;
             for (int i = 0; i < vectors.Count; i = i + 1) {
+                if (names[i] == null) {
+                    throw new ArgumentException("InsertVectorBulk: null name at " + Convert.ToString(i));
+                }
                 if (vectors[i] == null) {
                     throw new ArgumentException("InsertVectorBulk: null vector at " + Convert.ToString(i));
                 }
@@ -82,11 +90,12 @@ public partial class Collection {
                 else if (vectors[i].Length != dims) {
                     throw new ArgumentException("InsertVectorBulk: vector dimensions differ at " + Convert.ToString(i));
                 }
-                if (dims <= 0) {
-                    // 零维直写会出 tag 11 空数组，与装箱路的 tag 6 判据分叉。
-                    throw new ArgumentException("InsertVectorBulk: zero-dimension vector");
+                if (dims <= 0 || dims > 65536) {
+                    // 零维直写会出 tag 11 空数组，与装箱路的 tag 6 判据分叉；超限防 alloc 溢出。
+                    throw new ArgumentException("InsertVectorBulk: invalid vector dimensions");
                 }
             }
+            if (names.Count == 0) { return 0; }
             SyncMeta();
             this.kv.Begin();
             List<JsonValue> cacheDocs = new List<JsonValue>();
@@ -95,20 +104,32 @@ public partial class Collection {
                 for (int i = 0; i < names.Count; i = i + 1) {
                     int id = NextIdLocked();
                     if (first == 0) { first = id; }
-                    ByteBuffer b = ByteBuffer.Alloc(64 + names[i].Length + dims * 4);
-                    b.WriteU8(66);  // 'B'
-                    b.WriteVarInt(2);
-                    b.WriteVarInt(KeyId(nameField));
-                    if (names[i].Length == 0) { b.WriteU8(10); }
-                    else { b.WriteU8(5); b.WriteString(names[i]); }
-                    b.WriteVarInt(KeyId(vecField));
-                    b.WriteU8(11);
-                    b.WriteVarInt(dims);
-                    for (int j = 0; j < dims; j = j + 1) { b.WriteF32(vectors[i][j]); }
-                    this.kv.Put(DocKey(id), Collection.EscapeRecord(b));
+                    string nm = names[i];
+                    long allocCap = 64L + (long)nm.Length + (long)dims * 4L;
+                    if (allocCap > 67108864L) {
+                        throw new ArgumentException("InsertVectorBulk: record exceeds 64MB limit");
+                    }
+                    ByteBuffer b = ByteBuffer.Alloc((int)allocCap);
+                    bool freed = false;
+                    try {
+                        b.WriteU8(66);  // 'B'
+                        b.WriteVarInt(2);
+                        b.WriteVarInt(KeyId(nameField));
+                        if (nm.Length == 0) { b.WriteU8(10); }
+                        else { b.WriteU8(5); b.WriteString(nm); }
+                        b.WriteVarInt(KeyId(vecField));
+                        b.WriteU8(11);
+                        b.WriteVarInt(dims);
+                        for (int j = 0; j < dims; j = j + 1) { b.WriteF32(vectors[i][j]); }
+                        string encoded = Collection.EscapeRecord(b);
+                        freed = true;
+                        this.kv.Put(DocKey(id), encoded);
+                    } finally {
+                        if (!freed) { b.Free(); }
+                    }
                     // 轻量文档只服务索引维护、搜索 staging 与缓存。
                     JsonValue doc = JsonValue.NewObject();
-                    doc.Set(nameField, JsonValue.NewStr(names[i]));
+                    doc.Set(nameField, JsonValue.NewStr(nm));
                     double[] dv = new double[dims];
                     for (int j = 0; j < dims; j = j + 1) { dv[j] = vectors[i][j]; }
                     doc.Set(vecField, JsonValue.NewDoubleArray(dv));
@@ -284,6 +305,7 @@ public partial class Collection {
     // 对单篇文档的原子读改写：fn 在写临界区内基于最新已提交版本运行，
     // 返回非 null 替换值并更新成功时返回 true。
     public async bool UpdateAtomic(int id, DocUpdater fn) {
+        if (fn == null) { return false; }
         await this.rw.EnterWrite();
         this.tlock.EnterWrite();
         try {

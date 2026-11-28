@@ -1,0 +1,42 @@
+using System;
+using Game.Net;
+
+class Program {
+    static int Main() {
+        // 1. 全球多 PoP 中继路由与滞后防抖动切换
+        NetRelayRegionFailover relay = new NetRelayRegionFailover(25);
+        relay.UpsertNode("ap-east", 35, 0, true);
+        relay.UpsertNode("ap-south", 60, 0, true);
+        string r1 = relay.EvaluateBestRegion(); // ap-east (35)
+        relay.UpsertNode("ap-south", 25, 0, true); // 差值仅 10 < 25 -> 不抖动切换
+        string r2 = relay.EvaluateBestRegion();
+        relay.UpsertNode("ap-east", 40, 20, true); // 丢包惩罚 40+80=120 -> 差值 95 >= 25 -> 切换 ap-south
+        string r3 = relay.EvaluateBestRegion();
+        relay.UpsertNode("ap-south", 25, 0, false); // 宕机 -> 立即回切健康节点
+        string r4 = relay.EvaluateBestRegion();
+        bool relayOk = r1 == "ap-east" && r2 == "ap-east" && r3 == "ap-south"
+            && r4 == "ap-east" && relay.SwitchCount == 2;
+        Console.WriteLine("relay_failover_ok=" + (relayOk ? "1" : "0"));
+
+        // 2. GGPO 风格回滚输入预测器
+        NetRollbackInputPredictor pred = new NetRollbackInputPredictor(16);
+        pred.ReceiveRemoteInput(1, 4); // 确认帧 1 输入=4
+        int p2 = pred.PredictFrame(2); // 预测帧 2=4
+        int p3 = pred.PredictFrame(3); // 预测帧 3=4
+        int rb2 = pred.ReceiveRemoteInput(2, 4); // 预测命中 -> -1
+        int rb3 = pred.ReceiveRemoteInput(3, 9); // 误预测 -> 返回需回滚帧 3
+        bool rollbackOk = p2 == 4 && p3 == 4 && rb2 == -1 && rb3 == 3 && pred.MispredictionCount == 1;
+        Console.WriteLine("rollback_pred_ok=" + (rollbackOk ? "1" : "0"));
+
+        // 3. 自适应语音抗抖动缓冲与 PLC 丢包隐藏统计
+        NetVoiceJitterDejitterBuffer jb = new NetVoiceJitterDejitterBuffer(20, 120);
+        int d1 = jb.ObserveArrivalJitter(40); // jitter=10 -> 20+20=40
+        int d2 = jb.ObserveArrivalJitter(40); // jitter=17 -> 20+34=54
+        bool okPlay = jb.ConsumeNextAudioFrame(true);
+        bool okPlc = !jb.ConsumeNextAudioFrame(false);
+        bool jitterOk = d1 == 40 && d2 > d1 && d2 <= 120 && okPlay && okPlc
+            && jb.PlayedFrames == 1 && jb.ConcealedFrames == 1;
+        Console.WriteLine("voice_jitter_ok=" + (jitterOk ? "1" : "0"));
+        return 0;
+    }
+}

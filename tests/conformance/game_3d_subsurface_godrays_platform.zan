@@ -1,0 +1,126 @@
+using System;
+using Gui;
+using Game.Graphics;
+using Game.Render3D;
+
+namespace Conf;
+
+class Game3DSubsurfaceGodRaysPlatformTest {
+    [DllImport("zan_gui")]
+    private static extern int zan_gui_read_pixel(int surfaceId, int x, int y);
+
+    static int RedOf(int argb) { return (argb >> 16) & 255; }
+    static int GreenOf(int argb) { return (argb >> 8) & 255; }
+    static int BlueOf(int argb) { return argb & 255; }
+
+    static void Main() {
+        Canvas.SetBackend(1);
+        Canvas cv = new Canvas(128, 128);
+        int sid = cv.SurfaceId();
+        Renderer3D ren = new Renderer3D(16);
+        ren.UseCpuLighting = false;
+
+        Camera3D cam = new Camera3D();
+        cam.Position = new Vector3(0.0f, 0.0f, 3.2f);
+        cam.Target = new Vector3(0.0f, 0.0f, 0.0f);
+        cam.AspectRatio = 1.0f;
+        cam.FieldOfView = 1.1f;
+
+        // 1. GPU 3D 跨平台次表面散射包裹光照与逆光透射（左侧关闭保持暗底，右侧透出暖红次表面光）
+        Mesh3D leftQuad = new Mesh3D();
+        leftQuad.Vertex(-2.0f, -2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        leftQuad.Vertex( 0.0f, -2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+        leftQuad.Vertex( 0.0f,  2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        leftQuad.Vertex(-2.0f,  2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f);
+        leftQuad.Triangle(0, 1, 2);
+        leftQuad.Triangle(0, 2, 3);
+        int leftKey = cv.MeshUpload(leftQuad);
+
+        Mesh3D rightQuad = new Mesh3D();
+        rightQuad.Vertex(0.0f, -2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        rightQuad.Vertex(2.0f, -2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+        rightQuad.Vertex(2.0f,  2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        rightQuad.Vertex(0.0f,  2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f);
+        rightQuad.Triangle(0, 1, 2);
+        rightQuad.Triangle(0, 2, 3);
+        int rightKey = cv.MeshUpload(rightQuad);
+
+        Material darkMat = Material.Solid(0.0f, 0.0f, 0.0f);
+        darkMat.EmissiveRed = 0.04f; darkMat.EmissiveGreen = 0.04f; darkMat.EmissiveBlue = 0.04f;
+
+        Material sssMat = Material.Solid(0.0f, 0.0f, 0.0f);
+        sssMat.EmissiveRed = 0.04f; sssMat.EmissiveGreen = 0.04f; sssMat.EmissiveBlue = 0.04f;
+        sssMat.SubsurfaceEnabled = true;
+        sssMat.SubsurfaceWrap = 0.60f;
+        sssMat.SubsurfaceTranslucency = 1.40f;
+        sssMat.SubsurfacePower = 2.5f;
+        sssMat.SubsurfaceRed = 1.00f;
+        sssMat.SubsurfaceGreen = 0.32f;
+        sssMat.SubsurfaceBlue = 0.16f;
+
+        SceneNode root1 = new SceneNode("root1");
+        SceneNode ln = new SceneNode("left");
+        ln.MeshKey = leftKey; ln.BoundsRadius = 6.0f; ln.Material = darkMat;
+        SceneNode rn = new SceneNode("right");
+        rn.MeshKey = rightKey; rn.BoundsRadius = 6.0f; rn.Material = sssMat;
+        root1.AddChild(ln);
+        root1.AddChild(rn);
+
+        RenderPlan plan1 = new RenderPlan(cam);
+        cv.Clear(unchecked((int)0xFF000000));
+        plan1.Build(root1);
+        ren.Draw(cv, plan1);
+
+        int lp = zan_gui_read_pixel(sid, 32, 64);
+        int rp = zan_gui_read_pixel(sid, 96, 64);
+        bool sssOk = RedOf(lp) <= 22 && RedOf(rp) >= 165 && RedOf(rp) > BlueOf(rp) + 90;
+        Console.WriteLine("subsurface_wrap_ok=" + Convert.ToString(sssOk ? 1 : 0));
+
+        // 2. GPU 后处理跨平台屏幕空间径向丁达尔光束（中心太阳向外投射明显光柱并随距离衰减）
+        Mesh3D sunQuad = new Mesh3D();
+        sunQuad.Vertex(-0.45f, -0.45f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        sunQuad.Vertex( 0.45f, -0.45f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+        sunQuad.Vertex( 0.45f,  0.45f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        sunQuad.Vertex(-0.45f,  0.45f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f);
+        sunQuad.Triangle(0, 1, 2);
+        sunQuad.Triangle(0, 2, 3);
+        int sunKey = cv.MeshUpload(sunQuad);
+
+        Material sunMat = Material.Solid(0.0f, 0.0f, 0.0f);
+        sunMat.EmissiveRed = 1.0f; sunMat.EmissiveGreen = 0.95f; sunMat.EmissiveBlue = 0.85f;
+
+        SceneNode root2 = new SceneNode("root2");
+        SceneNode sn = new SceneNode("sun");
+        sn.MeshKey = sunKey; sn.BoundsRadius = 4.0f; sn.Material = sunMat;
+        root2.AddChild(sn);
+
+        PostProcess post = new PostProcess();
+        post.GodRaysStrength = 1.8f;
+        post.GodRaysDecay = 0.95f;
+        post.GodRaysLightX = 0.5f;
+        post.GodRaysLightY = 0.5f;
+        ren.PostProcess = post;
+
+        RenderPlan plan2 = new RenderPlan(cam);
+        cv.Clear(unchecked((int)0xFF000000));
+        plan2.Build(root2);
+        ren.Draw(cv, plan2);
+
+        int centerR = RedOf(zan_gui_read_pixel(sid, 64, 64));
+        int nearShaftR = RedOf(zan_gui_read_pixel(sid, 86, 64));
+        int farCornerR = RedOf(zan_gui_read_pixel(sid, 122, 122));
+        bool raysOk = centerR >= 245 && nearShaftR >= 30 && nearShaftR > farCornerR + 10;
+        Console.WriteLine("god_rays_ok=" + Convert.ToString(raysOk ? 1 : 0));
+
+        // 3. 分平台独立文件渲染档案接口多态验证（零 if 实现类）
+        IRenderBackendProfile3D host = RenderBackendProfileFactory3D.CreateForHost();
+        IRenderBackendProfile3D desk = new DesktopGlRenderProfile3D();
+        IRenderBackendProfile3D mob = new MobileGlesRenderProfile3D();
+        IRenderBackendProfile3D ohos = new HarmonyGlesRenderProfile3D();
+        bool platOk = host.GlslHeader().Length > 0
+            && desk.GlslHeader() == "#version 330 core" && desk.RecommendedShadowSize() == 2048
+            && mob.GlslHeader() == "#version 300 es" && mob.MaxSkinBones() == 64
+            && ohos.BackendName() == "HarmonyOpenGLES30" && ohos.DefaultRenderScale() < 0.85f;
+        Console.WriteLine("platform_profile_ok=" + Convert.ToString(platOk ? 1 : 0));
+    }
+}

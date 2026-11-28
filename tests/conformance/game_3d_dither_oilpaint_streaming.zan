@@ -1,0 +1,158 @@
+using System;
+using Gui;
+using Game.Graphics;
+using Game.Render3D;
+
+namespace Conf;
+
+class Game3DDitherOilPaintStreamingTest {
+    [DllImport("zan_gui")]
+    private static extern int zan_gui_read_pixel(int surfaceId, int x, int y);
+
+    static int RedOf(int argb) { return (argb >> 16) & 255; }
+    static int BlueOf(int argb) { return argb & 255; }
+
+    static void Main() {
+        Canvas.SetBackend(1);
+        Canvas cv = new Canvas(128, 128);
+        int sid = cv.SurfaceId();
+        Renderer3D ren = new Renderer3D(16);
+        ren.UseCpuLighting = false;
+
+        Camera3D cam = new Camera3D();
+        cam.Position = new Vector3(0.0f, 0.0f, 3.2f);
+        cam.Target = new Vector3(0.0f, 0.0f, 0.0f);
+        cam.AspectRatio = 1.0f;
+        cam.FieldOfView = 1.1f;
+
+        // 1. GPU 3D 屏幕空间 4x4 Bayer 有序抖动渐隐透明：opacity=0.5 精确保留 50% 像素，opacity=0.25 精确保留 25% 像素
+        Mesh3D fullQuad = new Mesh3D();
+        fullQuad.Vertex(-2.0f, -2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        fullQuad.Vertex( 2.0f, -2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+        fullQuad.Vertex( 2.0f,  2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        fullQuad.Vertex(-2.0f,  2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f);
+        fullQuad.Triangle(0, 1, 2);
+        fullQuad.Triangle(0, 2, 3);
+        int fullKey = cv.MeshUpload(fullQuad);
+
+        Material ditherMat = Material.Solid(0.0f, 0.0f, 0.0f);
+        ditherMat.EmissiveRed = 1.0f;
+        ditherMat.PixelDitherEnabled = true;
+        ditherMat.PixelDitherScale = 1.0f;
+
+        SceneNode root1 = new SceneNode("root1");
+        SceneNode qNode = new SceneNode("quad");
+        qNode.MeshKey = fullKey;
+        qNode.BoundsRadius = 6.0f;
+        qNode.Material = ditherMat;
+        root1.AddChild(qNode);
+
+        RenderPlan plan1 = new RenderPlan(cam);
+        ditherMat.PixelDitherOpacity = 0.5f;
+        cv.Clear(unchecked((int)0xFF000000));
+        plan1.Build(root1);
+        ren.Draw(cv, plan1);
+        int litHalf = 0;
+        for (int y = 48; y < 64; y = y + 1) {
+            for (int x = 48; x < 64; x = x + 1) {
+                if (RedOf(zan_gui_read_pixel(sid, x, y)) >= 200) { litHalf = litHalf + 1; }
+            }
+        }
+
+        ditherMat.PixelDitherOpacity = 0.25f;
+        cv.Clear(unchecked((int)0xFF000000));
+        plan1.Build(root1);
+        ren.Draw(cv, plan1);
+        int litQuarter = 0;
+        for (int y = 48; y < 64; y = y + 1) {
+            for (int x = 48; x < 64; x = x + 1) {
+                if (RedOf(zan_gui_read_pixel(sid, x, y)) >= 200) { litQuarter = litQuarter + 1; }
+            }
+        }
+        bool ditherOk = litHalf == 128 && litQuarter == 64;
+        Console.WriteLine("pixel_dither_ok=" + Convert.ToString(ditherOk ? 1 : 0));
+
+        // 2. GPU 后处理 Kuwahara 保边油画笔触滤镜：平滑左侧红区内部孤立黑噪点，同时保持中线红/蓝边界锐利零渗色
+        Mesh3D leftRed = new Mesh3D();
+        leftRed.Vertex(-2.0f, -2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        leftRed.Vertex( 0.0f, -2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+        leftRed.Vertex( 0.0f,  2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        leftRed.Vertex(-2.0f,  2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f);
+        leftRed.Triangle(0, 1, 2);
+        leftRed.Triangle(0, 2, 3);
+        int leftKey = cv.MeshUpload(leftRed);
+
+        Mesh3D rightBlue = new Mesh3D();
+        rightBlue.Vertex(0.0f, -2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        rightBlue.Vertex(2.0f, -2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+        rightBlue.Vertex(2.0f,  2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        rightBlue.Vertex(0.0f,  2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f);
+        rightBlue.Triangle(0, 1, 2);
+        rightBlue.Triangle(0, 2, 3);
+        int rightKey = cv.MeshUpload(rightBlue);
+
+        Mesh3D speck = new Mesh3D();
+        speck.Vertex(-1.01f, -0.025f, 0.05f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        speck.Vertex(-0.95f, -0.025f, 0.05f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+        speck.Vertex(-0.95f,  0.025f, 0.05f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        speck.Vertex(-1.01f,  0.025f, 0.05f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f);
+        speck.Triangle(0, 1, 2);
+        speck.Triangle(0, 2, 3);
+        int speckKey = cv.MeshUpload(speck);
+
+        Material redMat = Material.Solid(0.0f, 0.0f, 0.0f);
+        redMat.EmissiveRed = 1.0f;
+        Material blueMat = Material.Solid(0.0f, 0.0f, 0.0f);
+        blueMat.EmissiveBlue = 1.0f;
+        Material blackMat = Material.Solid(0.0f, 0.0f, 0.0f);
+
+        SceneNode root2 = new SceneNode("root2");
+        SceneNode ln = new SceneNode("left");
+        ln.MeshKey = leftKey; ln.BoundsRadius = 6.0f; ln.Material = redMat;
+        SceneNode rn = new SceneNode("right");
+        rn.MeshKey = rightKey; rn.BoundsRadius = 6.0f; rn.Material = blueMat;
+        SceneNode sn = new SceneNode("speck");
+        sn.MeshKey = speckKey; sn.BoundsRadius = 2.0f; sn.Material = blackMat;
+        root2.AddChild(ln);
+        root2.AddChild(rn);
+        root2.AddChild(sn);
+
+        RenderPlan plan2 = new RenderPlan(cam);
+        cv.Clear(unchecked((int)0xFF000000));
+        plan2.Build(root2);
+        ren.Draw(cv, plan2);
+        int speckBefore = zan_gui_read_pixel(sid, 32, 64);
+
+        PostProcess post = new PostProcess();
+        post.OilPaintStrength = 1.0f;
+        post.OilPaintRadius = 3.0f;
+        ren.PostProcess = post;
+
+        cv.Clear(unchecked((int)0xFF000000));
+        plan2.Build(root2);
+        ren.Draw(cv, plan2);
+        int speckAfter = zan_gui_read_pixel(sid, 32, 64);
+        int borderLeft = zan_gui_read_pixel(sid, 63, 64);
+        int borderRight = zan_gui_read_pixel(sid, 64, 64);
+
+        bool oilOk = RedOf(speckBefore) <= 20
+            && RedOf(speckAfter) >= 160
+            && RedOf(borderLeft) >= 240 && BlueOf(borderLeft) <= 15
+            && BlueOf(borderRight) >= 240 && RedOf(borderRight) <= 15;
+        Console.WriteLine("oil_paint_ok=" + Convert.ToString(oilOk ? 1 : 0));
+
+        ren.Dispose();
+
+        // 3. GpuTextureStreamingBudget3D：高优先近景纹理升清、超显存预算自动降级远景 Mip
+        GpuTextureStreamingBudget3D vram = new GpuTextureStreamingBudget3D(1400L);
+        vram.RegisterTexture("hero_albedo", 1024L, 3); // Mip0=1024, Mip1=256, Mip2=64
+        vram.RegisterTexture("far_rock", 1024L, 3);
+        vram.UpdateDemand("hero_albedo", 0, 10.0f);
+        vram.UpdateDemand("far_rock", 0, 2.0f);
+        vram.RebalanceBudget();
+        bool budgetOk = vram.ResidentMipOf("hero_albedo") == 0
+            && vram.ResidentMipOf("far_rock") == 1
+            && vram.TotalResidentBytes() <= 1400L;
+        Console.WriteLine("texture_streaming_ok=" + Convert.ToString(budgetOk ? 1 : 0));
+    }
+}

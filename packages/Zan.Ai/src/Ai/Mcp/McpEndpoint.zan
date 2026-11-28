@@ -30,7 +30,7 @@ public class McpEndpoint {
 
     // 请求路径：空路径补成 "/"（MCP 服务端的 JSON-RPC 入口在根）。
     public string RequestPath() {
-        if (this.path.Length == 0) { return "/"; }
+        if (this.path == null || this.path.Length == 0) { return "/"; }
         return this.path;
     }
 
@@ -78,16 +78,28 @@ public class McpEndpoint {
 
         // 单遍扫描校验非法字符、authority 中的 '@'/'?' 并定位首个 '/' 与 ':'。
         int slash = -1;
+        int query = -1;
         int firstColon = -1;
+        int lastColon = -1;
+        bool hostSafeBeforeColon = true;
         for (int i = authStart; i < end; i = i + 1) {
             int c = (int)sp[i];
-            if (c <= 32 || c == 127 || c == 35 || c == 92) {
+            if (c <= 32 || c >= 127 || c == 35 || c == 92) {
                 return null;
             }
             if (slash < 0) {
                 if (c == 47) { slash = i; }
                 else if (c == 64 || c == 63) { return null; }
-                else if (c == 58 && firstColon < 0) { firstColon = i; }
+                else if (c == 58) {
+                    if (firstColon < 0) { firstColon = i; }
+                    lastColon = i;
+                } else if (firstColon < 0 && hostSafeBeforeColon) {
+                    bool ok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90)
+                        || (c >= 97 && c <= 122) || c == 45 || c == 46;
+                    if (!ok) { hostSafeBeforeColon = false; }
+                }
+            } else if (c == 63 && query < 0) {
+                query = i;
             }
         }
 
@@ -102,24 +114,35 @@ public class McpEndpoint {
                 if (sp[i] == 93) { rb = i; break; }
             }
             if (rb <= authStart + 1) { return null; }
+            for (int i = authStart + 1; i < rb; i = i + 1) {
+                int c = (int)sp[i];
+                bool ok = (c >= 48 && c <= 57) || (c >= 65 && c <= 70)
+                    || (c >= 97 && c <= 102) || c == 58 || c == 46;
+                if (!ok) { return null; }
+            }
             hostStart = authStart + 1;
             hostEnd = rb;
             if (rb + 1 < hpEnd) {
                 if (sp[rb + 1] != 58) { return null; }
                 port = McpEndpoint.ParsePortSpan(sp, rb + 2, hpEnd, port);
             }
-        } else if (firstColon >= 0) {
-            if (firstColon == authStart) { return null; }
-            hostEnd = firstColon;
-            port = McpEndpoint.ParsePortSpan(sp, firstColon + 1, hpEnd, port);
+        } else {
+            if (!hostSafeBeforeColon) { return null; }
+            if (firstColon >= 0) {
+                if (firstColon == authStart || firstColon != lastColon) { return null; }
+                hostEnd = firstColon;
+                port = McpEndpoint.ParsePortSpan(sp, firstColon + 1, hpEnd, port);
+            }
         }
         if (hostEnd <= hostStart) { return null; }
 
         string pathStr = "";
         if (slash >= 0) {
             int pathEnd = end;
-            while (pathEnd > slash && sp[pathEnd - 1] == 47) {
-                pathEnd = pathEnd - 1;
+            if (query < 0) {
+                while (pathEnd > slash && sp[pathEnd - 1] == 47) {
+                    pathEnd = pathEnd - 1;
+                }
             }
             if (pathEnd > slash) {
                 pathStr = NativeMemory.GetString(up, slash, pathEnd - slash);

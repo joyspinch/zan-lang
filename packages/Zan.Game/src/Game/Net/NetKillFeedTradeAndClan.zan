@@ -1,0 +1,204 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Net;
+
+// 对局击杀播报单条记录。
+public class KillFeedEntry {
+    public int KillerId;
+    public int VictimId;
+    public string WeaponTag;
+    public bool Headshot;
+    public int AssistId;
+    public long TimestampMs;
+
+    public KillFeedEntry(int killerId, int victimId, string weaponTag,
+                         bool headshot, int assistId, long timestampMs) {
+        this.KillerId = killerId;
+        this.VictimId = victimId;
+        this.WeaponTag = weaponTag;
+        this.Headshot = headshot;
+        this.AssistId = assistId;
+        this.TimestampMs = timestampMs;
+    }
+}
+
+// 商业竞技击杀播报流：固定最大展示条数、TTL 自动淡出清理、最新优先输出。
+public class NetKillFeedStream {
+    private List<KillFeedEntry> entries;
+    public int MaxVisible;
+    public long EntryTtlMs;
+
+    public NetKillFeedStream(int maxVisible, long entryTtlMs) {
+        this.entries = new List<KillFeedEntry>();
+        this.MaxVisible = maxVisible > 0 ? maxVisible : 5;
+        this.EntryTtlMs = entryTtlMs > 0L ? entryTtlMs : 6000L;
+    }
+
+    public void PushKill(int killerId, int victimId, string weaponTag,
+                         bool headshot, int assistId, long nowMs) {
+        this.PruneExpired(nowMs);
+        this.entries.Add(new KillFeedEntry(killerId, victimId, weaponTag, headshot, assistId, nowMs));
+        while (this.entries.Count > this.MaxVisible) {
+            this.entries.RemoveAt(0);
+        }
+    }
+
+    public int PruneExpired(long nowMs) {
+        int removed = 0;
+        int i = 0;
+        while (i < this.entries.Count) {
+            if ((nowMs - this.entries[i].TimestampMs) >= this.EntryTtlMs) {
+                this.entries.RemoveAt(i);
+                removed = removed + 1;
+            } else {
+                i = i + 1;
+            }
+        }
+        return removed;
+    }
+
+    public List<KillFeedEntry> SnapshotNewestFirst(long nowMs) {
+        this.PruneExpired(nowMs);
+        List<KillFeedEntry> rev = new List<KillFeedEntry>();
+        for (int i = this.entries.Count - 1; i >= 0; i = i - 1) {
+            rev.Add(this.entries[i]);
+        }
+        return rev;
+    }
+}
+
+// 玩家面对面交易托管状态。
+public enum TradeEscrowStage {
+    Negotiating = 0,
+    BothLocked = 1,
+    Completed = 2,
+    Cancelled = 3
+}
+
+// 商业 MMO/联机双人安全交易防调包托管器：任一方修改筹码自动重置双方锁定与最终确认。
+public class NetPlayerTradeEscrow {
+    public int PlayerA;
+    public int PlayerB;
+    public int GoldOfferA;
+    public int GoldOfferB;
+    public bool LockedA;
+    public bool LockedB;
+    public bool ConfirmedA;
+    public bool ConfirmedB;
+    public TradeEscrowStage Stage;
+
+    public NetPlayerTradeEscrow(int playerA, int playerB) {
+        this.PlayerA = playerA;
+        this.PlayerB = playerB;
+        this.GoldOfferA = 0;
+        this.GoldOfferB = 0;
+        this.LockedA = false;
+        this.LockedB = false;
+        this.ConfirmedA = false;
+        this.ConfirmedB = false;
+        this.Stage = TradeEscrowStage.Negotiating;
+    }
+
+    public bool SetGoldOffer(int playerId, int amount) {
+        if (this.Stage == TradeEscrowStage.Completed || this.Stage == TradeEscrowStage.Cancelled) {
+            return false;
+        }
+        if (amount < 0) { return false; }
+        if (playerId == this.PlayerA) {
+            this.GoldOfferA = amount;
+        } else if (playerId == this.PlayerB) {
+            this.GoldOfferB = amount;
+        } else {
+            return false;
+        }
+        // 核心防调包规则：任一方变更交易物立即清空双方锁定与确认状态
+        this.LockedA = false;
+        this.LockedB = false;
+        this.ConfirmedA = false;
+        this.ConfirmedB = false;
+        this.Stage = TradeEscrowStage.Negotiating;
+        return true;
+    }
+
+    public bool LockOffer(int playerId) {
+        if (this.Stage == TradeEscrowStage.Completed || this.Stage == TradeEscrowStage.Cancelled) {
+            return false;
+        }
+        if (playerId == this.PlayerA) { this.LockedA = true; }
+        else if (playerId == this.PlayerB) { this.LockedB = true; }
+        else { return false; }
+        if (this.LockedA && this.LockedB) {
+            this.Stage = TradeEscrowStage.BothLocked;
+        }
+        return true;
+    }
+
+    public bool FinalConfirm(int playerId) {
+        if (this.Stage != TradeEscrowStage.BothLocked) { return false; }
+        if (playerId == this.PlayerA) { this.ConfirmedA = true; }
+        else if (playerId == this.PlayerB) { this.ConfirmedB = true; }
+        else { return false; }
+        if (this.ConfirmedA && this.ConfirmedB) {
+            this.Stage = TradeEscrowStage.Completed;
+        }
+        return true;
+    }
+}
+
+// 公会成员当日经验贡献记录。
+public class ClanMemberContrib {
+    public int PlayerId;
+    public int LastDayIndex;
+    public int ContributedToday;
+
+    public ClanMemberContrib(int playerId, int dayIndex) {
+        this.PlayerId = playerId;
+        this.LastDayIndex = dayIndex;
+        this.ContributedToday = 0;
+    }
+}
+
+// 商业公会共享成长经验库：单成员日贡献上限防刷、自动升级与公会特权解锁查询。
+public class NetClanProgressionBank {
+    private List<ClanMemberContrib> members;
+    public int ClanLevel;
+    public int TotalXp;
+    public int XpPerLevel;
+    public int DailyMemberXpCap;
+
+    public NetClanProgressionBank(int xpPerLevel, int dailyMemberXpCap) {
+        this.members = new List<ClanMemberContrib>();
+        this.ClanLevel = 1;
+        this.TotalXp = 0;
+        this.XpPerLevel = xpPerLevel > 0 ? xpPerLevel : 1000;
+        this.DailyMemberXpCap = dailyMemberXpCap > 0 ? dailyMemberXpCap : 300;
+    }
+
+    public int ContributeXp(int playerId, int rawXp, int dayIndex) {
+        if (rawXp <= 0) { return 0; }
+        ClanMemberContrib m = null;
+        for (int i = 0; i < this.members.Count; i = i + 1) {
+            if (this.members[i].PlayerId == playerId) { m = this.members[i]; break; }
+        }
+        if (m == null) {
+            m = new ClanMemberContrib(playerId, dayIndex);
+            this.members.Add(m);
+        }
+        if (m.LastDayIndex != dayIndex) {
+            m.LastDayIndex = dayIndex;
+            m.ContributedToday = 0;
+        }
+        int remaining = this.DailyMemberXpCap - m.ContributedToday;
+        if (remaining <= 0) { return 0; }
+        int accepted = rawXp < remaining ? rawXp : remaining;
+        m.ContributedToday = m.ContributedToday + accepted;
+        this.TotalXp = this.TotalXp + accepted;
+        this.ClanLevel = 1 + (this.TotalXp / this.XpPerLevel);
+        return accepted;
+    }
+
+    public bool IsPerkUnlocked(int requiredLevel) {
+        return this.ClanLevel >= requiredLevel;
+    }
+}

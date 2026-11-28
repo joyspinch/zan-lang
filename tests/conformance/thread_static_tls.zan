@@ -1,0 +1,61 @@
+using System;
+using System.Threading.Tasks;
+
+public struct TlsScratch {
+    public int Tag;
+    public [4]int Lanes;
+
+    public void Bump(int v) {
+        Tag = Tag + 1;
+        Lanes[0] = Lanes[0] + v;
+    }
+}
+
+public class TlsState {
+    [ThreadStatic]
+    public static int TlsInit = 100;
+
+    [ThreadStatic]
+    public static long TlsAccum;
+
+    [ThreadStatic]
+    public static TlsScratch TlsBuf;
+}
+
+public class Program {
+    public static int SharedHits;
+
+    public static void Main() {
+        // Main thread sees compile-time constant TLS initial value (100) and zero-init (0)
+        int mainStart = TlsState.TlsInit;
+        TlsState.TlsInit = 999;
+        TlsState.TlsAccum = 12345;
+        TlsState.TlsBuf.Bump(77);
+
+        // Worker tasks run on thread-pool threads with independent hardware TLS slots
+        int isolatedOk = 0;
+        Task[] tasks = new Task[4];
+        for (int i = 0; i < 4; i++) {
+            int workerId = i + 1;
+            tasks[i] = Task.Run(() => {
+                // Worker must NOT see main thread's 999
+                int seen = TlsState.TlsInit;
+                if (seen != 999 && seen >= 100) {
+                    Atomic.FetchAdd(ref isolatedOk, 1, MemoryOrder.AcqRel);
+                }
+                TlsState.TlsInit = TlsState.TlsInit + workerId;
+                TlsState.TlsAccum = TlsState.TlsAccum + (long)(workerId * 10);
+                TlsState.TlsBuf.Bump(workerId);
+                Atomic.FetchAdd(ref SharedHits, 1, MemoryOrder.AcqRel);
+            });
+        }
+        for (int i = 0; i < 4; i++) {
+            tasks[i].Wait();
+        }
+
+        // Main thread's TLS values must remain completely untouched by workers
+        Console.WriteLine($"mainStart={mainStart}");
+        Console.WriteLine($"mainAfter={TlsState.TlsInit},{TlsState.TlsAccum},{TlsState.TlsBuf.Tag},{TlsState.TlsBuf.Lanes[0]}");
+        Console.WriteLine($"workers={SharedHits},isolated={isolatedOk}");
+    }
+}

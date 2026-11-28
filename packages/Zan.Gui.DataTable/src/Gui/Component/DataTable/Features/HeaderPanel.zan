@@ -1,0 +1,171 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget;
+
+namespace Gui.Component.DataTable;
+
+// 关闭当前表头展开面板的无参回调（内部由弱引用中继器驱动，避免 ARC 循环引用）
+public delegate void HeaderPanelCloseAction();
+
+// 自定义表头展开面板的运行上下文（单次展开时创建并传入面板构建工厂）
+public class HeaderPanelContext {
+    public DataTableState state;
+    public List<DataColumn> columns;
+    public DataSource source;
+    public int column;
+    public DataColumn col;
+    internal HeaderPanelCloseAction closeAction;
+
+    public HeaderPanelContext(DataTableState st, List<DataColumn> cols, DataSource src,
+    int colIndex, HeaderPanelCloseAction closeAct) {
+        this.state = st;
+        this.columns = cols;
+        this.source = src;
+        this.column = colIndex;
+        this.col = (cols != null && colIndex >= 0 && colIndex < cols.Count) ? cols[colIndex] : null;
+        this.closeAction = closeAct;
+    }
+
+    // 业务面板内完成操作后主动关闭表头展开弹层
+    public void Close() {
+        if (this.closeAction != null) { this.closeAction(); }
+    }
+
+    // 通知表格刷新视图；recompute=true 时标记需要重新排序/筛选计算
+    public void Invalidate(bool recompute) {
+        if (this.state == null) { return; }
+        if (recompute) { this.state.dirty = true; }
+        if (this.state.retainedTree != null) { this.state.retainedTree.InputChanged(); }
+    }
+}
+
+// 自定义表头展开面板控件工厂：返回任意真实 Gui.Control 树（Panel/Input/Button/自定义控件），
+// 由 DataTableFeaturePopup 托管到 OverlayHost（天然零穿透、自动失焦关闭、支持 Esc）
+public delegate Control HeaderPanelFactory(App app, HeaderPanelContext ctx);
+
+// 表头展开面板的自定义标签页描述（对标 AG Grid menuTabs / DevExpress CustomColumnMenu）
+public class HeaderPanelTab {
+    public string key;
+    public string title;
+    public int prefWidth;   // 逻辑像素，<=0 使用默认面板宽度
+    public int prefHeight;  // 逻辑像素，<=0 使用默认面板高度
+    public bool hideFooter; // true 时隐藏底部 Clear Filter / Close 栏，由自定义面板全权掌控底部区
+    public HeaderPanelFactory build;
+
+    public HeaderPanelTab(string key, string title, HeaderPanelFactory build) {
+        this.key = key != null ? key : "";
+        this.title = title != null ? title : "";
+        this.prefWidth = 0;
+        this.prefHeight = 0;
+        this.hideFooter = false;
+        this.build = build;
+    }
+
+    public static HeaderPanelTab Create(string key, string title, HeaderPanelFactory build) {
+        return new HeaderPanelTab(key, title, build);
+    }
+
+    public HeaderPanelTab Size(int width, int height) {
+        this.prefWidth = width;
+        this.prefHeight = height;
+        return this;
+    }
+
+    public HeaderPanelTab HideFooter(bool hide) {
+        this.hideFooter = hide;
+        return this;
+    }
+}
+
+// 按列动态提供表头展开自定义面板的委托；返回 null 或空列表表示该列不追加动态面板
+public delegate List<HeaderPanelTab> HeaderPanelFunc(DataTableState st, List<DataColumn> cols, DataSource src, int col);
+
+public partial class DataTable {
+    // 注册按列动态提供表头展开自定义面板的委托
+    public static void SetHeaderPanelFunc(DataTableState st, HeaderPanelFunc fn) {
+        if (st != null) { st.headerPanelFunc = fn; }
+    }
+
+    public static HeaderPanelFunc GetHeaderPanelFunc(DataTableState st) {
+        return st != null ? st.headerPanelFunc : null;
+    }
+
+    // 注册全局静态表头展开自定义面板（对所有列生效，按注册顺序追加）
+    public static void AddHeaderPanel(DataTableState st, HeaderPanelTab tab) {
+        if (st == null || tab == null || tab.build == null) { return; }
+        if (st.headerPanels == null) { st.headerPanels = new List<HeaderPanelTab>(); }
+        for (int i = 0; i < st.headerPanels.Count; i = i + 1) {
+            if (tab.key != "" && st.headerPanels[i].key == tab.key) {
+                st.headerPanels[i] = tab;
+                return;
+            }
+        }
+        st.headerPanels.Add(tab);
+    }
+
+    // 清空全局静态表头展开自定义面板
+    public static void ClearHeaderPanels(DataTableState st) {
+        if (st != null && st.headerPanels != null) { st.headerPanels.Clear(); }
+    }
+
+    // 判断指定列是否应当在表头显示展开面板触发器
+    public static bool HasHeaderPanel(DataTableState st, DataColumn col) {
+        if (col == null) { return false; }
+        if (col.filterable || col.sortable) { return true; }
+        if (st == null) { return false; }
+        if (st.headerPanels != null && st.headerPanels.Count > 0) { return true; }
+        return st.headerPanelFunc != null;
+    }
+
+    // 合并静态与按列动态注册的自定义表头面板（同 key 后者覆盖前者）
+    internal static List<HeaderPanelTab> ResolveHeaderPanels(DataTableState st, List<DataColumn> cols,
+    DataSource src, int col) {
+        List<HeaderPanelTab> result = new List<HeaderPanelTab>();
+        if (st == null) { return result; }
+        if (st.headerPanels != null) {
+            for (int i = 0; i < st.headerPanels.Count; i = i + 1) {
+                HeaderPanelTab tab = st.headerPanels[i];
+                if (tab != null && tab.build != null) { result.Add(tab); }
+            }
+        }
+        if (st.headerPanelFunc != null && cols != null && col >= 0 && col < cols.Count) {
+            List<HeaderPanelTab> dyn = st.headerPanelFunc(st, cols, src, col);
+            if (dyn != null) {
+                for (int i = 0; i < dyn.Count; i = i + 1) {
+                    HeaderPanelTab tab = dyn[i];
+                    if (tab == null || tab.build == null) { continue; }
+                    bool replaced = false;
+                    if (tab.key != "") {
+                        for (int j = 0; j < result.Count; j = j + 1) {
+                            if (result[j].key == tab.key) {
+                                result[j] = tab;
+                                replaced = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!replaced) { result.Add(tab); }
+                }
+            }
+        }
+        return result;
+    }
+
+    // 程序化打开指定列的表头展开面板，可选直接定位到指定页签 key
+    // （内置 key："values" / "text" / "batch" / "rules"，或任意自定义 HeaderPanelTab.key；"" 打开默认首标签）
+    public static void OpenHeaderPanel(DataTableState st, List<DataColumn> cols,
+    DataSource src, int col, string tabKey) {
+        if (st == null || cols == null || col < 0 || col >= cols.Count) { return; }
+        DataTable.OpenFilterMenu(st, cols, src, col);
+        st.openMenuTabKey = tabKey != null ? tabKey : "";
+    }
+
+    // 程序化关闭当前表头展开面板
+    public static void CloseHeaderPanel(DataTableState st) {
+        if (st == null) { return; }
+        st.openMenu = -1;
+        st.openMenuTabKey = "";
+        st.editFocus = 0;
+    }
+}

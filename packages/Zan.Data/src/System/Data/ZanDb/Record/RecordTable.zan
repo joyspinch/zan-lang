@@ -113,6 +113,9 @@ public partial class RecordTable {
     public RecordSchema Schema() { return this.schema; }
 
     public RecordRow NewRow() {
+        if (this.schema == null || this.schema.rowBytes < 4) {
+            throw new InvalidOperationException("RecordTable schema is not initialized");
+        }
         return new RecordRow(this.schema, new byte[this.schema.rowBytes], 0, true, this);
     }
 
@@ -207,24 +210,35 @@ public partial class RecordTable {
         }
 
         ByteBuffer h = ByteBuffer.Alloc(HEADER_SIZE);
-        if (this.file.ReadAt(0, h, HEADER_SIZE) != HEADER_SIZE) {
+        string magic = "";
+        int ver = 0;
+        int rowBytes = 0;
+        int colCount = 0;
+        long total = 0L;
+        long active = 0L;
+        long schemaOffset = 0L;
+        long schemaBytes = 0L;
+        long dOffset = 0L;
+        try {
+            if (this.file.ReadAt(0, h, HEADER_SIZE) != HEADER_SIZE) {
+                this.lastError = "truncated ztab header";
+                this.file.Close();
+                return false;
+            }
+            h.SeekRead(0);
+            magic = h.Str(0, 4);
+            h.SeekRead(4);
+            ver = (int)h.ReadU32();
+            rowBytes = (int)h.ReadU32();
+            colCount = (int)h.ReadU32();
+            total = h.ReadU64();
+            active = h.ReadU64();
+            schemaOffset = h.ReadU64();
+            schemaBytes = h.ReadU64();
+            dOffset = h.ReadU64();
+        } finally {
             h.Free();
-            this.lastError = "truncated ztab header";
-            this.file.Close();
-            return false;
         }
-        h.SeekRead(0);
-        string magic = h.Str(0, 4);
-        h.SeekRead(4);
-        int ver = (int)h.ReadU32();
-        int rowBytes = (int)h.ReadU32();
-        int colCount = (int)h.ReadU32();
-        long total = h.ReadU64();
-        long active = h.ReadU64();
-        long schemaOffset = h.ReadU64();
-        long schemaBytes = h.ReadU64();
-        long dOffset = h.ReadU64();
-        h.Free();
 
         if (magic != MAGIC_TAB || ver != VERSION) {
             this.lastError = "invalid ztab magic or version";
@@ -237,7 +251,7 @@ public partial class RecordTable {
             colCount < 0 || colCount > 4096 ||
             schemaOffset < (long)HEADER_SIZE || schemaBytes <= 0L || schemaBytes > 4194304L ||
             dOffset < schemaOffset + schemaBytes ||
-            total < 0L || active < 0L || active > total) {
+            total < 0L || total > 2147483647L || active < 0L || active > total) {
             this.lastError = "corrupted ztab header bounds";
             this.file.Close();
             return false;
@@ -250,15 +264,22 @@ public partial class RecordTable {
         }
 
         ByteBuffer sb = ByteBuffer.Alloc((int)schemaBytes);
-        if (this.file.ReadAt(schemaOffset, sb, (int)schemaBytes) != (int)schemaBytes) {
+        try {
+            if (this.file.ReadAt(schemaOffset, sb, (int)schemaBytes) != (int)schemaBytes) {
+                this.lastError = "truncated ztab schema";
+                this.file.Close();
+                return false;
+            }
+            sb.SeekRead(0);
+            this.schema = RecordSchema.Deserialize(sb);
+        } finally {
             sb.Free();
-            this.lastError = "truncated ztab schema";
+        }
+        if (this.schema == null || this.schema.rowBytes != rowBytes || this.schema.columns.Count != colCount) {
+            this.lastError = "corrupted ztab schema";
             this.file.Close();
             return false;
         }
-        sb.SeekRead(0);
-        this.schema = RecordSchema.Deserialize(sb);
-        sb.Free();
 
         this.totalRows = (int)total;
         this.activeRows = (int)active;
@@ -266,14 +287,17 @@ public partial class RecordTable {
 
         if (this.totalRows > this.activeRows) {
             ByteBuffer flagBuf = ByteBuffer.Alloc(1);
-            for (int id = 1; id <= this.totalRows; id = id + 1) {
-                long off = this.dataOffset + (long)(id - 1) * (long)this.schema.rowBytes;
-                if (this.file.ReadAt(off, flagBuf, 1) == 1) {
-                    flagBuf.SeekRead(0);
-                    if (flagBuf.ReadU8() == 0) { this.tombstones[id] = true; }
+            try {
+                for (int id = 1; id <= this.totalRows; id = id + 1) {
+                    long off = this.dataOffset + (long)(id - 1) * (long)this.schema.rowBytes;
+                    if (this.file.ReadAt(off, flagBuf, 1) == 1) {
+                        flagBuf.SeekRead(0);
+                        if (flagBuf.ReadU8() == 0) { this.tombstones[id] = true; }
+                    }
                 }
+            } finally {
+                flagBuf.Free();
             }
-            flagBuf.Free();
         }
 
         this.OpenOrCreateBlobFileLocked();
@@ -337,21 +361,24 @@ public partial class RecordTable {
             this.blobFile = PageFile.OpenExisting(this.blobPath);
             if (this.blobFile != null && this.blobFile.IsOpen()) {
                 ByteBuffer bh = ByteBuffer.Alloc(BLOB_HEADER_SIZE);
-                if (this.blobFile.ReadAt(0, bh, BLOB_HEADER_SIZE) == BLOB_HEADER_SIZE) {
-                    bh.SeekRead(0);
-                    string bMagic = bh.Str(0, 4);
-                    bh.SeekRead(4);
-                    int bVer = (int)bh.ReadU32();
-                    long tBytes = bh.ReadU64();
-                    if (bMagic == MAGIC_BLOB && bVer == VERSION && tBytes >= (long)BLOB_HEADER_SIZE) {
-                        this.blobTotalBytes = tBytes;
+                try {
+                    if (this.blobFile.ReadAt(0, bh, BLOB_HEADER_SIZE) == BLOB_HEADER_SIZE) {
+                        bh.SeekRead(0);
+                        string bMagic = bh.Str(0, 4);
+                        bh.SeekRead(4);
+                        int bVer = (int)bh.ReadU32();
+                        long tBytes = bh.ReadU64();
+                        if (bMagic == MAGIC_BLOB && bVer == VERSION && tBytes >= (long)BLOB_HEADER_SIZE) {
+                            this.blobTotalBytes = tBytes;
+                        } else {
+                            this.blobTotalBytes = (long)this.blobFile.Size();
+                        }
                     } else {
                         this.blobTotalBytes = (long)this.blobFile.Size();
                     }
-                } else {
-                    this.blobTotalBytes = (long)this.blobFile.Size();
+                } finally {
+                    bh.Free();
                 }
-                bh.Free();
             }
         } else {
             this.blobFile = PageFile.Open(this.blobPath);
@@ -415,28 +442,33 @@ public partial class RecordTable {
         if (walExists) {
             this.walFile = PageFile.OpenExisting(this.walPath);
             if (this.walFile != null && this.walFile.IsOpen()) {
-                int fsize = this.walFile.Size();
-                if (fsize < WAL_HEADER_SIZE) {
+                long fsize = this.walFile.Size();
+                if (fsize < (long)WAL_HEADER_SIZE) {
                     this.ResetWalLocked();
                 } else {
                     ByteBuffer wh = ByteBuffer.Alloc(WAL_HEADER_SIZE);
-                    if (this.walFile.ReadAt(0, wh, WAL_HEADER_SIZE) == WAL_HEADER_SIZE) {
-                        wh.SeekRead(0);
-                        string wMagic = wh.Str(0, 4);
-                        wh.SeekRead(4);
-                        int wVer = (int)wh.ReadU32();
-                        long cpSeq = wh.ReadU64();
-                        wh.Free();
-                        if (wMagic == MAGIC_WAL && wVer == VERSION) {
-                            this.lastTxSeq = cpSeq;
-                            this.walValidSize = (long)fsize;
-                            // 重放未检查点日志并截断自愈撕裂尾
-                            this.ReplayWalLocked();
-                        } else {
-                            this.ResetWalLocked();
+                    bool headerValid = false;
+                    long cpSeq = 0L;
+                    try {
+                        if (this.walFile.ReadAt(0, wh, WAL_HEADER_SIZE) == WAL_HEADER_SIZE) {
+                            wh.SeekRead(0);
+                            string wMagic = wh.Str(0, 4);
+                            wh.SeekRead(4);
+                            int wVer = (int)wh.ReadU32();
+                            cpSeq = wh.ReadU64();
+                            if (wMagic == MAGIC_WAL && wVer == VERSION) {
+                                headerValid = true;
+                            }
                         }
-                    } else {
+                    } finally {
                         wh.Free();
+                    }
+                    if (headerValid) {
+                        this.lastTxSeq = cpSeq;
+                        this.walValidSize = fsize;
+                        // 重放未检查点日志并截断自愈撕裂尾
+                        this.ReplayWalLocked();
+                    } else {
                         this.ResetWalLocked();
                     }
                 }
@@ -470,9 +502,15 @@ public partial class RecordTable {
     }
 
     private void ReplaySingleOpLocked(int op, int id, ByteBuffer payload) {
+        if (id <= 0) {
+            throw new InvalidOperationException("invalid row id in WAL frame");
+        }
         int rbytes = this.schema.rowBytes;
         long tabOff = this.dataOffset + (long)(id - 1) * (long)rbytes;
         if (op == OP_ADD || op == OP_UPDATE) {
+            if (!payload.CanRead(rbytes)) {
+                throw new InvalidOperationException("truncated WAL row payload");
+            }
             byte[] rdata = new byte[rbytes];
             for (int j = 0; j < rbytes; j = j + 1) {
                 rdata[j] = (byte)payload.ReadU8();
@@ -513,13 +551,14 @@ public partial class RecordTable {
 
             this.RequireIo(this.walFile.ReadAt(off, hbuf, 8) == 8, "read WAL frame header", this.walFile);
             hbuf.SeekRead(0);
-            int plen = (int)hbuf.ReadU32();
+            long plenL = hbuf.ReadU32();
             long crc = hbuf.ReadU32();
 
-            if (plen <= 0 || plen > WAL_MAX_FRAME || (long)plen > fsize - off - 8L) {
+            if (plenL <= 0L || plenL > (long)WAL_MAX_FRAME || plenL > fsize - off - 8L) {
                 this.RepairWalTailLocked(off);
                 break;
             }
+            int plen = (int)plenL;
 
             ByteBuffer payload = ByteBuffer.Alloc(plen);
             try {
@@ -534,17 +573,33 @@ public partial class RecordTable {
             }
 
             payload.SeekRead(0);
+            if (!payload.CanRead(9)) {
+                throw new InvalidOperationException("truncated WAL frame payload in " + this.walPath);
+            }
             long seq = payload.ReadU64();
             int op = payload.ReadU8();
             if (seq > this.lastTxSeq) { this.lastTxSeq = seq; }
 
             if (op == OP_ADD || op == OP_UPDATE || op == OP_DELETE) {
+                if (!payload.CanRead(4)) {
+                    throw new InvalidOperationException("truncated WAL single op in " + this.walPath);
+                }
                 int id = (int)payload.ReadU32();
                 this.ReplaySingleOpLocked(op, id, payload);
                 replayedAny = true;
             } else if (op == OP_BATCH) {
-                int count = (int)payload.ReadU32();
+                if (!payload.CanRead(4)) {
+                    throw new InvalidOperationException("truncated WAL batch count in " + this.walPath);
+                }
+                long countL = payload.ReadU32();
+                if (countL < 0L || countL > (long)payload.Remaining() / 5L) {
+                    throw new InvalidOperationException("invalid WAL batch count in " + this.walPath);
+                }
+                int count = (int)countL;
                 for (int k = 0; k < count; k = k + 1) {
+                    if (!payload.CanRead(5)) {
+                        throw new InvalidOperationException("truncated WAL batch op in " + this.walPath);
+                    }
                     int subOp = payload.ReadU8();
                     int id = (int)payload.ReadU32();
                     this.ReplaySingleOpLocked(subOp, id, payload);
@@ -567,25 +622,32 @@ public partial class RecordTable {
     public void AppendWalFrameLocked(long seq, int op, ByteBuffer payload) {
         this.RequireWritable();
         this.RequireIo(this.walFile != null && this.walFile.IsOpen(), "WAL file is closed", this.walFile);
+        if (payload == null) { throw new ArgumentException("WAL payload cannot be null"); }
+        int plen = payload.Length();
+        if (plen <= 0 || plen > WAL_MAX_FRAME) {
+            throw new InvalidOperationException("WAL frame exceeds maximum size");
+        }
         this.WriteBlobHeaderLocked();
         this.BeforePersistenceIo("blob-commit-sync");
         this.RequireIo(this.blobFile.Sync(), "sync blob before WAL", this.blobFile);
-        int plen = payload.Length();
         int crc = payload.Crc32(plen);
         ByteBuffer frame = ByteBuffer.Alloc(8 + plen);
-        frame.WriteU32((long)plen);
-        frame.WriteU32((long)crc);
-        frame.WriteRaw(payload.Raw(), plen);
-        long off = this.walValidSize;
-        Mutex.Lock(this.ioMtx);
         try {
-            this.BeforePersistenceIo("wal-append-write");
-            this.RequireIo(this.walFile.WriteAt(off, frame.Raw(), 8 + plen) == 8 + plen, "append WAL frame", this.walFile);
-            this.BeforePersistenceIo("wal-append-sync");
-            this.RequireIo(this.walFile.Sync(), "sync WAL frame", this.walFile);
-            this.walValidSize = off + 8L + (long)plen;
+            frame.WriteU32((long)plen);
+            frame.WriteU32((long)crc);
+            frame.WriteRaw(payload.Raw(), plen);
+            long off = this.walValidSize;
+            Mutex.Lock(this.ioMtx);
+            try {
+                this.BeforePersistenceIo("wal-append-write");
+                this.RequireIo(this.walFile.WriteAt(off, frame.Raw(), 8 + plen) == 8 + plen, "append WAL frame", this.walFile);
+                this.BeforePersistenceIo("wal-append-sync");
+                this.RequireIo(this.walFile.Sync(), "sync WAL frame", this.walFile);
+                this.walValidSize = off + 8L + (long)plen;
+            } finally {
+                Mutex.Unlock(this.ioMtx);
+            }
         } finally {
-            Mutex.Unlock(this.ioMtx);
             frame.Free();
         }
     }
@@ -639,23 +701,30 @@ public partial class RecordTable {
 
             int n = this.txOps.Count;
             int rbytes = this.schema.rowBytes;
+            long frameCap = 17L + (long)n * (5L + (long)rbytes);
+            if (frameCap > (long)WAL_MAX_FRAME) {
+                throw new InvalidOperationException("transaction WAL frame exceeds maximum size");
+            }
             this.lastTxSeq = this.lastTxSeq + 1L;
 
             // 1. 打包原子 Batch 帧
-            ByteBuffer b = ByteBuffer.Alloc(17 + n * (5 + rbytes));
-            b.WriteU64(this.lastTxSeq);
-            b.WriteU8(OP_BATCH);
-            b.WriteU32((long)n);
-            for (int i = 0; i < n; i = i + 1) {
-                RecordTxOp op = this.txOps[i];
-                b.WriteU8(op.opType);
-                b.WriteU32((long)op.id);
-                if (op.opType == OP_ADD || op.opType == OP_UPDATE) {
-                    b.WriteRaw(op.row.data, rbytes);
+            ByteBuffer b = ByteBuffer.Alloc((int)frameCap);
+            try {
+                b.WriteU64(this.lastTxSeq);
+                b.WriteU8(OP_BATCH);
+                b.WriteU32((long)n);
+                for (int i = 0; i < n; i = i + 1) {
+                    RecordTxOp op = this.txOps[i];
+                    b.WriteU8(op.opType);
+                    b.WriteU32((long)op.id);
+                    if (op.opType == OP_ADD || op.opType == OP_UPDATE) {
+                        b.WriteRaw(op.row.data, rbytes);
+                    }
                 }
+                this.AppendWalFrameLocked(this.lastTxSeq, OP_BATCH, b);
+            } finally {
+                b.Free();
             }
-            try { this.AppendWalFrameLocked(this.lastTxSeq, OP_BATCH, b); }
-            finally { b.Free(); }
 
             // 2. 批量物理应用至 .ztab 文件并同步维护索引（支持同事务内 ADD->UPDATE / ADD->DELETE / UPDATE->DELETE）
             Dictionary<int, RecordRow> txLive = new Dictionary<int, RecordRow>();
@@ -744,6 +813,9 @@ public partial class RecordTable {
         }
         long off = this.blobTotalBytes;
         int len = bytes.Length;
+        if (off < (long)BLOB_HEADER_SIZE || off > 2147483647L || off + (long)len > 2147483647L) {
+            throw new InvalidOperationException("RecordTable blob store exceeds 2GiB 32-bit offset limit");
+        }
         this.RequireIo(this.blobFile.WriteAt(off, (nint)bytes, len) == len, "write blob", this.blobFile);
         this.blobTotalBytes = off + (long)len;
         this.WriteBlobHeaderLocked();
@@ -823,7 +895,9 @@ public partial class RecordTable {
         this.tlock.EnterWrite();
         try {
             this.RequireWritable();
-            if (row == null) { throw new ArgumentException("row cannot be null"); }
+            if (row == null || row.data == null || row.data.Length < this.schema.rowBytes) {
+                throw new ArgumentException("row cannot be null or invalid");
+            }
             if (this.totalRows >= 2147483647 || this.totalRows < 0) {
                 throw new InvalidOperationException("RecordTable reached maximum 32-bit row limit (2,147,483,647)");
             }
@@ -880,6 +954,17 @@ public partial class RecordTable {
                 throw new InvalidOperationException("AddBulk exceeds maximum 32-bit row limit (2,147,483,647)");
             }
             int rbytes = this.schema.rowBytes;
+            // 原子前校验：在修改任何行元数据或写入 .zblob 前验证全部行及 WAL 帧上限
+            for (int i = 0; i < n; i = i + 1) {
+                RecordRow r = rows[i];
+                if (r == null || r.data == null || r.data.Length < rbytes) {
+                    throw new ArgumentException("AddBulk contains null or invalid row");
+                }
+            }
+            long frameCap = 17L + (long)n * (5L + (long)rbytes);
+            if (!this.inTx && frameCap > (long)WAL_MAX_FRAME) {
+                throw new InvalidOperationException("AddBulk WAL frame exceeds maximum size");
+            }
             firstId = this.totalRows + 1;
 
             // 1. 先写大字段 blob 存储（自管理原子锁，避免与后续表文件锁重入）
@@ -905,18 +990,21 @@ public partial class RecordTable {
 
             // 2. 批量 WAL 帧写入
             this.lastTxSeq = this.lastTxSeq + 1L;
-            ByteBuffer b = ByteBuffer.Alloc(17 + n * (5 + rbytes));
-            b.WriteU64(this.lastTxSeq);
-            b.WriteU8(OP_BATCH);
-            b.WriteU32((long)n);
-            for (int i = 0; i < n; i = i + 1) {
-                RecordRow r = rows[i];
-                b.WriteU8(OP_ADD);
-                b.WriteU32((long)r.id);
-                b.WriteRaw(r.data, rbytes);
+            ByteBuffer b = ByteBuffer.Alloc((int)frameCap);
+            try {
+                b.WriteU64(this.lastTxSeq);
+                b.WriteU8(OP_BATCH);
+                b.WriteU32((long)n);
+                for (int i = 0; i < n; i = i + 1) {
+                    RecordRow r = rows[i];
+                    b.WriteU8(OP_ADD);
+                    b.WriteU32((long)r.id);
+                    b.WriteRaw(r.data, rbytes);
+                }
+                this.AppendWalFrameLocked(this.lastTxSeq, OP_BATCH, b);
+            } finally {
+                b.Free();
             }
-            try { this.AppendWalFrameLocked(this.lastTxSeq, OP_BATCH, b); }
-            finally { b.Free(); }
 
             // 3. 批量物理写主表记录槽位
             Mutex.Lock(this.ioMtx);
@@ -976,6 +1064,9 @@ public partial class RecordTable {
         this.tlock.EnterWrite();
         try {
             this.RequireWritable();
+            if (row == null || row.data == null || row.data.Length < this.schema.rowBytes) {
+                throw new ArgumentException("row cannot be null or invalid");
+            }
             if (id <= 0 || id > this.totalRows || this.tombstones.ContainsKey(id)) {
                 return false;
             }

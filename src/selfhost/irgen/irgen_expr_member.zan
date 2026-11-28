@@ -10,12 +10,14 @@ partial class Irgen {
     // member node is temporarily rewired to read the synthetic local so the
     // ordinary member/call codegen applies unchanged, then restored.
     ExprVal GenNullCond(Node full, Node qmem) {
+        EnterCallArm();
         ExprVal obj = GenExpr(qmem.a);
         string ot = MapType(obj.ty);
         if (!IsPtrLL(ot)) {
             qmem.ival = 0;
             ExprVal pv = GenExpr(full);
             qmem.ival = 1;
+            LeaveCallArm();
             return pv;
         }
         qdotSeq = qdotSeq + 1;
@@ -33,12 +35,10 @@ partial class Irgen {
         string bpre = curLbl;
         L("  br i1 " + isn + ", label %L" + lend + ", label %L" + lthen);
         Label(lthen);
-        List<string> svT = stmtTemps; List<Node> svTT = stmtTempTypes;
-        stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
+        BranchTempScope bts = EnterBranchTempScope();
         ExprVal v = GenExpr(full);
         EmitArcRetain(v.op, v.ty);
-        EmitTempReleases();
-        stmtTemps = svT; stmtTempTypes = svTT;
+        LeaveBranchTempScope(bts);
         qmem.a = saved; qmem.ival = 1;
         string valOp = v.op;
         bool isValPrim = (v.ty != null && IsPrimValue(v.ty) && !IsNullable(v.ty));
@@ -53,16 +53,21 @@ partial class Irgen {
             nty.op = 1;
             string r = NT();
             L("  " + r + " = phi i8* [ null, %" + bpre + " ], [ " + valOp + ", %" + bthen + " ]");
+            LeaveCallArm();
             AddTemp(r, nty);
             return new ExprVal(r, nty);
         }
         string vt = MapType(v.ty);
-        if (vt == "void") { return new ExprVal("0", MkType("int")); }
+        if (vt == "void") {
+            LeaveCallArm();
+            return new ExprVal("0", MkType("int"));
+        }
         string dflt = "0";
         if (IsPtrLL(vt)) { dflt = "null"; }
         if (vt == "double") { dflt = "0.0"; }
         string r = NT();
         L("  " + r + " = phi " + vt + " [ " + dflt + ", %" + bpre + " ], [ " + v.op + ", %" + bthen + " ]");
+        LeaveCallArm();
         AddTemp(r, v.ty);
         return new ExprVal(r, v.ty);
     }
@@ -888,22 +893,27 @@ partial class Irgen {
             L("  " + t + " = call i64 @zarr_len(i64* " + obj.op + ")");
             return new ExprVal(t, MkType("int"));
         }
-        if (e.sval == "Length" && IsSbType(obj.ty)) {
+        if ((e.sval == "Length" || e.sval == "Capacity") && IsSbType(obj.ty)) {
+            string rnm = e.a != null && e.a.kind == AK.Ident() && e.a.sval != "" ? e.a.sval : e.sval;
+            string nil = NT();
+            L("  " + nil + " = icmp eq i8* " + obj.op + ", null");
+            EmitRuntimeCheckIf(e, nil, "null reference: receiver '" + rnm + "' is null");
+            int nilBb = NL(); int okBb = NL(); int doneBb = NL();
+            L("  br i1 " + nil + ", label %L" + nilBb + ", label %L" + okBb);
+            Label(nilBb);
+            L("  br label %L" + doneBb);
+            Label(okBb);
             string bp = NT();
             L("  " + bp + " = bitcast i8* " + obj.op + " to %zsb*");
             string cp = NT();
-            L("  " + cp + " = getelementptr %zsb, %zsb* " + bp + ", i32 0, i32 0");
+            string fi = e.sval == "Length" ? "0" : "1";
+            L("  " + cp + " = getelementptr %zsb, %zsb* " + bp + ", i32 0, i32 " + fi);
+            string loaded = NT();
+            L("  " + loaded + " = load i64, i64* " + cp);
+            L("  br label %L" + doneBb);
+            Label(doneBb);
             string t = NT();
-            L("  " + t + " = load i64, i64* " + cp);
-            return new ExprVal(t, MkType("int"));
-        }
-        if (e.sval == "Capacity" && IsSbType(obj.ty)) {
-            string bp = NT();
-            L("  " + bp + " = bitcast i8* " + obj.op + " to %zsb*");
-            string cp = NT();
-            L("  " + cp + " = getelementptr %zsb, %zsb* " + bp + ", i32 0, i32 1");
-            string t = NT();
-            L("  " + t + " = load i64, i64* " + cp);
+            L("  " + t + " = phi i64 [ 0, %L" + nilBb + " ], [ " + loaded + ", %L" + okBb + " ]");
             return new ExprVal(t, MkType("int"));
         }
         if (e.sval == "Length" && IsStr(obj.ty)) {
@@ -916,30 +926,42 @@ partial class Irgen {
             return new ExprVal(len, MkType("int"));
         }
         if (e.sval == "Count" && IsListType(obj.ty)) {
+            string rnm = e.a != null && e.a.kind == AK.Ident() && e.a.sval != "" ? e.a.sval : e.sval;
+            string nil = NT();
+            L("  " + nil + " = icmp eq i8* " + obj.op + ", null");
+            EmitRuntimeCheckIf(e, nil, "null reference: receiver '" + rnm + "' is null");
             string t = NT();
             L("  " + t + " = call i64 @zlist_count(i8* " + obj.op + ")");
             return new ExprVal(t, MkType("int"));
         }
         if (e.sval == "Count" && IsDictType(obj.ty)) {
+            string rnm = e.a != null && e.a.kind == AK.Ident() && e.a.sval != "" ? e.a.sval : e.sval;
+            string nil = NT();
+            L("  " + nil + " = icmp eq i8* " + obj.op + ", null");
+            EmitRuntimeCheckIf(e, nil, "null reference: receiver '" + rnm + "' is null");
             string t = NT();
             L("  " + t + " = call i64 @zdict_count(i8* " + obj.op + ")");
             return new ExprVal(t, MkType("int"));
         }
         if (e.sval == "Clear" && IsDictType(obj.ty)) {
-            L("  call void @zdict_clear(i8* " + obj.op + ")");
+            string rnm = e.a != null && e.a.kind == AK.Ident() && e.a.sval != "" ? e.a.sval : e.sval;
+            string sel = EmitGuardNullObj(e, obj.op, "i8*", "null reference: receiver '" + rnm + "' is null");
+            L("  call void @zdict_clear(i8* " + sel + ")");
             return new ExprVal("0", MkType("void"));
         }
         if ((e.sval == "Keys" || e.sval == "Values") && IsDictType(obj.ty)) {
+            string rnm = e.a != null && e.a.kind == AK.Ident() && e.a.sval != "" ? e.a.sval : e.sval;
+            string sel = EmitGuardNullObj(e, obj.op, "i8*", "null reference: receiver '" + rnm + "' is null");
             bool keys = e.sval == "Keys";
             Node elem = keys ? DictKey(obj.ty) : DictVal(obj.ty);
             Node lt = ListOf(elem);
             string meta = ListTypeMetadata(lt);
             string t = NT();
             if (keys) {
-                L("  " + t + " = call i8* @zdict_keys(i8* " + obj.op + ", i64 "
+                L("  " + t + " = call i8* @zdict_keys(i8* " + sel + ", i64 "
                     + DictKeyStrFlag(obj.ty) + ", i8* " + meta + ")");
             } else {
-                L("  " + t + " = call i8* @zdict_values(i8* " + obj.op + ", i8* " + meta + ")");
+                L("  " + t + " = call i8* @zdict_values(i8* " + sel + ", i8* " + meta + ")");
             }
             AddTemp(t, lt);
             return new ExprVal(t, lt);
@@ -972,6 +994,16 @@ partial class Irgen {
         }
         // property getter: obj.Name -> obj.get_Name()
         if (cls != null && FindMethodUp(cls, "get_" + e.sval) != null) {
+            if (cls.kind == AK.ClassDecl()) {
+                string rt0 = MapType(obj.ty);
+                if (IsPtrLL(rt0)) {
+                    string rnm = e.a != null && e.a.kind == AK.Ident() && e.a.sval != ""
+                        ? e.a.sval : e.sval;
+                    string sel = EmitGuardNullObj(e, obj.op, rt0,
+                        "null reference: receiver '" + rnm + "' is null");
+                    obj = new ExprVal(sel, obj.ty);
+                }
+            }
             return EmitInstanceCall(obj, obj.ty.sval, "get_" + e.sval, new Node(AK.Call()));
         }
         // an INSTANCE method group used as a delegate value (`obj.Method`):
@@ -980,6 +1012,16 @@ partial class Irgen {
         if (cls != null) {
             Node mg = FindMethodUp(cls, e.sval);
             if (mg != null && !HasMod(mg, MOD.Static()) && !HasMod(mg, MOD.Extern())) {
+                if (cls.kind == AK.ClassDecl()) {
+                    string rt0 = MapType(obj.ty);
+                    if (IsPtrLL(rt0)) {
+                        string rnm = e.a != null && e.a.kind == AK.Ident() && e.a.sval != ""
+                            ? e.a.sval : e.sval;
+                        string sel = EmitGuardNullObj(e, obj.op, rt0,
+                            "null reference: receiver '" + rnm + "' is null");
+                        obj = new ExprVal(sel, obj.ty);
+                    }
+                }
                 if (ArrayInlineStruct(obj.ty)) {
                     obj = CopyStructValue(obj);
                     AddTemp(obj.op, obj.ty);

@@ -22,6 +22,8 @@ public class ZstdBits {
 
     // 把 v 的低 bits 位反转（bits ≤ 32）。
     public static int Reverse(int v, int bits) {
+        if (bits <= 0) { return 0; }
+        if (bits > 32) { bits = 32; }
         int r = 0;
         for (int i = 0; i < bits; i = i + 1) {
             r = (r << 1) | (v & 1);
@@ -43,27 +45,29 @@ public class ZstdBackBits {
     byte[] data;
     int start;
     int bytePos; // 下一个待载入的字节下标（从 end-2 递减至 start）
-    int total;   // 可读的总位数
-    int cur;     // 已读位数
+    long total;  // 可读的总位数（64 位防 256 MiB 溢出）
+    long cur;    // 已读位数
     ulong bitBuf;
     int bitCount;
     bool bad;    // 区间非法（空区间，或末字节为 0——没有结束标记）
 
     // 建立读取器，区间为 data[start, end)。
     public ZstdBackBits(byte[] src, int start, int end) {
-        this.data = src;
-        this.start = start;
-        this.bytePos = start - 1;
-        this.total = 0;
-        this.cur = 0;
+        this.data = null;
+        this.start = 0;
+        this.bytePos = -1;
+        this.total = 0L;
+        this.cur = 0L;
         this.bitBuf = 0UL;
         this.bitCount = 0;
         this.bad = true;
-        if (end > start && end <= src.Length && start >= 0) {
+        if (src != null && start >= 0 && end > start && end <= src.Length) {
             int last = src[end - 1] & 255;
             if (last != 0) {
                 int p = ZstdBits.HighBit(last);
-                this.total = p + (end - start - 1) * 8;
+                this.data = src;
+                this.start = start;
+                this.total = (long)p + (long)(end - start - 1) * 8L;
                 this.bad = false;
                 this.bytePos = end - 2;
                 if (p > 0) {
@@ -76,12 +80,13 @@ public class ZstdBackBits {
     }
 
     public void Refill() {
+        if (this.bad || this.data == null) { return; }
         byte[] d = this.data;
         int st = this.start;
         int bp = this.bytePos;
         int bc = this.bitCount;
         ulong bb = this.bitBuf;
-        while (bc <= 32 && bp - 3 >= st) {
+        while (bc <= 32 && bp >= st && bp - st >= 3) {
             ulong w = (((ulong)(d[bp] & 255)) << 24)
                 | (((ulong)(d[bp - 1] & 255)) << 16)
                 | (((ulong)(d[bp - 2] & 255)) << 8)
@@ -107,7 +112,10 @@ public class ZstdBackBits {
 
     // 剩余可读位数。
     public int Remaining() {
-        return this.total - this.cur;
+        long rem = this.total - this.cur;
+        if (rem > 2147483647L) { return 2147483647; }
+        if (rem < -2147483648L) { return -2147483648; }
+        return (int)rem;
     }
 
     // 是否读过头（多读过的位按 0 处理）。
@@ -117,7 +125,8 @@ public class ZstdBackBits {
 
     // 窥视接下来的 n 位（不推进游标）。n ≤ 32。
     public int Peek(int n) {
-        if (n <= 0) { return 0; }
+        if (this.bad || n <= 0) { return 0; }
+        if (n > 32) { n = 32; }
         if (this.bitCount < n && this.bytePos >= this.start) {
             this.Refill();
         }
@@ -126,11 +135,11 @@ public class ZstdBackBits {
 
     // 跳过 n 位。
     public void Skip(int n) {
-        if (n <= 0) { return; }
+        if (this.bad || n <= 0) { return; }
         if (this.bitCount < n && this.bytePos >= this.start) {
             this.Refill();
         }
-        this.cur = this.cur + n;
+        this.cur = this.cur + (long)n;
         if (n < this.bitCount) {
             this.bitBuf = this.bitBuf << n;
             this.bitCount = this.bitCount - n;
@@ -142,12 +151,13 @@ public class ZstdBackBits {
 
     // 读 n 位（先读到的位是最高位）。
     public int Read(int n) {
-        if (n <= 0) { return 0; }
+        if (this.bad || n <= 0) { return 0; }
+        if (n > 32) { n = 32; }
         if (this.bitCount < n && this.bytePos >= this.start) {
             this.Refill();
         }
         int v = (int)(this.bitBuf >> (64 - n));
-        this.cur = this.cur + n;
+        this.cur = this.cur + (long)n;
         if (n < this.bitCount) {
             this.bitBuf = this.bitBuf << n;
             this.bitCount = this.bitCount - n;
@@ -167,31 +177,35 @@ public class ZstdFwdBits {
     byte[] data;
     int bytePos;
     int end;
-    int bit;   // 已读的绝对位偏移
+    long bit;  // 已读的绝对位偏移
     ulong bitBuf;
     int bitCount;
 
     // 建立读取器，区间为 data[start, end)。
     public ZstdFwdBits(byte[] src, int start, int end) {
-        this.data = src;
-        this.bytePos = start;
-        this.end = end;
-        this.bit = 0;
+        this.data = null;
+        this.bytePos = 0;
+        this.end = 0;
+        this.bit = 0L;
         this.bitBuf = 0UL;
         this.bitCount = 0;
-        this.Refill();
+        if (src != null && start >= 0 && end >= start && end <= src.Length) {
+            this.data = src;
+            this.bytePos = start;
+            this.end = end;
+            this.Refill();
+        }
     }
 
     void Refill() {
+        if (this.data == null) { return; }
         byte[] d = this.data;
         int e = this.end;
         int bp = this.bytePos;
         int bc = this.bitCount;
         ulong bb = this.bitBuf;
         while (bc <= 56 && bp < e) {
-            if (bp >= 0) {
-                bb = bb | (((ulong)(d[bp] & 255)) << bc);
-            }
+            bb = bb | (((ulong)(d[bp] & 255)) << bc);
             bc = bc + 8;
             bp = bp + 1;
         }
@@ -200,12 +214,14 @@ public class ZstdFwdBits {
         this.bitBuf = bb;
     }
 
-    // 窥视接下来的 n 位（不推进游标）。n ≤ 24。
+    // 窥视接下来的 n 位（不推进游标）。n ≤ 32。
     public int Peek(int n) {
         if (n <= 0) { return 0; }
+        if (n > 32) { n = 32; }
         if (this.bitCount < n && this.bytePos < this.end) {
             this.Refill();
         }
+        if (n == 32) { return (int)this.bitBuf; }
         return (int)(this.bitBuf & ((1UL << n) - 1UL));
     }
 
@@ -215,7 +231,7 @@ public class ZstdFwdBits {
         if (this.bitCount < n && this.bytePos < this.end) {
             this.Refill();
         }
-        this.bit = this.bit + n;
+        this.bit = this.bit + (long)n;
         if (n < this.bitCount) {
             this.bitBuf = this.bitBuf >> n;
             this.bitCount = this.bitCount - n;
@@ -234,6 +250,9 @@ public class ZstdFwdBits {
 
     // 已消耗的字节数（向上取整——最后一个字节里没用完的位算作已消耗）。
     public int BytesUsed() {
-        return (this.bit + 7) / 8;
+        if (this.bit <= 0L) { return 0; }
+        long bytes = (this.bit + 7L) / 8L;
+        if (bytes > 2147483647L) { return 2147483647; }
+        return (int)bytes;
     }
 }

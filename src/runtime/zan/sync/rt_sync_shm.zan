@@ -1,0 +1,287 @@
+// rt_sync_shm.zan: Cross-platform named shared memory, mmap, exe dir, and dir listing.
+// Replaces src/runtime/sync/rt_sync_shm.c in 100% pure Zan.
+
+namespace Zan.Runtime.Sync;
+
+// POSIX zan_mmap_handle layout (264 bytes):
+//  0: int fd
+//  4: int owner
+//  8: char name[256]
+static class MmapOff {
+    internal const ulong POSIX_SIZE = 264UL;
+    internal const long FD = 0L;
+    internal const long OWNER = 4L;
+    internal const long NAME = 8L;
+}
+
+static class RtSyncShm {
+    [Export("zan_mmap_create")]
+    public static long MmapCreate(nint name, long size) {
+        if (name == (nint)0 || NativeMemory.Read<byte>(name) == (byte)0 || size <= 0L) return 0L;
+#if WINDOWS
+        uint hi = (uint)(((ulong)size) >> 32);
+        uint lo = (uint)(((ulong)size) & 0xFFFFFFFFUL);
+        nint wname = SyncPlat.Utf8ToWideAlloc(name);
+        if (wname == (nint)0) return 0L;
+        nint named = SyncPlat.WinCreateFileMappingW((nint)(-1), (nint)0, SyncPlat.PAGE_READWRITE, hi, lo, wname);
+        uint err = SyncPlat.WinGetLastError();
+        SyncPlat.CFree(wname);
+        if (named == (nint)0) return 0L;
+        if (err == SyncPlat.ERROR_ALREADY_EXISTS) {
+            SyncPlat.WinCloseHandle(named);
+            return 0L;
+        }
+        return (long)named;
+#else
+        SyncBuf256 sb = new SyncBuf256();
+        nint sp = NativeMemory.AddressOf(ref sb);
+        ulong nlen = SyncPlat.CStrLen(name);
+        if (nlen + 2UL > 256UL) return 0L;
+        NativeMemory.At<byte>(sp, 0L) = (byte)47; // '/'
+        SyncPlat.CMemcpy(sp + (nint)1, name, nlen + 1UL);
+        int fd = SyncPlat.PosixShmOpen(sp, SyncPlat.O_CREAT | SyncPlat.O_EXCL | SyncPlat.O_RDWR, 0x180U); // 0600
+        if (fd < 0) return 0L;
+        if (SyncPlat.PosixFtruncate(fd, size) != 0) {
+            SyncPlat.PosixShmUnlink(sp);
+            SyncPlat.PosixClose(fd);
+            return 0L;
+        }
+        nint h = SyncPlat.CCalloc(1UL, MmapOff.POSIX_SIZE);
+        if (h == (nint)0) {
+            SyncPlat.PosixShmUnlink(sp);
+            SyncPlat.PosixClose(fd);
+            return 0L;
+        }
+        NativeMemory.Write<int>(h + (nint)MmapOff.FD, fd);
+        NativeMemory.Write<int>(h + (nint)MmapOff.OWNER, 1);
+        SyncPlat.CMemcpy(h + (nint)MmapOff.NAME, sp, nlen + 2UL);
+        return (long)h;
+#endif
+    }
+
+    [Export("zan_mmap_open")]
+    public static long MmapOpen(nint name, long size) {
+        if (name == (nint)0 || NativeMemory.Read<byte>(name) == (byte)0) return 0L;
+#if WINDOWS
+        nint wname = SyncPlat.Utf8ToWideAlloc(name);
+        if (wname == (nint)0) return 0L;
+        nint h = SyncPlat.WinOpenFileMappingW(SyncPlat.FILE_MAP_ALL_ACCESS, 0, wname);
+        SyncPlat.CFree(wname);
+        if (h == (nint)0) return 0L;
+        return (long)h;
+#else
+        SyncBuf256 sb = new SyncBuf256();
+        nint sp = NativeMemory.AddressOf(ref sb);
+        ulong nlen = SyncPlat.CStrLen(name);
+        if (nlen + 2UL > 256UL) return 0L;
+        NativeMemory.At<byte>(sp, 0L) = (byte)47;
+        SyncPlat.CMemcpy(sp + (nint)1, name, nlen + 1UL);
+        int fd = SyncPlat.PosixShmOpen(sp, SyncPlat.O_RDWR, 0x180U);
+        if (fd < 0) return 0L;
+        if (size > 0L) {
+            SyncBuf160 stBuf = new SyncBuf160();
+            nint st = NativeMemory.AddressOf(ref stBuf);
+            // Linux x86_64 struct stat: st_size at offset 48 (int64)
+            if (SyncPlat.PosixFstat(fd, st) != 0 || NativeMemory.Read<long>(st + (nint)SyncPlat.STAT_SIZE_OFF) != size) {
+                SyncPlat.PosixClose(fd);
+                return 0L;
+            }
+        }
+        nint h = SyncPlat.CCalloc(1UL, MmapOff.POSIX_SIZE);
+        if (h == (nint)0) {
+            SyncPlat.PosixClose(fd);
+            return 0L;
+        }
+        NativeMemory.Write<int>(h + (nint)MmapOff.FD, fd);
+        SyncPlat.CMemcpy(h + (nint)MmapOff.NAME, sp, nlen + 2UL);
+        return (long)h;
+#endif
+    }
+
+    [Export("zan_mmap_from_file")]
+    public static long MmapFromFile(nint path, long size) {
+        if (path == (nint)0 || NativeMemory.Read<byte>(path) == (byte)0) return 0L;
+#if WINDOWS
+        nint wpath = SyncPlat.Utf8ToWideAlloc(path);
+        if (wpath == (nint)0) return 0L;
+        nint fh = SyncPlat.WinCreateFileW(wpath, SyncPlat.GENERIC_RW, SyncPlat.FILE_SHARE_RW, (nint)0,
+                                          SyncPlat.OPEN_EXISTING, SyncPlat.FILE_ATTRIBUTE_NORMAL, (nint)0);
+        SyncPlat.CFree(wpath);
+        if (fh == (nint)(-1)) return 0L;
+        uint hi = 0U;
+        uint lo = 0U;
+        if (size > 0L) {
+            hi = (uint)(((ulong)size) >> 32);
+            lo = (uint)(((ulong)size) & 0xFFFFFFFFUL);
+        }
+        nint h = SyncPlat.WinCreateFileMappingW(fh, (nint)0, SyncPlat.PAGE_READWRITE, hi, lo, (nint)0);
+        SyncPlat.WinCloseHandle(fh);
+        if (h == (nint)0) return 0L;
+        return (long)h;
+#else
+        int fd = SyncPlat.PosixOpen3(path, SyncPlat.O_RDWR | SyncPlat.O_CLOEXEC, 0U);
+        if (fd < 0) return 0L;
+        nint h = SyncPlat.CCalloc(1UL, MmapOff.POSIX_SIZE);
+        if (h == (nint)0) {
+            SyncPlat.PosixClose(fd);
+            return 0L;
+        }
+        NativeMemory.Write<int>(h + (nint)MmapOff.FD, fd);
+        NativeMemory.Write<byte>(h + (nint)MmapOff.NAME, (byte)0);
+        return (long)h;
+#endif
+    }
+
+    [Export("zan_mmap_map")]
+    public static long MmapMap(long handle, long size) {
+        if (handle == 0L || size <= 0L) return 0L;
+#if WINDOWS
+        nint p = SyncPlat.WinMapViewOfFile((nint)handle, SyncPlat.FILE_MAP_ALL_ACCESS, 0U, 0U, (ulong)size);
+        return p != (nint)0 ? (long)p : 0L;
+#else
+        nint h = (nint)handle;
+        int fd = NativeMemory.Read<int>(h + (nint)MmapOff.FD);
+        nint p = SyncPlat.PosixMmap((nint)0, (ulong)size, SyncPlat.PROT_RW, SyncPlat.MAP_SHARED, fd, 0L);
+        if (p == (nint)(-1)) return 0L;
+        return (long)p;
+#endif
+    }
+
+    [Export("zan_mmap_unmap")]
+    public static long MmapUnmap(long ptr, long size) {
+        if (ptr == 0L) return 0L;
+#if WINDOWS
+        return SyncPlat.WinUnmapViewOfFile((nint)ptr) != 0 ? 1L : 0L;
+#else
+        if (size <= 0L) return 0L;
+        return SyncPlat.PosixMunmap((nint)ptr, (ulong)size) == 0 ? 1L : 0L;
+#endif
+    }
+
+    [Export("zan_mmap_flush")]
+    public static long MmapFlush(long ptr, long size) {
+        if (ptr == 0L) return 1L;
+        if (size < 0L) return 0L;
+#if WINDOWS
+        return SyncPlat.WinFlushViewOfFile((nint)ptr, (ulong)size) != 0 ? 1L : 0L;
+#else
+        if (size == 0L) return 1L;
+        return SyncPlat.PosixMsync((nint)ptr, (ulong)size, SyncPlat.MS_SYNC) == 0 ? 1L : 0L;
+#endif
+    }
+
+    [Export("zan_mmap_close")]
+    public static long MmapClose(long handle) {
+        if (handle == 0L) return 0L;
+#if WINDOWS
+        return SyncPlat.WinCloseHandle((nint)handle) != 0 ? 1L : 0L;
+#else
+        nint h = (nint)handle;
+        SyncPlat.PosixClose(NativeMemory.Read<int>(h + (nint)MmapOff.FD));
+        if (NativeMemory.Read<int>(h + (nint)MmapOff.OWNER) != 0 &&
+            NativeMemory.Read<byte>(h + (nint)MmapOff.NAME) != (byte)0) {
+            SyncPlat.PosixShmUnlink(h + (nint)MmapOff.NAME);
+        }
+        SyncPlat.CFree(h);
+        return 1L;
+#endif
+    }
+
+    [Export("zan_mmap_unlink")]
+    public static long MmapUnlink(nint name) {
+        if (name == (nint)0 || NativeMemory.Read<byte>(name) == (byte)0) return 0L;
+#if WINDOWS
+        return 1L;
+#else
+        SyncBuf256 sb = new SyncBuf256();
+        nint sp = NativeMemory.AddressOf(ref sb);
+        ulong nlen = SyncPlat.CStrLen(name);
+        if (nlen + 2UL > 256UL) return 0L;
+        NativeMemory.At<byte>(sp, 0L) = (byte)47;
+        SyncPlat.CMemcpy(sp + (nint)1, name, nlen + 1UL);
+        return SyncPlat.PosixShmUnlink(sp) == 0 ? 1L : 0L;
+#endif
+    }
+
+    [Export("zan_exe_dir_into")]
+    public static long ExeDirInto(nint outBuf, long cap) {
+        if (outBuf == (nint)0 || cap <= 0L) return 0L;
+        NativeMemory.Write<byte>(outBuf, (byte)0);
+        SyncBuf1024 buf = new SyncBuf1024();
+        nint bp = NativeMemory.AddressOf(ref buf);
+#if WINDOWS
+        long n = (long)SyncPlat.WinGetModuleFileNameA((nint)0, bp, 1024U);
+        while (n > 0L && NativeMemory.At<byte>(bp, n - 1L) != (byte)92) n--; // '\\'
+        if (n > 0L) n--;
+#elif MACOS
+        uint mcap = 1023U;
+        long n = 0L;
+        if (SyncPlat.MacGetExecutablePath(bp, NativeMemory.AddressOf(ref mcap)) == 0) {
+            n = (long)SyncPlat.CStrLen(bp);
+        }
+        while (n > 0L && NativeMemory.At<byte>(bp, n - 1L) != (byte)47) n--; // '/'
+        if (n > 0L) n--;
+#else
+        long n = SyncPlat.PosixReadlink((nint)"/proc/self/exe", bp, 1023UL);
+        if (n < 0L) n = 0L;
+        while (n > 0L && NativeMemory.At<byte>(bp, n - 1L) != (byte)47) n--; // '/'
+        if (n > 0L) n--;
+#endif
+        if (n >= cap) n = cap - 1L;
+        if (n > 0L) SyncPlat.CMemcpy(outBuf, bp, (ulong)n);
+        NativeMemory.At<byte>(outBuf, n) = (byte)0;
+        return n;
+    }
+
+    [Export("zan_dir_list_into")]
+    public static long DirListInto(nint pattern, nint outBuf, long cap) {
+        if (outBuf == (nint)0 || cap <= 0L) return 0L;
+        NativeMemory.Write<byte>(outBuf, (byte)0);
+        if (pattern == (nint)0) return 0L;
+        long len = 0L;
+#if WINDOWS
+        SyncBuf320 fdBuf = new SyncBuf320();
+        nint fdp = NativeMemory.AddressOf(ref fdBuf);
+        nint h = SyncPlat.WinFindFirstFileA(pattern, fdp);
+        if (h == (nint)(-1)) return 0L;
+        while (true) {
+            nint fname = fdp + (nint)44; // WIN32_FIND_DATAA.cFileName @ 44
+            long nl = (long)SyncPlat.CStrLen(fname);
+            if (len + nl + 2L > cap) break;
+            SyncPlat.CMemcpy(outBuf + (nint)len, fname, (ulong)nl);
+            len += nl;
+            NativeMemory.At<byte>(outBuf, len) = (byte)10;
+            len++;
+            NativeMemory.At<byte>(outBuf, len) = (byte)0;
+            if (SyncPlat.WinFindNextFileA(h, fdp) == 0) break;
+        }
+        SyncPlat.WinFindClose(h);
+#else
+        SyncBuf128 gBuf = new SyncBuf128();
+        nint gp = NativeMemory.AddressOf(ref gBuf);
+        SyncPlat.CMemset(gp, 0, 128UL);
+        if (SyncPlat.PosixGlob(pattern, 0, (nint)0, gp) != 0) return 0L;
+        ulong pathc = NativeMemory.Read<ulong>(gp);
+#if MACOS
+        // Darwin glob_t: gl_pathc @ 0 (8B), gl_matchc @ 8 (4B), gl_offs @ 16 (8B), gl_flags @ 24 (4B), gl_pathv @ 32 (8B)
+        nint pathv = NativeMemory.Read<nint>(gp + (nint)32);
+#else
+        nint pathv = NativeMemory.Read<nint>(gp + (nint)8);
+#endif
+        for (ulong i = 0UL; i < pathc; i++) {
+            nint entry = NativeMemory.At<nint>(pathv, (long)i);
+            nint slash = SyncPlat.CStrRChr(entry, 47); // '/'
+            nint bname = slash != (nint)0 ? slash + (nint)1 : entry;
+            long nl = (long)SyncPlat.CStrLen(bname);
+            if (len + nl + 2L > cap) break;
+            SyncPlat.CMemcpy(outBuf + (nint)len, bname, (ulong)nl);
+            len += nl;
+            NativeMemory.At<byte>(outBuf, len) = (byte)10;
+            len++;
+            NativeMemory.At<byte>(outBuf, len) = (byte)0;
+        }
+        SyncPlat.PosixGlobfree(gp);
+#endif
+        return len;
+    }
+}

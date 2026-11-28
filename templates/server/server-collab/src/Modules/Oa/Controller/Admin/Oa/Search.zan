@@ -1,15 +1,14 @@
 using System;
-using System.Text;
-using System.Data.Orm;
+using System.Collections.Generic;
+using System.Json;
 using System.Web;
+using Zan.Web.AdminUi;
 using Zan.Web.Model;
 
 namespace Zan.Web.Admin.Oa;
 
-/* 全局搜索（T8）：顶栏下拉的数据端点，聚合器见 Framework/Search.zan。
-   仅片段无整页——Query 供 search.js 防抖拉取（X-Fragment 语义同外壳）。
-   授权 Grant+View 门槛 + 源内屏闸双保险：结果是他屏行名，各 Provider
-   已按 MaskOf View 位过滤，无位源的行名不会出现在下拉里。 */
+/* 全局搜索（纯 JSON 端点）：聚合器见 Framework/Search.zan。
+   授权 Grant+View 门槛 + 源内屏闸双保险：各 Provider 已按 View 权限位过滤。 */
 [Route("admin/oa/search/[action]")]
 [Custom(Authorization = CustomAuthorization.Grant)]
 [Description("全局搜索")]
@@ -18,33 +17,27 @@ public class Search : CollabAdminController {
     [HttpGet]
     [Custom(Perm = PermBit.View, ApiMax = 60)]
     [Description("全局搜索")]
-    async void Query() {
+    public async void Query() {
         SysUser me = await this.Admin();
         List<SearchHit> hits = new List<SearchHit>();
         if (this.DbReady()) {
             hits = await Zan.Web.Search.Run(this.Held(), Tenant.Cur(), me,
-                this.In("kw"), 5);
+                this.InAny("kw"), 5);
         }
 
-        /* 扁平分组：hits 已按注册序拼接（同模块天然相邻），组头随每组
-           首条携带 first 标记——模板引擎 #each 只在全局 ViewData 解析
-           列表（无嵌套行内列表），故不用 groups>items 两级结构。 */
-        ViewData d = new ViewData();
-        List<StrMap> items = d.AddList("items");
-        string prev = "";
+        JsonWriter w = new JsonWriter();
+        w.WriteStartArray();
         for (int i = 0; i < hits.Count; i = i + 1) {
             SearchHit h = hits[i];
-            string label = Search.LabelOf(h.module);
-            StrMap m = new StrMap();
-            m.Set("group", label);
-            m.Set("first", h.module != prev ? "1" : "");
-            m.Set("title", h.title);
-            m.Set("link", h.link.Length > 0 ? h.link : "#");
-            items.Add(m);
-            prev = h.module;
+            w.WriteStartObject();
+            w.WriteProperty("module", h.module);
+            w.WriteProperty("group", Search.LabelOf(h.module));
+            w.WriteProperty("title", h.title);
+            w.WriteProperty("link", h.link.Length > 0 ? h.link : "");
+            w.WriteEndObject();
         }
-        d.Set("empty", hits.Count == 0 ? "1" : "");
-        this.FragmentOf("Admin.Oa.Search.Query", d);
+        w.WriteEndArray();
+        AdminUiProtocol.Ok(this, w.ToString());
     }
 
     /* 徽标中文映射（module 注册键 -> 下拉组名）。 */

@@ -1,0 +1,947 @@
+// rt_sync_thread.zan: Native OS threads, weak delegate/EH hooks, 256-bucket
+// monitor lock, UI thread & dispatch ring, atomic i64 handles, and scoped
+// zero-copy Parallel.For / Parallel.ForRange worker pool.
+// Replaces src/runtime/sync/rt_sync_thread.c in 100% pure Zan (zero asm).
+
+namespace Zan.Runtime.Sync;
+
+// Monitor bucket offsets (SyncMonBucket = 64 bytes):
+//  0..39: lock (Win64 SRWLOCK @ 0; Linux pthread_mutex_t 40B @ 0)
+//  40: nint Head
+//  48: nint FreeList
+//  56: uint FreeCount
+static class MonOff {
+    internal const int BUCKETS = 256;
+    internal const uint FREE_CAP = 4U;
+    internal const int SPIN = 128;
+
+#if !WINDOWS && !MACOS && ARM64
+    internal const long B_SIZE = 72L;
+    internal const long B_LOCK = 0L;
+    internal const long B_HEAD = 48L;
+    internal const long B_FREE_LIST = 56L;
+    internal const long B_FREE_COUNT = 64L;
+#else
+    internal const long B_SIZE = 64L;
+    internal const long B_LOCK = 0L;
+    internal const long B_HEAD = 40L;
+    internal const long B_FREE_LIST = 48L;
+    internal const long B_FREE_COUNT = 56L;
+#endif
+
+    // Monitor block layout:
+    //  0: nint Obj
+    //  8: nint Next
+    // 16: ulong Owner
+    // 24: uint Recursion
+    // 28: uint Waiters
+    // 32: uint WakeSeq
+    // 36: uint Pad
+    // Win64: 40: SRWLOCK (8), 48: CONDITION_VARIABLE (8) -> total 56 bytes
+    // POSIX: 40: pthread_mutex_t (up to 64B on macOS/arm64), 104: pthread_cond_t (48B) -> total 152 bytes
+    internal const long SB_OBJ = 0L;
+    internal const long SB_NEXT = 8L;
+    internal const long SB_OWNER = 16L;
+    internal const long SB_REC = 24L;
+    internal const long SB_WAITERS = 28L;
+    internal const long SB_WAKE_SEQ = 32L;
+    internal const long SB_PARK_LOCK = 40L;
+#if WINDOWS
+    internal const long SB_PARK_CV = 48L;
+    internal const ulong SB_SIZE = 56UL;
+#else
+    internal const long SB_PARK_CV = 104L;
+    internal const ulong SB_SIZE = 152UL;
+#endif
+}
+
+// Scoped Parallel.For job descriptor (lives on caller stack, 40 bytes):
+//  0: nint FnPtr
+//  8: nint CloRec
+// 16: int From
+// 20: int To
+// 24: int Chunk
+// 28: int IsRange
+// 32: int NextIdx
+struct ParJob {
+    public nint FnPtr;
+    public nint CloRec;
+    public int From;
+    public int To;
+    public int Chunk;
+    public int IsRange;
+    public int NextIdx;
+    public int Pad;
+}
+
+static class RtSyncThread {
+    // ---- Weak delegate & EH hooks (overridable by selfhost/backend) ----
+
+    static nint DelegateRecord(nint d) {
+        ulong v = (ulong)d;
+        if ((v & SyncAbi.CLOSURE_TAG) == 0UL) return (nint)0;
+        return (nint)(v & ~SyncAbi.CLOSURE_TAG);
+    }
+
+    [Export("zan_backend_delegate_retain")]
+    [Weak]
+    public static void BackendDelegateRetain(nint d) {
+        nint rec = DelegateRecord(d);
+        if (rec == (nint)0) return;
+        nint rcPtr = rec + (nint)SyncAbi.RC_OFF;
+        if (Atomic.LoadAt<uint>(rcPtr, MemoryOrder.SeqCst) == SyncAbi.RC_IMMORTAL) return;
+        Atomic.FetchAddAt<uint>(rcPtr, 1U, MemoryOrder.SeqCst);
+    }
+
+    [Export("zan_backend_delegate_release")]
+    [Weak]
+    public static void BackendDelegateRelease(nint d) {
+        nint rec = DelegateRecord(d);
+        if (rec == (nint)0) return;
+        nint dtor = NativeMemory.At<nint>(rec, 1L);
+        if (dtor != (nint)0) {
+            NativeMemory.InvokeVoidWithCC<nint>("c", dtor, rec);
+        }
+    }
+
+    [Export("zan_backend_delegate_invoke")]
+    [Weak]
+    public static void BackendDelegateInvoke(nint body) {
+        if (body == (nint)0) return;
+        nint rec = DelegateRecord(body);
+        if (rec == (nint)0) {
+            NativeMemory.InvokeVoidWithCC("c", body);
+            return;
+        }
+        nint fn = NativeMemory.At<nint>(rec, 0L);
+        if (fn != (nint)0) {
+            NativeMemory.InvokeVoidWithCC<nint>("c", fn, rec);
+        }
+    }
+
+    [Export("__zan_eh_release")]
+    [Weak]
+    public static void EhRelease() {
+    }
+
+    [Export("zan_thread_detach")]
+    public static void ThreadDetach() {
+        EhRelease();
+    }
+
+    // ---- Native OS thread spawn & current thread id ----
+
+#if WINDOWS
+    [Export("__zan_sync_win_thread_trampoline")]
+    [Visibility("hidden")]
+    static uint WinThreadTrampoline(nint arg) {
+        BackendDelegateInvoke(arg);
+        BackendDelegateRelease(arg);
+        ThreadDetach();
+        return 0U;
+    }
+#else
+    [Export("__zan_sync_posix_thread_trampoline")]
+    [Visibility("hidden")]
+    static nint PosixThreadTrampoline(nint arg) {
+        BackendDelegateInvoke(arg);
+        BackendDelegateRelease(arg);
+        ThreadDetach();
+        return (nint)0;
+    }
+#endif
+
+    [Export("zan_thread_start")]
+    public static int ThreadStart(nint body) {
+        if (body == (nint)0) return 0;
+        BackendDelegateRetain(body);
+#if WINDOWS
+        nint h = SyncPlat.WinCreateThread((nint)0, 0UL, NativeMemory.FunctionPointer(WinThreadTrampoline), body, 0U, (nint)0);
+        if (h == (nint)0) {
+            BackendDelegateRelease(body);
+            return 0;
+        }
+        SyncPlat.WinCloseHandle(h);
+        return 1;
+#else
+        ulong tid = 0UL;
+        if (SyncPlat.PosixThreadCreate(NativeMemory.AddressOf(ref tid), (nint)0,
+                                       NativeMemory.FunctionPointer(PosixThreadTrampoline), body) != 0) {
+            BackendDelegateRelease(body);
+            return 0;
+        }
+        SyncPlat.PosixThreadDetach(tid);
+        return 1;
+#endif
+    }
+
+    [Export("zan_thread_current_id")]
+    public static long ThreadCurrentId() {
+#if WINDOWS
+        return (long)SyncPlat.WinGetCurrentThreadId();
+#elif MACOS
+        ulong tid = 0UL;
+        SyncPlat.MacThreadIdNp(0UL, NativeMemory.AddressOf(ref tid));
+        return (long)tid;
+#else
+        return SyncPlat.PosixSyscall0(SyncPlat.SYS_GETTID);
+#endif
+    }
+
+    // ---- Object slot string tag probe ----
+
+    [Export("zan_obj_slot_is_string")]
+    public static int ObjSlotIsString(nint p) {
+        if (p == (nint)0) return 0;
+        ulong w = NativeMemory.Read<ulong>(p + (nint)SyncAbi.HDR_WORD_OFF);
+        return (uint)(w >> 32) == SyncAbi.STRING_TAG ? 1 : 0;
+    }
+
+    // ---- 256-bucket Monitor lock ----
+
+    static SyncMonBuckets256 s_monBuckets;
+    static long s_monBlocksAllocated = 0L;
+
+    static nint MonBucketAt(uint idx) {
+        return NativeMemory.AddressOf(ref s_monBuckets) + (nint)((long)idx * MonOff.B_SIZE);
+    }
+
+    static uint MonBucketIdx(nint obj) {
+        ulong bits = (ulong)obj;
+        bits ^= bits >> 20;
+        bits ^= bits >> 8;
+        return (uint)((bits >> 4) & (ulong)(MonOff.BUCKETS - 1));
+    }
+
+    static ulong MonSelf() {
+#if WINDOWS
+        return (ulong)SyncPlat.WinGetCurrentThreadId();
+#else
+        return SyncPlat.PosixThreadSelf();
+#endif
+    }
+
+    static void MonBlockDestroy(nint sb) {
+#if !WINDOWS
+        SyncPlat.PosixCondDestroy(sb + (nint)MonOff.SB_PARK_CV);
+        SyncPlat.PosixMutexDestroy(sb + (nint)MonOff.SB_PARK_LOCK);
+#endif
+        SyncPlat.CFree(sb);
+        Atomic.FetchAdd(ref s_monBlocksAllocated, -1L, MemoryOrder.Relaxed);
+    }
+
+    static nint MonBlockTake(nint b) {
+        nint sb = NativeMemory.Read<nint>(b + (nint)MonOff.B_FREE_LIST);
+        if (sb != (nint)0) {
+            NativeMemory.Write<nint>(b + (nint)MonOff.B_FREE_LIST, NativeMemory.Read<nint>(sb + (nint)MonOff.SB_NEXT));
+            uint fc = NativeMemory.Read<uint>(b + (nint)MonOff.B_FREE_COUNT);
+            NativeMemory.Write<uint>(b + (nint)MonOff.B_FREE_COUNT, fc - 1U);
+            return sb;
+        }
+        sb = SyncPlat.CMalloc(MonOff.SB_SIZE);
+        if (sb == (nint)0) return (nint)0;
+        NativeMemory.Write<uint>(sb + (nint)MonOff.SB_WAKE_SEQ, 0U);
+#if WINDOWS
+        SyncPlat.WinInitSrw(sb + (nint)MonOff.SB_PARK_LOCK);
+        SyncPlat.WinInitCv(sb + (nint)MonOff.SB_PARK_CV);
+#else
+        SyncPlat.PosixMutexInit(sb + (nint)MonOff.SB_PARK_LOCK, (nint)0);
+        SyncPlat.PosixCondInit(sb + (nint)MonOff.SB_PARK_CV, (nint)0);
+#endif
+        Atomic.FetchAdd(ref s_monBlocksAllocated, 1L, MemoryOrder.Relaxed);
+        return sb;
+    }
+
+    [Export("zan_monitor_enter")]
+    public static void MonitorEnter(nint obj) {
+        if (obj == (nint)0) return;
+        ulong self = MonSelf();
+        nint b = MonBucketAt(MonBucketIdx(obj));
+
+        SyncPlat.MutexLock(b + (nint)MonOff.B_LOCK);
+        nint sb = NativeMemory.Read<nint>(b + (nint)MonOff.B_HEAD);
+        while (sb != (nint)0 && NativeMemory.Read<nint>(sb + (nint)MonOff.SB_OBJ) != obj) {
+            sb = NativeMemory.Read<nint>(sb + (nint)MonOff.SB_NEXT);
+        }
+
+        if (sb == (nint)0) {
+            sb = MonBlockTake(b);
+            if (sb == (nint)0) {
+                SyncPlat.MutexUnlock(b + (nint)MonOff.B_LOCK);
+                SyncPlat.RtFatal((nint)"oom", (nint)"sync: monitor block alloc failed");
+            }
+            NativeMemory.Write<nint>(sb + (nint)MonOff.SB_OBJ, obj);
+            NativeMemory.Write<uint>(sb + (nint)MonOff.SB_REC, 1U);
+            NativeMemory.Write<uint>(sb + (nint)MonOff.SB_WAITERS, 0U);
+            Atomic.StoreAt<ulong>(sb + (nint)MonOff.SB_OWNER, self, MemoryOrder.Relaxed);
+            NativeMemory.Write<nint>(sb + (nint)MonOff.SB_NEXT, NativeMemory.Read<nint>(b + (nint)MonOff.B_HEAD));
+            NativeMemory.Write<nint>(b + (nint)MonOff.B_HEAD, sb);
+            SyncPlat.MutexUnlock(b + (nint)MonOff.B_LOCK);
+            return;
+        }
+
+        ulong cur = Atomic.LoadAt<ulong>(sb + (nint)MonOff.SB_OWNER, MemoryOrder.Relaxed);
+        if (cur == self) {
+            NativeMemory.Write<uint>(sb + (nint)MonOff.SB_REC, NativeMemory.Read<uint>(sb + (nint)MonOff.SB_REC) + 1U);
+            SyncPlat.MutexUnlock(b + (nint)MonOff.B_LOCK);
+            return;
+        }
+        if (cur == 0UL) {
+            Atomic.StoreAt<ulong>(sb + (nint)MonOff.SB_OWNER, self, MemoryOrder.Relaxed);
+            NativeMemory.Write<uint>(sb + (nint)MonOff.SB_REC, 1U);
+            SyncPlat.MutexUnlock(b + (nint)MonOff.B_LOCK);
+            return;
+        }
+
+        NativeMemory.Write<uint>(sb + (nint)MonOff.SB_WAITERS, NativeMemory.Read<uint>(sb + (nint)MonOff.SB_WAITERS) + 1U);
+        while (true) {
+            uint seen = NativeMemory.Read<uint>(sb + (nint)MonOff.SB_WAKE_SEQ);
+            SyncPlat.MutexUnlock(b + (nint)MonOff.B_LOCK);
+
+            bool freed = false;
+            for (int i = 0; i < MonOff.SPIN; i++) {
+                if (Atomic.LoadAt<ulong>(sb + (nint)MonOff.SB_OWNER, MemoryOrder.Relaxed) == 0UL) {
+                    freed = true;
+                    break;
+                }
+                if ((i & 15) == 15) SyncPlat.OsYield();
+            }
+            if (!freed) {
+#if WINDOWS
+                SyncPlat.WinAcquireSrw(sb + (nint)MonOff.SB_PARK_LOCK);
+                while (NativeMemory.Read<uint>(sb + (nint)MonOff.SB_WAKE_SEQ) == seen) {
+                    SyncPlat.WinSleepCvSrw(sb + (nint)MonOff.SB_PARK_CV, sb + (nint)MonOff.SB_PARK_LOCK, SyncPlat.INFINITE_WAIT, 0U);
+                }
+                SyncPlat.WinReleaseSrw(sb + (nint)MonOff.SB_PARK_LOCK);
+#else
+                SyncPlat.PosixMutexLock(sb + (nint)MonOff.SB_PARK_LOCK);
+                while (NativeMemory.Read<uint>(sb + (nint)MonOff.SB_WAKE_SEQ) == seen) {
+                    SyncPlat.PosixCondWait(sb + (nint)MonOff.SB_PARK_CV, sb + (nint)MonOff.SB_PARK_LOCK);
+                }
+                SyncPlat.PosixMutexUnlock(sb + (nint)MonOff.SB_PARK_LOCK);
+#endif
+            }
+
+            SyncPlat.MutexLock(b + (nint)MonOff.B_LOCK);
+            if (Atomic.LoadAt<ulong>(sb + (nint)MonOff.SB_OWNER, MemoryOrder.Relaxed) == 0UL) {
+                Atomic.StoreAt<ulong>(sb + (nint)MonOff.SB_OWNER, self, MemoryOrder.Relaxed);
+                NativeMemory.Write<uint>(sb + (nint)MonOff.SB_REC, 1U);
+                NativeMemory.Write<uint>(sb + (nint)MonOff.SB_WAITERS, NativeMemory.Read<uint>(sb + (nint)MonOff.SB_WAITERS) - 1U);
+                SyncPlat.MutexUnlock(b + (nint)MonOff.B_LOCK);
+                return;
+            }
+        }
+    }
+
+    [Export("zan_monitor_exit")]
+    public static void MonitorExit(nint obj) {
+        if (obj == (nint)0) return;
+        ulong self = MonSelf();
+        nint b = MonBucketAt(MonBucketIdx(obj));
+
+        SyncPlat.MutexLock(b + (nint)MonOff.B_LOCK);
+        nint pp = b + (nint)MonOff.B_HEAD;
+        nint sb = NativeMemory.Read<nint>(pp);
+        while (sb != (nint)0 && NativeMemory.Read<nint>(sb + (nint)MonOff.SB_OBJ) != obj) {
+            pp = sb + (nint)MonOff.SB_NEXT;
+            sb = NativeMemory.Read<nint>(pp);
+        }
+
+        if (sb == (nint)0 || Atomic.LoadAt<ulong>(sb + (nint)MonOff.SB_OWNER, MemoryOrder.Relaxed) != self) {
+            SyncPlat.MutexUnlock(b + (nint)MonOff.B_LOCK);
+            return;
+        }
+        uint rec = NativeMemory.Read<uint>(sb + (nint)MonOff.SB_REC) - 1U;
+        NativeMemory.Write<uint>(sb + (nint)MonOff.SB_REC, rec);
+        if (rec > 0U) {
+            SyncPlat.MutexUnlock(b + (nint)MonOff.B_LOCK);
+            return;
+        }
+        Atomic.StoreAt<ulong>(sb + (nint)MonOff.SB_OWNER, 0UL, MemoryOrder.Relaxed);
+
+        if (NativeMemory.Read<uint>(sb + (nint)MonOff.SB_WAITERS) > 0U) {
+#if WINDOWS
+            SyncPlat.WinAcquireSrw(sb + (nint)MonOff.SB_PARK_LOCK);
+            NativeMemory.Write<uint>(sb + (nint)MonOff.SB_WAKE_SEQ, NativeMemory.Read<uint>(sb + (nint)MonOff.SB_WAKE_SEQ) + 1U);
+            SyncPlat.WinWakeCv(sb + (nint)MonOff.SB_PARK_CV);
+            SyncPlat.WinReleaseSrw(sb + (nint)MonOff.SB_PARK_LOCK);
+#else
+            SyncPlat.PosixMutexLock(sb + (nint)MonOff.SB_PARK_LOCK);
+            NativeMemory.Write<uint>(sb + (nint)MonOff.SB_WAKE_SEQ, NativeMemory.Read<uint>(sb + (nint)MonOff.SB_WAKE_SEQ) + 1U);
+            SyncPlat.PosixCondSignal(sb + (nint)MonOff.SB_PARK_CV);
+            SyncPlat.PosixMutexUnlock(sb + (nint)MonOff.SB_PARK_LOCK);
+#endif
+            SyncPlat.MutexUnlock(b + (nint)MonOff.B_LOCK);
+            return;
+        }
+
+        NativeMemory.Write<nint>(pp, NativeMemory.Read<nint>(sb + (nint)MonOff.SB_NEXT));
+        NativeMemory.Write<nint>(sb + (nint)MonOff.SB_OBJ, (nint)0);
+        uint fc = NativeMemory.Read<uint>(b + (nint)MonOff.B_FREE_COUNT);
+        if (fc < MonOff.FREE_CAP) {
+            NativeMemory.Write<nint>(sb + (nint)MonOff.SB_NEXT, NativeMemory.Read<nint>(b + (nint)MonOff.B_FREE_LIST));
+            NativeMemory.Write<nint>(b + (nint)MonOff.B_FREE_LIST, sb);
+            NativeMemory.Write<uint>(b + (nint)MonOff.B_FREE_COUNT, fc + 1U);
+            sb = (nint)0;
+        }
+        SyncPlat.MutexUnlock(b + (nint)MonOff.B_LOCK);
+        if (sb != (nint)0) MonBlockDestroy(sb);
+    }
+
+    [Export("zan_monitor_debug_stats")]
+    public static void MonitorDebugStats(nint inUseOut, nint allocatedOut) {
+        long used = 0L;
+        for (uint i = 0U; i < (uint)MonOff.BUCKETS; i++) {
+            nint b = MonBucketAt(i);
+            SyncPlat.MutexLock(b + (nint)MonOff.B_LOCK);
+            nint sb = NativeMemory.Read<nint>(b + (nint)MonOff.B_HEAD);
+            while (sb != (nint)0) {
+                used++;
+                sb = NativeMemory.Read<nint>(sb + (nint)MonOff.SB_NEXT);
+            }
+            SyncPlat.MutexUnlock(b + (nint)MonOff.B_LOCK);
+        }
+        if (inUseOut != (nint)0) NativeMemory.Write<long>(inUseOut, used);
+        if (allocatedOut != (nint)0) NativeMemory.Write<long>(allocatedOut, Atomic.Load(ref s_monBlocksAllocated, MemoryOrder.Relaxed));
+    }
+
+    // ---- UI thread & dispatch queue ----
+
+    const int DISPATCH_CAP0 = 64;
+    const int DISPATCH_CAP_MAX = 1048576; // 1 << 20
+
+    static SyncBuf512 s_dispatchStatic; // 64 * 8 = 512 bytes
+    static nint s_dispatchRing = (nint)0;
+    static int s_dispatchCap = DISPATCH_CAP0;
+    static int s_dispatchHead = 0;
+    static int s_dispatchTail = 0;
+    static int s_dispatchDropReported = 0;
+    static SyncBuf64 s_dispatchLockStore;
+    static ulong s_uiThreadId = 0UL;
+
+    static void DispatchLock() {
+        SyncPlat.MutexLock(NativeMemory.AddressOf(ref s_dispatchLockStore));
+    }
+
+    static void DispatchUnlock() {
+        SyncPlat.MutexUnlock(NativeMemory.AddressOf(ref s_dispatchLockStore));
+    }
+
+    static nint DispatchRingPtr() {
+        if (s_dispatchRing == (nint)0) {
+            s_dispatchRing = NativeMemory.AddressOf(ref s_dispatchStatic);
+        }
+        return s_dispatchRing;
+    }
+
+    [Export("zan_ui_thread_set")]
+    public static void UiThreadSet() {
+        Atomic.Store(ref s_uiThreadId, MonSelf(), MemoryOrder.Release);
+    }
+
+    [Export("zan_ui_thread_check")]
+    public static int UiThreadCheck() {
+        ulong id = Atomic.Load(ref s_uiThreadId, MemoryOrder.Acquire);
+        if (id == 0UL) return 1;
+#if WINDOWS
+        return MonSelf() == id ? 1 : 0;
+#else
+        return SyncPlat.PosixThreadEqual(id, SyncPlat.PosixThreadSelf()) != 0 ? 1 : 0;
+#endif
+    }
+
+    [Export("zan_ui_thread_assert")]
+    public static void UiThreadAssert(nint msg) {
+        if (UiThreadCheck() == 0) {
+            SyncBuf512 buf = new SyncBuf512();
+            nint bp = NativeMemory.AddressOf(ref buf);
+            ulong pos = SyncPlat.BufAppendCStr(bp, 512UL, 0UL, (nint)"fatal error: UI thread assertion failed: ");
+            pos = SyncPlat.BufAppendCStr(bp, 512UL, pos, msg != (nint)0 ? msg : (nint)"must be called on UI thread");
+            pos = SyncPlat.BufAppendCStr(bp, 512UL, pos, (nint)" (called from background thread)\n");
+            SyncPlat.WriteStderrBytes(bp, pos);
+            SyncPlat.CAbort();
+        }
+    }
+
+    static bool DispatchGrow() {
+        if (s_dispatchCap >= DISPATCH_CAP_MAX) return false;
+        int ncap = s_dispatchCap * 2;
+        nint nring = SyncPlat.CMalloc((ulong)ncap * 8UL);
+        if (nring == (nint)0) return false;
+        nint old = DispatchRingPtr();
+        int count = 0;
+        int i = s_dispatchHead;
+        int mask = s_dispatchCap - 1;
+        while (i != s_dispatchTail) {
+            NativeMemory.At<nint>(nring, (long)count) = NativeMemory.At<nint>(old, (long)i);
+            count++;
+            i = (i + 1) & mask;
+        }
+        if (old != NativeMemory.AddressOf(ref s_dispatchStatic)) {
+            SyncPlat.CFree(old);
+        }
+        s_dispatchRing = nring;
+        s_dispatchCap = ncap;
+        s_dispatchHead = 0;
+        s_dispatchTail = count;
+        return true;
+    }
+
+    [Export("zan_dispatch_clear")]
+    public static void DispatchClear() {
+        SyncBuf512 dropBuf = new SyncBuf512(); // 64 nints
+        nint drop = NativeMemory.AddressOf(ref dropBuf);
+        while (true) {
+            int n = 0;
+            DispatchLock();
+            nint ring = DispatchRingPtr();
+            int mask = s_dispatchCap - 1;
+            while (n < 64 && s_dispatchHead != s_dispatchTail) {
+                NativeMemory.At<nint>(drop, (long)n) = NativeMemory.At<nint>(ring, (long)s_dispatchHead);
+                n++;
+                s_dispatchHead = (s_dispatchHead + 1) & mask;
+            }
+            if (s_dispatchHead == s_dispatchTail) {
+                s_dispatchHead = 0;
+                s_dispatchTail = 0;
+            }
+            DispatchUnlock();
+            for (int k = 0; k < n; k++) {
+                BackendDelegateRelease(NativeMemory.At<nint>(drop, (long)k));
+            }
+            if (n < 64) return;
+        }
+    }
+
+    [Export("zan_dispatch_init")]
+    public static void DispatchInit() {
+        UiThreadSet();
+        DispatchClear();
+    }
+
+    [Export("zan_dispatch_post")]
+    public static int DispatchPost(nint fn) {
+        if (fn == (nint)0) return 0;
+        int ok = 0;
+        int capSnap = 0;
+        DispatchLock();
+        nint ring = DispatchRingPtr();
+        int next = (s_dispatchTail + 1) & (s_dispatchCap - 1);
+        if (next == s_dispatchHead && DispatchGrow()) {
+            ring = s_dispatchRing;
+            next = (s_dispatchTail + 1) & (s_dispatchCap - 1);
+        }
+        if (next != s_dispatchHead) {
+            BackendDelegateRetain(fn);
+            NativeMemory.At<nint>(ring, (long)s_dispatchTail) = fn;
+            s_dispatchTail = next;
+            ok = 1;
+        }
+        capSnap = s_dispatchCap;
+        DispatchUnlock();
+        if (ok == 0 && Atomic.Exchange(ref s_dispatchDropReported, 1, MemoryOrder.Relaxed) == 0) {
+            SyncBuf256 buf = new SyncBuf256();
+            nint bp = NativeMemory.AddressOf(ref buf);
+            ulong pos = SyncPlat.BufAppendCStr(bp, 256UL, 0UL, (nint)"zan: UI dispatch queue full (");
+            pos = SyncPlat.BufAppendI64(bp, 256UL, pos, (long)(capSnap - 1));
+            pos = SyncPlat.BufAppendCStr(bp, 256UL, pos, (nint)" pending); posted handler dropped\n");
+            SyncPlat.WriteStderrBytes(bp, pos);
+        }
+        return ok;
+    }
+
+    [Export("zan_dispatch_take")]
+    public static nint DispatchTake() {
+        nint fn = (nint)0;
+        DispatchLock();
+        nint ring = DispatchRingPtr();
+        if (s_dispatchHead != s_dispatchTail) {
+            fn = NativeMemory.At<nint>(ring, (long)s_dispatchHead);
+            s_dispatchHead = (s_dispatchHead + 1) & (s_dispatchCap - 1);
+        }
+        DispatchUnlock();
+        return fn;
+    }
+
+    // ---- Atomic i64 handle ----
+
+    [Export("zan_atomic_int_create")]
+    public static long AtomicIntCreate(long initialValue) {
+        nint p = SyncPlat.CMalloc(8UL);
+        if (p == (nint)0) return 0L;
+        Atomic.StoreAt<long>(p, initialValue, MemoryOrder.SeqCst);
+        return (long)p;
+    }
+
+    [Export("zan_atomic_int_destroy")]
+    public static void AtomicIntDestroy(long handle) {
+        if (handle != 0L) SyncPlat.CFree((nint)handle);
+    }
+
+    [Export("zan_atomic_int_load")]
+    public static long AtomicIntLoad(long handle) {
+        if (handle == 0L) return 0L;
+        return Atomic.LoadAt<long>((nint)handle, MemoryOrder.SeqCst);
+    }
+
+    [Export("zan_atomic_int_store")]
+    public static void AtomicIntStore(long handle, long value) {
+        if (handle == 0L) return;
+        Atomic.StoreAt<long>((nint)handle, value, MemoryOrder.SeqCst);
+    }
+
+    [Export("zan_atomic_int_exchange")]
+    public static long AtomicIntExchange(long handle, long value) {
+        if (handle == 0L) return 0L;
+        return Atomic.ExchangeAt<long>((nint)handle, value, MemoryOrder.SeqCst);
+    }
+
+    [Export("zan_atomic_int_compare_exchange")]
+    public static long AtomicIntCompareExchange(long handle, long expected, long desired) {
+        if (handle == 0L) return 0L;
+        return Atomic.CompareExchangeAt<long>((nint)handle, expected, desired, MemoryOrder.SeqCst, MemoryOrder.SeqCst);
+    }
+
+    [Export("zan_atomic_int_add")]
+    public static long AtomicIntAdd(long handle, long delta) {
+        if (handle == 0L) return 0L;
+        return Atomic.FetchAddAt<long>((nint)handle, delta, MemoryOrder.SeqCst) + delta;
+    }
+
+    // ---- Scoped zero-copy Parallel.For / Parallel.ForRange worker pool ----
+
+    const int PAR_MAX_WORKERS = 31;
+
+    static int s_parInitState = 0; // 0 uninit, 1 initializing, 2 ready
+#if WINDOWS
+    static uint s_parTlsIdx = 0xFFFFFFFFU;
+#elif MACOS
+    static ulong s_parTlsKey = 0UL;
+    static int s_parTlsReady = 0;
+#else
+    static uint s_parTlsKey = 0U;
+    static int s_parTlsReady = 0;
+#endif
+    static SyncBuf64 s_parLock;
+    static SyncBuf64 s_parCvWork;
+    static SyncBuf64 s_parCvDone;
+    static int s_parNumWorkers = 0;
+    static ulong s_parGeneration = 0UL;
+    static nint s_parActiveJob = (nint)0;
+    static int s_parActiveWorkers = 0;
+    static int s_parWorkersFinished = 0;
+    static int s_parDispatchBusy = 0;
+
+    static bool ParInForGet() {
+        if (Atomic.Load(ref s_parInitState, MemoryOrder.Acquire) != 2) return false;
+#if WINDOWS
+        if (s_parTlsIdx == SyncPlat.FLS_OUT_OF_INDEXES) return false;
+        return SyncPlat.WinFlsGetValue(s_parTlsIdx) != (nint)0;
+#else
+        if (s_parTlsReady == 0) return false;
+        return SyncPlat.PosixGetSpecific(s_parTlsKey) != (nint)0;
+#endif
+    }
+
+    static void ParInForSet(bool inside) {
+#if WINDOWS
+        if (s_parTlsIdx != SyncPlat.FLS_OUT_OF_INDEXES) {
+            SyncPlat.WinFlsSetValue(s_parTlsIdx, inside ? (nint)1 : (nint)0);
+        }
+#else
+        if (s_parTlsReady != 0) {
+            SyncPlat.PosixSetSpecific(s_parTlsKey, inside ? (nint)1 : (nint)0);
+        }
+#endif
+    }
+
+    [Export("zan_parallel_processor_count")]
+    public static int ParallelProcessorCount() {
+#if WINDOWS
+        SyncBuf48 si = new SyncBuf48();
+        nint sp = NativeMemory.AddressOf(ref si);
+        SyncPlat.CMemset(sp, 0, 48UL);
+        SyncPlat.WinGetSystemInfo(sp);
+        int n = (int)NativeMemory.Read<uint>(sp + (nint)32); // dwNumberOfProcessors @ 32
+        return n > 0 ? n : 1;
+#else
+        long n = SyncPlat.PosixSysconf(SyncPlat.SC_NPROCESSORS_ONLN);
+        return n > 0L ? (int)n : 1;
+#endif
+    }
+
+    static void ParDecodeDelegate(nint body, out nint fnOut, out nint recOut) {
+        ulong v = (ulong)body;
+        if ((v & SyncAbi.CLOSURE_TAG) != 0UL) {
+            nint rec = (nint)(v & ~SyncAbi.CLOSURE_TAG);
+            recOut = rec;
+            fnOut = NativeMemory.Read<nint>(rec);
+        } else {
+            recOut = (nint)0;
+            fnOut = body;
+        }
+    }
+
+    static void ParRunJob(nint jobPtr) {
+        nint fnPtr = NativeMemory.Read<nint>(jobPtr);
+        nint cloRec = NativeMemory.Read<nint>(jobPtr + (nint)8);
+        int to = NativeMemory.Read<int>(jobPtr + (nint)20);
+        int chunk = NativeMemory.Read<int>(jobPtr + (nint)24);
+        int isRange = NativeMemory.Read<int>(jobPtr + (nint)28);
+        nint nextPtr = jobPtr + (nint)32;
+
+        while (true) {
+            int s = Atomic.FetchAddAt<int>(nextPtr, chunk, MemoryOrder.Relaxed);
+            if (s >= to) break;
+            int e = s + chunk;
+            if (e > to) e = to;
+            if (isRange != 0) {
+                if (cloRec != (nint)0) {
+                    NativeMemory.InvokeVoidWithCC<nint, int, int>("c", fnPtr, cloRec, s, e);
+                } else {
+                    NativeMemory.InvokeVoidWithCC<int, int>("c", fnPtr, s, e);
+                }
+            } else {
+                if (cloRec != (nint)0) {
+                    for (int i = s; i < e; i++) {
+                        NativeMemory.InvokeVoidWithCC<nint, int>("c", fnPtr, cloRec, i);
+                    }
+                } else {
+                    for (int i = s; i < e; i++) {
+                        NativeMemory.InvokeVoidWithCC<int>("c", fnPtr, i);
+                    }
+                }
+            }
+        }
+    }
+
+    static void ParWorkerLoop() {
+        ulong myGen = 0UL;
+        nint lk = NativeMemory.AddressOf(ref s_parLock);
+        nint cvWork = NativeMemory.AddressOf(ref s_parCvWork);
+        nint cvDone = NativeMemory.AddressOf(ref s_parCvDone);
+        while (true) {
+#if WINDOWS
+        SyncPlat.WinAcquireSrw(lk);
+#else
+        SyncPlat.PosixMutexLock(lk);
+#endif
+            while (s_parGeneration == myGen) {
+#if WINDOWS
+                SyncPlat.WinSleepCvSrw(cvWork, lk, SyncPlat.INFINITE_WAIT, 0U);
+#else
+                SyncPlat.PosixCondWait(cvWork, lk);
+#endif
+            }
+            myGen = s_parGeneration;
+            nint job = s_parActiveJob;
+#if WINDOWS
+            SyncPlat.WinReleaseSrw(lk);
+#else
+            SyncPlat.PosixMutexUnlock(lk);
+#endif
+
+            if (job != (nint)0) {
+                ParInForSet(true);
+                ParRunJob(job);
+                ParInForSet(false);
+            }
+
+#if WINDOWS
+            SyncPlat.WinAcquireSrw(lk);
+#else
+            SyncPlat.PosixMutexLock(lk);
+#endif
+            s_parWorkersFinished++;
+            if (s_parWorkersFinished == s_parActiveWorkers) {
+#if WINDOWS
+                SyncPlat.WinWakeAllCv(cvDone);
+#else
+                SyncPlat.PosixCondBroadcast(cvDone);
+#endif
+            }
+#if WINDOWS
+            SyncPlat.WinReleaseSrw(lk);
+#else
+            SyncPlat.PosixMutexUnlock(lk);
+#endif
+        }
+    }
+
+#if WINDOWS
+    [Export("__zan_sync_par_worker_win")]
+    [Visibility("hidden")]
+    static uint ParWorkerWin(nint unused) {
+        ParWorkerLoop();
+        return 0U;
+    }
+#else
+    [Export("__zan_sync_par_worker_posix")]
+    [Visibility("hidden")]
+    static nint ParWorkerPosix(nint unused) {
+        ParWorkerLoop();
+        return (nint)0;
+    }
+#endif
+
+    static void ParEnsureInit() {
+        if (Atomic.Load(ref s_parInitState, MemoryOrder.Acquire) == 2) return;
+        if (Atomic.CompareExchange(ref s_parInitState, 0, 1, MemoryOrder.AcqRel, MemoryOrder.Acquire) == 0) {
+#if WINDOWS
+            s_parTlsIdx = SyncPlat.WinFlsAlloc((nint)0);
+#else
+            SyncPlat.PosixMutexInit(NativeMemory.AddressOf(ref s_parLock), (nint)0);
+            SyncPlat.PosixCondInit(NativeMemory.AddressOf(ref s_parCvWork), (nint)0);
+            SyncPlat.PosixCondInit(NativeMemory.AddressOf(ref s_parCvDone), (nint)0);
+            if (SyncPlat.PosixKeyCreate(NativeMemory.AddressOf(ref s_parTlsKey), (nint)0) == 0) {
+                s_parTlsReady = 1;
+            }
+#endif
+            int procs = ParallelProcessorCount();
+            int nw = procs > 1 ? procs - 1 : 0;
+            if (nw > PAR_MAX_WORKERS) nw = PAR_MAX_WORKERS;
+            int spawned = 0;
+            for (int i = 0; i < nw; i++) {
+#if WINDOWS
+                nint h = SyncPlat.WinCreateThread((nint)0, 0UL, NativeMemory.FunctionPointer(ParWorkerWin), (nint)0, 0U, (nint)0);
+                if (h != (nint)0) {
+                    SyncPlat.WinCloseHandle(h);
+                    spawned++;
+                }
+#else
+                ulong th = 0UL;
+                if (SyncPlat.PosixThreadCreate(NativeMemory.AddressOf(ref th), (nint)0,
+                                               NativeMemory.FunctionPointer(ParWorkerPosix), (nint)0) == 0) {
+                    SyncPlat.PosixThreadDetach(th);
+                    spawned++;
+                }
+#endif
+            }
+            s_parNumWorkers = spawned;
+            Atomic.Store(ref s_parInitState, 2, MemoryOrder.Release);
+        } else {
+            while (Atomic.Load(ref s_parInitState, MemoryOrder.Acquire) != 2) {
+                SyncPlat.OsYield();
+            }
+        }
+    }
+
+    static void ParDispatch(int from, int to, nint body, int isRange) {
+        if (body == (nint)0 || to <= from) return;
+        nint fnPtr = (nint)0;
+        nint cloRec = (nint)0;
+        ParDecodeDelegate(body, out fnPtr, out cloRec);
+        if (fnPtr == (nint)0) return;
+
+        int total = to - from;
+        if (ParInForGet() || total <= 1) {
+            if (isRange != 0) {
+                if (cloRec != (nint)0) {
+                    NativeMemory.InvokeVoidWithCC<nint, int, int>("c", fnPtr, cloRec, from, to);
+                } else {
+                    NativeMemory.InvokeVoidWithCC<int, int>("c", fnPtr, from, to);
+                }
+            } else {
+                if (cloRec != (nint)0) {
+                    for (int i = from; i < to; i++) {
+                        NativeMemory.InvokeVoidWithCC<nint, int>("c", fnPtr, cloRec, i);
+                    }
+                } else {
+                    for (int i = from; i < to; i++) {
+                        NativeMemory.InvokeVoidWithCC<int>("c", fnPtr, i);
+                    }
+                }
+            }
+            return;
+        }
+
+        ParEnsureInit();
+        int nw = s_parNumWorkers;
+        if (nw <= 0) {
+            ParInForSet(true);
+            ParDispatch(from, to, body, isRange);
+            ParInForSet(false);
+            return;
+        }
+
+        int nthreads = nw + 1;
+        ulong denom = (ulong)(isRange != 0 ? (nthreads * 4) : (nthreads * 8));
+        int chunk = denom > 0UL ? (int)((ulong)total / denom) : 1;
+        if (chunk < 1) chunk = 1;
+
+        ParJob job = new ParJob();
+        job.FnPtr = fnPtr;
+        job.CloRec = cloRec;
+        job.From = from;
+        job.To = to;
+        job.Chunk = chunk;
+        job.IsRange = isRange;
+        job.NextIdx = from;
+        nint jobPtr = NativeMemory.AddressOf(ref job);
+
+        nint lk = NativeMemory.AddressOf(ref s_parLock);
+        nint cvWork = NativeMemory.AddressOf(ref s_parCvWork);
+        nint cvDone = NativeMemory.AddressOf(ref s_parCvDone);
+
+#if WINDOWS
+        SyncPlat.WinAcquireSrw(lk);
+#else
+        SyncPlat.PosixMutexLock(lk);
+#endif
+        while (s_parDispatchBusy != 0) {
+#if WINDOWS
+            SyncPlat.WinSleepCvSrw(cvDone, lk, SyncPlat.INFINITE_WAIT, 0U);
+#else
+            SyncPlat.PosixCondWait(cvDone, lk);
+#endif
+        }
+        s_parDispatchBusy = 1;
+        s_parActiveJob = jobPtr;
+        s_parWorkersFinished = 0;
+        s_parActiveWorkers = nw;
+        s_parGeneration++;
+#if WINDOWS
+        SyncPlat.WinWakeAllCv(cvWork);
+        SyncPlat.WinReleaseSrw(lk);
+#else
+        SyncPlat.PosixCondBroadcast(cvWork);
+        SyncPlat.PosixMutexUnlock(lk);
+#endif
+
+        ParInForSet(true);
+        ParRunJob(jobPtr);
+        ParInForSet(false);
+
+#if WINDOWS
+        SyncPlat.WinAcquireSrw(lk);
+#else
+        SyncPlat.PosixMutexLock(lk);
+#endif
+        while (s_parWorkersFinished < s_parActiveWorkers) {
+#if WINDOWS
+            SyncPlat.WinSleepCvSrw(cvDone, lk, SyncPlat.INFINITE_WAIT, 0U);
+#else
+            SyncPlat.PosixCondWait(cvDone, lk);
+#endif
+        }
+        s_parActiveJob = (nint)0;
+        s_parDispatchBusy = 0;
+#if WINDOWS
+        SyncPlat.WinWakeAllCv(cvDone);
+        SyncPlat.WinReleaseSrw(lk);
+#else
+        SyncPlat.PosixCondBroadcast(cvDone);
+        SyncPlat.PosixMutexUnlock(lk);
+#endif
+    }
+
+    [Export("zan_parallel_for")]
+    public static void ParallelFor(int from, int to, nint body) {
+        ParDispatch(from, to, body, 0);
+    }
+
+    [Export("zan_parallel_for_range")]
+    public static void ParallelForRange(int from, int to, nint body) {
+        ParDispatch(from, to, body, 1);
+    }
+}

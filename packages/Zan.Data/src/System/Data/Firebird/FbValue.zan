@@ -19,16 +19,14 @@ public class FbValue {
 
     // 以 double 表示的 2^e（e 可为负）。
     public static double Pow2(int e) {
+        if (e > 1023) { return 1.0 / 0.0; }
+        if (e < -1075) { return 0.0; }
         if (e >= -1022 && e <= 1023) {
             return NativeMemory.AsF64((long)(e + 1023) << 52);
         }
         double v = 1.0;
         int i = 0;
-        if (e >= 0) {
-            while (i < e) { v = v * 2.0; i = i + 1; }
-        } else {
-            while (i > e) { v = v / 2.0; i = i - 1; }
-        }
+        while (i > e) { v = v / 2.0; i = i - 1; }
         return v;
     }
 
@@ -56,7 +54,7 @@ public class FbValue {
 
     // 两位零填充十进制。
     public static string Pad2(int v) {
-        if (v < 10) { return "0" + Convert.ToString(v); }
+        if (v >= 0 && v < 10) { return "0" + Convert.ToString(v); }
         return Convert.ToString(v);
     }
 
@@ -94,6 +92,7 @@ public class FbValue {
 
     // 一天内的时间，单位为万分之一秒。
     public static string Time(int n) {
+        if (n < 0) { n = 0; }
         int frac = n % 10000;
         int secs = n / 10000;
         string s = FbValue.Pad2(secs / 3600) + ":" + FbValue.Pad2((secs / 60) % 60)
@@ -108,6 +107,7 @@ public class FbValue {
     // （Firebird 元数据中 scale 为负数）。
     public static string Scaled(long units, int scale) {
         if (scale >= 0) { return Convert.ToString(units); }
+        if (scale < -1000) { scale = -1000; }
         int digitsAfter = 0 - scale;
         bool neg = units < 0;
         string digits = Convert.ToString(units);
@@ -176,6 +176,7 @@ public class FbValue {
         }
         string digits = buf.ToStr(start, slen - start);
         if (scale < 0) {
+            if (scale < -1000) { scale = -1000; }
             int after = 0 - scale;
             if (digits.Length <= after) {
                 StringBuilder sb = new StringBuilder();
@@ -194,6 +195,7 @@ public class FbValue {
 
     // 把原始字节渲染为 "0x…" 十六进制（无法识别/DECFLOAT 类型的兜底）。
     public static string Hex(FbBytes raw) {
+        if (raw == null) { return "0x"; }
         return "0x" + raw.Hex();
     }
 
@@ -201,6 +203,7 @@ public class FbValue {
     // 其载荷需要另外几轮往返，连接层
     // 会在组装行之前先取回它们。
     public static string Decode(FbColumn col, FbBytes raw) {
+        if (col == null || raw == null) { return ""; }
         int t = col.SqlType();
         FbReader r = FbReader.Over(raw);
         if (t == FbType.TEXT) {
@@ -262,6 +265,9 @@ public class FbValue {
     public static FbParamBlock Params(DbParams prms) {
         int count = 0;
         if (prms != null) { count = prms.Count(); }
+        if (count > 32767) {
+            throw new DbException("Firebird BLR parameter count exceeds 32767", 0, DbProvider.Firebird);
+        }
         FbBuf blr = new FbBuf();
         int ln = count * 2;
         blr.U8(5); blr.U8(2); blr.U8(4); blr.U8(0);
@@ -296,7 +302,11 @@ public class FbValue {
                 FbValue.AppendBE(vals, FbValue.DoubleBits(prms.DoubleAt(i)), 8);
             } else {
                 string s = prms.TextAt(i);
+                if (s == null) { s = ""; }
                 int n = s.Length;
+                if (n > 65535) {
+                    throw new DbException("Firebird BLR text parameter exceeds 65535 bytes", 0, DbProvider.Firebird);
+                }
                 blr.U8(14); blr.U8(n & 255); blr.U8((n >> 8) & 255);
                 vals.Raw(s);
                 int pad = (4 - (n % 4)) % 4;

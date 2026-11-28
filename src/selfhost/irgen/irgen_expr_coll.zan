@@ -86,7 +86,17 @@ partial class Irgen {
         return false;
     }
 
+    string NonNullStrOp(string op) {
+        string rn = NT();
+        L("  " + rn + " = icmp eq i8* " + op + ", null");
+        ExprVal ez = GenStr("");
+        string rs = NT();
+        L("  " + rs + " = select i1 " + rn + ", i8* " + ez.op + ", i8* " + op);
+        return rs;
+    }
+
     ExprVal EmitStrMethod(ExprVal recv, string name, Node e) {
+        recv = new ExprVal(NonNullStrOp(recv.op), recv.ty);
         if (name == "AsSpan" || name == "AsReadOnlySpan" || name == "Slice") {
             string baseOp = recv.op;
             string lenOp = StrLen(recv.op);
@@ -156,17 +166,19 @@ partial class Irgen {
         }
         if (name == "Contains" && e.kids.Count == 1) {
             ExprVal sub = StrArg(e.kids[0]);
+            string subOp = NonNullStrOp(sub.op);
             DeclStrstr();
-            string hit = NT(); L("  " + hit + " = call i8* @strstr(i8* " + recv.op + ", i8* " + sub.op + ")");
+            string hit = NT(); L("  " + hit + " = call i8* @strstr(i8* " + recv.op + ", i8* " + subOp + ")");
             string r = NT(); L("  " + r + " = icmp ne i8* " + hit + ", null");
             string z = NT(); L("  " + z + " = zext i1 " + r + " to i64");
             return new ExprVal(z, MkType("bool"));
         }
         if (name == "IndexOf" && (e.kids.Count == 1 || e.kids.Count == 2)) {
             ExprVal sub = StrArg(e.kids[0]);
+            string subOp = NonNullStrOp(sub.op);
             DeclStrstr();
             if (e.kids.Count == 1) {
-                string hit = NT(); L("  " + hit + " = call i8* @strstr(i8* " + recv.op + ", i8* " + sub.op + ")");
+                string hit = NT(); L("  " + hit + " = call i8* @strstr(i8* " + recv.op + ", i8* " + subOp + ")");
                 string hi = NT(); L("  " + hi + " = ptrtoint i8* " + hit + " to i64");
                 string si = NT(); L("  " + si + " = ptrtoint i8* " + recv.op + " to i64");
                 string diff = NT(); L("  " + diff + " = sub i64 " + hi + ", " + si);
@@ -183,7 +195,7 @@ partial class Irgen {
             L("  br i1 " + ok + ", label %L" + lrun + ", label %L" + lend);
             Label(lrun);
             string off = NT(); L("  " + off + " = getelementptr i8, i8* " + recv.op + ", i64 " + start);
-            string hit = NT(); L("  " + hit + " = call i8* @strstr(i8* " + off + ", i8* " + sub.op + ")");
+            string hit = NT(); L("  " + hit + " = call i8* @strstr(i8* " + off + ", i8* " + subOp + ")");
             string hi = NT(); L("  " + hi + " = ptrtoint i8* " + hit + " to i64");
             string si = NT(); L("  " + si + " = ptrtoint i8* " + recv.op + " to i64");
             string diff = NT(); L("  " + diff + " = sub i64 " + hi + ", " + si);
@@ -198,17 +210,19 @@ partial class Irgen {
         }
         if (name == "LastIndexOf" && e.kids.Count == 1) {
             ExprVal sub = StrArg(e.kids[0]);
+            string subOp = NonNullStrOp(sub.op);
             usesStrOps = true;
-            string r = NT(); L("  " + r + " = call i64 @zstr_lastidx(i8* " + recv.op + ", i8* " + sub.op + ")");
+            string r = NT(); L("  " + r + " = call i64 @zstr_lastidx(i8* " + recv.op + ", i8* " + subOp + ")");
             return new ExprVal(r, MkType("int"));
         }
         if ((name == "StartsWith" || name == "EndsWith") && e.kids.Count == 1) {
             ExprVal p = StrArg(e.kids[0]);
+            string pOp = NonNullStrOp(p.op);
             DeclStrncmp();
-            string lp = StrCLen(p.op);
+            string lp = StrCLen(pOp);
             string z = NT();
             if (name == "StartsWith") {
-                string cmp = NT(); L("  " + cmp + " = call i32 @strncmp(i8* " + recv.op + ", i8* " + p.op + ", i64 " + lp + ")");
+                string cmp = NT(); L("  " + cmp + " = call i32 @strncmp(i8* " + recv.op + ", i8* " + pOp + ", i64 " + lp + ")");
                 string r = NT(); L("  " + r + " = icmp eq i32 " + cmp + ", 0");
                 L("  " + z + " = zext i1 " + r + " to i64");
             } else {
@@ -217,7 +231,7 @@ partial class Irgen {
                 string fits = NT(); L("  " + fits + " = icmp sge i64 " + off + ", 0");
                 string offc = NT(); L("  " + offc + " = select i1 " + fits + ", i64 " + off + ", i64 0");
                 string tail = NT(); L("  " + tail + " = getelementptr i8, i8* " + recv.op + ", i64 " + offc);
-                string cmp = NT(); L("  " + cmp + " = call i32 @strcmp(i8* " + tail + ", i8* " + p.op + ")");
+                string cmp = NT(); L("  " + cmp + " = call i32 @strcmp(i8* " + tail + ", i8* " + pOp + ")");
                 string eq = NT(); L("  " + eq + " = icmp eq i32 " + cmp + ", 0");
                 string r = NT(); L("  " + r + " = and i1 " + fits + ", " + eq);
                 L("  " + z + " = zext i1 " + r + " to i64");
@@ -227,8 +241,10 @@ partial class Irgen {
         if (name == "Replace" && e.kids.Count == 2) {
             ExprVal from = StrArg(e.kids[0]);
             ExprVal to = StrArg(e.kids[1]);
+            string fromOp = NonNullStrOp(from.op);
+            string toOp = NonNullStrOp(to.op);
             usesStrOps = true;
-            string r = NT(); L("  " + r + " = call i8* @zstr_replace(i8* " + recv.op + ", i8* " + from.op + ", i8* " + to.op + ")");
+            string r = NT(); L("  " + r + " = call i8* @zstr_replace(i8* " + recv.op + ", i8* " + fromOp + ", i8* " + toOp + ")");
             return OwnedString(r);
         }
         if (name == "Trim" && e.kids.Count == 0) {
@@ -244,6 +260,7 @@ partial class Irgen {
         }
         if (name == "Split" && (e.kids.Count == 1 || e.kids.Count == 2)) {
             ExprVal sep = StrArg(e.kids[0]);
+            string sepOp = NonNullStrOp(sep.op);
             string opt = "0";
             if (e.kids.Count == 2) {
                 ExprVal ov = GenExpr(e.kids[1]);
@@ -253,7 +270,7 @@ partial class Irgen {
             Node lt = ListOf(MkType("string"));
             string meta = ListTypeMetadata(lt);
             string r = NT();
-            L("  " + r + " = call i8* @zstr_split(i8* " + recv.op + ", i8* " + sep.op
+            L("  " + r + " = call i8* @zstr_split(i8* " + recv.op + ", i8* " + sepOp
                 + ", i64 " + opt + ", i8* " + meta + ")");
             AddTemp(r, lt);
             return new ExprVal(r, lt);
@@ -634,9 +651,14 @@ partial class Irgen {
             return ToCStr(k);
         }
         if (k.ty != null && MapType(k.ty) == "i64") {
-            int w = HostIntWidth(k.ty);
+            Node kt = DictKeyTy(dictTy);
             string v = k.op;
-            if (w > 0 && w < 64) { v = WrapArith(v, w, IntUnsigned(k.ty)); }
+            if (kt != null && !IsErasedType(kt) && HostIntWidth(kt) > 0 && HostIntWidth(kt) < 64) {
+                v = WrapArith(v, HostIntWidth(kt), IntUnsigned(kt));
+            } else {
+                int w = HostIntWidth(k.ty);
+                if (w > 0 && w < 64) { v = WrapArith(v, w, IntUnsigned(k.ty)); }
+            }
             string t = NT();
             L("  " + t + " = inttoptr i64 " + v + " to i8*");
             return t;

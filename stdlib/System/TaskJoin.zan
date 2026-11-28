@@ -15,6 +15,7 @@ public class TaskJoin {
     // 登记期间持有 entry。同步登记不会在循环回边让出后被取消。
     private static long BindJoin(List<long> handles, int n, int any) {
         long entry = Task.JoinNew(n, any);
+        if (entry == 0) { return 0; }
         try {
             for (int i = 0; i < n; i = i + 1) {
                 Task.JoinBind(entry, handles[i], i);
@@ -28,18 +29,24 @@ public class TaskJoin {
 
     // 挂起直到 handles 全部完成并返回句柄数；空列表立即返回 0。
     public static async int WhenAll(List<long> handles) {
+        if (handles == null) { return 0; }
         int n = handles.Count;
         if (n == 0) { return 0; }
-        int r = await Task.JoinWaitOwned(TaskJoin.BindJoin(handles, n, 0));
+        long entry = TaskJoin.BindJoin(handles, n, 0);
+        if (entry == 0) { return await TaskJoin.WhenAllPoll(handles); }
+        int r = await Task.JoinWaitOwned(entry);
         if (r == 2) { return await TaskJoin.WhenAllPoll(handles); }
         return n;
     }
 
     // 挂起直到 handles 中任一句柄完成并返回最小已完成下标；空列表返回 -1。
     public static async int WhenAny(List<long> handles) {
+        if (handles == null) { return -1; }
         int n = handles.Count;
         if (n == 0) { return -1; }
-        int r = await Task.JoinWaitOwned(TaskJoin.BindJoin(handles, n, 1));
+        long entry = TaskJoin.BindJoin(handles, n, 1);
+        if (entry == 0) { return await TaskJoin.WhenAnyPoll(handles); }
+        int r = await Task.JoinWaitOwned(entry);
         if (r == 2) { return await TaskJoin.WhenAnyPoll(handles); }
         for (int i = 0; i < n; i = i + 1) {
             if (Task.IsDone(handles[i]) != 0) { return i; }
@@ -49,6 +56,7 @@ public class TaskJoin {
 
     // 轮询回退版 WhenAll：让渡/退避混合轮询。
     public static async int WhenAllPoll(List<long> handles) {
+        if (handles == null) { return 0; }
         int n = handles.Count;
         if (n == 0) { return 0; }
         int spins = 0;
@@ -64,7 +72,8 @@ public class TaskJoin {
                 await Task.Yield();
             } else {
                 await Task.Delay(wait);
-                if (wait < TaskJoin.MAX_BACKOFF) { wait = wait * 2; }
+                int cap = TaskJoin.MAX_BACKOFF > 0 ? TaskJoin.MAX_BACKOFF : 1;
+                if (wait < cap) { wait = wait > cap / 2 ? cap : wait * 2; }
             }
         }
         return n;
@@ -72,6 +81,7 @@ public class TaskJoin {
 
     // 轮询回退版 WhenAny：让渡/退避混合轮询。
     public static async int WhenAnyPoll(List<long> handles) {
+        if (handles == null) { return -1; }
         int n = handles.Count;
         if (n == 0) { return -1; }
         int spins = 0;
@@ -85,7 +95,8 @@ public class TaskJoin {
                 await Task.Yield();
             } else {
                 await Task.Delay(wait);
-                if (wait < TaskJoin.MAX_BACKOFF) { wait = wait * 2; }
+                int cap = TaskJoin.MAX_BACKOFF > 0 ? TaskJoin.MAX_BACKOFF : 1;
+                if (wait < cap) { wait = wait > cap / 2 ? cap : wait * 2; }
             }
         }
         return -1;
@@ -93,6 +104,7 @@ public class TaskJoin {
 
     // 协作式请求取消每个句柄（已完成句柄无副作用）。
     public static void CancelAll(List<long> handles) {
+        if (handles == null) { return; }
         for (int i = 0; i < handles.Count; i = i + 1) {
             Task.Cancel(handles[i]);
         }
@@ -100,6 +112,7 @@ public class TaskJoin {
 
     // `handles` 中已完成的句柄个数（不挂起）。
     public static int DoneCount(List<long> handles) {
+        if (handles == null) { return 0; }
         int done = 0;
         for (int i = 0; i < handles.Count; i = i + 1) {
             if (Task.IsDone(handles[i]) != 0) { done = done + 1; }
@@ -126,16 +139,21 @@ public class TaskJoin {
         }
 
         long timerH = Task.Spawn(TaskJoin.DelayHelper(timeoutMs));
-        List<long> waitBoth = new List<long>();
-        waitBoth.Add(handle);
-        waitBoth.Add(timerH);
-        int winner = await TaskJoin.WhenAny(waitBoth);
-        if (winner == 0) {
+        try {
+            List<long> waitBoth = new List<long>();
+            waitBoth.Add(handle);
+            waitBoth.Add(timerH);
+            int winner = await TaskJoin.WhenAny(waitBoth);
+            if (winner == 0) {
+                Task.Cancel(timerH);
+                return true;
+            } else {
+                Task.Cancel(handle);
+                return false;
+            }
+        } catch {
             Task.Cancel(timerH);
-            return true;
-        } else {
-            Task.Cancel(handle);
-            return false;
+            throw;
         }
     }
 

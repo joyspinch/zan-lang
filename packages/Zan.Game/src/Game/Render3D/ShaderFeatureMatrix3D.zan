@@ -1,0 +1,102 @@
+using System;
+
+namespace Game.Render3D;
+
+// 跨平台 GPU 后端特性档位（统一桌面 OpenGL 3.3、移动 GLES 3.0、OpenHarmony GLES 3.0 与软渲染兜底）。
+public enum GpuFeatureTier3D {
+    DesktopGl33 = 0,
+    MobileGles30 = 1,
+    HarmonyGles30 = 2,
+    SoftwareFallback = 3
+}
+
+// 跨平台着色器与管线能力上限描述。
+public class ShaderFeatureCapability3D {
+    public GpuFeatureTier3D Tier;
+    public string GlslHeaderVersion;
+    public int MaxShadowCascades;
+    public int MaxSkinBones;
+    public int MaxPostEffectsPerFrame;
+    public bool SupportsInstancing;
+    public bool SupportsDerivatives;
+    public bool SupportsAnisoFilter;
+
+    public ShaderFeatureCapability3D(GpuFeatureTier3D tier, string glslHeaderVersion,
+    int maxShadowCascades, int maxSkinBones, int maxPostEffectsPerFrame,
+    bool supportsInstancing, bool supportsDerivatives, bool supportsAnisoFilter) {
+        this.Tier = tier;
+        this.GlslHeaderVersion = glslHeaderVersion;
+        this.MaxShadowCascades = maxShadowCascades;
+        this.MaxSkinBones = maxSkinBones;
+        this.MaxPostEffectsPerFrame = maxPostEffectsPerFrame;
+        this.SupportsInstancing = supportsInstancing;
+        this.SupportsDerivatives = supportsDerivatives;
+        this.SupportsAnisoFilter = supportsAnisoFilter;
+    }
+}
+
+// 跨平台 3D 着色器能力矩阵与优雅降级协商器：
+// - 自动识别当前运行平台对应 GPU 特性档位（先判 OHOS/Android/iOS 再判桌面）；
+// - 对请求的阴影级联数、骨骼数、后处理叠加数执行安全上限裁剪并记录降级计数。
+public class ShaderFeatureMatrix3D {
+    private ShaderFeatureCapability3D capability;
+    public int DegradedFeatureCount;
+
+    public ShaderFeatureMatrix3D(GpuFeatureTier3D tier) {
+        this.capability = CapabilityForTier(tier);
+        this.DegradedFeatureCount = 0;
+    }
+
+    public ShaderFeatureCapability3D Capability {
+        get { return this.capability; }
+    }
+
+    public static GpuFeatureTier3D DetectHostTier() {
+        if (OperatingSystem.IsOhos()) { return GpuFeatureTier3D.HarmonyGles30; }
+        if (OperatingSystem.IsAndroid() || OperatingSystem.IsIos()) { return GpuFeatureTier3D.MobileGles30; }
+        if (OperatingSystem.IsWindows() || OperatingSystem.IsMacOS() || OperatingSystem.IsLinux()) {
+            return GpuFeatureTier3D.DesktopGl33;
+        }
+        return GpuFeatureTier3D.SoftwareFallback;
+    }
+
+    public static ShaderFeatureCapability3D CapabilityForTier(GpuFeatureTier3D tier) {
+        if (tier == GpuFeatureTier3D.DesktopGl33) {
+            return new ShaderFeatureCapability3D(tier, "330 core", 4, 128, 6, true, true, true);
+        }
+        if (tier == GpuFeatureTier3D.MobileGles30) {
+            return new ShaderFeatureCapability3D(tier, "300 es", 2, 64, 3, true, true, false);
+        }
+        if (tier == GpuFeatureTier3D.HarmonyGles30) {
+            return new ShaderFeatureCapability3D(tier, "300 es", 2, 64, 3, true, true, false);
+        }
+        return new ShaderFeatureCapability3D(GpuFeatureTier3D.SoftwareFallback, "330 core", 1, 32, 1, false, false, false);
+    }
+
+    public int NegotiateShadowCascades(int requested) {
+        int r = requested < 0 ? 0 : requested;
+        if (r > this.capability.MaxShadowCascades) {
+            this.DegradedFeatureCount = this.DegradedFeatureCount + 1;
+            return this.capability.MaxShadowCascades;
+        }
+        return r;
+    }
+
+    public int NegotiateSkinBones(int requested) {
+        int r = requested < 0 ? 0 : requested;
+        if (r > this.capability.MaxSkinBones) {
+            this.DegradedFeatureCount = this.DegradedFeatureCount + 1;
+            return this.capability.MaxSkinBones;
+        }
+        return r;
+    }
+
+    public int NegotiatePostEffectCount(int requested) {
+        int r = requested < 0 ? 0 : requested;
+        if (r > this.capability.MaxPostEffectsPerFrame) {
+            this.DegradedFeatureCount = this.DegradedFeatureCount + 1;
+            return this.capability.MaxPostEffectsPerFrame;
+        }
+        return r;
+    }
+}

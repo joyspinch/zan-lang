@@ -1,0 +1,690 @@
+// rt_sync_proc.zan: Cross-platform & POSIX exported process launch, capture, and sandbox API.
+
+namespace Zan.Runtime.Sync;
+
+static partial class RtSyncProc {
+    // ---- Common exported process API ----
+
+    [Export("zan_proc_run_safe_timeout")]
+    public static int RunSafeTimeout(nint exe, nint args, int argc, int timeoutMs) {
+        if (exe == (nint)0 || argc < 0 || (argc > 0 && args == (nint)0)) return -1;
+#if WINDOWS
+        nint cmdline = WinQuoteCmdline(exe, args, argc);
+        if (cmdline == (nint)0) return -1;
+        nint wcmd = SyncPlat.Utf8ToWideAlloc(cmdline);
+        SyncPlat.CFree(cmdline);
+        if (wcmd == (nint)0) return -1;
+
+        SyncBuf128 siBuf = new SyncBuf128();
+        nint si = NativeMemory.AddressOf(ref siBuf);
+        SyncPlat.CMemset(si, 0, 104UL);
+        NativeMemory.Write<uint>(si, 104U); // cb = sizeof(STARTUPINFOW)
+        SyncBuf24 piBuf = new SyncBuf24();
+        nint pi = NativeMemory.AddressOf(ref piBuf);
+        SyncPlat.CMemset(pi, 0, 24UL);
+
+        int ok = SyncPlat.WinCreateProcessW((nint)0, wcmd, (nint)0, (nint)0, 0, SyncPlat.CREATE_NO_WINDOW, (nint)0, (nint)0, si, pi);
+        SyncPlat.CFree(wcmd);
+        if (ok == 0) return -1;
+
+        nint hProc = NativeMemory.Read<nint>(pi);
+        nint hThr = NativeMemory.Read<nint>(pi + (nint)8);
+        uint waitRes = SyncPlat.WinWaitForSingleObject(hProc, timeoutMs > 0 ? (uint)timeoutMs : SyncPlat.INFINITE_WAIT);
+        if (waitRes == SyncPlat.WAIT_TIMEOUT) {
+            SyncPlat.WinTerminateProcess(hProc, 1U);
+            SyncPlat.WinWaitForSingleObject(hProc, 5000U);
+        }
+        uint code = 0U;
+        bool exited = waitRes == SyncPlat.WAIT_OBJECT_0 &&
+                      SyncPlat.WinGetExitCodeProcess(hProc, NativeMemory.AddressOf(ref code)) != 0;
+        SyncPlat.WinCloseHandle(hProc);
+        SyncPlat.WinCloseHandle(hThr);
+        return exited ? (int)code : -1;
+#else
+        nint argv = SyncPlat.CMalloc(((ulong)argc + 2UL) * 8UL);
+        if (argv == (nint)0) return -1;
+        NativeMemory.At<nint>(argv, 0L) = exe;
+        for (int i = 0; i < argc; i++) {
+            NativeMemory.At<nint>(argv, (long)(i + 1)) = NativeMemory.At<nint>(args, (long)i);
+        }
+        NativeMemory.At<nint>(argv, (long)(argc + 1)) = (nint)0;
+
+        int pid = SyncPlat.PosixFork();
+        if (pid < 0) {
+            SyncPlat.CFree(argv);
+            return -1;
+        }
+        if (pid == 0) {
+            SyncPlat.PosixExecvp(exe, argv);
+            SyncPlat.PosixExit(127);
+        }
+        SyncPlat.CFree(argv);
+        int status = 0;
+        long deadline = timeoutMs > 0 ? RtSyncTime.MonotonicUs() + (long)timeoutMs * 1000L : 0L;
+        while (true) {
+            int waited = SyncPlat.PosixWaitpid(pid, NativeMemory.AddressOf(ref status), deadline != 0L ? SyncPlat.WNOHANG : 0);
+            if (waited == pid) break;
+            if (waited < 0 && SyncPlat.GetErrno() != SyncPlat.EINTR) return -1;
+            if (deadline == 0L) continue;
+            long left = deadline - RtSyncTime.MonotonicUs();
+            if (left <= 0L) {
+                SyncPlat.PosixKill(pid, SyncPlat.SIGKILL);
+                while (SyncPlat.PosixWaitpid(pid, NativeMemory.AddressOf(ref status), 0) < 0 &&
+                       SyncPlat.GetErrno() == SyncPlat.EINTR) {
+                }
+                return -1;
+            }
+            SleepUs(left < 10000L ? left : 10000L);
+        }
+        if (WIfExited(status)) return WExitStatus(status);
+        if (WIfSignaled(status)) return 128 + WTermSig(status);
+        return -1;
+#endif
+    }
+
+    [Export("zan_proc_run_safe")]
+    public static int RunSafe(nint exe, nint args, int argc) {
+        return RunSafeTimeout(exe, args, argc, -1);
+    }
+
+    [Export("zan_proc_start_detached_safe")]
+    public static int StartDetachedSafe(nint exe, nint args, int argc) {
+        if (exe == (nint)0 || argc < 0 || (argc > 0 && args == (nint)0)) return -1;
+#if WINDOWS
+        nint cmdline = WinQuoteCmdline(exe, args, argc);
+        if (cmdline == (nint)0) return -1;
+        nint wcmd = SyncPlat.Utf8ToWideAlloc(cmdline);
+        SyncPlat.CFree(cmdline);
+        if (wcmd == (nint)0) return -1;
+
+        SyncBuf128 siBuf = new SyncBuf128();
+        nint si = NativeMemory.AddressOf(ref siBuf);
+        SyncPlat.CMemset(si, 0, 104UL);
+        NativeMemory.Write<uint>(si, 104U);
+        SyncBuf24 piBuf = new SyncBuf24();
+        nint pi = NativeMemory.AddressOf(ref piBuf);
+        SyncPlat.CMemset(pi, 0, 24UL);
+
+        int ok = SyncPlat.WinCreateProcessW((nint)0, wcmd, (nint)0, (nint)0, 0,
+                                            SyncPlat.CREATE_NO_WINDOW | SyncPlat.DETACHED_PROCESS,
+                                            (nint)0, (nint)0, si, pi);
+        SyncPlat.CFree(wcmd);
+        if (ok == 0) return -1;
+        SyncPlat.WinCloseHandle(NativeMemory.Read<nint>(pi));
+        SyncPlat.WinCloseHandle(NativeMemory.Read<nint>(pi + (nint)8));
+        return 0;
+#else
+        nint argv = SyncPlat.CMalloc(((ulong)argc + 2UL) * 8UL);
+        if (argv == (nint)0) return -1;
+        NativeMemory.At<nint>(argv, 0L) = exe;
+        for (int i = 0; i < argc; i++) {
+            NativeMemory.At<nint>(argv, (long)(i + 1)) = NativeMemory.At<nint>(args, (long)i);
+        }
+        NativeMemory.At<nint>(argv, (long)(argc + 1)) = (nint)0;
+        int res = LaunchDetached(exe, argv, (nint)0);
+        SyncPlat.CFree(argv);
+        return res;
+#endif
+    }
+
+    [Export("zan_proc_start_program_safe")]
+    public static int StartProgramSafe(nint exe, nint logPath) {
+        if (exe == (nint)0) return -1;
+#if WINDOWS
+        SyncBuf128 siBuf = new SyncBuf128();
+        nint si = NativeMemory.AddressOf(ref siBuf);
+        SyncPlat.CMemset(si, 0, 104UL);
+        NativeMemory.Write<uint>(si, 104U);
+        SyncBuf24 piBuf = new SyncBuf24();
+        nint pi = NativeMemory.AddressOf(ref piBuf);
+        SyncPlat.CMemset(pi, 0, 24UL);
+
+        nint hLog = (nint)(-1);
+        uint flags = SyncPlat.DETACHED_PROCESS;
+        if (logPath != (nint)0 && NativeMemory.Read<byte>(logPath) != (byte)0) {
+            nint wlog = SyncPlat.Utf8ToWideAlloc(logPath);
+            if (wlog != (nint)0) {
+                SyncBuf24 saBuf = new SyncBuf24();
+                nint sa = NativeMemory.AddressOf(ref saBuf);
+                SyncPlat.CMemset(sa, 0, 24UL);
+                NativeMemory.Write<uint>(sa, 24U);
+                NativeMemory.Write<int>(sa + (nint)16, 1);
+                hLog = SyncPlat.WinCreateFileW(wlog, SyncPlat.FILE_APPEND_DATA | SyncPlat.SYNCHRONIZE,
+                                               SyncPlat.FILE_SHARE_RW, sa, SyncPlat.OPEN_ALWAYS,
+                                               SyncPlat.FILE_ATTRIBUTE_NORMAL, (nint)0);
+                SyncPlat.CFree(wlog);
+            }
+        }
+        if (hLog != (nint)(-1)) {
+            NativeMemory.Write<uint>(si + (nint)60, SyncPlat.STARTF_USESTDHANDLES);
+            NativeMemory.Write<nint>(si + (nint)88, hLog);
+            NativeMemory.Write<nint>(si + (nint)96, hLog);
+            flags = SyncPlat.CREATE_NO_WINDOW;
+        }
+
+        nint cmdline = WinQuoteCmdline(exe, (nint)0, 0);
+        if (cmdline == (nint)0) {
+            if (hLog != (nint)(-1)) SyncPlat.WinCloseHandle(hLog);
+            return -1;
+        }
+        nint wcmd = SyncPlat.Utf8ToWideAlloc(cmdline);
+        SyncPlat.CFree(cmdline);
+        if (wcmd == (nint)0) {
+            if (hLog != (nint)(-1)) SyncPlat.WinCloseHandle(hLog);
+            return -1;
+        }
+        nint wapp = (nint)0;
+        if (SyncPlat.CStrChr(exe, 92) != (nint)0 || SyncPlat.CStrChr(exe, 47) != (nint)0 || SyncPlat.CStrChr(exe, 58) != (nint)0) {
+            wapp = SyncPlat.Utf8ToWideAlloc(exe);
+            if (wapp == (nint)0) {
+                SyncPlat.CFree(wcmd);
+                if (hLog != (nint)(-1)) SyncPlat.WinCloseHandle(hLog);
+                return -1;
+            }
+        }
+        int ok = SyncPlat.WinCreateProcessW(wapp, wcmd, (nint)0, (nint)0, 1, flags, (nint)0, (nint)0, si, pi);
+        SyncPlat.CFree(wapp);
+        SyncPlat.CFree(wcmd);
+        if (hLog != (nint)(-1)) SyncPlat.WinCloseHandle(hLog);
+        if (ok == 0) return -1;
+        SyncPlat.WinCloseHandle(NativeMemory.Read<nint>(pi));
+        SyncPlat.WinCloseHandle(NativeMemory.Read<nint>(pi + (nint)8));
+        return 0;
+#else
+        SyncBuf16 argvBuf = new SyncBuf16();
+        nint argv = NativeMemory.AddressOf(ref argvBuf);
+        NativeMemory.At<nint>(argv, 0L) = exe;
+        NativeMemory.At<nint>(argv, 1L) = (nint)0;
+        return LaunchDetached(exe, argv, logPath);
+#endif
+    }
+
+    [Export("zan_proc_capture_safe")]
+    public static int CaptureSafe(nint exe, nint args, int argc, nint outBuf, nint outLen, nint exitCode) {
+        if (exe == (nint)0 || outBuf == (nint)0 || outLen == (nint)0 || exitCode == (nint)0) return -1;
+        NativeMemory.Write<nint>(outBuf, (nint)0);
+        NativeMemory.Write<int>(outLen, 0);
+        NativeMemory.Write<int>(exitCode, -1);
+#if WINDOWS
+        SyncBuf24 saBuf = new SyncBuf24();
+        nint sa = NativeMemory.AddressOf(ref saBuf);
+        SyncPlat.CMemset(sa, 0, 24UL);
+        NativeMemory.Write<uint>(sa, 24U);
+        NativeMemory.Write<int>(sa + (nint)16, 1);
+
+        nint hRead = (nint)0;
+        nint hWrite = (nint)0;
+        if (SyncPlat.WinCreatePipe(NativeMemory.AddressOf(ref hRead), NativeMemory.AddressOf(ref hWrite), sa, 0U) == 0) {
+            return -1;
+        }
+        SyncPlat.WinSetHandleInformation(hRead, SyncPlat.HANDLE_FLAG_INHERIT, 0U);
+
+        SyncBuf128 siBuf = new SyncBuf128();
+        nint si = NativeMemory.AddressOf(ref siBuf);
+        SyncPlat.CMemset(si, 0, 104UL);
+        NativeMemory.Write<uint>(si, 104U);
+        NativeMemory.Write<uint>(si + (nint)60, SyncPlat.STARTF_USESTDHANDLES);
+        NativeMemory.Write<nint>(si + (nint)88, hWrite);
+        NativeMemory.Write<nint>(si + (nint)96, hWrite);
+
+        SyncBuf24 piBuf = new SyncBuf24();
+        nint pi = NativeMemory.AddressOf(ref piBuf);
+        SyncPlat.CMemset(pi, 0, 24UL);
+
+        nint cmdline = WinQuoteCmdline(exe, args, argc);
+        if (cmdline == (nint)0) {
+            SyncPlat.WinCloseHandle(hRead);
+            SyncPlat.WinCloseHandle(hWrite);
+            return -1;
+        }
+        nint wcmd = SyncPlat.Utf8ToWideAlloc(cmdline);
+        SyncPlat.CFree(cmdline);
+        if (wcmd == (nint)0) {
+            SyncPlat.WinCloseHandle(hRead);
+            SyncPlat.WinCloseHandle(hWrite);
+            return -1;
+        }
+        int ok = SyncPlat.WinCreateProcessW((nint)0, wcmd, (nint)0, (nint)0, 1, SyncPlat.CREATE_NO_WINDOW, (nint)0, (nint)0, si, pi);
+        SyncPlat.CFree(wcmd);
+        SyncPlat.WinCloseHandle(hWrite);
+        if (ok == 0) {
+            SyncPlat.WinCloseHandle(hRead);
+            return -1;
+        }
+
+        nint hProc = NativeMemory.Read<nint>(pi);
+        nint hThr = NativeMemory.Read<nint>(pi + (nint)8);
+        ulong cap = 4096UL;
+        ulong len = 0UL;
+        nint buf = SyncPlat.CMalloc(cap);
+        if (buf == (nint)0) {
+            SyncPlat.WinCloseHandle(hRead);
+            SyncPlat.WinWaitForSingleObject(hProc, SyncPlat.INFINITE_WAIT);
+            SyncPlat.WinCloseHandle(hProc);
+            SyncPlat.WinCloseHandle(hThr);
+            return -1;
+        }
+
+        uint bytesRead = 0U;
+        bool readErr = false;
+        while (SyncPlat.WinReadFile(hRead, buf + (nint)len, (uint)(cap - len - 1UL), NativeMemory.AddressOf(ref bytesRead), (nint)0) != 0 &&
+               bytesRead > 0U) {
+            len += (ulong)bytesRead;
+            if (len >= 2147483647UL) {
+                readErr = true;
+                break;
+            }
+            if (len + 1024UL >= cap) {
+                ulong maxCap = 2147483648UL;
+                ulong nextCap = cap <= maxCap / 2UL ? cap * 2UL : maxCap;
+                if (nextCap <= cap) {
+                    readErr = true;
+                    break;
+                }
+                nint nb = SyncPlat.CRealloc(buf, nextCap);
+                if (nb == (nint)0) {
+                    readErr = true;
+                    break;
+                }
+                buf = nb;
+                cap = nextCap;
+            }
+        }
+        SyncPlat.WinCloseHandle(hRead);
+        SyncPlat.WinWaitForSingleObject(hProc, SyncPlat.INFINITE_WAIT);
+        uint code = 0U;
+        SyncPlat.WinGetExitCodeProcess(hProc, NativeMemory.AddressOf(ref code));
+        SyncPlat.WinCloseHandle(hProc);
+        SyncPlat.WinCloseHandle(hThr);
+        if (readErr) {
+            SyncPlat.CFree(buf);
+            return -1;
+        }
+        NativeMemory.At<byte>(buf, (long)len) = (byte)0;
+        NativeMemory.Write<nint>(outBuf, buf);
+        NativeMemory.Write<int>(outLen, (int)len);
+        NativeMemory.Write<int>(exitCode, (int)code);
+        return 0;
+#else
+        return CaptureSafeTimeout(exe, args, argc, outBuf, outLen, exitCode, -1);
+#endif
+    }
+
+    [Export("zan_proc_free_buf")]
+    public static void FreeBuf(nint buf) {
+        if (buf != (nint)0) SyncPlat.CFree(buf);
+    }
+
+#if !WINDOWS
+    // ---- POSIX-only exported process & sandbox API (17 symbols) ----
+
+    [Export("zan_proc_capture_safe_timeout")]
+    public static int CaptureSafeTimeout(nint exe, nint args, int argc, nint outBuf, nint outLen, nint exitCode, int timeoutMs) {
+        if (outBuf == (nint)0 || outLen == (nint)0 || exitCode == (nint)0) return -1;
+        NativeMemory.Write<nint>(outBuf, (nint)0);
+        NativeMemory.Write<int>(outLen, 0);
+        NativeMemory.Write<int>(exitCode, -1);
+        if (exe == (nint)0 || argc < 0 || (argc > 0 && args == (nint)0)) return -1;
+
+        long deadline = timeoutMs > 0 ? RtSyncTime.MonotonicUs() + (long)timeoutMs * 1000L : 0L;
+        SyncBuf16 pfdBuf = new SyncBuf16();
+        nint pipefd = NativeMemory.AddressOf(ref pfdBuf);
+        if (LaunchPipe(pipefd) < 0) return -1;
+        int rdFd = NativeMemory.At<int>(pipefd, 0L);
+        int wrFd = NativeMemory.At<int>(pipefd, 1L);
+        int fl = SyncPlat.PosixFcntl(rdFd, SyncPlat.F_GETFL, 0);
+        if (fl < 0 || SyncPlat.PosixFcntl(rdFd, SyncPlat.F_SETFL, fl | SyncPlat.O_NONBLOCK) < 0) {
+            SyncPlat.PosixClose(rdFd);
+            SyncPlat.PosixClose(wrFd);
+            return -1;
+        }
+        ulong cap = 4096UL;
+        ulong len = 0UL;
+        nint buf = SyncPlat.CMalloc(cap);
+        nint argv = SyncPlat.CMalloc(((ulong)argc + 2UL) * 8UL);
+        if (buf == (nint)0 || argv == (nint)0) {
+            SyncPlat.CFree(buf);
+            SyncPlat.CFree(argv);
+            SyncPlat.PosixClose(rdFd);
+            SyncPlat.PosixClose(wrFd);
+            return -1;
+        }
+        NativeMemory.At<nint>(argv, 0L) = exe;
+        for (int i = 0; i < argc; i++) NativeMemory.At<nint>(argv, (long)(i + 1)) = NativeMemory.At<nint>(args, (long)i);
+        NativeMemory.At<nint>(argv, (long)(argc + 1)) = (nint)0;
+
+        int pid = SyncPlat.PosixFork();
+        if (pid < 0) {
+            SyncPlat.CFree(buf);
+            SyncPlat.CFree(argv);
+            SyncPlat.PosixClose(rdFd);
+            SyncPlat.PosixClose(wrFd);
+            return -1;
+        }
+        if (pid == 0) {
+            SyncPlat.PosixClose(rdFd);
+            if (SyncPlat.PosixDup2(wrFd, 1) < 0 || SyncPlat.PosixDup2(wrFd, 2) < 0) SyncPlat.PosixExit(127);
+            SyncPlat.PosixClose(wrFd);
+            SyncPlat.PosixExecvp(exe, argv);
+            SyncPlat.PosixExit(127);
+        }
+        SyncPlat.CFree(argv);
+        SyncPlat.PosixClose(wrFd);
+
+        bool reaped = false;
+        bool eof = false;
+        bool failed = false;
+        bool timedOut = false;
+        int status = 0;
+        SyncBuf4096 chunkBuf = new SyncBuf4096();
+        nint bytes = NativeMemory.AddressOf(ref chunkBuf);
+
+        while (true) {
+            if (deadline != 0L && RtSyncTime.MonotonicUs() >= deadline) {
+                timedOut = true;
+                break;
+            }
+            if (!reaped) {
+                int waited = SyncPlat.PosixWaitpid(pid, NativeMemory.AddressOf(ref status), SyncPlat.WNOHANG);
+                if (waited == pid) {
+                    reaped = true;
+                } else if (waited < 0) {
+                    int err = SyncPlat.GetErrno();
+                    if (err == SyncPlat.EINTR) continue;
+                    if (err == SyncPlat.ECHILD) reaped = true;
+                    failed = true;
+                    break;
+                }
+            }
+            if (!eof) {
+                long got = SyncPlat.PosixRead(rdFd, bytes, 4096UL);
+                if (got > 0L) {
+                    if (CaptureAppend(ref buf, ref cap, ref len, bytes, (ulong)got) < 0) {
+                        failed = true;
+                        break;
+                    }
+                    continue;
+                }
+                if (got == 0L) {
+                    eof = true;
+                } else {
+                    int err = SyncPlat.GetErrno();
+                    if (err == SyncPlat.EINTR) continue;
+                    if (err != SyncPlat.EAGAIN) {
+                        failed = true;
+                        break;
+                    }
+                }
+            }
+            if (reaped && eof) break;
+            int waitMs = 10;
+            if (deadline != 0L) {
+                long left = deadline - RtSyncTime.MonotonicUs();
+                if (left <= 0L) continue;
+                if (left < 10000L) waitMs = (int)((left + 999L) / 1000L);
+            }
+            SyncBuf16 polBuf = new SyncBuf16();
+            nint pol = NativeMemory.AddressOf(ref polBuf);
+            NativeMemory.Write<int>(pol, eof ? -1 : rdFd);
+            NativeMemory.Write<short>(pol + (nint)4, SyncPlat.POLLIN);
+            NativeMemory.Write<short>(pol + (nint)6, (short)0);
+            int polled = SyncPlat.PosixPoll(pol, 1UL, waitMs);
+            if ((polled < 0 && SyncPlat.GetErrno() != SyncPlat.EINTR) ||
+                (NativeMemory.Read<short>(pol + (nint)6) & SyncPlat.POLLNVAL) != 0) {
+                failed = true;
+                break;
+            }
+        }
+
+        if ((timedOut || failed) && !reaped) {
+            SyncPlat.PosixKill(pid, SyncPlat.SIGKILL);
+            int waited = -1;
+            while (true) {
+                waited = SyncPlat.PosixWaitpid(pid, NativeMemory.AddressOf(ref status), 0);
+                if (waited < 0 && SyncPlat.GetErrno() == SyncPlat.EINTR) continue;
+                break;
+            }
+            if (waited != pid) failed = true;
+        }
+        if (timedOut && !failed && !eof) {
+            int pending = 0;
+            if (SyncPlat.PosixIoctl(rdFd, SyncPlat.FIONREAD, NativeMemory.AddressOf(ref pending)) == 0) {
+                while (pending > 0) {
+                    ulong cnt = pending < 4096 ? (ulong)pending : 4096UL;
+                    long got = SyncPlat.PosixRead(rdFd, bytes, cnt);
+                    if (got <= 0L) break;
+                    if (CaptureAppend(ref buf, ref cap, ref len, bytes, (ulong)got) < 0) {
+                        failed = true;
+                        break;
+                    }
+                    pending -= (int)got;
+                }
+            }
+        }
+        SyncPlat.PosixClose(rdFd);
+        if (failed) {
+            SyncPlat.CFree(buf);
+            return -1;
+        }
+        NativeMemory.At<byte>(buf, (long)len) = (byte)0;
+        NativeMemory.Write<nint>(outBuf, buf);
+        NativeMemory.Write<int>(outLen, (int)len);
+        if (!timedOut) {
+            if (WIfExited(status)) NativeMemory.Write<int>(exitCode, WExitStatus(status));
+            else if (WIfSignaled(status)) NativeMemory.Write<int>(exitCode, 128 + WTermSig(status));
+        }
+        return 0;
+    }
+
+    [Export("zan_proc_spawn")]
+    public static int Spawn(nint argv, nint cwd, nint fds) {
+        return ProcSpawnCore(argv, cwd, fds, false, (nint)0, -1);
+    }
+
+    [Export("zan_proc_spawn_managed")]
+    public static int SpawnManaged(nint argv, nint cwd, nint fds) {
+        return ProcSpawnCore(argv, cwd, fds, true, (nint)0, -1);
+    }
+
+    [Export("zan_proc_sandbox_available")]
+    public static int SandboxAvailable(nint cgroupRoot) {
+#if MACOS
+        return 0;
+#else
+        if (!SandboxUnprivileged() || !SandboxCgroupRoot(cgroupRoot)) return 0;
+        long abi = SyncPlat.PosixSyscall3(SyncPlat.SYS_LANDLOCK_CREATE_RULESET, 0UL, 0UL, LANDLOCK_CREATE_RULESET_VERSION);
+        return abi >= LANDLOCK_ABI ? 1 : 0;
+#endif
+    }
+
+    [Export("zan_proc_spawn_sandboxed")]
+    public static int SpawnSandboxed(nint argv, nint cwd, nint readRoots, nint writeRoot, nint cgroupRoot, nint fds, nint handleOut) {
+        if (handleOut == (nint)0 || SandboxAvailable(cgroupRoot) == 0) return -1;
+        NativeMemory.Write<nint>(handleOut, (nint)0);
+        int ruleset = SandboxRuleset(readRoots, writeRoot);
+        if (ruleset < 0) return -1;
+        nint grp = SandboxGroupCreate(cgroupRoot);
+        int pid = -1;
+        if (grp != (nint)0) {
+            pid = ProcSpawnCore(argv, cwd, fds, true, grp, ruleset);
+            if (pid < 0) SandboxDispose(grp, 0, -1, -1);
+            else NativeMemory.Write<nint>(handleOut, grp);
+        }
+        SyncPlat.PosixClose(ruleset);
+        return pid;
+    }
+
+    [Export("zan_proc_sandbox_kill")]
+    public static int SandboxKill(nint handle) {
+        if (handle == (nint)0) return 0;
+        return SandboxWrite(NativeMemory.Read<int>(handle + (nint)SBG_KILL), (nint)"1", 1UL) == 0 ? 1 : 0;
+    }
+
+    [Export("zan_proc_sandbox_wait")]
+    public static int SandboxWait(int pid, int timeoutMs, nint handle) {
+        if (handle == (nint)0 || pid <= 0) return -1;
+        long deadline = timeoutMs > 0 ? RtSyncTime.MonotonicUs() + (long)timeoutMs * 1000L : 0L;
+        while (true) {
+            SyncBuf128 infoBuf = new SyncBuf128();
+            nint ip = NativeMemory.AddressOf(ref infoBuf);
+            SyncPlat.CMemset(ip, 0, 128UL);
+            if (SyncPlat.PosixWaitid(SyncPlat.P_PID, (uint)pid, ip, SyncPlat.WEXITED | SyncPlat.WNOWAIT | SyncPlat.WNOHANG) == 0) {
+                if (NativeMemory.Read<int>(ip + (nint)16) != 0) {
+                    if (SandboxKill(handle) == 0) return WAIT_OWNED_ERROR;
+                    if (SandboxGroupEmpty(handle)) return ProcWaitCore(pid, 0, false);
+                }
+            } else {
+                int err = SyncPlat.GetErrno();
+                if (err != SyncPlat.EINTR) return err == SyncPlat.ECHILD ? -1 : WAIT_OWNED_ERROR;
+            }
+            if (deadline != 0L && RtSyncTime.MonotonicUs() >= deadline) return -258;
+            SleepUs(1000L);
+        }
+    }
+
+    [Export("zan_proc_sandbox_dispose")]
+    public static int SandboxDispose(nint handle, int pid, int input, int output) {
+        if (input >= 0) SyncPlat.PosixClose(input);
+        if (output >= 0) SyncPlat.PosixClose(output);
+        if (handle == (nint)0) return 0;
+        int reaped = pid <= 0 ? 1 : 0;
+        if (pid > 0) {
+            SandboxKill(handle);
+            reaped = SpawnManagedDispose(pid, -1, -1);
+        }
+        if (SandboxGroupEmpty(handle) && SandboxGroupRemove(handle)) {
+            SandboxGroupFree(handle);
+            return reaped;
+        }
+        ulong reaper = 0UL;
+        if (SyncPlat.PosixThreadCreate(NativeMemory.AddressOf(ref reaper), (nint)0,
+                                       NativeMemory.FunctionPointer(ProcSandboxReap), handle) == 0) {
+            SyncPlat.PosixThreadDetach(reaper);
+        } else {
+            SandboxKill(handle);
+            SandboxGroupFree(handle);
+        }
+        return 0;
+    }
+
+    [Export("zan_proc_spawn_available")]
+    public static int SpawnAvailable(int fd) {
+        int cnt = 0;
+        return SyncPlat.PosixIoctl(fd, SyncPlat.FIONREAD, NativeMemory.AddressOf(ref cnt)) == 0 ? cnt : 0;
+    }
+
+    [Export("zan_proc_spawn_read")]
+    public static int SpawnRead(int fd, nint buf, int count) {
+        if (count <= 0) return 0;
+        long received = -1L;
+        while (true) {
+            received = SyncPlat.PosixRead(fd, buf, (ulong)count);
+            if (received < 0L && SyncPlat.GetErrno() == SyncPlat.EINTR) continue;
+            break;
+        }
+        return (int)received;
+    }
+
+    [Export("zan_proc_spawn_write")]
+    public static int SpawnWrite(int fd, nint buf, int count) {
+        if (count < 0) return 0;
+        SyncBuf128 pipeSigBuf = new SyncBuf128();
+        SyncBuf128 prevBuf = new SyncBuf128();
+        SyncBuf128 pendBuf = new SyncBuf128();
+        nint pipeSig = NativeMemory.AddressOf(ref pipeSigBuf);
+        nint prev = NativeMemory.AddressOf(ref prevBuf);
+        nint pend = NativeMemory.AddressOf(ref pendBuf);
+        SyncPlat.PosixSigemptyset(pipeSig);
+        SyncPlat.PosixSigaddset(pipeSig, SyncPlat.SIGPIPE);
+        if (SyncPlat.PosixSigmask(SyncPlat.SIG_BLOCK, pipeSig, prev) != 0) return 0;
+
+        int written = 0;
+        if (SyncPlat.PosixSigpending(pend) == 0) {
+            int wasPend = SyncPlat.PosixSigismember(pend, SyncPlat.SIGPIPE);
+            while (written < count) {
+                long n = SyncPlat.PosixWrite(fd, buf + (nint)written, (ulong)(count - written));
+                if (n > 0L) {
+                    written += (int)n;
+                    continue;
+                }
+                int err = SyncPlat.GetErrno();
+                if (n < 0L && err == SyncPlat.EINTR) continue;
+                if (n < 0L && err == SyncPlat.EPIPE && wasPend == 0 &&
+                    SyncPlat.PosixSigpending(pend) == 0 && SyncPlat.PosixSigismember(pend, SyncPlat.SIGPIPE) == 1) {
+                    int sigNum = 0;
+                    while (SyncPlat.PosixSigwait(pipeSig, NativeMemory.AddressOf(ref sigNum)) == SyncPlat.EINTR) {
+                    }
+                }
+                break;
+            }
+        }
+        SyncPlat.PosixSigmask(SyncPlat.SIG_SETMASK, prev, (nint)0);
+        return written == count ? 1 : 0;
+    }
+
+    [Export("zan_proc_spawn_kill")]
+    public static int SpawnKill(int pid) {
+        return (pid > 0 && SyncPlat.PosixKill(pid, SyncPlat.SIGKILL) == 0) ? 1 : 0;
+    }
+
+    [Export("zan_proc_spawn_managed_kill")]
+    public static int SpawnManagedKill(int pid) {
+        if (pid <= 0) return 0;
+        SyncBuf128 infoBuf = new SyncBuf128();
+        nint ip = NativeMemory.AddressOf(ref infoBuf);
+        SyncPlat.CMemset(ip, 0, 128UL);
+        int obs = -1;
+        while (true) {
+            obs = SyncPlat.PosixWaitid(SyncPlat.P_PID, (uint)pid, ip, SyncPlat.WEXITED | SyncPlat.WNOWAIT | SyncPlat.WNOHANG);
+            if (obs < 0 && SyncPlat.GetErrno() == SyncPlat.EINTR) continue;
+            break;
+        }
+        return (obs == 0 && ProcSignalGroup(pid)) ? 1 : 0;
+    }
+
+    [Export("zan_proc_spawn_wait")]
+    public static int SpawnWait(int pid, int timeoutMs) {
+        return ProcWaitCore(pid, timeoutMs, false);
+    }
+
+    [Export("zan_proc_spawn_managed_wait")]
+    public static int SpawnManagedWait(int pid, int timeoutMs) {
+        return ProcWaitCore(pid, timeoutMs, true);
+    }
+
+    [Export("zan_proc_spawn_managed_dispose")]
+    public static int SpawnManagedDispose(int pid, int input, int output) {
+        if (input >= 0) SyncPlat.PosixClose(input);
+        if (output >= 0) SyncPlat.PosixClose(output);
+        if (pid <= 0) return 1;
+        SpawnManagedKill(pid);
+        int code = SpawnManagedWait(pid, 1);
+        if (code >= 0) return 1;
+        if (code == -1) return 0;
+        if (code == WAIT_OWNED_ERROR) SpawnKill(pid);
+        ulong reaper = 0UL;
+        if (SyncPlat.PosixThreadCreate(NativeMemory.AddressOf(ref reaper), (nint)0,
+                                       NativeMemory.FunctionPointer(ProcReapChild), (nint)(long)pid) == 0) {
+            SyncPlat.PosixThreadDetach(reaper);
+        }
+        return 0;
+    }
+
+    [Export("zan_proc_spawn_dispose")]
+    public static void SpawnDispose(int pid, int input, int output) {
+        if (input >= 0) SyncPlat.PosixClose(input);
+        if (output >= 0) SyncPlat.PosixClose(output);
+        if (pid <= 0) return;
+        int status = 0;
+        int waited = -1;
+        while (true) {
+            waited = SyncPlat.PosixWaitpid(pid, NativeMemory.AddressOf(ref status), SyncPlat.WNOHANG);
+            if (waited < 0 && SyncPlat.GetErrno() == SyncPlat.EINTR) continue;
+            break;
+        }
+        if (waited < 0 || (waited == pid && (WIfExited(status) || WIfSignaled(status)))) return;
+        SpawnKill(pid);
+        SpawnWait(pid, 0);
+    }
+#endif
+}

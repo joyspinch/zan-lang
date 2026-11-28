@@ -1,0 +1,485 @@
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+using Gui;
+using Game.Animation;
+using Game.Combat3D;
+using Game.Render3D;
+
+// 大尺度开放世界与百人战场 3D 核心管线全链路契约测试：
+//   1. DynamicSceneTlas3D（旋转+等比缩放实例求交、Fat-AABB 增量 Refit、可破坏掩体 O(1) 开关、跨实例穿墙弹道）；
+//   2. KinematicCapsuleController3D.SimulateDynamic & RaycastLagCompensatedDynamic（移动旋转平台带人跟随、起跳动量继承、动态门遮挡回溯判定）；
+//   3. WorldChunkStreamer3D（双半径迟滞防抖、视野前瞻优先级、单帧加载/卸载预算闸门、关键据点常驻锁定并与 TLAS 自动联动）；
+//   4. RaycastVehicle3D（四轮悬挂重力平衡、油门加速、转向偏航、手刹漂移打滑遥测、自身 TLAS 车壳防自碰与位姿自动同步）；
+//   5. LargeMeshPartitioner3D（70,000 顶点 int32 网格 O(N) 切分 ushort 子块 + 100 骨骼高模贪心调色板拆批与矩阵提取）；
+//   6. ShadowCascadeSplitter3D & LightClusterCuller3D（摄像机旋转/平移下的纹素相位零闪烁不变性 + 200 光源 4-Wide SIMD Top-4 裁剪）。
+public class LargeWorld3DTests {
+    private static int failures = 0;
+
+    private static void Check(string name, bool ok) {
+        if (!ok) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL: " + name);
+        }
+    }
+
+    private static bool Near(float a, float b, float eps) {
+        float d = a - b;
+        if (d < 0.0f) { d = -d; }
+        return d <= eps;
+    }
+
+    private static StaticMeshBvh3D BuildFlatBoxBlas(float hx, float hy, float hz, int matId) {
+        StaticMeshBvh3D bvh = new StaticMeshBvh3D(16);
+        Vector3 v000 = new Vector3(-hx, -hy, -hz);
+        Vector3 v100 = new Vector3( hx, -hy, -hz);
+        Vector3 v101 = new Vector3( hx, -hy,  hz);
+        Vector3 v001 = new Vector3(-hx, -hy,  hz);
+        Vector3 v010 = new Vector3(-hx,  hy, -hz);
+        Vector3 v110 = new Vector3( hx,  hy, -hz);
+        Vector3 v111 = new Vector3( hx,  hy,  hz);
+        Vector3 v011 = new Vector3(-hx,  hy,  hz);
+
+        // Top (+Y)
+        bvh.AddTriangle(v010, v011, v111, matId);
+        bvh.AddTriangle(v010, v111, v110, matId);
+        // Bottom (-Y)
+        bvh.AddTriangle(v000, v101, v001, matId);
+        bvh.AddTriangle(v000, v100, v101, matId);
+        // Front (+Z)
+        bvh.AddTriangle(v001, v101, v111, matId);
+        bvh.AddTriangle(v001, v111, v011, matId);
+        // Back (-Z)
+        bvh.AddTriangle(v100, v000, v010, matId);
+        bvh.AddTriangle(v100, v010, v110, matId);
+        // Right (+X)
+        bvh.AddTriangle(v101, v100, v110, matId);
+        bvh.AddTriangle(v101, v110, v111, matId);
+        // Left (-X)
+        bvh.AddTriangle(v000, v001, v011, matId);
+        bvh.AddTriangle(v000, v011, v010, matId);
+        bvh.Build();
+        return bvh;
+    }
+
+    private static void TestDynamicTlasPlatformAndHitboxOcclusion() {
+        DynamicSceneTlas3D tlas = new DynamicSceneTlas3D(32);
+        StaticMeshBvh3D groundBlas = BuildFlatBoxBlas(50.0f, 0.5f, 50.0f, SurfaceMaterial3D.Concrete);
+        StaticMeshBvh3D panelBlas  = BuildFlatBoxBlas(1.0f, 1.0f, 0.1f, SurfaceMaterial3D.Wood);
+        StaticMeshBvh3D glassBlas  = BuildFlatBoxBlas(1.0f, 1.0f, 0.05f, SurfaceMaterial3D.Glass);
+        StaticMeshBvh3D wallBlas   = BuildFlatBoxBlas(2.0f, 2.0f, 0.4f, SurfaceMaterial3D.Concrete);
+
+        int groundId = tlas.AddInstance(groundBlas, new Vector3(0.0f, -0.5f, 0.0f), Quaternion.Identity, 1.0f, 1, 100);
+        // 木门放大 2 倍并绕 Y 轴旋转 90 度置于 X = 6m 处（旋转后局部 Z 厚度 0.1*2=0.2m 变为世界 X 方向厚度 [-0.2..+0.2]）
+        Quaternion rotY90 = Quaternion.FromAxisAngle(new Vector3(0.0f, 1.0f, 0.0f), 1.5707963f);
+        int woodDoorId = tlas.AddInstance(panelBlas, new Vector3(6.0f, 2.0f, 0.0f), rotY90, 2.0f, 1, 201);
+        int glassWinId = tlas.AddInstance(glassBlas, new Vector3(10.0f, 2.0f, 0.0f), rotY90, 2.0f, 1, 202);
+        int backWallId = tlas.AddInstance(wallBlas,  new Vector3(15.0f, 2.0f, 0.0f), rotY90, 1.0f, 1, 203);
+
+        Check("tlas_active_count", tlas.ActiveInstanceCount() == 4 && groundId >= 0);
+
+        // 沿 +X 轴发射射线命中旋转缩放后的木门正面（x = 6.0 - 0.2 = 5.8m，法线朝 -X）
+        SceneRayHit3D rHit;
+        bool okRay = tlas.Raycast(new Vector3(0.0f, 2.0f, 0.0f), new Vector3(1.0f, 0.0f, 0.0f), 30.0f, 1, false, out rHit);
+        Check("tlas_rot_scale_ray_hit", okRay && rHit.InstanceId == woodDoorId && rHit.UserTag == 201);
+        Check("tlas_rot_scale_ray_dist", Near(rHit.Distance, 5.8f, 0.02f));
+        Check("tlas_rot_scale_ray_nrm", Near(Math.Abs(rHit.Normal.X), 1.0f, 0.02f));
+
+        // 跨实例穿墙弹道：穿过木门（前后两面）+ 玻璃窗（前后两面），最终在混凝土后墙耗尽能量停下
+        float[] matCosts = new float[8];
+        matCosts[SurfaceMaterial3D.Wood] = 15.0f;
+        matCosts[SurfaceMaterial3D.Glass] = 5.0f;
+        matCosts[SurfaceMaterial3D.Concrete] = 80.0f;
+        List<SceneBallisticImpact3D> impacts = new List<SceneBallisticImpact3D>();
+        float remE = tlas.TraceBallisticPenetration(
+            new Vector3(0.0f, 2.0f, 0.0f), new Vector3(1.0f, 0.0f, 0.0f), 30.0f, 1, 100.0f, matCosts, impacts);
+        Check("tlas_multi_inst_wallbang_stop", Near(remE, 0.0f, 0.01f) && impacts.Count == 5);
+        Check("tlas_wallbang_last_wall", impacts.Count == 5 && impacts[4].InstanceId == backWallId);
+
+        // 瞬时打碎木门（SetInstanceEnabled false）：弹道不再经过木门，穿过两面玻璃后仍剩 90 能量，击穿混凝土前表面（剩 10）后停于后表面（共 4 次冲击）
+        tlas.SetInstanceEnabled(woodDoorId, false);
+        tlas.TraceBallisticPenetration(
+            new Vector3(0.0f, 2.0f, 0.0f), new Vector3(1.0f, 0.0f, 0.0f), 30.0f, 1, 100.0f, matCosts, impacts);
+        Check("tlas_destructible_toggle",
+            impacts.Count == 4 && impacts[0].InstanceId == glassWinId &&
+            Near(impacts[2].EnergyBefore, 90.0f, 0.01f) && Near(impacts[2].EnergyAfter, 10.0f, 0.01f));
+
+        // 动态防爆门遮挡延迟补偿爆头判定：关门时挡住子弹，开门滑移后爆头命中
+        Skeleton sk = new Skeleton();
+        sk.AddBone("Pelvis", -1, new Transform3D(new Vector3(0.0f, 1.0f, 0.0f), Quaternion.Identity, Vector3.One));
+        sk.AddBone("Head", 0, new Transform3D(new Vector3(0.0f, 0.65f, 0.0f), Quaternion.Identity, Vector3.One));
+        sk.ComputeWorldPoses();
+        SkeletalHitboxRig3D rig = new SkeletalHitboxRig3D();
+        rig.AddCapsule(1, HitboxRegion3D.Head, new Vector3(0.0f, -0.05f, 0.0f), new Vector3(0.0f, 0.12f, 0.0f), 0.16f, 4.0f);
+
+        LagCompensatedHitboxWorld3D hbWorld = new LagCompensatedHitboxWorld3D(16);
+        hbWorld.MaxRewindSeconds = 0.25;
+        hbWorld.RegisterActor(77, 2, rig);
+        hbWorld.RecordSnapshot(77, 1.00, new Transform3D(new Vector3(20.0f, 0.0f, 0.0f), Quaternion.Identity, Vector3.One), sk);
+
+        // 将后墙移至 X=12m 挡在射手(X=0)与目标(X=20)之间（触发 Refit）
+        tlas.SetInstanceEnabled(glassWinId, false);
+        tlas.SetInstanceTransform(backWallId, new Vector3(12.0f, 1.7f, 0.0f), rotY90, 1.0f);
+        HitboxRayHit3D shotBlocked;
+        bool hitWhenClosed = hbWorld.RaycastLagCompensatedDynamic(
+            new Vector3(0.0f, 1.68f, 0.0f), new Vector3(1.0f, 0.0f, 0.0f), 50.0f,
+            1, 1, true, 1.05, 1.00, tlas, 1, out shotBlocked);
+        Check("tlas_lagcomp_blocked_by_door", !hitWhenClosed);
+
+        // 防爆门向侧方 Z=+8m 滑开，再次回溯开火应精准爆头
+        tlas.SetInstanceTransform(backWallId, new Vector3(12.0f, 1.7f, 8.0f), rotY90, 1.0f);
+        HitboxRayHit3D shotOpen;
+        bool hitWhenOpen = hbWorld.RaycastLagCompensatedDynamic(
+            new Vector3(0.0f, 1.68f, 0.0f), new Vector3(1.0f, 0.0f, 0.0f), 50.0f,
+            1, 1, true, 1.05, 1.00, tlas, 1, out shotOpen);
+        Check("tlas_lagcomp_hit_when_door_open", hitWhenOpen && shotOpen.ActorId == 77 && Near(shotOpen.DamageMultiplier, 4.0f, 0.01f));
+
+        // 移动+旋转列车平台带人物理与起跳惯性继承测试
+        StaticMeshBvh3D platBlas = BuildFlatBoxBlas(3.0f, 0.25f, 3.0f, SurfaceMaterial3D.Metal);
+        Vector3 platPos = new Vector3(0.0f, 1.0f, -15.0f);
+        Quaternion platRot = Quaternion.Identity;
+        int platId = tlas.AddInstance(platBlas, platPos, platRot, 1.0f, 1, 305);
+
+        KinematicCapsuleController3D player = new KinematicCapsuleController3D();
+        player.Position = new Vector3(0.0f, 1.30f, -15.0f);
+        CharacterMoveInput3D idleIn = new CharacterMoveInput3D();
+        float dt = 1.0f / 60.0f;
+
+        // 先落地吸附到列车甲板上
+        for (int f = 0; f < 10; f = f + 1) {
+            player.SimulateDynamic(tlas, 1, idleIn, dt);
+        }
+        Check("platform_landed", player.IsGrounded && player.GroundInstanceId == platId);
+
+        // 列车以 10 m/s 沿 +X 行驶并以 1.5 m/s 爬升，角色无按键输入站立 30 帧（0.5 秒 -> 期望位移 X=+5.0m, Y=+0.75m）
+        float startX = player.Position.X;
+        float startY = player.Position.Y;
+        for (int f = 0; f < 30; f = f + 1) {
+            platPos = new Vector3(platPos.X + 10.0f * dt, platPos.Y + 1.5f * dt, platPos.Z);
+            tlas.StepKinematicTransform(platId, platPos, platRot, dt);
+            player.SimulateDynamic(tlas, 1, idleIn, dt);
+        }
+        Check("platform_carry_horiz", Near(player.Position.X - startX, 5.0f, 0.20f));
+        Check("platform_carry_vert", Near(player.Position.Y - startY, 0.75f, 0.12f));
+
+        // 在高速行驶列车上起跳：角色应继承列车 +10 m/s 的水平惯性速度
+        CharacterMoveInput3D jumpIn = new CharacterMoveInput3D();
+        jumpIn.JumpPressed = true;
+        platPos = new Vector3(platPos.X + 10.0f * dt, platPos.Y + 1.5f * dt, platPos.Z);
+        tlas.StepKinematicTransform(platId, platPos, platRot, dt);
+        player.SimulateDynamic(tlas, 1, jumpIn, dt);
+        Check("platform_jump_momentum_inherit", !player.IsGrounded && player.Velocity.X > 9.5f && player.Velocity.Y > player.JumpSpeed);
+    }
+
+    private static void TestWorldChunkStreamerHysteresis() {
+        DynamicSceneTlas3D tlas = new DynamicSceneTlas3D(32);
+        StaticMeshBvh3D tileBlas = BuildFlatBoxBlas(32.0f, 1.0f, 32.0f, SurfaceMaterial3D.Dirt);
+
+        WorldChunkStreamer3D streamer = new WorldChunkStreamer3D(100.0f, 145.0f);
+        streamer.MaxLoadsPerFrame = 2;
+        streamer.MaxUnloadsPerFrame = 2;
+
+        // 沿 -Z 方向每隔 80m 布置 5 个区块：Chunk 0 (z=0), Chunk 1 (z=-80), Chunk 2 (z=-160), Chunk 3 (z=-240), Chunk 4 (z=+90 在身后)
+        for (int i = 0; i < 4; i = i + 1) {
+            float cz = -80.0f * (float)i;
+            streamer.RegisterChunk(10 + i,
+                new Vector3(-32.0f, -2.0f, cz - 32.0f),
+                new Vector3( 32.0f,  2.0f, cz + 32.0f),
+                tileBlas, new Vector3(0.0f, 0.0f, cz), Quaternion.Identity, 1.0f, 1, 0);
+        }
+        streamer.RegisterChunk(99,
+            new Vector3(-32.0f, -2.0f, 90.0f - 32.0f),
+            new Vector3( 32.0f,  2.0f, 90.0f + 32.0f),
+            tileBlas, new Vector3(0.0f, 0.0f, 90.0f), Quaternion.Identity, 1.0f, 1, 0);
+
+        // 锁定远端剧情据点 Chunk 3 (z=-240)，尽管距离 208m > LoadRadius(100m) 也必须优先加载且永不卸载
+        streamer.SetChunkPinned(13, true);
+
+        List<int> loaded = new List<int>();
+        List<int> unloaded = new List<int>();
+
+        // 第 1 帧：玩家在原点朝 -Z 看，受单帧预算 MaxLoadsPerFrame=2 约束，优先加载 Pinned(13) 与脚下区块(10)
+        streamer.Update(Vector3.Zero, Vector3.Zero, new Vector3(0.0f, 0.0f, -1.0f), tlas, loaded, unloaded);
+        Check("stream_budget_cap", loaded.Count == 2 && loaded[0] == 13 && loaded[1] == 10);
+
+        // 第 2 帧：正前方区块(11, 距离 48m, 视线正前) 优先级高于正后方区块(99, 距离 58m, 视线背向)
+        streamer.Update(Vector3.Zero, Vector3.Zero, new Vector3(0.0f, 0.0f, -1.0f), tlas, loaded, unloaded);
+        Check("stream_forward_priority", loaded.Count == 2 && loaded[0] == 11 && loaded[1] == 99);
+        Check("stream_tlas_synced", tlas.ActiveInstanceCount() == 4);
+
+        // 迟滞防抖验证：玩家前进到 z=-45m，此时身后区块 99 的最近边界距离为 58 - (-45) = 103m（介于 LoadRadius=100 与 UnloadRadius=145 之间）
+        streamer.Update(new Vector3(0.0f, 0.0f, -45.0f), Vector3.Zero, new Vector3(0.0f, 0.0f, -1.0f), tlas, loaded, unloaded);
+        Check("stream_hysteresis_no_thrash", unloaded.Count == 0 && streamer.IsChunkResident(99));
+
+        // 玩家继续前进到 z=-120m，区块 99 边界距离为 178m > UnloadRadius(145m) -> 正常卸载，而 Pinned(13) 依然常驻
+        streamer.Update(new Vector3(0.0f, 0.0f, -120.0f), Vector3.Zero, new Vector3(0.0f, 0.0f, -1.0f), tlas, loaded, unloaded);
+        Check("stream_unload_beyond_outer", !streamer.IsChunkResident(99) && streamer.IsChunkResident(13));
+    }
+
+    private static void TestRaycastVehicle6Dof() {
+        DynamicSceneTlas3D tlas = new DynamicSceneTlas3D(16);
+        StaticMeshBvh3D roadBlas = BuildFlatBoxBlas(200.0f, 0.5f, 200.0f, SurfaceMaterial3D.Concrete);
+        StaticMeshBvh3D carHullBlas = BuildFlatBoxBlas(0.95f, 0.65f, 2.20f, SurfaceMaterial3D.Metal);
+
+        tlas.AddInstance(roadBlas, new Vector3(0.0f, -0.5f, 0.0f), Quaternion.Identity, 1.0f, 1, 1);
+        int carInstId = tlas.AddInstance(carHullBlas, new Vector3(0.0f, 1.2f, 0.0f), Quaternion.Identity, 1.0f, 1, 500);
+
+        RaycastVehicle3D suv = RaycastVehicle3D.CreateStandard4Wheel(1500.0f, new Vector3(1.90f, 1.45f, 4.40f), 0.38f, 0.45f);
+        suv.Position = new Vector3(0.0f, 1.15f, 0.0f);
+        suv.SelfTlasInstanceId = carInstId;
+
+        VehicleInput3D vIn = new VehicleInput3D();
+        float dt = 1.0f / 60.0f;
+
+        // 1. 自由落体落在地面并稳定在四轮胡克弹簧平衡高度（不会与自身 SelfTlasInstanceId 自碰悬空）
+        for (int f = 0; f < 60; f = f + 1) {
+            suv.Step(tlas, 1, vIn, dt);
+        }
+        Check("vehicle_settled_4wheels", suv.GroundedWheelCount() == 4 && suv.GetWheelState(0).Compression > 0.02f);
+
+        // 2. 全油门直线加速 90 帧（1.5 秒）：沿 -Z 方向高速前进，且车壳实例在 TLAS 中的坐标同步跟进
+        vIn.Throttle = 1.0f;
+        for (int f = 0; f < 90; f = f + 1) {
+            suv.Step(tlas, 1, vIn, dt);
+        }
+        float speedAfterAccel = suv.ForwardSpeed();
+        Vector3 hullMin;
+        Vector3 hullMax;
+        tlas.GetInstanceWorldBounds(carInstId, out hullMin, out hullMax);
+        Check("vehicle_accel_forward", speedAfterAccel > 8.0f && suv.Position.Z < -5.0f);
+        Check("vehicle_self_tlas_synced", Near((hullMin.Z + hullMax.Z) * 0.5f, suv.Position.Z, 0.1f));
+
+        // 3. 向右打方向盘转向 45 帧：产生 +X 侧向位移与右偏航
+        float xBeforeTurn = suv.Position.X;
+        vIn.Steer = 0.85f;
+        for (int f = 0; f < 45; f = f + 1) {
+            suv.Step(tlas, 1, vIn, dt);
+        }
+        Check("vehicle_right_steer_turn", suv.Position.X > xBeforeTurn + 0.8f);
+
+        // 4. 拉起手刹并脚刹制动：车速下降且后轮产生打滑遥测
+        vIn.Throttle = 0.0f;
+        vIn.Brake = 0.8f;
+        vIn.Handbrake = true;
+        float maxSkid = 0.0f;
+        for (int f = 0; f < 30; f = f + 1) {
+            suv.Step(tlas, 1, vIn, dt);
+            maxSkid = Math.Max(maxSkid, Math.Max(suv.GetWheelState(2).SkidSlipRatio, suv.GetWheelState(3).SkidSlipRatio));
+        }
+        Check("vehicle_handbrake_drift_and_slow", suv.ForwardSpeed() < speedAfterAccel && maxSkid > 0.1f);
+    }
+
+    private static void TestLargeMeshAndBonePalettePartitioning() {
+        // 1. 构造 70,000 顶点（突破 ushort 65,535 硬上限）的 32 位索引带状地形网格
+        int vCount = 70000;
+        float[] verts8 = new float[vCount * 8];
+        for (int i = 0; i < vCount; i = i + 1) {
+            int o = i * 8;
+            verts8[o + 0] = (float)(i >> 1);
+            verts8[o + 1] = (float)(i & 1);
+            verts8[o + 2] = 0.0f;
+            verts8[o + 4] = 1.0f;
+        }
+        int quadCount = (vCount / 2) - 1;
+        int totalTris = quadCount * 2;
+        int[] indices32 = new int[totalTris * 3];
+        for (int q = 0; q < quadCount; q = q + 1) {
+            int vBase = q * 2;
+            int iBase = q * 6;
+            indices32[iBase + 0] = vBase + 0;
+            indices32[iBase + 1] = vBase + 1;
+            indices32[iBase + 2] = vBase + 2;
+            indices32[iBase + 3] = vBase + 2;
+            indices32[iBase + 4] = vBase + 1;
+            indices32[iBase + 5] = vBase + 3;
+        }
+
+        List<StaticMeshChunk3D> chunks = LargeMeshPartitioner3D.PartitionStaticMesh32(
+            verts8, vCount, false, indices32, LargeMeshPartitioner3D.MaxUshortVertices);
+        int sumTris = 0;
+        bool allUnder65k = chunks.Count == 2;
+        for (int c = 0; c < chunks.Count; c = c + 1) {
+            sumTris = sumTris + chunks[c].TriangleCount;
+            if (chunks[c].Mesh.VertexCount() > 65535 || chunks[c].Mesh.IndexCount() != chunks[c].TriangleCount * 3) {
+                allUnder65k = false;
+            }
+        }
+        Check("partition_70k_static_chunks", allUnder65k && sumTris == totalTris);
+
+        // 2. 构造 100 根骨骼（突破 Shader 64 骨硬上限）的高精度角色骨架与蒙皮网格
+        int totalBones = 100;
+        Skeleton heroSkel = new Skeleton();
+        for (int b = 0; b < totalBones; b = b + 1) {
+            heroSkel.AddBone("B" + b.ToString(), b - 1,
+                new Transform3D(new Vector3(0.0f, 0.05f, 0.0f), Quaternion.Identity, Vector3.One));
+        }
+        heroSkel.RefreshBind();
+        // 给第 85 号手指骨骼施加平移以验证局部调色板矩阵提取正确性
+        heroSkel.SetLocalPose(85, new Transform3D(new Vector3(0.25f, 0.05f, 0.0f), Quaternion.Identity, Vector3.One));
+        heroSkel.ComputeWorldPoses();
+
+        int skVertCount = totalBones * 3;
+        float[] skVerts16 = new float[skVertCount * 16];
+        int[] skIndices = new int[totalBones * 3];
+        for (int t = 0; t < totalBones; t = t + 1) {
+            int b0 = t;
+            int b1 = (t + 1) < totalBones ? (t + 1) : t;
+            for (int k = 0; k < 3; k = k + 1) {
+                int vi = t * 3 + k;
+                int vo = vi * 16;
+                skVerts16[vo + 0] = (float)k * 0.1f;
+                skVerts16[vo + 1] = (float)t * 0.05f;
+                skVerts16[vo + 5] = 1.0f;
+                skVerts16[vo + 8] = (float)b0;
+                skVerts16[vo + 9] = (float)b1;
+                skVerts16[vo + 12] = 0.6f;
+                skVerts16[vo + 13] = 0.4f;
+                skIndices[vi] = vi;
+            }
+        }
+
+        List<SkinnedSubmeshBatch3D> batches = LargeMeshPartitioner3D.PartitionSkinnedMeshBonePalettes(
+            skVerts16, skVertCount, skIndices, 64, 65535);
+        int skSumTris = 0;
+        bool validPalettes = batches.Count == 2;
+        bool foundMovedBone85 = false;
+        float[] gpuBoneBuf = new float[64 * 16];
+
+        for (int i = 0; i < batches.Count; i = i + 1) {
+            SkinnedSubmeshBatch3D batch = batches[i];
+            skSumTris = skSumTris + batch.TriangleCount;
+            int palLen = batch.PaletteBoneCount();
+            if (palLen <= 0 || palLen > 64) { validPalettes = false; }
+
+            // 验证重映射后的所有顶点关节索引均严格落在 [0..palLen-1] 内
+            float[] outV = batch.Mesh.VertexArray();
+            int nV = batch.Mesh.VertexCount();
+            for (int v = 0; v < nV; v = v + 1) {
+                int o = v * 16;
+                for (int j = 0; j < 4; j = j + 1) {
+                    int localJoint = (int)outV[o + 8 + j];
+                    if (localJoint < 0 || localJoint >= palLen) { validPalettes = false; }
+                }
+            }
+
+            int uploaded = batch.ExtractShaderBoneMatrices(heroSkel, gpuBoneBuf);
+            if (uploaded != palLen) { validPalettes = false; }
+            for (int slot = 0; slot < palLen; slot = slot + 1) {
+                if (batch.GlobalBonePalette[slot] == 85) {
+                    // 列主序平移分量位于 offset + 12 (+0.25m X 偏移)
+                    if (Near(gpuBoneBuf[slot * 16 + 12], 0.25f, 1e-4f)) {
+                        foundMovedBone85 = true;
+                    }
+                }
+            }
+        }
+        Check("partition_100bone_skinned_batches", validPalettes && skSumTris == totalBones && foundMovedBone85);
+    }
+
+    private static float Frac(float v) {
+        return v - (float)Math.Floor((double)v);
+    }
+
+    private static float CyclicFracDiff(float a, float b) {
+        float d = Math.Abs(a - b);
+        if (d > 0.5f) { d = 1.0f - d; }
+        return d;
+    }
+
+    private static void TestRotationInvariantCsmAndLightCuller() {
+        ShadowCascadeSplitter3D csm = new ShadowCascadeSplitter3D(4, 0.75f, 2048);
+        Vector3 sunDir = new Vector3(-0.4f, -0.85f, -0.3f);
+
+        List<ShadowCascadeMatrix3D> casA = csm.ComputeCascadeMatrices(
+            new Vector3(10.0f, 4.0f, 20.0f), new Vector3(0.0f, 0.0f, -1.0f),
+            1.0471976f, 16.0f / 9.0f, 0.2f, 200.0f, sunDir, 60.0f);
+        // 大幅转动摄像机偏航/俯仰并平移摄像机坐标
+        List<ShadowCascadeMatrix3D> casB = csm.ComputeCascadeMatrices(
+            new Vector3(13.73f, 5.12f, 17.41f), new Vector3(0.62f, -0.21f, -0.75f),
+            1.0471976f, 16.0f / 9.0f, 0.2f, 200.0f, sunDir, 60.0f);
+
+        Check("csm_4_cascades", casA.Count == 4 && casB.Count == 4);
+        // 旋转不变性：任意旋转镜头时包络球半径与纹素尺寸严格相等
+        Check("csm_rot_invariant_radius",
+            Near(casA[0].BoundingRadius, casB[0].BoundingRadius, 1e-6f) &&
+            Near(casA[2].WorldTexelSize, casB[2].WorldTexelSize, 1e-6f));
+
+        // 纹素相位锁定验证：世界静态路标点投影到两帧 Shadow Map 像素坐标系下，亚像素小数相位完全一致（零边缘游走闪烁）
+        float[] landmark = new float[3];
+        landmark[0] = 12.5f; landmark[1] = 1.2f; landmark[2] = 5.0f;
+        float[] ndcA = new float[3];
+        float[] ndcB = new float[3];
+        casA[1].LightViewProj.TransformPoints(landmark, 0, ndcA, 0, 1);
+        casB[1].LightViewProj.TransformPoints(landmark, 0, ndcB, 0, 1);
+
+        float texU_A = (ndcA[0] * 0.5f + 0.5f) * 2048.0f;
+        float texV_A = (ndcA[1] * 0.5f + 0.5f) * 2048.0f;
+        float texU_B = (ndcB[0] * 0.5f + 0.5f) * 2048.0f;
+        float texV_B = (ndcB[1] * 0.5f + 0.5f) * 2048.0f;
+        Check("csm_subtexel_phase_locked",
+            CyclicFracDiff(Frac(texU_A), Frac(texU_B)) < 1e-2f &&
+            CyclicFracDiff(Frac(texV_A), Frac(texV_B)) < 1e-2f);
+
+        // 200 盏动态光源 4-Wide SIMD 分簇 Top-K 裁剪验证
+        LightClusterCuller3D culler = new LightClusterCuller3D(256);
+        Light sun = Light.DirectionalLight(1.0f, 0.98f, 0.92f, 1.5f, sunDir);
+        culler.AddLight(sun);
+
+        // 添加 120 盏远近不同的背景点光源
+        for (int i = 0; i < 120; i = i + 1) {
+            float px = 200.0f + (float)i * 5.0f;
+            culler.AddLight(Light.PointLight(0.5f, 0.5f, 0.5f, 1.0f, new Vector3(px, 2.0f, 0.0f), 12.0f));
+        }
+        // 在玩家房间 [(-5,-1,-5)..(5,4,5)] 内布置 6 盏点光源，其中最强的一盏为强度 12.0 的爆炸核心火光
+        Light topExplosion = Light.PointLight(1.0f, 0.8f, 0.4f, 12.0f, new Vector3(0.5f, 1.5f, 0.0f), 18.0f);
+        culler.AddLight(topExplosion);
+        for (int i = 0; i < 5; i = i + 1) {
+            culler.AddLight(Light.PointLight(0.8f, 0.8f, 1.0f, 1.0f + (float)i * 0.5f, new Vector3(1.0f, 2.0f, (float)i * 0.5f), 15.0f));
+        }
+
+        // 添加 70 盏背向房间的聚光灯（虽距离近但锥轴朝 +Z 背离原点，必须被圆锥剔除）+ 2 盏正对原点的战术聚光灯
+        for (int i = 0; i < 70; i = i + 1) {
+            culler.AddLight(Light.SpotLight(1.0f, 1.0f, 1.0f, 20.0f,
+                new Vector3(0.0f, 2.0f, 8.0f + (float)i * 0.1f),
+                new Vector3(0.0f, 0.0f, 1.0f), 30.0f, 0.2f, 0.35f));
+        }
+        Light validSpotA = Light.SpotLight(1.0f, 0.9f, 0.8f, 8.0f, new Vector3(0.0f, 3.0f, 6.0f), new Vector3(0.0f, -0.3f, -1.0f), 25.0f, 0.25f, 0.5f);
+        Light validSpotB = Light.SpotLight(0.7f, 0.9f, 1.0f, 5.0f, new Vector3(-2.0f, 3.0f, 6.0f), new Vector3(0.2f, -0.3f, -1.0f), 25.0f, 0.25f, 0.5f);
+        culler.AddLight(validSpotA);
+        culler.AddLight(validSpotB);
+
+        List<Light> selected = new List<Light>();
+        Vector3 roomMin = new Vector3(-4.0f, 0.0f, -4.0f);
+        Vector3 roomMax = new Vector3( 4.0f, 3.5f,  4.0f);
+        culler.SelectTopLights(roomMin, roomMax, new Vector3(0.0f, 1.5f, 0.0f), 4, 4, selected);
+
+        // 应精确选出：1 盏主平行光 + Top-4 室内点光源（榜首为 topExplosion）+ 仅有的 2 盏正对房间聚光灯（70 盏背向强聚光全部被剔除！）
+        Check("light_cull_count", selected.Count == 7 && selected[0] == sun && selected[1] == topExplosion);
+
+        float[] ptPos16 = new float[16];
+        float[] ptCol12 = new float[12];
+        float[] spPos16 = new float[16];
+        float[] spDir16 = new float[16];
+        float[] spCol16 = new float[16];
+        int ptCnt;
+        int spCnt;
+        culler.PackTopLightsToUniforms(roomMin, roomMax, new Vector3(0.0f, 1.5f, 0.0f),
+                                       ptPos16, ptCol12, out ptCnt,
+                                       spPos16, spDir16, spCol16, out spCnt);
+        Check("light_pack_uniforms", ptCnt == 4 && spCnt == 2 && spDir16[3] >= spCol16[3]);
+    }
+
+    public static void Main() {
+        TestDynamicTlasPlatformAndHitboxOcclusion();
+        TestWorldChunkStreamerHysteresis();
+        TestRaycastVehicle6Dof();
+        TestLargeMeshAndBonePalettePartitioning();
+        TestRotationInvariantCsmAndLightCuller();
+
+        if (failures == 0) {
+            Console.WriteLine("ALL LARGE WORLD 3D TESTS PASSED");
+        } else {
+            Console.WriteLine("TOTAL FAILURES: " + failures.ToString());
+        }
+    }
+}

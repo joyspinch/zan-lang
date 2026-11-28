@@ -53,11 +53,38 @@ public partial class DataTable {
         return sb.ToString();
     }
 
-    private static void AppendHeaderRow(StringBuilder sb, DataTableState st, List<DataColumn> cols,
-                                        int c0, int c1, string sep, bool csv, string nl) {
-        bool first = true;
+    // 计算剪贴板/导出应遍历的列顺序：
+    // 优先沿用 VisibleOrder（遵循用户拖拽后的视觉列序并自动跳过隐藏列）；
+    // 在未调用 EnsureInit 的极简单元测试场景下回退为模型列区间 [c0..c1]。
+    private static List<int> ClipboardCols(DataTableState st, List<DataColumn> cols,
+                                           int c0, int c1, bool rangeMode) {
+        List<int> outCols = new List<int>();
+        if (cols == null || cols.Count == 0) { return outCols; }
+        if (c0 < 0) { c0 = 0; }
+        if (c1 >= cols.Count) { c1 = cols.Count - 1; }
+        if (c0 > c1) { return outCols; }
+        if (st != null && st.colHidden != null && st.colHidden.Count >= cols.Count) {
+            List<int> vorder = DataTable.VisibleOrder(st, cols);
+            for (int i = 0; i < vorder.Count; i = i + 1) {
+                int cc = vorder[i];
+                if (!rangeMode || (cc >= c0 && cc <= c1)) {
+                    outCols.Add(cc);
+                }
+            }
+            return outCols;
+        }
         for (int cc = c0; cc <= c1; cc = cc + 1) {
-            if (st != null && cc < st.colHidden.Count && st.colHidden[cc]) { continue; }
+            if (st != null && st.colHidden != null && cc < st.colHidden.Count && st.colHidden[cc]) { continue; }
+            outCols.Add(cc);
+        }
+        return outCols;
+    }
+
+    private static void AppendHeaderRow(StringBuilder sb, List<DataColumn> cols,
+                                        List<int> colList, string sep, bool csv, string nl) {
+        bool first = true;
+        for (int i = 0; i < colList.Count; i = i + 1) {
+            int cc = colList[i];
             string h = cols[cc].title;
             if (csv) { h = DataTable.CsvField(h); }
             if (!first) { sb.Append(sep); }
@@ -67,11 +94,11 @@ public partial class DataTable {
         sb.Append(nl);
     }
 
-    private static void AppendDataRow(StringBuilder sb, DataTableState st, List<DataColumn> cols, DataSource src,
-                                      int srcRow, int c0, int c1, string sep, bool csv, string nl) {
+    private static void AppendDataRow(StringBuilder sb, List<DataColumn> cols, DataSource src,
+                                      int srcRow, List<int> colList, string sep, bool csv, string nl) {
         bool first = true;
-        for (int cc = c0; cc <= c1; cc = cc + 1) {
-            if (st != null && cc < st.colHidden.Count && st.colHidden[cc]) { continue; }
+        for (int i = 0; i < colList.Count; i = i + 1) {
+            int cc = colList[i];
             string v = DataTable.CellTextRouted(cols, src, srcRow, cc);
             if (csv) { v = DataTable.CsvField(v); }
             if (!first) { sb.Append(sep); }
@@ -98,11 +125,13 @@ public partial class DataTable {
             for (int mi = 0; mi < n; mi = mi + 1) {
                 int mr0 = -1; int mc0 = -1; int mr1 = -1; int mc1 = -1;
                 if (!DataTable.RangeAt(st, mi, out mr0, out mc0, out mr1, out mc1)) { continue; }
-                if (withHeader) { DataTable.AppendHeaderRow(sb, st, cols, mc0, mc1, sep, csv, nl); }
+                List<int> mCols = DataTable.ClipboardCols(st, cols, mc0, mc1, true);
+                if (mCols.Count == 0) { continue; }
+                if (withHeader) { DataTable.AppendHeaderRow(sb, cols, mCols, sep, csv, nl); }
                 for (int mrr = mr0; mrr <= mr1; mrr = mrr + 1) {
                     int rowIdx = DataTable.DispRowOf(st, mrr);
                     if (rowIdx >= 0) {
-                        DataTable.AppendDataRow(sb, st, cols, src, rowIdx, mc0, mc1, sep, csv, nl);
+                        DataTable.AppendDataRow(sb, cols, src, rowIdx, mCols, sep, csv, nl);
                     }
                 }
             }
@@ -122,7 +151,10 @@ public partial class DataTable {
             if (c0 > c1) { return ""; }
         }
 
-        if (withHeader) { DataTable.AppendHeaderRow(sb, st, cols, c0, c1, sep, csv, nl); }
+        List<int> colList = DataTable.ClipboardCols(st, cols, c0, c1, rangeMode);
+        if (colList.Count == 0) { return ""; }
+
+        if (withHeader) { DataTable.AppendHeaderRow(sb, cols, colList, sep, csv, nl); }
 
         if (rangeMode) {
             int r0 = DataTable.MinI(st.rangeR0, st.rangeR1);
@@ -130,7 +162,7 @@ public partial class DataTable {
             for (int rr = r0; rr <= r1; rr = rr + 1) {
                 int rowIdx = DataTable.DispRowOf(st, rr);
                 if (rowIdx >= 0) {
-                    DataTable.AppendDataRow(sb, st, cols, src, rowIdx, c0, c1, sep, csv, nl);
+                    DataTable.AppendDataRow(sb, cols, src, rowIdx, colList, sep, csv, nl);
                 }
             }
             return sb.ToString();
@@ -144,7 +176,7 @@ public partial class DataTable {
         for (int oi = 0; oi < st.order.Count; oi = oi + 1) {
             int ri = st.order[oi];
             if (!anySel || DataTable.IsSelected(st, src, ri)) {
-                DataTable.AppendDataRow(sb, st, cols, src, ri, c0, c1, sep, csv, nl);
+                DataTable.AppendDataRow(sb, cols, src, ri, colList, sep, csv, nl);
             }
         }
         return sb.ToString();

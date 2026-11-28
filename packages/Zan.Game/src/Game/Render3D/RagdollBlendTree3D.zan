@@ -1,0 +1,112 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Render3D;
+
+// 2D 运动混合树中的单个动画采样节点（用于速度/横移平滑混合）。
+public class AnimBlendSample3D {
+    public string ClipName;
+    public float ParamX; // 例如横向移动速度 [-1..1]
+    public float ParamY; // 例如前向速度 [0..1]
+    public float Weight;
+
+    public AnimBlendSample3D(string clipName, float paramX, float paramY) {
+        this.ClipName = clipName;
+        this.ParamX = paramX;
+        this.ParamY = paramY;
+        this.Weight = 0.0f;
+    }
+}
+
+// 商业 2D 运动动画混合权重求解器：按反距离平方加权自动归一化各动作片段权重（总和恒为 1.0）。
+public class LocomotionBlend2D3D {
+    private List<AnimBlendSample3D> samples;
+
+    public LocomotionBlend2D3D() {
+        this.samples = new List<AnimBlendSample3D>();
+    }
+
+    public void AddSample(string clipName, float paramX, float paramY) {
+        this.samples.Add(new AnimBlendSample3D(clipName, paramX, paramY));
+    }
+
+    public int SampleCount() { return this.samples.Count; }
+
+    public AnimBlendSample3D FindSample(string clipName) {
+        for (int i = 0; i < this.samples.Count; i = i + 1) {
+            if (this.samples[i].ClipName == clipName) { return this.samples[i]; }
+        }
+        return null;
+    }
+
+    // 评估当前 (x, y) 运动参数对应的各片段归一化混合权重。
+    public void Evaluate(float x, float y) {
+        int n = this.samples.Count;
+        if (n == 0) { return; }
+        for (int i = 0; i < n; i = i + 1) {
+            AnimBlendSample3D s = this.samples[i];
+            float dx = x - s.ParamX;
+            float dy = y - s.ParamY;
+            float d2 = dx * dx + dy * dy;
+            if (d2 < 0.00001f) {
+                for (int k = 0; k < n; k = k + 1) {
+                    this.samples[k].Weight = (k == i) ? 1.0f : 0.0f;
+                }
+                return;
+            }
+        }
+        float sum = 0.0f;
+        for (int i = 0; i < n; i = i + 1) {
+            AnimBlendSample3D s = this.samples[i];
+            float dx = x - s.ParamX;
+            float dy = y - s.ParamY;
+            float inv = 1.0f / (dx * dx + dy * dy);
+            s.Weight = inv;
+            sum = sum + inv;
+        }
+        if (sum > 0.0f) {
+            for (int i = 0; i < n; i = i + 1) {
+                this.samples[i].Weight = this.samples[i].Weight / sum;
+            }
+        }
+    }
+}
+
+// 商业角色击倒布娃娃（Ragdoll）物理权重切入与平滑起身恢复状态机。
+public class RagdollBlendState3D {
+    public float PhysicsWeight; // 0=纯动画, 1=纯物理布娃娃
+    public float RecoveryDurationSec;
+    public bool IsKnockedDown;
+    public bool IsRecovering;
+
+    public RagdollBlendState3D(float recoveryDurationSec) {
+        this.PhysicsWeight = 0.0f;
+        this.RecoveryDurationSec = recoveryDurationSec > 0.05f ? recoveryDurationSec : 0.6f;
+        this.IsKnockedDown = false;
+        this.IsRecovering = false;
+    }
+
+    public void TriggerKnockdown() {
+        this.IsKnockedDown = true;
+        this.IsRecovering = false;
+        this.PhysicsWeight = 1.0f;
+    }
+
+    public void BeginRecovery() {
+        if (!this.IsKnockedDown) { return; }
+        this.IsKnockedDown = false;
+        this.IsRecovering = true;
+    }
+
+    public float Step(float dtSec) {
+        if (dtSec <= 0.0f) { return this.PhysicsWeight; }
+        if (this.IsRecovering) {
+            this.PhysicsWeight = this.PhysicsWeight - (dtSec / this.RecoveryDurationSec);
+            if (this.PhysicsWeight <= 0.0f) {
+                this.PhysicsWeight = 0.0f;
+                this.IsRecovering = false;
+            }
+        }
+        return this.PhysicsWeight;
+    }
+}

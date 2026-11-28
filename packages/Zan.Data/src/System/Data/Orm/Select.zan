@@ -29,6 +29,7 @@ public class Select {
 
     // 构造；统一经 <see cref="Create"/> 或直接创建。
     public Select(IDbExecutor db, Meta meta) {
+        if (meta == null) { throw new ArgumentNullException("meta"); }
         this.db = db;
         this.meta = meta;
         this.tbl = meta.Table;
@@ -59,10 +60,20 @@ public class Select {
     }
 
     // 仅在容量不足时调用的冷路径扩容，热路径零跨单元调用、零 byte[] ARC 传参返回。
+    private static int NextCap(int curLen, int curCap, int initCap, int need) {
+        long wantL = (long)curLen + (long)need;
+        if (wantL > 2147483647L) { throw new ArgumentException("SQL buffer size overflow"); }
+        int want = (int)wantL;
+        int cap = curCap <= 0 ? initCap : (curCap > 1073741823 ? want : curCap * 2);
+        while (cap < want) {
+            if (cap > 1073741823) { cap = want; break; }
+            cap = cap * 2;
+        }
+        return cap;
+    }
+
     private void GrowW(int need) {
-        int want = this.wLen + need;
-        int cap = this.wBuf == null ? 256 : this.wBuf.Length * 2;
-        while (cap < want) { cap = cap * 2; }
+        int cap = Select.NextCap(this.wLen, this.wBuf == null ? 0 : this.wBuf.Length, 256, need);
         byte[] next = new byte[cap];
         if (this.wLen > 0) {
             NativeMemory.Copy((nint)next, (nint)this.wBuf, this.wLen);
@@ -71,9 +82,7 @@ public class Select {
     }
 
     private void GrowOb(int need) {
-        int want = this.obLen + need;
-        int cap = this.obBuf == null ? 96 : this.obBuf.Length * 2;
-        while (cap < want) { cap = cap * 2; }
+        int cap = Select.NextCap(this.obLen, this.obBuf == null ? 0 : this.obBuf.Length, 96, need);
         byte[] next = new byte[cap];
         if (this.obLen > 0) {
             NativeMemory.Copy((nint)next, (nint)this.obBuf, this.obLen);
@@ -82,9 +91,7 @@ public class Select {
     }
 
     private void GrowGb(int need) {
-        int want = this.gbLen + need;
-        int cap = this.gbBuf == null ? 64 : this.gbBuf.Length * 2;
-        while (cap < want) { cap = cap * 2; }
+        int cap = Select.NextCap(this.gbLen, this.gbBuf == null ? 0 : this.gbBuf.Length, 64, need);
         byte[] next = new byte[cap];
         if (this.gbLen > 0) {
             NativeMemory.Copy((nint)next, (nint)this.gbBuf, this.gbLen);
@@ -93,9 +100,7 @@ public class Select {
     }
 
     private void GrowH(int need) {
-        int want = this.hLen + need;
-        int cap = this.hBuf == null ? 96 : this.hBuf.Length * 2;
-        while (cap < want) { cap = cap * 2; }
+        int cap = Select.NextCap(this.hLen, this.hBuf == null ? 0 : this.hBuf.Length, 96, need);
         byte[] next = new byte[cap];
         if (this.hLen > 0) {
             NativeMemory.Copy((nint)next, (nint)this.hBuf, this.hLen);
@@ -144,9 +149,10 @@ public class Select {
         return this.gbLen == 0 ? "" : NativeMemory.GetString((nint)this.gbBuf, 0, this.gbLen);
     }
 
-    public bool NavOn(int i) { return this.navOn != null && this.navOn[i]; }
+    public bool NavOn(int i) { return this.navOn != null && i >= 0 && i < this.navOn.Count && this.navOn[i]; }
 
     public void GroupBy(string col) {
+        if (col == null || col.Length == 0) { return; }
         int cl = col.Length;
         int need = (this.gbLen > 0 ? 2 : 0) + cl;
         if (this.gbBuf == null || this.gbLen + need > this.gbBuf.Length) { this.GrowGb(need); }
@@ -161,6 +167,7 @@ public class Select {
     }
 
     public void Having(string condition) {
+        if (condition == null || condition.Length == 0) { return; }
         int cl = condition.Length;
         int need = (this.hLen > 0 ? 5 : 0) + cl;
         if (this.hBuf == null || this.hLen + need > this.hBuf.Length) { this.GrowH(need); }
@@ -180,7 +187,7 @@ public class Select {
     public void Distinct() { this.distinct = true; }
 
     public void W(string f) {
-        if (!this.on) { return; }
+        if (!this.on || f == null || f.Length == 0) { return; }
         int fl = f.Length;
         int need = (this.wLen > 0 ? 5 : 0) + fl;
         if (this.wBuf == null || this.wLen + need > this.wBuf.Length) { this.GrowW(need); }
@@ -232,7 +239,7 @@ public class Select {
     }
 
     public void WhereDict(DbValues v) {
-        if (!this.on) { return; }
+        if (!this.on || v == null) { return; }
         int pv = this.db != null ? this.db.GetProvider() : DbProvider.SQLite;
         byte oq = 34; byte cq = 34;
         if (pv == DbProvider.MySQL || pv == DbProvider.MariaDB) { oq = 96; cq = 96; }
@@ -272,6 +279,9 @@ public class Select {
     public void Pd(double v) { if (this.on) { this.ps.AddDouble(v); } }
 
     public string RequireCol(string c) {
+        if (c == null || c.Length == 0) {
+            throw new Exception(this.meta.Table + " has no column: ");
+        }
         string n = c;
         if (n.Length > 2 && (n[0] & 255) == 116 && (n[1] & 255) == 46) { n = n.Substring(2); }
         if (!this.meta.Has(n)) {
@@ -283,6 +293,9 @@ public class Select {
 
     // 统一内联写入 " [AND ]t.<quoted><op>"（Meta.Col 已经 QueryBuilder.RequireIdent 校验，单段无转义）。
     private void AppendWhereCmp(string c, int opKind) {
+        if (c == null || c.Length == 0) {
+            throw new Exception(this.meta.Table + " has no column: ");
+        }
         string n = c;
         if (n.Length > 2 && (n[0] & 255) == 116 && (n[1] & 255) == 46) { n = n.Substring(2); }
         if (!this.meta.Has(n)) {
@@ -363,6 +376,9 @@ public class Select {
     }
 
     private void AppendWhereInHeadAndMarks(string c, int count) {
+        if (c == null || c.Length == 0) {
+            throw new Exception(this.meta.Table + " has no column: ");
+        }
         string n = c;
         if (n.Length > 2 && (n[0] & 255) == 116 && (n[1] & 255) == 46) { n = n.Substring(2); }
         if (!this.meta.Has(n)) {
@@ -395,7 +411,7 @@ public class Select {
 
     public void WhereIn(string c, List<int> vs) {
         if (!this.on) { return; }
-        int cnt = vs.Count;
+        int cnt = vs == null ? 0 : vs.Count;
         if (cnt == 0) { this.W("1 = 0"); return; }
         if (cnt > 2000) { throw new Exception("WhereIn parameter count exceeds safety limit of 2000"); }
         this.AppendWhereInHeadAndMarks(c, cnt);
@@ -404,7 +420,7 @@ public class Select {
 
     public void WhereIn(string c, List<long> vs) {
         if (!this.on) { return; }
-        int cnt = vs.Count;
+        int cnt = vs == null ? 0 : vs.Count;
         if (cnt == 0) { this.W("1 = 0"); return; }
         if (cnt > 2000) { throw new Exception("WhereIn parameter count exceeds safety limit of 2000"); }
         this.AppendWhereInHeadAndMarks(c, cnt);
@@ -413,7 +429,7 @@ public class Select {
 
     public void WhereIn(string c, List<string> vs) {
         if (!this.on) { return; }
-        int cnt = vs.Count;
+        int cnt = vs == null ? 0 : vs.Count;
         if (cnt == 0) { this.W("1 = 0"); return; }
         if (cnt > 2000) { throw new Exception("WhereIn parameter count exceeds safety limit of 2000"); }
         this.AppendWhereInHeadAndMarks(c, cnt);
@@ -422,14 +438,18 @@ public class Select {
 
     public void WhereLikeAny(string cols, string v) {
         if (!this.on) { return; }
+        if (cols == null || cols.Length == 0) {
+            throw new Exception("WhereLikeAny without columns");
+        }
         int clen = cols.Length;
         nint cp = (nint)cols;
         int pv = this.db != null ? this.db.GetProvider() : DbProvider.SQLite;
         byte oq = 34; byte cq = 34;
         if (pv == DbProvider.MySQL || pv == DbProvider.MariaDB) { oq = 96; cq = 96; }
         else if (pv == DbProvider.SqlServer) { oq = 91; cq = 93; }
-        string pat = "%" + v + "%";
+        string pat = "%" + (v != null ? v : "") + "%";
         int savedWLen = this.wLen;
+        int savedParams = this.ps.Count();
         int n = 0;
         int pos = 0;
         while (pos <= clen) {
@@ -444,6 +464,9 @@ public class Select {
                 string colName = (l == 0 && r == clen) ? cols : cols.Substring(l, r - l);
                 if (!this.meta.Has(colName)) {
                     this.wLen = savedWLen;
+                    while (this.ps.items.Count > savedParams) {
+                        this.ps.items.RemoveAt(this.ps.items.Count - 1);
+                    }
                     throw new Exception(this.meta.Table + " has no column: " + colName);
                 }
                 int nl = colName.Length;
@@ -489,15 +512,17 @@ public class Select {
         if (cs == null) { return; }
         for (int i = 0; i < cs.Count; i = i + 1) {
             Cond q = cs[i];
+            if (q == null) { continue; }
             if (q.kind == "LIKE") { this.WhereLikeAny(q.col, q.value); }
             else if (q.kind == "EQ") { this.WhereEq(q.col, (int)Cond.Num(q.value)); }
             else if (q.kind == "GE") { this.WhereGe(q.col, Cond.Num(q.value)); }
             else if (q.kind == "LE") { this.WhereLe(q.col, Cond.Num(q.value)); }
-            else { throw new Exception("unknown cond kind: " + q.kind); }
+            else { throw new Exception("unknown cond kind: " + (q.kind != null ? q.kind : "")); }
         }
     }
 
     public void OB(string col) {
+        if (col == null || col.Length == 0) { return; }
         int cl = col.Length;
         int need = (this.obLen > 0 ? 2 : 0) + cl;
         if (this.obBuf == null || this.obLen + need > this.obBuf.Length) { this.GrowOb(need); }
@@ -511,6 +536,7 @@ public class Select {
     public void OrderBy(string col) { this.OB(col); }
 
     public void OBD(string col) {
+        if (col == null || col.Length == 0) { return; }
         int cl = col.Length;
         int need = (this.obLen > 0 ? 2 : 0) + cl + 5;
         if (this.obBuf == null || this.obLen + need > this.obBuf.Length) { this.GrowOb(need); }
@@ -523,6 +549,9 @@ public class Select {
     }
 
     public void OrderBySafe(string col) {
+        if (col == null || col.Length == 0) {
+            throw new Exception(this.meta.Table + " has no column: ");
+        }
         string n = col;
         if (n.Length > 2 && (n[0] & 255) == 116 && (n[1] & 255) == 46) { n = n.Substring(2); }
         if (!this.meta.Has(n)) {
@@ -545,6 +574,9 @@ public class Select {
     }
 
     public void OrderBySafeDesc(string col) {
+        if (col == null || col.Length == 0) {
+            throw new Exception(this.meta.Table + " has no column: ");
+        }
         string n = col;
         if (n.Length > 2 && (n[0] & 255) == 116 && (n[1] & 255) == 46) { n = n.Substring(2); }
         if (!this.meta.Has(n)) {
@@ -568,6 +600,7 @@ public class Select {
 
     public void GB(string col) {
         this.gbLen = 0;
+        if (col == null) { return; }
         int cl = col.Length;
         if (cl > 0) {
             if (this.gbBuf == null || cl > this.gbBuf.Length) { this.GrowGb(cl); }
@@ -616,13 +649,14 @@ public class Select {
     }
 
     public void Include(int i) {
-        if (this.navOn != null) { this.navOn[i] = true; }
+        if (this.navOn != null && i >= 0 && i < this.navOn.Count) { this.navOn[i] = true; }
     }
 
     public int NavAt(int i) {
         int at = this.meta.Cols.Count;
         if (this.navOn != null) {
-            for (int k = 0; k < i; k = k + 1) {
+            int lim = i < this.navOn.Count ? i : this.navOn.Count;
+            for (int k = 0; k < lim; k = k + 1) {
                 if (this.navOn[k]) { at = at + this.meta.Navs[k].Cols.Count; }
             }
         }
@@ -670,7 +704,7 @@ public class Select {
 
         int tblLen = this.tbl.Length;
         int customLen = customSel != null ? customSel.Length : 0;
-        int totalCap = 128 + selList.Length + customLen + tblLen + navSelTotal + navJoinTotal
+        int totalCap = 256 + selList.Length + customLen + tblLen + navSelTotal + navJoinTotal
             + this.wLen + this.gbLen + this.hLen + (includeOrderLimit ? this.obLen : 0);
 
         byte[] buf = new byte[totalCap];
@@ -896,7 +930,7 @@ public class Select {
     public string BuildLimitOffset() {
         if (this.limN < 0 && this.offN < 0) { return ""; }
         int pv = this.db != null ? this.db.GetProvider() : DbProvider.SQLite;
-        byte[] buf = new byte[96];
+        byte[] buf = new byte[128];
         nint dst = (nint)buf;
         int p = 0;
         if (pv == DbProvider.SqlServer || pv == DbProvider.Oracle) {
@@ -934,15 +968,20 @@ public class Select {
         sb.Append(this.BuildLimitOffset());
     }
 
+    private IDbExecutor RequireDb() {
+        if (this.db == null) { throw new InvalidOperationException("Select executor is null"); }
+        return this.db;
+    }
+
     public string BuildSelect() {
         return this.BuildQueryCore(0, null, true, true, true);
     }
 
-    public DbResult Rows() { return this.db.Query(this.BuildSelect(), this.ps); }
+    public DbResult Rows() { return this.RequireDb().Query(this.BuildSelect(), this.ps); }
 
     public async DbResult RowsAsync() {
         string sql = this.BuildSelect();
-        return await this.db.QueryAsync(sql, this.ps);
+        return await this.RequireDb().QueryAsync(sql, this.ps);
     }
 
     public string BuildCol(string col) {
@@ -966,22 +1005,22 @@ public class Select {
     }
 
     public List<string> ToListCol(string col) {
-        return this.MapCol(this.db.Query(this.BuildCol(col), this.ps));
+        return this.MapCol(this.RequireDb().Query(this.BuildCol(col), this.ps));
     }
 
     public async List<string> ToListColAsync(string col) {
         string sql = this.BuildCol(col);
-        DbResult r = await this.db.QueryAsync(sql, this.ps);
+        DbResult r = await this.RequireDb().QueryAsync(sql, this.ps);
         return this.MapCol(r);
     }
 
     public DbResult Dto(string cols) {
-        return this.db.Query(this.BuildDto(cols), this.ps);
+        return this.RequireDb().Query(this.BuildDto(cols), this.ps);
     }
 
     public async DbResult DtoAsync(string cols) {
         string sql = this.BuildDto(cols);
-        return await this.db.QueryAsync(sql, this.ps);
+        return await this.RequireDb().QueryAsync(sql, this.ps);
     }
 
     public void One() { this.limN = 1; }
@@ -995,12 +1034,12 @@ public class Select {
     }
 
     public DbResult AggR(string expr) {
-        return this.db.Query(this.BuildAgg(expr), this.ps);
+        return this.RequireDb().Query(this.BuildAgg(expr), this.ps);
     }
 
     public async DbResult AggRAsync(string expr) {
         string sql = this.BuildAgg(expr);
-        return await this.db.QueryAsync(sql, this.ps);
+        return await this.RequireDb().QueryAsync(sql, this.ps);
     }
 
     public int AggI(string expr) {
@@ -1040,12 +1079,12 @@ public class Select {
     }
 
     public int Count() {
-        DbResult r = this.db.Query(this.BuildCount(), this.ps);
+        DbResult r = this.RequireDb().Query(this.BuildCount(), this.ps);
         return r == null || r.RowCount() == 0 ? 0 : r.GetInt(0, 0);
     }
 
     public async int CountAsync() {
-        DbResult r = await this.db.QueryAsync(this.BuildCount(), this.ps);
+        DbResult r = await this.RequireDb().QueryAsync(this.BuildCount(), this.ps);
         return r == null || r.RowCount() == 0 ? 0 : r.GetInt(0, 0);
     }
 

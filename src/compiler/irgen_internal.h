@@ -141,11 +141,15 @@ typedef struct local_var {
   int async_role;
   int frame_owner;
   int struct_rc;
+  LLVMValueRef drop_flag;
   int per_iteration;
+  int noalias_scope_id;
+  uint8_t is_scoped;
 } local_var_t;
 
 static inline bool local_needs_cleanup(local_var_t *v) {
-  return v && (v->arc_owned || v->struct_rc || v->box_cell || v->obj_rc_flag);
+  return v && (v->arc_owned || v->struct_rc || v->box_cell || v->obj_rc_flag ||
+               v->drop_flag != NULL);
 }
 
 typedef struct {
@@ -351,6 +355,8 @@ LLVMValueRef emit_entry_alloca(zan_irgen_t *g, LLVMTypeRef ty,
 LLVMValueRef emit_field_ptr(zan_irgen_t *g, zan_symbol_t *type_sym,
                             LLVMTypeRef st, LLVMValueRef base, int fi,
                             const char *name);
+void apply_pack_field_align(zan_irgen_t *g, zan_symbol_t *type_sym,
+                            LLVMValueRef mem_inst, LLVMTypeRef field_ty);
 void zan_tbaa_mark_field(zan_irgen_t *g, LLVMValueRef gep, LLVMTypeRef st,
                          int fi);
 void zan_tbaa_tag_array_len(zan_irgen_t *g, LLVMValueRef load);
@@ -474,10 +480,13 @@ void zan_irgen_emit_oom_check(zan_irgen_t *g, LLVMValueRef fn,
 LLVMValueRef zan_irgen_intern_string(zan_irgen_t *g, const char *text);
 LLVMValueRef zan_irgen_intern_type_name(zan_irgen_t *g, const char *text);
 
-/* --- From irgen_abi.c (5 functions) --- */
+/* --- From irgen_abi.c (6 functions) --- */
 void abi_add_int_ext_attrs(zan_irgen_t *g, LLVMValueRef fn, zan_type_t *ret,
                            zan_type_t **ptypes, int pc);
 unsigned long abi_align_of(LLVMTypeRef t);
+LLVMValueRef abi_extern_sig_adapt_thunk(zan_irgen_t *g, const char *name,
+                                        LLVMValueRef existing_fn,
+                                        LLVMTypeRef zan_ft);
 LLVMValueRef abi_extern_thunk(zan_irgen_t *g, const char *name,
                               LLVMTypeRef zan_ft);
 void abi_pending_report(zan_irgen_t *g);
@@ -558,6 +567,15 @@ void emit_struct_local_release(zan_irgen_t *g, zan_type_t *type,
                                LLVMValueRef slot);
 void emit_struct_local_release_ex(zan_irgen_t *g, zan_type_t *type,
                                   LLVMValueRef slot, bool is_volatile);
+bool struct_needs_raii_drop(zan_irgen_t *g, zan_type_t *type, int depth);
+void emit_arm_drop_flag(zan_irgen_t *g, local_scope_t *locals, int var_idx,
+                        bool initial_alive);
+void emit_move_clear_drop_flag(zan_irgen_t *g, zan_ast_node_t *expr,
+                               local_scope_t *locals);
+void emit_raii_drop_value_at(zan_irgen_t *g, zan_type_t *type,
+                             LLVMValueRef slot_ptr, bool is_volatile);
+void emit_raii_drop_local_ex(zan_irgen_t *g, local_var_t *v, bool is_volatile);
+void emit_raii_drop_local(zan_irgen_t *g, local_var_t *v);
 void emit_struct_local_retain(zan_irgen_t *g, zan_type_t *type,
                               LLVMValueRef slot);
 void emit_typed_out_store(zan_irgen_t *g, zan_type_t *value_type,
@@ -673,6 +691,8 @@ void emit_async_check_sub_exc(zan_irgen_t *g, LLVMValueRef sub,
 void emit_async_complete(zan_irgen_t *g, local_scope_t *locals,
                          LLVMValueRef result_i64);
 void emit_async_complete_epilogue(zan_irgen_t *g, local_scope_t *locals);
+void emit_pending_finallys(zan_irgen_t *g, local_scope_t *locals, int base,
+                           bool preserve_return);
 void emit_async_eh_prologue(zan_irgen_t *g);
 void emit_async_eh_unarm(zan_irgen_t *g);
 void emit_async_exc_epilogue(zan_irgen_t *g, local_scope_t *locals);
@@ -861,6 +881,8 @@ bool ident_names_own_field(zan_irgen_t *g, zan_ast_node_t *e);
 local_var_t *receiver_local(zan_ast_node_t *e, local_scope_t *locals);
 zan_symbol_t *receiver_type_symbol(zan_irgen_t *g, zan_ast_node_t *e,
                                    local_scope_t *locals);
+zan_type_t *resolve_tp_ident_type(zan_irgen_t *g, zan_ast_node_t *e);
+bool decl_uses_static_abstract_or_assoc(zan_irgen_t *g, zan_ast_list_t *wcs);
 int irgen_enum_members(zan_symbol_t *sym, zan_symbol_t **out_syms,
                        long long *out_vals, int cap);
 int is_string_like_expr(zan_irgen_t *g, zan_ast_node_t *e,
@@ -915,6 +937,14 @@ void emit_property_setter_call(zan_irgen_t *g, zan_symbol_t *setter,
                                zan_ast_node_t *rhs_ast, local_scope_t *locals);
 bool emit_span_call(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals,
                     LLVMValueRef *out);
+bool emit_vec_call(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals,
+                   LLVMValueRef *out);
+bool zan_ctfe_expr_wants_rodata(zan_ast_node_t *init);
+bool zan_ctfe_eval_to_llvm_const(zan_irgen_t *g, zan_symbol_t *owner_type,
+                                 zan_ast_node_t *expr, zan_type_t *target_type,
+                                 LLVMValueRef *out_const);
+LLVMValueRef zan_ctfe_emit_comptime(zan_irgen_t *g, zan_ast_node_t *call_expr,
+                                    local_scope_t *locals);
 bool emit_sse2_call(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals,
                     LLVMValueRef *out);
 bool emit_sse42_call(zan_irgen_t *g, zan_ast_node_t *expr,
@@ -930,6 +960,14 @@ bool is_target_class_obj(zan_ast_node_t *obj, const char *name, size_t len,
 zan_symbol_t *property_getter_sym(zan_irgen_t *g, zan_symbol_t *prop);
 zan_symbol_t *property_setter_sym(zan_irgen_t *g, zan_symbol_t *prop);
 LLVMTypeRef span_elem_storage_type(zan_irgen_t *g, zan_type_t *elem_type);
+unsigned zan_span_elem_align(zan_irgen_t *g, LLVMTypeRef elem_llvm);
+void zan_fn_reset_alias_scopes(zan_irgen_t *g);
+int zan_fn_alloc_alias_scope(zan_irgen_t *g);
+void zan_attach_noalias_md(zan_irgen_t *g, LLVMValueRef mem_inst, int scope_id);
+int zan_local_noalias_scope(zan_ast_node_t *expr, local_scope_t *locals);
+bool irgen_bce_check(zan_irgen_t *g, zan_ast_node_t *container_expr,
+                     zan_ast_node_t *index_expr, local_scope_t *locals,
+                     int *out_scope_id);
 int type_declares_member(zan_symbol_t *cls, zan_istr_t name);
 LLVMValueRef v16i8_to_vec128(zan_irgen_t *g, LLVMValueRef v16);
 
@@ -1051,6 +1089,13 @@ bool is_call_to(zan_ast_node_t *expr, const char *obj, const char *method);
 bool is_implicit_ctor_source(zan_type_t *t);
 bool is_name_path(zan_ast_node_t *node);
 int is_span_type(zan_type_t *t);
+int is_inline_array_type(zan_type_t *t);
+int64_t inline_array_len(zan_type_t *t);
+zan_type_t *inline_array_elem(zan_type_t *t);
+int is_vec_type(zan_type_t *t);
+int64_t vec_len(zan_type_t *t);
+zan_type_t *vec_elem(zan_type_t *t);
+bool resolve_const_param_val(zan_irgen_t *g, zan_istr_t name, int64_t *out);
 bool is_string_expr(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals);
 bool istr_matches_class(zan_istr_t name, const char *cls);
 zan_type_t *member_access_field_type(zan_irgen_t *g, local_scope_t *locals,
@@ -1116,6 +1161,7 @@ LLVMValueRef emit_box_cell(zan_irgen_t *g, zan_loc_t loc, LLVMTypeRef payload,
                            zan_type_t *vtype, LLVMValueRef init);
 LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
                                zan_type_t *expected, local_scope_t *locals);
+bool method_param_is_noescape(zan_symbol_t *msym, int idx);
 LLVMValueRef emit_method_group_closure(zan_irgen_t *g, zan_symbol_t *msym,
                                        LLVMValueRef recv, zan_loc_t loc);
 LLVMValueRef emit_method_group_closure_typed(zan_irgen_t *g, zan_symbol_t *msym,
@@ -1126,6 +1172,16 @@ LLVMValueRef emit_ref_arg(zan_irgen_t *g, zan_ast_node_t *arg,
                           local_scope_t *locals);
 LLVMValueRef emit_ref_lvalue_ptr(zan_irgen_t *g, zan_ast_node_t *tgt,
                                  local_scope_t *locals);
+bool call_returns_ref(zan_irgen_t *g, zan_ast_node_t *expr,
+                      local_scope_t *locals);
+bool zan_irgen_eval_layout_query(zan_irgen_t *g, zan_ast_node_t *expr,
+                                 int64_t *out);
+void zan_ctfe_eval_static_assert(zan_irgen_t *g, zan_ast_node_t *call_expr);
+bool method_c_export_name(zan_ast_node_t *member, char *out, size_t cap);
+bool field_c_attr_name(zan_ast_node_t *member, const char *attr_name,
+                       char *out, size_t cap);
+bool method_calling_conv(zan_ast_node_t *member, unsigned *out_cc,
+                         const char **out_c_macro);
 void infer_method_tp_bindings(zan_irgen_t *g, zan_symbol_t *msym,
                               zan_ast_node_t *call, zan_ast_node_t *recv_expr,
                               local_scope_t *locals, zan_type_t **bind);

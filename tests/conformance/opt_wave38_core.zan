@@ -1,0 +1,290 @@
+using System;
+using System.IO;
+using System.Text;
+using System.Collections.Generic;
+using System.Json;
+using System.Net.Http;
+using System.Web;
+using System.Text.Html;
+using System.Configuration;
+using Formats.Cbor;
+using Document.Pdf;
+
+class Program {
+    static void Check(bool cond, string label) {
+        if (!cond) {
+            Console.WriteLine("FAIL: " + label);
+            Environment.Exit(1);
+        }
+    }
+
+    static HttpContext MakeCtx(string method, string path) {
+        HttpRequest req = new HttpRequest();
+        req.method = method;
+        req.path = path;
+        return new HttpContext(req, "127.0.0.1");
+    }
+
+    static void TestRouter() {
+        Router r = new Router();
+        SyncHttpAction noop = (HttpContext c) => {};
+        r.AddSync("GET", "/health", noop);
+        r.AddSync("GET", "/about/company", noop);
+        r.AddSync("GET", "/about/company", noop); // duplicate first-wins
+        r.AddSync("*", "/any/path", noop);
+        r.AddSync("GET", "/users/{id}/posts/{pid}", noop);
+        r.AddSync("POST", "/a/{p1}/{p2}/{p3}/{p4}/{p5}", noop);
+
+        HttpContext c1 = MakeCtx("GET", "/health");
+        Route m1 = r.Match(c1);
+        Check(m1 != null && m1.Pattern() == "/health", "router static exact");
+
+        HttpContext c2 = MakeCtx("GET", "/about/company/");
+        Route m2 = r.Match(c2);
+        Check(m2 != null && m2.Idx() == 1, "router trailing slash + dup first-wins");
+
+        HttpContext c3 = MakeCtx("DELETE", "/any/path");
+        Route m3 = r.Match(c3);
+        Check(m3 != null && m3.Pattern() == "/any/path", "router wildcard static");
+
+        HttpContext c4 = MakeCtx("GET", "/users/42/posts/99");
+        Route m4 = r.Match(c4);
+        Check(m4 != null && c4.Param("id") == "42" && c4.Param("pid") == "99", "router dynamic 2 params");
+
+        // >4 params exercises ExtractRouteParams fallback
+        HttpContext c5 = MakeCtx("POST", "/a/v1/v2/v3/v4/v5");
+        Route m5 = r.Match(c5);
+        Check(m5 != null
+            && c5.Param("p1") == "v1"
+            && c5.Param("p2") == "v2"
+            && c5.Param("p3") == "v3"
+            && c5.Param("p4") == "v4"
+            && c5.Param("p5") == "v5", "router dynamic 5 params");
+
+        HttpContext cMiss = MakeCtx("GET", "/a/very/long/missing/static/path/exceeding/max");
+        Check(r.Match(cMiss) == null, "router miss");
+        Check(r.PathExists("/health"), "router PathExists static");
+        Check(r.PathExists("/users/7/posts/8"), "router PathExists dynamic");
+        Check(!r.PathExists("/nope/here"), "router PathExists false");
+        Console.WriteLine("router=ok");
+    }
+
+    static void TestJsonReader() {
+        string js = "{\"a\":0,\"b\":-1234567890123,\"c\":-0,\"d\":1.5,\"e\":1e3,\"f\":true,\"g\":false,\"h\":null,\"s\":\"hi\\n\\t\\\"\\\\\\/\\u4e2d\",\"arr\":[{\"k\":1},{\"k\":2},{\"k\":3}]}";
+        JsonReader r = JsonReader.OfStrict(js);
+        JsonValue v = r.ReadValue();
+        Check(!r.Failed(), "json valid strict");
+        JsonValue va = v.Get("a");
+        JsonValue vb = v.Get("b");
+        JsonValue vc = v.Get("c");
+        JsonValue vd = v.Get("d");
+        JsonValue ve = v.Get("e");
+        JsonValue vf = v.Get("f");
+        JsonValue vg = v.Get("g");
+        JsonValue vh = v.Get("h");
+        JsonValue vs = v.Get("s");
+        JsonValue arr = v.Get("arr");
+        Check(va != null && va.IsInt() && va.AsLong(9L) == 0L, "json 0 int");
+        Check(vb != null && vb.IsInt() && vb.AsLong(0L) == -1234567890123L, "json neg i64");
+        Check(vc != null && vc.IsInt() && vc.AsLong(1L) == 0L, "json -0 int");
+        Check(vd != null && !vd.IsInt() && vd.AsDouble(0.0) == 1.5, "json frac double");
+        Check(ve != null && !ve.IsInt() && ve.AsDouble(0.0) == 1000.0, "json exp double");
+        Check(vf != null && vf.AsBool(false), "json true");
+        Check(vg != null && !vg.AsBool(true), "json false");
+        Check(vh != null && vh.IsNull(), "json null");
+        Check(vs != null && vs.AsString("") == "hi\n\t\"\\/\u4e2d", "json escapes + unicode");
+        Check(arr != null && arr.Count() == 3, "json arr count");
+        JsonValue a2 = arr.At(2);
+        JsonValue a2k = a2 != null ? a2.Get("k") : null;
+        Check(a2k != null && a2k.AsLong(0L) == 3L, "json keyCache hit");
+
+        // Strict rejections
+        JsonReader bad1 = JsonReader.OfStrict("{\"x\":1-2}");
+        bad1.ReadValue();
+        Check(bad1.Failed(), "json malformed number rejected");
+
+        JsonReader bad2 = JsonReader.OfStrict("{\"x\":tru}");
+        bad2.ReadValue();
+        Check(bad2.Failed(), "json bad literal rejected");
+
+        JsonReader bad3 = JsonReader.OfStrict("{\"x\":1.}");
+        bad3.ReadValue();
+        Check(bad3.Failed(), "json trailing dot rejected");
+
+        // 20-digit integer overflows long -> falls back to double cleanly
+        JsonReader big = JsonReader.OfStrict("{\"big\":99999999999999999999}");
+        JsonValue bv = big.ReadValue();
+        Check(!big.Failed(), "json big num valid");
+        JsonValue bbig = bv.Get("big");
+        Check(bbig != null && bbig.AsDouble(0.0) > 1e19, "json big num double");
+        Console.WriteLine("jsonreader=ok");
+    }
+
+    static void TestCbor() {
+        JsonValue root = JsonValue.NewObject();
+        root.Put("nil", JsonValue.NewNull());
+        root.Put("t", JsonValue.NewBool(true));
+        root.Put("f", JsonValue.NewBool(false));
+        root.Put("u0", JsonValue.NewInt(0L));
+        root.Put("u23", JsonValue.NewInt(23L));
+        root.Put("u250", JsonValue.NewInt(250L));
+        root.Put("u60000", JsonValue.NewInt(60000L));
+        root.Put("uBig", JsonValue.NewInt(5000000000L));
+        root.Put("n1", JsonValue.NewInt(-1L));
+        root.Put("n100000", JsonValue.NewInt(-100000L));
+        root.Put("dbl", JsonValue.NewDouble(3.125));
+        root.Put("rawInt", JsonValue.NewNum("42"));
+        root.Put("rawDbl", JsonValue.NewNum("2.5"));
+        root.Put("str", JsonValue.NewStr("hello cbor world wave 38"));
+
+        JsonValue arr = JsonValue.NewArray();
+        for (int i = 0; i < 4; i = i + 1) {
+            JsonValue item = JsonValue.NewObject();
+            item.Put("id", JsonValue.NewInt((long)i));
+            item.Put("tag", JsonValue.NewStr("t" + Convert.ToString(i)));
+            arr.items.Add(item);
+        }
+        root.Put("items", arr);
+
+        byte[] enc = Cbor.Encode(root);
+        JsonValue dec = Cbor.Decode(enc);
+        JsonValue cNil = dec.Get("nil");
+        JsonValue cT = dec.Get("t");
+        JsonValue cF = dec.Get("f");
+        JsonValue cU23 = dec.Get("u23");
+        JsonValue cU250 = dec.Get("u250");
+        JsonValue cU60k = dec.Get("u60000");
+        JsonValue cUBig = dec.Get("uBig");
+        JsonValue cN1 = dec.Get("n1");
+        JsonValue cN100k = dec.Get("n100000");
+        JsonValue cDbl = dec.Get("dbl");
+        JsonValue cRawInt = dec.Get("rawInt");
+        JsonValue cRawDbl = dec.Get("rawDbl");
+        JsonValue cStr = dec.Get("str");
+        Check(cNil != null && cNil.IsNull(), "cbor nil");
+        Check(cT != null && cT.AsBool(false), "cbor true");
+        Check(cF != null && !cF.AsBool(true), "cbor false");
+        Check(cU23 != null && cU23.AsLong(-1L) == 23L, "cbor u23");
+        Check(cU250 != null && cU250.AsLong(-1L) == 250L, "cbor u250");
+        Check(cU60k != null && cU60k.AsLong(-1L) == 60000L, "cbor u60000");
+        Check(cUBig != null && cUBig.AsLong(-1L) == 5000000000L, "cbor uBig");
+        Check(cN1 != null && cN1.AsLong(0L) == -1L, "cbor n1");
+        Check(cN100k != null && cN100k.AsLong(0L) == -100000L, "cbor n100000");
+        Check(cDbl != null && cDbl.AsDouble(0.0) == 3.125, "cbor dbl");
+        Check(cRawInt != null && cRawInt.IsInt() && cRawInt.AsLong(0L) == 42L, "cbor rawInt");
+        Check(cRawDbl != null && !cRawDbl.IsInt() && cRawDbl.AsDouble(0.0) == 2.5, "cbor rawDbl");
+        Check(cStr != null && cStr.AsString("") == "hello cbor world wave 38", "cbor str");
+        JsonValue ditems = dec.Get("items");
+        Check(ditems != null && ditems.Count() == 4, "cbor items");
+        JsonValue d3 = ditems.At(3);
+        JsonValue d3id = d3 != null ? d3.Get("id") : null;
+        Check(d3id != null && d3id.AsLong(0L) == 3L, "cbor item 3");
+        Console.WriteLine("cbor=ok");
+    }
+
+    static void TestHtmlCssSanitizer() {
+        string html = "<div id=\"root\" class=\"a b\"><section class=\"card\"><ul class=\"list\"><li class=\"item first\" data-v=\"x y\">1</li><li class=\"item\" data-v=\"en-US\">2</li></ul></section><p><a href=\"javascript:alert(1)\" onclick=\"x()\">bad</a><a href=\"https://example.com/p\">good</a></p><script>evil()</script></div>";
+        HtmlDocument doc = HtmlDocument.Parse(html);
+
+        List<HtmlNode> q1 = doc.Query("div#root.a section.card ul.list li.item");
+        Check(q1.Count == 2, "css descendant chain");
+
+        List<HtmlNode> q2 = doc.Query("li[data-v~=y], li[data-v|=en]");
+        Check(q2.Count == 2, "css comma + attr ~= |=");
+
+        HtmlNode f1 = doc.Find("div > section > ul > li:nth-child(2)");
+        Check(f1 != null && f1.TextContent() == "2", "css child + nth-child");
+
+        // Verify cachedClass / cachedId invalidation on SetAttr & direct attrs mutation
+        HtmlNode rootDiv = doc.Find("#root");
+        Check(rootDiv != null && rootDiv.HasClass("a") && rootDiv.HasClass("b") && !rootDiv.HasClass("c"), "html cached class initial");
+        rootDiv.SetAttr("class", "c d");
+        Check(rootDiv.HasClass("c") && !rootDiv.HasClass("a"), "html SetAttr class update");
+        Dictionary<string, string> rawAttrs = rootDiv.attrs;
+        rawAttrs["class"] = "e";
+        rawAttrs["id"] = "root2";
+        Check(rootDiv.HasClass("e") && !rootDiv.HasClass("c"), "html direct attrs mutation class");
+        Check(doc.Find("#root2") != null && doc.Find("#root") == null, "html direct attrs mutation id");
+
+        // Sanitizer default policy (0 allowed attributes -> exercises ParseForSanitize skip-attr path)
+        string cleanDef = HtmlSanitizer.Clean("<p class=\"x\" id=\"y\"><a href=\"https://a.test\" title=\"t\">ok</a></p><script>evil()</script>", HtmlPolicy.Default());
+        Check(cleanDef == "<p><a>ok</a></p>", "sanitizer default zero-attr exact");
+
+        // Sanitizer rich policy (keeps safe href, drops javascript:/onclick/script)
+        string cleanRich = HtmlSanitizer.Clean(html, HtmlPolicy.Rich());
+        Check(!cleanRich.Contains("<script>") && !cleanRich.Contains("evil()") && !cleanRich.Contains("onclick") && !cleanRich.Contains("javascript:"), "sanitizer rich strips unsafe");
+        Check(cleanRich.Contains("https://example.com/p") && cleanRich.Contains(">good</a>"), "sanitizer rich keeps safe link");
+        Console.WriteLine("htmlcss=ok");
+    }
+
+    static void TestPdf() {
+        PdfDocument doc = new PdfDocument();
+        doc.Title = "Wave 38 (Test)";
+        doc.Author = "Zan\\Bot";
+        PdfFont f = PdfFont.Helvetica();
+        PdfColor c = PdfColor.FromRgb(10, 20, 30);
+        for (int i = 0; i < 2; i = i + 1) {
+            PdfPage p = doc.AddPage();
+            p.DrawRect(10.0, 20.0, 100.0, 30.0, c);
+            p.DrawText(20.0, 40.0, "Line (1) \\ ok\nLine 2", f, 12.0, c);
+        }
+        byte[] pdf1 = doc.Build();
+        byte[] pdf2 = doc.Build();
+        Check(pdf1.Length == pdf2.Length && pdf1.Length > 200, "pdf deterministic length");
+        string s = NativeMemory.GetString((nint)pdf1, 0, pdf1.Length);
+        Check(s.StartsWith("%PDF-1.4\n"), "pdf header");
+        Check(s.Contains("%%EOF"), "pdf eof");
+        Check(s.Contains("(Line \\(1\\) \\\\ ok)"), "pdf escaped text");
+        Check(s.Contains("(Line 2)"), "pdf multiline text");
+        Check(s.Contains("/Count 2"), "pdf page count");
+        Console.WriteLine("pdf=ok");
+    }
+
+    static void TestEnvConfig() {
+        Check(ConfigurationKeys.Canonical("APP__DATABASE__PORT") == "App:Database:Port", "cfg canonical __");
+        Check(ConfigurationKeys.Canonical("Database:Pool:Size") == "Database:Pool:Size", "cfg canonical exact");
+        Check(ConfigurationKeys.CanonicalSlice("  APP__DB__HOST = x", 2, 15) == "App:Db:Host", "cfg canonical slice");
+        Check(EnvFileConfigurationProvider.ParseValue("\"a\\nb\\t\\\"c\\\"\\\\d\\x\" # tail") == "a\nb\t\"c\"\\d\\x", "cfg parse double quoted");
+        Check(EnvFileConfigurationProvider.ParseValue("'raw # keep' # drop") == "raw # keep", "cfg parse single quoted");
+        Check(EnvFileConfigurationProvider.StripInlineComment("a#b # comment") == "a#b", "cfg inline comment");
+
+        // Build >512-byte key to exercise scratch overflow fallback cleanly
+        StringBuilder longKey = new StringBuilder();
+        for (int i = 0; i < 60; i = i + 1) {
+            if (i > 0) { longKey.Append("__"); }
+            longKey.Append("SEG");
+            longKey.Append(i);
+        }
+        string tmp = Path.Combine(Path.GetTempPath(), "zan_wave38_env_test.env");
+        string content = "# comment\n"
+            + "export APP__HOST = localhost # primary\n"
+            + "APP__EMPTY = # comment only\n"
+            + "APP__QUOTED=\"line1\\nline2\\\"ok\\\"\"\n"
+            + "APP__SINGLE='val # literal'\n"
+            + longKey.ToString() + "=long_ok\n";
+        File.WriteAllText(tmp, content);
+        try {
+            EnvFileConfigurationProvider prov = new EnvFileConfigurationProvider(tmp, false);
+            prov.Load();
+            string v = "";
+            Check(prov.TryGet("App:Host", out v) && v == "localhost", "env host");
+            Check(prov.TryGet("App:Empty", out v) && v == "", "env empty comment");
+            Check(prov.TryGet("App:Quoted", out v) && v == "line1\nline2\"ok\"", "env quoted");
+            Check(prov.TryGet("App:Single", out v) && v == "val # literal", "env single");
+            string canonLong = ConfigurationKeys.Canonical(longKey.ToString());
+            Check(prov.TryGet(canonLong, out v) && v == "long_ok", "env >512 key fallback");
+        } finally {
+            if (File.Exists(tmp)) { File.Delete(tmp); }
+        }
+        Console.WriteLine("envcfg=ok");
+    }
+
+    static void Main() {
+        TestRouter();
+        TestJsonReader();
+        TestCbor();
+        TestHtmlCssSanitizer();
+        TestPdf();
+        TestEnvConfig();
+    }
+}

@@ -1,8 +1,10 @@
 using System;
 using System.Data;
 using System.Data.Orm;
+using System.Json;
 using System.Text;
 using System.Web;
+using Zan.Web.AdminUi;
 using Zan.Web.Ai;
 using Zan.Web.Core;
 using Zan.Web.Model;
@@ -11,10 +13,7 @@ using Zan.Web;
 
 namespace Zan.Web.Admin.Wiki;
 
-/* /admin/wiki 知识库：左侧空间（一个部门/通用一个库），右侧所选空间
-   的文档。文档正文为 Markdown，阅读页经 WikiController.Html 渲染可视化；
-   每次保存（人工/AI 整理/回滚）都写整篇快照到 wiki_revision，
-   可查看可回滚；回滚本身也生成新版本，历史不被改写。 */
+/* /admin/wiki/wiki 知识库：左侧空间 + 右侧文档、Markdown 阅读/编辑、修订历史与回滚、AI 整理（纯 JSON 协议）。 */
 [Custom(Authorization = CustomAuthorization.Grant)]
 [Description("知识库")]
 public class WikiController : AdminController {
@@ -22,92 +21,172 @@ public class WikiController : AdminController {
     [Custom(IsMenu = true, Icon = "mdi:book-multiple", Perm = PermBit.View)]
     [Description("知识库")]
     public async void Index() {
-        ViewData d = await this.Layout("知识库");
-        if (!this.PageReady(d)) { return; }
-
-        List<SysWikiSpace> spaces = await this.SysWikiSpace
-            .OrderBy(a => a.sortOrder).ToListAsync();
-        string current = this.In("space");
-        if (current.Length == 0 && spaces.Count > 0) {
-            current = Convert.ToString(spaces[0].id);
-        }
-        int spaceId = Filter.ToInt(current, 0);
-
-        List<StrMap> left = d.AddList("spaces");
-        Rows.Project(spaces, left);
-        for (int i = 0; i < spaces.Count; i = i + 1) {
-            int docs = await this.SysWikiDoc
-                .Where(a => a.spaceId == spaces[i].id).CountAsync();
-            left[i].Set("count", Convert.ToString(docs));
-            if (Convert.ToString(spaces[i].id) == current) {
-                left[i].Set("active", "active");
-            }
-        }
-
-        List<SysWikiDoc> docs = await this.SysWikiDoc
-            .Where(a => a.spaceId == spaceId)
-            .OrderByDescending(a => a.updatedAt).ToListAsync();
-        List<StrMap> right = d.AddList("docs");
-        Rows.Project(docs, right);
-        d.Set("space", current);
-        if (spaces.Count == 0) { d.Set("emptySpaces", "1"); }
-        if (docs.Count == 0) { d.Set("emptyDocs", "1"); }
-        this.Page(d);
+        await this.Conf();
     }
 
-    [HttpGet]
-    [Custom(Perm = PermBit.Create | PermBit.Update)]
-    [Description("知识库表单")]
-    public async void SpaceForm() {
-        int id = this.InInt("id", 0);
-        if (!await this.Can(id > 0 ? (int)PermBit.Update : (int)PermBit.Create)) {
-            this.Fail(403, "0403", "无操作权限"); return;
+    [HttpPut]
+    [Custom(Perm = PermBit.View)]
+    [Description("知识库页面配置")]
+    public async void Conf() {
+        bool aiOn = await Ai.Ready();
+        bool canCreate = await this.Can((int)PermBit.Create);
+        bool canUpdate = await this.Can((int)PermBit.Update);
+        bool canDelete = await this.Can((int)PermBit.Delete);
+        List<SysDepartment> depts = await this.SysDepartment.OrderBy(a => a.sortOrder).ToListAsync();
+
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("PageType", "wiki");
+        w.WriteProperty("title", "知识库");
+        w.WriteProperty("spacesUrl", "spaces");
+        w.WriteProperty("docsUrl", "docs");
+        w.WriteProperty("docUrl", "doc");
+        w.WriteProperty("saveUrl", "save");
+        w.WriteProperty("deleteUrl", "delete");
+        w.WriteProperty("spaceSaveUrl", "spacesave");
+        w.WriteProperty("spaceDeleteUrl", "spacedelete");
+        w.WriteProperty("historyUrl", "history");
+        w.WriteProperty("revisionUrl", "revision");
+        w.WriteProperty("rollbackUrl", "rollback");
+        w.WriteProperty("aiOrganizeUrl", "aiorganize");
+        w.WriteProperty("aiReady", aiOn);
+        w.WriteProperty("canCreate", canCreate);
+        w.WriteProperty("canUpdate", canUpdate);
+        w.WriteProperty("canDelete", canDelete);
+        w.WritePropertyName("departments");
+        w.WriteStartArray();
+        for (int i = 0; i < depts.Count; i = i + 1) {
+            w.WriteStartObject();
+            w.WriteProperty("id", depts[i].id);
+            w.WriteProperty("name", depts[i].name);
+            w.WriteEndObject();
         }
-        ViewData d = new ViewData();
-        d.Set("id", Convert.ToString(id));
-        d.Set("dialogTitle", "新增知识库");
-        d.Set("icon", "mdi:folder-outline");
-        d.Set("sortOrder", "1");
-        d.Set("status1", "selected");
-        List<SysDepartment> depts = await this.SysDepartment
+        w.WriteEndArray();
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(this, w.ToString());
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.View)]
+    [Description("知识库空间列表")]
+    public async void Spaces() {
+        List<SysWikiSpace> spaces = await this.SysWikiSpace
             .OrderBy(a => a.sortOrder).ToListAsync();
-        List<StrMap> items = d.AddList("departments");
-        Rows.Project(depts, items);
-        if (id > 0) {
-            SysWikiSpace s = await this.SysWikiSpace.ById(id);
-            if (s == null) { this.Fail(404, "0404", "知识库不存在"); }
-            d.Set("dialogTitle", "编辑知识库");
-            d.Set("name", s.name);
-            d.Set("description", s.description);
-            d.Set("icon", s.icon);
-            d.Set("departmentId", Convert.ToString(s.departmentId));
-            d.Set("sortOrder", Convert.ToString(s.sortOrder));
-            d.Set("status1", "");
-            if (s.status == 1) { d.Set("status1", "selected"); }
-            else { d.Set("status0", "selected"); }
+        JsonWriter w = new JsonWriter();
+        w.WriteStartArray();
+        for (int i = 0; i < spaces.Count; i = i + 1) {
+            SysWikiSpace s = spaces[i];
+            int count = await this.SysWikiDoc.Where(a => a.spaceId == s.id).CountAsync();
+            w.WriteStartObject();
+            w.WriteProperty("id", s.id);
+            w.WriteProperty("name", s.name);
+            w.WriteProperty("description", s.description);
+            w.WriteProperty("icon", s.icon);
+            w.WriteProperty("departmentId", s.departmentId);
+            w.WriteProperty("sortOrder", s.sortOrder);
+            w.WriteProperty("status", s.status);
+            w.WriteProperty("count", count);
+            w.WriteEndObject();
         }
-        this.Dialog(d);
+        w.WriteEndArray();
+        AdminUiProtocol.Ok(this, w.ToString());
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.View)]
+    [Description("空间文档列表")]
+    public async void Docs() {
+        int spaceId = this.InAnyInt("spaceId", 0);
+        string kw = this.InAny("kw").Trim();
+        List<SysWikiDoc> docs = spaceId > 0
+            ? await this.SysWikiDoc.Where(a => a.spaceId == spaceId).OrderByDescending(a => a.updatedAt).ToListAsync()
+            : await this.SysWikiDoc.OrderByDescending(a => a.updatedAt).ToListAsync();
+
+        JsonWriter w = new JsonWriter();
+        w.WriteStartArray();
+        for (int i = 0; i < docs.Count; i = i + 1) {
+            SysWikiDoc g = docs[i];
+            if (kw.Length > 0 && !g.title.Contains(kw) && !g.tags.Contains(kw) && !g.summary.Contains(kw)) { continue; }
+            w.WriteStartObject();
+            w.WriteProperty("id", g.id);
+            w.WriteProperty("spaceId", g.spaceId);
+            w.WriteProperty("title", g.title);
+            w.WriteProperty("summary", g.summary);
+            w.WriteProperty("tags", g.tags);
+            w.WriteProperty("rev", g.rev);
+            w.WriteProperty("views", g.views);
+            w.WriteProperty("status", g.status);
+            w.WriteProperty("updatedBy", g.updatedBy);
+            w.WriteProperty("updatedAt", Fmt.Stamp(g.updatedAt));
+            w.WriteEndObject();
+        }
+        w.WriteEndArray();
+        AdminUiProtocol.Ok(this, w.ToString());
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.View)]
+    [Description("文档详情")]
+    public async void Doc() {
+        int id = this.InAnyInt("id", 0);
+        int incView = this.InAnyInt("view", 0);
+        SysWikiDoc g = await this.SysWikiDoc.ById(id);
+        if (g == null) { this.Fail(404, "0404", "文档不存在"); return; }
+        SysWikiSpace s = await this.SysWikiSpace.ById(g.spaceId);
+        int views = g.views;
+        if (incView == 1) {
+            views = views + 1;
+            int _u = await this.SysWikiDoc.Update()
+                .Set(a => a.views, views)
+                .Where(a => a.id == id).ExecuteAffrowsAsync();
+        }
+        List<string> labels = Prose.Tags(g.tags);
+
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("id", g.id);
+        w.WriteProperty("spaceId", g.spaceId);
+        w.WriteProperty("spaceName", s != null ? s.name : "");
+        w.WriteProperty("title", g.title);
+        w.WriteProperty("body", g.body);
+        w.WriteProperty("bodyHtml", MarkdownLite.Html(g.body));
+        w.WriteProperty("tags", g.tags);
+        w.WritePropertyName("tagList");
+        w.WriteStartArray();
+        for (int i = 0; i < labels.Count; i = i + 1) {
+            w.WriteString(labels[i]);
+        }
+        w.WriteEndArray();
+        w.WriteProperty("rev", g.rev);
+        w.WriteProperty("views", views);
+        w.WriteProperty("status", g.status);
+        w.WriteProperty("minutes", Prose.Minutes(g.body));
+        w.WriteProperty("updatedBy", g.updatedBy);
+        w.WriteProperty("updatedAt", Fmt.Stamp(g.updatedAt));
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(this, w.ToString());
     }
 
     [HttpPost]
     [Custom(Perm = PermBit.Create | PermBit.Update)]
     [Description("保存知识库")]
     public async void SpaceSave() {
-        int id = this.InInt("id", 0);
+        int id = this.InAnyInt("id", 0);
         if (!await this.Can(id > 0 ? (int)PermBit.Update : (int)PermBit.Create)) {
             this.Fail(403, "0403", "无操作权限"); return;
         }
-        string name = this.Need("name", "知识库名称");
+        string name = this.NeedAny("name", "知识库名称");
         if (name.Length > 64) { name = name.Substring(0, 64); }
-        string description = this.In("description");
+        string description = this.InAny("description");
         if (description.Length > 255) {
             description = description.Substring(0, 255);
         }
-        string icon = this.In("icon");
+        string icon = this.InAny("icon");
+        if (icon.Length == 0) { icon = "mdi:folder-outline"; }
         if (icon.Length > 32) { icon = icon.Substring(0, 32); }
-        int departmentId = this.InInt("departmentId", 0);
-        int sortOrder = this.InInt("sortOrder", 1);
-        int status = this.InInt("status", 1);
+        int departmentId = this.InAnyInt("departmentId", 0);
+        int sortOrder = this.InAnyInt("sortOrder", 1);
+        int status = this.InAnyInt("status", 1);
         if (status != 1) { status = 0; }
 
         if (id > 0) {
@@ -144,14 +223,15 @@ public class WikiController : AdminController {
     [Custom(Perm = PermBit.Delete)]
     [Description("删除知识库")]
     public async void SpaceDelete() {
-        int id = this.InInt("id", 0);
+        int id = this.InAnyInt("id", 0);
         SysWikiSpace s = await this.SysWikiSpace.ById(id);
-        if (s == null) { this.Fail(404, "0404", "知识库不存在"); }
+        if (s == null) { this.Fail(404, "0404", "知识库不存在"); return; }
         int docs = await this.SysWikiDoc
             .Where(a => a.spaceId == id).CountAsync();
         if (docs > 0) {
             this.Fail(400, "0004", "知识库下还有 " + Convert.ToString(docs)
                 + " 篇文档，先删除或移动它们");
+            return;
         }
         int n = await this.SysWikiSpace.Delete().Where(a => a.id == id)
             .ExecuteAffrowsAsync();
@@ -159,66 +239,33 @@ public class WikiController : AdminController {
         this.Saved("知识库已删除");
     }
 
-    /* 文档编辑页（非弹窗：正文需要足够的书写空间）。 */
-    [HttpGet]
-    [Custom(Perm = PermBit.Create | PermBit.Update)]
-    [Description("编辑文档")]
-    public async void Edit() {
-        int id = this.InInt("id", 0);
-        if (!await this.Can(id > 0 ? (int)PermBit.Update : (int)PermBit.Create)) {
-            this.Fail(403, "0403", "无操作权限"); return;
-        }
-        ViewData d = await this.Layout(id > 0 ? "编辑文档" : "新建文档");
-        d.Set("id", Convert.ToString(id));
-        d.Set("spaceId", this.In("spaceId"));
-        d.Set("status1", "selected");
-        bool aiOn = await Ai.Ready();
-        d.Set("aiReady", aiOn ? "1" : "");
-        if (id > 0) {
-            SysWikiDoc g = await this.SysWikiDoc.ById(id);
-            if (g == null) { this.Fail(404, "0404", "文档不存在"); }
-            d.Set("spaceId", Convert.ToString(g.spaceId));
-            d.Set("title", g.title);
-            d.Set("body", g.body);
-            d.Set("tags", g.tags);
-            d.Set("rev", Convert.ToString(g.rev));
-            d.Set("status1", "");
-            if (g.status == 1) { d.Set("status1", "selected"); }
-            else { d.Set("status0", "selected"); }
-        }
-        this.Page(d);
-    }
-
-    /* 保存文档：新建写版本 1；更新 rev+1 并把新状态整篇入快照。
-       note 为本次修订说明（人工改动时来自表单）。 */
+    /* 保存文档：新建写版本 1；更新 rev+1 并把新状态整篇入快照。 */
     [HttpPost]
     [Custom(Perm = PermBit.Create | PermBit.Update)]
     [Description("保存文档")]
     public async void Save() {
-        int id = this.InInt("id", 0);
+        int id = this.InAnyInt("id", 0);
         if (!await this.Can(id > 0 ? (int)PermBit.Update : (int)PermBit.Create)) {
             this.Fail(403, "0403", "无操作权限"); return;
         }
-        int spaceId = this.InInt("spaceId", 0);
-        string title = this.Need("title", "文档标题");
+        int spaceId = this.InAnyInt("spaceId", 0);
+        string title = this.NeedAny("title", "文档标题");
         if (title.Length > 128) { title = title.Substring(0, 128); }
-        /* 正文是 Markdown 源文，必须走 InRaw 保留换行；In/InText 都会经
-           Filter.Clean 丢弃 CR/LF。注入防线在渲染端：WikiController.Html 先转义再叠标记。 */
-        string body = this.InRaw("body").Trim();
-        if (body.Length == 0) { this.Fail(400, "0004", "正文不能为空"); }
-        string tags = this.In("tags");
+        string body = this.InAnyRaw("body").Trim();
+        if (body.Length == 0) { this.Fail(400, "0004", "正文不能为空"); return; }
+        string tags = this.InAny("tags");
         if (tags.Length > 128) { tags = tags.Substring(0, 128); }
-        string note = this.In("note");
+        string note = this.InAny("note");
         if (note.Length > 255) { note = note.Substring(0, 255); }
-        int status = this.InInt("status", 1);
+        int status = this.InAnyInt("status", 1);
         if (status != 1) { status = 0; }
         SysWikiSpace space = await this.SysWikiSpace.ById(spaceId);
-        if (space == null) { this.Fail(404, "0404", "所属知识库不存在"); }
+        if (space == null) { this.Fail(404, "0404", "所属知识库不存在"); return; }
         string editor = this.who != null ? this.who.username : "";
 
         if (id > 0) {
             SysWikiDoc cur = await this.SysWikiDoc.ById(id);
-            if (cur == null) { this.Fail(404, "0404", "文档不存在"); }
+            if (cur == null) { this.Fail(404, "0404", "文档不存在"); return; }
             int rev = cur.rev + 1;
             int n = await this.SysWikiDoc.Update()
                 .Set(a => a.title, title)
@@ -258,89 +305,67 @@ public class WikiController : AdminController {
         this.Saved("文档已创建");
     }
 
-    /* 阅读页：Markdown 渲染为 HTML，阅读计数 +1。 */
-    [HttpGet]
-    [Custom(Perm = PermBit.View)]
-    [Description("阅读文档")]
-    public async void Page() {
-        int id = this.InInt("id", 0);
-        SysWikiDoc g = await this.SysWikiDoc.ById(id);
-        if (g == null) { this.Fail(404, "0404", "文档不存在"); }
-        SysWikiSpace s = await this.SysWikiSpace.ById(g.spaceId);
-        ViewData d = await this.Layout(g.title);
-        d.Set("id", Convert.ToString(g.id));
-        d.Set("title", g.title);
-        d.Set("rev", Convert.ToString(g.rev));
-        d.Set("updatedBy", g.updatedBy);
-        d.Set("updatedAt", Fmt.Stamp(g.updatedAt));
-        d.Set("spaceName", s != null ? s.name : "");
-        d.Set("spaceId", Convert.ToString(g.spaceId));
-        d.Set("minutes", Convert.ToString(Prose.Minutes(g.body)));
-        d.Set("views", Convert.ToString(g.views + 1));
-        d.Set("bodyHtml", MarkdownLite.Html(g.body));
-        List<StrMap> tagItems = d.AddList("tags");
-        List<string> labels = Prose.Tags(g.tags);
-        for (int i = 0; i < labels.Count; i = i + 1) {
-            StrMap row = new StrMap();
-            row.Set("name", labels[i]);
-            tagItems.Add(row);
-        }
-        if (labels.Count > 0) { d.Set("hasTags", "1"); }
-        int _u = await this.SysWikiDoc.Update()
-            .Set(a => a.views, g.views + 1)
-            .Where(a => a.id == id).ExecuteAffrowsAsync();
-        this.Page(d);
-    }
-
-    [HttpGet]
+    [HttpPost]
     [Custom(Perm = PermBit.View)]
     [Description("修订历史")]
     public async void History() {
-        int id = this.InInt("id", 0);
+        int id = this.InAnyInt("id", 0);
         SysWikiDoc g = await this.SysWikiDoc.ById(id);
-        if (g == null) { this.Fail(404, "0404", "文档不存在"); }
-        ViewData d = await this.Layout(g.title + " · 修订历史");
-        d.Set("id", Convert.ToString(g.id));
-        d.Set("title", g.title);
-        d.Set("rev", Convert.ToString(g.rev));
+        if (g == null) { this.Fail(404, "0404", "文档不存在"); return; }
         bool canUp = await this.Can((int)PermBit.Update);
         List<SysWikiRevision> rows = await this.SysWikiRevision
             .Where(a => a.docId == id)
             .OrderByDescending(a => a.rev).ToListAsync();
-        List<StrMap> items = d.AddList("revisions");
-        Rows.Project(rows, items);
+
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("id", g.id);
+        w.WriteProperty("title", g.title);
+        w.WriteProperty("rev", g.rev);
+        w.WriteProperty("canRollback", canUp);
+        w.WritePropertyName("revisions");
+        w.WriteStartArray();
         for (int i = 0; i < rows.Count; i = i + 1) {
-            /* 回链指向文档而非修订本身，行上的 id 覆写为 g.id。 */
-            items[i].Set("id", Convert.ToString(g.id));
-            if (rows[i].rev == g.rev) { items[i].Set("current", "1"); }
-            if (canUp && rows[i].rev != g.rev) { items[i].Set("canRollback", "1"); }
+            SysWikiRevision r = rows[i];
+            w.WriteStartObject();
+            w.WriteProperty("rev", r.rev);
+            w.WriteProperty("title", r.title);
+            w.WriteProperty("note", r.note);
+            w.WriteProperty("editor", r.editor);
+            w.WriteProperty("createdAt", Fmt.Stamp(r.createdAt));
+            w.WriteProperty("current", r.rev == g.rev);
+            w.WriteEndObject();
         }
-        this.Page(d);
+        w.WriteEndArray();
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(this, w.ToString());
     }
 
-    /* 查看历史版本（只读渲染，不改变当前版本）。 */
-    [HttpGet]
+    [HttpPost]
     [Custom(Perm = PermBit.View)]
     [Description("查看版本")]
     public async void Revision() {
-        int id = this.InInt("id", 0);
-        int rev = this.InInt("rev", 0);
+        int id = this.InAnyInt("id", 0);
+        int rev = this.InAnyInt("rev", 0);
         SysWikiDoc g = await this.SysWikiDoc.ById(id);
-        if (g == null) { this.Fail(404, "0404", "文档不存在"); }
+        if (g == null) { this.Fail(404, "0404", "文档不存在"); return; }
         SysWikiRevision r = await this.SysWikiRevision
             .Where(a => a.docId == id)
             .Where(a => a.rev == rev).FirstAsync();
-        if (r == null) { this.Fail(404, "0404", "版本不存在"); }
-        ViewData d = await this.Layout(g.title + " · r"
-            + Convert.ToString(rev));
-        d.Set("id", Convert.ToString(id));
-        d.Set("title", g.title);
-        d.Set("rev", Convert.ToString(rev));
-        d.Set("editor", r.editor);
-        d.Set("createdAt", Fmt.Stamp(r.createdAt));
-        d.Set("note", r.note);
-        d.Set("bodyHtml", MarkdownLite.Html(r.body));
-        this.Page(d);
+        if (r == null) { this.Fail(404, "0404", "版本不存在"); return; }
+
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("id", id);
+        w.WriteProperty("title", r.title);
+        w.WriteProperty("rev", rev);
+        w.WriteProperty("editor", r.editor);
+        w.WriteProperty("createdAt", Fmt.Stamp(r.createdAt));
+        w.WriteProperty("note", r.note);
+        w.WriteProperty("body", r.body);
+        w.WriteProperty("bodyHtml", MarkdownLite.Html(r.body));
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(this, w.ToString());
     }
 
     /* 回滚 = 以历史版本内容新建一个版本，历史不被改写。 */
@@ -348,14 +373,14 @@ public class WikiController : AdminController {
     [Custom(Perm = PermBit.Update)]
     [Description("回滚版本")]
     public async void Rollback() {
-        int id = this.InInt("id", 0);
-        int rev = this.InInt("rev", 0);
+        int id = this.InAnyInt("id", 0);
+        int rev = this.InAnyInt("rev", 0);
         SysWikiDoc g = await this.SysWikiDoc.ById(id);
-        if (g == null) { this.Fail(404, "0404", "文档不存在"); }
+        if (g == null) { this.Fail(404, "0404", "文档不存在"); return; }
         SysWikiRevision r = await this.SysWikiRevision
             .Where(a => a.docId == id)
             .Where(a => a.rev == rev).FirstAsync();
-        if (r == null) { this.Fail(404, "0404", "版本不存在"); }
+        if (r == null) { this.Fail(404, "0404", "版本不存在"); return; }
         string editor = this.who != null ? this.who.username : "";
         int next = g.rev + 1;
         int n = await this.SysWikiDoc.Update()
@@ -376,23 +401,22 @@ public class WikiController : AdminController {
             + "，当前为 r" + Convert.ToString(next));
     }
 
-    /* AI 整理：把当前正文交给模型做结构化重写，结果作为一个新版本
-       落快照（note=AI 整理），人工可继续编辑或回滚。未配置 AI 时拒绝。 */
     [HttpPost]
     [Custom(Perm = PermBit.Update)]
     [Description("AI 整理")]
     public async void AiOrganize() {
         if (!await Ai.Ready()) {
             this.Fail(400, "0005", "尚未配置 AI 服务");
+            return;
         }
-        int id = this.InInt("id", 0);
+        int id = this.InAnyInt("id", 0);
         SysWikiDoc g = await this.SysWikiDoc.ById(id);
-        if (g == null) { this.Fail(404, "0404", "文档不存在"); }
+        if (g == null) { this.Fail(404, "0404", "文档不存在"); return; }
         AiReply r = await Ai.CompleteRaw(OrganizePrompt,
             g.title + "\n\n" + g.body);
-        if (!r.ok) { this.Fail(502, "0502", r.text); }
+        if (!r.ok) { this.Fail(502, "0502", r.text); return; }
         string body = r.text.Trim();
-        if (body.Length == 0) { this.Fail(502, "0502", "模型返回空内容"); }
+        if (body.Length == 0) { this.Fail(502, "0502", "模型返回空内容"); return; }
         if (body.Length > 200000) { body = body.Substring(0, 200000); }
         string editor = this.who != null ? this.who.username : "ai";
         int next = g.rev + 1;
@@ -414,9 +438,9 @@ public class WikiController : AdminController {
     [Custom(Perm = PermBit.Delete)]
     [Description("删除文档")]
     public async void Delete() {
-        int id = this.InInt("id", 0);
+        int id = this.InAnyInt("id", 0);
         SysWikiDoc g = await this.SysWikiDoc.ById(id);
-        if (g == null) { this.Fail(404, "0404", "文档不存在"); }
+        if (g == null) { this.Fail(404, "0404", "文档不存在"); return; }
         string title = g.title;
         int n = await this.SysWikiDoc.Delete().Where(a => a.id == id)
             .ExecuteAffrowsAsync();

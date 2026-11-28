@@ -1,0 +1,203 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Net;
+
+// 竞技排位 BP 选人阶段类型。
+public enum DraftPhaseKind {
+    Ban = 0,
+    Pick = 1,
+    Completed = 2
+}
+
+// 单个 BP 回合配置与锁定记录。
+public class DraftStepRecord {
+    public int StepIndex;
+    public int TeamId; // 1=蓝方, 2=红方
+    public DraftPhaseKind Phase;
+    public int HeroId;
+
+    public DraftStepRecord(int stepIndex, int teamId, DraftPhaseKind phase) {
+        this.StepIndex = stepIndex;
+        this.TeamId = teamId;
+        this.Phase = phase;
+        this.HeroId = 0;
+    }
+}
+
+// 商业 MOBA/竞技排位 BP 状态机：交替禁选顺序校验、全局唯一英雄防重（禁用/已选皆不可复选）与完结态转换。
+public class NetHeroDraftSession {
+    private List<DraftStepRecord> steps;
+    public int CurrentStep;
+
+    public NetHeroDraftSession() {
+        this.steps = new List<DraftStepRecord>();
+        this.CurrentStep = 0;
+    }
+
+    public void AddStep(int teamId, DraftPhaseKind phase) {
+        if (phase == DraftPhaseKind.Completed) { return; }
+        this.steps.Add(new DraftStepRecord(this.steps.Count, teamId, phase));
+    }
+
+    public DraftPhaseKind CurrentPhase() {
+        if (this.CurrentStep >= this.steps.Count) { return DraftPhaseKind.Completed; }
+        return this.steps[this.CurrentStep].Phase;
+    }
+
+    public int CurrentTeamId() {
+        if (this.CurrentStep >= this.steps.Count) { return 0; }
+        return this.steps[this.CurrentStep].TeamId;
+    }
+
+    public bool IsHeroUnavailable(int heroId) {
+        if (heroId <= 0) { return true; }
+        for (int i = 0; i < this.CurrentStep; i = i + 1) {
+            if (this.steps[i].HeroId == heroId) { return true; }
+        }
+        return false;
+    }
+
+    public bool LockHero(int teamId, int heroId) {
+        if (this.CurrentStep >= this.steps.Count) { return false; }
+        DraftStepRecord step = this.steps[this.CurrentStep];
+        if (step.TeamId != teamId) { return false; }
+        if (this.IsHeroUnavailable(heroId)) { return false; }
+        step.HeroId = heroId;
+        this.CurrentStep = this.CurrentStep + 1;
+        return true;
+    }
+
+    public List<int> GetTeamPicks(int teamId) {
+        List<int> picks = new List<int>();
+        for (int i = 0; i < this.CurrentStep; i = i + 1) {
+            DraftStepRecord s = this.steps[i];
+            if (s.TeamId == teamId && s.Phase == DraftPhaseKind.Pick && s.HeroId > 0) {
+                picks.Add(s.HeroId);
+            }
+        }
+        return picks;
+    }
+}
+
+// 对局内玩家连杀赏金账本条目。
+public class BountyContractRecord {
+    public int PlayerId;
+    public int KillStreak;
+    public int ShutdownGold;
+
+    public BountyContractRecord(int playerId) {
+        this.PlayerId = playerId;
+        this.KillStreak = 0;
+        this.ShutdownGold = 0;
+    }
+}
+
+// 商业竞技对局赏金追踪器：连杀阶梯赏金递增、终结结算归零与经济劣势方翻盘赏金加成。
+public class NetMatchBountyTracker {
+    private List<BountyContractRecord> records;
+    public int BaseKillGold;
+    public int StreakStepGold;
+    public int MaxShutdownGold;
+
+    public NetMatchBountyTracker(int baseKillGold, int streakStepGold, int maxShutdownGold) {
+        this.records = new List<BountyContractRecord>();
+        this.BaseKillGold = baseKillGold > 0 ? baseKillGold : 300;
+        this.StreakStepGold = streakStepGold > 0 ? streakStepGold : 150;
+        this.MaxShutdownGold = maxShutdownGold > 0 ? maxShutdownGold : 1000;
+    }
+
+    public BountyContractRecord EnsurePlayer(int playerId) {
+        for (int i = 0; i < this.records.Count; i = i + 1) {
+            if (this.records[i].PlayerId == playerId) { return this.records[i]; }
+        }
+        BountyContractRecord r = new BountyContractRecord(playerId);
+        this.records.Add(r);
+        return r;
+    }
+
+    // 记录一次击杀并返回击杀者获得的总赏金（基础击杀金 + 终结赏金 + 劣势翻盘倍率）。
+    public int RecordKill(int killerId, int victimId, bool killerTeamTrailing) {
+        BountyContractRecord killer = this.EnsurePlayer(killerId);
+        BountyContractRecord victim = this.EnsurePlayer(victimId);
+
+        int shutdown = victim.ShutdownGold;
+        victim.KillStreak = 0;
+        victim.ShutdownGold = 0;
+
+        killer.KillStreak = killer.KillStreak + 1;
+        if (killer.KillStreak >= 2) {
+            int bonus = (killer.KillStreak - 1) * this.StreakStepGold;
+            if (bonus > this.MaxShutdownGold) { bonus = this.MaxShutdownGold; }
+            killer.ShutdownGold = bonus;
+        }
+
+        int total = this.BaseKillGold + shutdown;
+        if (killerTeamTrailing && shutdown > 0) {
+            total = total + (shutdown / 2); // 劣势方终结高赏金目标获得 +50% 翻盘赏金
+        }
+        return total;
+    }
+}
+
+// 服务端快照帧（用于客户端插值抖动缓冲）。
+public class JitterSnapshotFrame {
+    public int Tick;
+    public int PayloadChecksum;
+
+    public JitterSnapshotFrame(int tick, int payloadChecksum) {
+        this.Tick = tick;
+        this.PayloadChecksum = payloadChecksum;
+    }
+}
+
+// 客户端自适应快照抖动缓冲：乱序自动按 Tick 升序归位、重复包去重、迟到过旧包丢弃计数与稳定深度出队。
+public class NetSnapshotJitterBuffer {
+    private List<JitterSnapshotFrame> queue;
+    public int TargetDepth;
+    public int LastPoppedTick;
+    public int DroppedLateCount;
+    public int DroppedDuplicateCount;
+
+    public NetSnapshotJitterBuffer(int targetDepth) {
+        this.queue = new List<JitterSnapshotFrame>();
+        this.TargetDepth = targetDepth > 0 ? targetDepth : 3;
+        this.LastPoppedTick = -1;
+        this.DroppedLateCount = 0;
+        this.DroppedDuplicateCount = 0;
+    }
+
+    public int BufferedCount() { return this.queue.Count; }
+
+    public bool Push(int tick, int payloadChecksum) {
+        if (tick <= this.LastPoppedTick) {
+            this.DroppedLateCount = this.DroppedLateCount + 1;
+            return false;
+        }
+        for (int i = 0; i < this.queue.Count; i = i + 1) {
+            if (this.queue[i].Tick == tick) {
+                this.DroppedDuplicateCount = this.DroppedDuplicateCount + 1;
+                return false;
+            }
+        }
+        JitterSnapshotFrame f = new JitterSnapshotFrame(tick, payloadChecksum);
+        int pos = this.queue.Count;
+        while (pos > 0 && this.queue[pos - 1].Tick > tick) {
+            pos = pos - 1;
+        }
+        this.queue.Insert(pos, f);
+        return true;
+    }
+
+    // 当缓冲积攒达到目标深度（或已进入播放流）时弹出最早的一帧。
+    public JitterSnapshotFrame PopNextReady() {
+        if (this.queue.Count == 0) { return null; }
+        if (this.LastPoppedTick < 0 && this.queue.Count < this.TargetDepth) {
+            return null;
+        }
+        JitterSnapshotFrame head = this.queue[0];
+        this.queue.RemoveAt(0);
+        this.LastPoppedTick = head.Tick;
+        return head;
+    }
+}

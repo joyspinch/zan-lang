@@ -1,0 +1,281 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+using System.Threading;
+using System.Web;
+using Zan.Web.AdminUi;
+using Zan.Web.Core;
+using Zan.Web.Model;
+using Zan.Web.Services;
+using Zan.Web;
+
+namespace Zan.Web.Api;
+
+/* 通用前端壳元数据、动态菜单路由与全局字典控制器（规范前缀 /api/shell/...）：
+     GET /api/shell/meta         : 协议版本与能力发现（公开，供前端壳自适配）
+     GET /api/shell/menu         : 动态 MenuRoute[] 树（自动区分 view.vlist 与 view.iframe-page）
+     GET /api/shell/dict         : 全局字典映射
+     GET /api/shell/route-exists : 路由存在性校验 */
+[Custom(Authorization = CustomAuthorization.Login)]
+[Description("通用前端壳配置")]
+public class AdminUiConfController : Zan.Web.AdminApiController {
+    [HttpGet]
+    [Route("/api/shell/meta")]
+    [Custom(Authorization = CustomAuthorization.None)]
+    [Description("前端壳能力自描述")]
+    public void ShellMeta() {
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("protocolVersion", AdminUiProtocol.Version);
+        w.WriteProperty("backend", "zan-mvc");
+        w.WriteProperty("spaUrl", Cfg.Server.spaUrl != null ? Cfg.Server.spaUrl : "/ui");
+        w.WriteProperty("spaMounted", Cfg.Server.spaDir != null && Cfg.Server.spaDir.Trim().Length > 0);
+        w.WritePropertyName("capabilities");
+        w.WriteStartObject();
+        w.WriteProperty("vlist", true);
+        w.WriteProperty("formModal", true);
+        w.WriteProperty("confirmAction", true);
+        w.WriteProperty("detailView", true);
+        w.WriteProperty("iframeModal", false);
+        w.WriteProperty("batchRowsForm", true);
+        w.WriteProperty("drilldownNavigate", true);
+        w.WriteProperty("summaryBar", true);
+        w.WriteProperty("leftPanel", true);
+        w.WriteProperty("permMatrix", true);
+        w.WriteProperty("pageTypeDispatch", true);
+        w.WriteProperty("logout", true);
+        w.WriteProperty("iframeFallback", false);
+        w.WriteProperty("dict", true);
+        w.WriteProperty("userPrefs", true);
+        w.WriteEndObject();
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(this, w.ToString());
+    }
+
+    [HttpGet]
+    [Route("/api/shell/menu")]
+    [Custom(Authorization = CustomAuthorization.Login)]
+    [Description("动态菜单路由")]
+    public async void ShellMenu() { await HandleMenu(); }
+
+    [HttpGet]
+    [Route("/api/shell/dict")]
+    [Custom(Authorization = CustomAuthorization.Login)]
+    [Description("全局字典")]
+    public async void ShellDict() { await HandleDict(); }
+
+    [HttpGet]
+    [Route("/api/shell/route-exists")]
+    [Custom(Authorization = CustomAuthorization.Login)]
+    [Description("路由存在性校验")]
+    public async void ShellRouteExist() { await HandleIsRouteExist(); }
+
+    private async Task HandleMenu() {
+        WebApp app = WebHost.Current();
+        List<MenuNode> nodes = await MenuService.ForUser(
+            app, this.uid, "", this.DbReady() ? this.Held() : null);
+
+        List<string> groupNames = new List<string>();
+        List<string> groupIcons = new List<string>();
+        List<List<MenuNode>> groupItems = new List<List<MenuNode>>();
+        StrMap groupIdx = new StrMap();
+
+        for (int i = 0; i < nodes.Count; i = i + 1) {
+            MenuNode n = nodes[i];
+            string p = n.Path();
+            if (p == null || p.Length == 0) { continue; }
+            string g = n.Group();
+            if (g == null || g.Length == 0) { g = "工作台"; }
+            int idx = -1;
+            if (groupIdx.Has(g)) {
+                idx = Filter.ToInt(groupIdx.Get(g), -1);
+            }
+            if (idx < 0) {
+                idx = groupNames.Count;
+                groupIdx.Set(g, Convert.ToString(idx));
+                groupNames.Add(g);
+                groupIcons.Add(n.Icon().Length > 0 ? n.Icon() : "mdi:folder-outline");
+                groupItems.Add(new List<MenuNode>());
+            }
+            groupItems[idx].Add(n);
+        }
+
+        JsonWriter w = new JsonWriter();
+        w.WriteStartArray();
+        for (int gi = 0; gi < groupNames.Count; gi = gi + 1) {
+            List<MenuNode> items = groupItems[gi];
+            if (items.Count == 0) { continue; }
+            string gSlug = "grp" + Convert.ToString(gi);
+            w.WriteStartObject();
+            w.WriteProperty("name", gSlug);
+            w.WriteProperty("path", "/" + gSlug);
+            w.WriteProperty("component", "layout.base");
+
+            w.WritePropertyName("meta");
+            w.WriteStartObject();
+            w.WriteProperty("title", groupNames[gi]);
+            w.WriteProperty("icon", groupIcons[gi]);
+            w.WriteProperty("order", gi + 1);
+            w.WriteEndObject();
+
+            w.WritePropertyName("children");
+            w.WriteStartArray();
+            for (int ci = 0; ci < items.Count; ci = ci + 1) {
+                MenuNode item = items[ci];
+                string itemPath = item.Path();
+                string routeName = RouteNameFor(gSlug, itemPath, ci);
+                w.WriteStartObject();
+                w.WriteProperty("name", routeName);
+                w.WriteProperty("path", itemPath);
+                w.WriteProperty("component", "view.vlist");
+                w.WritePropertyName("meta");
+                w.WriteStartObject();
+                w.WriteProperty("title", item.Title());
+                w.WriteProperty("icon", item.Icon().Length > 0 ? item.Icon() : "mdi:table");
+                w.WriteProperty("order", ci + 1);
+                w.WriteProperty("keepAlive", true);
+                w.WriteEndObject();
+                w.WriteEndObject();
+            }
+            w.WriteEndArray();
+            w.WriteEndObject();
+        }
+        w.WriteStartObject();
+        w.WriteProperty("name", "shell-hidden");
+        w.WriteProperty("path", "/shell-hidden");
+        w.WriteProperty("component", "layout.base");
+        w.WritePropertyName("meta");
+        w.WriteStartObject();
+        w.WriteProperty("title", "系统内置");
+        w.WriteProperty("hideInMenu", true);
+        w.WriteProperty("order", 999);
+        w.WriteEndObject();
+        w.WritePropertyName("children");
+        w.WriteStartArray();
+        w.WriteStartObject();
+        w.WriteProperty("name", "shell-hidden_admin-profile");
+        w.WriteProperty("path", "/admin/profile");
+        w.WriteProperty("component", "view.vlist");
+        w.WritePropertyName("meta");
+        w.WriteStartObject();
+        w.WriteProperty("title", "个人资料");
+        w.WriteProperty("icon", "mdi:account-circle");
+        w.WriteProperty("hideInMenu", true);
+        w.WriteProperty("keepAlive", true);
+        w.WriteEndObject();
+        w.WriteEndObject();
+        w.WriteStartObject();
+        w.WriteProperty("name", "shell-hidden_admin-system-jobs-logs");
+        w.WriteProperty("path", "/admin/system/jobs/logs");
+        w.WriteProperty("component", "view.vlist");
+        w.WritePropertyName("meta");
+        w.WriteStartObject();
+        w.WriteProperty("title", "任务运行历史");
+        w.WriteProperty("icon", "mdi:history");
+        w.WriteProperty("hideInMenu", true);
+        w.WriteProperty("keepAlive", true);
+        w.WriteEndObject();
+        w.WriteEndObject();
+        w.WriteEndArray();
+        w.WriteEndObject();
+
+        w.WriteEndArray();
+        AdminUiProtocol.Ok(this, w.ToString());
+    }
+
+    private async Task HandleDict() {
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        bool hasStatus = false;
+
+        if (this.DbReady()) {
+            try {
+                List<SysDictType> types = await this.SysDictType.AllActive();
+                for (int i = 0; i < types.Count; i = i + 1) {
+                    SysDictType dt = types[i];
+                    if (dt.code == null || dt.code.Length == 0) { continue; }
+                    if (dt.code == "Status") { hasStatus = true; }
+                    List<SysDictItem> items = await this.SysDictItem.ByTypeCodeActive(dt.code);
+                    w.WritePropertyName(dt.code);
+                    w.WriteStartObject();
+                    w.WriteProperty("DictName", dt.name != null && dt.name.Length > 0 ? dt.name : dt.code);
+                    w.WritePropertyName("Content");
+                    w.WriteStartObject();
+                    for (int j = 0; j < items.Count; j = j + 1) {
+                        w.WriteProperty(items[j].value, items[j].label);
+                    }
+                    w.WriteEndObject();
+                    w.WriteEndObject();
+                }
+            } catch (Exception _ex) {
+                /* 降级：未初始化字典表时返回内置 Status 字典。 */
+            }
+        }
+
+        if (!hasStatus) {
+            w.WritePropertyName("Status");
+            w.WriteStartObject();
+            w.WriteProperty("DictName", "状态");
+            w.WritePropertyName("Content");
+            w.WriteStartObject();
+            w.WriteProperty("0", "禁用");
+            w.WriteProperty("1", "启用");
+            w.WriteEndObject();
+            w.WriteEndObject();
+        }
+
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(this, w.ToString());
+    }
+
+    private async Task HandleIsRouteExist() {
+        string target = this.InAny("routeName").Trim();
+        bool found = target == "home" || target == "login" || target == "403" || target == "404" || target == "500"
+            || target == "shell-hidden" || target == "shell-hidden_admin-profile"
+            || target == "shell-hidden_admin-system-jobs-logs";
+        if (!found && target.Length > 0) {
+            WebApp app = WebHost.Current();
+            List<MenuNode> nodes = await MenuService.ForUser(
+                app, this.uid, "", this.DbReady() ? this.Held() : null);
+            StrMap groupIdx = new StrMap();
+            List<int> groupCounts = new List<int>();
+            for (int i = 0; i < nodes.Count; i = i + 1) {
+                MenuNode n = nodes[i];
+                string g = n.Group();
+                if (g == null || g.Length == 0) { g = "工作台"; }
+                int gi = -1;
+                if (groupIdx.Has(g)) { gi = Filter.ToInt(groupIdx.Get(g), -1); }
+                if (gi < 0) {
+                    gi = groupCounts.Count;
+                    groupIdx.Set(g, Convert.ToString(gi));
+                    groupCounts.Add(0);
+                }
+                string gSlug = "grp" + Convert.ToString(gi);
+                int ci = groupCounts[gi];
+                groupCounts[gi] = ci + 1;
+                if (target == gSlug || target == RouteNameFor(gSlug, n.Path(), ci)) {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        AdminUiProtocol.Ok(this, found ? "true" : "false");
+    }
+
+    private static string RouteNameFor(string gSlug, string path, int index) {
+        string clean = "";
+        if (path != null) {
+            for (int i = 0; i < path.Length; i = i + 1) {
+                string ch = path.Substring(i, 1);
+                bool ok = (ch >= "a" && ch <= "z") || (ch >= "A" && ch <= "Z") || (ch >= "0" && ch <= "9");
+                if (ok) { clean = clean + ch; }
+                else if (clean.Length > 0 && !clean.EndsWith("-")) { clean = clean + "-"; }
+            }
+        }
+        while (clean.EndsWith("-")) {
+            clean = clean.Substring(0, clean.Length - 1);
+        }
+        if (clean.Length == 0) { clean = "item" + Convert.ToString(index); }
+        return gSlug + "_" + clean;
+    }
+}

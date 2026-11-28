@@ -8,6 +8,7 @@ public delegate void SqlTraceSink(string sql, long us);
 
 // SQL 执行耗时与链路追踪上报槽点，打通 OpenTelemetry 数据库遥测规范与慢查询治理。
 public class DbTrace {
+    private static string stateLock = "System.Data.DbTrace.stateLock";
     public static SqlTraceSink sink = null;
     public static SqlTraceSink slowSink = null;
     public static long slowThresholdUs = 500000; // 默认 500ms
@@ -15,28 +16,38 @@ public class DbTrace {
     public static string dbSystemName = "sql";
 
     // 配置耗时 SQL 语句接收回调；传入 null 停止追踪。
-    public static void Sink(SqlTraceSink fn) { DbTrace.sink = fn; }
+    public static void Sink(SqlTraceSink fn) {
+        lock (DbTrace.stateLock) { DbTrace.sink = fn; }
+    }
 
     // 配置慢查询告警接收回调。
-    public static void OnSlowQuery(SqlTraceSink fn) { DbTrace.slowSink = fn; }
+    public static void OnSlowQuery(SqlTraceSink fn) {
+        lock (DbTrace.stateLock) { DbTrace.slowSink = fn; }
+    }
 
     // 设置慢查询阈值（毫秒）。
     public static void SetSlowQueryThresholdMs(int ms) {
-        DbTrace.slowThresholdUs = ms > 0 ? (long)ms * 1000L : 500000L;
+        lock (DbTrace.stateLock) {
+            DbTrace.slowThresholdUs = ms > 0 ? (long)ms * 1000L : 500000L;
+        }
     }
 
     // 设置数据库类型名称（例如 "mysql", "postgres", "sqlite", "sqlserver"）。
     public static void SetDbSystem(string system) {
-        DbTrace.dbSystemName = system != null ? system : "sql";
+        lock (DbTrace.stateLock) {
+            DbTrace.dbSystemName = system != null ? system : "sql";
+        }
     }
 
     // 是否开启自动 Activity 分布式链路追踪。
     public static void EnableActivityTracing(bool on) {
-        DbTrace.activityTracing = on;
+        lock (DbTrace.stateLock) { DbTrace.activityTracing = on; }
     }
 
     public static bool Enabled() {
-        return DbTrace.sink != null || DbTrace.slowSink != null || DbTrace.activityTracing;
+        lock (DbTrace.stateLock) {
+            return DbTrace.sink != null || DbTrace.slowSink != null || DbTrace.activityTracing;
+        }
     }
 
     public static long NowUs() {
@@ -48,10 +59,16 @@ public class DbTrace {
 
     // 开启一次 SQL 操作，若当前存在链路且开启追踪则返回对应 Activity。
     public static Activity BeginSpan(string sql) {
-        if (!DbTrace.activityTracing) { return null; }
+        bool traceOn = false;
+        string sysName = "sql";
+        lock (DbTrace.stateLock) {
+            traceOn = DbTrace.activityTracing;
+            sysName = DbTrace.dbSystemName;
+        }
+        if (!traceOn) { return null; }
         if (Activity.Current == null) { return null; }
         Activity span = Activity.Start("db.query");
-        span.SetTag("db.system", DbTrace.dbSystemName);
+        span.SetTag("db.system", sysName);
         if (sql != null) {
             span.SetTag("db.statement", sql);
         }
@@ -63,20 +80,29 @@ public class DbTrace {
         long us = DbTrace.NowUs() - startUs;
         if (us < 0) { us = 0; }
 
+        SqlTraceSink curSink = null;
+        SqlTraceSink curSlow = null;
+        long thresh = 500000L;
+        lock (DbTrace.stateLock) {
+            curSink = DbTrace.sink;
+            curSlow = DbTrace.slowSink;
+            thresh = DbTrace.slowThresholdUs;
+        }
+
         if (span != null) {
             span.SetTag("db.duration_us", Convert.ToString(us));
-            if (us >= DbTrace.slowThresholdUs) {
+            if (us >= thresh) {
                 span.SetTag("db.slow", "true");
             }
             span.Stop();
         }
 
-        if (DbTrace.sink != null) {
-            DbTrace.sink(sql, us);
+        if (curSink != null) {
+            curSink(sql, us);
         }
 
-        if (us >= DbTrace.slowThresholdUs && DbTrace.slowSink != null) {
-            DbTrace.slowSink(sql, us);
+        if (us >= thresh && curSlow != null) {
+            curSlow(sql, us);
         }
     }
 

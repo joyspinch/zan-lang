@@ -55,22 +55,57 @@ public partial class DataTable {
         return col.editable && !col.required && col.formula.Length == 0;
     }
 
-    // 把一个文本块按 Excel 语义平铺进槽位×列的矩形：
-    // 行取 `lines[(slot-r0)%行数]`，列取 `fields[ci%bw]`，
-    // 块比目标大则裁剪。写入前跳过分组行。
-    public static int PasteSeg(DataTableState st, List<DataColumn> cols, DataSource src,
-                        List<string> lines, int bw,
-                        int slotR0, int slotR1, int c0, int ncols) {
+    // 计算粘贴目标列序列：优先遵循视觉列序并跳过隐藏列。
+    private static List<int> PasteTargetCols(DataTableState st, List<DataColumn> cols,
+                                             int c0, int c1, bool rangeMode) {
+        List<int> targets = new List<int>();
+        if (cols == null || cols.Count == 0) { return targets; }
+        if (st != null && st.colHidden != null && st.colHidden.Count >= cols.Count) {
+            List<int> vorder = DataTable.VisibleOrder(st, cols);
+            if (rangeMode) {
+                for (int i = 0; i < vorder.Count; i = i + 1) {
+                    int cc = vorder[i];
+                    if (cc >= c0 && cc <= c1) { targets.Add(cc); }
+                }
+                return targets;
+            }
+            int startPos = vorder.IndexOf(c0);
+            if (startPos >= 0) {
+                for (int i = startPos; i < vorder.Count; i = i + 1) {
+                    targets.Add(vorder[i]);
+                }
+                return targets;
+            }
+        }
+        int endCol = rangeMode ? c1 : cols.Count - 1;
+        if (endCol >= cols.Count) { endCol = cols.Count - 1; }
+        for (int cc = c0; cc <= endCol; cc = cc + 1) {
+            if (cc < 0) { continue; }
+            if (st != null && st.colHidden != null && cc < st.colHidden.Count && st.colHidden[cc]) { continue; }
+            targets.Add(cc);
+        }
+        return targets;
+    }
+
+    // 把一个已解析的二维矩阵块按 Excel 语义平铺进槽位×列的矩形：
+    // 行取 `rows[(slot-r0)%行数]`，列取 `fields[ci%bw]`，
+    // 块比目标大则裁剪。写入前跳过分组行，列按视觉列序映射并跳过隐藏列。
+    public static int PasteSegRows(DataTableState st, List<DataColumn> cols, DataSource src,
+                            List<List<string>> rows, int bw,
+                            int slotR0, int slotR1, int c0, int ncols) {
+        if (rows == null || rows.Count == 0 || ncols <= 0) { return 0; }
+        List<int> targetCols = DataTable.PasteTargetCols(st, cols, c0, c0 + ncols - 1, true);
+        if (targetCols.Count == 0) { return 0; }
         int written = 0;
         int t = slotR0;
         while (t <= slotR1 && t < DataTable.DispCount(st)) {
             if (DataTable.DispKind(st, t) == 0) {
                 int row = DataTable.DispRowOf(st, t);
-                List<string> fields = DataTable.SplitTabs(lines[(t - slotR0) % lines.Count]);
-                for (int ci = 0; ci < ncols && c0 + ci < cols.Count; ci = ci + 1) {
+                List<string> fields = rows[(t - slotR0) % rows.Count];
+                for (int ci = 0; ci < targetCols.Count; ci = ci + 1) {
                     int fi = ci % bw;
                     string v = fi < fields.Count ? fields[fi] : "";
-                    written = written + DataTable.WriteCellValue(st, cols, src, row, c0 + ci, v);
+                    written = written + DataTable.WriteCellValue(st, cols, src, row, targetCols[ci], v);
                 }
             }
             t = t + 1;
@@ -78,31 +113,41 @@ public partial class DataTable {
         return written;
     }
 
-    // 从光标处开始向网格粘贴制表符分隔文本。
+    // 把一个文本块按 Excel 语义平铺进槽位×列的矩形（兼容旧签名）。
+    public static int PasteSeg(DataTableState st, List<DataColumn> cols, DataSource src,
+                        List<string> lines, int bw,
+                        int slotR0, int slotR1, int c0, int ncols) {
+        List<List<string>> rows = new List<List<string>>();
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            rows.Add(DataTable.SplitTabs(lines[i]));
+        }
+        return DataTable.PasteSegRows(st, cols, src, rows, bw, slotR0, slotR1, c0, ncols);
+    }
+
+    // 从光标处开始向网格粘贴制表符分隔文本（支持 RFC4180 多行引号单元格）。
     // 有选区时按 Excel 语义写入整个选区：块比选区小就
     // 平铺（1x1 块铺满整片），块比选区大则裁剪到选区内；
     // 多区域（Ctrl 追加）时逐区域独立平铺。无选区时从
-    // 锚点向下向右铺开（块按原样流动）。一次粘贴记一组
+    // 锚点向下向右铺开（沿视觉列序，自动跳过隐藏列）。一次粘贴记一组
     // 撤销。只有可编辑且非 bool 的列接受值；bool 列通过
     // ParseBool 读取粘贴文本，"Yes"/"1" 都能落库。
     // 返回实际写入的单元格数。
     public static int PasteText(DataTableState st, List<DataColumn> cols, DataSource src, string text) {
         if (text.Length == 0) { return 0; }
 
-        // 解析块：丢掉结尾空行（它们不指向任何行），
+        // 解析块（支持含换行的引号 TSV，且自动丢弃结尾空行），
         // 宽度取最宽行，供平铺取模对齐。
-        List<string> lines = DataTable.SplitLines(text);
-        while (lines.Count > 0 && lines[lines.Count - 1].Length == 0) { lines.RemoveAt(lines.Count - 1); }
-        if (lines.Count == 0) { return 0; }
+        List<List<string>> rows = DataTable.ParseTsvRows(text);
+        if (rows.Count == 0) { return 0; }
         int bw = 1;
-        for (int li = 0; li < lines.Count; li = li + 1) {
-            int w = DataTable.SplitTabs(lines[li]).Count;
+        for (int li = 0; li < rows.Count; li = li + 1) {
+            int w = rows[li].Count;
             if (w > bw) { bw = w; }
         }
 
         int nRanges = DataTable.RangeCount(st);
         if (nRanges == 0) {
-            // 无选区：从锚点向下向右铺开（旧语义）。
+            // 无选区：从锚点向下向右沿视觉列序铺开。
             int r0 = st.hitOrder;
             int c0 = st.hitCol;
             if (r0 < 0 || c0 < 0) { return 0; }
@@ -110,20 +155,22 @@ public partial class DataTable {
             // 从那里起第一个数据行开始写入。
             r0 = DataTable.NextDataSlot(st, r0, 1);
             if (r0 < 0) { return 0; }
+            List<int> targetCols = DataTable.PasteTargetCols(st, cols, c0, cols.Count - 1, false);
+            if (targetCols.Count == 0) { return 0; }
 
             // 一次粘贴记一次撤销，无论涉及多少单元格。
             DataTable.BeginUndoGroup(st);
             int written = 0;
             int slot = r0;
             int li = 0;
-            while (li < lines.Count) {
+            while (li < rows.Count) {
                 slot = DataTable.NextDataSlot(st, slot, 1);
-                if (slot < 0) { li = lines.Count; }
+                if (slot < 0) { li = rows.Count; }
                 else {
                     int row = DataTable.DispRowOf(st, slot);
-                    List<string> fields = DataTable.SplitTabs(lines[li]);
-                    for (int fi = 0; fi < fields.Count && c0 + fi < cols.Count; fi = fi + 1) {
-                        written = written + DataTable.WriteCellValue(st, cols, src, row, c0 + fi, fields[fi]);
+                    List<string> fields = rows[li];
+                    for (int fi = 0; fi < fields.Count && fi < targetCols.Count; fi = fi + 1) {
+                        written = written + DataTable.WriteCellValue(st, cols, src, row, targetCols[fi], fields[fi]);
                     }
                     slot = slot + 1;
                     li = li + 1;
@@ -132,7 +179,7 @@ public partial class DataTable {
             DataTable.EndUndoGroup(st);
             if (written > 0) {
                 st.editRow = DataTable.DispRowOf(st, r0);
-                st.editCol = c0;
+                st.editCol = targetCols[0];
                 st.CellEdit.Raise();
                 st.dirty = true;
             }
@@ -149,7 +196,7 @@ public partial class DataTable {
             if (!DataTable.RangeAt(st, qi, out qr0, out qc0, out qr1, out qc1)) { continue; }
             if (qr0 < 0 || qc0 < 0) { continue; }
             int ncols = qc1 - qc0 + 1;
-            total = total + DataTable.PasteSeg(st, cols, src, lines, bw, qr0, qr1, qc0, ncols);
+            total = total + DataTable.PasteSegRows(st, cols, src, rows, bw, qr0, qr1, qc0, ncols);
             if (editSlot < 0) {
                 int fs = DataTable.NextDataSlot(st, qr0, 1);
                 if (fs >= 0 && fs <= qr1) { editSlot = fs; editCol = qc0; }
@@ -306,12 +353,12 @@ public partial class DataTable {
                 int mir = right
                     ? ((k % srcCols) + srcCols) % srcCols
                     : srcCols - 1 - (((k % srcCols) + srcCols) % srcCols);
-                int srcCol = right ? sc0 + mir : sc0 + mir;
+                int srcCol = sc0 + mir;
                 if (!DataTable.FillWritable(cols[t])) { t = t + 1; continue; }
                 for (int ri = 0; ri < srcRows.Count; ri = ri + 1) {
                     int row = srcRows[ri];
                     string v = null;
-                    if (srcRows.Count >= 2) {
+                    if (srcCols >= 2) {
                         v = DataTable.FillSeriesValueRow(st, cols, src, row, sc0, sc1, right ? t - sc1 : sc0 - t, right);
                     }
                     if (v == null) { v = src.CellText(row, srcCol); }
@@ -321,7 +368,7 @@ public partial class DataTable {
             }
         }
         DataTable.EndUndoGroup(st);
-        if (written > 0) { st.CellEdit.Raise(); st.dirty = true; }
+        if (written > 0) { st.CellEdit.Raise(st.host); st.dirty = true; }
         return written;
     }
 
@@ -345,38 +392,45 @@ public partial class DataTable {
     }
 
     // 清空当前范围内的所有可编辑单元格（Delete 键）。
-    // 多区域（Ctrl 追加）时先归并成互不重叠的行×列段，逐段
-    // 调用自身清空（此时 RangeCount==1，不会再次进入本分支）。
+    // 多区域（Ctrl 追加）时逐矩形独立清空并按 (row, col) 去重，
+    // 避免把不相交的列区间错误合并成包围盒误删中间列。
     // 返回清空的单元格数。
     public static int ClearRangeCells(DataTableState st, List<DataColumn> cols, DataSource src) {
         if (DataTable.RangeCount(st) > 1) {
             int n = DataTable.RangeCount(st);
             int total = 0;
-            int segR0 = -1;
-            int segR1 = -1;
-            int segC0 = -1;
-            int segC1 = -1;
-            // 归并：按行段收集与既有段相交的区域，重叠消解后
-            // 每个行段调用一次单矩形清空。调用方（Delete 键）
-            // 一次操作仍记一组撤销。
+            int firstRow = -1;
+            int firstCol = -1;
+            Dict<string, bool> seen = new Dict<string, bool>();
             DataTable.BeginUndoGroup(st);
             for (int mi = 0; mi < n; mi = mi + 1) {
                 int mr0 = -1; int mc0 = -1; int mr1 = -1; int mc1 = -1;
                 if (!DataTable.RangeAt(st, mi, out mr0, out mc0, out mr1, out mc1)) { continue; }
-                if (segR0 >= 0 && mr0 <= segR1 && mr1 >= segR0) {
-                    if (mc0 < segC0) { segC0 = mc0; }
-                    if (mc1 > segC1) { segC1 = mc1; }
-                    continue;
+                for (int rr = mr0; rr <= mr1; rr = rr + 1) {
+                    if (rr < 0 || rr >= DataTable.DispCount(st) || DataTable.DispKind(st, rr) != 0) { continue; }
+                    int row = DataTable.DispRowOf(st, rr);
+                    for (int cc = mc0; cc <= mc1; cc = cc + 1) {
+                        if (cc < 0 || cc >= cols.Count || !cols[cc].editable || cols[cc].required || cols[cc].formula.Length > 0) {
+                            continue;
+                        }
+                        string cellKey = Convert.ToString(row) + ":" + Convert.ToString(cc);
+                        if (seen.ContainsKey(cellKey)) { continue; }
+                        seen[cellKey] = true;
+                        string blank = cols[cc].isBool ? cols[cc].boolFalse : "";
+                        DataTable.Journal(st, RowEdit.Cell(row, cc, src.CellText(row, cc), blank));
+                        src.SetCell(row, cc, blank);
+                        if (firstRow < 0) { firstRow = row; firstCol = cc; }
+                        total = total + 1;
+                    }
                 }
-                if (segR0 >= 0) {
-                    total = total + DataTable.ClearSeg(st, cols, src, segR0, segR1, segC0, segC1);
-                }
-                segR0 = mr0; segR1 = mr1; segC0 = mc0; segC1 = mc1;
-            }
-            if (segR0 >= 0) {
-                total = total + DataTable.ClearSeg(st, cols, src, segR0, segR1, segC0, segC1);
             }
             DataTable.EndUndoGroup(st);
+            if (total > 0) {
+                st.editRow = firstRow;
+                st.editCol = firstCol;
+                st.CellEdit.Raise(st.host);
+                st.dirty = true;
+            }
             return total;
         }
         int r0 = st.hitOrder;
@@ -421,9 +475,8 @@ public partial class DataTable {
                 int row = DataTable.DispRowOf(st, rr);
                 int cc = c0;
                 while (cc <= c1) {
-                    // 必填列不能留空；跳过它，而不是
-                    // 写入列声明为非法的值。
-                    if (cc < cols.Count && cols[cc].editable && !cols[cc].required) {
+                    // 必填列不能留空；公式列值由表达式派生不可直接覆写。
+                    if (cc < cols.Count && cols[cc].editable && !cols[cc].required && cols[cc].formula.Length == 0) {
                         string blank = "";
                         if (cols[cc].isBool) { blank = cols[cc].boolFalse; }
                         DataTable.Journal(st, RowEdit.Cell(row, cc, src.CellText(row, cc), blank));
@@ -436,6 +489,89 @@ public partial class DataTable {
             rr = rr + 1;
         }
         return cleared;
+    }
+
+    // 解析 TSV 剪贴板文本为二维矩阵：
+    // 无双引号时走快路径；含双引号时按 RFC4180 状态机解析
+    // （保留引号内的换行与制表符，将 "" 还原为 "），并采用 Substring 片段复制保真 UTF-8。
+    public static List<List<string>> ParseTsvRows(string text) {
+        List<List<string>> rows = new List<List<string>>();
+        if (text == null || text.Length == 0) { return rows; }
+        bool hasQuote = false;
+        for (int q = 0; q < text.Length; q = q + 1) {
+            if ((int)text[q] == 34) { hasQuote = true; break; }
+        }
+        if (!hasQuote) {
+            List<string> lines = DataTable.SplitLines(text);
+            while (lines.Count > 0 && lines[lines.Count - 1].Length == 0) { lines.RemoveAt(lines.Count - 1); }
+            for (int li = 0; li < lines.Count; li = li + 1) {
+                rows.Add(DataTable.SplitTabs(lines[li]));
+            }
+            return rows;
+        }
+
+        List<string> curRow = new List<string>();
+        StringBuilder curField = new StringBuilder();
+        bool inQuotes = false;
+        bool atFieldStart = true;
+        int n = text.Length;
+        int segStart = 0;
+        int i = 0;
+        while (i < n) {
+            int ch = (int)text[i];
+            if (inQuotes) {
+                if (ch == 34) {
+                    if (i > segStart) { curField.Append(text.Substring(segStart, i - segStart)); }
+                    if (i + 1 < n && (int)text[i + 1] == 34) {
+                        curField.Append("\"");
+                        i = i + 2;
+                        segStart = i;
+                    } else {
+                        inQuotes = false;
+                        i = i + 1;
+                        segStart = i;
+                    }
+                } else {
+                    i = i + 1;
+                }
+            } else {
+                if (atFieldStart && ch == 34) {
+                    inQuotes = true;
+                    atFieldStart = false;
+                    i = i + 1;
+                    segStart = i;
+                } else if (ch == 9) {
+                    if (i > segStart) { curField.Append(text.Substring(segStart, i - segStart)); }
+                    curRow.Add(curField.ToString());
+                    curField = new StringBuilder();
+                    atFieldStart = true;
+                    i = i + 1;
+                    segStart = i;
+                } else if (ch == 10 || ch == 13) {
+                    if (i > segStart) { curField.Append(text.Substring(segStart, i - segStart)); }
+                    curRow.Add(curField.ToString());
+                    rows.Add(curRow);
+                    curRow = new List<string>();
+                    curField = new StringBuilder();
+                    atFieldStart = true;
+                    if (ch == 13 && i + 1 < n && (int)text[i + 1] == 10) { i = i + 2; }
+                    else { i = i + 1; }
+                    segStart = i;
+                } else {
+                    atFieldStart = false;
+                    i = i + 1;
+                }
+            }
+        }
+        if (n > segStart) { curField.Append(text.Substring(segStart, n - segStart)); }
+        if (curRow.Count > 0 || curField.Length > 0) {
+            curRow.Add(curField.ToString());
+            rows.Add(curRow);
+        }
+        while (rows.Count > 0 && rows[rows.Count - 1].Count == 1 && rows[rows.Count - 1][0].Length == 0) {
+            rows.RemoveAt(rows.Count - 1);
+        }
+        return rows;
     }
 
     // 按 '\n' 分割并去掉 '\r'——剪贴板文本的

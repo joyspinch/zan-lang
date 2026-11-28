@@ -1,0 +1,173 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Game.Graphics;
+using Game.Render3D;
+
+namespace Conf;
+
+class Game3DSonarHalftoneDecalTest {
+    [DllImport("zan_gui")]
+    private static extern int zan_gui_read_pixel(int surfaceId, int x, int y);
+
+    static int RedOf(int argb) { return (argb >> 16) & 255; }
+    static int GreenOf(int argb) { return (argb >> 8) & 255; }
+    static int BlueOf(int argb) { return argb & 255; }
+
+    static void Main() {
+        Canvas.SetBackend(1);
+        Canvas cv = new Canvas(128, 128);
+        int sid = cv.SurfaceId();
+
+        // 1. GPU 3D 世界空间球面声呐脉冲波前：环中心暗、波前(r=1.4)青色高能发光、环外暗
+        Mesh3D floor = new Mesh3D();
+        floor.Vertex(-4.0f, 0.0f, -4.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f);
+        floor.Vertex( 4.0f, 0.0f, -4.0f, 0.0f, 1.0f, 0.0f, 1.0f, 0.0f);
+        floor.Vertex( 4.0f, 0.0f,  4.0f, 0.0f, 1.0f, 0.0f, 1.0f, 1.0f);
+        floor.Vertex(-4.0f, 0.0f,  4.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f);
+        floor.Triangle(0, 2, 1);
+        floor.Triangle(0, 3, 2);
+        int floorKey = cv.MeshUpload(floor);
+
+        Camera3D topCam = new Camera3D();
+        topCam.Position = new Vector3(0.0f, 4.0f, 0.001f);
+        topCam.Target = new Vector3(0.0f, 0.0f, 0.0f);
+        topCam.AspectRatio = 1.0f;
+        topCam.FieldOfView = 1.05f;
+
+        Material sonarMat = Material.Solid(0.0f, 0.0f, 0.0f);
+        sonarMat.EmissiveRed = 0.03f;
+        sonarMat.EmissiveGreen = 0.03f;
+        sonarMat.EmissiveBlue = 0.03f;
+
+        SceneNode root1 = new SceneNode("root1");
+        SceneNode floorNode = new SceneNode("floor");
+        floorNode.MeshKey = floorKey;
+        floorNode.BoundsRadius = 10.0f;
+        floorNode.Material = sonarMat;
+        root1.AddChild(floorNode);
+
+        Renderer3D ren = new Renderer3D(16);
+        ren.UseCpuLighting = false;
+        RenderPlan plan1 = new RenderPlan(topCam);
+
+        sonarMat.SonarPulseEnabled = true;
+        sonarMat.SonarOriginX = 0.0f;
+        sonarMat.SonarOriginY = 0.0f;
+        sonarMat.SonarOriginZ = 0.0f;
+        sonarMat.SonarRadius = 1.35f;
+        sonarMat.SonarRingWidth = 0.45f;
+        sonarMat.SonarStrength = 2.0f;
+        sonarMat.SonarRed = 0.0f;
+        sonarMat.SonarGreen = 1.0f;
+        sonarMat.SonarBlue = 1.0f;
+
+        cv.Clear(unchecked((int)0xFF000000));
+        plan1.Build(root1);
+        ren.Draw(cv, plan1);
+
+        int centerPx = zan_gui_read_pixel(sid, 64, 64);
+        int outerPx = zan_gui_read_pixel(sid, 122, 64);
+        int peakG = 0;
+        int peakB = 0;
+        int peakR = 255;
+        for (int x = 64; x <= 122; x = x + 1) {
+            int px = zan_gui_read_pixel(sid, x, 64);
+            int g = GreenOf(px);
+            int b = BlueOf(px);
+            int r = RedOf(px);
+            if (g > peakG) {
+                peakG = g;
+                peakB = b;
+                peakR = r;
+            }
+        }
+        bool sonarOk = GreenOf(centerPx) < 25 && BlueOf(centerPx) < 25
+            && GreenOf(outerPx) < 25 && BlueOf(outerPx) < 25
+            && peakG > 180 && peakB > 180 && peakR < 40;
+        Console.WriteLine("gpu-sonar-pulse: " + Convert.ToString(sonarOk ? 1 : 0));
+
+        // 2. GPU 后处理 45° 半色调漫画网点：均匀中灰画面变为高对比度 Ben-Day 墨点与纸白交替图案
+        Mesh3D quad = new Mesh3D();
+        quad.Vertex(-3.0f, -3.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        quad.Vertex( 3.0f, -3.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+        quad.Vertex( 3.0f,  3.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        quad.Vertex(-3.0f,  3.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f);
+        quad.Triangle(0, 1, 2);
+        quad.Triangle(0, 2, 3);
+        int quadKey = cv.MeshUpload(quad);
+
+        Material grayMat = Material.Solid(0.0f, 0.0f, 0.0f);
+        grayMat.EmissiveRed = 0.45f;
+        grayMat.EmissiveGreen = 0.45f;
+        grayMat.EmissiveBlue = 0.45f;
+
+        SceneNode root2 = new SceneNode("root2");
+        SceneNode panel = new SceneNode("panel");
+        panel.MeshKey = quadKey;
+        panel.BoundsRadius = 6.0f;
+        panel.Material = grayMat;
+        root2.AddChild(panel);
+
+        Camera3D cam2 = new Camera3D();
+        cam2.Position = new Vector3(0.0f, 0.0f, 3.2f);
+        cam2.Target = new Vector3(0.0f, 0.0f, 0.0f);
+        cam2.AspectRatio = 1.0f;
+        cam2.FieldOfView = 1.1f;
+        RenderPlan plan2 = new RenderPlan(cam2);
+
+        cv.Clear(unchecked((int)0xFF000000));
+        plan2.Build(root2);
+        ren.Draw(cv, plan2);
+        int baseMinG = 255;
+        int baseMaxG = 0;
+        for (int x = 24; x <= 104; x = x + 1) {
+            int g = GreenOf(zan_gui_read_pixel(sid, x, 64));
+            if (g < baseMinG) { baseMinG = g; }
+            if (g > baseMaxG) { baseMaxG = g; }
+        }
+
+        PostProcess post = new PostProcess();
+        post.HalftoneStrength = 1.0f;
+        post.HalftoneDotScale = 8.0f;
+        post.HalftoneContrast = 1.0f;
+        ren.PostProcess = post;
+
+        cv.Clear(unchecked((int)0xFF000000));
+        plan2.Build(root2);
+        ren.Draw(cv, plan2);
+        int htMinG = 255;
+        int htMaxG = 0;
+        for (int y = 48; y <= 80; y = y + 2) {
+            for (int x = 24; x <= 104; x = x + 1) {
+                int g = GreenOf(zan_gui_read_pixel(sid, x, y));
+                if (g < htMinG) { htMinG = g; }
+                if (g > htMaxG) { htMaxG = g; }
+            }
+        }
+        bool halftoneOk = (baseMaxG - baseMinG) < 10
+            && htMinG < 35 && htMaxG > 130 && (htMaxG - htMinG) > 100;
+        Console.WriteLine("gpu-post-halftone: " + Convert.ToString(halftoneOk ? 1 : 0));
+
+        ren.Dispose();
+
+        // 3. 3D 表面贴花投射池：LRU 满容淘汰、尾段线性淡出、超时清理、球体查询与按类清空
+        DecalProjectorPool3D pool = new DecalProjectorPool3D(3);
+        pool.Spawn(new Vector3(0.0f, 0.0f, 0.0f), new Vector3(0.0f, 1.0f, 0.0f), 0.3f, 5.0f, 1.0f, "bullet");
+        pool.Spawn(new Vector3(1.0f, 0.0f, 0.0f), new Vector3(0.0f, 1.0f, 0.0f), 0.4f, 4.0f, 2.0f, "bullet");
+        pool.Spawn(new Vector3(10.0f, 0.0f, 0.0f), new Vector3(0.0f, 1.0f, 0.0f), 0.5f, 10.0f, 1.0f, "scorch");
+        pool.Spawn(new Vector3(1.5f, 0.0f, 0.0f), new Vector3(0.0f, 1.0f, 0.0f), 0.3f, 10.0f, 1.0f, "bullet"); // 淘汰 #1
+
+        bool evictedOk = pool.ActiveCount() == 3 && pool.EvictedCount == 1 && pool.FindById(1) == null;
+        pool.Step(3.0f); // #2 剩余 1.0s / fadeOut 2.0s -> alpha = 0.5
+        DecalInstance3D d2 = pool.FindById(2);
+        bool fadeOk = d2 != null && d2.CurrentAlpha() > 0.49f && d2.CurrentAlpha() < 0.51f;
+
+        int exp = pool.Step(1.5f); // #2 过期清除
+        List<DecalInstance3D> near = pool.QueryWithinRadius(new Vector3(1.0f, 0.0f, 0.0f), 2.0f);
+        int cleared = pool.ClearCategory("scorch");
+
+        bool decalOk = evictedOk && fadeOk && exp == 1 && near.Count == 1 && cleared == 1 && pool.ActiveCount() == 1;
+        Console.WriteLine("decal-projector-pool-3d: " + Convert.ToString(decalOk ? 1 : 0));
+    }
+}

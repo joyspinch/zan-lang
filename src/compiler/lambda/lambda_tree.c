@@ -412,6 +412,12 @@ LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
     LLVMValueRef lambda_fn = LLVMAddFunction(g->mod, lname, fn_type);
     /* 全程序静态编译：Lambda 设为 internal 链接属性 */
     zan_set_module_local(lambda_fn);
+    if (expr->lambda.is_noescape) {
+        unsigned ih = LLVMGetEnumAttributeKindForName("inlinehint", 10);
+        if (ih)
+            LLVMAddAttributeAtIndex(lambda_fn, LLVMAttributeFunctionIndex,
+                                    LLVMCreateEnumAttribute(g->ctx, ih, 0));
+    }
 
     /* 闭包记录内存布局：{ 函数指针, 析构指针, 目标指针, 捕获槽..., [this], [__gctx] } */
     LLVMTypeRef rec_ty = NULL;
@@ -767,9 +773,14 @@ LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
         ? LLVMBuildLoad2(g->builder, LLVMGetAllocatedType(saved_this),
                          saved_this, "cap.self")
         : NULL;
-    LLVMValueRef clo = emit_closure_record_gctx(
-        g, expr->loc, lname, rec_ty, lambda_fn, NULL, cs.caps, capc,
-        weak_this ? 2 : has_this, self, true, has_gctx ? saved_gctx_val : NULL);
+    LLVMValueRef clo = expr->lambda.is_noescape
+        ? emit_stack_closure_record_gctx(
+              g, rec_ty, lambda_fn, cs.caps, capc, has_this, self,
+              has_gctx ? saved_gctx_val : NULL)
+        : emit_closure_record_gctx(
+              g, expr->loc, lname, rec_ty, lambda_fn, NULL, cs.caps, capc,
+              weak_this ? 2 : has_this, self, true,
+              has_gctx ? saved_gctx_val : NULL);
     cap_scan_free(&cs);
     return clo;
 }
@@ -785,4 +796,11 @@ zan_type_t *method_param_type(zan_irgen_t *g, zan_symbol_t *msym, int idx) {
         if (ps && ps->kind == SYM_PARAM && ps->decl == p) return ps->type;
     }
     return zan_binder_resolve_type(g->binder, p->param.type);
+}
+bool method_param_is_noescape(zan_symbol_t *msym, int idx) {
+    if (!msym || !msym->decl || msym->decl->kind != AST_METHOD_DECL) return false;
+    zan_ast_list_t *params = &msym->decl->method_decl.params;
+    if (idx < 0 || idx >= params->count) return false;
+    zan_ast_node_t *p = params->items[idx];
+    return p && p->kind == AST_PARAM && p->param.is_noescape != 0;
 }

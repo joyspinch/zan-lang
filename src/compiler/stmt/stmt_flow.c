@@ -58,6 +58,26 @@ if (g->current_async_frame) {
   emit_async_complete(g, locals, ri);
   break;
 }
+if (stmt->ret.value && (g->current_fn_is_ref_return || stmt->ret.is_ref)) {
+  LLVMValueRef ref_ptr = emit_ref_lvalue_ptr(g, stmt->ret.value, locals);
+  LLVMTypeRef fn_ret = g->current_fn_ret_type;
+  if (!ref_ptr)
+    ref_ptr = LLVMConstNull(fn_ret);
+  else if (LLVMTypeOf(ref_ptr) != fn_ret)
+    ref_ptr = LLVMBuildBitCast(g->builder, ref_ptr, fn_ret, "retref.bc");
+  if (g->finally_count > 0) {
+    LLVMValueRef p_slot = emit_entry_alloca(g, fn_ret, "retref.fin.slot");
+    LLVMBuildStore(g->builder, ref_ptr, p_slot);
+    emit_pending_finallys(g, locals, 0, false);
+    if (LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
+      break;
+    ref_ptr = LLVMBuildLoad2(g->builder, fn_ret, p_slot, "retref.fin");
+  }
+  emit_release_active_catch_excs(g, 0);
+  emit_release_owned_locals(g, locals);
+  LLVMBuildRet(g->builder, ref_ptr);
+  break;
+}
 if (stmt->ret.value) {
   LLVMValueRef val = emit_expr(g, stmt->ret.value, locals);
   bool conv_ret = false;
@@ -99,7 +119,10 @@ if (stmt->ret.value) {
   } else if (ret_type && ret_type->kind == TYPE_STRUCT &&
              type_contains_collection_rc(g, ret_type, 0) &&
              !expr_yields_owned_rc_value(g, stmt->ret.value, locals) &&
-             !conv_ret) {
+             !conv_ret &&
+             !(stmt->ret.value->kind == AST_IDENTIFIER &&
+               local_find(locals, stmt->ret.value->ident.name) &&
+               local_find(locals, stmt->ret.value->ident.name)->drop_flag)) {
     emit_collection_value_retain(g, ret_type, val, 0);
   }
   if (g->finally_count > 0) {
@@ -127,6 +150,7 @@ if (stmt->ret.value) {
     /* Successful completion transfers ownership to the caller. */
     LLVMBuildStore(g->builder, LLVMConstNull(LLVMTypeOf(val)), v_slot);
   }
+  emit_move_clear_drop_flag(g, stmt->ret.value, locals);
   /* 退出顺序：先释放 catch 捕获的异常对象，再释放局部变量。
    * 被捕获的异常还压在异常临时栈顶（catch 进入时压入），若先弹局部
    * 变量的 eh_slot，弹出的是异常而不是该局部变量的槽位标记——标记滞留
@@ -366,10 +390,87 @@ case AST_FOR_STMT: {
   int saved_loop_ehbase = g->eh_armed_loop_base;
   g->eh_armed_loop_base = g->eh_armed_count;
   int saved_guarded_lists = g->loop_guarded_list_count;
+  int saved_bce_count = g->loop_bce_count;
 
   emit_loop_preheader_list_guards(g, stmt->for_stmt.cond, stmt->for_stmt.step,
                                   stmt->for_stmt.body, locals);
-  LLVMBuildBr(g->builder, cond_bb);
+
+  bce_for_plan_t bce_plan;
+  bce_plan_for_loop(g, stmt, locals, &bce_plan);
+
+  if (bce_plan.can_version) {
+    /* Fast-path + Slow-path versioned loop: 0 bounds checks + scoped noalias on fast path,
+     * 100% identical checked/overlapping semantics on slow path. */
+    LLVMValueRef fast_ok = bce_emit_preheader_fast_cond(g, &bce_plan, locals);
+    LLVMBasicBlockRef fast_cond_bb =
+        LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "for.fcond");
+    LLVMBasicBlockRef fast_body_bb =
+        LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "for.fbody");
+    LLVMBasicBlockRef fast_step_bb =
+        LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "for.fstep");
+    LLVMValueRef vbr = LLVMBuildCondBr(g->builder, fast_ok, fast_cond_bb, cond_bb);
+    zan_set_branch_weights(g, vbr, 2000, 1);
+
+    /* Push BCE entries + disjoint alias scopes for the fast loop */
+    int saved_alias_cnt = g->fn_alias_scope_count;
+    for (int bi = 0; bi < bce_plan.ver_count && g->loop_bce_count < 32; bi++) {
+      int sid = bce_plan.ver_spans[bi]->noalias_scope_id;
+      if (sid <= 0 && bce_plan.ver_count >= 2)
+        sid = zan_fn_alloc_alias_scope(g);
+      g->loop_bce[g->loop_bce_count].iv_local = bce_plan.iv_local;
+      g->loop_bce[g->loop_bce_count].container_local = bce_plan.ver_spans[bi];
+      g->loop_bce[g->loop_bce_count].max_offset = bce_plan.ver_max_off[bi];
+      g->loop_bce[g->loop_bce_count].alias_scope_id = sid;
+      g->loop_bce_count++;
+    }
+    g->continue_target = fast_step_bb;
+    LLVMPositionBuilderAtEnd(g->builder, fast_cond_bb);
+    {
+      LLVMValueRef cond = emit_expr(g, stmt->for_stmt.cond, locals);
+      cond = zan_tobool(g->builder, cond, "tobool");
+      LLVMBuildCondBr(g->builder, cond, fast_body_bb, end_bb);
+    }
+    LLVMPositionBuilderAtEnd(g->builder, fast_body_bb);
+    emit_stmt(g, stmt->for_stmt.body, locals);
+    if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
+      emit_release_owned_locals_from(g, locals, for_body_start);
+      LLVMBuildBr(g->builder, fast_step_bb);
+    } else {
+      emit_release_owned_locals_from(g, locals, for_body_start);
+    }
+    LLVMPositionBuilderAtEnd(g->builder, fast_step_bb);
+    if (stmt->for_stmt.step) {
+      if (stmt->for_stmt.step->kind == AST_BLOCK ||
+          stmt->for_stmt.step->kind == AST_EXPR_STMT)
+        emit_stmt(g, stmt->for_stmt.step, locals);
+      else
+        emit_expr(g, stmt->for_stmt.step, locals);
+    }
+    LLVMBuildBr(g->builder, fast_cond_bb);
+
+    /* Restore BCE and alias scope count before emitting the slow checked fallback loop */
+    g->loop_bce_count = saved_bce_count;
+    g->fn_alias_scope_count = saved_alias_cnt;
+    g->continue_target = step_bb;
+    if (bce_plan.static_span && g->loop_bce_count < 32) {
+      g->loop_bce[g->loop_bce_count].iv_local = bce_plan.iv_local;
+      g->loop_bce[g->loop_bce_count].container_local = bce_plan.static_span;
+      g->loop_bce[g->loop_bce_count].max_offset = bce_plan.static_max_off;
+      g->loop_bce[g->loop_bce_count].alias_scope_id =
+          bce_plan.static_span->noalias_scope_id;
+      g->loop_bce_count++;
+    }
+  } else {
+    if (bce_plan.static_span && g->loop_bce_count < 32) {
+      g->loop_bce[g->loop_bce_count].iv_local = bce_plan.iv_local;
+      g->loop_bce[g->loop_bce_count].container_local = bce_plan.static_span;
+      g->loop_bce[g->loop_bce_count].max_offset = bce_plan.static_max_off;
+      g->loop_bce[g->loop_bce_count].alias_scope_id =
+          bce_plan.static_span->noalias_scope_id;
+      g->loop_bce_count++;
+    }
+    LLVMBuildBr(g->builder, cond_bb);
+  }
   LLVMPositionBuilderAtEnd(g->builder, cond_bb);
   if (stmt->for_stmt.cond) {
     LLVMValueRef cond = emit_expr(g, stmt->for_stmt.cond, locals);
@@ -419,6 +520,7 @@ case AST_FOR_STMT: {
   g->finally_loop_base = saved_loop_fbase;
   g->eh_armed_loop_base = saved_loop_ehbase;
   g->loop_guarded_list_count = saved_guarded_lists;
+  g->loop_bce_count = saved_bce_count;
 
   LLVMPositionBuilderAtEnd(g->builder, end_bb);
   emit_release_owned_locals_from(g, locals, for_start);
@@ -455,6 +557,8 @@ break;
 
 case AST_SWITCH_STMT: {
   int switch_start = locals->count;
+  zan_type_t *sw_type =
+      concretize(g, infer_expr_type(g, stmt->switch_stmt.expr, locals));
   LLVMValueRef switch_val = emit_expr(g, stmt->switch_stmt.expr, locals);
   LLVMBasicBlockRef end_bb =
       LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "sw.end");
@@ -464,7 +568,8 @@ case AST_SWITCH_STMT: {
   for (int i = 0; i < stmt->switch_stmt.cases.count; i++) {
     zan_ast_node_t *sc = stmt->switch_stmt.cases.items[i];
     if (sc->switch_case.pattern || sc->switch_case.type_pattern ||
-        sc->switch_case.when_cond || sc->switch_case.var_name.len > 0) {
+        sc->switch_case.adt_pat || sc->switch_case.when_cond ||
+        sc->switch_case.var_name.len > 0) {
       num_cases++;
     } else {
       default_case = sc;
@@ -482,6 +587,193 @@ case AST_SWITCH_STMT: {
   g->break_target = end_bb;
   int sw_saved_break_base = g->break_locals_base;
   g->break_locals_base = switch_start;
+
+  /* Tagged Union ADT switch lowering (value-type struct with __adt_tag + payload fields) */
+  zan_adt_info_t *adt_info =
+      (sw_type && sw_type->kind == TYPE_STRUCT && sw_type->sym &&
+       sw_type->sym->decl && sw_type->sym->decl->kind == AST_STRUCT_DECL &&
+       sw_type->sym->decl->meta)
+          ? sw_type->sym->decl->meta->adt_info
+          : NULL;
+  if (adt_info) {
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef sw_st = get_struct_llvm_type(g, sw_type->sym);
+    if (!sw_st)
+      sw_st = LLVMTypeOf(switch_val);
+    LLVMValueRef sw_slot = emit_entry_alloca(g, sw_st, "sw.adt");
+    zan_store_fit(g, LLVMConstNull(sw_st), sw_slot);
+    zan_store_fit(g, switch_val, sw_slot);
+
+    /* If scrutinee is an owned temporary RC struct (e.g. returned from a call/ctor),
+     * register cleanup at switch_start so it is released on break/return/exit. */
+    bool adt_is_owned_temp =
+        stmt->switch_stmt.expr &&
+        (stmt->switch_stmt.expr->kind == AST_CALL ||
+         stmt->switch_stmt.expr->kind == AST_NEW_EXPR ||
+         stmt->switch_stmt.expr->kind == AST_SWITCH_EXPR ||
+         stmt->switch_stmt.expr->kind == AST_CONDITIONAL ||
+         stmt->switch_stmt.expr->kind == AST_WITH_EXPR);
+    if (adt_is_owned_temp && type_contains_collection_rc(g, sw_type, 0)) {
+      static const char kAdtTmp[] = {1, 'a', 'd', 't'};
+      int tidx = locals->count;
+      local_add(locals, (zan_istr_t){(char *)kAdtTmp, 4}, sw_slot, sw_type);
+      locals->vars[tidx].struct_rc = 1;
+      lpad_register_local(g, &locals->vars[tidx]);
+    }
+    int case_locals_base = locals->count;
+    g->break_locals_base = case_locals_base;
+
+    int tag_fi = get_field_index(sw_type->sym, (zan_istr_t){(char *)"__adt_tag", 9});
+    LLVMValueRef tag_ptr =
+        emit_field_ptr(g, sw_type->sym, sw_st, sw_slot, tag_fi >= 0 ? tag_fi : 0, "adt.tagp");
+    LLVMValueRef tag_val = LLVMBuildLoad2(g->builder, i32, tag_ptr, "adt.tag");
+
+    LLVMBasicBlockRef test_bb =
+        LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "sw.adttest");
+    LLVMBuildBr(g->builder, test_bb);
+
+    for (int i = 0; i < stmt->switch_stmt.cases.count; i++) {
+      zan_ast_node_t *sc = stmt->switch_stmt.cases.items[i];
+      if (!sc->switch_case.adt_pat && !sc->switch_case.pattern)
+        continue;
+
+      zan_istr_t vname = {0};
+      zan_ast_list_t *binds = NULL;
+      if (sc->switch_case.adt_pat) {
+        vname = sc->switch_case.adt_pat->variant;
+        binds = &sc->switch_case.adt_pat->bindings;
+      } else if (sc->switch_case.pattern->kind == AST_CALL) {
+        zan_ast_node_t *cal = sc->switch_case.pattern->call.callee;
+        if (cal && cal->kind == AST_MEMBER_ACCESS)
+          vname = cal->member.name;
+        else if (cal && cal->kind == AST_IDENTIFIER)
+          vname = cal->ident.name;
+        binds = &sc->switch_case.pattern->call.args;
+      } else if (sc->switch_case.pattern->kind == AST_MEMBER_ACCESS) {
+        vname = sc->switch_case.pattern->member.name;
+      } else if (sc->switch_case.pattern->kind == AST_IDENTIFIER) {
+        vname = sc->switch_case.pattern->ident.name;
+      }
+
+      zan_adt_variant_t *av = NULL;
+      for (int vi = 0; vi < adt_info->variant_count; vi++) {
+        if (adt_info->variants[vi].name.len == vname.len &&
+            memcmp(adt_info->variants[vi].name.str, vname.str, (size_t)vname.len) == 0) {
+          av = &adt_info->variants[vi];
+          break;
+        }
+      }
+      if (!av)
+        continue;
+
+      LLVMPositionBuilderAtEnd(g->builder, test_bb);
+      LLVMBasicBlockRef bind_bb =
+          LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "sw.adtbind");
+      LLVMBasicBlockRef fail_bb =
+          LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "sw.adtnext");
+
+      LLVMValueRef cond = zan_icmp(g->builder, LLVMIntEQ, tag_val,
+                                   LLVMConstInt(i32, (uint64_t)av->tag, 0),
+                                   "adt.eq");
+      LLVMBuildCondBr(g->builder, cond, bind_bb, fail_bb);
+
+      LLVMPositionBuilderAtEnd(g->builder, bind_bb);
+      int bc = binds ? binds->count : 0;
+      for (int bi = 0; bi < bc && bi < av->params.count; bi++) {
+        zan_ast_node_t *bn = binds->items[bi];
+        if (!bn || bn->kind != AST_IDENTIFIER)
+          continue;
+        zan_istr_t bname = bn->ident.name;
+        if (bname.len == 1 && bname.str[0] == '_')
+          continue;
+        int fi = get_field_index(sw_type->sym, av->struct_field_names[bi]);
+        if (fi < 0)
+          continue;
+        zan_symbol_t *fsym = get_field_sym(sw_type->sym, av->struct_field_names[bi]);
+        zan_type_t *fty = fsym ? field_type_at(g, fsym, sw_type) : NULL;
+        if (!fty)
+          continue;
+        LLVMTypeRef fll = map_type(g, fty);
+        LLVMValueRef fptr = emit_field_ptr(g, sw_type->sym, sw_st, sw_slot, fi, "adt.fp");
+        LLVMValueRef fv0 = LLVMBuildLoad2(g->builder, fll, fptr, "adt.fv");
+        LLVMValueRef fv = promote_loaded(g, fv0, fty);
+        LLVMTypeRef bslot_ty = LLVMTypeOf(fv);
+        LLVMValueRef bslot = emit_entry_alloca(g, bslot_ty, "adt.bind");
+        zan_store_fit(g, LLVMConstNull(bslot_ty), bslot);
+        /* Retain payload so destructured variable owns its reference cleanly */
+        int is_struct_rc = (fty->kind == TYPE_STRUCT &&
+                            type_contains_collection_rc(g, fty, 0));
+        int is_ptr_rc = (!is_struct_rc && is_rc_managed_type(fty) &&
+                         LLVMGetTypeKind(bslot_ty) == LLVMPointerTypeKind);
+        if (is_struct_rc)
+          emit_collection_value_retain(g, fty, fv, 0);
+        else if (is_ptr_rc)
+          emit_rc_retain_for_type(g, fty, fv);
+        zan_store_fit(g, fv, bslot);
+        int bidx = locals->count;
+        local_add(locals, bname, bslot, fty);
+        locals->vars[bidx].binding_decl = bn;
+        if (is_ptr_rc) {
+          locals->vars[bidx].arc_owned = 1;
+          lpad_register_local(g, &locals->vars[bidx]);
+        } else if (is_struct_rc) {
+          locals->vars[bidx].struct_rc = 1;
+          lpad_register_local(g, &locals->vars[bidx]);
+        }
+      }
+
+      if (sc->switch_case.when_cond) {
+        LLVMBasicBlockRef match_bb =
+            LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "sw.adtmatch");
+        LLVMBasicBlockRef gfail_bb =
+            LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "sw.adtgfail");
+        LLVMValueRef gv = emit_expr(g, sc->switch_case.when_cond, locals);
+        if (LLVMGetTypeKind(LLVMTypeOf(gv)) != LLVMIntegerTypeKind ||
+            LLVMGetIntTypeWidth(LLVMTypeOf(gv)) != 1)
+          gv = LLVMBuildICmp(g->builder, LLVMIntNE, gv,
+                             LLVMConstInt(LLVMTypeOf(gv), 0, 0), "sw.guard");
+        LLVMBuildCondBr(g->builder, gv, match_bb, gfail_bb);
+        LLVMPositionBuilderAtEnd(g->builder, gfail_bb);
+        int saved_bind_count = locals->count;
+        emit_release_owned_locals_from(g, locals, case_locals_base);
+        locals->count = saved_bind_count;
+        LLVMBuildBr(g->builder, fail_bb);
+        LLVMPositionBuilderAtEnd(g->builder, match_bb);
+      }
+
+      emit_stmt(g, sc->switch_case.body, locals);
+      if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
+        emit_release_owned_locals_from(g, locals, case_locals_base);
+        LLVMBuildBr(g->builder, end_bb);
+      }
+      locals->count = case_locals_base;
+      test_bb = fail_bb;
+    }
+
+    LLVMPositionBuilderAtEnd(g->builder, test_bb);
+    if (default_case)
+      LLVMBuildBr(g->builder, default_bb);
+    else
+      LLVMBuildBr(g->builder, end_bb);
+
+    if (default_case) {
+      LLVMPositionBuilderAtEnd(g->builder, default_bb);
+      emit_stmt(g, default_case->switch_case.body, locals);
+      if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
+        emit_release_owned_locals_from(g, locals, case_locals_base);
+        LLVMBuildBr(g->builder, end_bb);
+      }
+      locals->count = case_locals_base;
+    }
+
+    LLVMPositionBuilderAtEnd(g->builder, end_bb);
+    emit_release_owned_locals_from(g, locals, switch_start);
+    locals->count = switch_start;
+    g->pending.break_scope = sw_saved_pending_break;
+    g->break_target = sw_saved_break;
+    g->break_locals_base = sw_saved_break_base;
+    break;
+  }
 
   bool has_patterns = false;
   for (int i = 0; i < stmt->switch_stmt.cases.count && !has_patterns; i++) {

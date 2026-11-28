@@ -74,6 +74,7 @@ static const keyword_entry_t s_keywords[] = {
     {"set",       TK_SET},
     {"short",     TK_SHORT},
     {"sizeof",    TK_SIZEOF},
+    {"stackalloc", TK_STACKALLOC},
     {"static",    TK_STATIC},
     {"string",    TK_STRING},
     {"struct",    TK_STRUCT},

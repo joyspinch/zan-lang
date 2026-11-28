@@ -13,4 +13,5 @@
 
 /* Composite Dispatcher Submodules */
 #include "nsresolve/nsresolve_stamp.c"
+#include "nsresolve/macro_expand.c"
 #include "nsresolve/nsresolve_walk.c"

@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Generic;
 using System.Data.Orm;
+using System.Json;
 using System.Text;
 using System.Web;
+using Zan.Web.AdminUi;
 using Zan.Web.Api;
 using Zan.Web.Dao.Lifecycle;
 using Zan.Web.Model.Collab;
@@ -11,181 +13,203 @@ using Zan.Web.Model;
 
 namespace Zan.Web.Admin.Lifecycle;
 
-/* 全生命周期协同大屏工作台：
-   遵循"网页优先、客户端配合快捷操作"架构设计，作为全链路大屏监控、项目复盘、多业务模板配置与审核工作台。
-   展示项目概览 KPI、全流程多阶段流转推进甘特图、阶段成果/审核驳回预警列表与在线核准流转。 */
+/* 全生命周期协同工作台：项目全链路总览 + 阶段工序核准/驳回/AI推演子表弹窗 + 快速立项。 */
 [Route("admin/lifecycle/workbench/[action]")]
 [Custom(Authorization = CustomAuthorization.Login)]
 [Description("全链路工作台")]
 public class Workbench : CollabAdminController {
+    static ListPage ScreenDef() {
+        return ListPage.Of()
+            .Tab("全部项目", "status", "")
+            .Tab("推进中", "status", "in_progress")
+            .Tab("驳回重修", "status", "rejected")
+            .Tab("已结案", "status", "completed")
+            .TbarAdd("新建全链路项目", "/admin/lifecycle/workbench/form")
+            .Col("projectNo", "项目编号", "text", "150")
+            .Col("name", "项目名称", "text", "200")
+            .Col("category", "行业/品类", "text", "110")
+            .Col("tmplName", "业务模板", "text", "160")
+            .Col("currentStage", "当前阶段", "text", "120")
+            .Tag("status", "状态", "in_progress=推进中|warn,rejected=驳回重修|off,completed=已结案|ok", "95")
+            .Col("targetGmv", "目标 GMV", "text", "105")
+            .Col("targetRoi", "目标 ROI", "text", "90")
+            .Col("createdAt", "立项时间", "text", "155")
+            .Ops("阶段推进与审核", "/admin/lifecycle/workbench/nodes", "", "projectId={id}", "");
+    }
 
-    /* 大屏工作台主界面 */
+    static ListPage NodesDef() {
+        return ListPage.Of()
+            .Col("seq", "顺序", "num", "70")
+            .Col("stageName", "阶段名称", "text", "130")
+            .Col("respName", "责任人", "text", "100")
+            .Col("aiRole", "AI 角色", "text", "110")
+            .Tag("status", "状态", "passed=已核准|ok,in_progress=推进中|warn,rejected=已驳回|off,pending=待开始|off", "95")
+            .Col("metric1", "指标 1", "text", "140")
+            .Col("metric2", "指标 2", "text", "140")
+            .Col("deliverableSummary", "阶段成果", "text", "200")
+            .Col("aiSuggestion", "AI 建议", "text", "220")
+            .Ops("核准通过", "/admin/lifecycle/workbench/advance", "确认核准通过该阶段并流转至下一阶段吗？",
+                "projectId={projectId}&stage={stage}&action=pass", "")
+            .Ops("驳回重修", "/admin/lifecycle/workbench/advance", "确认驳回该阶段并下发作战群预警吗？",
+                "projectId={projectId}&stage={stage}&action=reject", "")
+            .Ops("AI 推演", "/admin/lifecycle/workbench/aiassist", "确认触发该阶段 AI 深度推演并同步至作战群吗？",
+                "projectId={projectId}&stage={stage}", "");
+    }
+
     [HttpGet]
     [Route("/admin/lifecycle/workbench")]
     [Custom(IsMenu = true, Icon = "mdi:view-dashboard", Perm = PermBit.View)]
     [Description("全链路工作台")]
-    async void Index() {
-        ViewData d = await this.Layout("全链路大屏工作台");
-        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+    void Index() {
+        this.Conf();
+    }
 
+    [HttpPut]
+    [Description("全链路工作台表格配置")]
+    public void Conf() {
+        CrudOps.Conf(this, Workbench.ScreenDef());
+    }
+
+    [HttpPost]
+    [Description("全链路项目列表数据")]
+    public async void List() {
+        if (!this.DataReady()) { return; }
         int tid = Tenant.Cur();
-        SysUser me = await this.Admin();
-
-        /* 拉取本租户全部全生命周期项目 */
+        string st = this.InAny("status");
         List<LifecycleProject> projs = await this.LifecycleProject
             .Where(a => a.tenantId == tid)
+            .WhereIf(st.Length > 0, a => a.status == st)
             .OrderByDescending(a => a.id)
             .ToListAsync();
-
-        int totalProjects = projs.Count;
-        int inProgressCount = 0;
-        int completedCount = 0;
-        int rejectedCount = 0;
-
-        for (int i = 0; i < projs.Count; i = i + 1) {
-            LifecycleProject p = projs[i];
-            if (p.status == "completed") {
-                completedCount = completedCount + 1;
-            } else if (p.status == "rejected") {
-                rejectedCount = rejectedCount + 1;
-            } else {
-                inProgressCount = inProgressCount + 1;
-            }
-        }
-
-        d.Set("totalProjects", Convert.ToString(totalProjects));
-        d.Set("inProgressCount", Convert.ToString(inProgressCount));
-        d.Set("completedCount", Convert.ToString(completedCount));
-        d.Set("rejectedCount", Convert.ToString(rejectedCount));
-
-        /* 选中项目解析 */
-        int selId = this.InInt("projectId", 0);
-        if (selId == 0 && projs.Count > 0) {
-            selId = projs[0].id;
-        }
-
-        List<StrMap> projRows = d.AddList("projects");
-        LifecycleProject curProj = null;
-
-        for (int i = 0; i < projs.Count; i = i + 1) {
-            LifecycleProject p = projs[i];
-            StrMap pm = new StrMap();
-            pm.Set("id", Convert.ToString(p.id));
-            pm.Set("projectNo", p.projectNo);
-            pm.Set("name", p.name);
-            pm.Set("category", p.category);
-            pm.Set("status", p.status);
-            pm.Set("currentStage", p.currentStage);
-            bool isSel = (p.id == selId);
-            pm.Set("isSelected", isSel ? "selected" : "");
-            projRows.Add(pm);
-            if (isSel) { curProj = p; }
-        }
-
-        if (curProj != null) {
-            d.Set("hasProject", "1");
-            d.Set("projId", Convert.ToString(curProj.id));
-            d.Set("projNo", curProj.projectNo);
-            d.Set("projName", curProj.name);
-            d.Set("projCategory", curProj.category);
-            d.Set("projGmv", curProj.targetGmv.Length > 0 ? curProj.targetGmv : "-");
-            d.Set("projRoi", curProj.targetRoi.Length > 0 ? curProj.targetRoi : "-");
-            d.Set("convId", Convert.ToString(curProj.conversationId));
-            d.Set("curStage", curProj.currentStage);
-
-            string stZh = curProj.status == "completed" ? "已结案闭环"
-                : (curProj.status == "rejected" ? "驳回重修中" : "推进中");
-            string stCls = curProj.status == "completed" ? "good"
-                : (curProj.status == "rejected" ? "bad" : "pri");
-            d.Set("projStatusZh", stZh);
-            d.Set("projTagClass", stCls);
-
-            /* 业务模板 */
-            LifecycleTemplate tmpl = await this.LifecycleTemplate
-                .Where(a => a.id == curProj.templateId).FirstAsync();
-            d.Set("tmplName", tmpl != null ? tmpl.name : "默认模板");
-
-            /* 全部阶段节点 (按 seq 排序) */
-            List<LifecycleNode> nodes = await this.LifecycleNode
-                .Where(a => a.projectId == curProj.id)
-                .OrderBy(a => a.seq)
-                .ToListAsync();
-
-            List<LifecycleStageDetail> details = await this.LifecycleStageDetail
-                .Where(a => a.projectId == curProj.id)
-                .ToListAsync();
-
-            List<SysUser> allUsers = await this.SysUser.ToListAsync();
-            List<StrMap> nodeRows = d.AddList("nodes");
-
-            for (int i = 0; i < nodes.Count; i = i + 1) {
-                LifecycleNode n = nodes[i];
-                StrMap nm = new StrMap();
-                nm.Set("id", Convert.ToString(n.id));
-                nm.Set("seq", Convert.ToString(n.seq));
-                nm.Set("stage", n.stage);
-                nm.Set("stageName", n.stageName);
-                nm.Set("aiRole", n.aiAgentRole);
-
-                string uName = "";
-                for (int u = 0; u < allUsers.Count; u = u + 1) {
-                    if (allUsers[u].id == n.responsibleUserId) {
-                        uName = allUsers[u].nickname.Length > 0 ? allUsers[u].nickname : allUsers[u].username;
-                    }
-                }
-                nm.Set("respName", uName.Length > 0 ? uName : "责任人");
-
-                string nStZh = n.status == "passed" ? "已核准通过"
-                    : (n.status == "rejected" ? "已驳回"
-                    : (n.status == "in_progress" ? "正在推进" : "待开始"));
-                string nStCls = n.status == "passed" ? "good"
-                    : (n.status == "rejected" ? "bad"
-                    : (n.status == "in_progress" ? "pri" : ""));
-                nm.Set("status", n.status);
-                nm.Set("statusZh", nStZh);
-                nm.Set("statusClass", nStCls);
-                nm.Set("isCurrent", n.stage == curProj.currentStage ? "1" : "");
-                nm.Set("canAdvance", (n.status == "in_progress" || n.status == "rejected") ? "1" : "");
-                nm.Set("isRejected", n.status == "rejected" ? "1" : "");
-                nm.Set("deliverableSummary", n.deliverableSummary.Length > 0 ? n.deliverableSummary : "（暂无阶段成果说明）");
-                nm.Set("aiSuggestion", n.aiSuggestion.Length > 0 ? n.aiSuggestion : "（暂无 AI 协同建议）");
-
-                /* 指标详情 */
-                string m1 = "-";
-                string m2 = "-";
-                string m3 = "-";
-                for (int dti = 0; dti < details.Count; dti = dti + 1) {
-                    if (details[dti].stage == n.stage) {
-                        m1 = details[dti].metric1;
-                        m2 = details[dti].metric2;
-                        m3 = details[dti].metric3;
-                    }
-                }
-                nm.Set("metric1", m1);
-                nm.Set("metric2", m2);
-                nm.Set("metric3", m3);
-                nodeRows.Add(nm);
-            }
-        } else {
-            d.Set("hasProject", "");
-        }
-
-        /* 可选业务模板列表 */
         List<LifecycleTemplate> tmpls = await this.LifecycleTemplate
-            .Where(a => a.tenantId == tid)
-            .OrderBy(a => a.id)
-            .ToListAsync();
-        List<StrMap> tmplRows = d.AddList("templates");
-        for (int i = 0; i < tmpls.Count; i = i + 1) {
-            LifecycleTemplate t = tmpls[i];
-            StrMap tm = new StrMap();
-            tm.Set("id", Convert.ToString(t.id));
-            tm.Set("name", t.name);
-            tm.Set("industry", t.category);
-            tmplRows.Add(tm);
-        }
+            .Where(a => a.tenantId == tid).ToListAsync();
 
-        this.Page(d);
+        JsonWriter w = new JsonWriter();
+        w.WriteStartArray();
+        for (int i = 0; i < projs.Count; i = i + 1) {
+            LifecycleProject p = projs[i];
+            string tName = "默认模板";
+            for (int k = 0; k < tmpls.Count; k = k + 1) {
+                if (tmpls[k].id == p.templateId) { tName = tmpls[k].name; }
+            }
+            w.WriteStartObject();
+            w.WriteProperty("id", p.id);
+            w.WriteProperty("projectNo", p.projectNo);
+            w.WriteProperty("name", p.name);
+            w.WriteProperty("category", Fmt.Dash(p.category));
+            w.WriteProperty("tmplName", tName);
+            w.WriteProperty("currentStage", p.currentStage);
+            w.WriteProperty("status", p.status);
+            w.WriteProperty("targetGmv", Fmt.Dash(p.targetGmv));
+            w.WriteProperty("targetRoi", Fmt.Dash(p.targetRoi));
+            w.WriteProperty("conversationId", p.conversationId);
+            w.WriteProperty("createdAt", Fmt.Stamp(p.createdAt));
+            w.WriteEndObject();
+        }
+        w.WriteEndArray();
+        AdminUiProtocol.WriteListData(this, projs.Count, w.ToString());
+    }
+
+    [HttpPut]
+    [Description("新建项目表单配置")]
+    public async void FormConf() {
+        int tid = Tenant.Cur();
+        List<LifecycleTemplate> tmpls = await this.LifecycleTemplate
+            .Where(a => a.tenantId == tid).OrderBy(a => a.id).ToListAsync();
+        if (tmpls.Count == 0) {
+            await LifecycleTemplateApi.SeedDefaultTemplates(this, tid);
+            tmpls = await this.LifecycleTemplate
+                .Where(a => a.tenantId == tid).OrderBy(a => a.id).ToListAsync();
+        }
+        List<StrMap> topts = new List<StrMap>();
+        for (int i = 0; i < tmpls.Count; i = i + 1) {
+            StrMap m = new StrMap();
+            m.Set("id", Convert.ToString(tmpls[i].id));
+            m.Set("name", tmpls[i].name + " (" + tmpls[i].category + ")");
+            topts.Add(m);
+        }
+        FormPage fp = FormPage.Of("/admin/lifecycle/workbench/create")
+            .Text("项目名称", "name").Req().Ph("例如：2026秋季新品爆品孵化")
+            .Text("行业/品类", "category").Val("服装鞋包").Ph("例如：3C / 美妆 / 服装鞋包")
+            .SelectList("业务模板", "templateId", topts)
+            .Text("目标 GMV", "targetGmv").Val("100000")
+            .Text("目标 ROI", "targetRoi").Val("2.5");
+        CrudOps.FormConf(this, fp, "新建全链路协同项目");
+    }
+
+    /* ---- 阶段工序节点子表（SubTableModal）---- */
+
+    [HttpGet]
+    [Description("项目阶段节点")]
+    void Nodes() {
+        this.NodesConf();
+    }
+
+    [HttpPut]
+    [Route("/admin/lifecycle/workbench/nodes/conf")]
+    [Description("项目阶段节点表格配置")]
+    public void NodesConf() {
+        CrudOps.Conf(this, Workbench.NodesDef());
+    }
+
+    [HttpPost]
+    [Route("/admin/lifecycle/workbench/nodes/list")]
+    [Description("项目阶段节点列表数据")]
+    public async void NodesList() {
+        if (!this.DataReady()) { return; }
+        int tid = Tenant.Cur();
+        int projectId = this.InAnyInt("projectId", 0);
+        LifecycleProject p = await this.LifecycleProject
+            .Where(a => a.id == projectId && a.tenantId == tid).FirstAsync();
+        if (p == null) { this.Fail(404, "0404", "项目不存在"); return; }
+
+        List<LifecycleNode> nodes = await this.LifecycleNode
+            .Where(a => a.projectId == p.id)
+            .OrderBy(a => a.seq)
+            .ToListAsync();
+        List<LifecycleStageDetail> details = await this.LifecycleStageDetail
+            .Where(a => a.projectId == p.id)
+            .ToListAsync();
+        List<SysUser> allUsers = await this.SysUser.ToListAsync();
+
+        JsonWriter w = new JsonWriter();
+        w.WriteStartArray();
+        for (int i = 0; i < nodes.Count; i = i + 1) {
+            LifecycleNode n = nodes[i];
+            string uName = "";
+            for (int u = 0; u < allUsers.Count; u = u + 1) {
+                if (allUsers[u].id == n.responsibleUserId) {
+                    uName = allUsers[u].nickname.Length > 0 ? allUsers[u].nickname : allUsers[u].username;
+                }
+            }
+            string m1 = "-";
+            string m2 = "-";
+            string m3 = "-";
+            for (int dti = 0; dti < details.Count; dti = dti + 1) {
+                if (details[dti].stage == n.stage) {
+                    m1 = details[dti].metric1;
+                    m2 = details[dti].metric2;
+                    m3 = details[dti].metric3;
+                }
+            }
+            w.WriteStartObject();
+            w.WriteProperty("id", n.id);
+            w.WriteProperty("projectId", p.id);
+            w.WriteProperty("seq", n.seq);
+            w.WriteProperty("stage", n.stage);
+            w.WriteProperty("stageName", n.stageName);
+            w.WriteProperty("respName", uName.Length > 0 ? uName : "责任人");
+            w.WriteProperty("aiRole", Fmt.Dash(n.aiAgentRole));
+            w.WriteProperty("status", n.status);
+            w.WriteProperty("metric1", m1);
+            w.WriteProperty("metric2", m2);
+            w.WriteProperty("metric3", m3);
+            w.WriteProperty("deliverableSummary", n.deliverableSummary.Length > 0 ? n.deliverableSummary : "—");
+            w.WriteProperty("aiSuggestion", n.aiSuggestion.Length > 0 ? n.aiSuggestion : "—");
+            w.WriteEndObject();
+        }
+        w.WriteEndArray();
+        AdminUiProtocol.WriteListData(this, nodes.Count, w.ToString());
     }
 
     /* 阶段成果核准流转或审核驳回 */
@@ -194,10 +218,10 @@ public class Workbench : CollabAdminController {
     async void Advance() {
         int tid = Tenant.Cur();
         SysUser me = await this.Admin();
-        int projectId = this.InInt("projectId", 0);
-        string stage = this.Need("stage", "阶段标识");
-        string summary = this.In("summary");
-        string action = this.In("action");
+        int projectId = this.InAnyInt("projectId", 0);
+        string stage = this.NeedAny("stage", "阶段标识");
+        string summary = this.InAny("summary");
+        string action = this.InAny("action");
         if (action.Length == 0) { action = "pass"; }
 
         LifecycleProject p = await this.LifecycleProject
@@ -401,9 +425,9 @@ public class Workbench : CollabAdminController {
     async void AiAssist() {
         int tid = Tenant.Cur();
         SysUser me = await this.Admin();
-        int projectId = this.InInt("projectId", 0);
-        string stage = this.Need("stage", "阶段标识");
-        string prompt = this.In("prompt");
+        int projectId = this.InAnyInt("projectId", 0);
+        string stage = this.NeedAny("stage", "阶段标识");
+        string prompt = this.InAny("prompt");
         if (prompt.Length == 0) { prompt = "Web工作台触发 AI 深度多维推演"; }
 
         LifecycleProject p = await this.LifecycleProject
@@ -447,14 +471,14 @@ public class Workbench : CollabAdminController {
     async void Create() {
         int tid = Tenant.Cur();
         SysUser me = await this.Admin();
-        string name = this.Need("name", "项目名称");
-        string category = this.In("category");
+        string name = this.NeedAny("name", "项目名称");
+        string category = this.InAny("category");
         if (category.Length == 0) { category = "服装鞋包"; }
-        string targetGmv = this.In("targetGmv");
+        string targetGmv = this.InAny("targetGmv");
         if (targetGmv.Length == 0) { targetGmv = "100000"; }
-        string targetRoi = this.In("targetRoi");
+        string targetRoi = this.InAny("targetRoi");
         if (targetRoi.Length == 0) { targetRoi = "2.5"; }
-        int templateId = this.InInt("templateId", 0);
+        int templateId = this.InAnyInt("templateId", 0);
 
         long now = WebApp.NowSeconds();
         string projectNo = "PRJ-" + Convert.ToString(now);

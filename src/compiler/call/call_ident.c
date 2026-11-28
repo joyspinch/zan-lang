@@ -35,8 +35,12 @@
                                 call_args[0] = this_val;
                             }
                             for (int k = 0; k < argc; k++) {
+                                zan_ast_node_t *ka = expr->call.args.items[k];
+                                if (ka && ka->kind == AST_LAMBDA &&
+                                    method_param_is_noescape(method_sym, k))
+                                    ka->lambda.is_noescape = 1;
                                 call_args[k + extra] = emit_arg_typed(g,
-                                    expr->call.args.items[k],
+                                    ka,
                                     method_param_type_at(g, method_sym, k, expr,
                                                          NULL, locals),
                                     locals);

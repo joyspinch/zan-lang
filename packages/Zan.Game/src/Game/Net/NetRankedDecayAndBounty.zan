@@ -1,0 +1,160 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Net;
+
+// 商业竞技高段位休眠衰减与活跃天数银行：每局对局存入保级活跃天数，归零后每日定量衰减至段位底线。
+public class NetRankedDecayTracker {
+    public int Rating;
+    public int DecayFloor;
+    public int BankDays;
+    public int MaxBankDays;
+    public int DecayPerDay;
+
+    public NetRankedDecayTracker(int initialRating, int decayFloor, int maxBankDays, int decayPerDay) {
+        this.Rating = initialRating;
+        this.DecayFloor = decayFloor;
+        this.BankDays = 0;
+        this.MaxBankDays = maxBankDays > 0 ? maxBankDays : 14;
+        this.DecayPerDay = decayPerDay > 0 ? decayPerDay : 25;
+    }
+
+    public void RecordRankedMatch(int bankGainDays) {
+        if (bankGainDays <= 0) { return; }
+        this.BankDays = this.BankDays + bankGainDays;
+        if (this.BankDays > this.MaxBankDays) { this.BankDays = this.MaxBankDays; }
+    }
+
+    // 推进若干非活跃天数，返回本轮实际扣除的排位分总量。
+    public int AdvanceInactiveDays(int inactiveDays) {
+        if (inactiveDays <= 0) { return 0; }
+        int overflow = inactiveDays - this.BankDays;
+        if (overflow <= 0) {
+            this.BankDays = this.BankDays - inactiveDays;
+            return 0;
+        }
+        this.BankDays = 0;
+        if (this.Rating <= this.DecayFloor) { return 0; }
+        int rawLoss = overflow * this.DecayPerDay;
+        int maxLoss = this.Rating - this.DecayFloor;
+        int actual = rawLoss < maxLoss ? rawLoss : maxLoss;
+        this.Rating = this.Rating - actual;
+        return actual;
+    }
+}
+
+// 单个玩家的连杀赏金记录。
+public class PlayerBountyEntry {
+    public int PlayerId;
+    public int KillStreak;
+
+    public PlayerBountyEntry(int playerId) {
+        this.PlayerId = playerId;
+        this.KillStreak = 0;
+    }
+}
+
+// 商业 MOBA/撤离竞技连杀赏金与终结奖金池：连杀达阈值递增赏金并设上限，终结时派发奖金并清零连杀。
+public class NetBountyShutdownPool {
+    private List<PlayerBountyEntry> entries;
+    public int BaseKillReward;
+    public int StreakThreshold;
+    public int BonusPerExtraKill;
+    public int MaxBonusBounty;
+
+    public NetBountyShutdownPool(int baseKillReward, int streakThreshold,
+    int bonusPerExtraKill, int maxBonusBounty) {
+        this.entries = new List<PlayerBountyEntry>();
+        this.BaseKillReward = baseKillReward >= 0 ? baseKillReward : 300;
+        this.StreakThreshold = streakThreshold > 1 ? streakThreshold : 3;
+        this.BonusPerExtraKill = bonusPerExtraKill >= 0 ? bonusPerExtraKill : 150;
+        this.MaxBonusBounty = maxBonusBounty >= 0 ? maxBonusBounty : 700;
+    }
+
+    private PlayerBountyEntry FindOrCreate(int playerId) {
+        for (int i = 0; i < this.entries.Count; i = i + 1) {
+            if (this.entries[i].PlayerId == playerId) { return this.entries[i]; }
+        }
+        PlayerBountyEntry e = new PlayerBountyEntry(playerId);
+        this.entries.Add(e);
+        return e;
+    }
+
+    public int CurrentBonusFor(int playerId) {
+        PlayerBountyEntry e = this.FindOrCreate(playerId);
+        if (e.KillStreak < this.StreakThreshold) { return 0; }
+        int extra = (e.KillStreak - this.StreakThreshold + 1) * this.BonusPerExtraKill;
+        return extra > this.MaxBonusBounty ? this.MaxBonusBounty : extra;
+    }
+
+    // 结算一次击杀：返还击杀基础奖 + 被终结者当前赏金，并推进击杀者连杀与清零阵亡者连杀。
+    public int RecordKill(int killerId, int victimId) {
+        int shutdownBonus = this.CurrentBonusFor(victimId);
+        PlayerBountyEntry victim = this.FindOrCreate(victimId);
+        victim.KillStreak = 0;
+        PlayerBountyEntry killer = this.FindOrCreate(killerId);
+        killer.KillStreak = killer.KillStreak + 1;
+        return this.BaseKillReward + shutdownBonus;
+    }
+}
+
+// 单个跨区数据中心的 RTT 与负载健康态。
+public class RegionEndpointHealth {
+    public string RegionId;
+    public float SmoothedRttMs;
+    public float LoadRatio;
+
+    public RegionEndpointHealth(string regionId, float rttMs, float loadRatio) {
+        this.RegionId = regionId;
+        this.SmoothedRttMs = rttMs;
+        this.LoadRatio = loadRatio;
+    }
+}
+
+// 商业全球同服跨区数据中心选路器：EWMA 延迟平滑 + 过载熔断跳过 + 切换滞回防乒乓抖动。
+public class NetRegionPingSelector {
+    private List<RegionEndpointHealth> regions;
+    public string CurrentRegionId;
+    public float SwitchMarginMs;
+    public float MaxLoadRatio;
+
+    public NetRegionPingSelector(float switchMarginMs, float maxLoadRatio) {
+        this.regions = new List<RegionEndpointHealth>();
+        this.CurrentRegionId = "";
+        this.SwitchMarginMs = switchMarginMs >= 0.0f ? switchMarginMs : 12.0f;
+        this.MaxLoadRatio = maxLoadRatio > 0.0f ? maxLoadRatio : 0.92f;
+    }
+
+    public void UpdateSample(string regionId, float rttMs, float loadRatio) {
+        for (int i = 0; i < this.regions.Count; i = i + 1) {
+            RegionEndpointHealth r = this.regions[i];
+            if (r.RegionId == regionId) {
+                r.SmoothedRttMs = r.SmoothedRttMs * 0.7f + rttMs * 0.3f;
+                r.LoadRatio = loadRatio;
+                return;
+            }
+        }
+        this.regions.Add(new RegionEndpointHealth(regionId, rttMs, loadRatio));
+    }
+
+    public string SelectBestRegion() {
+        RegionEndpointHealth best = null;
+        RegionEndpointHealth current = null;
+        for (int i = 0; i < this.regions.Count; i = i + 1) {
+            RegionEndpointHealth r = this.regions[i];
+            if (r.RegionId == this.CurrentRegionId) { current = r; }
+            if (r.LoadRatio >= this.MaxLoadRatio) { continue; }
+            if (best == null || r.SmoothedRttMs < best.SmoothedRttMs) {
+                best = r;
+            }
+        }
+        if (best == null) { return this.CurrentRegionId; }
+        if (current != null && current.LoadRatio < this.MaxLoadRatio
+            && current.RegionId != best.RegionId
+            && (current.SmoothedRttMs - best.SmoothedRttMs) < this.SwitchMarginMs) {
+            return this.CurrentRegionId;
+        }
+        this.CurrentRegionId = best.RegionId;
+        return this.CurrentRegionId;
+    }
+}

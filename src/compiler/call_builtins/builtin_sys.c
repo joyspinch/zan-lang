@@ -8,7 +8,591 @@ if (expr->call.callee && expr->call.callee->kind == AST_IDENTIFIER &&
   if (na && na->kind == AST_MEMBER_ACCESS)
     return emit_string_literal_rc(g, na->member.name);
 }
-/* Reflection (irgen_reflect */
+if (expr->call.callee && expr->call.callee->kind == AST_IDENTIFIER &&
+    expr->call.callee->ident.name.len == 8 &&
+    memcmp(expr->call.callee->ident.name.str, "comptime", 8) == 0 &&
+    expr->call.args.count == 1 &&
+    !local_find(locals, expr->call.callee->ident.name)) {
+  return zan_ctfe_emit_comptime(g, expr, locals);
+}
+if (expr->call.callee && expr->call.callee->kind == AST_IDENTIFIER &&
+    expr->call.callee->ident.name.len == 13 &&
+    memcmp(expr->call.callee->ident.name.str, "static_assert", 13) == 0 &&
+    expr->call.args.count >= 1 &&
+    !local_find(locals, expr->call.callee->ident.name)) {
+  zan_ctfe_eval_static_assert(g, expr);
+  return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
+}
+if (expr->call.args.count == 1 && expr->call.callee) {
+  int expect_val = -1;
+  if (expr->call.callee->kind == AST_IDENTIFIER &&
+      !local_find(locals, expr->call.callee->ident.name)) {
+    zan_istr_t bn = expr->call.callee->ident.name;
+    if (bn.len == 6 && memcmp(bn.str, "likely", 6) == 0) expect_val = 1;
+    else if (bn.len == 8 && memcmp(bn.str, "unlikely", 8) == 0) expect_val = 0;
+  } else if (expr->call.callee->kind == AST_MEMBER_ACCESS &&
+             expr->call.callee->member.object &&
+             expr->call.callee->member.object->kind == AST_IDENTIFIER &&
+             expr->call.callee->member.object->ident.name.len == 4 &&
+             memcmp(expr->call.callee->member.object->ident.name.str, "Hint", 4) == 0 &&
+             !local_find(locals, expr->call.callee->member.object->ident.name)) {
+    zan_istr_t mn = expr->call.callee->member.name;
+    if (mn.len == 6 && memcmp(mn.str, "Likely", 6) == 0) expect_val = 1;
+    else if (mn.len == 8 && memcmp(mn.str, "Unlikely", 8) == 0) expect_val = 0;
+  }
+  if (expect_val >= 0) {
+    LLVMValueRef cv = emit_expr(g, expr->call.args.items[0], locals);
+    LLVMTypeRef i1 = LLVMInt1TypeInContext(g->ctx);
+    if (LLVMTypeOf(cv) != i1) {
+      if (LLVMGetTypeKind(LLVMTypeOf(cv)) == LLVMIntegerTypeKind)
+        cv = LLVMBuildICmp(g->builder, LLVMIntNE, cv,
+                           LLVMConstInt(LLVMTypeOf(cv), 0, 0), "hint.b");
+      else
+        return cv;
+    }
+    if (!g->expect_false_fn) {
+      LLVMTypeRef ty = LLVMFunctionType(i1, (LLVMTypeRef[]){i1, i1}, 2, 0);
+      g->expect_false_fn = LLVMAddFunction(g->mod, "llvm.expect.i1", ty);
+    }
+    LLVMValueRef args[] = {cv, LLVMConstInt(i1, (unsigned long long)expect_val, 0)};
+    return LLVMBuildCall2(g->builder, LLVMGlobalGetValueType(g->expect_false_fn),
+                          g->expect_false_fn, args, 2,
+                          expect_val ? "hint.likely" : "hint.unlikely");
+  }
+}
+/* Volatile.* and Atomic.* zero-allocation hardware intrinsics */
+if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS &&
+    expr->call.callee->member.object &&
+    expr->call.callee->member.object->kind == AST_IDENTIFIER &&
+    !local_find(locals, expr->call.callee->member.object->ident.name)) {
+  zan_istr_t on = expr->call.callee->member.object->ident.name;
+  zan_istr_t mn = expr->call.callee->member.name;
+  if (on.len == 4 && memcmp(on.str, "Hint", 4) == 0) {
+    if (mn.len == 6 && memcmp(mn.str, "Assume", 6) == 0 &&
+        expr->call.args.count == 1) {
+      LLVMValueRef cv = emit_expr(g, expr->call.args.items[0], locals);
+      LLVMTypeRef i1 = LLVMInt1TypeInContext(g->ctx);
+      if (LLVMTypeOf(cv) != i1 &&
+          LLVMGetTypeKind(LLVMTypeOf(cv)) == LLVMIntegerTypeKind)
+        cv = LLVMBuildICmp(g->builder, LLVMIntNE, cv,
+                           LLVMConstInt(LLVMTypeOf(cv), 0, 0), "hint.ab");
+      LLVMTypeRef fty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i1, 1, 0);
+      LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "llvm.assume");
+      if (!fn)
+        fn = LLVMAddFunction(g->mod, "llvm.assume", fty);
+      LLVMBuildCall2(g->builder, fty, fn, &cv, 1, "");
+      return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
+    }
+    if (mn.len == 11 && memcmp(mn.str, "Unreachable", 11) == 0 &&
+        expr->call.args.count == 0) {
+      LLVMBasicBlockRef cur_bb = LLVMGetInsertBlock(g->builder);
+      LLVMValueRef cur_fn = cur_bb ? LLVMGetBasicBlockParent(cur_bb) : NULL;
+      LLVMBuildUnreachable(g->builder);
+      if (cur_fn) {
+        LLVMBasicBlockRef dead_bb =
+            LLVMAppendBasicBlockInContext(g->ctx, cur_fn, "hint.after_unreach");
+        LLVMPositionBuilderAtEnd(g->builder, dead_bb);
+      }
+      return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
+    }
+    if (mn.len == 4 && memcmp(mn.str, "Trap", 4) == 0 &&
+        expr->call.args.count == 0) {
+      LLVMTypeRef fty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), NULL, 0, 0);
+      LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "llvm.trap");
+      if (!fn)
+        fn = LLVMAddFunction(g->mod, "llvm.trap", fty);
+      LLVMBuildCall2(g->builder, fty, fn, NULL, 0, "");
+      return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
+    }
+    if (mn.len == 8 && memcmp(mn.str, "BlackBox", 8) == 0 &&
+        expr->call.args.count == 1) {
+      zan_type_t *rt = expr->call.type_args.count == 1
+                           ? resolve_type_ctx(g, expr->call.type_args.items[0])
+                           : infer_expr_type(g, expr->call.args.items[0], locals);
+      LLVMValueRef v = emit_expr(g, expr->call.args.items[0], locals);
+      LLVMTypeRef lt = rt ? map_type(g, rt) : LLVMTypeOf(v);
+      if (LLVMGetTypeKind(lt) == LLVMIntegerTypeKind &&
+          LLVMGetTypeKind(LLVMTypeOf(v)) == LLVMIntegerTypeKind &&
+          lt != LLVMTypeOf(v))
+        v = coerce_int_to(g, v, lt);
+      else
+        lt = LLVMTypeOf(v);
+      LLVMValueRef slot = emit_entry_alloca(g, lt, "hint.bb");
+      LLVMBuildStore(g->builder, v, slot);
+      LLVMTypeRef ptr_ty = LLVMTypeOf(slot);
+      LLVMTypeRef asm_fty =
+          LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &ptr_ty, 1, 0);
+      LLVMValueRef asm_fn = LLVMGetInlineAsm(
+          asm_fty, "", 0, "r,~{memory}", 11, 1, 0, LLVMInlineAsmDialectATT, 0);
+      LLVMBuildCall2(g->builder, asm_fty, asm_fn, &slot, 1, "");
+      return LLVMBuildLoad2(g->builder, lt, slot, "hint.bb.v");
+    }
+  }
+  if (on.len == 9 && memcmp(on.str, "InlineAsm", 9) == 0 &&
+      ((mn.len == 4 && memcmp(mn.str, "Emit", 4) == 0) ||
+       (mn.len == 9 && memcmp(mn.str, "EmitIntel", 9) == 0)) &&
+      expr->call.args.count >= 2 &&
+      expr->call.args.items[0]->kind == AST_STRING_LITERAL &&
+      expr->call.args.items[1]->kind == AST_STRING_LITERAL) {
+    bool is_intel = (mn.len == 9);
+    zan_istr_t tmpl = expr->call.args.items[0]->str_val;
+    zan_istr_t cons = expr->call.args.items[1]->str_val;
+    bool is_void = true;
+    LLVMTypeRef ret_lt = LLVMVoidTypeInContext(g->ctx);
+    if (expr->call.type_args.count == 1) {
+      zan_type_t *rt = resolve_type_ctx(g, expr->call.type_args.items[0]);
+      if (rt && rt->kind != TYPE_VOID) {
+        ret_lt = map_type(g, rt);
+        is_void = false;
+      }
+    }
+    int nops = expr->call.args.count - 2;
+    if (nops > 16) nops = 16;
+    LLVMTypeRef ptys[16];
+    LLVMValueRef pvals[16];
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    for (int i = 0; i < nops; i++) {
+      zan_ast_node_t *ai = expr->call.args.items[i + 2];
+      if (ai && ai->kind == AST_REF_ARG && ai->ref_arg.expr) {
+        LLVMValueRef ptr = emit_ref_lvalue_ptr(g, ai->ref_arg.expr, locals);
+        pvals[i] = ptr ? ptr : LLVMConstNull(i8ptr);
+        ptys[i] = LLVMTypeOf(pvals[i]);
+      } else {
+        LLVMValueRef v = emit_expr(g, ai, locals);
+        zan_type_t *at = infer_expr_type(g, ai, locals);
+        LLVMTypeRef lt = at ? map_type(g, at) : LLVMTypeOf(v);
+        LLVMTypeRef vt = LLVMTypeOf(v);
+        if (LLVMGetTypeKind(lt) == LLVMIntegerTypeKind &&
+            LLVMGetTypeKind(vt) == LLVMIntegerTypeKind && lt != vt)
+          v = coerce_int_to(g, v, lt);
+        pvals[i] = v;
+        ptys[i] = lt;
+      }
+    }
+    LLVMTypeRef fty = LLVMFunctionType(ret_lt, ptys, (unsigned)nops, 0);
+    LLVMValueRef asm_fn = LLVMGetInlineAsm(
+        fty, tmpl.str ? tmpl.str : "", (size_t)tmpl.len,
+        cons.str ? cons.str : "", (size_t)cons.len,
+        1, 0, is_intel ? LLVMInlineAsmDialectIntel : LLVMInlineAsmDialectATT, 0);
+    LLVMValueRef res = LLVMBuildCall2(g->builder, fty, asm_fn, pvals,
+                                      (unsigned)nops, is_void ? "" : "asm.v");
+    return is_void ? LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0) : res;
+  }
+  bool is_vol = (on.len == 8 && memcmp(on.str, "Volatile", 8) == 0);
+  bool is_atm = (on.len == 6 && memcmp(on.str, "Atomic", 6) == 0);
+  if (is_vol || is_atm) {
+    if (is_vol && expr->call.args.count == 3 &&
+        ((mn.len == 9 && memcmp(mn.str, "CopyBlock", 9) == 0) ||
+         (mn.len == 9 && memcmp(mn.str, "InitBlock", 9) == 0))) {
+      bool is_copy = (mn.str[0] == 'C');
+      LLVMTypeRef i8t = LLVMInt8TypeInContext(g->ctx);
+      LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+      LLVMTypeRef i1t = LLVMInt1TypeInContext(g->ctx);
+      LLVMTypeRef i8ptr = LLVMPointerType(i8t, 0);
+      LLVMValueRef zero64 = LLVMConstInt(i64t, 0, 0);
+      LLVMValueRef dst_i = coerce_int_to(g, emit_expr(g, expr->call.args.items[0], locals), i64t);
+      LLVMValueRef mid = emit_expr(g, expr->call.args.items[1], locals);
+      LLVMValueRef n = coerce_int_to(g, emit_expr(g, expr->call.args.items[2], locals), i64t);
+      LLVMValueRef ok = LLVMBuildICmp(g->builder, LLVMIntSGT, n, zero64, "vol.blk.ok");
+      LLVMValueRef cur_fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+      LLVMBasicBlockRef run_bb = LLVMAppendBasicBlockInContext(g->ctx, cur_fn, "vol.blk.run");
+      LLVMBasicBlockRef done_bb = LLVMAppendBasicBlockInContext(g->ctx, cur_fn, "vol.blk.done");
+      LLVMBuildCondBr(g->builder, ok, run_bb, done_bb);
+      LLVMPositionBuilderAtEnd(g->builder, run_bb);
+      LLVMValueRef dp = LLVMBuildIntToPtr(g->builder, dst_i, i8ptr, "vol.blk.dp");
+      if (is_copy) {
+        LLVMValueRef src_i = coerce_int_to(g, mid, i64t);
+        LLVMValueRef sp = LLVMBuildIntToPtr(g->builder, src_i, i8ptr, "vol.blk.sp");
+        LLVMTypeRef ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+                                          (LLVMTypeRef[]){i8ptr, i8ptr, i64t, i1t}, 4, 0);
+        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "llvm.memmove.p0.p0.i64");
+        if (!fn) fn = LLVMAddFunction(g->mod, "llvm.memmove.p0.p0.i64", ty);
+        LLVMBuildCall2(g->builder, ty, fn,
+                       (LLVMValueRef[]){dp, sp, n, LLVMConstInt(i1t, 1, 0)}, 4, "");
+      } else {
+        LLVMValueRef bv = coerce_int_to(g, mid, i8t);
+        LLVMTypeRef ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+                                          (LLVMTypeRef[]){i8ptr, i8t, i64t, i1t}, 4, 0);
+        LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "llvm.memset.p0.i64");
+        if (!fn) fn = LLVMAddFunction(g->mod, "llvm.memset.p0.i64", ty);
+        LLVMBuildCall2(g->builder, ty, fn,
+                       (LLVMValueRef[]){dp, bv, n, LLVMConstInt(i1t, 1, 0)}, 4, "");
+      }
+      LLVMBuildBr(g->builder, done_bb);
+      LLVMPositionBuilderAtEnd(g->builder, done_bb);
+      return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
+    }
+    if (is_atm && mn.len == 5 && memcmp(mn.str, "Pause", 5) == 0) {
+      LLVMTypeRef vty = LLVMVoidTypeInContext(g->ctx);
+      LLVMTypeRef fty = LLVMFunctionType(vty, NULL, 0, 0);
+      bool is_arm = g->target_triple &&
+                    (strstr(g->target_triple, "aarch64") != NULL ||
+                     strstr(g->target_triple, "arm64") != NULL);
+      const char *insn = is_arm ? "yield" : "pause";
+      LLVMValueRef asm_fn = LLVMGetInlineAsm(
+          fty, (char *)insn, strlen(insn), "", 0, 1, 0, LLVMInlineAsmDialectATT, 0);
+      LLVMBuildCall2(g->builder, fty, asm_fn, NULL, 0, "");
+      return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
+    }
+    if (is_atm && mn.len == 13 && memcmp(mn.str, "CompilerFence", 13) == 0) {
+      LLVMBuildFence(g->builder, LLVMAtomicOrderingAcquireRelease, 1, "");
+      return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
+    }
+    if (is_atm && mn.len == 5 && memcmp(mn.str, "Fence", 5) == 0) {
+      LLVMAtomicOrdering ord = LLVMAtomicOrderingSequentiallyConsistent;
+      if (expr->call.args.count == 1) {
+        zan_ast_node_t *oa = expr->call.args.items[0];
+        if (oa->kind == AST_INT_LITERAL) {
+          ord = oa->int_val == 1 ? LLVMAtomicOrderingAcquire
+              : oa->int_val == 2 ? LLVMAtomicOrderingRelease
+              : oa->int_val == 3 ? LLVMAtomicOrderingAcquireRelease
+                                 : LLVMAtomicOrderingSequentiallyConsistent;
+        } else if (oa->kind == AST_MEMBER_ACCESS && oa->member.name.str) {
+          if (oa->member.name.len == 7 && memcmp(oa->member.name.str, "Acquire", 7) == 0)
+            ord = LLVMAtomicOrderingAcquire;
+          else if (oa->member.name.len == 7 && memcmp(oa->member.name.str, "Release", 7) == 0)
+            ord = LLVMAtomicOrderingRelease;
+          else if (oa->member.name.len == 6 && memcmp(oa->member.name.str, "AcqRel", 6) == 0)
+            ord = LLVMAtomicOrderingAcquireRelease;
+        }
+      }
+      LLVMBuildFence(g->builder, ord, 0, "");
+      return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
+    }
+    if (is_atm && mn.len == 20 &&
+        memcmp(mn.str, "CompareExchange128At", 20) == 0 &&
+        expr->call.args.count >= 5) {
+      LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+      LLVMTypeRef i128t = LLVMInt128TypeInContext(g->ctx);
+      LLVMValueRef addr = coerce_int_to(g, emit_expr(g, expr->call.args.items[0], locals), i64t);
+      LLVMValueRef p128 = LLVMBuildIntToPtr(g->builder, addr, LLVMPointerType(i128t, 0), "cx128.p");
+      zan_ast_node_t *elo_arg = expr->call.args.items[1];
+      zan_ast_node_t *ehi_arg = expr->call.args.items[2];
+      LLVMValueRef elo_ptr = (elo_arg && elo_arg->kind == AST_REF_ARG && elo_arg->ref_arg.expr)
+                                 ? emit_ref_lvalue_ptr(g, elo_arg->ref_arg.expr, locals)
+                                 : NULL;
+      LLVMValueRef ehi_ptr = (ehi_arg && ehi_arg->kind == AST_REF_ARG && ehi_arg->ref_arg.expr)
+                                 ? emit_ref_lvalue_ptr(g, ehi_arg->ref_arg.expr, locals)
+                                 : NULL;
+      LLVMValueRef elo = elo_ptr ? LLVMBuildLoad2(g->builder, i64t, elo_ptr, "cx128.elo")
+                                 : LLVMConstInt(i64t, 0, 0);
+      LLVMValueRef ehi = ehi_ptr ? LLVMBuildLoad2(g->builder, i64t, ehi_ptr, "cx128.ehi")
+                                 : LLVMConstInt(i64t, 0, 0);
+      LLVMValueRef dlo = coerce_int_to(g, emit_expr(g, expr->call.args.items[3], locals), i64t);
+      LLVMValueRef dhi = coerce_int_to(g, emit_expr(g, expr->call.args.items[4], locals), i64t);
+      LLVMValueRef exp128 = LLVMBuildOr(
+          g->builder,
+          LLVMBuildShl(g->builder, LLVMBuildZExt(g->builder, ehi, i128t, "cx128.ehiz"),
+                       LLVMConstInt(i128t, 64, 0), "cx128.ehis"),
+          LLVMBuildZExt(g->builder, elo, i128t, "cx128.eloz"), "cx128.exp");
+      LLVMValueRef des128 = LLVMBuildOr(
+          g->builder,
+          LLVMBuildShl(g->builder, LLVMBuildZExt(g->builder, dhi, i128t, "cx128.dhiz"),
+                       LLVMConstInt(i128t, 64, 0), "cx128.dhis"),
+          LLVMBuildZExt(g->builder, dlo, i128t, "cx128.dloz"), "cx128.des");
+      LLVMAtomicOrdering succ_ord = LLVMAtomicOrderingSequentiallyConsistent;
+      LLVMAtomicOrdering fail_ord = LLVMAtomicOrderingSequentiallyConsistent;
+      for (int oi = 0; oi < 2; oi++) {
+        if (expr->call.args.count <= 5 + oi) continue;
+        zan_ast_node_t *oa = expr->call.args.items[5 + oi];
+        LLVMAtomicOrdering decoded = LLVMAtomicOrderingSequentiallyConsistent;
+        if (oa && oa->kind == AST_INT_LITERAL) {
+          decoded = oa->int_val == 0 ? LLVMAtomicOrderingMonotonic
+                  : oa->int_val == 1 ? LLVMAtomicOrderingAcquire
+                  : oa->int_val == 2 ? LLVMAtomicOrderingRelease
+                  : oa->int_val == 3 ? LLVMAtomicOrderingAcquireRelease
+                                     : LLVMAtomicOrderingSequentiallyConsistent;
+        } else if (oa && oa->kind == AST_MEMBER_ACCESS && oa->member.name.str) {
+          if (oa->member.name.len == 7 && memcmp(oa->member.name.str, "Relaxed", 7) == 0)
+            decoded = LLVMAtomicOrderingMonotonic;
+          else if (oa->member.name.len == 7 && memcmp(oa->member.name.str, "Acquire", 7) == 0)
+            decoded = LLVMAtomicOrderingAcquire;
+          else if (oa->member.name.len == 7 && memcmp(oa->member.name.str, "Release", 7) == 0)
+            decoded = LLVMAtomicOrderingRelease;
+          else if (oa->member.name.len == 6 && memcmp(oa->member.name.str, "AcqRel", 6) == 0)
+            decoded = LLVMAtomicOrderingAcquireRelease;
+        }
+        if (oi == 0) succ_ord = decoded;
+        else fail_ord = decoded;
+      }
+      if (expr->call.args.count == 6) {
+        fail_ord = (succ_ord == LLVMAtomicOrderingRelease ||
+                    succ_ord == LLVMAtomicOrderingAcquireRelease)
+                       ? LLVMAtomicOrderingAcquire
+                       : succ_ord;
+      }
+      if (fail_ord == LLVMAtomicOrderingRelease ||
+          fail_ord == LLVMAtomicOrderingAcquireRelease)
+        fail_ord = LLVMAtomicOrderingAcquire;
+      LLVMValueRef pair = LLVMBuildAtomicCmpXchg(
+          g->builder, p128, exp128, des128, succ_ord, fail_ord, 0);
+      LLVMSetAlignment(pair, 16);
+      LLVMValueRef old128 = LLVMBuildExtractValue(g->builder, pair, 0, "cx128.old");
+      LLVMValueRef ok1 = LLVMBuildExtractValue(g->builder, pair, 1, "cx128.ok");
+      LLVMValueRef old_lo = LLVMBuildTrunc(g->builder, old128, i64t, "cx128.olo");
+      LLVMValueRef old_hi = LLVMBuildTrunc(
+          g->builder,
+          LLVMBuildLShr(g->builder, old128, LLVMConstInt(i128t, 64, 0), "cx128.ohis"),
+          i64t, "cx128.ohi");
+      if (elo_ptr) LLVMBuildStore(g->builder, old_lo, elo_ptr);
+      if (ehi_ptr) LLVMBuildStore(g->builder, old_hi, ehi_ptr);
+      return ok1;
+    }
+    bool is_at = (mn.len > 2 && memcmp(mn.str + mn.len - 2, "At", 2) == 0 &&
+                  expr->call.type_args.count == 1 && expr->call.args.count >= 1);
+    if (is_at ||
+        (expr->call.args.count >= 1 && expr->call.args.items[0] &&
+         expr->call.args.items[0]->kind == AST_REF_ARG &&
+         expr->call.args.items[0]->ref_arg.expr)) {
+      zan_type_t *lt = NULL;
+      LLVMTypeRef llt = NULL;
+      LLVMValueRef ptr = NULL;
+      if (is_at) {
+        mn.len -= 2;
+        lt = resolve_type_ctx(g, expr->call.type_args.items[0]);
+        llt = lt ? map_type(g, lt) : LLVMInt32TypeInContext(g->ctx);
+        LLVMValueRef addr = emit_expr(g, expr->call.args.items[0], locals);
+        LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+        if (addr && LLVMTypeOf(addr) != i64t &&
+            LLVMGetTypeKind(LLVMTypeOf(addr)) == LLVMIntegerTypeKind)
+          addr = coerce_int_to(g, addr, i64t);
+        ptr = addr ? LLVMBuildIntToPtr(g->builder, addr, LLVMPointerType(llt, 0),
+                                       "mmio.p")
+                   : NULL;
+      } else {
+        zan_ast_node_t *tgt = expr->call.args.items[0]->ref_arg.expr;
+        lt = infer_expr_type(g, tgt, locals);
+        llt = lt ? map_type(g, lt) : LLVMInt32TypeInContext(g->ctx);
+        ptr = emit_ref_lvalue_ptr(g, tgt, locals);
+      }
+      if (ptr && llt) {
+        unsigned align = (unsigned)abi_size_of(llt);
+        if (align == 0) align = 1;
+        LLVMValueRef tptr = LLVMBuildBitCast(g->builder, ptr, LLVMPointerType(llt, 0), "at.p");
+        bool is_unsigned = lt && (lt->kind == TYPE_BYTE || lt->kind == TYPE_USHORT ||
+                                  lt->kind == TYPE_UINT || lt->kind == TYPE_ULONG);
+        if (is_vol && mn.len == 4 && memcmp(mn.str, "Read", 4) == 0) {
+          LLVMValueRef ld = LLVMBuildLoad2(g->builder, llt, tptr, "vol.ld");
+          LLVMSetVolatile(ld, 1);
+          LLVMSetAlignment(ld, align);
+          return ld;
+        }
+        if (is_vol && mn.len == 5 && memcmp(mn.str, "Write", 5) == 0 && expr->call.args.count == 2) {
+          LLVMValueRef vv = emit_expr(g, expr->call.args.items[1], locals);
+          if (LLVMTypeOf(vv) != llt) {
+            if (LLVMGetTypeKind(llt) == LLVMIntegerTypeKind &&
+                LLVMGetTypeKind(LLVMTypeOf(vv)) == LLVMIntegerTypeKind)
+              vv = coerce_int_to(g, vv, llt);
+            else if (LLVMGetTypeKind(llt) == LLVMFloatTypeKind &&
+                     LLVMGetTypeKind(LLVMTypeOf(vv)) == LLVMDoubleTypeKind)
+              vv = LLVMBuildFPTrunc(g->builder, vv, llt, "vol.ft");
+            else if (LLVMGetTypeKind(llt) == LLVMDoubleTypeKind &&
+                     LLVMGetTypeKind(LLVMTypeOf(vv)) == LLVMFloatTypeKind)
+              vv = LLVMBuildFPExt(g->builder, vv, llt, "vol.fe");
+          }
+          LLVMValueRef st = LLVMBuildStore(g->builder, vv, tptr);
+          LLVMSetVolatile(st, 1);
+          LLVMSetAlignment(st, align);
+          return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
+        }
+        /* Re-define MO decoder cleanly for Atomic.* operations */
+        #define ZAN_MO(node, def_ord)                                           \
+          ((node) == NULL ? (def_ord)                                           \
+           : ((node)->kind == AST_INT_LITERAL                                   \
+                  ? ((node)->int_val == 0 ? LLVMAtomicOrderingMonotonic         \
+                     : (node)->int_val == 1 ? LLVMAtomicOrderingAcquire         \
+                     : (node)->int_val == 2 ? LLVMAtomicOrderingRelease         \
+                     : (node)->int_val == 3 ? LLVMAtomicOrderingAcquireRelease  \
+                                            : LLVMAtomicOrderingSequentiallyConsistent) \
+              : ((node)->kind == AST_MEMBER_ACCESS && (node)->member.name.str   \
+                     ? ((node)->member.name.len == 7 &&                         \
+                                memcmp((node)->member.name.str, "Relaxed", 7) == 0 \
+                            ? LLVMAtomicOrderingMonotonic                       \
+                        : (node)->member.name.len == 7 &&                       \
+                                  memcmp((node)->member.name.str, "Acquire", 7) == 0 \
+                              ? LLVMAtomicOrderingAcquire                       \
+                        : (node)->member.name.len == 7 &&                       \
+                                  memcmp((node)->member.name.str, "Release", 7) == 0 \
+                              ? LLVMAtomicOrderingRelease                       \
+                        : (node)->member.name.len == 6 &&                       \
+                                  memcmp((node)->member.name.str, "AcqRel", 6) == 0 \
+                              ? LLVMAtomicOrderingAcquireRelease                \
+                              : LLVMAtomicOrderingSequentiallyConsistent)       \
+                     : (def_ord))))
+
+        if (is_atm && mn.len == 4 && memcmp(mn.str, "Load", 4) == 0) {
+          LLVMAtomicOrdering ord = ZAN_MO(
+              expr->call.args.count >= 2 ? expr->call.args.items[1] : NULL,
+              LLVMAtomicOrderingSequentiallyConsistent);
+          if (ord == LLVMAtomicOrderingRelease || ord == LLVMAtomicOrderingAcquireRelease)
+            ord = LLVMAtomicOrderingSequentiallyConsistent;
+          LLVMValueRef ld = LLVMBuildLoad2(g->builder, llt, tptr, "atom.ld");
+          LLVMSetOrdering(ld, ord);
+          LLVMSetAlignment(ld, align);
+          #undef ZAN_MO
+          return ld;
+        }
+        /* Helper local re-eval via inline switch */
+        LLVMAtomicOrdering ord_arg2 = LLVMAtomicOrderingSequentiallyConsistent;
+        LLVMAtomicOrdering ord_arg3 = LLVMAtomicOrderingSequentiallyConsistent;
+        LLVMAtomicOrdering ord_arg4 = LLVMAtomicOrderingAcquire;
+        if (expr->call.args.count >= 3) {
+          zan_ast_node_t *o2 = expr->call.args.items[2];
+          if (o2->kind == AST_INT_LITERAL) {
+            ord_arg2 = o2->int_val == 0 ? LLVMAtomicOrderingMonotonic
+                     : o2->int_val == 1 ? LLVMAtomicOrderingAcquire
+                     : o2->int_val == 2 ? LLVMAtomicOrderingRelease
+                     : o2->int_val == 3 ? LLVMAtomicOrderingAcquireRelease
+                                        : LLVMAtomicOrderingSequentiallyConsistent;
+          } else if (o2->kind == AST_MEMBER_ACCESS && o2->member.name.str) {
+            if (o2->member.name.len == 7 && memcmp(o2->member.name.str, "Relaxed", 7) == 0)
+              ord_arg2 = LLVMAtomicOrderingMonotonic;
+            else if (o2->member.name.len == 7 && memcmp(o2->member.name.str, "Acquire", 7) == 0)
+              ord_arg2 = LLVMAtomicOrderingAcquire;
+            else if (o2->member.name.len == 7 && memcmp(o2->member.name.str, "Release", 7) == 0)
+              ord_arg2 = LLVMAtomicOrderingRelease;
+            else if (o2->member.name.len == 6 && memcmp(o2->member.name.str, "AcqRel", 6) == 0)
+              ord_arg2 = LLVMAtomicOrderingAcquireRelease;
+          }
+        }
+        if (expr->call.args.count >= 4) {
+          zan_ast_node_t *o3 = expr->call.args.items[3];
+          if (o3->kind == AST_INT_LITERAL) {
+            ord_arg3 = o3->int_val == 0 ? LLVMAtomicOrderingMonotonic
+                     : o3->int_val == 1 ? LLVMAtomicOrderingAcquire
+                     : o3->int_val == 2 ? LLVMAtomicOrderingRelease
+                     : o3->int_val == 3 ? LLVMAtomicOrderingAcquireRelease
+                                        : LLVMAtomicOrderingSequentiallyConsistent;
+          } else if (o3->kind == AST_MEMBER_ACCESS && o3->member.name.str) {
+            if (o3->member.name.len == 7 && memcmp(o3->member.name.str, "Relaxed", 7) == 0)
+              ord_arg3 = LLVMAtomicOrderingMonotonic;
+            else if (o3->member.name.len == 7 && memcmp(o3->member.name.str, "Acquire", 7) == 0)
+              ord_arg3 = LLVMAtomicOrderingAcquire;
+            else if (o3->member.name.len == 7 && memcmp(o3->member.name.str, "Release", 7) == 0)
+              ord_arg3 = LLVMAtomicOrderingRelease;
+            else if (o3->member.name.len == 6 && memcmp(o3->member.name.str, "AcqRel", 6) == 0)
+              ord_arg3 = LLVMAtomicOrderingAcquireRelease;
+          }
+          /* Default failure ordering derived from success ordering */
+          ord_arg4 = (ord_arg3 == LLVMAtomicOrderingMonotonic ||
+                      ord_arg3 == LLVMAtomicOrderingRelease)
+                         ? LLVMAtomicOrderingMonotonic
+                         : (ord_arg3 == LLVMAtomicOrderingSequentiallyConsistent
+                                ? LLVMAtomicOrderingSequentiallyConsistent
+                                : LLVMAtomicOrderingAcquire);
+        }
+        if (expr->call.args.count >= 5) {
+          zan_ast_node_t *o4 = expr->call.args.items[4];
+          if (o4->kind == AST_INT_LITERAL) {
+            ord_arg4 = o4->int_val == 0 ? LLVMAtomicOrderingMonotonic
+                     : o4->int_val == 1 ? LLVMAtomicOrderingAcquire
+                                        : LLVMAtomicOrderingSequentiallyConsistent;
+          } else if (o4->kind == AST_MEMBER_ACCESS && o4->member.name.str) {
+            if (o4->member.name.len == 7 && memcmp(o4->member.name.str, "Relaxed", 7) == 0)
+              ord_arg4 = LLVMAtomicOrderingMonotonic;
+            else if (o4->member.name.len == 7 && memcmp(o4->member.name.str, "Acquire", 7) == 0)
+              ord_arg4 = LLVMAtomicOrderingAcquire;
+            else
+              ord_arg4 = LLVMAtomicOrderingSequentiallyConsistent;
+          }
+        }
+        if (is_atm && mn.len == 5 && memcmp(mn.str, "Store", 5) == 0 && expr->call.args.count >= 2) {
+          LLVMValueRef vv = coerce_int_to(g, emit_expr(g, expr->call.args.items[1], locals), llt);
+          LLVMAtomicOrdering st_ord = ord_arg2;
+          if (st_ord == LLVMAtomicOrderingAcquire || st_ord == LLVMAtomicOrderingAcquireRelease)
+            st_ord = LLVMAtomicOrderingSequentiallyConsistent;
+          LLVMValueRef st = LLVMBuildStore(g->builder, vv, tptr);
+          LLVMSetOrdering(st, st_ord);
+          LLVMSetAlignment(st, align);
+          return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
+        }
+        if (is_atm &&
+            ((mn.len == 15 && memcmp(mn.str, "CompareExchange", 15) == 0) ||
+             (mn.len == 19 && memcmp(mn.str, "CompareExchangeBool", 19) == 0)) &&
+            expr->call.args.count >= 3) {
+          LLVMValueRef expv = coerce_int_to(g, emit_expr(g, expr->call.args.items[1], locals), llt);
+          LLVMValueRef desv = coerce_int_to(g, emit_expr(g, expr->call.args.items[2], locals), llt);
+          if (expr->call.args.count < 4) {
+            ord_arg3 = LLVMAtomicOrderingSequentiallyConsistent;
+            ord_arg4 = LLVMAtomicOrderingSequentiallyConsistent;
+          }
+          LLVMValueRef pair = LLVMBuildAtomicCmpXchg(
+              g->builder, tptr, expv, desv, ord_arg3, ord_arg4, 0);
+          return LLVMBuildExtractValue(g->builder, pair, mn.len == 19 ? 1 : 0,
+                                       mn.len == 19 ? "atom.cx.ok" : "atom.cx.old");
+        }
+        if (is_atm && expr->call.args.count >= 2) {
+          int rmw_op = -1;
+          if (mn.len == 8 && memcmp(mn.str, "Exchange", 8) == 0) rmw_op = LLVMAtomicRMWBinOpXchg;
+          else if (mn.len == 8 && memcmp(mn.str, "FetchAdd", 8) == 0) rmw_op = LLVMAtomicRMWBinOpAdd;
+          else if (mn.len == 8 && memcmp(mn.str, "FetchSub", 8) == 0) rmw_op = LLVMAtomicRMWBinOpSub;
+          else if (mn.len == 8 && memcmp(mn.str, "FetchAnd", 8) == 0) rmw_op = LLVMAtomicRMWBinOpAnd;
+          else if (mn.len == 7 && memcmp(mn.str, "FetchOr", 7) == 0) rmw_op = LLVMAtomicRMWBinOpOr;
+          else if (mn.len == 8 && memcmp(mn.str, "FetchXor", 8) == 0) rmw_op = LLVMAtomicRMWBinOpXor;
+          else if (mn.len == 8 && memcmp(mn.str, "FetchMin", 8) == 0)
+            rmw_op = is_unsigned ? LLVMAtomicRMWBinOpUMin : LLVMAtomicRMWBinOpMin;
+          else if (mn.len == 8 && memcmp(mn.str, "FetchMax", 8) == 0)
+            rmw_op = is_unsigned ? LLVMAtomicRMWBinOpUMax : LLVMAtomicRMWBinOpMax;
+          if (rmw_op >= 0) {
+            LLVMValueRef vv = coerce_int_to(g, emit_expr(g, expr->call.args.items[1], locals), llt);
+            return LLVMBuildAtomicRMW(g->builder, (LLVMAtomicRMWBinOp)rmw_op,
+                                      tptr, vv, ord_arg2, 0);
+          }
+        }
+      }
+    }
+  }
+}
+  if (expr->call.callee->kind == AST_MEMBER_ACCESS &&
+      expr->call.callee->member.object->kind == AST_IDENTIFIER &&
+      expr->call.callee->member.object->ident.name.len == 8 &&
+      memcmp(expr->call.callee->member.object->ident.name.str, "Parallel", 8) == 0 &&
+      !local_find(locals, expr->call.callee->member.object->ident.name) &&
+      expr->call.args.count == 3) {
+    zan_istr_t mn = expr->call.callee->member.name;
+    bool is_for = (mn.len == 3 && memcmp(mn.str, "For", 3) == 0);
+    bool is_range = (mn.len == 8 && memcmp(mn.str, "ForRange", 8) == 0);
+    if (is_for || is_range) {
+      LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+      LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+      LLVMTypeRef void_t = LLVMVoidTypeInContext(g->ctx);
+      LLVMValueRef v_from = emit_expr(g, expr->call.args.items[0], locals);
+      LLVMValueRef v_to = emit_expr(g, expr->call.args.items[1], locals);
+      v_from = coerce_int_to(g, v_from, i32t);
+      v_to = coerce_int_to(g, v_to, i32t);
+
+      zan_ast_node_t *body_arg = expr->call.args.items[2];
+      zan_type_t *adt = (zan_type_t *)zan_arena_alloc(g->arena, sizeof(zan_type_t));
+      memset(adt, 0, sizeof(*adt));
+      adt->kind = TYPE_DELEGATE;
+      adt->name = (zan_istr_t){(char *)(is_range ? "__ParallelRangeAction" : "__ParallelAction"),
+                               is_range ? 21 : 16};
+      adt->delegate_param_count = is_range ? 2 : 1;
+      adt->delegate_param_types = (zan_type_t **)zan_arena_alloc(
+          g->arena, (size_t)adt->delegate_param_count * sizeof(zan_type_t *));
+      adt->delegate_param_types[0] = g->binder->type_int;
+      if (is_range) adt->delegate_param_types[1] = g->binder->type_int;
+      adt->delegate_ret_type = g->binder->type_void;
+
+      if (body_arg && body_arg->kind == AST_LAMBDA)
+        body_arg->lambda.is_noescape = 1;
+      LLVMValueRef v_body = emit_arg_typed(g, body_arg, adt, locals);
+      if (LLVMTypeOf(v_body) != i8ptr)
+        v_body = LLVMBuildBitCast(g->builder, v_body, i8ptr, "par.body8");
+
+      const char *rt_name = is_range ? "zan_parallel_for_range" : "zan_parallel_for";
+      LLVMTypeRef pts[3] = {i32t, i32t, i8ptr};
+      LLVMTypeRef fty = LLVMFunctionType(void_t, pts, 3, 0);
+      LLVMValueRef fn = LLVMGetNamedFunction(g->mod, rt_name);
+      if (!fn) fn = LLVMAddFunction(g->mod, rt_name, fty);
+      g->uses_sync_runtime = true;
+      LLVMValueRef args[3] = {v_from, v_to, v_body};
+      zan_call2(g->builder, fty, fn, args, 3, "");
+      emit_release_owned_call_temp(g, body_arg, v_body, locals);
+      return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0);
+    }
+  }
+  /* Reflection (irgen_reflect */
 if (expr->call.callee->kind == AST_MEMBER_ACCESS) {
   zan_ast_node_t *recv = expr->call.callee->member.object;
   zan_istr_t mname = expr->call.callee->member.name;

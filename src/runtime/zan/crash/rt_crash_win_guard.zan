@@ -1,0 +1,463 @@
+// rt_crash_win_guard.zan: Win32 thread guard slots, crash record writer, SEH handler & C ABI exports.
+
+using System;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Threading;
+
+namespace ZanCrashRuntime {
+#if WINDOWS
+    static partial class CrashRt {
+        // ---- Per-thread 64-slot table ----
+
+        static nint SlotAddr(int idx) {
+            nint baseP = NativeMemory.AddressOf(ref s_slots);
+            return (nint)((ulong)baseP + (ulong)idx * (ulong)sizeof(ThreadSlot));
+        }
+
+        static nint FindOrAllocSlot(bool create) {
+            int tid = (int)WinGetCurrentThreadId();
+            uint start = ((uint)tid * 2654435761U) & 63U;
+            for (uint i = 0U; i < 64U; i++) {
+                nint sp = SlotAddr((int)((start + i) & 63U));
+                if (Atomic.LoadAt<int>(sp, MemoryOrder.Acquire) == tid) return sp;
+            }
+            if (!create) return (nint)0;
+            for (uint i = 0U; i < 64U; i++) {
+                nint sp = SlotAddr((int)((start + i) & 63U));
+                if (Atomic.CompareExchangeBoolAt<int>(sp, 0, tid, MemoryOrder.AcqRel, MemoryOrder.Acquire)) {
+                    return sp;
+                }
+            }
+            return (nint)0;
+        }
+
+        static int CrashBusyGet(nint slotPtr) {
+            if (slotPtr != (nint)0) return NativeMemory.AsRef<ThreadSlot>(slotPtr).Busy;
+            return Atomic.Load(ref s_busyShared, MemoryOrder.Relaxed);
+        }
+
+        static void CrashBusySet(nint slotPtr, int v) {
+            if (slotPtr != (nint)0) NativeMemory.AsRef<ThreadSlot>(slotPtr).Busy = v;
+            else Atomic.Store(ref s_busyShared, v, MemoryOrder.Relaxed);
+        }
+
+        // ---- Crash record writer ----
+
+        static nint ArcReasonForCode(uint code) {
+            if (code == 0xE0A2C001U) return (nint)("retain of an already-freed object");
+            if (code == 0xE0A2C002U) return (nint)("release of an already-freed object");
+            if (code == 0xE0A2C003U) return (nint)("retain of an already-freed string");
+            if (code == 0xE0A2C004U) return (nint)("release of an already-freed string");
+            if (code == 0xE0A2C005U) return (nint)("use of a freed object through a stale reference (missing retain when stored)");
+            if (code == 0xE0A2C006U) return (nint)("use of a freed string through a stale reference (missing retain when stored)");
+            if (code == 0xE0A2C007U) return (nint)("retain of an already-freed array");
+            if (code == 0xE0A2C008U) return (nint)("release of an already-freed array");
+            if (code == 0xE0A2C009U) return (nint)("use of a freed array through a stale reference (missing retain when stored)");
+            return (nint)0;
+        }
+
+        static void WriteCrashRecord(nint erPtr, nint ctxPtr, nint reason, nint btPtr, int btn) {
+            if (erPtr == (nint)0) return;
+            Buf4096 logPath = new Buf4096();
+            Buf260 exeDir = new Buf260();
+            Buf260 exe = new Buf260();
+            nint logP = NativeMemory.AddressOf(ref logPath);
+            nint exeDirP = NativeMemory.AddressOf(ref exeDir);
+            nint exeP = NativeMemory.AddressOf(ref exe);
+
+            GetLogAndExeDir(logP, ZAN_CRASH_PATH_CAP, exeDirP);
+            if (WinGetModuleFileNameA((nint)0, exeP, 260U) == 0U) {
+                NativeMemory.At<byte>(exeP, 0) = (byte)0;
+            }
+            ulong exeBase = (ulong)WinGetModuleHandleW((nint)0);
+
+            PtrBuf62 frames = new PtrBuf62();
+            nint framesP = NativeMemory.AddressOf(ref frames);
+            int fn = 0;
+            nint arcFreedBy = (nint)0;
+
+            nint h = OpenLogWithRotate(logP);
+            if (h == (nint)0) {
+                GetTempLogPath(logP, ZAN_CRASH_PATH_CAP);
+                if (NativeMemory.At<byte>(logP, 0) != (byte)0) h = OpenLogWithRotate(logP);
+            }
+            if (h == (nint)0) return;
+
+            LineWriter lw = new LineWriter();
+            LwInit(ref lw, h);
+
+            uint code = NativeMemory.AsRef<uint>(erPtr);
+            uint flags = NativeMemory.AsRef<uint>((nint)((ulong)erPtr + 4UL));
+            nint faultAddr = NativeMemory.AsRef<nint>((nint)((ulong)erPtr + 16UL));
+            uint numParams = NativeMemory.AsRef<uint>((nint)((ulong)erPtr + 24UL));
+
+            LwCStr(ref lw, (nint)("==== ZAN CRASH "));
+            WriteTimestamp(ref lw);
+            LwCStr(ref lw, (nint)(" ("));
+            LwCStr(ref lw, (reason != (nint)0) ? reason : (nint)("unhandled"));
+            LwCStr(ref lw, (nint)(") ====\n"));
+
+            LwCStr(ref lw, (nint)("exe="));
+            LwCStr(ref lw, exeP);
+            LwCStr(ref lw, (nint)(" pid="));
+            LwUIntDec(ref lw, (ulong)WinGetCurrentProcessId(), 0, (byte)32);
+            LwCStr(ref lw, (nint)(" tid="));
+            LwUIntDec(ref lw, (ulong)WinGetCurrentThreadId(), 0, (byte)32);
+            LwByte(ref lw, (byte)10);
+
+            LwCStr(ref lw, (nint)("code=0x"));
+            LwHex(ref lw, (ulong)code, 8, true);
+            LwCStr(ref lw, (nint)(" flags=0x"));
+            LwHex(ref lw, (ulong)flags, 8, true);
+            LwByte(ref lw, (byte)10);
+
+            if (code == 0xE0A2C010U && numParams >= 1U) {
+                nint info0 = NativeMemory.AsRef<nint>((nint)((ulong)erPtr + 32UL));
+                if (info0 != (nint)0) {
+                    LwCStr(ref lw, (nint)("zan="));
+                    LwCStr(ref lw, info0);
+                    if (numParams >= 2U) {
+                        long info1 = NativeMemory.AsRef<long>((nint)((ulong)erPtr + 40UL));
+                        LwCStr(ref lw, (nint)("exit="));
+                        LwIntDec(ref lw, info1);
+                        LwByte(ref lw, (byte)10);
+                    }
+                }
+            }
+            nint arc = ArcReasonForCode(code);
+            if (arc != (nint)0) {
+                LwCStr(ref lw, (nint)("arc="));
+                LwCStr(ref lw, arc);
+                LwByte(ref lw, (byte)10);
+                if (numParams >= 3U) {
+                    ulong objAddr = NativeMemory.AsRef<ulong>((nint)((ulong)erPtr + 32UL));
+                    long rcVal = NativeMemory.AsRef<long>((nint)((ulong)erPtr + 40UL));
+                    arcFreedBy = NativeMemory.AsRef<nint>((nint)((ulong)erPtr + 48UL));
+                    LwCStr(ref lw, (nint)("arc.object=0x"));
+                    LwPtr(ref lw, objAddr);
+                    LwCStr(ref lw, (nint)(" arc.refcount="));
+                    LwIntDec(ref lw, rcVal);
+                    LwByte(ref lw, (byte)10);
+                    WriteModLine(ref lw, arcFreedBy, (nint)("arc.freed_by="));
+                }
+            }
+            if (code == EX_ACCESS_VIOLATION && numParams >= 2U) {
+                ulong accessKind = NativeMemory.AsRef<ulong>((nint)((ulong)erPtr + 32UL));
+                ulong accessAddr = NativeMemory.AsRef<ulong>((nint)((ulong)erPtr + 40UL));
+                nint kindStr = (accessKind == 1UL) ? (nint)("write")
+                             : (accessKind == 8UL) ? (nint)("execute")
+                                                   : (nint)("read");
+                LwCStr(ref lw, (nint)("access="));
+                LwCStr(ref lw, kindStr);
+                LwCStr(ref lw, (nint)(" addr=0x"));
+                LwPtr(ref lw, accessAddr);
+                LwByte(ref lw, (byte)10);
+            }
+            WriteModLine(ref lw, faultAddr, (nint)("fault="));
+
+#if X86_64
+            ulong ctxSp = 0UL;
+            if (ctxPtr != (nint)0) {
+                ulong rax = NativeMemory.AsRef<ulong>((nint)((ulong)ctxPtr + 120UL));
+                ulong rcx = NativeMemory.AsRef<ulong>((nint)((ulong)ctxPtr + 128UL));
+                ulong rdx = NativeMemory.AsRef<ulong>((nint)((ulong)ctxPtr + 136UL));
+                ulong rbx = NativeMemory.AsRef<ulong>((nint)((ulong)ctxPtr + 144UL));
+                ulong rsp = NativeMemory.AsRef<ulong>((nint)((ulong)ctxPtr + 152UL));
+                ulong rbp = NativeMemory.AsRef<ulong>((nint)((ulong)ctxPtr + 160UL));
+                ulong rsi = NativeMemory.AsRef<ulong>((nint)((ulong)ctxPtr + 168UL));
+                ulong rdi = NativeMemory.AsRef<ulong>((nint)((ulong)ctxPtr + 176UL));
+                ulong rip = NativeMemory.AsRef<ulong>((nint)((ulong)ctxPtr + 248UL));
+                ctxSp = rsp;
+
+                LwCStr(ref lw, (nint)("rip=")); LwPtr(ref lw, rip);
+                LwCStr(ref lw, (nint)(" rsp=")); LwPtr(ref lw, rsp);
+                LwCStr(ref lw, (nint)(" rbp=")); LwPtr(ref lw, rbp);
+                LwByte(ref lw, (byte)10);
+
+                LwCStr(ref lw, (nint)("rax=")); LwPtr(ref lw, rax);
+                LwCStr(ref lw, (nint)(" rbx=")); LwPtr(ref lw, rbx);
+                LwCStr(ref lw, (nint)(" rcx=")); LwPtr(ref lw, rcx);
+                LwCStr(ref lw, (nint)(" rdx=")); LwPtr(ref lw, rdx);
+                LwCStr(ref lw, (nint)(" rsi=")); LwPtr(ref lw, rsi);
+                LwCStr(ref lw, (nint)(" rdi=")); LwPtr(ref lw, rdi);
+                LwByte(ref lw, (byte)10);
+
+                Buf64 rawMbi = new Buf64();
+                nint rawMbiP = NativeMemory.AddressOf(ref rawMbi);
+                if (rsp != 0UL && WinVirtualQuery((nint)rsp, rawMbiP, 48UL) != 0UL) {
+                    uint st = NativeMemory.AsRef<uint>((nint)((ulong)rawMbiP + 32UL));
+                    uint pr = NativeMemory.AsRef<uint>((nint)((ulong)rawMbiP + 36UL));
+                    if (st == MEM_COMMIT && (pr & (PAGE_GUARD | PAGE_NOACCESS)) == 0U) {
+                        LwCStr(ref lw, (nint)("raw stack (@rsp):\n"));
+                        for (int w = 0; w < 16; w++) {
+                            nint val = NativeMemory.AsRef<nint>((nint)(rsp + (ulong)w * 8UL));
+                            LwCStr(ref lw, (nint)("  ["));
+                            LwUIntDec(ref lw, (ulong)w, 2, (byte)48);
+                            WriteModLine(ref lw, val, (nint)("] "));
+                        }
+                    }
+                }
+            }
+#endif
+
+            if (btPtr != (nint)0) {
+                fn = (btn < 62) ? btn : 62;
+                for (int i = 0; i < fn; i++) {
+                    NativeMemory.At<nint>(framesP, i) = NativeMemory.At<nint>(btPtr, i);
+                }
+            } else {
+                fn = (int)WinCaptureBackTrace(0U, 62U, framesP, (nint)0);
+            }
+#if X86_64
+            if (fn == 0 && ctxSp != 0UL) {
+                StackScan(ref lw, ctxSp, exeBase);
+            }
+#endif
+            LwCStr(ref lw, (nint)("backtrace ("));
+            LwIntDec(ref lw, (long)fn);
+            LwCStr(ref lw, (nint)(" frames):\n"));
+            for (int i = 0; i < fn; i++) {
+                LwCStr(ref lw, (nint)("  #"));
+                LwUIntDec(ref lw, (ulong)i, 2, (byte)48);
+                WriteModLine(ref lw, NativeMemory.At<nint>(framesP, i), (nint)(" "));
+            }
+            LwByte(ref lw, (byte)10);
+            LwFlush(ref lw);
+            CfClose(h);
+
+            nint symDir = (NativeMemory.At<byte>(exeDirP, 0) != (byte)0) ? exeDirP : (nint)(".\\");
+            if (code != EX_STACK_OVERFLOW && code != EX_HEAP_CORRUPTION && code != EX_FAIL_FAST) {
+                SymbolizeFrames(logP, exeP, symDir, exeBase, faultAddr, framesP, fn, false);
+            }
+            if (arcFreedBy != (nint)0) {
+                SymbolizeOne(logP, exeP, symDir, exeBase, arcFreedBy);
+            }
+        }
+
+        // ---- Exception classification & callbacks ----
+
+        static bool IsRecoverableCode(uint code) {
+            if (code == EX_ACCESS_VIOLATION || code == EX_IN_PAGE_ERROR ||
+                code == EX_ARRAY_BOUNDS || code == EX_DATATYPE_MISALIGN ||
+                code == EX_ILLEGAL_INSTR || code == EX_PRIV_INSTR ||
+                code == EX_INT_DIV_ZERO || code == EX_INT_OVERFLOW ||
+                code == EX_FLT_DIV_ZERO || code == EX_FLT_INVALID_OP) {
+                return true;
+            }
+            if (code >= 0xE0A2C001U && code <= 0xE0A2C010U) return true;
+            return false;
+        }
+
+        static bool IsHardFaultCode(uint code) {
+            if (code == EX_ACCESS_VIOLATION || code == EX_IN_PAGE_ERROR ||
+                code == EX_ILLEGAL_INSTR || code == EX_PRIV_INSTR ||
+                code == EX_STACK_OVERFLOW || code == EX_HEAP_CORRUPTION) {
+                return true;
+            }
+            if (code >= 0xE0A2C001U && code <= 0xE0A2C009U) return true;
+            return false;
+        }
+
+        static bool IsRipInMainExe(nint ctxPtr) {
+            if (ctxPtr == (nint)0) return false;
+#if X86_64
+            ulong rip = NativeMemory.AsRef<ulong>((nint)((ulong)ctxPtr + 248UL));
+            if (rip == 0UL) return false;
+            nint m = (nint)0;
+            if (WinGetModuleHandleExA(GMHEX_FROM_ADDRESS | GMHEX_UNCHANGED_REFCOUNT, (nint)rip, NativeMemory.AddressOf(ref m)) == 0) {
+                return false;
+            }
+            return m == WinGetModuleHandleA((nint)0);
+#else
+            return false;
+#endif
+        }
+
+        [Export("__zan_crash_filter")]
+        [Visibility("hidden")]
+        static int UnhandledFilter(nint ep) {
+            if (ep == (nint)0) return EXCEPTION_EXECUTE_HANDLER;
+            nint er = NativeMemory.AsRef<nint>(ep);
+            nint ctx = NativeMemory.AsRef<nint>((nint)((ulong)ep + 8UL));
+            if (er == (nint)0) return EXCEPTION_EXECUTE_HANDLER;
+            nint slot = FindOrAllocSlot(false);
+            if (CrashBusyGet(slot) != 0) return EXCEPTION_EXECUTE_HANDLER;
+            CrashBusySet(slot, 1);
+            WriteCrashRecord(er, ctx, (nint)("unhandled"), (nint)0, 0);
+            CrashBusySet(slot, 0);
+            if (NativeMemory.AsRef<uint>(er) == 0xE0A2C010U) {
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            return EXCEPTION_EXECUTE_HANDLER;
+        }
+
+        [Export("__zan_crash_veh")]
+        [Visibility("hidden")]
+        static int VehHandler(nint ep) {
+            if (ep == (nint)0) return EXCEPTION_CONTINUE_SEARCH;
+            nint er = NativeMemory.AsRef<nint>(ep);
+            nint ctx = NativeMemory.AsRef<nint>((nint)((ulong)ep + 8UL));
+            if (er == (nint)0 || ctx == (nint)0) return EXCEPTION_CONTINUE_SEARCH;
+
+            nint slot = FindOrAllocSlot(false);
+            if (CrashBusyGet(slot) != 0) return EXCEPTION_CONTINUE_SEARCH;
+
+            uint code = NativeMemory.AsRef<uint>(er);
+#if X86_64
+            if (slot != (nint)0) {
+                nint gPtr = NativeMemory.AsRef<ThreadSlot>(slot).Top;
+                if (gPtr != (nint)0) {
+                    ref GuardFrame g = ref NativeMemory.AsRef<GuardFrame>(gPtr);
+                    if (Atomic.Load(ref g.Armed, MemoryOrder.Acquire) != 0 &&
+                        IsRecoverableCode(code) &&
+                        IsRipInMainExe(ctx) &&
+                        Atomic.CompareExchangeBool(ref g.Armed, 1, 0, MemoryOrder.AcqRel, MemoryOrder.Acquire)) {
+                        CMemcpy(NativeMemory.AddressOf(ref g.FaultEr), er, WIN64_ER_SIZE);
+                        CMemcpy(g.FaultCtxPtr, ctx, WIN64_CTX_SIZE);
+                        g.Btn = (uint)WinCaptureBackTrace(0U, 62U, NativeMemory.AddressOf(ref g.Bt), (nint)0);
+                        g.Have = 1;
+                        Atomic.Store(ref g.Resumed, 1, MemoryOrder.Release);
+                        // Pure Win32 zero-assembly recovery: restore saved RtlCaptureContext frame.
+                        CMemcpy(ctx, g.SavedCtxPtr, WIN64_CTX_SIZE);
+                        return EXCEPTION_CONTINUE_EXECUTION;
+                    }
+                }
+            }
+#endif
+            if (IsHardFaultCode(code)) {
+                int seen = Atomic.FetchAdd(ref s_firstChance, 1, MemoryOrder.AcqRel) + 1;
+                if (seen <= ZAN_GUARD_LOG_FULL || (seen % ZAN_GUARD_LOG_EVERY) == 0) {
+                    CrashBusySet(slot, 1);
+                    WriteCrashRecord(er, ctx, (nint)("first-chance"), (nint)0, 0);
+                    CrashBusySet(slot, 0);
+                }
+            }
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+
+        [Export("__zan_crash_atexit")]
+        [Visibility("hidden")]
+        static void OnProcessExit() {
+            Buf128 detail = new Buf128();
+            nint dP = NativeMemory.AddressOf(ref detail);
+            int p = 0;
+            p = SBAppendCStr(dP, p, 128, (nint)("recovered="));
+            p = SBAppendInt(dP, p, 128, (long)Atomic.Load(ref s_recovered, MemoryOrder.Relaxed));
+            p = SBAppendCStr(dP, p, 128, (nint)(" logged="));
+            p = SBAppendInt(dP, p, 128, (long)Atomic.Load(ref s_logged, MemoryOrder.Relaxed));
+            p = SBAppendCStr(dP, p, 128, (nint)(" first-chance="));
+            SBAppendInt(dP, p, 128, (long)Atomic.Load(ref s_firstChance, MemoryOrder.Relaxed));
+            WriteCrashNote((nint)("exit"), dP);
+        }
+
+        static nint PinCallbackImage() {
+            nint img = (nint)0;
+            if (WinGetModuleHandleExA(GMHEX_FROM_ADDRESS | GMHEX_PIN,
+                                      NativeMemory.FunctionPointer(UnhandledFilter),
+                                      NativeMemory.AddressOf(ref img)) == 0) {
+                return (nint)0;
+            }
+            return img;
+        }
+
+        static void LogDeferredRecovery(nint slot, ref GuardFrame g) {
+            if (g.Have == 0) return;
+            g.Have = 0;
+            if (CrashBusyGet(slot) != 0) return;
+            int seen = Atomic.FetchAdd(ref s_recovered, 1, MemoryOrder.AcqRel) + 1;
+            if (seen > ZAN_GUARD_LOG_FULL && (seen % ZAN_GUARD_LOG_EVERY) != 0) return;
+            CrashBusySet(slot, 1);
+            WriteCrashRecord(NativeMemory.AddressOf(ref g.FaultEr), g.FaultCtxPtr,
+                             (nint)("recovered"), NativeMemory.AddressOf(ref g.Bt), (int)g.Btn);
+            CrashBusySet(slot, 0);
+            Atomic.FetchAdd(ref s_logged, 1, MemoryOrder.AcqRel);
+        }
+
+        // ---- Public C ABI Exports & ModuleInitializer ----
+
+        [ModuleInitializer]
+        static void AutoInstall() {
+            Install();
+        }
+
+        [Export("zan__crash_install")]
+        public static void Install() {
+            if (!Atomic.CompareExchangeBool(ref s_installed, 0, 1, MemoryOrder.AcqRel, MemoryOrder.Acquire)) {
+                return;
+            }
+            nint img = PinCallbackImage();
+            if (img == (nint)0) {
+                Atomic.Store(ref s_installed, 0, MemoryOrder.Release);
+                return;
+            }
+            ResolvePaths();
+            WinSetUnhandledFilter(NativeMemory.FunctionPointer(UnhandledFilter));
+            WinAddVeh(1U, NativeMemory.FunctionPointer(VehHandler));
+            WriteCrashNote((nint)("run"), (nint)(""));
+            if (img == WinGetModuleHandleA((nint)0)) {
+                CAtexit(NativeMemory.FunctionPointer(OnProcessExit));
+            }
+        }
+
+        [Export("zan__guard_call")]
+        public static int GuardCall(nint fn, nint arg) {
+            if (fn == (nint)0) return 1;
+            nint slot = FindOrAllocSlot(true);
+            if (slot == (nint)0) {
+                NativeMemory.InvokeVoidWithCC<nint>("c", fn, arg);
+                return 1;
+            }
+            ref ThreadSlot s = ref NativeMemory.AsRef<ThreadSlot>(slot);
+            if (s.Ready == 0) {
+                s.Ready = 1;
+                if (PinCallbackImage() != (nint)0) {
+                    WinSetUnhandledFilter(NativeMemory.FunctionPointer(UnhandledFilter));
+                }
+                Install();
+                uint guarantee = 65536U;
+                WinSetThreadStackGuarantee(NativeMemory.AddressOf(ref guarantee));
+            }
+#if X86_64
+            GuardFrame g = new GuardFrame();
+            nint gPtr = NativeMemory.AddressOf(ref g);
+            ulong rawSaved = (ulong)NativeMemory.AddressOf(ref g.SavedCtxBuf);
+            nint alignedSaved = (nint)((rawSaved + 15UL) & ~15UL);
+            ulong rawFault = (ulong)NativeMemory.AddressOf(ref g.FaultCtxBuf);
+            nint alignedFault = (nint)((rawFault + 15UL) & ~15UL);
+
+            g.SavedCtxPtr = alignedSaved;
+            g.FaultCtxPtr = alignedFault;
+            g.Prev = s.Top;
+            g.Armed = 0;
+            g.Resumed = 0;
+            g.Btn = 0U;
+            g.Have = 0;
+            s.Top = gPtr;
+
+            WinRtlCaptureContext(alignedSaved);
+
+            if (Atomic.Load(ref g.Resumed, MemoryOrder.Acquire) == 0) {
+                Atomic.Store(ref g.Armed, 1, MemoryOrder.Release);
+                NativeMemory.InvokeVoidWithCC<nint>("c", fn, arg);
+                Atomic.Store(ref g.Armed, 0, MemoryOrder.Release);
+                s.Top = g.Prev;
+                return 1;
+            }
+            s.Top = g.Prev;
+            LogDeferredRecovery(slot, ref g);
+            return 0;
+#else
+            NativeMemory.InvokeVoidWithCC<nint>("c", fn, arg);
+            return 1;
+#endif
+        }
+
+        [Export("zan__guard_recovered_count")]
+        public static long GuardRecoveredCount() {
+            return (long)Atomic.Load(ref s_recovered, MemoryOrder.Relaxed);
+        }
+    }
+
+#endif
+}

@@ -7,3 +7,4 @@
 #include "expr/expr_simd128.c"
 #include "expr/expr_simd256.c"
 #include "expr/expr_prop.c"
+#include "expr/expr_ctfe.c"

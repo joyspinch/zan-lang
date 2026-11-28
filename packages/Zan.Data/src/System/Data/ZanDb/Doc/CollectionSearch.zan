@@ -124,7 +124,7 @@ public class CollectionSearch {
     }
 
     public static void CheckDefinition(JsonValue def) {
-        if (!def.IsObject() || CollectionSearch.Number(def, "format") != 1
+        if (def == null || !def.IsObject() || CollectionSearch.Number(def, "format") != 1
         || def.Str("status", "") != "ready") {
             throw new IOException("unsupported or unfinished search index");
         }
@@ -140,21 +140,27 @@ public class CollectionSearch {
     }
 
     public List<JsonValue> Definitions() {
-        string body = this.kv.Get(this.prefix + "catalog");
-        if (body == this.catalogBody) { return this.catalog; }
-        List<JsonValue> defs = new List<JsonValue>();
-        if (body.Length > 0) {
-            JsonValue list = JsonValue.Parse(body);
-            if (!list.IsArray()) { throw new IOException("invalid search catalog"); }
-            for (int i = 0; i < list.Count(); i = i + 1) {
-                JsonValue def = list.At(i);
-                CollectionSearch.CheckDefinition(def);
-                defs.Add(def);
+        if (this.smtx != 0) { Mutex.Lock(this.smtx); }
+        try {
+            string body = this.kv.Get(this.prefix + "catalog");
+            if (body == null) { body = ""; }
+            if (body == this.catalogBody) { return this.catalog; }
+            List<JsonValue> defs = new List<JsonValue>();
+            if (body.Length > 0) {
+                JsonValue list = JsonValue.Parse(body);
+                if (list == null || !list.IsArray()) { throw new IOException("invalid search catalog"); }
+                for (int i = 0; i < list.Count(); i = i + 1) {
+                    JsonValue def = list.At(i);
+                    CollectionSearch.CheckDefinition(def);
+                    defs.Add(def);
+                }
             }
+            this.catalogBody = body;
+            this.catalog = defs;
+            return defs;
+        } finally {
+            if (this.smtx != 0) { Mutex.Unlock(this.smtx); }
         }
-        this.catalogBody = body;
-        this.catalog = defs;
-        return defs;
     }
 
     public JsonValue ListIndexes() {
@@ -316,7 +322,9 @@ public class CollectionSearch {
             DiscardGeneration(state, generation, true);
             throw;
         }
-        this.states[kind + ":" + field] = state;
+        if (this.smtx != 0) { Mutex.Lock(this.smtx); }
+        try { this.states[kind + ":" + field] = state; }
+        finally { if (this.smtx != 0) { Mutex.Unlock(this.smtx); } }
         Cleanup(state, generation, state.applied);
     }
 
@@ -355,14 +363,14 @@ public class CollectionSearch {
     }
 
     public static float[] ReadVector(JsonValue value, VectorIndexOptions options) {
-        if (!value.IsArray() || value.Count() != options.dimensions) {
+        if (value == null || options == null || !value.IsArray() || value.Count() != options.dimensions) {
             throw new ArgumentException("vector dimensions do not match index");
         }
         float[] vector = new float[options.dimensions];
         double norm = 0;
         for (int i = 0; i < options.dimensions; i = i + 1) {
             JsonValue coordinate = value.At(i);
-            if (!coordinate.IsNumber()) { throw new ArgumentException("vector coordinates must be numeric"); }
+            if (coordinate == null || !coordinate.IsNumber()) { throw new ArgumentException("vector coordinates must be numeric"); }
             double d = coordinate.AsDouble(0);
             float coordinateValue = (float)d;
             double stored = (double)coordinateValue;
@@ -460,14 +468,14 @@ public class CollectionSearch {
             if (state.applied > revision) { throw new IOException("search checkpoint ahead of input"); }
             string snapshotGeneration = snapshot.Str("generation", "");
             long rowCount = CollectionSearch.Number(snapshot, "count");
-            if (rowCount > 2147483647) { throw new IOException("search checkpoint too large"); }
+            if (rowCount < 0 || rowCount > 2147483647) { throw new IOException("search checkpoint count out of range"); }
             JsonValue rootNode = snapshot.Get("root");
             JsonValue root = rootNode != null ? rootNode.Clone() : JsonValue.NewNull();
             if (format == 2) {
                 // 向量代 v2：逐行流式二进制导入，全程只持一个批次
                 // 载荷与打包边暂存；头部 root 带图元，行序即槽位序。
                 long batchCount = CollectionSearch.Number(snapshot, "batches");
-                if (batchCount > 2147483647) { throw new IOException("search checkpoint too large"); }
+                if (batchCount < 0 || batchCount > 2147483647) { throw new IOException("search checkpoint batch count out of range"); }
                 state.options = VectorIndexOptions.FromJson(config);
                 VectorIndexOptions rootOpts = VectorIndexOptions.FromJson(root.Get("options"));
                 if (!rootOpts.Equals(state.options)) {
@@ -748,7 +756,9 @@ public class CollectionSearch {
                 DiscardGeneration(state, generation, true);
                 throw;
             }
-            this.states[kind + ":" + field] = state;
+            if (this.smtx != 0) { Mutex.Lock(this.smtx); }
+            try { this.states[kind + ":" + field] = state; }
+            finally { if (this.smtx != 0) { Mutex.Unlock(this.smtx); } }
             Cleanup(state, generation, state.applied);
         }
     }

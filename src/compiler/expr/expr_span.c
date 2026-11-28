@@ -265,6 +265,91 @@ LLVMTypeRef span_elem_storage_type(zan_irgen_t *g, zan_type_t *elem_type) {
   return map_type(g, elem_type);
 }
 
+unsigned zan_span_elem_align(zan_irgen_t *g, LLVMTypeRef elem_llvm) {
+  if (!elem_llvm)
+    return 1;
+  if (!g->tbaa_td && g->mod) {
+    const char *dl = LLVMGetDataLayoutStr(g->mod);
+    if (dl && dl[0])
+      g->tbaa_td = LLVMCreateTargetData(dl);
+  }
+  if (g->tbaa_td) {
+    unsigned a = LLVMABIAlignmentOfType(g->tbaa_td, elem_llvm);
+    if (a >= 1 && a <= 16)
+      return a;
+    if (a > 16)
+      return 16;
+  }
+  LLVMTypeKind tk = LLVMGetTypeKind(elem_llvm);
+  if (tk == LLVMIntegerTypeKind) {
+    unsigned bits = LLVMGetIntTypeWidth(elem_llvm);
+    if (bits <= 8) return 1;
+    if (bits <= 16) return 2;
+    if (bits <= 32) return 4;
+    return 8;
+  }
+  if (tk == LLVMFloatTypeKind) return 4;
+  if (tk == LLVMDoubleTypeKind || tk == LLVMPointerTypeKind) return 8;
+  return 1;
+}
+
+void zan_fn_reset_alias_scopes(zan_irgen_t *g) {
+  g->fn_alias_domain = NULL;
+  g->fn_alias_scope_count = 0;
+}
+
+int zan_fn_alloc_alias_scope(zan_irgen_t *g) {
+  if (g->fn_alias_scope_count >= 16)
+    return 0;
+  if (!g->fn_alias_domain) {
+    char dbuf[48];
+    int dlen = snprintf(dbuf, sizeof(dbuf), "zan.alias.dom.%d", ++g->fn_alias_domain_seq);
+    LLVMMetadataRef dstr = LLVMMDStringInContext2(g->ctx, dbuf, (size_t)dlen);
+    g->fn_alias_domain = LLVMMDNodeInContext2(g->ctx, &dstr, 1);
+  }
+  int idx = g->fn_alias_scope_count;
+  char sbuf[64];
+  int slen = snprintf(sbuf, sizeof(sbuf), "zan.alias.scope.%d.%d",
+                      g->fn_alias_domain_seq, idx);
+  LLVMMetadataRef sops[2] = {
+      LLVMMDStringInContext2(g->ctx, sbuf, (size_t)slen),
+      g->fn_alias_domain
+  };
+  g->fn_alias_scopes[idx] = LLVMMDNodeInContext2(g->ctx, sops, 2);
+  g->fn_alias_scope_count++;
+  return idx + 1; /* 1-based scope id */
+}
+
+void zan_attach_noalias_md(zan_irgen_t *g, LLVMValueRef mem_inst, int scope_id) {
+  if (!mem_inst || scope_id <= 0 || scope_id > g->fn_alias_scope_count ||
+      g->fn_alias_scope_count < 2)
+    return;
+  int idx = scope_id - 1;
+  LLVMMetadataRef my_scope = g->fn_alias_scopes[idx];
+  LLVMMetadataRef scope_list = LLVMMDNodeInContext2(g->ctx, &my_scope, 1);
+  unsigned k_as = LLVMGetMDKindIDInContext(g->ctx, "alias.scope", 11);
+  LLVMSetMetadata(mem_inst, k_as, LLVMMetadataAsValue(g->ctx, scope_list));
+
+  LLVMMetadataRef others[16];
+  int oc = 0;
+  for (int j = 0; j < g->fn_alias_scope_count; j++) {
+    if (j != idx)
+      others[oc++] = g->fn_alias_scopes[j];
+  }
+  if (oc > 0) {
+    LLVMMetadataRef noalias_list = LLVMMDNodeInContext2(g->ctx, others, (size_t)oc);
+    unsigned k_na = LLVMGetMDKindIDInContext(g->ctx, "noalias", 7);
+    LLVMSetMetadata(mem_inst, k_na, LLVMMetadataAsValue(g->ctx, noalias_list));
+  }
+}
+
+int zan_local_noalias_scope(zan_ast_node_t *expr, local_scope_t *locals) {
+  if (!expr || expr->kind != AST_IDENTIFIER || !locals)
+    return 0;
+  local_var_t *lv = local_find(locals, expr->ident.name);
+  return lv ? lv->noalias_scope_id : 0;
+}
+
 /* Span<T> 原语：将切片操作降解为 { i8* base, i64 len } 胖指针视图 */
 bool emit_span_call(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals,
                     LLVMValueRef *out) {
@@ -293,7 +378,20 @@ bool emit_span_call(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals,
       base = emit_str_nonnull(g, sobj);
       len = emit_string_length(g, base, callee->loc);
       elem_llvm = span_elem_storage_type(g, g->binder->type_char);
-
+    } else if (is_inline_array_type(ot)) {
+      int64_t arr_n = inline_array_len(ot);
+      zan_type_t *et = inline_array_elem(ot);
+      elem_llvm = span_elem_storage_type(g, et);
+      LLVMValueRef ptr = emit_ref_lvalue_ptr(g, callee->member.object, locals);
+      if (!ptr) {
+        LLVMTypeRef arr_llvm =
+            LLVMArrayType(elem_llvm, (unsigned)(arr_n > 0 ? arr_n : 1));
+        LLVMValueRef val = emit_expr(g, callee->member.object, locals);
+        ptr = emit_entry_alloca(g, arr_llvm, "iasp.tmp");
+        LLVMBuildStore(g->builder, val, ptr);
+      }
+      base = LLVMBuildBitCast(g->builder, ptr, i8ptr, "iasp.base");
+      len = LLVMConstInt(i64t, (unsigned long long)arr_n, 0);
     } else {
       return false;
     }
@@ -432,3 +530,356 @@ bool emit_bytes_call(zan_irgen_t *g, zan_ast_node_t *expr,
   *out = s;
   return true;
 }
+
+/* Portable SIMD Vec<N, T> lowering helpers (<N x T> LLVM vectors) */
+static LLVMValueRef vec_coerce_scalar(zan_irgen_t *g, LLVMValueRef v,
+                                      LLVMTypeRef elt) {
+  if (LLVMTypeOf(v) == elt)
+    return v;
+  LLVMTypeKind ek = LLVMGetTypeKind(elt);
+  LLVMTypeKind vk = LLVMGetTypeKind(LLVMTypeOf(v));
+  if (ek == LLVMFloatTypeKind || ek == LLVMDoubleTypeKind) {
+    if (vk == LLVMIntegerTypeKind)
+      return LLVMBuildSIToFP(g->builder, v, elt, "v.fp");
+    return LLVMBuildFPCast(g->builder, v, elt, "v.fpc");
+  }
+  return coerce_int_to(g, v, elt);
+}
+
+static LLVMValueRef vec_splat_val(zan_irgen_t *g, LLVMValueRef scalar,
+                                  LLVMTypeRef vec_ty, unsigned nlanes) {
+  LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+  LLVMValueRef zero = LLVMConstInt(i32t, 0, 0);
+  LLVMValueRef ins = LLVMBuildInsertElement(g->builder, LLVMGetUndef(vec_ty),
+                                            scalar, zero, "v.splat0");
+  LLVMValueRef *mask = (LLVMValueRef *)calloc(nlanes, sizeof(LLVMValueRef));
+  for (unsigned i = 0; i < nlanes; i++)
+    mask[i] = zero;
+  LLVMValueRef res = LLVMBuildShuffleVector(
+      g->builder, ins, LLVMGetUndef(vec_ty), LLVMConstVector(mask, nlanes),
+      "v.splat");
+  free(mask);
+  return res;
+}
+
+static void vec_intrinsic_suffix(LLVMTypeRef elt, unsigned nlanes, char *buf,
+                                 size_t cap) {
+  LLVMTypeKind ek = LLVMGetTypeKind(elt);
+  if (ek == LLVMFloatTypeKind)
+    snprintf(buf, cap, "v%uf32", nlanes);
+  else if (ek == LLVMDoubleTypeKind)
+    snprintf(buf, cap, "v%uf64", nlanes);
+  else
+    snprintf(buf, cap, "v%ui%u", nlanes, LLVMGetIntTypeWidth(elt));
+}
+
+static bool vec_extract_mem_base(zan_irgen_t *g, zan_ast_node_t *src_expr,
+                                 local_scope_t *locals, LLVMValueRef *out_base,
+                                 LLVMValueRef *out_len) {
+  zan_type_t *st = infer_expr_type(g, src_expr, locals);
+  if (!st)
+    return false;
+  LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+  LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+  if (is_span_type(st)) {
+    LLVMValueRef sv = emit_expr(g, src_expr, locals);
+    *out_base = LLVMBuildExtractValue(g->builder, sv, 0, "vl.base");
+    *out_len = LLVMBuildExtractValue(g->builder, sv, 1, "vl.len");
+    return true;
+  }
+  if (st->kind == TYPE_ARRAY) {
+    LLVMValueRef arr = emit_expr(g, src_expr, locals);
+    *out_base = LLVMBuildBitCast(g->builder, arr, i8ptr, "vl.abase");
+    *out_len = zan_array_len(g, arr);
+    return true;
+  }
+  if (is_inline_array_type(st)) {
+    int64_t arr_n = inline_array_len(st);
+    LLVMValueRef ptr = emit_ref_lvalue_ptr(g, src_expr, locals);
+    if (!ptr)
+      return false;
+    *out_base = LLVMBuildBitCast(g->builder, ptr, i8ptr, "vl.iabase");
+    *out_len = LLVMConstInt(i64t, (unsigned long long)arr_n, 0);
+    return true;
+  }
+  return false;
+}
+
+bool emit_vec_call(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_t *locals,
+                   LLVMValueRef *out) {
+  zan_ast_node_t *callee = expr->call.callee;
+  if (!callee || callee->kind != AST_MEMBER_ACCESS)
+    return false;
+  zan_type_t *vt = infer_expr_type(g, callee->member.object, locals);
+  if (!is_vec_type(vt))
+    return false;
+  int64_t vn = vec_len(vt);
+  zan_type_t *et = vec_elem(vt);
+  if (!et)
+    return false;
+  if (et->kind == TYPE_TYPE_PARAM)
+    et = concretize(g, et);
+  unsigned nlanes = (unsigned)(vn > 0 ? vn : 1);
+  LLVMTypeRef elt =
+      (et && et->kind != TYPE_TYPE_PARAM)
+          ? span_elem_storage_type(g, et)
+          : LLVMFloatTypeInContext(g->ctx);
+  LLVMTypeRef vec_ty = LLVMVectorType(elt, nlanes);
+  LLVMTypeKind ek = LLVMGetTypeKind(elt);
+  bool is_fp = (ek == LLVMFloatTypeKind || ek == LLVMDoubleTypeKind);
+  bool is_unsigned =
+      (et->kind == TYPE_BYTE || et->kind == TYPE_USHORT ||
+       et->kind == TYPE_UINT || et->kind == TYPE_ULONG);
+  bool is_static_recv = (callee->member.object->kind == AST_IDENTIFIER &&
+                         callee->member.object->ident.inst_type_ref != NULL);
+  zan_istr_t mm = callee->member.name;
+  int argc = expr->call.args.count;
+
+  if (mm.len == 4 && memcmp(mm.str, "Zero", 4) == 0 && argc == 0) {
+    *out = LLVMConstNull(vec_ty);
+    return true;
+  }
+  if (mm.len == 5 && memcmp(mm.str, "Splat", 5) == 0 && argc == 1) {
+    LLVMValueRef sv =
+        vec_coerce_scalar(g, emit_expr(g, expr->call.args.items[0], locals), elt);
+    *out = vec_splat_val(g, sv, vec_ty, nlanes);
+    return true;
+  }
+  if (mm.len == 4 && memcmp(mm.str, "Load", 4) == 0 &&
+      (argc == 1 || argc == 2)) {
+    LLVMValueRef base = NULL, slen = NULL;
+    if (!vec_extract_mem_base(g, expr->call.args.items[0], locals, &base, &slen))
+      return false;
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    LLVMValueRef off =
+        argc == 2
+            ? coerce_int_to(g, emit_expr(g, expr->call.args.items[1], locals),
+                            i64t)
+            : LLVMConstInt(i64t, 0, 0);
+    emit_span_window_check(g, off, LLVMConstInt(i64t, nlanes, 0), slen,
+                           expr->loc, "Vec.Load");
+    LLVMValueRef typed =
+        LLVMBuildBitCast(g->builder, base, LLVMPointerType(elt, 0), "vl.ep");
+    LLVMValueRef ep =
+        LLVMBuildInBoundsGEP2(g->builder, elt, typed, &off, 1, "vl.ptr");
+    LLVMValueRef vp =
+        LLVMBuildBitCast(g->builder, ep, LLVMPointerType(vec_ty, 0), "vl.vp");
+    LLVMValueRef ld = LLVMBuildLoad2(g->builder, vec_ty, vp, "vl.vec");
+    LLVMSetAlignment(ld, zan_span_elem_align(g, elt));
+    *out = ld;
+    return true;
+  }
+  if (mm.len == 5 && memcmp(mm.str, "Store", 5) == 0 &&
+      (argc == 1 || argc == 2)) {
+    LLVMValueRef vv = emit_expr(g, callee->member.object, locals);
+    LLVMValueRef base = NULL, slen = NULL;
+    if (!vec_extract_mem_base(g, expr->call.args.items[0], locals, &base, &slen))
+      return false;
+    LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+    LLVMValueRef off =
+        argc == 2
+            ? coerce_int_to(g, emit_expr(g, expr->call.args.items[1], locals),
+                            i64t)
+            : LLVMConstInt(i64t, 0, 0);
+    emit_span_window_check(g, off, LLVMConstInt(i64t, nlanes, 0), slen,
+                           expr->loc, "Vec.Store");
+    LLVMValueRef typed =
+        LLVMBuildBitCast(g->builder, base, LLVMPointerType(elt, 0), "vs.ep");
+    LLVMValueRef ep =
+        LLVMBuildInBoundsGEP2(g->builder, elt, typed, &off, 1, "vs.ptr");
+    LLVMValueRef vp =
+        LLVMBuildBitCast(g->builder, ep, LLVMPointerType(vec_ty, 0), "vs.vp");
+    LLVMValueRef st = LLVMBuildStore(g->builder, vv, vp);
+    LLVMSetAlignment(st, zan_span_elem_align(g, elt));
+    *out = LLVMConstNull(LLVMInt32TypeInContext(g->ctx));
+    return true;
+  }
+  if (mm.len == 8 && memcmp(mm.str, "WithLane", 8) == 0 && argc == 2) {
+    LLVMValueRef vv = emit_expr(g, callee->member.object, locals);
+    LLVMValueRef idx = coerce_int_to(
+        g, emit_expr(g, expr->call.args.items[0], locals),
+        LLVMInt32TypeInContext(g->ctx));
+    LLVMValueRef sv =
+        vec_coerce_scalar(g, emit_expr(g, expr->call.args.items[1], locals), elt);
+    *out = LLVMBuildInsertElement(g->builder, vv, sv, idx, "v.with");
+    return true;
+  }
+  if (mm.len == 3 && memcmp(mm.str, "Sum", 3) == 0 && argc == 0) {
+    LLVMValueRef vv = emit_expr(g, callee->member.object, locals);
+    char suf[32], fname[64];
+    vec_intrinsic_suffix(elt, nlanes, suf, sizeof(suf));
+    if (is_fp) {
+      snprintf(fname, sizeof(fname), "llvm.vector.reduce.fadd.%s", suf);
+      LLVMTypeRef fty =
+          LLVMFunctionType(elt, (LLVMTypeRef[]){elt, vec_ty}, 2, 0);
+      LLVMValueRef fn = LLVMGetNamedFunction(g->mod, fname);
+      if (!fn)
+        fn = LLVMAddFunction(g->mod, fname, fty);
+      LLVMValueRef z0 = LLVMConstReal(elt, 0.0);
+      LLVMValueRef res =
+          zan_call2(g->builder, fty, fn, (LLVMValueRef[]){z0, vv}, 2, "v.sum");
+      *out = promote_loaded(g, res, et);
+    } else {
+      snprintf(fname, sizeof(fname), "llvm.vector.reduce.add.%s", suf);
+      LLVMTypeRef fty = LLVMFunctionType(elt, (LLVMTypeRef[]){vec_ty}, 1, 0);
+      LLVMValueRef fn = LLVMGetNamedFunction(g->mod, fname);
+      if (!fn)
+        fn = LLVMAddFunction(g->mod, fname, fty);
+      LLVMValueRef res =
+          zan_call2(g->builder, fty, fn, &vv, 1, "v.sum");
+      *out = promote_loaded(g, res, et);
+    }
+    return true;
+  }
+  if (mm.len == 3 && memcmp(mm.str, "Dot", 3) == 0 && argc == 1) {
+    LLVMValueRef a = emit_expr(g, callee->member.object, locals);
+    LLVMValueRef b = emit_expr(g, expr->call.args.items[0], locals);
+    LLVMValueRef prod = is_fp ? LLVMBuildFMul(g->builder, a, b, "v.dotm")
+                              : LLVMBuildMul(g->builder, a, b, "v.dotm");
+    char suf[32], fname[64];
+    vec_intrinsic_suffix(elt, nlanes, suf, sizeof(suf));
+    if (is_fp) {
+      snprintf(fname, sizeof(fname), "llvm.vector.reduce.fadd.%s", suf);
+      LLVMTypeRef fty =
+          LLVMFunctionType(elt, (LLVMTypeRef[]){elt, vec_ty}, 2, 0);
+      LLVMValueRef fn = LLVMGetNamedFunction(g->mod, fname);
+      if (!fn)
+        fn = LLVMAddFunction(g->mod, fname, fty);
+      LLVMValueRef z0 = LLVMConstReal(elt, 0.0);
+      *out = promote_loaded(
+          g, zan_call2(g->builder, fty, fn, (LLVMValueRef[]){z0, prod}, 2, "v.dot"),
+          et);
+    } else {
+      snprintf(fname, sizeof(fname), "llvm.vector.reduce.add.%s", suf);
+      LLVMTypeRef fty = LLVMFunctionType(elt, (LLVMTypeRef[]){vec_ty}, 1, 0);
+      LLVMValueRef fn = LLVMGetNamedFunction(g->mod, fname);
+      if (!fn)
+        fn = LLVMAddFunction(g->mod, fname, fty);
+      *out = promote_loaded(
+          g, zan_call2(g->builder, fty, fn, &prod, 1, "v.dot"), et);
+    }
+    return true;
+  }
+  if (((mm.len == 4 && (memcmp(mm.str, "HMin", 4) == 0 ||
+                        memcmp(mm.str, "HMax", 4) == 0)) ||
+       (argc == 0 && !is_static_recv && mm.len == 3 &&
+        (memcmp(mm.str, "Min", 3) == 0 || memcmp(mm.str, "Max", 3) == 0))) &&
+      argc == 0) {
+    bool is_max = (mm.str[mm.len - 1] == 'x');
+    LLVMValueRef vv = emit_expr(g, callee->member.object, locals);
+    char suf[32], fname[64];
+    vec_intrinsic_suffix(elt, nlanes, suf, sizeof(suf));
+    const char *op = is_fp        ? (is_max ? "fmax" : "fmin")
+                     : is_unsigned ? (is_max ? "umax" : "umin")
+                                   : (is_max ? "smax" : "smin");
+    snprintf(fname, sizeof(fname), "llvm.vector.reduce.%s.%s", op, suf);
+    LLVMTypeRef fty = LLVMFunctionType(elt, (LLVMTypeRef[]){vec_ty}, 1, 0);
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, fname);
+    if (!fn)
+      fn = LLVMAddFunction(g->mod, fname, fty);
+    *out = promote_loaded(g, zan_call2(g->builder, fty, fn, &vv, 1, "v.hred"), et);
+    return true;
+  }
+  if ((mm.len == 3 && (memcmp(mm.str, "Min", 3) == 0 ||
+                       memcmp(mm.str, "Max", 3) == 0)) &&
+      argc == 2) {
+    bool is_max = (mm.str[2] == 'x');
+    LLVMValueRef a = emit_expr(g, expr->call.args.items[0], locals);
+    LLVMValueRef b = emit_expr(g, expr->call.args.items[1], locals);
+    LLVMValueRef cmp =
+        is_fp ? LLVMBuildFCmp(g->builder, is_max ? LLVMRealOGT : LLVMRealOLT, a,
+                              b, "v.cmp")
+              : LLVMBuildICmp(
+                    g->builder,
+                    is_unsigned ? (is_max ? LLVMIntUGT : LLVMIntULT)
+                                : (is_max ? LLVMIntSGT : LLVMIntSLT),
+                    a, b, "v.cmp");
+    *out = LLVMBuildSelect(g->builder, cmp, a, b, is_max ? "v.max" : "v.min");
+    return true;
+  }
+  if (mm.len == 5 && memcmp(mm.str, "Clamp", 5) == 0 && argc == 3) {
+    LLVMValueRef v = emit_expr(g, expr->call.args.items[0], locals);
+    LLVMValueRef lo = emit_expr(g, expr->call.args.items[1], locals);
+    LLVMValueRef hi = emit_expr(g, expr->call.args.items[2], locals);
+    LLVMValueRef c1 =
+        is_fp ? LLVMBuildFCmp(g->builder, LLVMRealOLT, v, lo, "vc.lo")
+              : LLVMBuildICmp(g->builder, is_unsigned ? LLVMIntULT : LLVMIntSLT,
+                              v, lo, "vc.lo");
+    LLVMValueRef t1 = LLVMBuildSelect(g->builder, c1, lo, v, "vc.m1");
+    LLVMValueRef c2 =
+        is_fp ? LLVMBuildFCmp(g->builder, LLVMRealOGT, t1, hi, "vc.hi")
+              : LLVMBuildICmp(g->builder, is_unsigned ? LLVMIntUGT : LLVMIntSGT,
+                              t1, hi, "vc.hi");
+    *out = LLVMBuildSelect(g->builder, c2, hi, t1, "vc.res");
+    return true;
+  }
+  if (mm.len == 3 && memcmp(mm.str, "Fma", 3) == 0 && argc == 3 && is_fp) {
+    LLVMValueRef a = emit_expr(g, expr->call.args.items[0], locals);
+    LLVMValueRef b = emit_expr(g, expr->call.args.items[1], locals);
+    LLVMValueRef c = emit_expr(g, expr->call.args.items[2], locals);
+    char suf[32], fname[64];
+    vec_intrinsic_suffix(elt, nlanes, suf, sizeof(suf));
+    snprintf(fname, sizeof(fname), "llvm.fma.%s", suf);
+    LLVMTypeRef fty =
+        LLVMFunctionType(vec_ty, (LLVMTypeRef[]){vec_ty, vec_ty, vec_ty}, 3, 0);
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, fname);
+    if (!fn)
+      fn = LLVMAddFunction(g->mod, fname, fty);
+    *out = zan_call2(g->builder, fty, fn, (LLVMValueRef[]){a, b, c}, 3, "v.fma");
+    return true;
+  }
+  if (mm.len == 4 && memcmp(mm.str, "Sqrt", 4) == 0 && argc == 1 && is_fp) {
+    LLVMValueRef a = emit_expr(g, expr->call.args.items[0], locals);
+    char suf[32], fname[64];
+    vec_intrinsic_suffix(elt, nlanes, suf, sizeof(suf));
+    snprintf(fname, sizeof(fname), "llvm.sqrt.%s", suf);
+    LLVMTypeRef fty = LLVMFunctionType(vec_ty, (LLVMTypeRef[]){vec_ty}, 1, 0);
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, fname);
+    if (!fn)
+      fn = LLVMAddFunction(g->mod, fname, fty);
+    *out = zan_call2(g->builder, fty, fn, &a, 1, "v.sqrt");
+    return true;
+  }
+  if (mm.len == 3 && memcmp(mm.str, "Abs", 3) == 0 && argc == 1) {
+    LLVMValueRef a = emit_expr(g, expr->call.args.items[0], locals);
+    if (is_fp) {
+      char suf[32], fname[64];
+      vec_intrinsic_suffix(elt, nlanes, suf, sizeof(suf));
+      snprintf(fname, sizeof(fname), "llvm.fabs.%s", suf);
+      LLVMTypeRef fty = LLVMFunctionType(vec_ty, (LLVMTypeRef[]){vec_ty}, 1, 0);
+      LLVMValueRef fn = LLVMGetNamedFunction(g->mod, fname);
+      if (!fn)
+        fn = LLVMAddFunction(g->mod, fname, fty);
+      *out = zan_call2(g->builder, fty, fn, &a, 1, "v.fabs");
+    } else if (is_unsigned) {
+      *out = a;
+    } else {
+      LLVMValueRef neg = LLVMBuildNeg(g->builder, a, "v.neg");
+      LLVMValueRef z0 = LLVMConstNull(vec_ty);
+      LLVMValueRef cmp = LLVMBuildICmp(g->builder, LLVMIntSLT, a, z0, "v.lt0");
+      *out = LLVMBuildSelect(g->builder, cmp, neg, a, "v.abs");
+    }
+    return true;
+  }
+  if (mm.len == 6 && memcmp(mm.str, "Select", 6) == 0 && argc == 3) {
+    LLVMValueRef m = emit_expr(g, expr->call.args.items[0], locals);
+    LLVMValueRef a = emit_expr(g, expr->call.args.items[1], locals);
+    LLVMValueRef b = emit_expr(g, expr->call.args.items[2], locals);
+    LLVMTypeRef mt = LLVMTypeOf(m);
+    LLVMValueRef cond = m;
+    if (LLVMGetTypeKind(mt) == LLVMVectorTypeKind) {
+      LLVMTypeRef me = LLVMGetElementType(mt);
+      if (LLVMGetTypeKind(me) == LLVMFloatTypeKind ||
+          LLVMGetTypeKind(me) == LLVMDoubleTypeKind)
+        cond = LLVMBuildFCmp(g->builder, LLVMRealONE, m, LLVMConstNull(mt),
+                             "v.selc");
+      else if (LLVMGetIntTypeWidth(me) != 1)
+        cond = LLVMBuildICmp(g->builder, LLVMIntNE, m, LLVMConstNull(mt),
+                             "v.selc");
+    }
+    *out = LLVMBuildSelect(g->builder, cond, a, b, "v.sel");
+    return true;
+  }
+  return false;
+}
+

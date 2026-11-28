@@ -87,6 +87,60 @@ bool zan_ast_has_attr(const zan_ast_node_t *decl, const char *name) {
   return false;
 }
 
+bool zan_ast_attr_string(const zan_ast_node_t *decl, const char *name,
+                         char *out, size_t cap) {
+  if (!decl || !decl->meta || !name)
+    return false;
+  size_t n = strlen(name);
+  for (int i = 0; i < decl->meta->attributes.count; i++) {
+    zan_ast_node_t *a = decl->meta->attributes.items[i];
+    if (!a || a->kind != AST_ATTRIBUTE || !a->attribute.name ||
+        a->attribute.name->kind != AST_IDENTIFIER)
+      continue;
+    zan_istr_t s = a->attribute.name->ident.name;
+    if (s.len == (uint32_t)n && memcmp(s.str, name, n) == 0) {
+      if (a->attribute.args.count == 1 && a->attribute.args.items[0] &&
+          a->attribute.args.items[0]->kind == AST_STRING_LITERAL) {
+        zan_istr_t v = a->attribute.args.items[0]->str_val;
+        if (!v.str || v.len == 0)
+          return false;
+        if (out && cap > 0) {
+          size_t copy = v.len < cap - 1 ? v.len : cap - 1;
+          memcpy(out, v.str, copy);
+          out[copy] = '\0';
+        }
+        return true;
+      }
+      return false;
+    }
+  }
+  return false;
+}
+
+bool zan_ast_attr_int(const zan_ast_node_t *decl, const char *name,
+                      int64_t *out) {
+  if (!decl || !decl->meta || !name)
+    return false;
+  size_t n = strlen(name);
+  for (int i = 0; i < decl->meta->attributes.count; i++) {
+    zan_ast_node_t *a = decl->meta->attributes.items[i];
+    if (!a || a->kind != AST_ATTRIBUTE || !a->attribute.name ||
+        a->attribute.name->kind != AST_IDENTIFIER)
+      continue;
+    zan_istr_t s = a->attribute.name->ident.name;
+    if (s.len == (uint32_t)n && memcmp(s.str, name, n) == 0) {
+      if (a->attribute.args.count == 1 && a->attribute.args.items[0] &&
+          a->attribute.args.items[0]->kind == AST_INT_LITERAL) {
+        if (out)
+          *out = a->attribute.args.items[0]->int_val;
+        return true;
+      }
+      return false;
+    }
+  }
+  return false;
+}
+
 static bool zan_attr_name_matches_module_initializer(const zan_ast_node_t *name) {
   if (!name)
     return false;
@@ -220,7 +274,8 @@ int zan_ast_child_count(const zan_ast_node_t *n) {
     return 1 + n->method_decl.params.count + n->method_decl.type_params.count;
   case AST_METHOD_DECL:
   case AST_CONSTRUCTOR_DECL:
-  case AST_DESTRUCTOR_DECL: {
+  case AST_DESTRUCTOR_DECL:
+  case AST_MACRO_DECL: {
     int c =
         1 + n->method_decl.params.count + n->method_decl.type_params.count + 1;
     if (n->method_decl.ext) {
@@ -231,6 +286,7 @@ int zan_ast_child_count(const zan_ast_node_t *n) {
   }
   case AST_FIELD_DECL:
   case AST_PROPERTY_DECL:
+  case AST_ASSOC_TYPE_DECL:
     return 4; /* type/initializer/getter_body/setter_body */
   case AST_PARAM:
     return 2;
@@ -294,6 +350,7 @@ int zan_ast_child_count(const zan_ast_node_t *n) {
   case AST_NEW_EXPR:
     return 2 + n->new_expr.args.count + n->new_expr.arg_inits.count;
   case AST_CAST_EXPR:
+  case AST_STACKALLOC_EXPR:
   case AST_IS_EXPR:
   case AST_AS_EXPR:
     return 2;
@@ -404,7 +461,8 @@ zan_ast_node_t **zan_ast_child_ptr_at(zan_ast_node_t *n, int i) {
   }
   case AST_METHOD_DECL:
   case AST_CONSTRUCTOR_DECL:
-  case AST_DESTRUCTOR_DECL: {
+  case AST_DESTRUCTOR_DECL:
+  case AST_MACRO_DECL: {
     if (i == 0)
       return &n->method_decl.return_type;
     int b = 1;
@@ -428,6 +486,7 @@ zan_ast_node_t **zan_ast_child_ptr_at(zan_ast_node_t *n, int i) {
   }
   case AST_FIELD_DECL:
   case AST_PROPERTY_DECL:
+  case AST_ASSOC_TYPE_DECL:
     switch (i) {
     case 0:
       return &n->field_decl.type;
@@ -563,6 +622,7 @@ zan_ast_node_t **zan_ast_child_ptr_at(zan_ast_node_t *n, int i) {
     return NULL;
   }
   case AST_CAST_EXPR:
+  case AST_STACKALLOC_EXPR:
     return i == 0 ? &n->cast.type : (i == 1 ? &n->cast.expr : NULL);
   case AST_IS_EXPR:
   case AST_AS_EXPR:

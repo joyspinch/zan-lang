@@ -1,0 +1,80 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Render3D;
+
+// 单个 3D 角色的遮挡查询时序状态。
+public class OcclusionActorRecord3D {
+    public int ActorId;
+    public bool Visible;
+    public int ConsecutiveOccluded;
+
+    public OcclusionActorRecord3D(int actorId) {
+        this.ActorId = actorId;
+        this.Visible = true;
+        this.ConsecutiveOccluded = 0;
+    }
+}
+
+// 商业 3D 帧配额遮挡查询调度器：每帧限额轮询（Round-Robin）+ 连续遮挡帧滞回防闪隐。
+public class OcclusionQueryBudget3D {
+    private List<OcclusionActorRecord3D> actors;
+    private int cursor;
+    public int MaxQueriesPerFrame;
+    public int HideAfterOccludedFrames;
+
+    public OcclusionQueryBudget3D(int maxQueriesPerFrame, int hideAfterOccludedFrames) {
+        this.actors = new List<OcclusionActorRecord3D>();
+        this.cursor = 0;
+        this.MaxQueriesPerFrame = maxQueriesPerFrame > 0 ? maxQueriesPerFrame : 8;
+        this.HideAfterOccludedFrames = hideAfterOccludedFrames > 0 ? hideAfterOccludedFrames : 2;
+    }
+
+    public void RegisterActor(int actorId) {
+        for (int i = 0; i < this.actors.Count; i = i + 1) {
+            if (this.actors[i].ActorId == actorId) { return; }
+        }
+        this.actors.Add(new OcclusionActorRecord3D(actorId));
+    }
+
+    // 取出本帧预算内应当提交 GPU 遮挡查询的 ActorId 列表（公平轮询，永不爆帧预算）。
+    public List<int> SelectBatchForFrame() {
+        List<int> batch = new List<int>();
+        int n = this.actors.Count;
+        if (n == 0) { return batch; }
+        int take = n < this.MaxQueriesPerFrame ? n : this.MaxQueriesPerFrame;
+        for (int i = 0; i < take; i = i + 1) {
+            int idx = (this.cursor + i) % n;
+            batch.Add(this.actors[idx].ActorId);
+        }
+        this.cursor = (this.cursor + take) % n;
+        return batch;
+    }
+
+    // 回填某角色的遮挡查询采样结果（isOccluded=true 需连续满 HideAfterOccludedFrames 次才隐藏）。
+    public bool ReportQueryResult(int actorId, bool isOccluded) {
+        for (int i = 0; i < this.actors.Count; i = i + 1) {
+            OcclusionActorRecord3D r = this.actors[i];
+            if (r.ActorId == actorId) {
+                if (isOccluded) {
+                    r.ConsecutiveOccluded = r.ConsecutiveOccluded + 1;
+                    if (r.ConsecutiveOccluded >= this.HideAfterOccludedFrames) {
+                        r.Visible = false;
+                    }
+                } else {
+                    r.ConsecutiveOccluded = 0;
+                    r.Visible = true;
+                }
+                return r.Visible;
+            }
+        }
+        return true;
+    }
+
+    public bool IsVisible(int actorId) {
+        for (int i = 0; i < this.actors.Count; i = i + 1) {
+            if (this.actors[i].ActorId == actorId) { return this.actors[i].Visible; }
+        }
+        return true;
+    }
+}

@@ -9,6 +9,11 @@ extern "C" {
 
 int32_t zan_thread_start(void *body);
 
+/* 作用域零拷贝并行循环（栈闭包安全，返回前严格 join 全部工作线程） */
+int32_t zan_parallel_processor_count(void);
+void zan_parallel_for(int32_t from, int32_t to, void *body);
+void zan_parallel_for_range(int32_t from, int32_t to, void *body);
+
 /* 获取当前线程的进程内唯一数值 ID（跨平台底层线程标识） */
 int64_t zan_thread_current_id(void);
 

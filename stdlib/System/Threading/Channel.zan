@@ -14,6 +14,7 @@ public class Channel<T> : IDisposable {
     bool isClosed;
     AsyncGate readGate;
     AsyncGate writeGate;
+    List<AsyncGate> selectWaiters;
     nint mtx;
 
     // 创建无界通道（capacity <= 0 表示无上限）
@@ -27,6 +28,7 @@ public class Channel<T> : IDisposable {
         this.isClosed = false;
         this.readGate = new AsyncGate();
         this.writeGate = new AsyncGate();
+        this.selectWaiters = null;
         this.mtx = Mutex.Create();
     }
 
@@ -46,8 +48,66 @@ public class Channel<T> : IDisposable {
         if (this.mtx != 0) {
             nint m = this.mtx;
             this.mtx = 0;
+            Mutex.Lock(m);
+            this.selectWaiters = null;
+            Mutex.Unlock(m);
             Mutex.Destroy(m);
         }
+    }
+
+    // 注册/注销多通道 Select 等待门（供 ChannelSelect 使用）
+    public void AddSelectWaiter(AsyncGate gate) {
+        if (gate == null) { return; }
+        nint m = this.mtx;
+        if (m == 0) {
+            gate.SignalAll();
+            return;
+        }
+        Mutex.Lock(m);
+        if (this.selectWaiters == null) {
+            this.selectWaiters = new List<AsyncGate>();
+        }
+        this.selectWaiters.Add(gate);
+        bool ready = (this.head < this.buffer.Count) || this.isClosed;
+        Mutex.Unlock(m);
+        if (ready) {
+            gate.Signal();
+        }
+    }
+
+    public void RemoveSelectWaiter(AsyncGate gate) {
+        if (gate == null) { return; }
+        nint m = this.mtx;
+        if (m == 0) { return; }
+        Mutex.Lock(m);
+        if (this.selectWaiters != null) {
+            for (int i = this.selectWaiters.Count - 1; i >= 0; i = i - 1) {
+                if (this.selectWaiters[i] == gate) {
+                    this.selectWaiters.RemoveAt(i);
+                    break;
+                }
+            }
+        }
+        Mutex.Unlock(m);
+    }
+
+    private void SignalSelectWaitersLocked(List<AsyncGate> snap) {
+        if (snap == null) { return; }
+        for (int i = 0; i < snap.Count; i = i + 1) {
+            AsyncGate g = snap[i];
+            if (g != null) { g.SignalAll(); }
+        }
+    }
+
+    private List<AsyncGate> SnapshotSelectWaitersLocked() {
+        if (this.selectWaiters == null || this.selectWaiters.Count == 0) {
+            return null;
+        }
+        List<AsyncGate> snap = new List<AsyncGate>();
+        for (int i = 0; i < this.selectWaiters.Count; i = i + 1) {
+            snap.Add(this.selectWaiters[i]);
+        }
+        return snap;
     }
 
 
@@ -103,8 +163,10 @@ public class Channel<T> : IDisposable {
         }
         this.buffer.Add(item);
         AsyncGate rg = this.readGate;
+        List<AsyncGate> sw = this.SnapshotSelectWaitersLocked();
         Mutex.Unlock(m);
         if (rg != null) { rg.Signal(); }
+        this.SignalSelectWaitersLocked(sw);
         return true;
     }
 
@@ -128,8 +190,10 @@ public class Channel<T> : IDisposable {
             if (this.capacity == 0 || (this.buffer.Count - this.head) < this.capacity) {
                 this.buffer.Add(item);
                 AsyncGate rg = this.readGate;
+                List<AsyncGate> sw = this.SnapshotSelectWaitersLocked();
                 Mutex.Unlock(m);
                 if (rg != null) { rg.Signal(); }
+                this.SignalSelectWaitersLocked(sw);
                 return true;
             }
             AsyncGate wg = this.writeGate;
@@ -236,6 +300,7 @@ public class Channel<T> : IDisposable {
         this.isClosed = true;
         AsyncGate rg = this.readGate;
         AsyncGate wg = this.writeGate;
+        List<AsyncGate> sw = this.SnapshotSelectWaitersLocked();
         Mutex.Unlock(m);
         // 唤醒挂起的读取协程以便感知关闭退出
         if (rg != null) {
@@ -245,10 +310,107 @@ public class Channel<T> : IDisposable {
         if (wg != null) {
             wg.SignalAll();
         }
+        this.SignalSelectWaitersLocked(sw);
     }
 
     // 与 Complete 语义对齐的别名方法
     public void Close() {
         this.Complete();
+    }
+
+    // 支持结构化取消令牌的异步读取
+    public async bool Read(out T item, CancellationToken token) {
+        if (token == null) {
+            return await this.Read(out item);
+        }
+        if (token.IsCancellationRequested) {
+            item = null;
+            return false;
+        }
+        AsyncGate rgCap = this.readGate;
+        CancellationTokenRegistration reg = token.Register(() => {
+            if (rgCap != null) { rgCap.SignalAll(); }
+        });
+        try {
+            while (true) {
+                if (token.IsCancellationRequested) {
+                    item = null;
+                    return false;
+                }
+                if (this.TryRead(out item)) {
+                    return true;
+                }
+                if (this.IsCompleted()) {
+                    item = null;
+                    return false;
+                }
+                AsyncGate rg = this.readGate;
+                if (rg == null || !await rg.Wait()) {
+                    item = null;
+                    return false;
+                }
+            }
+        } finally {
+            reg.Dispose();
+        }
+    }
+
+    // 将通道以异步流（IAsyncEnumerable<T>）方式暴露，支持 `await foreach` 直接消费
+    public IAsyncEnumerable<T> ReadAllAsync() {
+        return new ChannelAsyncEnumerable<T>(this, null);
+    }
+
+    public IAsyncEnumerable<T> ReadAllAsync(CancellationToken token) {
+        return new ChannelAsyncEnumerable<T>(this, token);
+    }
+}
+
+public class ChannelAsyncEnumerator<T> : IAsyncEnumerator<T> {
+    Channel<T> ch;
+    CancellationToken token;
+    T current;
+
+    public ChannelAsyncEnumerator(Channel<T> ch, CancellationToken token) {
+        this.ch = ch;
+        this.token = token;
+    }
+
+    public async Task<bool> MoveNextAsync() {
+        if (this.ch == null) { return false; }
+        T val;
+        bool ok = false;
+        if (this.token != null) {
+            ok = await this.ch.Read(out val, this.token);
+        } else {
+            ok = await this.ch.Read(out val);
+        }
+        if (ok) {
+            this.current = val;
+            return true;
+        }
+        return false;
+    }
+
+    public T Current() {
+        return this.current;
+    }
+
+    public void Dispose() {
+        this.ch = null;
+        this.token = null;
+    }
+}
+
+public class ChannelAsyncEnumerable<T> : IAsyncEnumerable<T> {
+    Channel<T> ch;
+    CancellationToken token;
+
+    public ChannelAsyncEnumerable(Channel<T> ch, CancellationToken token) {
+        this.ch = ch;
+        this.token = token;
+    }
+
+    public IAsyncEnumerator<T> GetAsyncEnumerator() {
+        return new ChannelAsyncEnumerator<T>(this.ch, this.token);
     }
 }

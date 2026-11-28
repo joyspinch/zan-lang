@@ -1,0 +1,143 @@
+using System;
+using Gui;
+using Game.Graphics;
+using Game.Render3D;
+
+namespace Conf;
+
+class Game3DAnisoBrushedDaltonizeProfileTest {
+    [DllImport("zan_gui")]
+    private static extern int zan_gui_read_pixel(int surfaceId, int x, int y);
+
+    static int RedOf(int argb) { return (argb >> 16) & 255; }
+    static int GreenOf(int argb) { return (argb >> 8) & 255; }
+    static int BlueOf(int argb) { return argb & 255; }
+
+    static int AbsInt(int v) { return v < 0 ? -v : v; }
+
+    static void Main() {
+        Canvas.SetBackend(1);
+        Canvas cv = new Canvas(128, 128);
+        int sid = cv.SurfaceId();
+        Renderer3D ren = new Renderer3D(16);
+        ren.UseCpuLighting = false;
+
+        Camera3D cam = new Camera3D();
+        cam.Position = new Vector3(0.0f, 0.0f, 3.2f);
+        cam.Target = new Vector3(0.0f, 0.0f, 0.0f);
+        cam.AspectRatio = 1.0f;
+        cam.FieldOfView = 1.1f;
+
+        Mesh3D leftQuad = new Mesh3D();
+        leftQuad.Vertex(-2.0f, -2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        leftQuad.Vertex( 0.0f, -2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+        leftQuad.Vertex( 0.0f,  2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        leftQuad.Vertex(-2.0f,  2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f);
+        leftQuad.Triangle(0, 1, 2);
+        leftQuad.Triangle(0, 2, 3);
+        int leftKey = cv.MeshUpload(leftQuad);
+
+        Mesh3D rightQuad = new Mesh3D();
+        rightQuad.Vertex(0.0f, -2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        rightQuad.Vertex(2.0f, -2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+        rightQuad.Vertex(2.0f,  2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        rightQuad.Vertex(0.0f,  2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f);
+        rightQuad.Triangle(0, 1, 2);
+        rightQuad.Triangle(0, 2, 3);
+        int rightKey = cv.MeshUpload(rightQuad);
+
+        // 1. GPU 3D 跨平台各向异性拉丝金属与微纹理高光：右侧出现沿副切线周期明暗拉丝带，左侧关闭保持暗底
+        Material plainDark = Material.Solid(0.0f, 0.0f, 0.0f);
+        plainDark.EmissiveRed = 0.06f; plainDark.EmissiveGreen = 0.06f; plainDark.EmissiveBlue = 0.06f;
+
+        Material brushed = Material.Solid(0.0f, 0.0f, 0.0f);
+        brushed.EmissiveRed = 0.06f; brushed.EmissiveGreen = 0.06f; brushed.EmissiveBlue = 0.06f;
+        brushed.AnisoBrushedEnabled = true;
+        brushed.AnisoBrushedGrainFreq = 4.0f;
+        brushed.AnisoBrushedAnisotropy = 8.0f;
+        brushed.AnisoBrushedStrength = 1.15f;
+        brushed.AnisoBrushedRed = 0.70f;
+        brushed.AnisoBrushedGreen = 0.85f;
+        brushed.AnisoBrushedBlue = 1.00f;
+
+        SceneNode root1 = new SceneNode("root1");
+        SceneNode ln1 = new SceneNode("left1");
+        ln1.MeshKey = leftKey; ln1.BoundsRadius = 6.0f; ln1.Material = plainDark;
+        SceneNode rn1 = new SceneNode("right1");
+        rn1.MeshKey = rightKey; rn1.BoundsRadius = 6.0f; rn1.Material = brushed;
+        root1.AddChild(ln1);
+        root1.AddChild(rn1);
+
+        RenderPlan plan1 = new RenderPlan(cam);
+        cv.Clear(unchecked((int)0xFF000000));
+        plan1.Build(root1);
+        ren.Draw(cv, plan1);
+
+        int plainMaxB = 0;
+        int brushMinB = 255;
+        int brushMaxB = 0;
+        for (int y = 20; y <= 108; y = y + 1) {
+            int lb = BlueOf(zan_gui_read_pixel(sid, 32, y));
+            if (lb > plainMaxB) { plainMaxB = lb; }
+            int rb = BlueOf(zan_gui_read_pixel(sid, 96, y));
+            if (rb < brushMinB) { brushMinB = rb; }
+            if (rb > brushMaxB) { brushMaxB = rb; }
+        }
+        bool anisoOk = plainMaxB <= 30 && brushMaxB >= 140 && (brushMaxB - brushMinB) >= 70;
+        Console.WriteLine("aniso_brushed_ok=" + Convert.ToString(anisoOk ? 1 : 0));
+
+        // 2. GPU 后处理跨平台无障碍色盲校正（Protanopia Daltonize）：纯红显著补绿/蓝对比，中性灰保持无偏色
+        Material pureRed = Material.Solid(0.0f, 0.0f, 0.0f);
+        pureRed.EmissiveRed = 1.0f;
+        Material midGray = Material.Solid(0.0f, 0.0f, 0.0f);
+        midGray.EmissiveRed = 0.5f; midGray.EmissiveGreen = 0.5f; midGray.EmissiveBlue = 0.5f;
+
+        SceneNode root2 = new SceneNode("root2");
+        SceneNode ln2 = new SceneNode("left2");
+        ln2.MeshKey = leftKey; ln2.BoundsRadius = 6.0f; ln2.Material = pureRed;
+        SceneNode rn2 = new SceneNode("right2");
+        rn2.MeshKey = rightKey; rn2.BoundsRadius = 6.0f; rn2.Material = midGray;
+        root2.AddChild(ln2);
+        root2.AddChild(rn2);
+
+        PostProcess post = new PostProcess();
+        post.DaltonizeMode = 1.0f; // Protanopia
+        post.DaltonizeStrength = 1.0f;
+        ren.PostProcess = post;
+
+        RenderPlan plan2 = new RenderPlan(cam);
+        cv.Clear(unchecked((int)0xFF000000));
+        plan2.Build(root2);
+        ren.Draw(cv, plan2);
+
+        int redPx = zan_gui_read_pixel(sid, 32, 64);
+        int grayPx = zan_gui_read_pixel(sid, 96, 64);
+        bool redShifted = RedOf(redPx) >= 240 && GreenOf(redPx) >= 95 && BlueOf(redPx) >= 95;
+        int gr = RedOf(grayPx);
+        int gg = GreenOf(grayPx);
+        int gb = BlueOf(grayPx);
+        bool grayNeutral = gr >= 110 && gr <= 145 && AbsInt(gr - gg) <= 12 && AbsInt(gg - gb) <= 12;
+        bool daltOk = redShifted && grayNeutral;
+        Console.WriteLine("post_daltonize_ok=" + Convert.ToString(daltOk ? 1 : 0));
+
+        // 3. 跨平台 3D 设备渲染分档与动态分辨率缩放（DRS）闭环
+        RenderDeviceTier3D hostTier = CrossPlatformQualityProfile3D.DetectDefaultTier();
+        RenderQualityBudget3D desk = CrossPlatformQualityProfile3D.BuildPreset(RenderDeviceTier3D.DesktopHigh);
+        RenderQualityBudget3D ohos = CrossPlatformQualityProfile3D.BuildPreset(RenderDeviceTier3D.HarmonyHandheld);
+        CrossPlatformQualityProfile3D prof = new CrossPlatformQualityProfile3D(RenderDeviceTier3D.DesktopHigh);
+        float s1 = prof.SampleGpuFrameMs(20.0f); // 1 次超预算不变 -> 1.0
+        float s2 = prof.SampleGpuFrameMs(21.0f); // 连续 2 次 -> 0.9
+        int scaledW = prof.ScaledDimension(1920); // 1728 (8px 对齐)
+        float s3 = prof.SampleGpuFrameMs(10.0f);
+        float s4 = prof.SampleGpuFrameMs(10.0f);
+        float s5 = prof.SampleGpuFrameMs(10.0f); // 连续 3 次宽裕 -> 1.0
+        bool profOk = (hostTier == RenderDeviceTier3D.DesktopHigh
+            || hostTier == RenderDeviceTier3D.DesktopBalanced
+            || hostTier == RenderDeviceTier3D.MobileHigh
+            || hostTier == RenderDeviceTier3D.HarmonyHandheld)
+            && desk.GlslDialect == "glsl330" && ohos.GlslDialect == "gles300"
+            && s1 > 0.99f && s2 > 0.89f && s2 < 0.91f && scaledW == 1728
+            && s3 < 0.91f && s4 < 0.91f && s5 > 0.99f;
+        Console.WriteLine("quality_profile_ok=" + Convert.ToString(profOk ? 1 : 0));
+    }
+}

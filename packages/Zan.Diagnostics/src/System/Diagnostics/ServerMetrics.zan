@@ -412,18 +412,21 @@ public class ServerMetrics {
         long rss = ServerMetrics.MemoryRssBytes();
         long cpuMs = ServerMetrics.CpuMillis();
         lock (this.sampleLock) {
+            long nowWall = sec * 1000L;
+            if (nowWall < this.seriesLastWall) { return; }
             this.sSampleSec[idx] = sec;
             this.sRss[idx] = rss;
             this.sCpu[idx] = 0 - 1;
-            long nowWall = sec * 1000;
             if (cpuMs >= 0) {
                 long dWall = nowWall - this.seriesLastWall;
                 long dCpu = cpuMs - this.seriesLastCpu;
                 if (dWall > 0 && dCpu >= 0) {
                     this.sCpu[idx] = (int)((dCpu * 100) / dWall);
                 }
-                this.seriesLastWall = nowWall;
-                this.seriesLastCpu = cpuMs;
+                if (nowWall > this.seriesLastWall) {
+                    this.seriesLastWall = nowWall;
+                    this.seriesLastCpu = cpuMs;
+                }
             }
         }
     }
@@ -456,9 +459,14 @@ public class ServerMetrics {
         return this;
     }
     // 打开/关闭错误同时回显到 stdout；返回自身以便链式配置。
-    public ServerMetrics DebugConsole(bool on) { this.errDebug = on; return this; }
+    public ServerMetrics DebugConsole(bool on) {
+        lock (this.errLock) { this.errDebug = on; }
+        return this;
+    }
     // 当前是否把错误回显到 stdout。
-    public bool DebugConsoleOn() { return this.errDebug; }
+    public bool DebugConsoleOn() {
+        lock (this.errLock) { return this.errDebug; }
+    }
 
     // 向错误日志追加一行并在 close 时落盘，进程随即崩溃记录也能存活。
     // 错误罕见，不在任何热路径上；请求路径不碰磁盘。
@@ -474,22 +482,29 @@ public class ServerMetrics {
 
     public void RecordError(long ts, string origin, string detail) {
         long _et = this.errTotal.Increment();
-        ErrorSink sink = this.errSink;
-        bool dbg = this.errDebug;
+        string safeOrigin = origin != null ? origin : "";
+        string safeDetail = detail != null ? detail : "";
         string line = "[" + DateTime.FromUnixSeconds(ts).ToString() + "] "
-            + origin + " | " + detail + "\n";
+            + safeOrigin + " | " + safeDetail + "\n";
+        ErrorSink sink = null;
+        bool dbg = false;
         lock (this.errLock) {
-            this.errors.Add(new ErrEntry(ts, origin, detail));
+            sink = this.errSink;
+            dbg = this.errDebug;
+            this.errors.Add(new ErrEntry(ts, safeOrigin, safeDetail));
             while (this.errors.Count > this.errCap) { this.errors.RemoveAt(0); }
             this.AppendErrLine(line);
         }
-        if (sink != null) { sink(ts, origin, detail); }
+        if (sink != null) { sink(ts, safeOrigin, safeDetail); }
         if (dbg) {
-            Console.WriteLine("[error] " + origin + " | " + detail);
+            Console.WriteLine("[error] " + safeOrigin + " | " + safeDetail);
         }
     }
 
-    public ServerMetrics OnError(ErrorSink fn) { this.errSink = fn; return this; }
+    public ServerMetrics OnError(ErrorSink fn) {
+        lock (this.errLock) { this.errSink = fn; }
+        return this;
+    }
 
     // 启动以来记录的错误总数（含已滚出内存 ring 的条目）。
     public long ErrorTotal() { return this.errTotal.Load(); }
@@ -512,13 +527,11 @@ public class ServerMetrics {
 
     // ---- OS probes ----
 
-    // 从 `buf` 的 `off` 起按小端读 `n` 字节为无符号整数（探针缓冲区用）。
+    // 从 `buf` 的 `off` 起按小端读 `n` 字节为整数（探针缓冲区用，按位移避免 64 位有符号乘法溢出）。
     private static long LeInt(byte[] buf, int off, int n) {
-        long v = 0;
-        long mul = 1;
-        for (int k = 0; k < n; k = k + 1) {
-            v = v + (buf[off + k] & 255) * mul;
-            mul = mul * 256;
+        long v = 0L;
+        for (int k = 0; k < n && k < 8; k = k + 1) {
+            v = v | (((long)(buf[off + k] & 255)) << (k * 8));
         }
         return v;
     }

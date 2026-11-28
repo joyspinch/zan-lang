@@ -1,0 +1,180 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Net;
+
+// 副本战利品掷点档位（需求 > 贪婪 > 放弃）。
+public enum LootBidChoice {
+    Pass = 0,
+    Greed = 1,
+    Need = 2
+}
+
+// 单条战利品掷点记录。
+public class LootRollEntry {
+    public int PlayerId;
+    public LootBidChoice Choice;
+    public int RollValue;
+
+    public LootRollEntry(int playerId, LootBidChoice choice, int rollValue) {
+        this.PlayerId = playerId;
+        this.Choice = choice;
+        this.RollValue = rollValue;
+    }
+}
+
+// 商业 MMO 副本 Need/Greed/Pass 战利品掷点分配器：防重复提交、优先级裁决与全放弃返回 -1。
+public class NetLootNeedGreedRoll {
+    private List<LootRollEntry> bids;
+    public int ItemId;
+
+    public NetLootNeedGreedRoll(int itemId) {
+        this.bids = new List<LootRollEntry>();
+        this.ItemId = itemId;
+    }
+
+    public bool SubmitRoll(int playerId, LootBidChoice choice, int rollValue) {
+        if (rollValue < 1 || rollValue > 100) { return false; }
+        for (int i = 0; i < this.bids.Count; i = i + 1) {
+            if (this.bids[i].PlayerId == playerId) { return false; }
+        }
+        this.bids.Add(new LootRollEntry(playerId, choice, rollValue));
+        return true;
+    }
+
+    public int ResolveWinner() {
+        int winnerId = -1;
+        int bestTier = 0;
+        int bestRoll = -1;
+        for (int i = 0; i < this.bids.Count; i = i + 1) {
+            LootRollEntry e = this.bids[i];
+            int tier = (int)e.Choice;
+            if (tier == 0) { continue; }
+            if (tier > bestTier || (tier == bestTier && e.RollValue > bestRoll)) {
+                bestTier = tier;
+                bestRoll = e.RollValue;
+                winnerId = e.PlayerId;
+            }
+        }
+        return winnerId;
+    }
+}
+
+// 拍卖行被超价退款记录。
+public class AuctionBidRecord {
+    public int PlayerId;
+    public int RefundGold;
+
+    public AuctionBidRecord(int playerId, int refundGold) {
+        this.PlayerId = playerId;
+        this.RefundGold = refundGold;
+    }
+}
+
+// 商业联机拍卖行托管器：最小加价校验、一口价直购、防狙击延时（Anti-Snipe）与被超价自动退款账本。
+public class NetAuctionEscrowHouse {
+    private List<AuctionBidRecord> refunds;
+    public int CurrentBid;
+    public int HighestBidderId;
+    public int MinIncrement;
+    public int BuyoutPrice;
+    public long EndTimeMs;
+    public long AntiSnipeWindowMs;
+    public long AntiSnipeExtendMs;
+    public bool Settled;
+
+    public NetAuctionEscrowHouse(int startBid, int minIncrement, int buyoutPrice,
+                                 long endTimeMs, long antiSnipeWindowMs, long antiSnipeExtendMs) {
+        this.refunds = new List<AuctionBidRecord>();
+        this.CurrentBid = startBid > 0 ? startBid : 1;
+        this.HighestBidderId = 0;
+        this.MinIncrement = minIncrement > 0 ? minIncrement : 1;
+        this.BuyoutPrice = buyoutPrice > this.CurrentBid ? buyoutPrice : 0;
+        this.EndTimeMs = endTimeMs;
+        this.AntiSnipeWindowMs = antiSnipeWindowMs > 0L ? antiSnipeWindowMs : 30000L;
+        this.AntiSnipeExtendMs = antiSnipeExtendMs > 0L ? antiSnipeExtendMs : 30000L;
+        this.Settled = false;
+    }
+
+    public bool PlaceBid(int bidderId, int amount, long nowMs) {
+        if (this.Settled || nowMs >= this.EndTimeMs || bidderId <= 0) { return false; }
+        int required = this.HighestBidderId == 0 ? this.CurrentBid : (this.CurrentBid + this.MinIncrement);
+        if (amount < required) { return false; }
+
+        if (this.HighestBidderId > 0) {
+            this.refunds.Add(new AuctionBidRecord(this.HighestBidderId, this.CurrentBid));
+        }
+        this.HighestBidderId = bidderId;
+        this.CurrentBid = amount;
+
+        if (this.BuyoutPrice > 0 && amount >= this.BuyoutPrice) {
+            this.CurrentBid = this.BuyoutPrice;
+            this.Settled = true;
+            return true;
+        }
+        // 防尾秒偷拍：临近截拍窗口内出价自动延长时间
+        if ((this.EndTimeMs - nowMs) <= this.AntiSnipeWindowMs) {
+            this.EndTimeMs = this.EndTimeMs + this.AntiSnipeExtendMs;
+        }
+        return true;
+    }
+
+    public int PendingRefundTotalFor(int playerId) {
+        int sum = 0;
+        for (int i = 0; i < this.refunds.Count; i = i + 1) {
+            if (this.refunds[i].PlayerId == playerId) {
+                sum = sum + this.refunds[i].RefundGold;
+            }
+        }
+        return sum;
+    }
+}
+
+// 跨服迁移一次性令牌。
+public class ShardTransferTicket {
+    public string Token;
+    public int PlayerId;
+    public int TargetShardId;
+    public long ExpiresAtMs;
+    public bool Consumed;
+
+    public ShardTransferTicket(string token, int playerId, int targetShardId, long expiresAtMs) {
+        this.Token = token;
+        this.PlayerId = playerId;
+        this.TargetShardId = targetShardId;
+        this.ExpiresAtMs = expiresAtMs;
+        this.Consumed = false;
+    }
+}
+
+// 商业无缝跨服/分线迁移令牌签发与核销器：一次性核销防重放 + TTL 超时失效拦截。
+public class NetCrossServerTransferTicket {
+    private List<ShardTransferTicket> tickets;
+    private int seq;
+
+    public NetCrossServerTransferTicket() {
+        this.tickets = new List<ShardTransferTicket>();
+        this.seq = 1000;
+    }
+
+    public string Issue(int playerId, int targetShardId, long nowMs, long ttlMs) {
+        this.seq = this.seq + 1;
+        string tok = "xfer_" + Convert.ToString(playerId) + "_" + Convert.ToString(targetShardId) + "_" + Convert.ToString(this.seq);
+        long exp = nowMs + (ttlMs > 0L ? ttlMs : 15000L);
+        this.tickets.Add(new ShardTransferTicket(tok, playerId, targetShardId, exp));
+        return tok;
+    }
+
+    public bool Redeem(string token, int playerId, int targetShardId, long nowMs) {
+        for (int i = 0; i < this.tickets.Count; i = i + 1) {
+            ShardTransferTicket t = this.tickets[i];
+            if (t.Token == token) {
+                if (t.Consumed || nowMs > t.ExpiresAtMs) { return false; }
+                if (t.PlayerId != playerId || t.TargetShardId != targetShardId) { return false; }
+                t.Consumed = true;
+                return true;
+            }
+        }
+        return false;
+    }
+}

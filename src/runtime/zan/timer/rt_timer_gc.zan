@@ -1,0 +1,829 @@
+// rt_timer_gc.zan: Heap diagnostics gate, 32-stripe live object registry,
+// trial-deletion cycle detection & collection, and heap snapshot export (B-ID89).
+// Replaces src/runtime/timer/rt_timer_gc.c in 100% pure Zan.
+
+namespace Zan.Runtime.Timer;
+
+// LiveStripe: OsMutex (8B Win / 40B Linux) + 32B fields
+struct LiveStripe {
+    public OsMutex Lock;
+    public nint Buckets;
+    public ulong BucketCount;
+    public ulong Count;
+    public nint FreeList;
+}
+
+struct LiveStripe8 {
+    public LiveStripe S0; public LiveStripe S1; public LiveStripe S2; public LiveStripe S3;
+    public LiveStripe S4; public LiveStripe S5; public LiveStripe S6; public LiveStripe S7;
+}
+
+struct LiveStripe32 {
+    public LiveStripe8 G0; public LiveStripe8 G1; public LiveStripe8 G2; public LiveStripe8 G3;
+}
+
+// Open-addressing pointer -> int map
+struct ObjMap {
+    public nint Entries; // array of { nint Key (0), int Val (8), int Pad (12) } -> 16B
+    public ulong Capacity;
+    public ulong Mask;
+}
+
+static class GcOff {
+    internal const int LIVE_STRIPES = 32;
+    internal const int KIND_OBJECT = 0;
+    internal const int KIND_ARRAY = 1;
+    internal const int KIND_REF_ARRAY = 2;
+
+#if WINDOWS
+    internal const long STRIPE_BUCKETS = 8L;
+    internal const long STRIPE_BCNT = 16L;
+    internal const long STRIPE_COUNT = 24L;
+    internal const long STRIPE_FREELIST = 32L;
+    internal const long STRIPE_SIZE = 40L;
+#else
+    internal const long STRIPE_BUCKETS = 40L;
+    internal const long STRIPE_BCNT = 48L;
+    internal const long STRIPE_COUNT = 56L;
+    internal const long STRIPE_FREELIST = 64L;
+    internal const long STRIPE_SIZE = 72L;
+#endif
+
+    // zan_live_entry_t (56 bytes)
+    internal const long LE_SIZE = 56L;
+    internal const long LE_OBJ = 0L;
+    internal const long LE_BYTES = 8L;
+    internal const long LE_SITE = 16L;
+    internal const long LE_SOURCE = 24L;
+    internal const long LE_DATA_OFF = 32L;
+    internal const long LE_KIND = 40L;
+    internal const long LE_NEXT = 48L;
+
+    // zan_cycle_node_t (32 bytes): entry(0), rc(8), internal_rc(16), marked(24)
+    internal const long CN_SIZE = 32L;
+    internal const long CN_ENTRY = 0L;
+    internal const long CN_RC = 8L;
+    internal const long CN_INTERNAL = 16L;
+    internal const long CN_MARKED = 24L;
+
+    // zan_gc_node_t (56 bytes): obj(0), body_bytes(8), fg(16), dtor(24), rc(32), internal(40), marked(48)
+    internal const long GN_SIZE = 56L;
+    internal const long GN_OBJ = 0L;
+    internal const long GN_BODY = 8L;
+    internal const long GN_FG = 16L;
+    internal const long GN_DTOR = 24L;
+    internal const long GN_RC = 32L;
+    internal const long GN_INTERNAL = 40L;
+    internal const long GN_MARKED = 48L;
+
+    // zan_arc_desc_t: dtor_fn(0), tynames_arr(8), meta_ptr(16), field_graph(24)
+    internal const long DESC_DTOR = 0L;
+    internal const long DESC_TYNAMES = 8L;
+    internal const long DESC_FG = 24L;
+
+    // zan_field_graph_t: kind(0), ref_count(4), instance_size(8), reserved(12), refs[](16)
+    internal const long FG_KIND = 0L;
+    internal const long FG_REF_COUNT = 4L;
+    internal const long FG_REFS = 16L;
+}
+
+static partial class RtTimerGc {
+    // ---- Heap diagnostics gate ----
+    static OsMutex s_heapGate;
+    static int s_heapDiagEnabled = 0;
+    static ulong s_heapActiveMutators = 0UL;
+
+    static void GateLock() { RtPlat.MutexLock(NativeMemory.AddressOf(ref s_heapGate)); }
+    static bool GateTryLock() => RtPlat.MutexTryLock(NativeMemory.AddressOf(ref s_heapGate));
+    static void GateUnlock() { RtPlat.MutexUnlock(NativeMemory.AddressOf(ref s_heapGate)); }
+
+    [Export("zan_rt_heap_diagnostics_enable")]
+    public static void HeapDiagnosticsEnable() {
+        GateLock();
+        s_heapDiagEnabled = 1;
+        GateUnlock();
+        LiveEnable();
+    }
+
+    [Export("zan_rt_heap_mutator_enter")]
+    public static void HeapMutatorEnter() {
+        nint tls = RtPlat.TimerTlsGet();
+        ulong prev = 0UL;
+        if (tls != (nint)0) {
+            ref TimerTls tlsRef = ref NativeMemory.AsRef<TimerTls>(tls);
+            prev = tlsRef.HeapMutatorDepth;
+            tlsRef.HeapMutatorDepth = prev + 1UL;
+        }
+        if (prev != 0UL) return;
+        GateLock();
+        s_heapActiveMutators++;
+        GateUnlock();
+    }
+
+    [Export("zan_rt_heap_mutator_leave")]
+    public static void HeapMutatorLeave() {
+        nint tls = RtPlat.TimerTlsPeek();
+        ulong depth = tls != (nint)0 ? NativeMemory.AsRef<TimerTls>(tls).HeapMutatorDepth : 0UL;
+        if (depth == 0UL) {
+            RtTimerDiag.Fatal((nint)"mem", (nint)"heap mutator leave without enter");
+            return;
+        }
+        depth--;
+        NativeMemory.AsRef<TimerTls>(tls).HeapMutatorDepth = depth;
+        if (depth != 0UL) return;
+        GateLock();
+        s_heapActiveMutators--;
+        GateUnlock();
+    }
+
+    static bool HeapScanTryBegin() {
+        if (!GateTryLock()) return false;
+        nint tls = RtPlat.TimerTlsPeek();
+        ulong ownSlot = (tls != (nint)0 && NativeMemory.AsRef<TimerTls>(tls).HeapMutatorDepth != 0UL) ? 1UL : 0UL;
+        if (s_heapDiagEnabled != 0 && s_heapActiveMutators == ownSlot) {
+            return true;
+        }
+        GateUnlock();
+        return false;
+    }
+
+    // ---- 32-stripe live object registry ----
+    static LiveStripe32 s_stripes;
+    internal static int s_stripesInited = 0;
+    static int s_stripesInitLock = 0;
+    static int s_liveEnabled = -1;
+
+    internal static nint s_siteFieldGraphsReg = (nint)0;
+    internal static nint s_siteTynamesReg = (nint)0;
+    internal static long s_siteRegCount = 0L;
+
+    static nint s_siteDtorsReg = (nint)0;
+    static long s_siteDtorsCount = 0L;
+
+    internal static nint s_descTblReg = (nint)0;
+    internal static long s_descTblCount = 0L;
+
+    internal static nint StripeAt(int idx) {
+        return NativeMemory.AddressOf(ref s_stripes) + (nint)((long)idx * GcOff.STRIPE_SIZE);
+    }
+
+    internal static void LiveLockAll() {
+        for (int i = 0; i < GcOff.LIVE_STRIPES; i++) {
+            RtPlat.MutexLock(StripeAt(i));
+        }
+    }
+
+    internal static void LiveUnlockAll() {
+        for (int i = GcOff.LIVE_STRIPES - 1; i >= 0; i--) {
+            RtPlat.MutexUnlock(StripeAt(i));
+        }
+    }
+
+    internal static uint LiveHash(ulong ptr) {
+        ulong x = ptr >> 4;
+        x ^= x >> 16;
+        x ^= x >> 8;
+        return (uint)x;
+    }
+
+    [Export("__zan_live_atexit_detector")]
+    [Visibility("hidden")]
+    static void LiveAtexitDetector() {
+        HeapDiagnosticsEnable();
+        GcDetectCycles();
+    }
+
+    static void LiveEnsureInit() {
+        if (Atomic.Load(ref s_stripesInited, MemoryOrder.Acquire) != 0) return;
+        RtPlat.SpinLockWord(NativeMemory.AddressOf(ref s_stripesInitLock));
+        if (s_stripesInited == 0) {
+            for (int i = 0; i < GcOff.LIVE_STRIPES; i++) {
+                nint s = StripeAt(i);
+                RtPlat.MutexInit(s);
+                nint buckets = RtPlat.CCalloc(64UL, 8UL);
+                NativeMemory.Write<nint>(s + (nint)GcOff.STRIPE_BUCKETS, buckets);
+                NativeMemory.Write<ulong>(s + (nint)GcOff.STRIPE_BCNT, buckets != (nint)0 ? 64UL : 0UL);
+                NativeMemory.Write<ulong>(s + (nint)GcOff.STRIPE_COUNT, 0UL);
+                NativeMemory.Write<nint>(s + (nint)GcOff.STRIPE_FREELIST, (nint)0);
+            }
+            if (RtPlat.CGetenv((nint)"ZAN_DETECT_LEAKS") != (nint)0) {
+                RtPlat.CAtexit(NativeMemory.FunctionPointer(LiveAtexitDetector));
+            }
+            Atomic.Store(ref s_stripesInited, 1, MemoryOrder.Release);
+        }
+        RtPlat.SpinUnlockWord(NativeMemory.AddressOf(ref s_stripesInitLock));
+    }
+
+    [Export("zan_rt_live_enable")]
+    public static void LiveEnable() {
+        Atomic.Store(ref s_liveEnabled, 1, MemoryOrder.Release);
+    }
+
+    static int LiveWanted() {
+        int v = Atomic.Load(ref s_liveEnabled, MemoryOrder.Acquire);
+        if (v >= 0) return v;
+        int on = RtPlat.CGetenv((nint)"ZAN_DETECT_LEAKS") != (nint)0 ? 1 : 0;
+        Atomic.CompareExchangeBool(ref s_liveEnabled, -1, on, MemoryOrder.AcqRel, MemoryOrder.Acquire);
+        return Atomic.Load(ref s_liveEnabled, MemoryOrder.Acquire);
+    }
+
+    static void LiveRegisterInternal(nint obj, ulong size, int kind, ulong dataOffset, nint source) {
+        if (obj == (nint)0 || LiveWanted() == 0 || size < (ulong)RtAbi.OBJ_HDR_SIZE) return;
+        ulong site = NativeMemory.Read<ulong>(obj + (nint)RtAbi.HDR_WORD_OFF);
+        if (kind == GcOff.KIND_OBJECT && site == RtAbi.ARRAY_MAGIC) {
+            kind = GcOff.KIND_ARRAY;
+        }
+        ulong headerSize = (kind == GcOff.KIND_OBJECT) ? (ulong)RtAbi.OBJ_HDR_SIZE : (ulong)RtAbi.ARR_HDR_SIZE;
+        if (size < headerSize || dataOffset > size - headerSize) return;
+
+        LiveEnsureInit();
+        uint h = LiveHash((ulong)obj);
+        int stripeIdx = (int)(h & (uint)(GcOff.LIVE_STRIPES - 1));
+        nint s = StripeAt(stripeIdx);
+
+        RtPlat.MutexLock(s);
+        nint buckets = NativeMemory.Read<nint>(s + (nint)GcOff.STRIPE_BUCKETS);
+        ulong bcnt = NativeMemory.Read<ulong>(s + (nint)GcOff.STRIPE_BCNT);
+        if (buckets == (nint)0) {
+            buckets = RtPlat.CCalloc(64UL, 8UL);
+            if (buckets == (nint)0) {
+                RtPlat.MutexUnlock(s);
+                return;
+            }
+            NativeMemory.Write<nint>(s + (nint)GcOff.STRIPE_BUCKETS, buckets);
+            bcnt = 64UL;
+            NativeMemory.Write<ulong>(s + (nint)GcOff.STRIPE_BCNT, bcnt);
+        }
+
+        ulong cnt = NativeMemory.Read<ulong>(s + (nint)GcOff.STRIPE_COUNT);
+        if (cnt > bcnt * 2UL && bcnt < (1UL << 24)) {
+            ulong newCap = bcnt * 2UL;
+            nint newBuckets = RtPlat.CCalloc(newCap, 8UL);
+            if (newBuckets != (nint)0) {
+                for (ulong b = 0UL; b < bcnt; b++) {
+                    nint curr = NativeMemory.At<nint>(buckets, (long)b);
+                    while (curr != (nint)0) {
+                        nint nxt = NativeMemory.Read<nint>(curr + (nint)GcOff.LE_NEXT);
+                        ulong curObj = (ulong)NativeMemory.Read<nint>(curr + (nint)GcOff.LE_OBJ);
+                        ulong bIdx = ((ulong)(LiveHash(curObj) / (uint)GcOff.LIVE_STRIPES)) & (newCap - 1UL);
+                        NativeMemory.Write<nint>(curr + (nint)GcOff.LE_NEXT, NativeMemory.At<nint>(newBuckets, (long)bIdx));
+                        NativeMemory.At<nint>(newBuckets, (long)bIdx) = curr;
+                        curr = nxt;
+                    }
+                }
+                RtPlat.CFree(buckets);
+                buckets = newBuckets;
+                bcnt = newCap;
+                NativeMemory.Write<nint>(s + (nint)GcOff.STRIPE_BUCKETS, buckets);
+                NativeMemory.Write<ulong>(s + (nint)GcOff.STRIPE_BCNT, bcnt);
+            }
+        }
+
+        ulong bucketIdx = ((ulong)(h / (uint)GcOff.LIVE_STRIPES)) & (bcnt - 1UL);
+        nint entry = NativeMemory.Read<nint>(s + (nint)GcOff.STRIPE_FREELIST);
+        if (entry != (nint)0) {
+            NativeMemory.Write<nint>(s + (nint)GcOff.STRIPE_FREELIST, NativeMemory.Read<nint>(entry + (nint)GcOff.LE_NEXT));
+        } else {
+            entry = RtPlat.CMalloc((ulong)GcOff.LE_SIZE);
+            if (entry == (nint)0) {
+                RtPlat.MutexUnlock(s);
+                return;
+            }
+        }
+        NativeMemory.Write<nint>(entry + (nint)GcOff.LE_OBJ, obj);
+        NativeMemory.Write<ulong>(entry + (nint)GcOff.LE_BYTES, size);
+        NativeMemory.Write<ulong>(entry + (nint)GcOff.LE_SITE, site);
+        NativeMemory.Write<nint>(entry + (nint)GcOff.LE_SOURCE, source);
+        NativeMemory.Write<ulong>(entry + (nint)GcOff.LE_DATA_OFF, dataOffset);
+        NativeMemory.Write<int>(entry + (nint)GcOff.LE_KIND, kind);
+        NativeMemory.Write<nint>(entry + (nint)GcOff.LE_NEXT, NativeMemory.At<nint>(buckets, (long)bucketIdx));
+        NativeMemory.At<nint>(buckets, (long)bucketIdx) = entry;
+        NativeMemory.Write<ulong>(s + (nint)GcOff.STRIPE_COUNT, cnt + 1UL);
+        RtPlat.MutexUnlock(s);
+    }
+
+    [Export("zan_rt_live_register")]
+    public static void LiveRegister(nint obj, ulong size) {
+        LiveRegisterInternal(obj, size, GcOff.KIND_OBJECT, 0UL, (nint)0);
+    }
+
+    [Export("zan_rt_live_register_named")]
+    public static void LiveRegisterNamed(nint obj, ulong size, nint source) {
+        LiveRegisterInternal(obj, size, GcOff.KIND_OBJECT, 0UL, source);
+    }
+
+    [Export("zan_rt_live_register_array")]
+    public static void LiveRegisterArray(nint obj, ulong size, ulong dataOffset, int elementsAreRefs) {
+        LiveRegisterInternal(obj, size, elementsAreRefs != 0 ? GcOff.KIND_REF_ARRAY : GcOff.KIND_ARRAY, dataOffset, (nint)0);
+    }
+
+    [Export("zan_rt_live_unregister")]
+    public static void LiveUnregister(nint obj) {
+        if (obj == (nint)0) return;
+        if (Atomic.Load(ref s_stripesInited, MemoryOrder.Acquire) == 0) return;
+        uint h = LiveHash((ulong)obj);
+        int stripeIdx = (int)(h & (uint)(GcOff.LIVE_STRIPES - 1));
+        nint s = StripeAt(stripeIdx);
+
+        RtPlat.MutexLock(s);
+        nint buckets = NativeMemory.Read<nint>(s + (nint)GcOff.STRIPE_BUCKETS);
+        ulong cnt = NativeMemory.Read<ulong>(s + (nint)GcOff.STRIPE_COUNT);
+        if (buckets == (nint)0 || cnt == 0UL) {
+            RtPlat.MutexUnlock(s);
+            return;
+        }
+        ulong bcnt = NativeMemory.Read<ulong>(s + (nint)GcOff.STRIPE_BCNT);
+        ulong bIdx = ((ulong)(h / (uint)GcOff.LIVE_STRIPES)) & (bcnt - 1UL);
+        nint prevPtr = buckets + (nint)((long)bIdx * 8L);
+        nint curr = NativeMemory.Read<nint>(prevPtr);
+        while (curr != (nint)0) {
+            if (NativeMemory.Read<nint>(curr + (nint)GcOff.LE_OBJ) == obj) {
+                NativeMemory.Write<nint>(prevPtr, NativeMemory.Read<nint>(curr + (nint)GcOff.LE_NEXT));
+                NativeMemory.Write<nint>(curr + (nint)GcOff.LE_NEXT, NativeMemory.Read<nint>(s + (nint)GcOff.STRIPE_FREELIST));
+                NativeMemory.Write<nint>(s + (nint)GcOff.STRIPE_FREELIST, curr);
+                NativeMemory.Write<ulong>(s + (nint)GcOff.STRIPE_COUNT, cnt - 1UL);
+                break;
+            }
+            prevPtr = curr + (nint)GcOff.LE_NEXT;
+            curr = NativeMemory.Read<nint>(prevPtr);
+        }
+        RtPlat.MutexUnlock(s);
+    }
+
+    [Export("zan_rt_register_site_field_graphs")]
+    public static void RegisterSiteFieldGraphs(nint graphs, nint tynames, long count) {
+        s_siteFieldGraphsReg = graphs;
+        s_siteTynamesReg = tynames;
+        s_siteRegCount = count;
+    }
+
+    [Export("zan_rt_register_site_dtors")]
+    public static void RegisterSiteDtors(nint dtors, long count) {
+        s_siteDtorsReg = dtors;
+        s_siteDtorsCount = count;
+    }
+
+    [Export("zan_rt_register_desc_table")]
+    public static void RegisterDescTable(nint tbl, long count) {
+        s_descTblReg = tbl;
+        s_descTblCount = count;
+    }
+
+    // ---- Header decoding helpers (shared with rt_timer_leak.zan) ----
+
+    internal static bool WordIsString(ulong word) => (word >> 32) == RtAbi.STRING_TAG;
+
+    internal static bool HdrIsObj(ulong word) => (((uint)(word >> 32)) & RtAbi.OBJ_TW_MARK) != 0U;
+
+    internal static ulong HdrSite(ulong word) => (ulong)(((uint)(word >> 32)) & RtAbi.OBJ_TW_SITE_MASK);
+
+    internal static ulong WordSite(ulong word) {
+        if (WordIsString(word) || !HdrIsObj(word)) return 0UL;
+        return HdrSite(word);
+    }
+
+    internal static ulong ObjHdrBytes(ulong word) {
+        if (HdrIsObj(word) && (((uint)(word >> 32)) & RtAbi.OBJ_TW_PAD16) != 0U) {
+            return (ulong)(RtAbi.OBJ_HDR_SIZE + 8L);
+        }
+        return (ulong)RtAbi.OBJ_HDR_SIZE;
+    }
+
+    internal static nint WordDesc(ulong word) {
+        if (WordIsString(word)) return (nint)0;
+        if (HdrIsObj(word)) {
+            ulong site = HdrSite(word);
+            if (s_descTblReg != (nint)0 && site > 0UL && (long)site < s_descTblCount) {
+                return NativeMemory.At<nint>(s_descTblReg, (long)site);
+            }
+            return (nint)0;
+        }
+        if (word >= 4096UL && word != RtAbi.ARRAY_MAGIC) return (nint)word;
+        return (nint)0;
+    }
+
+    internal static nint EdgeUntag(nint p) => (nint)((ulong)p & ~RtAbi.CLOSURE_TAG);
+
+    internal static long LiveReadRc(nint entry) {
+        nint obj = NativeMemory.Read<nint>(entry + (nint)GcOff.LE_OBJ);
+        int kind = NativeMemory.Read<int>(entry + (nint)GcOff.LE_KIND);
+        if (kind == GcOff.KIND_OBJECT) {
+            uint rc = Atomic.LoadAt<uint>(obj + (nint)RtAbi.RC_OFF, MemoryOrder.Relaxed);
+            return (long)(int)rc;
+        }
+        return Atomic.LoadAt<long>(obj + (nint)RtAbi.ARR_RC_OFF, MemoryOrder.Relaxed);
+    }
+
+    internal static nint GetObjectTyname(nint entry) {
+        ulong word = NativeMemory.Read<ulong>(entry + (nint)GcOff.LE_SITE) & ~RtAbi.OBJ_STACK_FLAG;
+        int kind = NativeMemory.Read<int>(entry + (nint)GcOff.LE_KIND);
+        nint names = (nint)0;
+        if (kind != GcOff.KIND_OBJECT) {
+            if (kind == GcOff.KIND_REF_ARRAY &&
+                NativeMemory.Read<ulong>(entry + (nint)GcOff.LE_DATA_OFF) == 0UL &&
+                word != RtAbi.ARRAY_MAGIC && word >= 4096UL && !HdrIsObj(word)) {
+                names = NativeMemory.Read<nint>((nint)word + (nint)GcOff.DESC_TYNAMES);
+            }
+            if (names != (nint)0) {
+                nint n0 = NativeMemory.At<nint>(names, 0L);
+                if (n0 != (nint)0) return n0;
+            }
+            return (nint)"Array";
+        }
+        if (WordIsString(word)) return (nint)"string";
+        nint desc = WordDesc(word);
+        if (desc != (nint)0 && NativeMemory.Read<nint>(desc + (nint)GcOff.DESC_TYNAMES) != (nint)0) {
+            names = NativeMemory.Read<nint>(desc + (nint)GcOff.DESC_TYNAMES);
+        } else {
+            ulong site = WordSite(word);
+            if (s_siteTynamesReg != (nint)0 && site > 0UL && (long)site < s_siteRegCount) {
+                names = NativeMemory.At<nint>(s_siteTynamesReg, (long)site);
+            }
+        }
+        if (names != (nint)0) {
+            nint n0 = NativeMemory.At<nint>(names, 0L);
+            if (n0 != (nint)0) return n0;
+        }
+        return (nint)"object";
+    }
+
+    internal static nint EntryFieldGraph(nint entry, ulong word) {
+        nint desc = WordDesc(word);
+        if (desc != (nint)0) return NativeMemory.Read<nint>(desc + (nint)GcOff.DESC_FG);
+        ulong site = WordSite(word);
+        if (s_siteFieldGraphsReg != (nint)0 && site > 0UL && (long)site < s_siteRegCount) {
+            return NativeMemory.At<nint>(s_siteFieldGraphsReg, (long)site);
+        }
+        return (nint)0;
+    }
+
+    // ---- Open-addressing pointer -> index map (shared with rt_timer_leak.zan) ----
+
+    internal static void ObjMapInit(ref ObjMap map, ulong minCap) {
+        if (minCap > RtAbi.SIZE_MAX_U64 / 32UL) {
+            map.Entries = (nint)0; map.Capacity = 0UL; map.Mask = 0UL;
+            return;
+        }
+        ulong target = minCap * 2UL;
+        ulong cap = 64UL;
+        while (cap < target) {
+            if (cap > RtAbi.SIZE_MAX_U64 / 32UL) {
+                map.Entries = (nint)0; map.Capacity = 0UL; map.Mask = 0UL;
+                return;
+            }
+            cap *= 2UL;
+        }
+        map.Capacity = cap;
+        map.Mask = cap - 1UL;
+        map.Entries = RtPlat.CCalloc(cap, 16UL);
+    }
+
+    internal static void ObjMapFree(ref ObjMap map) {
+        if (map.Entries != (nint)0) RtPlat.CFree(map.Entries);
+        map.Entries = (nint)0;
+    }
+
+    internal static void ObjMapPut(ref ObjMap map, nint key, int val) {
+        if (key == (nint)0 || map.Entries == (nint)0) return;
+        ulong idx = ((ulong)LiveHash((ulong)key)) & map.Mask;
+        while (true) {
+            nint slot = map.Entries + (nint)((long)idx * 16L);
+            nint k = NativeMemory.Read<nint>(slot);
+            if (k == (nint)0 || k == key) {
+                NativeMemory.Write<nint>(slot, key);
+                NativeMemory.Write<int>(slot + (nint)8, val);
+                return;
+            }
+            idx = (idx + 1UL) & map.Mask;
+        }
+    }
+
+    internal static int ObjMapGet(ref ObjMap map, nint key) {
+        if (key == (nint)0 || map.Entries == (nint)0) return -1;
+        ulong idx = ((ulong)LiveHash((ulong)key)) & map.Mask;
+        while (true) {
+            nint slot = map.Entries + (nint)((long)idx * 16L);
+            nint k = NativeMemory.Read<nint>(slot);
+            if (k == (nint)0) return -1;
+            if (k == key) return NativeMemory.Read<int>(slot + (nint)8);
+            idx = (idx + 1UL) & map.Mask;
+        }
+    }
+
+    // ---- Edge walking for detect_cycles ----
+
+    static void WalkEdgesForCount(nint entry, nint nodes, ref ObjMap map) {
+        nint obj = NativeMemory.Read<nint>(entry + (nint)GcOff.LE_OBJ);
+        int kind = NativeMemory.Read<int>(entry + (nint)GcOff.LE_KIND);
+        ulong size = NativeMemory.Read<ulong>(entry + (nint)GcOff.LE_BYTES);
+        if (kind != GcOff.KIND_OBJECT) {
+            if (kind == GcOff.KIND_REF_ARRAY) {
+                long count = NativeMemory.Read<long>(obj + (nint)RtAbi.ARR_COUNT_OFF);
+                ulong dataOff = NativeMemory.Read<ulong>(entry + (nint)GcOff.LE_DATA_OFF);
+                ulong bytes = size - (ulong)RtAbi.ARR_HDR_SIZE - dataOff;
+                if (count > 0L && (ulong)count <= bytes / 8UL) {
+                    nint elems = obj + (nint)dataOff;
+                    for (long i = 0L; i < count; i++) {
+                        nint el = NativeMemory.At<nint>(elems, i);
+                        if (el != (nint)0) {
+                            int j = ObjMapGet(ref map, EdgeUntag(el));
+                            if (j >= 0) {
+                                nint nd = nodes + (nint)((long)j * GcOff.CN_SIZE);
+                                NativeMemory.Write<long>(nd + (nint)GcOff.CN_INTERNAL,
+                                    NativeMemory.Read<long>(nd + (nint)GcOff.CN_INTERNAL) + 1L);
+                            }
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        ulong word = NativeMemory.Read<ulong>(entry + (nint)GcOff.LE_SITE) & ~RtAbi.OBJ_STACK_FLAG;
+        if (WordIsString(word)) return;
+        nint fg = EntryFieldGraph(entry, word);
+        if (fg == (nint)0) return;
+
+        ulong hdrBytes = ObjHdrBytes(word);
+        if (size < hdrBytes) return;
+        ulong body = size - hdrBytes;
+        uint fgKind = NativeMemory.Read<uint>(fg + (nint)GcOff.FG_KIND);
+        uint refCount = NativeMemory.Read<uint>(fg + (nint)GcOff.FG_REF_COUNT);
+
+        if (fgKind == 0U) {
+            for (uint k = 0U; k < refCount; k++) {
+                nint r = fg + (nint)(GcOff.FG_REFS + (long)k * 8L);
+                uint off = NativeMemory.Read<uint>(r);
+                uint isRc = NativeMemory.Read<uint>(r + (nint)4);
+                if (isRc == 0U || (ulong)off > body || body - (ulong)off < 8UL) continue;
+                nint child = NativeMemory.Read<nint>(obj + (nint)off);
+                if (child != (nint)0) {
+                    int j = ObjMapGet(ref map, EdgeUntag(child));
+                    if (j >= 0) {
+                        nint nd = nodes + (nint)((long)j * GcOff.CN_SIZE);
+                        NativeMemory.Write<long>(nd + (nint)GcOff.CN_INTERNAL,
+                            NativeMemory.Read<long>(nd + (nint)GcOff.CN_INTERNAL) + 1L);
+                    }
+                }
+            }
+        } else if (fgKind == 1U || fgKind == 2U) {
+            ulong req = 16UL + 8UL * (ulong)fgKind;
+            if (body < req) return;
+            long count = NativeMemory.Read<long>(obj);
+            long capacity = NativeMemory.Read<long>(obj + (nint)8);
+            if (count <= 0L || count > capacity) return;
+            if (fgKind == 1U || (refCount & 1U) != 0U) {
+                nint data = NativeMemory.Read<nint>(obj + (nint)16);
+                if (data != (nint)0) {
+                    for (long i = 0L; i < count; i++) {
+                        nint el = NativeMemory.At<nint>(data, i);
+                        if (el != (nint)0) {
+                            int j = ObjMapGet(ref map, EdgeUntag(el));
+                            if (j >= 0) {
+                                nint nd = nodes + (nint)((long)j * GcOff.CN_SIZE);
+                                NativeMemory.Write<long>(nd + (nint)GcOff.CN_INTERNAL,
+                                    NativeMemory.Read<long>(nd + (nint)GcOff.CN_INTERNAL) + 1L);
+                            }
+                        }
+                    }
+                }
+            }
+            if (fgKind == 2U && (refCount & 2U) != 0U) {
+                nint vals = NativeMemory.Read<nint>(obj + (nint)24);
+                if (vals != (nint)0) {
+                    for (long i = 0L; i < count; i++) {
+                        nint el = NativeMemory.At<nint>(vals, i);
+                        if (el != (nint)0) {
+                            int j = ObjMapGet(ref map, EdgeUntag(el));
+                            if (j >= 0) {
+                                nint nd = nodes + (nint)((long)j * GcOff.CN_SIZE);
+                                NativeMemory.Write<long>(nd + (nint)GcOff.CN_INTERNAL,
+                                    NativeMemory.Read<long>(nd + (nint)GcOff.CN_INTERNAL) + 1L);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    static void MarkReachableTarget(nint target, nint nodes, ref ObjMap map, nint queue, ref ulong qtail) {
+        int v = ObjMapGet(ref map, EdgeUntag(target));
+        if (v >= 0) {
+            nint nd = nodes + (nint)((long)v * GcOff.CN_SIZE);
+            if (NativeMemory.Read<int>(nd + (nint)GcOff.CN_MARKED) == 0) {
+                NativeMemory.Write<int>(nd + (nint)GcOff.CN_MARKED, 1);
+                NativeMemory.At<int>(queue, (long)qtail) = v;
+                qtail++;
+            }
+        }
+    }
+
+    static void WalkEdgesForBfs(nint entry, nint nodes, ref ObjMap map, nint queue, ref ulong qtail) {
+        nint obj = NativeMemory.Read<nint>(entry + (nint)GcOff.LE_OBJ);
+        int kind = NativeMemory.Read<int>(entry + (nint)GcOff.LE_KIND);
+        ulong size = NativeMemory.Read<ulong>(entry + (nint)GcOff.LE_BYTES);
+        if (kind != GcOff.KIND_OBJECT) {
+            if (kind == GcOff.KIND_REF_ARRAY) {
+                long count = NativeMemory.Read<long>(obj + (nint)RtAbi.ARR_COUNT_OFF);
+                ulong dataOff = NativeMemory.Read<ulong>(entry + (nint)GcOff.LE_DATA_OFF);
+                ulong bytes = size - (ulong)RtAbi.ARR_HDR_SIZE - dataOff;
+                if (count > 0L && (ulong)count <= bytes / 8UL) {
+                    nint elems = obj + (nint)dataOff;
+                    for (long i = 0L; i < count; i++) {
+                        nint el = NativeMemory.At<nint>(elems, i);
+                        if (el != (nint)0) MarkReachableTarget(el, nodes, ref map, queue, ref qtail);
+                    }
+                }
+            }
+            return;
+        }
+
+        ulong word = NativeMemory.Read<ulong>(entry + (nint)GcOff.LE_SITE) & ~RtAbi.OBJ_STACK_FLAG;
+        if (WordIsString(word)) return;
+        nint fg = EntryFieldGraph(entry, word);
+        if (fg == (nint)0) return;
+
+        ulong hdrBytes = ObjHdrBytes(word);
+        if (size < hdrBytes) return;
+        ulong body = size - hdrBytes;
+        uint fgKind = NativeMemory.Read<uint>(fg + (nint)GcOff.FG_KIND);
+        uint refCount = NativeMemory.Read<uint>(fg + (nint)GcOff.FG_REF_COUNT);
+
+        if (fgKind == 0U) {
+            for (uint k = 0U; k < refCount; k++) {
+                nint r = fg + (nint)(GcOff.FG_REFS + (long)k * 8L);
+                uint off = NativeMemory.Read<uint>(r);
+                uint isRc = NativeMemory.Read<uint>(r + (nint)4);
+                if (isRc == 0U || (ulong)off > body || body - (ulong)off < 8UL) continue;
+                nint child = NativeMemory.Read<nint>(obj + (nint)off);
+                if (child != (nint)0) MarkReachableTarget(child, nodes, ref map, queue, ref qtail);
+            }
+        } else if (fgKind == 1U || fgKind == 2U) {
+            ulong req = 16UL + 8UL * (ulong)fgKind;
+            if (body < req) return;
+            long count = NativeMemory.Read<long>(obj);
+            long capacity = NativeMemory.Read<long>(obj + (nint)8);
+            if (count <= 0L || count > capacity) return;
+            if (fgKind == 1U || (refCount & 1U) != 0U) {
+                nint data = NativeMemory.Read<nint>(obj + (nint)16);
+                if (data != (nint)0) {
+                    for (long i = 0L; i < count; i++) {
+                        nint el = NativeMemory.At<nint>(data, i);
+                        if (el != (nint)0) MarkReachableTarget(el, nodes, ref map, queue, ref qtail);
+                    }
+                }
+            }
+            if (fgKind == 2U && (refCount & 2U) != 0U) {
+                nint vals = NativeMemory.Read<nint>(obj + (nint)24);
+                if (vals != (nint)0) {
+                    for (long i = 0L; i < count; i++) {
+                        nint el = NativeMemory.At<nint>(vals, i);
+                        if (el != (nint)0) MarkReachableTarget(el, nodes, ref map, queue, ref qtail);
+                    }
+                }
+            }
+        }
+    }
+
+    [Export("zan_gc_detect_cycles")]
+    public static long GcDetectCycles() {
+        if (!HeapScanTryBegin()) return -1L;
+        if (Atomic.Load(ref s_stripesInited, MemoryOrder.Acquire) == 0) {
+            GateUnlock();
+            return 0L;
+        }
+
+        LiveLockAll();
+        nint nodes = (nint)0;
+        nint queue = (nint)0;
+        ObjMap map;
+        map.Entries = (nint)0; map.Capacity = 0UL; map.Mask = 0UL;
+        long orphanCount = -1L;
+
+        ulong totalCount = 0UL;
+        for (int s = 0; s < GcOff.LIVE_STRIPES; s++) {
+            totalCount += NativeMemory.Read<ulong>(StripeAt(s) + (nint)GcOff.STRIPE_COUNT);
+        }
+        if (totalCount == 0UL) {
+            orphanCount = 0L;
+        } else if (totalCount <= 0x7FFFFFFFUL && totalCount <= RtAbi.SIZE_MAX_U64 / (ulong)GcOff.CN_SIZE) {
+            nodes = RtPlat.CMalloc(totalCount * (ulong)GcOff.CN_SIZE);
+            queue = RtPlat.CMalloc(totalCount * 4UL);
+            ObjMapInit(ref map, totalCount);
+            if (nodes != (nint)0 && queue != (nint)0 && map.Entries != (nint)0) {
+                ulong idx = 0UL;
+                for (int s = 0; s < GcOff.LIVE_STRIPES; s++) {
+                    nint st = StripeAt(s);
+                    nint buckets = NativeMemory.Read<nint>(st + (nint)GcOff.STRIPE_BUCKETS);
+                    ulong bcnt = NativeMemory.Read<ulong>(st + (nint)GcOff.STRIPE_BCNT);
+                    for (ulong b = 0UL; b < bcnt; b++) {
+                        nint entry = NativeMemory.At<nint>(buckets, (long)b);
+                        while (entry != (nint)0 && idx < totalCount) {
+                            long rc = LiveReadRc(entry);
+                            if (rc != 0L) {
+                                nint nd = nodes + (nint)((long)idx * GcOff.CN_SIZE);
+                                NativeMemory.Write<nint>(nd + (nint)GcOff.CN_ENTRY, entry);
+                                NativeMemory.Write<long>(nd + (nint)GcOff.CN_RC, rc);
+                                NativeMemory.Write<long>(nd + (nint)GcOff.CN_INTERNAL, 0L);
+                                NativeMemory.Write<int>(nd + (nint)GcOff.CN_MARKED, 0);
+                                ObjMapPut(ref map, NativeMemory.Read<nint>(entry + (nint)GcOff.LE_OBJ), (int)idx);
+                                idx++;
+                            }
+                            entry = NativeMemory.Read<nint>(entry + (nint)GcOff.LE_NEXT);
+                        }
+                    }
+                }
+                ulong actualCount = idx;
+                for (ulong i = 0UL; i < actualCount; i++) {
+                    nint e = NativeMemory.Read<nint>(nodes + (nint)((long)i * GcOff.CN_SIZE) + (nint)GcOff.CN_ENTRY);
+                    WalkEdgesForCount(e, nodes, ref map);
+                }
+
+                ulong qhead = 0UL;
+                ulong qtail = 0UL;
+                for (ulong i = 0UL; i < actualCount; i++) {
+                    nint nd = nodes + (nint)((long)i * GcOff.CN_SIZE);
+                    long rc = NativeMemory.Read<long>(nd + (nint)GcOff.CN_RC);
+                    long irc = NativeMemory.Read<long>(nd + (nint)GcOff.CN_INTERNAL);
+                    if (rc < 0L || rc > irc) {
+                        NativeMemory.Write<int>(nd + (nint)GcOff.CN_MARKED, 1);
+                        NativeMemory.At<int>(queue, (long)qtail) = (int)i;
+                        qtail++;
+                    }
+                }
+                while (qhead < qtail) {
+                    int u = NativeMemory.At<int>(queue, (long)qhead);
+                    qhead++;
+                    nint e = NativeMemory.Read<nint>(nodes + (nint)((long)u * GcOff.CN_SIZE) + (nint)GcOff.CN_ENTRY);
+                    WalkEdgesForBfs(e, nodes, ref map, queue, ref qtail);
+                }
+
+                orphanCount = 0L;
+                ulong orphanBytes = 0UL;
+                for (ulong i = 0UL; i < actualCount; i++) {
+                    nint nd = nodes + (nint)((long)i * GcOff.CN_SIZE);
+                    if (NativeMemory.Read<int>(nd + (nint)GcOff.CN_MARKED) == 0) {
+                        orphanCount++;
+                        nint e = NativeMemory.Read<nint>(nd + (nint)GcOff.CN_ENTRY);
+                        orphanBytes += NativeMemory.Read<ulong>(e + (nint)GcOff.LE_BYTES);
+                    }
+                }
+
+                if (orphanCount > 0L) {
+                    Buf512 line = new Buf512();
+                    nint lp = NativeMemory.AddressOf(ref line);
+                    ulong pos = RtPlat.BufAppendCStr(lp, 512UL, 0UL, (nint)"[zan-gc] cycle detection: ");
+                    pos = RtPlat.BufAppendI64(lp, 512UL, pos, orphanCount);
+                    pos = RtPlat.BufAppendCStr(lp, 512UL, pos, (nint)" unreachable object(s) in orphan cycles (");
+                    pos = RtPlat.BufAppendU64(lp, 512UL, pos, orphanBytes);
+                    pos = RtPlat.BufAppendCStr(lp, 512UL, pos, (nint)" bytes):\n");
+                    RtPlat.WriteStderrBytes(lp, pos);
+
+                    int printed = 0;
+                    for (ulong i = 0UL; i < actualCount && printed < 20; i++) {
+                        nint nd = nodes + (nint)((long)i * GcOff.CN_SIZE);
+                        if (NativeMemory.Read<int>(nd + (nint)GcOff.CN_MARKED) == 0) {
+                            nint e = NativeMemory.Read<nint>(nd + (nint)GcOff.CN_ENTRY);
+                            ulong site = WordSite(NativeMemory.Read<ulong>(e + (nint)GcOff.LE_SITE) & ~RtAbi.OBJ_STACK_FLAG);
+                            ulong p = RtPlat.BufAppendCStr(lp, 512UL, 0UL, (nint)"  - [");
+                            p = RtPlat.BufAppendCStr(lp, 512UL, p, GetObjectTyname(e));
+                            p = RtPlat.BufAppendCStr(lp, 512UL, p, (nint)"] at ");
+                            p = RtPlat.BufAppendHexPtr(lp, 512UL, p, (ulong)NativeMemory.Read<nint>(e + (nint)GcOff.LE_OBJ));
+                            p = RtPlat.BufAppendCStr(lp, 512UL, p, (nint)" (rc=");
+                            p = RtPlat.BufAppendI64(lp, 512UL, p, NativeMemory.Read<long>(nd + (nint)GcOff.CN_RC));
+                            p = RtPlat.BufAppendCStr(lp, 512UL, p, (nint)", internal_rc=");
+                            p = RtPlat.BufAppendI64(lp, 512UL, p, NativeMemory.Read<long>(nd + (nint)GcOff.CN_INTERNAL));
+                            p = RtPlat.BufAppendCStr(lp, 512UL, p, (nint)", size=");
+                            p = RtPlat.BufAppendU64(lp, 512UL, p, NativeMemory.Read<ulong>(e + (nint)GcOff.LE_BYTES));
+                            p = RtPlat.BufAppendCStr(lp, 512UL, p, (nint)", site=");
+                            p = RtPlat.BufAppendU64(lp, 512UL, p, site);
+                            p = RtPlat.BufAppendCStr(lp, 512UL, p, (nint)")\n");
+                            RtPlat.WriteStderrBytes(lp, p);
+                            printed++;
+                        }
+                    }
+                    if (orphanCount > 20L) {
+                        ulong p = RtPlat.BufAppendCStr(lp, 512UL, 0UL, (nint)"  ... and ");
+                        p = RtPlat.BufAppendI64(lp, 512UL, p, orphanCount - 20L);
+                        p = RtPlat.BufAppendCStr(lp, 512UL, p, (nint)" more orphan object(s)\n");
+                        RtPlat.WriteStderrBytes(lp, p);
+                    }
+                }
+            }
+        }
+
+        RtPlat.CFree(queue);
+        ObjMapFree(ref map);
+        RtPlat.CFree(nodes);
+        LiveUnlockAll();
+        GateUnlock();
+        return orphanCount;
+    }
+
+    [Export("zan_rt_dump_leaks")]
+    public static void DumpLeaks() {
+        GcDetectCycles();
+    }
+
+}

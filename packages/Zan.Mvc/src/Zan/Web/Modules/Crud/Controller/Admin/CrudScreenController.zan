@@ -5,6 +5,7 @@ using System.Text;
 using System.Threading;
 using System.Web;
 using System.Json;
+using Zan.Web.AdminUi;
 using Zan.Web.Core;
 using Zan.Web.Model;
 using Zan.Web.Security;
@@ -140,27 +141,9 @@ public abstract class CrudScreenController : AdminController {
         return opts;
     }
 
-    /* 列表屏：声明收集条件 → 计数 → 取页 → 投影钩子 → 整段渲染。 */
+    /* 列表屏：纯 JSON 模式直接委派给 DoConfAsync（adminUI PUT {path}/conf 同源）。 */
     public virtual async Task DoList() {
-        CrudConf conf = this.Def();
-        await this.ResolveDicts(conf);
-        ListPage lp = conf.Build(false);
-        ViewData d = await this.Layout(conf.Title());
-        /* 引擎自家屏渲染走 CrudPage（覆写 Page 的壳），故此处不套 PageReady。 */
-        if (!this.DbReady()) { d.Set("dbDown", "1"); this.CrudPage(d); return; }
-
-        List<OrmCond> conds = lp.Collect(this);
-        long total = await this.CountRows(conf, conds);
-        ListQuery q = this.PagedAny();
-        List<StrMap> rows = await this.LoadRows(conf, conds, q);
-
-        int mask = await this.Mask();
-        bool canCreate = (mask & (int)PermBit.Create) != 0;
-        bool canUpdate = (mask & (int)PermBit.Update) != 0;
-        bool canDelete = (mask & (int)PermBit.Delete) != 0;
-        lp.Screen(this, d, "/" + conf.path, "/" + conf.path,
-            conds, q, (int)total, rows, canCreate, canUpdate, canDelete);
-        this.CrudPage(d);
+        await this.DoConfAsync();
     }
 
     /* 列表数据（adminUI 契约 POST /list）：分页行 JSON + total，信封
@@ -270,17 +253,6 @@ public abstract class CrudScreenController : AdminController {
         Env(this, w.ToString());
     }
 
-    /* 通用屏共享一份视图（views/Admin/CrudScreenController.Index.html，键即基座自身的约定视图键）：screenHtml 整段由
-       ListPage 产出，整页/面板双形态与 Page() 同一分支。 */
-    public void CrudPage(ViewData d) {
-        if (this.IsFragment()) {
-            this.Ctx().SetHeader("X-Tab-Title", Encoding.UrlEncode(this.headingText));
-            this.FragmentOf("Admin.CrudScreenController.Index", d);
-            return;
-        }
-        this.ViewOf("Admin.CrudScreenController.Index", d);
-    }
-
     /* adminUI ZanTable 表格配置（列/筛选/工具栏与列表同源产出）。 */
     public virtual void DoConf() {
         CrudOps.Conf(this, this.Def().Build(false));
@@ -292,48 +264,14 @@ public abstract class CrudScreenController : AdminController {
         CrudOps.Conf(this, conf.Build(false));
     }
 
-    /* 表单对话框：FormPage 产出表单体，共享壳 Admin._FormDialog 渲染；
-       编辑时按行回显（pass 字段恒不回显）。 */
+    /* 表单配置：纯 JSON 模式校验权限后委派给 DoFormConfAsync。 */
     public virtual async Task DoForm() {
-        CrudConf conf = this.Def();
-        await this.ResolveDicts(conf);
         int id = this.InAnyInt("id");
         bool isEdit = id > 0;
         if (!await this.Can(isEdit ? (int)PermBit.Update : (int)PermBit.Create)) {
             this.Fail(403, "0403", "无操作权限"); return;
         }
-        FormPage fp = conf.ToFormPage(isEdit ? Convert.ToString(id) : "0");
-        ViewData d = new ViewData();
-        d.Set("dialogTitle", (isEdit ? Lang.T("编辑") : Lang.T("新增")) + Lang.T(conf.title));
-        if (isEdit) {
-            DbResult r = await DbTable.Of(this.Held(), conf.table).ReadAsync("id", id);
-            if (r == null || r.RowCount() == 0) { this.Fail(404, "0404", "记录不存在"); }
-            if (!await this.RowAllowed(conf, r)) { this.Fail(404, "0404", "记录不存在"); }
-            for (int i = 0; i < conf.forms.Count; i = i + 1) {
-                FormField f = conf.forms[i];
-                if (f.name.Length == 0 || f.kind == "pass" || f.kind == "hint") { continue; }
-                int col = r.GetColumnIndex(f.name);
-                if (col < 0) { continue; }
-                fp.Field(f.name).Val(r.GetString(0, col));
-            }
-        }
-        /* 资源列渲染成"只含可见资源"的下拉：受域账号不该手填店铺 id，
-           也不该在下拉里看见别人的店铺。 */
-        if (conf.scopeKey.Length > 0 && conf.scopeCol.Length > 0) {
-            RowScope sc = await this.ScopeRow(conf);
-            if (sc != null) {
-                bool declared = false;
-                for (int i = 0; i < conf.forms.Count; i = i + 1) {
-                    if (conf.forms[i].name == conf.scopeCol) { declared = true; }
-                }
-                if (declared) {
-                    string opts = await DataGrant.Options(this.Held(), conf.scopeKey, sc, 300);
-                    fp.Field(conf.scopeCol).AsSelect(opts);
-                }
-            }
-        }
-        fp.Render(d);
-        this.FormDialog(d);
+        await this.DoFormConfAsync();
     }
 
     /* 保存：表单校验（FormPage 同源规则）→ 写白名单绑定 → 唯一约束 →
@@ -355,7 +293,7 @@ public abstract class CrudScreenController : AdminController {
         for (int i = 0; i < conf.forms.Count; i = i + 1) {
             FormField f = conf.forms[i];
             if (f.name.Length == 0) { continue; }
-            if (f.kind == "pass" && !isNew && this.In(f.name).Length == 0) { continue; }
+            if (f.kind == "pass" && !isNew && this.InAny(f.name).Length == 0) { continue; }
             StrMap def = CrudOps.Find(lp, f.name);
             if (def == null) {
                 this.Fail(500, "9999", "表单字段 " + f.name + " 未列入 EditFields 写白名单");
@@ -383,7 +321,7 @@ public abstract class CrudScreenController : AdminController {
         for (int i = 0; i < conf.uniques.Count; i = i + 1) {
             StrMap u = conf.uniques[i];
             string col = u.Get("col");
-            string val = this.In(col);
+            string val = this.InAny(col);
             if (val.Length == 0) { continue; }
             /* 唯一性检查并入域：与域外行同值不报"重复"（当作不存在），
                否则受域账号能用 400 探测域外有没有某值——存在性泄露，
@@ -461,8 +399,10 @@ public abstract class CrudScreenController : AdminController {
             }
             return;
         }
-        string bad = this.CheckValue(conf, conf.toggleField, value);
-        if (bad.Length > 0) { this.Fail(400, "0004", bad); }
+        string batchField = this.InAny("field").Trim();
+        if (batchField.Length == 0) { batchField = conf.toggleField; }
+        string bad = this.CheckValue(conf, batchField, value);
+        if (bad.Length > 0) { this.Fail(400, "0004", bad); return; }
         /* 批量启停同样逐行校验域：ids 里混入域外行时整批拒绝，不做
            "能改的改、不能改的跳过"——半成功比失败更难解释。 */
         if (conf.scopeKey.Length > 0) {
@@ -474,8 +414,8 @@ public abstract class CrudScreenController : AdminController {
                 }
             }
         }
-        await CrudOps.Batch(this, lp, conf.toggleField, value, ids, conf.title + "·批量");
-        await this.OnBatched(conf.toggleField, value, ids);
+        await CrudOps.Batch(this, lp, batchField, value, ids, conf.title + "·批量");
+        await this.OnBatched(batchField, value, ids);
     }
 
     /* 行内单字段修改：field 必须在行内白名单内，行必须存在。 */
@@ -678,8 +618,8 @@ public abstract class CrudScreenController : AdminController {
         return this.Paged("id", 20);
     }
 
-    /* 批量 id 列表：CSV（自研壳）或 JSON 数组（adminUI 系）皆收，只
-       收正 id、上限 500——与 AdminController.Ids 同一钳制。 */
+    /* 批量 id 列表：兼容 CSV（自研壳）、{ids:[1,2]}、{data:[{id:1}]} 与顶层
+       行对象数组 [{id:1}, ...]（adminUI DeleteForm 提交形态）；只收正 id、上限 500。 */
     public List<int> IdsAny() {
         List<int> out_ = new List<int>();
         string csv = this.InAny("ids").Trim();
@@ -695,33 +635,38 @@ public abstract class CrudScreenController : AdminController {
         }
         JsonDoc doc = this.Ctx().JsonDoc();
         if (doc == null) { return out_; }
-        int arr = doc.Get(doc.root, "ids");
-        if (arr < 0) { return out_; }
+        int arr = -1;
+        if (doc.KindAt(doc.root) == 4) {
+            arr = doc.root;
+        } else {
+            arr = doc.Get(doc.root, "ids");
+            if (arr < 0) { arr = doc.Get(doc.root, "data"); }
+        }
+        if (arr < 0 || doc.KindAt(arr) != 4) { return out_; }
         int c = doc.FirstChild(arr);
         int count = doc.Count(arr);
         for (int i = 0; i < count && out_.Count < 500 && c >= 0; i = i + 1) {
-            int v = doc.IntAt(c, 0);
+            int v = 0;
+            if (doc.KindAt(c) == 5) {
+                int idSlot = doc.Get(c, "id");
+                if (idSlot < 0) { idSlot = doc.Get(c, "ID"); }
+                if (idSlot >= 0) {
+                    v = doc.IntAt(idSlot, 0);
+                    if (v <= 0) { v = Filter.ToInt(doc.StrAt(idSlot, "").Trim(), 0); }
+                }
+            } else {
+                v = doc.IntAt(c, 0);
+                if (v <= 0) { v = Filter.ToInt(doc.StrAt(c, "").Trim(), 0); }
+            }
             if (v > 0) { out_.Add(v); }
             c = doc.NextSibling(c);
         }
         return out_;
     }
 
-    /* adminUI 统一信封（与 CrudOps.Conf 同形）：resp_code "0000" 为成功。 */
+    /* adminUI 统一信封：收口至 AdminUiProtocol。 */
     private static void Env(AdminController c, string dataJson) {
-        JsonWriter w = new JsonWriter();
-        w.WriteStartObject();
-        w.WriteProperty("resp_code", "0000");
-        w.WriteProperty("status", 200);
-        w.WriteProperty("msg", "ok");
-        w.WriteProperty("url", "");
-        w.WriteProperty("dynamicToken", "");
-        w.WriteProperty("t", 0);
-        if (dataJson.Length > 0) {
-            w.WriteRawProperty("data", dataJson);
-        }
-        w.WriteEndObject();
-        c.Json(w.ToString());
+        AdminUiProtocol.Ok(c, dataJson);
     }
 
     /* 行 → JSON 数组：按显式键集序列化，值全部文本（NULL 一律空串）。 */
@@ -737,23 +682,9 @@ public abstract class CrudScreenController : AdminController {
         w.WriteEndArray();
     }
 
-    /* "1=显示,0=隐藏" → [{value,label}]（下拉选项 JSON）。 */
+    /* "1=显示,0=隐藏" → [{value,label}]（收口至 AdminUiProtocol.WriteOptArray）。 */
     private static void WriteSelectOpts(JsonWriter w, string opts) {
-        w.WriteStartArray();
-        string rest = opts;
-        while (rest.Length > 0) {
-            string pair = rest;
-            int comma = rest.IndexOf(",");
-            if (comma >= 0) { pair = rest.Substring(0, comma); rest = rest.Substring(comma + 1); }
-            else { rest = ""; }
-            int eq = pair.IndexOf("=");
-            if (eq <= 0) { continue; }
-            w.WriteStartObject();
-            w.WriteProperty("value", pair.Substring(0, eq));
-            w.WriteProperty("label", pair.Substring(eq + 1));
-            w.WriteEndObject();
-        }
-        w.WriteEndArray();
+        AdminUiProtocol.WriteOptArray(w, opts);
     }
 
     /* FormField → 校验规则 JSON（adminUI FormRule 形状，与 FormPage.
@@ -790,7 +721,7 @@ public abstract class CrudScreenController : AdminController {
     /* 审计目标：Label() 列的提交值优先（人可读），否则 #id。 */
     public string RowTarget(CrudConf conf, int id) {
         if (conf.labelCol.Length > 0) {
-            string v = this.In(conf.labelCol).Trim();
+            string v = this.InAny(conf.labelCol).Trim();
             if (v.Length > 0) { return v; }
         }
         return "#" + Convert.ToString(id);

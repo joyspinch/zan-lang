@@ -53,10 +53,65 @@ static bool is_intrinsic_attr_name(zan_istr_t name) {
   return false;
 }
 
+static zan_ast_node_t *parse_macro_decl(zan_parser_t *p, uint32_t mods) {
+  zan_loc_t mloc = p->current.loc;
+  parser_advance(p); /* consume contextual 'macro' */
+  zan_loc_t name_loc = p->current.loc;
+  zan_istr_t mname = {NULL, 0};
+  if (parser_check(p, TK_IDENT)) {
+    parser_advance(p);
+    mname = p->previous.str_val;
+  } else {
+    parser_diag_expected_name(p, p->current.loc, "expected macro name");
+  }
+  zan_ast_list_t params;
+  zan_ast_list_init(&params);
+  parser_expect(p, TK_LPAREN);
+  if (!parser_check(p, TK_RPAREN)) {
+    for (;;) {
+      if (parser_check(p, TK_IDENT)) {
+        zan_loc_t ploc = p->current.loc;
+        parser_advance(p);
+        zan_ast_node_t *param = zan_ast_new(p->arena, AST_PARAM, ploc);
+        param->param.name = p->previous.str_val;
+        param->param.name_loc = ploc;
+        zan_ast_set_name_span(param, ploc, param->param.name.len);
+        zan_ast_list_push(&params, param, p->arena);
+      } else {
+        break;
+      }
+      if (!parser_match(p, TK_COMMA))
+        break;
+    }
+  }
+  parser_expect(p, TK_RPAREN);
+
+  zan_ast_node_t *body = NULL;
+  if (parser_match(p, TK_ARROW)) {
+    body = parse_expression(p);
+    parser_expect(p, TK_SEMICOLON);
+  } else if (parser_check(p, TK_LBRACE)) {
+    body = parse_block(p);
+    parser_match(p, TK_SEMICOLON);
+  } else {
+    zan_diag_emit_code(p->diag, DIAG_ERROR, p->current.loc, 35,
+                       "expected '=>' or '{' in macro declaration");
+  }
+
+  zan_ast_node_t *m = zan_ast_new(p->arena, AST_MACRO_DECL, mloc);
+  zan_ast_set_name_span(m, name_loc, mname.len);
+  m->method_decl.name = mname;
+  m->method_decl.params = params;
+  m->method_decl.body = body;
+  m->method_decl.modifiers = mods;
+  return m;
+}
+
 static bool parse_top_level_decl(zan_parser_t *p, zan_ast_node_t *unit) {
   /* 解析类型特性：保留特性元数据，[StructLayout] 触发 C 内存布局对齐 */
   bool has_c_layout = false;
   bool has_explicit_layout = false;
+  uint8_t pack_align = 0;
   bool has_intrinsic = false;
   zan_ast_list_t type_attrs;
   zan_ast_list_init(&type_attrs);
@@ -67,10 +122,32 @@ static bool parse_top_level_decl(zan_parser_t *p, zan_ast_node_t *unit) {
       has_intrinsic = true;
     if (_n.str && _n.len == 12 && memcmp(_n.str, "StructLayout", 12) == 0) {
       has_c_layout = true;
-      /* `LayoutKind */
+      /* `LayoutKind` and optional `Pack = N` */
       zan_ast_list_t *_args = &type_attrs.items[_ai]->attribute.args;
       for (int _aj = 0; _aj < _args->count; _aj++) {
         zan_ast_node_t *_a = _args->items[_aj];
+        if ((_a->kind == AST_ASSIGNMENT && _a->binary.left &&
+             _a->binary.left->kind == AST_IDENTIFIER &&
+             _a->binary.left->ident.name.len == 4 &&
+             memcmp(_a->binary.left->ident.name.str, "Pack", 4) == 0 &&
+             _a->binary.right && _a->binary.right->kind == AST_INT_LITERAL) ||
+            (_a->kind == AST_NAMED_ARG && _a->named_arg.name.len == 4 &&
+             memcmp(_a->named_arg.name.str, "Pack", 4) == 0 &&
+             _a->named_arg.expr &&
+             _a->named_arg.expr->kind == AST_INT_LITERAL)) {
+          int64_t pv = (_a->kind == AST_ASSIGNMENT)
+                           ? _a->binary.right->int_val
+                           : _a->named_arg.expr->int_val;
+          if (pv == 1 || pv == 2 || pv == 4 || pv == 8) {
+            pack_align = (uint8_t)pv;
+          } else {
+            zan_diag_emit_code(
+                p->diag, DIAG_ERROR, _a->loc, 3096,
+                "[StructLayout(Pack = %lld)] must be 1, 2, 4, or 8",
+                (long long)pv);
+          }
+          continue;
+        }
         zan_istr_t _k = {NULL, 0};
         if (_a->kind == AST_MEMBER_ACCESS)
           _k = _a->member.name;
@@ -93,6 +170,14 @@ static bool parse_top_level_decl(zan_parser_t *p, zan_ast_node_t *unit) {
       parser_advance(p);
       mods |= MOD_PARTIAL;
     }
+  }
+
+  if (parser_check(p, TK_IDENT) && p->current.str_val.len == 5 &&
+      memcmp(p->current.str_val.str, "macro", 5) == 0 &&
+      zan_lexer_peek(p->lex).kind == TK_IDENT) {
+    zan_ast_node_t *mdecl = parse_macro_decl(p, mods);
+    zan_ast_list_push(&unit->comp_unit.decls, mdecl, p->arena);
+    return true;
   }
 
   if (parser_check(p, TK_IDENT) && p->current.str_val.len == 6 &&
@@ -118,6 +203,7 @@ static bool parse_top_level_decl(zan_parser_t *p, zan_ast_node_t *unit) {
     zan_ast_node_t *decl = parse_type_decl(p, mods);
     decl->type_decl.is_c_layout = has_c_layout;
     decl->type_decl.is_explicit_layout = has_explicit_layout;
+    decl->type_decl.pack_align = pack_align;
     if (type_attrs.count > 0)
       zan_ast_ensure_decl_meta(decl, p->arena)->attributes = type_attrs;
     zan_ast_list_push(&unit->comp_unit.decls, decl, p->arena);
@@ -204,6 +290,42 @@ static zan_ast_node_t *parse_type_ref(zan_parser_t *p) {
                        ZAN_PARSER_MAX_TYPE_DEPTH);
     p->type_depth--;
     return parser_error_node(p);
+  }
+
+  if (parser_check(p, TK_INT_LIT)) {
+    parser_advance(p);
+    int64_t cval = p->previous.int_val;
+    char cbuf[32];
+    int clen = snprintf(cbuf, sizeof(cbuf), "%lld", (long long)cval);
+    zan_ast_node_t *cn = zan_ast_new(p->arena, AST_TYPE_REF, loc);
+    cn->type_ref.name.str = zan_arena_strdup(p->arena, cbuf, (size_t)clen);
+    cn->type_ref.name.len = (uint32_t)clen;
+    cn->type_ref.is_const_int = true;
+    cn->type_ref.const_int_val = cval;
+    zan_ast_list_init(&cn->type_ref.type_args);
+    p->type_depth--;
+    return cn;
+  }
+
+  /* First-class fixed-size value array syntax: `[N]T` -> `InlineArray<N, T>` */
+  if (parser_check(p, TK_LBRACKET)) {
+    zan_token_t nxt = zan_lexer_peek(p->lex);
+    zan_token_t nxt2 = zan_lexer_peek2(p->lex);
+    if ((nxt.kind == TK_INT_LIT || nxt.kind == TK_IDENT) &&
+        nxt2.kind == TK_RBRACKET) {
+      parser_advance(p); /* '[' */
+      zan_ast_node_t *len_arg = parse_type_ref(p);
+      parser_expect(p, TK_RBRACKET);
+      zan_ast_node_t *elem_arg = parse_type_ref(p);
+      zan_ast_node_t *ia = zan_ast_new(p->arena, AST_TYPE_REF, loc);
+      ia->type_ref.name.str = "InlineArray";
+      ia->type_ref.name.len = 11;
+      zan_ast_list_init(&ia->type_ref.type_args);
+      zan_ast_list_push(&ia->type_ref.type_args, len_arg, p->arena);
+      zan_ast_list_push(&ia->type_ref.type_args, elem_arg, p->arena);
+      p->type_depth--;
+      return ia;
+    }
   }
 
   if (parser_check(p, TK_LPAREN)) {
@@ -471,7 +593,7 @@ static uint32_t parse_modifiers(zan_parser_t *p) {
       break;
     case TK_CONST:
       parser_advance(p);
-      mods |= MOD_STATIC | MOD_READONLY;
+      mods |= MOD_STATIC | MOD_READONLY | MOD_CONST;
       break;
     case TK_EXTERN:
       parser_advance(p);

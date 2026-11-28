@@ -50,26 +50,28 @@ public class PdfBuffer {
         if (text == null) { return; }
         int len = text.Length;
         if (len <= 0) { return; }
-        this.Ensure(len);
-        NativeMemory.PutString((nint)this.data, this.count, text, len);
-        this.count = this.count + len;
+        int p = this.count;
+        if ((long)p + (long)len > (long)this.data.Length) { this.Ensure(len); }
+        NativeMemory.Copy((nint)this.data + (nint)p, (nint)text, len);
+        this.count = p + len;
     }
 
     // 追加字符串切片 [start, start + length) 的 ASCII/Latin-1 字节（零中间 Substring 分配）。
     public void AsciiSlice(string text, int start, int length) {
         if (text == null || length <= 0) { return; }
         if (start < 0) { start = 0; }
-        int end = start + length;
-        if (end > text.Length) { end = text.Length; }
+        int tlen = text.Length;
+        if (start >= tlen) { return; }
+        long endL = (long)start + (long)length;
+        int end = endL > (long)tlen ? tlen : (int)endL;
         int n = end - start;
         if (n <= 0) { return; }
-        this.Ensure(n);
-        byte[] dst = this.data;
         int p = this.count;
+        if ((long)p + (long)n > (long)this.data.Length) { this.Ensure(n); }
+        Span<byte> src = new Span<byte>((nint)text, tlen);
+        Span<byte> dst = new Span<byte>((nint)this.data, this.data.Length);
         for (int i = 0; i < n; i = i + 1) {
-            int c = text[start + i];
-            if (c > 255) { c = 63; }
-            dst[p + i] = (byte)c;
+            dst[p + i] = src[start + i];
         }
         this.count = p + n;
     }
@@ -78,9 +80,10 @@ public class PdfBuffer {
     public void Append(PdfBuffer other) {
         if (other == null || other.count <= 0) { return; }
         int n = other.count;
-        this.Ensure(n);
-        NativeMemory.Copy((nint)this.data + this.count, (nint)other.data, n);
-        this.count = this.count + n;
+        int p = this.count;
+        if ((long)p + (long)n > (long)this.data.Length) { this.Ensure(n); }
+        NativeMemory.Copy((nint)this.data + (nint)p, (nint)other.data, n);
+        this.count = p + n;
     }
 
     // 追加十进制整数（零中间字符串分配）。
@@ -94,9 +97,9 @@ public class PdfBuffer {
             this.Ascii("-9223372036854775808");
             return;
         }
-        this.Ensure(21);
-        byte[] dst = this.data;
         int p = this.count;
+        if ((long)p + 21L > (long)this.data.Length) { this.Ensure(21); }
+        Span<byte> dst = new Span<byte>((nint)this.data, this.data.Length);
         if (value == 0L) {
             dst[p] = 48;
             this.count = p + 1;
@@ -108,7 +111,7 @@ public class PdfBuffer {
             p = p + 1;
             v = -v;
         }
-        byte[] digits = this.scratch;
+        Span<byte> digits = new Span<byte>((nint)this.scratch, 24);
         int n = 0;
         while (v > 0L) {
             long q = v / 10L;
@@ -125,10 +128,10 @@ public class PdfBuffer {
 
     // 追加定长 10 位十进制整数（左侧补 '0'，用于 xref 偏移表，零堆分配）。
     public void AppendPad10(int value) {
-        this.Ensure(10);
-        int v = value < 0 ? 0 : value;
-        byte[] dst = this.data;
         int p = this.count;
+        if ((long)p + 10L > (long)this.data.Length) { this.Ensure(10); }
+        int v = value < 0 ? 0 : value;
+        Span<byte> dst = new Span<byte>((nint)this.data, this.data.Length);
         for (int i = 9; i >= 0; i = i - 1) {
             int q = v / 10;
             dst[p + i] = (byte)(48 + (v - q * 10));
@@ -139,20 +142,83 @@ public class PdfBuffer {
 
     // 追加一个字节。
     public void Raw(byte value) {
-        if (this.count >= this.data.Length) { this.Ensure(1); }
-        this.data[this.count] = value;
-        this.count = this.count + 1;
+        int p = this.count;
+        if (p >= this.data.Length) { this.Ensure(1); }
+        Span<byte> dst = new Span<byte>((nint)this.data, this.data.Length);
+        dst[p] = value;
+        this.count = p + 1;
     }
 
-    // 追加一个数（PDF 数字格式，最多三位小数，零堆分配；拒绝 NaN/Infinity/超范围值防产出损坏 PDF）。
+    // 批量直写切片 [start, end) 的转义 PDF 字面量字节流；遇到不可编码字节时返回其索引，全部成功返回 -1。
+    internal int WritePdfEscapedFast(string text, int start, int end) {
+        if (text == null) { return -1; }
+        int slen = end - start;
+        if (slen <= 0) { return -1; }
+        // 每 ASCII 字节最多写 2 字节，每 2 字节 UTF-8 Latin-1 写 4 字节，故 slen * 2 为严格上界。
+        long worstL = (long)slen * 2L;
+        if (worstL > 2147483591L) {
+            throw new InvalidOperationException("PdfBuffer escaped text exceeds capacity limit");
+        }
+        int worst = (int)worstL;
+        int p = this.count;
+        if ((long)p + worstL > (long)this.data.Length) { this.Ensure(worst); }
+        Span<byte> src = new Span<byte>((nint)text, text.Length);
+        Span<byte> dst = new Span<byte>((nint)this.data, this.data.Length);
+        int i = start;
+        while (i < end) {
+            int b0 = src[i];
+            if (b0 < 128) {
+                if (b0 >= 32 && b0 <= 126) {
+                    if (b0 == 92 || b0 == 40 || b0 == 41) {
+                        dst[p] = 92;
+                        dst[p + 1] = (byte)b0;
+                        p = p + 2;
+                    } else {
+                        dst[p] = (byte)b0;
+                        p = p + 1;
+                    }
+                    i = i + 1;
+                } else {
+                    this.count = p;
+                    return i;
+                }
+            } else if ((b0 == 194 || b0 == 195) && i + 1 < end) {
+                int b1 = src[i + 1];
+                if ((b1 & 192) != 128) {
+                    this.count = p;
+                    return i;
+                }
+                int cp = ((b0 & 31) << 6) | (b1 & 63);
+                if (cp < 160 || cp > 255) {
+                    this.count = p;
+                    return i;
+                }
+                dst[p] = 92;
+                dst[p + 1] = (byte)(48 + ((cp >> 6) & 7));
+                dst[p + 2] = (byte)(48 + ((cp >> 3) & 7));
+                dst[p + 3] = (byte)(48 + (cp & 7));
+                p = p + 4;
+                i = i + 2;
+            } else {
+                this.count = p;
+                return i;
+            }
+        }
+        this.count = p;
+        return -1;
+    }
+
+    // 追加一个数（PDF 数字格式，最多三位小数，单次 Ensure + Span 直写零堆分配；拒绝 NaN/Infinity/超范围值防产出损坏 PDF）。
     public void Number(double value) {
         if (value != value || (value - value) != 0.0 || value >= 9223372036854774784.0 || value <= -9223372036854774784.0) {
             throw new PdfException(PdfError.InvalidArgument, "PdfBuffer.Number: non-finite or out-of-range number");
         }
-        this.Ensure(28);
+        int p = this.count;
+        if ((long)p + 28L > (long)this.data.Length) { this.Ensure(28); }
+        Span<byte> dst = new Span<byte>((nint)this.data, this.data.Length);
         if (value < 0.0) {
-            this.data[this.count] = 45;
-            this.count = this.count + 1;
+            dst[p] = 45;
+            p = p + 1;
             value = -value;
         }
         double intPart = Math.Floor(value);
@@ -162,10 +228,47 @@ public class PdfBuffer {
             whole = whole + 1L;
             thousandths = thousandths - 1000L;
         }
-        this.AppendLong(whole);
-        if (thousandths == 0L) { return; }
-        byte[] dst = this.data;
-        int p = this.count;
+        if (whole == 0L) {
+            dst[p] = 48;
+            p = p + 1;
+        } else if (whole < 1000L) {
+            int w = (int)whole;
+            if (w >= 100) {
+                int h = w / 100;
+                int r = w - h * 100;
+                int t1 = r / 10;
+                dst[p] = (byte)(48 + h);
+                dst[p + 1] = (byte)(48 + t1);
+                dst[p + 2] = (byte)(48 + (r - t1 * 10));
+                p = p + 3;
+            } else if (w >= 10) {
+                int t1 = w / 10;
+                dst[p] = (byte)(48 + t1);
+                dst[p + 1] = (byte)(48 + (w - t1 * 10));
+                p = p + 2;
+            } else {
+                dst[p] = (byte)(48 + w);
+                p = p + 1;
+            }
+        } else {
+            Span<byte> digits = new Span<byte>((nint)this.scratch, 24);
+            long v = whole;
+            int dn = 0;
+            while (v > 0L) {
+                long q = v / 10L;
+                digits[dn] = (byte)(48 + (int)(v - q * 10L));
+                v = q;
+                dn = dn + 1;
+            }
+            for (int i = dn - 1; i >= 0; i = i - 1) {
+                dst[p] = digits[i];
+                p = p + 1;
+            }
+        }
+        if (thousandths == 0L) {
+            this.count = p;
+            return;
+        }
         dst[p] = 46;
         p = p + 1;
         int t = (int)thousandths;

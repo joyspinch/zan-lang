@@ -147,6 +147,24 @@ LLVMTypeRef map_type(zan_irgen_t *g, zan_type_t *type) {
         (type->name.len == 12 &&
          memcmp(type->name.str, "ReadOnlySpan", 12) == 0))
       return g->span_struct_type;
+    if (is_inline_array_type(type)) {
+      int64_t n = inline_array_len(type);
+      zan_type_t *et = inline_array_elem(type);
+      if (et && et->kind == TYPE_TYPE_PARAM)
+        et = concretize(g, et);
+      LLVMTypeRef elt =
+          et ? span_elem_storage_type(g, et) : LLVMInt32TypeInContext(g->ctx);
+      return LLVMArrayType(elt, (unsigned)(n > 0 ? n : 1));
+    }
+    if (is_vec_type(type)) {
+      int64_t n = vec_len(type);
+      zan_type_t *et = vec_elem(type);
+      if (et && et->kind == TYPE_TYPE_PARAM)
+        et = concretize(g, et);
+      LLVMTypeRef elt =
+          et ? span_elem_storage_type(g, et) : LLVMFloatTypeInContext(g->ctx);
+      return LLVMVectorType(elt, (unsigned)(n > 0 ? n : 1));
+    }
     for (int i = 0; i < g->struct_type_count; i++) {
       if (g->struct_types[i].sym == type->sym) {
         if (type->kind == TYPE_CLASS) {
@@ -400,6 +418,97 @@ LLVMValueRef emit_field_ptr(zan_irgen_t *g, zan_symbol_t *type_sym,
   zan_tbaa_mark_field(g, p, st, fi);
   return p;
 }
+
+void apply_pack_field_align(zan_irgen_t *g, zan_symbol_t *type_sym,
+                            LLVMValueRef mem_inst, LLVMTypeRef field_ty) {
+  if (!g || !type_sym || !mem_inst || !field_ty)
+    return;
+  struct zan_struct_type_entry *e = get_struct_entry(g, type_sym);
+  if (!e || e->pack_align == 0)
+    return;
+  unsigned long nat = abi_align_of(field_ty);
+  unsigned eff = (unsigned)((nat > e->pack_align) ? e->pack_align : nat);
+  if (eff == 0)
+    eff = 1;
+  if (LLVMIsALoadInst(mem_inst) || LLVMIsAStoreInst(mem_inst))
+    LLVMSetAlignment(mem_inst, eff);
+}
+
+bool zan_irgen_eval_layout_query(zan_irgen_t *g, zan_ast_node_t *expr,
+                                 int64_t *out) {
+  if (!g || !expr || expr->kind != AST_SIZEOF_EXPR || !out)
+    return false;
+  zan_type_t *t = resolve_type_ctx(g, expr->cast.type);
+  LLVMTypeRef mt = t ? map_type(g, t) : NULL;
+  if (!mt || LLVMGetTypeKind(mt) == LLVMVoidTypeKind) {
+    *out = (expr->cast.layout_op == 1) ? 1 : 0;
+    return false;
+  }
+  if (expr->cast.layout_op == 0) {
+    /* sizeof(T) */
+    *out = (int64_t)abi_size_of(mt);
+    return true;
+  }
+  if (expr->cast.layout_op == 1) {
+    /* alignof(T) */
+    int64_t explicit_al = 0;
+    if (t && t->kind == TYPE_STRUCT && t->sym && t->sym->decl &&
+        zan_ast_attr_int(t->sym->decl, "Align", &explicit_al) &&
+        explicit_al >= 1 && (explicit_al & (explicit_al - 1)) == 0) {
+      unsigned long nat = (LLVMGetTypeKind(mt) == LLVMStructTypeKind &&
+                           LLVMIsPackedStruct(mt))
+                              ? 1
+                              : abi_align_of(mt);
+      *out = (int64_t)((unsigned long)explicit_al > nat
+                           ? (unsigned long)explicit_al
+                           : nat);
+      return true;
+    }
+    if (LLVMGetTypeKind(mt) == LLVMStructTypeKind && LLVMIsPackedStruct(mt)) {
+      *out = 1;
+      return true;
+    }
+    *out = (int64_t)abi_align_of(mt);
+    return true;
+  }
+  if (expr->cast.layout_op == 2) {
+    /* offsetof(T, Field) */
+    if (!t || t->kind != TYPE_STRUCT || !t->sym)
+      return false;
+    int fi = get_field_index(t->sym, expr->cast.field_name);
+    if (fi < 0)
+      return false;
+    struct zan_struct_type_entry *e = get_struct_entry(g, t->sym);
+    if (e && e->explicit_layout && e->field_offsets && fi < e->field_count) {
+      *out = (int64_t)e->field_offsets[fi];
+      return true;
+    }
+    unsigned n = LLVMCountStructElementTypes(mt);
+    if ((unsigned)fi >= n)
+      return false;
+    LLVMTypeRef *elems = (LLVMTypeRef *)calloc(n, sizeof(LLVMTypeRef));
+    LLVMGetStructElementTypes(mt, elems);
+    bool packed = LLVMIsPackedStruct(mt) != 0;
+    unsigned long off = 0;
+    for (unsigned k = 0; k < (unsigned)fi; k++) {
+      if (!packed) {
+        unsigned long fa = abi_align_of(elems[k]);
+        if (fa > 1 && (off % fa) != 0)
+          off += fa - (off % fa);
+      }
+      off += abi_size_of(elems[k]);
+    }
+    if (!packed) {
+      unsigned long fa = abi_align_of(elems[fi]);
+      if (fa > 1 && (off % fa) != 0)
+        off += fa - (off % fa);
+    }
+    free(elems);
+    *out = (int64_t)off;
+    return true;
+  }
+  return false;
+}
 bool field_member_is_static(zan_symbol_t *m) {
   if (m->modifiers & MOD_STATIC)
     return true;
@@ -611,7 +720,8 @@ unsigned long abi_size_of(LLVMTypeRef t);
 
 static LLVMTypeRef generic_field_slot(zan_irgen_t *g, zan_symbol_t *sym,
                                       zan_type_t *ftype, LLVMTypeRef base) {
-  if (!ftype || ftype->kind != TYPE_TYPE_PARAM)
+  if (!ftype ||
+      (ftype->kind != TYPE_TYPE_PARAM && !type_mentions_tp(ftype)))
     return base;
   unsigned long have = abi_size_of(base), need = have;
   for (int i = 0; i < g->generic_inst_count; i++) {
@@ -675,9 +785,55 @@ void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym) {
   entry->field_count = field_count + vptr;
   entry->field_llvm = field_types;
   entry->explicit_layout = decl_is_explicit_layout(sym);
+  unsigned long pack = 0;
+  if (sym->decl &&
+      (sym->decl->kind == AST_STRUCT_DECL || sym->decl->kind == AST_CLASS_DECL))
+    pack = sym->decl->type_decl.pack_align;
+  entry->pack_align = (uint8_t)pack;
 
-  if (!entry->explicit_layout) {
+  if (!entry->explicit_layout && pack == 0) {
     LLVMStructSetBody(st, field_types, (unsigned)(field_count + vptr), 0);
+    return;
+  }
+
+  if (!entry->explicit_layout && pack == 1) {
+    LLVMStructSetBody(st, field_types, (unsigned)(field_count + vptr), 1);
+    return;
+  }
+
+  /* Either [StructLayout(LayoutKind.Explicit)] (with optional Pack)
+   * or [StructLayout(LayoutKind.Sequential, Pack = 2/4/8)] */
+  if (!entry->explicit_layout && pack > 1) {
+    entry->explicit_layout = true;
+    entry->field_offsets = (unsigned long *)calloc((size_t)(field_count + vptr),
+                                                   sizeof(unsigned long));
+    unsigned long off = 0, align = 1;
+    for (int slot = 0; slot < field_count + vptr; slot++) {
+      unsigned long fa = abi_align_of(field_types[slot]);
+      unsigned long eff = (fa > pack) ? pack : fa;
+      if (eff == 0) eff = 1;
+      if (off % eff)
+        off += eff - (off % eff);
+      entry->field_offsets[slot] = off;
+      if (eff > align)
+        align = eff;
+      off += abi_size_of(field_types[slot]);
+    }
+    if (off % align)
+      off += align - (off % align);
+    if (off == 0) off = 1;
+    LLVMTypeRef body[2];
+    unsigned nbody = 0;
+    if (align == 1) {
+      body[nbody++] = LLVMArrayType(LLVMInt8TypeInContext(g->ctx), (unsigned)off);
+      LLVMStructSetBody(st, body, nbody, 1);
+    } else {
+      body[nbody++] = LLVMIntTypeInContext(g->ctx, (unsigned)(align * 8));
+      if (off > align)
+        body[nbody++] = LLVMArrayType(LLVMInt8TypeInContext(g->ctx),
+                                      (unsigned)(off - align));
+      LLVMStructSetBody(st, body, nbody, 0);
+    }
     return;
   }
 
@@ -705,14 +861,16 @@ void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym) {
     }
     entry->field_offsets[slot] = off;
     unsigned long fa = abi_align_of(field_types[slot]);
-    if (off % fa != 0) {
+    unsigned long eff_align = (pack > 0 && fa > pack) ? pack : fa;
+    if (eff_align == 0) eff_align = 1;
+    if (off % eff_align != 0) {
       zan_diag_emit_code(g->diag, DIAG_ERROR,
                          m->decl ? m->decl->loc : sym->decl->loc, 3095,
                          "[FieldOffset(%lu)] on '%.*s' is not %lu-byte aligned",
-                         off, (int)m->name.len, m->name.str, fa);
+                         off, (int)m->name.len, m->name.str, eff_align);
     }
-    if (fa > align)
-      align = fa;
+    if (eff_align > align)
+      align = eff_align;
     unsigned long end = off + abi_size_of(field_types[slot]);
     if (end > size)
       size = end;
@@ -720,14 +878,21 @@ void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym) {
   }
   if (size % align)
     size += align - size % align;
+  if (size == 0)
+    size = 1;
 
   LLVMTypeRef body[2];
   unsigned nbody = 0;
-  body[nbody++] = LLVMIntTypeInContext(g->ctx, (unsigned)(align * 8));
-  if (size > align)
-    body[nbody++] =
-        LLVMArrayType(LLVMInt8TypeInContext(g->ctx), (unsigned)(size - align));
-  LLVMStructSetBody(st, body, nbody, 0);
+  if (align == 1) {
+    body[nbody++] = LLVMArrayType(LLVMInt8TypeInContext(g->ctx), (unsigned)size);
+    LLVMStructSetBody(st, body, nbody, 1);
+  } else {
+    body[nbody++] = LLVMIntTypeInContext(g->ctx, (unsigned)(align * 8));
+    if (size > align)
+      body[nbody++] =
+          LLVMArrayType(LLVMInt8TypeInContext(g->ctx), (unsigned)(size - align));
+    LLVMStructSetBody(st, body, nbody, 0);
+  }
 }
 bool class_has_virtual_methods(zan_symbol_t *sym) {
   for (int i = 0; i < sym->member_count; i++) {
@@ -866,6 +1031,7 @@ void local_add(local_scope_t *scope, zan_istr_t name, LLVMValueRef alloca,
   scope->vars[scope->count].async_role = 0;
   scope->vars[scope->count].frame_owner = -1;
   scope->vars[scope->count].struct_rc = 0;
+  scope->vars[scope->count].drop_flag = NULL;
   scope->vars[scope->count].per_iteration = 0;
   scope->count++;
   di_declare_var(g_di_emit_ctx, name, alloca, type);
@@ -1009,6 +1175,8 @@ void release_all_arc_locals(zan_irgen_t *g, local_scope_t *locals) {
       continue;
     if (locals->vars[i].obj_rc_flag) {
       emit_release_obj_local(g, &locals->vars[i]);
+    } else if (locals->vars[i].drop_flag) {
+      emit_raii_drop_local(g, &locals->vars[i]);
     } else if (locals->vars[i].struct_rc) {
       emit_struct_local_release(g, locals->vars[i].type,
                                 locals->vars[i].alloca);

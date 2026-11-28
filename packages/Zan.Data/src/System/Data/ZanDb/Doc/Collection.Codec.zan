@@ -169,6 +169,8 @@ public partial class Collection {
         this.search.Validate(doc);
     }
 
+    public static int MAX_DECODE_DEPTH = 128;
+
     // 将文档序列化为紧凑的二进制记录：一个 'B'
     // 格式字节，随后是顶层对象的字段（字典 id 键 +
     // 带类型的值）。冗余的 "_id" 被省略——它是行键，读取时
@@ -177,27 +179,35 @@ public partial class Collection {
     // 必须在 kv 事务内运行：新字段名
     // 会与正文一起持久化。
     public string EncodeDoc(JsonValue doc) {
+        if (doc == null) { throw new ArgumentNullException("doc"); }
         ByteBuffer b = ByteBuffer.Alloc(64);
-        b.WriteU8(66);  // 'B'
-        int cnt = doc.Count();
-        bool[] keep = new bool[cnt];
-        int n = 0;
-        for (int i = 0; i < cnt; i = i + 1) {
-            string k0 = doc.KeyAt(i);
-            if (k0 != "_id" && !Collection.HasLaterKey(doc, k0, i)) {
-                keep[i] = true;
-                n = n + 1;
+        bool freed = false;
+        try {
+            b.WriteU8(66);  // 'B'
+            int cnt = doc.Count();
+            bool[] keep = new bool[cnt];
+            int n = 0;
+            for (int i = 0; i < cnt; i = i + 1) {
+                string k0 = doc.KeyAt(i);
+                if (k0 != "_id" && !Collection.HasLaterKey(doc, k0, i)) {
+                    keep[i] = true;
+                    n = n + 1;
+                }
             }
-        }
-        b.WriteVarInt(n);
-        for (int i = 0; i < cnt; i = i + 1) {
-            if (keep[i]) {
-                b.WriteVarInt(KeyId(doc.KeyAt(i)));
-                WriteVal(b, doc.ValAt(i));
+            b.WriteVarInt(n);
+            for (int i = 0; i < cnt; i = i + 1) {
+                if (keep[i]) {
+                    b.WriteVarInt(KeyId(doc.KeyAt(i)));
+                    WriteVal(b, doc.ValAt(i));
+                }
             }
+            PersistKeyDict();
+            string res = Collection.EscapeRecord(b);
+            freed = true;
+            return res;
+        } finally {
+            if (!freed) { b.Free(); }
         }
-        PersistKeyDict();
-        return Collection.EscapeRecord(b);
     }
 
     // 记录缓冲 → 存储字符串（刀13 废除 0x00/0xFF 转义，确立全二进制安全
@@ -243,16 +253,24 @@ public partial class Collection {
     [DllImport("crt", EntryPoint = "memcmp")]
     public static extern int MemCmpRaw(nint a, string b, long n);
 
-    // 与 ByteBuffer.WriteVarInt 同格式的变长整数读取（显式位置传递）。
+    // 与 ByteBuffer.WriteVarInt 同格式的变长整数读取（显式位置传递，带边界与移位上限防护）。
     public static long RecVarInt(string s, int p, out int np) {
+        if (s == null || p < 0 || p >= s.Length) {
+            np = s != null ? s.Length : 0;
+            return 0;
+        }
         long v = 0;
         int shift = 0;
-        while (true) {
+        int slen = s.Length;
+        while (p < slen) {
             int by = s[p] & 255;
             p = p + 1;
-            v = v + ((long)(by & 127) << shift);
+            if (shift <= 63) {
+                v = v + ((long)(by & 127) << shift);
+            }
             if ((by & 128) == 0) { break; }
             shift = shift + 7;
+            if (shift > 63) { break; }
         }
         np = p;
         return v;
@@ -266,6 +284,15 @@ public partial class Collection {
     // 从记录中读取 <see cref="WriteVal"/> 写出的一个值并还原为
     // JsonValue；p 为值起始字节，np 为值结束后的位置。
     public JsonValue ReadValS(string s, int p, out int np) {
+        return ReadValSDepth(s, p, out np, 0);
+    }
+
+    private JsonValue ReadValSDepth(string s, int p, out int np, int depth) {
+        if (s == null || p < 0 || p >= s.Length || depth > Collection.MAX_DECODE_DEPTH) {
+            np = s != null ? s.Length : 0;
+            return JsonValue.NewNull();
+        }
+        int slen = s.Length;
         int tag = s[p] & 255;
         p = p + 1;
         if (tag == 0) { np = p; return JsonValue.NewNull(); }
@@ -282,6 +309,10 @@ public partial class Collection {
         if (tag == 9) { np = p; return JsonValue.NewNum("0"); }
         if (tag == 4 || tag == 5) {
             long n = Collection.RecVarInt(s, p, out p);
+            if (n < 0L || n > (long)(slen - p)) {
+                np = slen;
+                return tag == 4 ? JsonValue.NewNum("0") : JsonValue.NewStr("");
+            }
             string t = s.Substring(p, (int)n);
             np = p + (int)n;
             if (tag == 4) { return JsonValue.NewNum(t); }
@@ -292,6 +323,10 @@ public partial class Collection {
             // 刀7 float32 数组直编码：dims + dims×4 字节小端。
             // 刀11：直还数值形态，免逐元素装箱。
             long c = Collection.RecVarInt(s, p, out p);
+            if (c < 0L || c > (long)(slen - p) / 4L) {
+                np = slen;
+                return JsonValue.NewDoubleArray(new double[0]);
+            }
             double[] arr = new double[(int)c];
             for (int i = 0; i < (int)c; i = i + 1) {
                 int bits = (s[p] & 255)
@@ -307,52 +342,71 @@ public partial class Collection {
         if (tag == 6) {
             long c = Collection.RecVarInt(s, p, out p);
             JsonValue a = JsonValue.NewArray();
-            for (int i = 0; i < (int)c; i = i + 1) {
-                JsonValue v = ReadValS(s, p, out p);
+            if (c < 0L || c > (long)(slen - p)) { np = slen; return a; }
+            for (int i = 0; i < (int)c && p < slen; i = i + 1) {
+                JsonValue v = ReadValSDepth(s, p, out p, depth + 1);
                 a.Append(v);
             }
             np = p;
             return a;
         }
-        // tag == 7：对象
-        long oc = Collection.RecVarInt(s, p, out p);
-        JsonValue obj = JsonValue.NewObject();
-        for (int i = 0; i < (int)oc; i = i + 1) {
-            long kid = Collection.RecVarInt(s, p, out p);
-            JsonValue v = ReadValS(s, p, out p);
-            obj.Set(KeyName((int)kid), v);
+        if (tag == 7) {
+            // tag == 7：对象
+            long oc = Collection.RecVarInt(s, p, out p);
+            JsonValue obj = JsonValue.NewObject();
+            if (oc < 0L || oc > (long)(slen - p)) { np = slen; return obj; }
+            for (int i = 0; i < (int)oc && p < slen; i = i + 1) {
+                long kid = Collection.RecVarInt(s, p, out p);
+                JsonValue v = ReadValSDepth(s, p, out p, depth + 1);
+                obj.Set(KeyName((int)kid), v);
+            }
+            np = p;
+            return obj;
         }
-        np = p;
-        return obj;
+        np = slen;
+        return JsonValue.NewNull();
     }
 
     // 跳过一个编码值，而不从中构建任何内容。
     // 字符串和文本形式的数字按长度跳过，而非复制。
     public static void SkipValS(string s, int p, out int np) {
+        Collection.SkipValSDepth(s, p, out np, 0);
+    }
+
+    private static void SkipValSDepth(string s, int p, out int np, int depth) {
+        if (s == null || p < 0 || p >= s.Length || depth > Collection.MAX_DECODE_DEPTH) {
+            np = s != null ? s.Length : 0;
+            return;
+        }
+        int slen = s.Length;
         int tag = s[p] & 255;
         p = p + 1;
         if (tag == 3 || tag == 8) { Collection.RecVarInt(s, p, out np); return; }
         if (tag == 11) {
-            long c = Collection.RecVarInt(s, p, out np);
-            np = np + (int)c * 4;
+            long c = Collection.RecVarInt(s, p, out p);
+            if (c < 0L || c > (long)(slen - p) / 4L) { np = slen; return; }
+            np = p + (int)c * 4;
             return;
         }
         if (tag == 4 || tag == 5) {
             long n = Collection.RecVarInt(s, p, out p);
+            if (n < 0L || n > (long)(slen - p)) { np = slen; return; }
             np = p + (int)n;
             return;
         }
         if (tag == 6) {
             long c = Collection.RecVarInt(s, p, out p);
-            for (int i = 0; i < (int)c; i = i + 1) { Collection.SkipValS(s, p, out p); }
+            if (c < 0L || c > (long)(slen - p)) { np = slen; return; }
+            for (int i = 0; i < (int)c && p < slen; i = i + 1) { Collection.SkipValSDepth(s, p, out p, depth + 1); }
             np = p;
             return;
         }
         if (tag == 7) {
             long c = Collection.RecVarInt(s, p, out p);
-            for (int i = 0; i < (int)c; i = i + 1) {
-                p = (int)Collection.RecVarInt(s, p, out p);
-                Collection.SkipValS(s, p, out p);
+            if (c < 0L || c > (long)(slen - p)) { np = slen; return; }
+            for (int i = 0; i < (int)c && p < slen; i = i + 1) {
+                Collection.RecVarInt(s, p, out p);
+                Collection.SkipValSDepth(s, p, out p, depth + 1);
             }
             np = p;
             return;
@@ -364,12 +418,15 @@ public partial class Collection {
     // 把存储的二进制记录（见 <see cref="EncodeDoc"/>）解码回 JsonValue 对象；
     // "_id" 由调用方从行键附加。
     public JsonValue DecodeDoc(string body) {
+        JsonValue o = JsonValue.NewObject();
+        if (body == null || body.Length < 2 || (body[0] & 255) != 66) { return o; }
+        int slen = body.Length;
         int p = 1;  // 'B' = 66
         long n = Collection.RecVarInt(body, p, out p);
-        JsonValue o = JsonValue.NewObject();
-        for (int i = 0; i < (int)n; i = i + 1) {
+        if (n < 0L || n > (long)(slen - p)) { return o; }
+        for (int i = 0; i < (int)n && p < slen; i = i + 1) {
             long kid = Collection.RecVarInt(body, p, out p);
-            JsonValue v = ReadValS(body, p, out p);
+            JsonValue v = ReadValSDepth(body, p, out p, 0);
             o.Set(KeyName((int)kid), v);
         }
         return o;

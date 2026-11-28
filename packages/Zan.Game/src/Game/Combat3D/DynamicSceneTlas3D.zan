@@ -1,0 +1,863 @@
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+using Game.Animation;
+
+namespace Game.Combat3D;
+
+// 双层动态场景射线求交结果（值类型，零堆分配，携带命中的实例句柄与自定义实体标签）。
+public struct SceneRayHit3D {
+    public bool Hit;
+    public float Distance;
+    public Vector3 Point;
+    public Vector3 Normal;
+    public int InstanceId;
+    public int UserTag;
+    public int TriangleIndex;
+    public int MaterialId;
+}
+
+// 双层动态场景胶囊体连续扫掠命中结果（值类型，零堆分配）。
+public struct SceneSweepHit3D {
+    public bool Hit;
+    public float Fraction;
+    public float Distance;
+    public Vector3 Point;
+    public Vector3 Normal;
+    public Vector3 SurfaceNormal;
+    public int InstanceId;
+    public int UserTag;
+    public int TriangleIndex;
+    public int MaterialId;
+    public bool StartedPenetrating;
+}
+
+// 跨实例穿墙弹道冲击记录（支持子弹穿过木门实例后继续飞入后方建筑区块 BLAS）。
+public struct SceneBallisticImpact3D {
+    public float Distance;
+    public Vector3 Point;
+    public Vector3 Normal;
+    public int InstanceId;
+    public int UserTag;
+    public int TriangleIndex;
+    public int MaterialId;
+    public float EnergyBefore;
+    public float EnergyAfter;
+}
+
+// 工业级双层空间加速结构（Two-Level Acceleration Structure，对标 Intel Embree Instance BVH4 / Jolt BroadPhase）：
+// - 底层（BLAS）：复用不可变高密度 StaticMeshBvh3D（建筑区块、门扇、可破坏掩体、载具车壳可百倍共享同一份网格）
+// - 顶层（TLAS）：基于 4-Wide SIMD QBVH（Vec<4, float>）组织世界空间实例包围盒
+// - Arvo 无分支旋转包围盒 + Fat-AABB 松弛边界增量重拟合（Refit）：电梯/载具微移免重建，可破坏物 <5 ns 瞬时开关
+// - 局部空间等比刚体逆变换：世界空间胶囊体在实例局部空间仍为严格正胶囊体，距离/法线零失真精确映射
+public partial class DynamicSceneTlas3D {
+    private const int LEAF_MAX_INST = 2;
+    private const int SAH_BINS = 8;
+    private const float EMPTY_MIN = 1e20f;
+    private const float EMPTY_MAX = -1e20f;
+
+    public float FatMargin;
+
+    // 实例槽位池（SoA 扁平数组 + 空闲链表 O(1) 槽位复用，满足开放世界流式频繁增删零内存膨胀）
+    private StaticMeshBvh3D[] instBlas;
+    private float[] instPos;        // 3 float: px, py, pz
+    private Quaternion[] instRot;   // 单位旋转四元数
+    private float[] instRotMat;     // 9 float: col0(3), col1(3), col2(3) 正交旋转矩阵列向量
+    private float[] instScale;      // 正等比缩放 s
+    private float[] instInvScale;   // 1 / s
+    private float[] instLinVel;     // 3 float: vx, vy, vz
+    private float[] instAngVel;     // 3 float: wx, wy, wz (rad/s)
+    private float[] tightBounds;    // 6 float: minX, minY, minZ, maxX, maxY, maxZ
+    private float[] fatBounds;      // 6 float: 建树/Refit 时扩张后的松弛包围盒
+    private int[] instLayers;
+    private int[] instUserTags;
+    private byte[] instState;       // 0=空闲, 1=已分配但禁用, 2=已分配且启用
+
+    private int[] freeSlots;
+    private int freeCount;
+    private int slotHighWater;
+    private int activeCount;
+    private int capacity;
+
+    // 4-Wide SIMD QBVH TLAS 节点与叶子表
+    private int[] leafInstances;    // 按树叶子顺序重排的实例 ID
+    private float[] qBounds;        // 每节点 24 float: minX[4], minY[4], minZ[4], maxX[4], maxY[4], maxZ[4]
+    private int[] qChildren;        // 每节点 4 int: >=0 子节点, -1 空, <=-2 叶子 (-2 - leafIdx)
+    private int[] qParent;          // 子 QBVH 节点 -> 父节点下标（供自底向上 O(M) 快速 Refit）
+    private int[] qParentSlot;      // 子 QBVH 节点在父节点中的通道 [0..3]
+    private int[] leafFirst;
+    private int[] leafCount;
+    private int[] leafParentNode;
+    private int[] leafParentSlot;
+    private int qNodeCount;
+    private int totalLeaves;
+
+    private bool needsRebuild;
+    private bool needsRefit;
+    private int outOfFatCount;
+    private int dynamicEpoch;
+
+    public DynamicSceneTlas3D() : this(128) {
+    }
+
+    public DynamicSceneTlas3D(int initialCapacity) {
+        int cap = initialCapacity > 16 ? initialCapacity : 16;
+        this.FatMargin = 0.35f;
+        this.capacity = cap;
+        this.instBlas = new StaticMeshBvh3D[cap];
+        this.instPos = new float[cap * 3];
+        this.instRot = new Quaternion[cap];
+        this.instRotMat = new float[cap * 9];
+        this.instScale = new float[cap];
+        this.instInvScale = new float[cap];
+        this.instLinVel = new float[cap * 3];
+        this.instAngVel = new float[cap * 3];
+        this.tightBounds = new float[cap * 6];
+        this.fatBounds = new float[cap * 6];
+        this.instLayers = new int[cap];
+        this.instUserTags = new int[cap];
+        this.instState = new byte[cap];
+
+        this.freeSlots = new int[cap];
+        this.freeCount = 0;
+        this.slotHighWater = 0;
+        this.activeCount = 0;
+
+        this.leafInstances = new int[0];
+        this.qBounds = new float[0];
+        this.qChildren = new int[0];
+        this.qParent = new int[0];
+        this.qParentSlot = new int[0];
+        this.leafFirst = new int[0];
+        this.leafCount = new int[0];
+        this.leafParentNode = new int[0];
+        this.leafParentSlot = new int[0];
+        this.qNodeCount = 0;
+        this.totalLeaves = 0;
+
+        this.needsRebuild = true;
+        this.needsRefit = false;
+        this.outOfFatCount = 0;
+        this.dynamicEpoch = 1;
+    }
+
+    public int ActiveInstanceCount() { return this.activeCount; }
+    public int NodeCount() { return this.qNodeCount; }
+    public int DynamicEpoch() { return this.dynamicEpoch; }
+
+    public void Clear() {
+        for (int i = 0; i < this.slotHighWater; i = i + 1) {
+            this.instBlas[i] = null;
+            this.instState[i] = (byte)0;
+        }
+        this.freeCount = 0;
+        this.slotHighWater = 0;
+        this.activeCount = 0;
+        this.qNodeCount = 0;
+        this.totalLeaves = 0;
+        this.needsRebuild = true;
+        this.needsRefit = false;
+        this.outOfFatCount = 0;
+        this.dynamicEpoch = this.dynamicEpoch + 1;
+    }
+
+    private void EnsureInstanceCapacity(int needed) {
+        if (needed <= this.capacity) { return; }
+        int newCap = this.capacity * 2;
+        while (newCap < needed) { newCap = newCap * 2; }
+
+        StaticMeshBvh3D[] nb = new StaticMeshBvh3D[newCap];
+        Array.Copy(this.instBlas, 0, nb, 0, this.slotHighWater);
+        this.instBlas = nb;
+
+        float[] np = new float[newCap * 3];
+        Array.Copy(this.instPos, 0, np, 0, this.slotHighWater * 3);
+        this.instPos = np;
+
+        Quaternion[] nr = new Quaternion[newCap];
+        Array.Copy(this.instRot, 0, nr, 0, this.slotHighWater);
+        this.instRot = nr;
+
+        float[] nrm = new float[newCap * 9];
+        Array.Copy(this.instRotMat, 0, nrm, 0, this.slotHighWater * 9);
+        this.instRotMat = nrm;
+
+        float[] ns = new float[newCap];
+        Array.Copy(this.instScale, 0, ns, 0, this.slotHighWater);
+        this.instScale = ns;
+
+        float[] nis = new float[newCap];
+        Array.Copy(this.instInvScale, 0, nis, 0, this.slotHighWater);
+        this.instInvScale = nis;
+
+        float[] nlv = new float[newCap * 3];
+        Array.Copy(this.instLinVel, 0, nlv, 0, this.slotHighWater * 3);
+        this.instLinVel = nlv;
+
+        float[] nav = new float[newCap * 3];
+        Array.Copy(this.instAngVel, 0, nav, 0, this.slotHighWater * 3);
+        this.instAngVel = nav;
+
+        float[] ntb = new float[newCap * 6];
+        Array.Copy(this.tightBounds, 0, ntb, 0, this.slotHighWater * 6);
+        this.tightBounds = ntb;
+
+        float[] nfb = new float[newCap * 6];
+        Array.Copy(this.fatBounds, 0, nfb, 0, this.slotHighWater * 6);
+        this.fatBounds = nfb;
+
+        int[] nl = new int[newCap];
+        Array.Copy(this.instLayers, 0, nl, 0, this.slotHighWater);
+        this.instLayers = nl;
+
+        int[] nut = new int[newCap];
+        Array.Copy(this.instUserTags, 0, nut, 0, this.slotHighWater);
+        this.instUserTags = nut;
+
+        byte[] nst = new byte[newCap];
+        Array.Copy(this.instState, 0, nst, 0, this.slotHighWater);
+        this.instState = nst;
+
+        int[] nfs = new int[newCap];
+        Array.Copy(this.freeSlots, 0, nfs, 0, this.freeCount);
+        this.freeSlots = nfs;
+
+        this.capacity = newCap;
+    }
+
+    // 注册一个场景实例并返回稳定的 instanceId（底层 BLAS 若未建树将自动触发 Build）。
+    public int AddInstance(StaticMeshBvh3D blas, Vector3 position, Quaternion rotation,
+                           float uniformScale, int layerMask, int userTag) {
+        if (blas == null) { return -1; }
+        if (!blas.IsBuilt()) { blas.Build(); }
+        if (blas.TriangleCount() <= 0) { return -1; }
+
+        int id;
+        if (this.freeCount > 0) {
+            this.freeCount = this.freeCount - 1;
+            id = this.freeSlots[this.freeCount];
+        } else {
+            this.EnsureInstanceCapacity(this.slotHighWater + 1);
+            id = this.slotHighWater;
+            this.slotHighWater = id + 1;
+        }
+
+        this.instBlas[id] = blas;
+        this.instLayers[id] = layerMask;
+        this.instUserTags[id] = userTag;
+        this.instState[id] = (byte)2;
+
+        int v3 = id * 3;
+        this.instLinVel[v3 + 0] = 0.0f; this.instLinVel[v3 + 1] = 0.0f; this.instLinVel[v3 + 2] = 0.0f;
+        this.instAngVel[v3 + 0] = 0.0f; this.instAngVel[v3 + 1] = 0.0f; this.instAngVel[v3 + 2] = 0.0f;
+
+        this.WriteTransformAndTightBounds(id, position, rotation, uniformScale);
+        this.activeCount = this.activeCount + 1;
+        this.needsRebuild = true;
+        this.dynamicEpoch = this.dynamicEpoch + 1;
+        return id;
+    }
+
+    // 移除实例并将槽位归还空闲池（供开放世界区块卸载调用）。
+    public bool RemoveInstance(int instanceId) {
+        if (!this.IsSlotAllocated(instanceId)) { return false; }
+        this.instBlas[instanceId] = null;
+        this.instState[instanceId] = (byte)0;
+        this.freeSlots[this.freeCount] = instanceId;
+        this.freeCount = this.freeCount + 1;
+        this.activeCount = this.activeCount - 1;
+        this.needsRebuild = true;
+        this.dynamicEpoch = this.dynamicEpoch + 1;
+        return true;
+    }
+
+    // 瞬时启用/禁用可破坏掩体、木板或自动门（O(1) 状态位翻转，无需重建 BLAS 或 TLAS）。
+    public bool SetInstanceEnabled(int instanceId, bool enabled) {
+        if (!this.IsSlotAllocated(instanceId)) { return false; }
+        byte target = enabled ? (byte)2 : (byte)1;
+        if (this.instState[instanceId] != target) {
+            this.instState[instanceId] = target;
+            this.dynamicEpoch = this.dynamicEpoch + 1;
+        }
+        return true;
+    }
+
+    public bool IsInstanceEnabled(int instanceId) {
+        if (instanceId < 0 || instanceId >= this.slotHighWater) { return false; }
+        return this.instState[instanceId] == (byte)2;
+    }
+
+    public int GetInstanceUserTag(int instanceId) {
+        if (!this.IsSlotAllocated(instanceId)) { return -1; }
+        return this.instUserTags[instanceId];
+    }
+
+    // 更新实例世界空间位姿：若新紧致 AABB 仍落在 Fat-AABB 内则零树开销，越界时标记快速 Refit。
+    public bool SetInstanceTransform(int instanceId, Vector3 position, Quaternion rotation, float uniformScale) {
+        if (!this.IsSlotAllocated(instanceId)) { return false; }
+        this.WriteTransformAndTightBounds(instanceId, position, rotation, uniformScale);
+        this.dynamicEpoch = this.dynamicEpoch + 1;
+
+        if (!this.needsRebuild) {
+            int b = instanceId * 6;
+            float[] tb = this.tightBounds;
+            float[] fb = this.fatBounds;
+            if (tb[b + 0] < fb[b + 0] || tb[b + 1] < fb[b + 1] || tb[b + 2] < fb[b + 2] ||
+                tb[b + 3] > fb[b + 3] || tb[b + 4] > fb[b + 4] || tb[b + 5] > fb[b + 5]) {
+                this.needsRefit = true;
+                this.outOfFatCount = this.outOfFatCount + 1;
+                if (this.outOfFatCount > (this.activeCount >> 1) + 16) {
+                    this.needsRebuild = true;
+                }
+            }
+        }
+        return true;
+    }
+
+    public bool SetInstanceVelocity(int instanceId, Vector3 linearVelocity, Vector3 angularVelocity) {
+        if (!this.IsSlotAllocated(instanceId)) { return false; }
+        int v = instanceId * 3;
+        this.instLinVel[v + 0] = linearVelocity.X;
+        this.instLinVel[v + 1] = linearVelocity.Y;
+        this.instLinVel[v + 2] = linearVelocity.Z;
+        this.instAngVel[v + 0] = angularVelocity.X;
+        this.instAngVel[v + 1] = angularVelocity.Y;
+        this.instAngVel[v + 2] = angularVelocity.Z;
+        return true;
+    }
+
+    // 运动学推进平台/旋转机关/电梯：自动由前后帧位姿精确反解线速度与世界空间角速度，供角色控制器附着跟随。
+    public bool StepKinematicTransform(int instanceId, Vector3 newPosition, Quaternion newRotation, float dt) {
+        if (!this.IsSlotAllocated(instanceId)) { return false; }
+        Quaternion normNew = DynamicSceneTlas3D.NormalizeQuat(newRotation);
+        if (dt > 1e-6f) {
+            int p = instanceId * 3;
+            float invDt = 1.0f / dt;
+            Vector3 linVel = new Vector3(
+                (newPosition.X - this.instPos[p + 0]) * invDt,
+                (newPosition.Y - this.instPos[p + 1]) * invDt,
+                (newPosition.Z - this.instPos[p + 2]) * invDt);
+
+            Quaternion oldRot = this.instRot[instanceId];
+            Quaternion alignedNew = normNew;
+            float dot = oldRot.X * alignedNew.X + oldRot.Y * alignedNew.Y + oldRot.Z * alignedNew.Z + oldRot.W * alignedNew.W;
+            if (dot < 0.0f) {
+                alignedNew = new Quaternion(-alignedNew.X, -alignedNew.Y, -alignedNew.Z, -alignedNew.W);
+            }
+            Quaternion invOld = new Quaternion(-oldRot.X, -oldRot.Y, -oldRot.Z, oldRot.W);
+            Quaternion dq = Quaternion.Multiply(alignedNew, invOld);
+            float sinHalfSq = dq.X * dq.X + dq.Y * dq.Y + dq.Z * dq.Z;
+            Vector3 angVel;
+            if (sinHalfSq > 1e-12f) {
+                float sinHalf = MathF.Sqrt(sinHalfSq);
+                float angle = 2.0f * (float)Math.Atan2((double)sinHalf, (double)Math.Abs(dq.W));
+                float wScale = (dq.W < 0.0f ? -angle : angle) / (sinHalf * dt);
+                angVel = new Vector3(dq.X * wScale, dq.Y * wScale, dq.Z * wScale);
+            } else {
+                float wScale = 2.0f * invDt;
+                angVel = new Vector3(dq.X * wScale, dq.Y * wScale, dq.Z * wScale);
+            }
+            this.SetInstanceVelocity(instanceId, linVel, angVel);
+        }
+        return this.SetInstanceTransform(instanceId, newPosition, normNew, this.instScale[instanceId]);
+    }
+
+    // 计算刚体实例表面或内部任意世界空间点 p 处的瞬时线速度 v(p) = v_lin + omega x (p - center)。
+    public Vector3 GetInstancePointVelocity(int instanceId, Vector3 worldPoint) {
+        if (!this.IsSlotAllocated(instanceId)) { return Vector3.Zero; }
+        int v = instanceId * 3;
+        float rx = worldPoint.X - this.instPos[v + 0];
+        float ry = worldPoint.Y - this.instPos[v + 1];
+        float rz = worldPoint.Z - this.instPos[v + 2];
+        float wx = this.instAngVel[v + 0];
+        float wy = this.instAngVel[v + 1];
+        float wz = this.instAngVel[v + 2];
+        return new Vector3(
+            this.instLinVel[v + 0] + (wy * rz - wz * ry),
+            this.instLinVel[v + 1] + (wz * rx - wx * rz),
+            this.instLinVel[v + 2] + (wx * ry - wy * rx));
+    }
+
+    public bool GetInstanceWorldBounds(int instanceId, out Vector3 minCorner, out Vector3 maxCorner) {
+        if (!this.IsSlotAllocated(instanceId)) {
+            minCorner = Vector3.Zero;
+            maxCorner = Vector3.Zero;
+            return false;
+        }
+        int b = instanceId * 6;
+        minCorner = new Vector3(this.tightBounds[b + 0], this.tightBounds[b + 1], this.tightBounds[b + 2]);
+        maxCorner = new Vector3(this.tightBounds[b + 3], this.tightBounds[b + 4], this.tightBounds[b + 5]);
+        return true;
+    }
+
+    private bool IsSlotAllocated(int id) {
+        return id >= 0 && id < this.slotHighWater && this.instState[id] != (byte)0;
+    }
+
+    private static Quaternion NormalizeQuat(Quaternion q) {
+        float lenSq = q.X * q.X + q.Y * q.Y + q.Z * q.Z + q.W * q.W;
+        if (lenSq <= 1e-12f) { return Quaternion.Identity; }
+        if (Math.Abs(lenSq - 1.0f) <= 1e-6f) { return q; }
+        float inv = 1.0f / MathF.Sqrt(lenSq);
+        return new Quaternion(q.X * inv, q.Y * inv, q.Z * inv, q.W * inv);
+    }
+
+    // 写入实例位姿并用 Jim Arvo 无分支矩阵绝对值算法 O(1) 计算紧致世界空间 AABB。
+    private void WriteTransformAndTightBounds(int id, Vector3 pos, Quaternion rot, float uniformScale) {
+        float s = Math.Abs(uniformScale);
+        if (s < 1e-4f) { s = 1.0f; }
+        Quaternion q = DynamicSceneTlas3D.NormalizeQuat(rot);
+
+        int p = id * 3;
+        this.instPos[p + 0] = pos.X;
+        this.instPos[p + 1] = pos.Y;
+        this.instPos[p + 2] = pos.Z;
+        this.instRot[id] = q;
+        this.instScale[id] = s;
+        this.instInvScale[id] = 1.0f / s;
+
+        Vector3 c0 = Quaternion.Rotate(new Vector3(1.0f, 0.0f, 0.0f), q);
+        Vector3 c1 = Quaternion.Rotate(new Vector3(0.0f, 1.0f, 0.0f), q);
+        Vector3 c2 = Quaternion.Rotate(new Vector3(0.0f, 0.0f, 1.0f), q);
+
+        int m = id * 9;
+        float[] rm = this.instRotMat;
+        rm[m + 0] = c0.X; rm[m + 1] = c0.Y; rm[m + 2] = c0.Z;
+        rm[m + 3] = c1.X; rm[m + 4] = c1.Y; rm[m + 5] = c1.Z;
+        rm[m + 6] = c2.X; rm[m + 7] = c2.Y; rm[m + 8] = c2.Z;
+
+        Vector3 lMin;
+        Vector3 lMax;
+        this.instBlas[id].GetLocalBounds(out lMin, out lMax);
+
+        float lcx = (lMin.X + lMax.X) * 0.5f * s;
+        float lcy = (lMin.Y + lMax.Y) * 0.5f * s;
+        float lcz = (lMin.Z + lMax.Z) * 0.5f * s;
+        float lex = (lMax.X - lMin.X) * 0.5f * s;
+        float ley = (lMax.Y - lMin.Y) * 0.5f * s;
+        float lez = (lMax.Z - lMin.Z) * 0.5f * s;
+
+        float wcx = pos.X + c0.X * lcx + c1.X * lcy + c2.X * lcz;
+        float wcy = pos.Y + c0.Y * lcx + c1.Y * lcy + c2.Y * lcz;
+        float wcz = pos.Z + c0.Z * lcx + c1.Z * lcy + c2.Z * lcz;
+
+        float wex = Math.Abs(c0.X) * lex + Math.Abs(c1.X) * ley + Math.Abs(c2.X) * lez;
+        float wey = Math.Abs(c0.Y) * lex + Math.Abs(c1.Y) * ley + Math.Abs(c2.Y) * lez;
+        float wez = Math.Abs(c0.Z) * lex + Math.Abs(c1.Z) * ley + Math.Abs(c2.Z) * lez;
+
+        int b = id * 6;
+        float[] tb = this.tightBounds;
+        tb[b + 0] = wcx - wex; tb[b + 1] = wcy - wey; tb[b + 2] = wcz - wez;
+        tb[b + 3] = wcx + wex; tb[b + 4] = wcy + wey; tb[b + 5] = wcz + wez;
+    }
+
+    private void UpdateFatBoundsForInstance(int id) {
+        int b = id * 6;
+        int v = id * 3;
+        float margin = Math.Max(0.0f, this.FatMargin);
+        float vx = Math.Abs(this.instLinVel[v + 0]) * 0.10f + margin;
+        float vy = Math.Abs(this.instLinVel[v + 1]) * 0.10f + margin;
+        float vz = Math.Abs(this.instLinVel[v + 2]) * 0.10f + margin;
+        float[] tb = this.tightBounds;
+        float[] fb = this.fatBounds;
+        fb[b + 0] = tb[b + 0] - vx; fb[b + 1] = tb[b + 1] - vy; fb[b + 2] = tb[b + 2] - vz;
+        fb[b + 3] = tb[b + 3] + vx; fb[b + 4] = tb[b + 4] + vy; fb[b + 5] = tb[b + 5] + vz;
+    }
+
+    // 确保 TLAS 处于最新可查询状态：优先走自底向上微秒级 Refit，拓扑大变时走 8-Bin SAH 重建。
+    public void EnsureReady() {
+        if (this.needsRebuild) {
+            this.RebuildTlas();
+        } else if (this.needsRefit) {
+            this.RefitTlas();
+        }
+    }
+
+    private void RefitTlas() {
+        int nLeaves = this.totalLeaves;
+        float[] qb = this.qBounds;
+        float[] fb = this.fatBounds;
+        int[] li = this.leafInstances;
+
+        for (int lid = 0; lid < nLeaves; lid = lid + 1) {
+            int first = this.leafFirst[lid];
+            int end = first + this.leafCount[lid];
+            float minX = EMPTY_MIN; float minY = EMPTY_MIN; float minZ = EMPTY_MIN;
+            float maxX = EMPTY_MAX; float maxY = EMPTY_MAX; float maxZ = EMPTY_MAX;
+            for (int s = first; s < end; s = s + 1) {
+                int id = li[s];
+                this.UpdateFatBoundsForInstance(id);
+                int b = id * 6;
+                minX = Math.Min(minX, fb[b + 0]); minY = Math.Min(minY, fb[b + 1]); minZ = Math.Min(minZ, fb[b + 2]);
+                maxX = Math.Max(maxX, fb[b + 3]); maxY = Math.Max(maxY, fb[b + 4]); maxZ = Math.Max(maxZ, fb[b + 5]);
+            }
+            int pNode = this.leafParentNode[lid];
+            int pSlot = this.leafParentSlot[lid];
+            if (pNode >= 0) {
+                int o = pNode * 24;
+                qb[o + 0 + pSlot] = minX;  qb[o + 4 + pSlot] = minY;  qb[o + 8 + pSlot] = minZ;
+                qb[o + 12 + pSlot] = maxX; qb[o + 16 + pSlot] = maxY; qb[o + 20 + pSlot] = maxZ;
+            }
+        }
+
+        // QBVH 节点为前序生成（父下标严格小于子下标），逆序扫描即可一次遍历完成自底向上紧缩
+        for (int q = this.qNodeCount - 1; q >= 1; q = q - 1) {
+            int o = q * 24;
+            int qc = q * 4;
+            float minX = EMPTY_MIN; float minY = EMPTY_MIN; float minZ = EMPTY_MIN;
+            float maxX = EMPTY_MAX; float maxY = EMPTY_MAX; float maxZ = EMPTY_MAX;
+            for (int k = 0; k < 4; k = k + 1) {
+                if (this.qChildren[qc + k] != -1) {
+                    minX = Math.Min(minX, qb[o + 0 + k]); minY = Math.Min(minY, qb[o + 4 + k]); minZ = Math.Min(minZ, qb[o + 8 + k]);
+                    maxX = Math.Max(maxX, qb[o + 12 + k]); maxY = Math.Max(maxY, qb[o + 16 + k]); maxZ = Math.Max(maxZ, qb[o + 20 + k]);
+                }
+            }
+            int pNode = this.qParent[q];
+            int pSlot = this.qParentSlot[q];
+            if (pNode >= 0) {
+                int po = pNode * 24;
+                qb[po + 0 + pSlot] = minX;  qb[po + 4 + pSlot] = minY;  qb[po + 8 + pSlot] = minZ;
+                qb[po + 12 + pSlot] = maxX; qb[po + 16 + pSlot] = maxY; qb[po + 20 + pSlot] = maxZ;
+            }
+        }
+
+        this.needsRefit = false;
+        this.outOfFatCount = 0;
+    }
+
+    private void RebuildTlas() {
+        this.needsRebuild = false;
+        this.needsRefit = false;
+        this.outOfFatCount = 0;
+
+        int n = this.activeCount;
+        if (n <= 0) {
+            this.qNodeCount = 0;
+            this.totalLeaves = 0;
+            return;
+        }
+
+        int[] activeIds = new int[n];
+        float[] centroids = new float[n * 3];
+        float rootMinX = EMPTY_MIN; float rootMinY = EMPTY_MIN; float rootMinZ = EMPTY_MIN;
+        float rootMaxX = EMPTY_MAX; float rootMaxY = EMPTY_MAX; float rootMaxZ = EMPTY_MAX;
+        float cMinX = EMPTY_MIN; float cMinY = EMPTY_MIN; float cMinZ = EMPTY_MIN;
+        float cMaxX = EMPTY_MAX; float cMaxY = EMPTY_MAX; float cMaxZ = EMPTY_MAX;
+
+        float[] fb = this.fatBounds;
+        int w = 0;
+        for (int id = 0; id < this.slotHighWater; id = id + 1) {
+            if (this.instState[id] == (byte)0) { continue; }
+            this.UpdateFatBoundsForInstance(id);
+            activeIds[w] = id;
+            int b = id * 6;
+            float minX = fb[b + 0]; float minY = fb[b + 1]; float minZ = fb[b + 2];
+            float maxX = fb[b + 3]; float maxY = fb[b + 4]; float maxZ = fb[b + 5];
+            float cx = (minX + maxX) * 0.5f;
+            float cy = (minY + maxY) * 0.5f;
+            float cz = (minZ + maxZ) * 0.5f;
+
+            int c3 = w * 3;
+            centroids[c3 + 0] = cx; centroids[c3 + 1] = cy; centroids[c3 + 2] = cz;
+            rootMinX = Math.Min(rootMinX, minX); rootMinY = Math.Min(rootMinY, minY); rootMinZ = Math.Min(rootMinZ, minZ);
+            rootMaxX = Math.Max(rootMaxX, maxX); rootMaxY = Math.Max(rootMaxY, maxY); rootMaxZ = Math.Max(rootMaxZ, maxZ);
+            cMinX = Math.Min(cMinX, cx); cMinY = Math.Min(cMinY, cy); cMinZ = Math.Min(cMinZ, cz);
+            cMaxX = Math.Max(cMaxX, cx); cMaxY = Math.Max(cMaxY, cy); cMaxZ = Math.Max(cMaxZ, cz);
+            w = w + 1;
+        }
+
+        int[] perm = new int[n];
+        for (int i = 0; i < n; i = i + 1) { perm[i] = i; }
+
+        int maxBin = n * 2 + 2;
+        float[] binBounds = new float[maxBin * 6];
+        int[] binLeftFirst = new int[maxBin];
+        int[] binCount = new int[maxBin];
+        binBounds[0] = rootMinX; binBounds[1] = rootMinY; binBounds[2] = rootMinZ;
+        binBounds[3] = rootMaxX; binBounds[4] = rootMaxY; binBounds[5] = rootMaxZ;
+        binLeftFirst[0] = 0;
+        binCount[0] = n;
+        int binNodes = 1;
+
+        this.SubdivideBinary(0, ref binNodes, perm, activeIds, centroids, binBounds, binLeftFirst, binCount,
+                             cMinX, cMinY, cMinZ, cMaxX, cMaxY, cMaxZ, 0);
+
+        this.leafInstances = new int[n];
+        for (int i = 0; i < n; i = i + 1) {
+            this.leafInstances[i] = activeIds[perm[i]];
+        }
+
+        int maxQ = n + 2;
+        this.qBounds = new float[maxQ * 24];
+        this.qChildren = new int[maxQ * 4];
+        this.qParent = new int[maxQ];
+        this.qParentSlot = new int[maxQ];
+        this.leafFirst = new int[n + 2];
+        this.leafCount = new int[n + 2];
+        this.leafParentNode = new int[n + 2];
+        this.leafParentSlot = new int[n + 2];
+
+        this.qNodeCount = 0;
+        int leafTotal = 0;
+
+        if (binCount[0] > 0) {
+            // 整棵树仅有单个叶子时包装进 1 个根 QBVH 节点，统一查询入口无需分支
+            this.qNodeCount = 1;
+            this.qParent[0] = -1;
+            this.qParentSlot[0] = -1;
+            this.leafFirst[0] = 0;
+            this.leafCount[0] = n;
+            this.leafParentNode[0] = 0;
+            this.leafParentSlot[0] = 0;
+            leafTotal = 1;
+
+            this.qBounds[0] = rootMinX;  this.qBounds[4] = rootMinY;  this.qBounds[8] = rootMinZ;
+            this.qBounds[12] = rootMaxX; this.qBounds[16] = rootMaxY; this.qBounds[20] = rootMaxZ;
+            this.qChildren[0] = -2;
+            for (int k = 1; k < 4; k = k + 1) {
+                this.qBounds[0 + k] = EMPTY_MIN;  this.qBounds[4 + k] = EMPTY_MIN;  this.qBounds[8 + k] = EMPTY_MIN;
+                this.qBounds[12 + k] = EMPTY_MAX; this.qBounds[16 + k] = EMPTY_MAX; this.qBounds[20 + k] = EMPTY_MAX;
+                this.qChildren[k] = -1;
+            }
+        } else {
+            this.CollapseToQbvh(0, -1, -1, binBounds, binLeftFirst, binCount, ref leafTotal);
+        }
+        this.totalLeaves = leafTotal;
+    }
+
+    private void SubdivideBinary(int nodeIdx, ref int binNodes, int[] perm, int[] activeIds, float[] centroids,
+                                 float[] binBounds, int[] binLeftFirst, int[] binCount,
+                                 float cMinX, float cMinY, float cMinZ,
+                                 float cMaxX, float cMaxY, float cMaxZ, int depth) {
+        int count = binCount[nodeIdx];
+        if (count <= LEAF_MAX_INST || depth >= 28) { return; }
+
+        int first = binLeftFirst[nodeIdx];
+        float extX = cMaxX - cMinX;
+        float extY = cMaxY - cMinY;
+        float extZ = cMaxZ - cMinZ;
+        int axis = 0;
+        float axisExtent = extX;
+        float axisMin = cMinX;
+        if (extY > axisExtent) { axis = 1; axisExtent = extY; axisMin = cMinY; }
+        if (extZ > axisExtent) { axis = 2; axisExtent = extZ; axisMin = cMinZ; }
+        if (axisExtent <= 1e-6f) { return; }
+
+        [8]int bCnt = new InlineArray<8, int>();
+        [48]float bBox = new InlineArray<48, float>();
+        for (int b = 0; b < SAH_BINS; b = b + 1) {
+            int o = b * 6;
+            bBox[o + 0] = EMPTY_MIN; bBox[o + 1] = EMPTY_MIN; bBox[o + 2] = EMPTY_MIN;
+            bBox[o + 3] = EMPTY_MAX; bBox[o + 4] = EMPTY_MAX; bBox[o + 5] = EMPTY_MAX;
+        }
+
+        float scale = (float)SAH_BINS / axisExtent;
+        float[] fb = this.fatBounds;
+        for (int i = 0; i < count; i = i + 1) {
+            int slot = perm[first + i];
+            int instId = activeIds[slot];
+            float c = centroids[slot * 3 + axis];
+            int bin = (int)((c - axisMin) * scale);
+            if (bin < 0) { bin = 0; }
+            if (bin >= SAH_BINS) { bin = SAH_BINS - 1; }
+            bCnt[bin] = bCnt[bin] + 1;
+            int ib = instId * 6;
+            int bo = bin * 6;
+            bBox[bo + 0] = Math.Min(bBox[bo + 0], fb[ib + 0]);
+            bBox[bo + 1] = Math.Min(bBox[bo + 1], fb[ib + 1]);
+            bBox[bo + 2] = Math.Min(bBox[bo + 2], fb[ib + 2]);
+            bBox[bo + 3] = Math.Max(bBox[bo + 3], fb[ib + 3]);
+            bBox[bo + 4] = Math.Max(bBox[bo + 4], fb[ib + 4]);
+            bBox[bo + 5] = Math.Max(bBox[bo + 5], fb[ib + 5]);
+        }
+
+        [7]float lArea = new InlineArray<7, float>();
+        [7]int lCnt = new InlineArray<7, int>();
+        float lMinX = EMPTY_MIN; float lMinY = EMPTY_MIN; float lMinZ = EMPTY_MIN;
+        float lMaxX = EMPTY_MAX; float lMaxY = EMPTY_MAX; float lMaxZ = EMPTY_MAX;
+        int sumL = 0;
+        for (int i = 0; i < SAH_BINS - 1; i = i + 1) {
+            sumL = sumL + bCnt[i];
+            lCnt[i] = sumL;
+            if (bCnt[i] > 0) {
+                int bo = i * 6;
+                lMinX = Math.Min(lMinX, bBox[bo + 0]); lMinY = Math.Min(lMinY, bBox[bo + 1]); lMinZ = Math.Min(lMinZ, bBox[bo + 2]);
+                lMaxX = Math.Max(lMaxX, bBox[bo + 3]); lMaxY = Math.Max(lMaxY, bBox[bo + 4]); lMaxZ = Math.Max(lMaxZ, bBox[bo + 5]);
+            }
+            lArea[i] = sumL > 0 ? DynamicSceneTlas3D.HalfArea(lMinX, lMinY, lMinZ, lMaxX, lMaxY, lMaxZ) : 0.0f;
+        }
+
+        float rMinX = EMPTY_MIN; float rMinY = EMPTY_MIN; float rMinZ = EMPTY_MIN;
+        float rMaxX = EMPTY_MAX; float rMaxY = EMPTY_MAX; float rMaxZ = EMPTY_MAX;
+        int sumR = 0;
+        float bestCost = 1e30f;
+        int bestSplit = -1;
+        for (int i = SAH_BINS - 2; i >= 0; i = i - 1) {
+            int rb = i + 1;
+            sumR = sumR + bCnt[rb];
+            if (bCnt[rb] > 0) {
+                int bo = rb * 6;
+                rMinX = Math.Min(rMinX, bBox[bo + 0]); rMinY = Math.Min(rMinY, bBox[bo + 1]); rMinZ = Math.Min(rMinZ, bBox[bo + 2]);
+                rMaxX = Math.Max(rMaxX, bBox[bo + 3]); rMaxY = Math.Max(rMaxY, bBox[bo + 4]); rMaxZ = Math.Max(rMaxZ, bBox[bo + 5]);
+            }
+            if (lCnt[i] > 0 && sumR > 0) {
+                float rArea = DynamicSceneTlas3D.HalfArea(rMinX, rMinY, rMinZ, rMaxX, rMaxY, rMaxZ);
+                float cost = (float)lCnt[i] * lArea[i] + (float)sumR * rArea;
+                if (cost < bestCost) {
+                    bestCost = cost;
+                    bestSplit = i;
+                }
+            }
+        }
+
+        float splitPos = axisMin + axisExtent * ((float)(bestSplit + 1) / (float)SAH_BINS);
+        int lp = first;
+        int rp = first + count - 1;
+        while (lp <= rp) {
+            int slot = perm[lp];
+            if (centroids[slot * 3 + axis] < splitPos) {
+                lp = lp + 1;
+            } else {
+                perm[lp] = perm[rp];
+                perm[rp] = slot;
+                rp = rp - 1;
+            }
+        }
+
+        int leftCount = lp - first;
+        if (leftCount <= 0 || leftCount >= count) {
+            leftCount = count >> 1;
+        }
+
+        float aMinX = EMPTY_MIN; float aMinY = EMPTY_MIN; float aMinZ = EMPTY_MIN;
+        float aMaxX = EMPTY_MAX; float aMaxY = EMPTY_MAX; float aMaxZ = EMPTY_MAX;
+        float acMinX = EMPTY_MIN; float acMinY = EMPTY_MIN; float acMinZ = EMPTY_MIN;
+        float acMaxX = EMPTY_MAX; float acMaxY = EMPTY_MAX; float acMaxZ = EMPTY_MAX;
+        for (int i = 0; i < leftCount; i = i + 1) {
+            int s = perm[first + i];
+            int ib = activeIds[s] * 6;
+            int c3 = s * 3;
+            aMinX = Math.Min(aMinX, fb[ib + 0]); aMinY = Math.Min(aMinY, fb[ib + 1]); aMinZ = Math.Min(aMinZ, fb[ib + 2]);
+            aMaxX = Math.Max(aMaxX, fb[ib + 3]); aMaxY = Math.Max(aMaxY, fb[ib + 4]); aMaxZ = Math.Max(aMaxZ, fb[ib + 5]);
+            acMinX = Math.Min(acMinX, centroids[c3 + 0]); acMinY = Math.Min(acMinY, centroids[c3 + 1]); acMinZ = Math.Min(acMinZ, centroids[c3 + 2]);
+            acMaxX = Math.Max(acMaxX, centroids[c3 + 0]); acMaxY = Math.Max(acMaxY, centroids[c3 + 1]); acMaxZ = Math.Max(acMaxZ, centroids[c3 + 2]);
+        }
+
+        float bMinX = EMPTY_MIN; float bMinY = EMPTY_MIN; float bMinZ = EMPTY_MIN;
+        float bMaxX = EMPTY_MAX; float bMaxY = EMPTY_MAX; float bMaxZ = EMPTY_MAX;
+        float bcMinX = EMPTY_MIN; float bcMinY = EMPTY_MIN; float bcMinZ = EMPTY_MIN;
+        float bcMaxX = EMPTY_MAX; float bcMaxY = EMPTY_MAX; float bcMaxZ = EMPTY_MAX;
+        for (int i = leftCount; i < count; i = i + 1) {
+            int s = perm[first + i];
+            int ib = activeIds[s] * 6;
+            int c3 = s * 3;
+            bMinX = Math.Min(bMinX, fb[ib + 0]); bMinY = Math.Min(bMinY, fb[ib + 1]); bMinZ = Math.Min(bMinZ, fb[ib + 2]);
+            bMaxX = Math.Max(bMaxX, fb[ib + 3]); bMaxY = Math.Max(bMaxY, fb[ib + 4]); bMaxZ = Math.Max(bMaxZ, fb[ib + 5]);
+            bcMinX = Math.Min(bcMinX, centroids[c3 + 0]); bcMinY = Math.Min(bcMinY, centroids[c3 + 1]); bcMinZ = Math.Min(bcMinZ, centroids[c3 + 2]);
+            bcMaxX = Math.Max(bcMaxX, centroids[c3 + 0]); bcMaxY = Math.Max(bcMaxY, centroids[c3 + 1]); bcMaxZ = Math.Max(bcMaxZ, centroids[c3 + 2]);
+        }
+
+        int leftChild = binNodes;
+        int rightChild = binNodes + 1;
+        binNodes = binNodes + 2;
+
+        binLeftFirst[leftChild] = first;
+        binCount[leftChild] = leftCount;
+        binLeftFirst[rightChild] = first + leftCount;
+        binCount[rightChild] = count - leftCount;
+        binLeftFirst[nodeIdx] = leftChild;
+        binCount[nodeIdx] = 0;
+
+        int lb = leftChild * 6;
+        binBounds[lb + 0] = aMinX; binBounds[lb + 1] = aMinY; binBounds[lb + 2] = aMinZ;
+        binBounds[lb + 3] = aMaxX; binBounds[lb + 4] = aMaxY; binBounds[lb + 5] = aMaxZ;
+
+        int rb2 = rightChild * 6;
+        binBounds[rb2 + 0] = bMinX; binBounds[rb2 + 1] = bMinY; binBounds[rb2 + 2] = bMinZ;
+        binBounds[rb2 + 3] = bMaxX; binBounds[rb2 + 4] = bMaxY; binBounds[rb2 + 5] = bMaxZ;
+
+        this.SubdivideBinary(leftChild, ref binNodes, perm, activeIds, centroids, binBounds, binLeftFirst, binCount,
+                             acMinX, acMinY, acMinZ, acMaxX, acMaxY, acMaxZ, depth + 1);
+        this.SubdivideBinary(rightChild, ref binNodes, perm, activeIds, centroids, binBounds, binLeftFirst, binCount,
+                             bcMinX, bcMinY, bcMinZ, bcMaxX, bcMaxY, bcMaxZ, depth + 1);
+    }
+
+    private int CollapseToQbvh(int bNode, int parentQ, int parentSlot,
+                               float[] binBounds, int[] binLeftFirst, int[] binCount, ref int leafTotal) {
+        int qIdx = this.qNodeCount;
+        this.qNodeCount = qIdx + 1;
+        this.qParent[qIdx] = parentQ;
+        this.qParentSlot[qIdx] = parentSlot;
+
+        [4]int cNodes = new InlineArray<4, int>();
+        int firstPair = binLeftFirst[bNode];
+        cNodes[0] = firstPair;
+        cNodes[1] = firstPair + 1;
+        int cCount = 2;
+
+        while (cCount < 4) {
+            int bestSlot = -1;
+            float bestArea = -1.0f;
+            for (int s = 0; s < cCount; s = s + 1) {
+                int cand = cNodes[s];
+                if (binCount[cand] == 0) {
+                    int cb = cand * 6;
+                    float area = DynamicSceneTlas3D.HalfArea(
+                        binBounds[cb + 0], binBounds[cb + 1], binBounds[cb + 2],
+                        binBounds[cb + 3], binBounds[cb + 4], binBounds[cb + 5]);
+                    if (area > bestArea) { bestArea = area; bestSlot = s; }
+                }
+            }
+            if (bestSlot < 0) { break; }
+            int expand = cNodes[bestSlot];
+            int subL = binLeftFirst[expand];
+            cNodes[bestSlot] = subL;
+            cNodes[cCount] = subL + 1;
+            cCount = cCount + 1;
+        }
+
+        int qb = qIdx * 24;
+        int qc = qIdx * 4;
+        for (int k = 0; k < 4; k = k + 1) {
+            if (k < cCount) {
+                int bn = cNodes[k];
+                int bb = bn * 6;
+                this.qBounds[qb + 0 + k]  = binBounds[bb + 0];
+                this.qBounds[qb + 4 + k]  = binBounds[bb + 1];
+                this.qBounds[qb + 8 + k]  = binBounds[bb + 2];
+                this.qBounds[qb + 12 + k] = binBounds[bb + 3];
+                this.qBounds[qb + 16 + k] = binBounds[bb + 4];
+                this.qBounds[qb + 20 + k] = binBounds[bb + 5];
+
+                int cnt = binCount[bn];
+                if (cnt > 0) {
+                    int lid = leafTotal;
+                    leafTotal = lid + 1;
+                    this.leafFirst[lid] = binLeftFirst[bn];
+                    this.leafCount[lid] = cnt;
+                    this.leafParentNode[lid] = qIdx;
+                    this.leafParentSlot[lid] = k;
+                    this.qChildren[qc + k] = -2 - lid;
+                } else {
+                    this.qChildren[qc + k] = this.CollapseToQbvh(bn, qIdx, k, binBounds, binLeftFirst, binCount, ref leafTotal);
+                }
+            } else {
+                this.qBounds[qb + 0 + k]  = EMPTY_MIN;
+                this.qBounds[qb + 4 + k]  = EMPTY_MIN;
+                this.qBounds[qb + 8 + k]  = EMPTY_MIN;
+                this.qBounds[qb + 12 + k] = EMPTY_MAX;
+                this.qBounds[qb + 16 + k] = EMPTY_MAX;
+                this.qBounds[qb + 20 + k] = EMPTY_MAX;
+                this.qChildren[qc + k] = -1;
+            }
+        }
+        return qIdx;
+    }
+
+    private static float HalfArea(float minX, float minY, float minZ, float maxX, float maxY, float maxZ) {
+        float dx = Math.Max(0.0f, maxX - minX);
+        float dy = Math.Max(0.0f, maxY - minY);
+        float dz = Math.Max(0.0f, maxZ - minZ);
+        return dx * dy + dy * dz + dz * dx;
+    }
+}

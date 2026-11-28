@@ -1,7 +1,9 @@
 using System;
 using System.Data;
 using System.Data.Orm;
+using System.Json;
 using System.Web;
+using Zan.Web.AdminUi;
 using Zan.Web.Ai;
 using Zan.Web.Core;
 using Zan.Web.Dao;
@@ -20,66 +22,153 @@ public class SettingsController : AdminController {
     [Custom(IsMenu = true, Icon = "mdi:cog", Perm = PermBit.View)]
     [Description("站点设置")]
     public async void Index() {
-        ViewData d = await this.Layout("站点设置");
-        if (!this.PageReady(d)) { return; }
+        await this.Conf();
+    }
 
-        List<SysSiteSetting> rows = await this.SysSiteSetting.All();
-        /* 每组一面板，全部渲出由前端切换；表单整体提交，故切 tab 不丢编辑。 */
-        List<StrMap> tabs = d.AddList("tabs");
-        List<StrMap> fields = d.AddList("fields");
-        string group = "";
+    [HttpPut]
+    [Custom(Perm = PermBit.View)]
+    [Description("站点设置表单配置")]
+    public async void Conf() {
+        if (!this.DataReady()) { return; }
+        List<SysSiteSetting> all = await this.SysSiteSetting.All();
+        List<SysSiteSetting> rows = new List<SysSiteSetting>();
+        for (int i = 0; i < all.Count; i = i + 1) {
+            if (all[i].groupName == "adminui") { continue; }
+            rows.Add(all[i]);
+        }
+        bool aiReady = await Ai.Ready();
+        string mailHost = await Settings.Get(SettingKeys.MailHost, "");
+        List<AiVendor> vendors = Ai.Vendors();
+
+        List<string> groups = new List<string>();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            string g = rows[i].groupName;
+            if (g == null || g.Length == 0) { g = "基本设置"; }
+            bool seen = false;
+            for (int j = 0; j < groups.Count; j = j + 1) {
+                if (groups[j] == g) { seen = true; break; }
+            }
+            if (!seen) { groups.Add(g); }
+        }
+
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("PageType", "form");
+        w.WriteProperty("title", "站点设置");
+        w.WriteProperty("subtitle", "按分组管理站点、AI 与邮件等系统参数，修改后即时生效");
+        w.WriteProperty("submitUrl", "save");
+        w.WriteProperty("submitAllTabs", false);
+
+        w.WritePropertyName("summary");
+        w.WriteStartArray();
+        w.WriteStartObject();
+        w.WriteProperty("label", "AI 服务");
+        w.WriteProperty("value", aiReady ? "已配置" : "未配置");
+        w.WriteProperty("tone", aiReady ? "success" : "default");
+        w.WriteEndObject();
+        w.WriteStartObject();
+        w.WriteProperty("label", "邮件 SMTP");
+        w.WriteProperty("value", mailHost.Length > 0 ? "已配置" : "未配置");
+        w.WriteProperty("tone", mailHost.Length > 0 ? "success" : "default");
+        w.WriteEndObject();
+        w.WriteEndArray();
+
+        w.WritePropertyName("tabs");
+        w.WriteStartArray();
+        for (int gi = 0; gi < groups.Count; gi = gi + 1) {
+            string g = groups[gi];
+            bool hasAi = false;
+            bool hasMail = false;
+            for (int i = 0; i < rows.Count; i = i + 1) {
+                string rg = rows[i].groupName != null && rows[i].groupName.Length > 0 ? rows[i].groupName : "基本设置";
+                if (rg != g) { continue; }
+                if (rows[i].name == SettingKeys.AiBaseUrl || rows[i].name.StartsWith("ai.")) { hasAi = true; }
+                if (rows[i].name == SettingKeys.MailHost || rows[i].name.StartsWith("mail.")) { hasMail = true; }
+            }
+
+            w.WriteStartObject();
+            w.WriteProperty("key", g);
+            w.WriteProperty("label", g);
+            w.WriteProperty("submitUrl", "save");
+            w.WriteProperty("submitLabel", "保存「" + g + "」");
+
+            if (hasAi && vendors.Count > 0) {
+                w.WritePropertyName("presets");
+                w.WriteStartArray();
+                for (int vi = 0; vi < vendors.Count; vi = vi + 1) {
+                    w.WriteStartObject();
+                    w.WriteProperty("label", vendors[vi].name);
+                    w.WriteProperty("link", vendors[vi].signup);
+                    w.WritePropertyName("values");
+                    w.WriteStartObject();
+                    w.WriteProperty(SettingKeys.AiBaseUrl, vendors[vi].baseUrl);
+                    w.WriteProperty(SettingKeys.AiModel, vendors[vi].model);
+                    w.WriteEndObject();
+                    w.WriteEndObject();
+                }
+                w.WriteEndArray();
+            }
+
+            if (hasMail) {
+                w.WritePropertyName("actions");
+                w.WriteStartArray();
+                w.WriteStartObject();
+                w.WriteProperty("label", "发送测试邮件");
+                w.WriteProperty("url", "mailtest");
+                w.WriteProperty("type", "info");
+                w.WriteProperty("promptField", "to");
+                w.WriteProperty("promptLabel", "收件邮箱地址");
+                w.WriteProperty("promptPlaceholder", "name@example.com");
+                w.WriteEndObject();
+                w.WriteEndArray();
+            }
+
+            w.WritePropertyName("formItems");
+            w.WriteStartArray();
+            for (int i = 0; i < rows.Count; i = i + 1) {
+                SysSiteSetting s = rows[i];
+                string rg = s.groupName != null && s.groupName.Length > 0 ? s.groupName : "基本设置";
+                if (rg != g) { continue; }
+                string comp = "input";
+                if (s.kind == "textarea") { comp = "textarea"; }
+                else if (s.kind == "switch") { comp = "switch"; }
+                else if (s.kind == "password") { comp = "password"; }
+                else if (s.kind == "number") { comp = "input-number"; }
+                string ph = s.tip;
+                if (s.kind == "password" && s.value.Length > 0) {
+                    ph = "已配置，留空表示不修改，填 - 表示清除";
+                }
+                w.WriteStartObject();
+                w.WriteProperty("field", s.name);
+                w.WriteProperty("label", s.label.Length > 0 ? s.label : s.name);
+                w.WriteProperty("component", comp);
+                w.WriteProperty("span", comp == "textarea" ? 24 : 12);
+                if (ph.Length > 0) { w.WriteProperty("placeholder", ph); }
+                w.WriteEndObject();
+            }
+            w.WriteEndArray();
+            w.WriteEndObject();
+        }
+        w.WriteEndArray();
+
+        w.WritePropertyName("values");
+        w.WriteStartObject();
         for (int i = 0; i < rows.Count; i = i + 1) {
             SysSiteSetting s = rows[i];
-            if (s.groupName != group) {
-                group = s.groupName;
-                StrMap tab = new StrMap();
-                tab.Set("group", group);
-                if (tabs.Count == 0) { tab.Set("on", "on"); }
-                tabs.Add(tab);
-                StrMap head = new StrMap();
-                head.Set("group", group);
-                if (fields.Count == 0) { head.Set("open", "open"); }
-                fields.Add(head);
+            if (s.kind == "password") {
+                w.WriteProperty(s.name, "");
+            } else if (s.kind == "switch") {
+                w.WriteProperty(s.name, s.value != "0");
+            } else if (s.kind == "number") {
+                w.WriteProperty(s.name, Filter.ToInt(s.value, 0));
+            } else {
+                w.WriteProperty(s.name, s.value);
             }
-            StrMap f = new StrMap();
-            f.Set("name", s.name);
-            f.Set("label", s.label);
-            f.Set("value", s.value);
-            f.Set("tip", s.tip);
-            f.Set("group", "");
-            if (s.kind == "textarea") { f.Set("area", "1"); }
-            else if (s.kind == "switch") {
-                f.Set("bool", "1");
-                if (s.value != "0") { f.Set("on", "1"); }
-            }
-            else if (s.kind == "password") {
-                /* 已存密钥永不写回页面；字段为空，空意为"不改"。 */
-                f.Set("secret", "1");
-                f.Set("value", "");
-                if (s.value.Length > 0) { f.Set("tip", "已配置，留空表示不修改，填 - 表示清除"); }
-            }
-            else if (s.kind == "number") { f.Set("num", "1"); }
-            else { f.Set("line", "1"); }
-            fields.Add(f);
         }
-        /* 官方服务一键预设，各附可取 key 的页面。 */
-        List<StrMap> vendors = d.AddList("vendors");
-        List<AiVendor> vs = Ai.Vendors();
-        for (int i = 0; i < vs.Count; i = i + 1) {
-            StrMap v = new StrMap();
-            v.Set("code", vs[i].code);
-            v.Set("name", vs[i].name);
-            v.Set("baseUrl", vs[i].baseUrl);
-            v.Set("model", vs[i].model);
-            v.Set("signup", vs[i].signup);
-            vendors.Add(v);
-        }
-        if (await Ai.Ready()) { d.Set("aiReady", "1"); }
+        w.WriteEndObject();
 
-        string mailHost = await Settings.Get(SettingKeys.MailHost, "");
-        if (mailHost.Length > 0) { d.Set("mailReady", "1"); }
-        if (rows.Count == 0) { d.Set("empty", "1"); }
-        this.Page(d);
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(this, w.ToString());
     }
 
     [HttpPost]
@@ -90,8 +179,8 @@ public class SettingsController : AdminController {
         /* 先校验外呼目标，避免前面的普通设置已写入后才拒绝请求。 */
         for (int i = 0; i < rows.Count; i = i + 1) {
             SysSiteSetting s = rows[i];
-            if (s.name != SettingKeys.AiBaseUrl || !this.HasIn(s.name)) { continue; }
-            string endpoint = this.In(s.name);
+            if (s.name != SettingKeys.AiBaseUrl || !this.HasInAny(s.name)) { continue; }
+            string endpoint = this.InAny(s.name);
             if (endpoint.Length > 0 && !AiEndpointPolicy.IsAllowed(endpoint)) {
                 this.Fail(400, "0004", "AI 接口地址不在允许列表");
             }
@@ -99,12 +188,16 @@ public class SettingsController : AdminController {
         int changed = 0;
         for (int i = 0; i < rows.Count; i = i + 1) {
             SysSiteSetting s = rows[i];
-            if (!this.HasIn(s.name)) { continue; }
-            string value = this.In(s.name);
-            /* checkbox 关闭时不提交，开关借隐藏伴字段，按 1/0 读。 */
+            if (!this.HasInAny(s.name)) { continue; }
+            string value = this.InAny(s.name);
+            /* 兼容传统表单隐藏伴字段 sw.<name> 与 JSON 布尔 true/false/1/0。 */
             if (s.kind == "switch") {
-                value = "0";
-                if (this.In("sw." + s.name) == "1") { value = "1"; }
+                if (this.HasIn("sw." + s.name)) {
+                    value = this.In("sw." + s.name) == "1" ? "1" : "0";
+                } else {
+                    string low = value.Trim().ToLower();
+                    value = (low == "1" || low == "true") ? "1" : "0";
+                }
             }
             /* 空密钥字段表示保留原值；单字符 "-" 表示清除。 */
             if (s.kind == "password") {
@@ -127,7 +220,7 @@ public class SettingsController : AdminController {
     [Custom(Perm = PermBit.Update)]
     [Description("发送测试邮件")]
     public async void MailTest() {
-        string to = this.In("to");
+        string to = this.InAny("to");
         if (to.IndexOf("@") <= 0) { this.Fail(400, "0004", "请填写收件邮箱"); }
         string site = await Settings.Get(SettingKeys.SiteTitle, "ZanWeb");
         MailResult r = await Mailer.Send(to, site + " 邮件配置测试",

@@ -423,6 +423,18 @@ LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
       v = LLVMBuildInsertValue(g->builder, v, len, 1, "span.n1");
       return v;
     }
+    if (spn.len == 11 && memcmp(spn.str, "InlineArray", 11) == 0) {
+      zan_type_t *it = resolve_type_ctx(g, expr->new_expr.type);
+      LLVMTypeRef arr_lt = map_type(g, it);
+      return LLVMConstNull(arr_lt);
+    }
+    if (spn.len == 3 && memcmp(spn.str, "Vec", 3) == 0) {
+      zan_type_t *vt = resolve_type_ctx(g, expr->new_expr.type);
+      if (vt && !vt->sym && vt->type_arg_count == 2) {
+        LLVMTypeRef vec_lt = map_type(g, vt);
+        return LLVMConstNull(vec_lt);
+      }
+    }
   }
   /* A declaration/layout/typeof is not executable type demand. Record
    * construction even when the type has no explicit constructor body. */
@@ -837,6 +849,10 @@ LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                                       locals)) {
         emit_rc_retain_for_type(g, elem_type, v);
       }
+      if (LLVMGetTypeKind(elem_llvm) == LLVMStructTypeKind &&
+          LLVMGetTypeKind(LLVMTypeOf(v)) == LLVMPointerTypeKind) {
+        v = LLVMBuildLoad2(g->builder, elem_llvm, v, "arr.sval");
+      }
       LLVMValueRef idx = LLVMConstInt(i64t, (unsigned long long)k, 0);
       LLVMValueRef slot =
           LLVMBuildGEP2(g->builder, elem_llvm, arr, &idx, 1, "aep");
@@ -895,6 +911,10 @@ LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             !expr_yields_owned_rc_value(g, expr->new_expr.args.items[ndims + k],
                                         locals)) {
           emit_rc_retain_for_type(g, elem_type, v);
+        }
+        if (LLVMGetTypeKind(elem_llvm) == LLVMStructTypeKind &&
+            LLVMGetTypeKind(LLVMTypeOf(v)) == LLVMPointerTypeKind) {
+          v = LLVMBuildLoad2(g->builder, elem_llvm, v, "arr.sval");
         }
         LLVMValueRef idx = LLVMConstInt(i64t, (unsigned long long)k, 0);
         LLVMValueRef slot =

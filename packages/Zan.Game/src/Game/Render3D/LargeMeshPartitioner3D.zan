@@ -1,0 +1,428 @@
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+using Game.Animation;
+
+namespace Game.Render3D;
+
+// 32 位大尺度静态网格自动切分后的单个 16 位索引渲染子块（可直接上传 Canvas.MeshUpload 并独立参与视锥/流式裁剪）。
+public class StaticMeshChunk3D {
+    public Mesh3D Mesh;
+    public Vector3 BoundsMin;
+    public Vector3 BoundsMax;
+    public int TriangleCount;
+
+    public StaticMeshChunk3D(Mesh3D mesh, Vector3 boundsMin, Vector3 boundsMax, int triangleCount) {
+        this.Mesh = mesh;
+        this.BoundsMin = boundsMin;
+        this.BoundsMax = boundsMax;
+        this.TriangleCount = triangleCount;
+    }
+}
+
+// 超 64 骨骼高模自动拆批后的单个 GPU 蒙皮渲染批次（局部骨骼索引已重映射至 [0..PaletteCount-1]）。
+public class SkinnedSubmeshBatch3D {
+    public SkinnedMesh3D Mesh;
+    public int[] GlobalBonePalette;
+    public Vector3 BindBoundsMin;
+    public Vector3 BindBoundsMax;
+    public int TriangleCount;
+
+    public SkinnedSubmeshBatch3D(SkinnedMesh3D mesh, int[] globalBonePalette,
+                                 Vector3 bindBoundsMin, Vector3 bindBoundsMax, int triangleCount) {
+        this.Mesh = mesh;
+        this.GlobalBonePalette = globalBonePalette;
+        this.BindBoundsMin = bindBoundsMin;
+        this.BindBoundsMax = bindBoundsMax;
+        this.TriangleCount = triangleCount;
+    }
+
+    public int PaletteBoneCount() {
+        return this.GlobalBonePalette != null ? this.GlobalBonePalette.Length : 0;
+    }
+
+    // 从已完成动画求值的完整大模型骨架（如 120 骨骼）提取本批次专属的 <=64 根列主序 GPU 蒙皮矩阵。
+    public int ExtractShaderBoneMatrices(Skeleton posedSkeleton, float[] outPaletteMatrices16) {
+        if (posedSkeleton == null || this.GlobalBonePalette == null || outPaletteMatrices16 == null) {
+            return 0;
+        }
+        int count = this.GlobalBonePalette.Length;
+        int maxFit = outPaletteMatrices16.Length / 16;
+        if (count > maxFit) { count = maxFit; }
+
+        int skelBones = posedSkeleton.Count();
+        for (int i = 0; i < count; i = i + 1) {
+            int globalBone = this.GlobalBonePalette[i];
+            Transform3D skinXf = (globalBone >= 0 && globalBone < skelBones)
+                ? posedSkeleton.SkinMatrix(globalBone)
+                : Transform3D.Identity;
+            SkinnedMesh3D.WriteTransformColumnMajor(skinXf, outPaletteMatrices16, i * 16);
+        }
+        return count;
+    }
+}
+
+// 内部工作桶：供多桶贪心骨骼调色板打包器维护活跃子网格。
+internal class SkinnedPackBin {
+    internal SkinnedMesh3D Mesh;
+    internal int[] PaletteToGlobal;
+    internal int[] GlobalToLocal;
+    internal int[] GlobalBoneStamp;
+    internal int BoneStampId;
+    internal int PaletteCount;
+
+    internal int[] VertGlobalToLocal;
+    internal int[] VertStamp;
+    internal int VertStampId;
+    internal int TriCount;
+    internal float MinX;
+    internal float MinY;
+    internal float MinZ;
+    internal float MaxX;
+    internal float MaxY;
+    internal float MaxZ;
+
+    internal SkinnedPackBin(int maxPaletteBones, int maxGlobalBoneIdPlusOne, int totalVerts) {
+        this.Mesh = new SkinnedMesh3D();
+        this.PaletteToGlobal = new int[maxPaletteBones];
+        this.GlobalToLocal = new int[maxGlobalBoneIdPlusOne];
+        this.GlobalBoneStamp = new int[maxGlobalBoneIdPlusOne];
+        this.BoneStampId = 1;
+        this.PaletteCount = 0;
+
+        this.VertGlobalToLocal = new int[totalVerts];
+        this.VertStamp = new int[totalVerts];
+        this.VertStampId = 1;
+        this.TriCount = 0;
+        this.MinX = 1e30f; this.MinY = 1e30f; this.MinZ = 1e30f;
+        this.MaxX = -1e30f; this.MaxY = -1e30f; this.MaxZ = -1e30f;
+    }
+
+    internal void ResetForReuse() {
+        this.Mesh = new SkinnedMesh3D();
+        this.BoneStampId = this.BoneStampId + 1;
+        this.PaletteCount = 0;
+        this.VertStampId = this.VertStampId + 1;
+        this.TriCount = 0;
+        this.MinX = 1e30f; this.MinY = 1e30f; this.MinZ = 1e30f;
+        this.MaxX = -1e30f; this.MaxY = -1e30f; this.MaxZ = -1e30f;
+    }
+
+    internal SkinnedSubmeshBatch3D FlushBatch() {
+        int[] pal = new int[this.PaletteCount];
+        Array.Copy(this.PaletteToGlobal, 0, pal, 0, this.PaletteCount);
+        Vector3 bMin = this.TriCount > 0 ? new Vector3(this.MinX, this.MinY, this.MinZ) : Vector3.Zero;
+        Vector3 bMax = this.TriCount > 0 ? new Vector3(this.MaxX, this.MaxY, this.MaxZ) : Vector3.Zero;
+        return new SkinnedSubmeshBatch3D(this.Mesh, pal, bMin, bMax, this.TriCount);
+    }
+}
+
+// 大尺度网格与超上限骨骼高模自动拆批器（对标 meshoptimizer / ozz-animation）：
+// 1. PartitionStaticMesh32：采用世代印章表（Generation-Stamped Remap）以严格 O(N) 线性时间、零哈希分配将百万面
+//    int32 索引网格无缝切分为多个 <=65535 顶点的 ushort Mesh3D 子块，并同步产出每块紧致世界/局部包围盒。
+// 2. PartitionSkinnedMeshBonePalettes：采用多活跃桶最大调色板重合度贪心装箱算法，将 80~500 根骨骼的高精度角色模型
+//    自动拆分为最少数量的 <=64 骨骼 & <=65535 顶点子批次，重映射局部关节槽位且零原生驱动 ABI 破坏。
+public static class LargeMeshPartitioner3D {
+    public const int MaxUshortVertices = 65535;
+    public const int MaxHardwareShaderBones = 64;
+
+    // 切分 32 位索引大尺度静态网格（vertices 步长：colored=false 为 8 float，colored=true 为 12 float）。
+    public static List<StaticMeshChunk3D> PartitionStaticMesh32(
+        float[] vertices, int vertexCount, bool colored,
+        int[] indices32, int maxVerticesPerChunk) {
+        List<StaticMeshChunk3D> result = new List<StaticMeshChunk3D>();
+        if (vertices == null || indices32 == null || vertexCount <= 0 || indices32.Length < 3) {
+            return result;
+        }
+
+        int stride = colored ? 12 : 8;
+        if (vertices.Length < vertexCount * stride) {
+            return result;
+        }
+
+        int vLimit = maxVerticesPerChunk;
+        if (vLimit < 3) { vLimit = 3; }
+        if (vLimit > MaxUshortVertices) { vLimit = MaxUshortVertices; }
+
+        int[] remapLocal = new int[vertexCount];
+        int[] remapStamp = new int[vertexCount];
+        int curStamp = 1;
+
+        Mesh3D curMesh = new Mesh3D();
+        int curTris = 0;
+        float minX = 1e30f; float minY = 1e30f; float minZ = 1e30f;
+        float maxX = -1e30f; float maxY = -1e30f; float maxZ = -1e30f;
+
+        int triTotal = indices32.Length / 3;
+        for (int t = 0; t < triTotal; t = t + 1) {
+            int baseIdx = t * 3;
+            int i0 = indices32[baseIdx + 0];
+            int i1 = indices32[baseIdx + 1];
+            int i2 = indices32[baseIdx + 2];
+            if (i0 < 0 || i0 >= vertexCount || i1 < 0 || i1 >= vertexCount || i2 < 0 || i2 >= vertexCount) {
+                continue;
+            }
+
+            int newNeeded = 0;
+            if (remapStamp[i0] != curStamp) { newNeeded = newNeeded + 1; }
+            if (i1 != i0 && remapStamp[i1] != curStamp) { newNeeded = newNeeded + 1; }
+            if (i2 != i0 && i2 != i1 && remapStamp[i2] != curStamp) { newNeeded = newNeeded + 1; }
+
+            if (curMesh.VertexCount() + newNeeded > vLimit && curTris > 0) {
+                result.Add(new StaticMeshChunk3D(
+                    curMesh,
+                    new Vector3(minX, minY, minZ),
+                    new Vector3(maxX, maxY, maxZ),
+                    curTris));
+                curMesh = new Mesh3D();
+                curTris = 0;
+                curStamp = curStamp + 1;
+                minX = 1e30f; minY = 1e30f; minZ = 1e30f;
+                maxX = -1e30f; maxY = -1e30f; maxZ = -1e30f;
+            }
+
+            int l0 = LargeMeshPartitioner3D.EmitStaticVertex(
+                i0, vertices, stride, colored, curMesh, remapLocal, remapStamp, curStamp,
+                ref minX, ref minY, ref minZ, ref maxX, ref maxY, ref maxZ);
+            int l1 = LargeMeshPartitioner3D.EmitStaticVertex(
+                i1, vertices, stride, colored, curMesh, remapLocal, remapStamp, curStamp,
+                ref minX, ref minY, ref minZ, ref maxX, ref maxY, ref maxZ);
+            int l2 = LargeMeshPartitioner3D.EmitStaticVertex(
+                i2, vertices, stride, colored, curMesh, remapLocal, remapStamp, curStamp,
+                ref minX, ref minY, ref minZ, ref maxX, ref maxY, ref maxZ);
+
+            curMesh.Triangle(l0, l1, l2);
+            curTris = curTris + 1;
+        }
+
+        if (curTris > 0) {
+            result.Add(new StaticMeshChunk3D(
+                curMesh,
+                new Vector3(minX, minY, minZ),
+                new Vector3(maxX, maxY, maxZ),
+                curTris));
+        }
+        return result;
+    }
+
+    private static int EmitStaticVertex(int gIdx, float[] verts, int stride, bool colored,
+                                        Mesh3D dstMesh, int[] remapLocal, int[] remapStamp, int stamp,
+                                        ref float minX, ref float minY, ref float minZ,
+                                        ref float maxX, ref float maxY, ref float maxZ) {
+        if (remapStamp[gIdx] == stamp) {
+            return remapLocal[gIdx];
+        }
+        int o = gIdx * stride;
+        float px = verts[o + 0]; float py = verts[o + 1]; float pz = verts[o + 2];
+        float nx = verts[o + 3]; float ny = verts[o + 4]; float nz = verts[o + 5];
+        float u = verts[o + 6];  float vv = verts[o + 7];
+
+        int localId;
+        if (colored) {
+            localId = dstMesh.VertexC(px, py, pz, nx, ny, nz, u, vv,
+                                      verts[o + 8], verts[o + 9], verts[o + 10], verts[o + 11]);
+        } else {
+            localId = dstMesh.Vertex(px, py, pz, nx, ny, nz, u, vv);
+        }
+
+        minX = Math.Min(minX, px); minY = Math.Min(minY, py); minZ = Math.Min(minZ, pz);
+        maxX = Math.Max(maxX, px); maxY = Math.Max(maxY, py); maxZ = Math.Max(maxZ, pz);
+
+        remapStamp[gIdx] = stamp;
+        remapLocal[gIdx] = localId;
+        return localId;
+    }
+
+    // 将超 64 骨骼（及/或超 65535 顶点）的 16-float 交错蒙皮网格自动按骨骼调色板拆批并重映射局部关节索引。
+    public static List<SkinnedSubmeshBatch3D> PartitionSkinnedMeshBonePalettes(
+        float[] skinnedVertices16, int vertexCount, int[] indices32,
+        int maxBonesPerSubmesh, int maxVerticesPerSubmesh) {
+        List<SkinnedSubmeshBatch3D> batches = new List<SkinnedSubmeshBatch3D>();
+        if (skinnedVertices16 == null || indices32 == null || vertexCount <= 0 || indices32.Length < 3) {
+            return batches;
+        }
+        if (skinnedVertices16.Length < vertexCount * 16) {
+            return batches;
+        }
+
+        // 单个三角形最多 3 个顶点 * 4 个非零权重 = 12 根不同骨骼，故调色板上界下限为 12
+        int boneLimit = maxBonesPerSubmesh;
+        if (boneLimit < 12) { boneLimit = 12; }
+        if (boneLimit > MaxHardwareShaderBones) { boneLimit = MaxHardwareShaderBones; }
+
+        int vertLimit = maxVerticesPerSubmesh;
+        if (vertLimit < 3) { vertLimit = 3; }
+        if (vertLimit > MaxUshortVertices) { vertLimit = MaxUshortVertices; }
+
+        // 扫描全局最大骨骼索引，确定无哈希印章表容量
+        int maxBoneIdx = 0;
+        for (int v = 0; v < vertexCount; v = v + 1) {
+            int vo = v * 16;
+            for (int k = 0; k < 4; k = k + 1) {
+                if (skinnedVertices16[vo + 12 + k] > 1e-6f) {
+                    int jb = (int)skinnedVertices16[vo + 8 + k];
+                    if (jb > maxBoneIdx) { maxBoneIdx = jb; }
+                }
+            }
+        }
+        int boneTableSize = maxBoneIdx + 2;
+
+        // 维护最多 6 个并行活跃分桶，最大化相邻躯干/四肢三角面的调色板命中复用率
+        const int MAX_OPEN_BINS = 6;
+        SkinnedPackBin[] openBins = new SkinnedPackBin[MAX_OPEN_BINS];
+        int openCount = 0;
+
+        [12]int triBones = new InlineArray<12, int>();
+        [3]int triVerts = new InlineArray<3, int>();
+
+        int triTotal = indices32.Length / 3;
+        for (int t = 0; t < triTotal; t = t + 1) {
+            int baseIdx = t * 3;
+            int i0 = indices32[baseIdx + 0];
+            int i1 = indices32[baseIdx + 1];
+            int i2 = indices32[baseIdx + 2];
+            if (i0 < 0 || i0 >= vertexCount || i1 < 0 || i1 >= vertexCount || i2 < 0 || i2 >= vertexCount) {
+                continue;
+            }
+
+            triVerts[0] = i0;
+            triVerts[1] = i1;
+            triVerts[2] = i2;
+
+            // 提取本三角形去重后的有效（权重 > 0）全局骨骼集合
+            int uniqueBoneCnt = 0;
+            for (int vi = 0; vi < 3; vi = vi + 1) {
+                int vo = triVerts[vi] * 16;
+                for (int k = 0; k < 4; k = k + 1) {
+                    float w = skinnedVertices16[vo + 12 + k];
+                    if (w <= 1e-6f) { continue; }
+                    int gb = (int)skinnedVertices16[vo + 8 + k];
+                    if (gb < 0) { gb = 0; }
+                    bool exists = false;
+                    for (int u = 0; u < uniqueBoneCnt; u = u + 1) {
+                        if (triBones[u] == gb) { exists = true; break; }
+                    }
+                    if (!exists) {
+                        triBones[uniqueBoneCnt] = gb;
+                        uniqueBoneCnt = uniqueBoneCnt + 1;
+                    }
+                }
+            }
+            if (uniqueBoneCnt == 0) {
+                triBones[0] = 0;
+                uniqueBoneCnt = 1;
+            }
+
+            // 在活跃桶中寻找新增骨骼最少（调色板重叠度最高）且容量允许的目标桶
+            int bestBinSlot = -1;
+            int bestAddedBones = 999;
+            for (int b = 0; b < openCount; b = b + 1) {
+                SkinnedPackBin cand = openBins[b];
+                int newVerts = 0;
+                if (cand.VertStamp[i0] != cand.VertStampId) { newVerts = newVerts + 1; }
+                if (i1 != i0 && cand.VertStamp[i1] != cand.VertStampId) { newVerts = newVerts + 1; }
+                if (i2 != i0 && i2 != i1 && cand.VertStamp[i2] != cand.VertStampId) { newVerts = newVerts + 1; }
+                if (cand.Mesh.VertexCount() + newVerts > vertLimit) { continue; }
+
+                int addedBones = 0;
+                for (int u = 0; u < uniqueBoneCnt; u = u + 1) {
+                    int gb = triBones[u];
+                    if (cand.GlobalBoneStamp[gb] != cand.BoneStampId) {
+                        addedBones = addedBones + 1;
+                    }
+                }
+                if (cand.PaletteCount + addedBones <= boneLimit && addedBones < bestAddedBones) {
+                    bestAddedBones = addedBones;
+                    bestBinSlot = b;
+                    if (addedBones == 0) { break; }
+                }
+            }
+
+            SkinnedPackBin targetBin;
+            if (bestBinSlot >= 0) {
+                targetBin = openBins[bestBinSlot];
+            } else if (openCount < MAX_OPEN_BINS) {
+                targetBin = new SkinnedPackBin(boneLimit, boneTableSize, vertexCount);
+                openBins[openCount] = targetBin;
+                openCount = openCount + 1;
+            } else {
+                // 淘汰并封存当前调色板最满（或顶点数最多）的活跃桶，原地复用其印章缓冲数组
+                int evictSlot = 0;
+                int maxFill = -1;
+                for (int b = 0; b < openCount; b = b + 1) {
+                    int score = openBins[b].PaletteCount * 65536 + openBins[b].Mesh.VertexCount();
+                    if (score > maxFill) {
+                        maxFill = score;
+                        evictSlot = b;
+                    }
+                }
+                batches.Add(openBins[evictSlot].FlushBatch());
+                openBins[evictSlot].ResetForReuse();
+                targetBin = openBins[evictSlot];
+            }
+
+            // 将本三角形新增骨骼注册进 targetBin 的局部调色板
+            for (int u = 0; u < uniqueBoneCnt; u = u + 1) {
+                int gb = triBones[u];
+                if (targetBin.GlobalBoneStamp[gb] != targetBin.BoneStampId) {
+                    int localSlot = targetBin.PaletteCount;
+                    targetBin.PaletteCount = localSlot + 1;
+                    targetBin.PaletteToGlobal[localSlot] = gb;
+                    targetBin.GlobalToLocal[gb] = localSlot;
+                    targetBin.GlobalBoneStamp[gb] = targetBin.BoneStampId;
+                }
+            }
+
+            int lv0 = LargeMeshPartitioner3D.EmitSkinnedVertex(i0, skinnedVertices16, targetBin);
+            int lv1 = LargeMeshPartitioner3D.EmitSkinnedVertex(i1, skinnedVertices16, targetBin);
+            int lv2 = LargeMeshPartitioner3D.EmitSkinnedVertex(i2, skinnedVertices16, targetBin);
+            targetBin.Mesh.Triangle(lv0, lv1, lv2);
+            targetBin.TriCount = targetBin.TriCount + 1;
+        }
+
+        for (int b = 0; b < openCount; b = b + 1) {
+            if (openBins[b].TriCount > 0) {
+                batches.Add(openBins[b].FlushBatch());
+            }
+        }
+        return batches;
+    }
+
+    private static int EmitSkinnedVertex(int gVertIdx, float[] srcVerts, SkinnedPackBin bin) {
+        if (bin.VertStamp[gVertIdx] == bin.VertStampId) {
+            return bin.VertGlobalToLocal[gVertIdx];
+        }
+
+        int vo = gVertIdx * 16;
+        float px = srcVerts[vo + 0]; float py = srcVerts[vo + 1]; float pz = srcVerts[vo + 2];
+        float nx = srcVerts[vo + 3]; float ny = srcVerts[vo + 4]; float nz = srcVerts[vo + 5];
+        float u = srcVerts[vo + 6];  float vv = srcVerts[vo + 7];
+
+        [4]int lj = new InlineArray<4, int>();
+        [4]float lw = new InlineArray<4, float>();
+        for (int k = 0; k < 4; k = k + 1) {
+            float w = srcVerts[vo + 12 + k];
+            if (w > 1e-6f) {
+                int gb = (int)srcVerts[vo + 8 + k];
+                if (gb < 0) { gb = 0; }
+                lj[k] = bin.GlobalToLocal[gb];
+                lw[k] = w;
+            } else {
+                lj[k] = 0;
+                lw[k] = 0.0f;
+            }
+        }
+
+        int localId = bin.Mesh.Vertex(
+            px, py, pz, nx, ny, nz, u, vv,
+            lj[0], lj[1], lj[2], lj[3],
+            lw[0], lw[1], lw[2], lw[3]);
+
+        bin.MinX = Math.Min(bin.MinX, px); bin.MinY = Math.Min(bin.MinY, py); bin.MinZ = Math.Min(bin.MinZ, pz);
+        bin.MaxX = Math.Max(bin.MaxX, px); bin.MaxY = Math.Max(bin.MaxY, py); bin.MaxZ = Math.Max(bin.MaxZ, pz);
+
+        bin.VertStamp[gVertIdx] = bin.VertStampId;
+        bin.VertGlobalToLocal[gVertIdx] = localId;
+        return localId;
+    }
+}

@@ -100,7 +100,8 @@ static bool sym_is_type(zan_symbol_t *sym) {
     return false;
   return sym->kind == SYM_CLASS || sym->kind == SYM_STRUCT ||
          sym->kind == SYM_INTERFACE || sym->kind == SYM_ENUM ||
-         sym->kind == SYM_TYPE_PARAM || sym->kind == SYM_DELEGATE;
+         sym->kind == SYM_TYPE_PARAM || sym->kind == SYM_DELEGATE ||
+         sym->kind == SYM_ASSOC_TYPE;
 }
 
 static zan_symbol_t *scope_find_type(zan_scope_t *scope, zan_istr_t name) {
@@ -799,11 +800,53 @@ zan_type_t *zan_binder_make_tuple_type(zan_binder_t *b, zan_type_t **elems,
   return t;
 }
 
+zan_type_t *zan_binder_lookup_assoc_type(zan_binder_t *b, zan_type_t *owner,
+                                         zan_istr_t assoc_name) {
+  if (!b || !owner || !owner->sym || !assoc_name.str || assoc_name.len == 0)
+    return NULL;
+  for (zan_symbol_t *s = owner->sym; s;
+       s = (s->type && s->type->base_type) ? s->type->base_type->sym : NULL) {
+    for (int i = 0; i < s->member_count; i++) {
+      zan_symbol_t *m = s->members[i];
+      if (!m || m->kind != SYM_ASSOC_TYPE)
+        continue;
+      if (m->name.len == assoc_name.len &&
+          memcmp(m->name.str, assoc_name.str, (size_t)assoc_name.len) == 0) {
+        zan_type_t *res = m->type;
+        if (res && owner->type_arg_count > 0 && owner->sym->decl &&
+            (owner->sym->decl->kind == AST_CLASS_DECL ||
+             owner->sym->decl->kind == AST_STRUCT_DECL ||
+             owner->sym->decl->kind == AST_INTERFACE_DECL)) {
+          zan_ast_list_t *otps = &owner->sym->decl->type_decl.type_params;
+          if (otps->count == owner->type_arg_count)
+            res = zan_binder_subst_named(b, res, otps, owner->type_args);
+        }
+        return res;
+      }
+    }
+  }
+  return NULL;
+}
+
 zan_type_t *zan_binder_subst_named(zan_binder_t *b, zan_type_t *t,
                                    zan_ast_list_t *tps, zan_type_t **args) {
   if (!t)
     return t;
   if (t->kind == TYPE_TYPE_PARAM) {
+    if (t->element_type && t->element_type->kind == TYPE_TYPE_PARAM) {
+      zan_type_t *base = zan_binder_subst_named(b, t->element_type, tps, args);
+      if (base && base != t->element_type) {
+        const char *dot = (const char *)memchr(t->name.str, '.', (size_t)t->name.len);
+        if (dot) {
+          zan_istr_t rhs = {
+              dot + 1, (uint32_t)(t->name.len - (uint32_t)(dot + 1 - t->name.str))};
+          zan_type_t *proj = zan_binder_lookup_assoc_type(b, base, rhs);
+          if (proj)
+            return proj;
+        }
+      }
+      return t;
+    }
     for (int i = 0; i < tps->count; i++) {
       zan_istr_t tn = tps->items[i]->ident.name;
       if (args[i] && tn.len == t->name.len &&
@@ -948,6 +991,13 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
   if (type_ref->kind != AST_TYPE_REF) {
     return b->type_error;
   }
+  if (type_ref->type_ref.is_const_int) {
+    zan_type_t *ct = make_type(b->arena, TYPE_CONST_INT,
+                               type_ref->type_ref.name.str,
+                               type_ref->type_ref.name.len);
+    ct->const_int_val = type_ref->type_ref.const_int_val;
+    return ct;
+  }
 
   if (b->binding_done && type_ref->type_ref.rt_type &&
       (!type_ref->type_ref.rt_scope ||
@@ -1002,6 +1052,15 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
     base = make_type(b->arena, TYPE_STRUCT, "Span", 4);
   else if (istr_eq(name, "ReadOnlySpan", 12))
     base = make_type(b->arena, TYPE_STRUCT, "ReadOnlySpan", 12);
+  else if (istr_eq(name, "InlineArray", 11))
+    base = make_type(b->arena, TYPE_STRUCT, "InlineArray", 11);
+  else if (istr_eq(name, "Vec", 3)) {
+    zan_symbol_t *sym = scope_find_type(b->current_scope, name);
+    if (sym && sym->type && type_ref->type_ref.type_args.count == 0)
+      base = sym->type;
+    else
+      base = make_type(b->arena, TYPE_STRUCT, "Vec", 3);
+  }
   else if (istr_eq(name, "TypeInfo", 8))
     base = b->type_typeinfo;
   else if (istr_eq(name, "Task", 4))
@@ -1017,8 +1076,29 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
       base = make_type(b->arena, TYPE_DELEGATE, name.str, name.len);
   } else {
     zan_symbol_t *sym = scope_find_type(b->current_scope, name);
-    if (sym)
+    if (sym) {
       base = sym->type;
+    } else if (name.str && name.len > 2) {
+      /* Associated type projection: `T.Item` or `ConcreteType.Item` */
+      const char *dot = (const char *)memchr(name.str, '.', (size_t)name.len);
+      if (dot && dot > name.str &&
+          (uint32_t)(dot - name.str + 1) < name.len) {
+        zan_istr_t lhs = {name.str, (uint32_t)(dot - name.str)};
+        zan_istr_t rhs = {dot + 1,
+                          (uint32_t)(name.len - (uint32_t)(dot + 1 - name.str))};
+        zan_symbol_t *lsym = scope_find_type(b->current_scope, lhs);
+        if (lsym && lsym->kind == SYM_TYPE_PARAM && lsym->type) {
+          zan_type_t *proj =
+              make_type(b->arena, TYPE_TYPE_PARAM, name.str, name.len);
+          proj->element_type = lsym->type;
+          base = proj;
+        } else if (lsym && lsym->type &&
+                   (lsym->kind == SYM_CLASS || lsym->kind == SYM_STRUCT ||
+                    lsym->kind == SYM_INTERFACE)) {
+          base = zan_binder_lookup_assoc_type(b, lsym->type, rhs);
+        }
+      }
+    }
   }
 
   if (!base) {
@@ -1086,7 +1166,8 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
     bool builtin_generic =
         istr_eq(name, "List", 4) || istr_eq(name, "Dict", 4) ||
         istr_eq(name, "Dictionary", 10) || istr_eq(name, "Span", 4) ||
-        istr_eq(name, "ReadOnlySpan", 12) || istr_eq(name, "Task", 4);
+        istr_eq(name, "ReadOnlySpan", 12) || istr_eq(name, "InlineArray", 11) ||
+        istr_eq(name, "Vec", 3) || istr_eq(name, "Task", 4);
     bool user_generic = !builtin_generic && (base->kind == TYPE_CLASS ||
                                              base->kind == TYPE_STRUCT ||
                                              base->kind == TYPE_INTERFACE);
@@ -1096,7 +1177,8 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
       if (istr_eq(name, "List", 4) || istr_eq(name, "Span", 4) ||
           istr_eq(name, "ReadOnlySpan", 12) || istr_eq(name, "Task", 4))
         expected_tps = 1;
-      else if (istr_eq(name, "Dict", 4) || istr_eq(name, "Dictionary", 10))
+      else if (istr_eq(name, "Dict", 4) || istr_eq(name, "Dictionary", 10) ||
+               istr_eq(name, "InlineArray", 11) || istr_eq(name, "Vec", 3))
         expected_tps = 2;
       else if (user_generic && base->sym && base->sym->decl)
         expected_tps = binder_decl_type_param_count(base->sym->decl);

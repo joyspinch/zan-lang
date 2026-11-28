@@ -258,6 +258,9 @@ if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
                   method_param_type_at(g, method_sym, k, expr, NULL, locals);
               if (pt && recv_inst)
                 pt = subst_type_param_deep(g, pt, recv_inst);
+              if (arg && arg->kind == AST_LAMBDA &&
+                  method_param_is_noescape(method_sym, k))
+                arg->lambda.is_noescape = 1;
               call_args[k] = emit_arg_typed(g, arg, pt, locals);
               arg_eh_pushed[k] =
                   emit_call_arg_eh_push(g, arg, call_args[k], locals);
@@ -369,8 +372,12 @@ if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS) {
           }
           int n_eh_args = 0;
           for (int k = 0; k < expr->call.args.count; k++) {
+            zan_ast_node_t *ka = expr->call.args.items[k];
+            if (ka && ka->kind == AST_LAMBDA &&
+                method_param_is_noescape(method_sym, k))
+              ka->lambda.is_noescape = 1;
             call_args[k + recv_off] = emit_arg_typed(
-                g, expr->call.args.items[k],
+                g, ka,
                 method_param_type_at(g, method_sym, k, expr,
                                      callee->member.object, locals),
                 locals);

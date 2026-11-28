@@ -30,6 +30,37 @@ int32_t zan_thread_start(void *body) {
 
 int64_t zan_thread_current_id(void) { return 1; }
 
+int32_t zan_parallel_processor_count(void) { return 1; }
+
+void zan_parallel_for(int32_t from, int32_t to, void *body) {
+  if (!body || to <= from)
+    return;
+  uintptr_t v = (uintptr_t)body;
+  if (v & 1) {
+    void *rec = (void *)(v & ~(uintptr_t)1);
+    void (*fn)(void *, int32_t) = *(void (**)(void *, int32_t))rec;
+    if (!fn) return;
+    for (int32_t i = from; i < to; i++) fn(rec, i);
+  } else {
+    void (*fn)(int32_t) = (void (*)(int32_t))body;
+    for (int32_t i = from; i < to; i++) fn(i);
+  }
+}
+
+void zan_parallel_for_range(int32_t from, int32_t to, void *body) {
+  if (!body || to <= from)
+    return;
+  uintptr_t v = (uintptr_t)body;
+  if (v & 1) {
+    void *rec = (void *)(v & ~(uintptr_t)1);
+    void (*fn)(void *, int32_t, int32_t) = *(void (**)(void *, int32_t, int32_t))rec;
+    if (fn) fn(rec, from, to);
+  } else {
+    void (*fn)(int32_t, int32_t) = (void (*)(int32_t, int32_t))body;
+    fn(from, to);
+  }
+}
+
 typedef struct {
   i64 value;
 } zan_wasm_atomic;

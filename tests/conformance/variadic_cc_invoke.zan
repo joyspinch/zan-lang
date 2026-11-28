@@ -1,0 +1,82 @@
+using System;
+
+class Program {
+    [DllImport("crt", EntryPoint = "snprintf")]
+    static extern int CSnprintf(nint buf, long cap, nint fmt);
+
+    [Export("k_vec_add")]
+    [CallingConvention("vectorcall")]
+    [NoAlloc]
+    static double VecAdd(double a, double b) {
+        return a + b * 2.0;
+    }
+
+    [Export("k_pmost_fn")]
+    [CallingConvention("preserve_most")]
+    [NoAlloc]
+    static long PreserveMostFn(long x) {
+        return x * 3L + 7L;
+    }
+
+    [Export("k_pall_fn")]
+    [CallingConvention("preserve_all")]
+    [NoAlloc]
+    static long PreserveAllFn(long x) {
+        return x * 5L - 1L;
+    }
+
+    static int Main() {
+        // 1. True C variadic invocation calling libc snprintf (int + float->double promotion + byte->int promotion)
+        nint outBuf = NativeMemory.Alloc(64L);
+        nint fmtBuf = NativeMemory.Alloc(32L);
+        // "i=%d f=%.1f b=%u"
+        NativeMemory.At<byte>(fmtBuf, 0) = (byte)105;  // 'i'
+        NativeMemory.At<byte>(fmtBuf, 1) = (byte)61;   // '='
+        NativeMemory.At<byte>(fmtBuf, 2) = (byte)37;   // '%'
+        NativeMemory.At<byte>(fmtBuf, 3) = (byte)100;  // 'd'
+        NativeMemory.At<byte>(fmtBuf, 4) = (byte)32;   // ' '
+        NativeMemory.At<byte>(fmtBuf, 5) = (byte)102;  // 'f'
+        NativeMemory.At<byte>(fmtBuf, 6) = (byte)61;   // '='
+        NativeMemory.At<byte>(fmtBuf, 7) = (byte)37;   // '%'
+        NativeMemory.At<byte>(fmtBuf, 8) = (byte)46;   // '.'
+        NativeMemory.At<byte>(fmtBuf, 9) = (byte)49;   // '1'
+        NativeMemory.At<byte>(fmtBuf, 10) = (byte)102; // 'f'
+        NativeMemory.At<byte>(fmtBuf, 11) = (byte)32;  // ' '
+        NativeMemory.At<byte>(fmtBuf, 12) = (byte)98;  // 'b'
+        NativeMemory.At<byte>(fmtBuf, 13) = (byte)61;  // '='
+        NativeMemory.At<byte>(fmtBuf, 14) = (byte)37;  // '%'
+        NativeMemory.At<byte>(fmtBuf, 15) = (byte)117; // 'u'
+        NativeMemory.At<byte>(fmtBuf, 16) = (byte)0;
+
+        nint fnSnprintf = NativeMemory.FunctionPointer(CSnprintf);
+        int written = NativeMemory.InvokeVariadic<int>(
+            fnSnprintf, 3, outBuf, 64L, fmtBuf, 42, 3.5f, (byte)9);
+
+        // Verify exact ASCII bytes of "i=42 f=3.5 b=9\0"
+        bool bytesOk = (written == 14 &&
+                        NativeMemory.At<byte>(outBuf, 0) == (byte)105 && // 'i'
+                        NativeMemory.At<byte>(outBuf, 2) == (byte)52 &&  // '4'
+                        NativeMemory.At<byte>(outBuf, 3) == (byte)50 &&  // '2'
+                        NativeMemory.At<byte>(outBuf, 7) == (byte)51 &&  // '3'
+                        NativeMemory.At<byte>(outBuf, 8) == (byte)46 &&  // '.'
+                        NativeMemory.At<byte>(outBuf, 9) == (byte)53 &&  // '5'
+                        NativeMemory.At<byte>(outBuf, 13) == (byte)57 && // '9'
+                        NativeMemory.At<byte>(outBuf, 14) == (byte)0);
+
+        // 2. vectorcall / preserve_most / preserve_all indirect calls
+        nint fnVec = NativeMemory.FunctionPointer(VecAdd);
+        nint fnMost = NativeMemory.FunctionPointer(PreserveMostFn);
+        nint fnAll = NativeMemory.FunctionPointer(PreserveAllFn);
+        double vr = NativeMemory.InvokeWithCC<double>("vectorcall", fnVec, 1.5, 2.25);
+        long mr = NativeMemory.InvokeWithCC<long>("preserve_most", fnMost, 10L);
+        long ar = NativeMemory.InvokeWithCC<long>("preserve_all", fnAll, 10L);
+
+        NativeMemory.Free(outBuf);
+        NativeMemory.Free(fmtBuf);
+
+        int vaOk = bytesOk ? 1 : 0;
+        int ccOk = (vr == 6.0 && mr == 37L && ar == 49L) ? 1 : 0;
+        Console.WriteLine($"va={vaOk} cc={ccOk}");
+        return 0;
+    }
+}

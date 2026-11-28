@@ -30,12 +30,15 @@ public class SegmentWriter {
 
     private bool WriteHeader(long count) {
         ByteBuffer h = ByteBuffer.Alloc(16);
-        h.WriteRaw(SegmentWriter.MAGIC, 4);
-        h.WriteU32(SegmentWriter.VERSION);
-        h.WriteU64(count);
-        int wrote = this.file.WriteAt(0, h.Raw(), 16);
-        h.Free();
-        return wrote == 16;
+        try {
+            h.WriteRaw(SegmentWriter.MAGIC, 4);
+            h.WriteU32(SegmentWriter.VERSION);
+            h.WriteU64(count);
+            int wrote = this.file.WriteAt(0, h.Raw(), 16);
+            return wrote == 16;
+        } finally {
+            h.Free();
+        }
     }
 
     // 创建段文件并写入头部占位（记录数在 Finish 时回填）。
@@ -100,40 +103,52 @@ public class SegmentWriter {
         this.buf.WriteU32(this.sparseEntries.Count);
 
         ByteBuffer block = ByteBuffer.Alloc(256);
-        int n = this.sparseEntries.Count;
-        for (int i = 0; i < n; i = i + 1) {
-            long end = indexStart;
-            if (i + 1 < n) { end = this.sparseEntries[i + 1].offset; }
-            int len = (int)(end - this.sparseEntries[i].offset);
-            long crc = 0;
-            if (len > 0) {
-                block.EnsureCapacity(len);
-                int got = this.file.ReadAt(this.sparseEntries[i].offset, block, len);
-                if (got == len) { crc = block.Crc32(len); }
-                else {
+        try {
+            int n = this.sparseEntries.Count;
+            for (int i = 0; i < n; i = i + 1) {
+                long end = indexStart;
+                if (i + 1 < n) { end = this.sparseEntries[i + 1].offset; }
+                long lenL = end - this.sparseEntries[i].offset;
+                if (lenL < 0L || lenL > 2147483647L) {
                     this.failed = true;
-                    this.lastError = "segment verify read failed";
+                    this.lastError = "segment block size out of range";
                     break;
                 }
+                int len = (int)lenL;
+                long crc = 0;
+                if (len > 0) {
+                    block.EnsureCapacity(len);
+                    int got = this.file.ReadAt(this.sparseEntries[i].offset, block, len);
+                    if (got == len) { crc = block.Crc32(len); }
+                    else {
+                        this.failed = true;
+                        this.lastError = "segment verify read failed";
+                        break;
+                    }
+                }
+                this.buf.EnsureRoom(24 + this.sparseEntries[i].key.Length);
+                this.buf.WriteU64(this.sparseEntries[i].offset);
+                this.buf.WriteString(this.sparseEntries[i].key);
+                this.buf.WriteU32(crc);
             }
-            this.buf.EnsureRoom(24 + this.sparseEntries[i].key.Length);
-            this.buf.WriteU64(this.sparseEntries[i].offset);
-            this.buf.WriteString(this.sparseEntries[i].key);
-            this.buf.WriteU32(crc);
+        } finally {
+            block.Free();
         }
-        block.Free();
         if (this.failed) { return false; }
         this.FlushBuf();
         if (this.failed) { return false; }
 
         ByteBuffer foot = ByteBuffer.Alloc(12);
-        foot.WriteU64(indexStart);
-        foot.WriteRaw(SegmentWriter.MAGIC, 4);
-        if (this.file.WriteAt(this.fileLen, foot.Raw(), 12) != 12) {
-            this.failed = true;
-            this.lastError = "segment footer write failed";
+        try {
+            foot.WriteU64(indexStart);
+            foot.WriteRaw(SegmentWriter.MAGIC, 4);
+            if (this.file.WriteAt(this.fileLen, foot.Raw(), 12) != 12) {
+                this.failed = true;
+                this.lastError = "segment footer write failed";
+            }
+        } finally {
+            foot.Free();
         }
-        foot.Free();
         if (this.failed) { return false; }
         this.fileLen = this.fileLen + 12;
 

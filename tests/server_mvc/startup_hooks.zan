@@ -313,9 +313,11 @@ class Program {
         Program.Check(historyCount == 0, "history insert failure leaves no new history");
     }
 
-    static async string ListPage(WebApp app, AdminController controller, string page, string query, string uid) {
-        HttpRequest req = HttpRequest.Parse("GET /admin/system/" + page + "?" + query
-            + " HTTP/1.1\r\nHost: test\r\nX-Fragment: 1\r\n\r\n");
+    static async string ListApi(WebApp app, AdminController controller, string page, string action, string query, string uid) {
+        string path = "/admin/system/" + page + "/" + action;
+        if (query.Length > 0) { path = path + "?" + query; }
+        HttpRequest req = HttpRequest.Parse("POST " + path
+            + " HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}");
         HttpContext ctx = new HttpContext(req, "127.0.0.1");
         ctx.SetApp(app);
         ctx.SetUid(uid);
@@ -323,13 +325,13 @@ class Program {
         try {
             if (!await controller.BeforeAsync()) { throw new Exception("list fixture preflight failed"); }
             if (page == "roles") {
-                controller.SetView("Admin.System.RolesController.Index");
-                await ((RolesController)controller).Index();
+                await ((RolesController)controller).List();
+            } else if (action == "tree") {
+                await ((DepartmentsController)controller).Tree();
             } else {
-                controller.SetView("Admin.System.DepartmentsController.Index");
-                await ((DepartmentsController)controller).Index();
+                await ((DepartmentsController)controller).List();
             }
-            Program.Check(ctx.GetStatus() == 200, "list response prepared");
+            Program.Check(ctx.GetStatus() == 200, "list api response prepared");
             return ctx.ResponseBody();
         } finally {
             await controller.AfterAsync();
@@ -352,17 +354,17 @@ class Program {
         int assigned = await orm.Insert<SysUserRole>(link).ExecuteAffrowsAsync();
         Program.Check(deptId > 0 && changed == 1 && assigned == 1 && PermTable.Open(), "list fixture seeded");
         WebApp app = new WebApp("127.0.0.1", 0);
-        app.Views("packages/Zan.Mvc/views");
         WebHost.Use(app);
         try {
-            string roles = await Program.ListPage(app, new RolesController(), "roles", "", uid);
-            Program.Check(roles.Contains("商家") && roles.Contains("<td class=\"num\">1</td>"),
-                "role list renders persisted grant and assigned user counts");
-            string departments = await Program.ListPage(app, new DepartmentsController(), "departments",
+            string roles = await Program.ListApi(app, new RolesController(), "roles", "list", "", uid);
+            Program.Check(roles.Contains("商家") && roles.Contains("\"perms\":1") && roles.Contains("\"users\":1"),
+                "role list returns persisted grant and assigned user counts");
+            string deptTree = await Program.ListApi(app, new DepartmentsController(), "departments", "tree", "", uid);
+            string deptMembers = await Program.ListApi(app, new DepartmentsController(), "departments", "list",
                 "id=" + Convert.ToString(deptId), uid);
-            Program.Check(departments.Contains("list-fixture-department") && departments.Contains("成员 1")
-                && departments.Contains("<td class=\"mono\">admin</td>") && departments.Contains("商家")
-                && !departments.Contains("legacy-seller"), "department list renders the selected roster and role names");
+            Program.Check(deptTree.Contains("list-fixture-department") && deptTree.Contains("\"members\":1")
+                && deptMembers.Contains("\"username\":\"admin\"") && deptMembers.Contains("商家")
+                && !deptMembers.Contains("legacy-seller"), "department tree and roster return persisted counts and role names");
         } finally {
             WebHost.Use(null);
             app.Dispose();

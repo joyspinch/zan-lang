@@ -209,6 +209,7 @@ struct zan_irgen {
   LLVMValueRef current_fn;
   LLVMTypeRef current_fn_ret_type;
   zan_type_t *current_fn_zan_ret_type;
+  bool current_fn_is_ref_return;
 
   int qdot_counter;
 
@@ -249,6 +250,7 @@ struct zan_irgen {
     LLVMTypeRef llvm_type;
     /* [StructLayout(LayoutKind */
     bool explicit_layout;
+    uint8_t pack_align;
     unsigned long *field_offsets;
     LLVMTypeRef *field_llvm;
     int field_count;
@@ -336,6 +338,18 @@ struct zan_irgen {
   int eh_armed_loop_base;
   void *loop_guarded_lists[16];
   int loop_guarded_list_count;
+  /* Loop BCE (Bounds Check Elimination) proved ranges & scoped alias tracking */
+  struct {
+    void *iv_local;
+    void *container_local;
+    int64_t max_offset;
+    int alias_scope_id;
+  } loop_bce[32];
+  int loop_bce_count;
+  LLVMMetadataRef fn_alias_domain;
+  LLVMMetadataRef fn_alias_scopes[16];
+  int fn_alias_scope_count;
+  int fn_alias_domain_seq;
 
   zan_lpad_entry_t lpad_stack[ZAN_MAX_ARMED_TRY];
   int lpad_depth;
@@ -603,7 +617,9 @@ struct zan_irgen {
   bool shard_opt;   /* --shard-opt：非发布模式也对 shard 模块跑 pass 管线 */
   bool sharded_module; /* zan_irgen_shard_run 已拆出分片（非封闭整模块） */
   bool emit_lib;    /* 库构建模式：保持 public 成员导出链接 */
+  bool emit_obj;    /* 纯对象文件模式 (-c/--emit-obj)：不发主程序全局表/启动桩 */
   bool emit_shared; /* 动态共享库模式：发射平台标准入口 (DllMain) */
+  bool freestanding; /* 裸机无运行时模式：零 CRT / 零 ARC / 零运行时表 */
 
   /* Binding<T> 属性访问器函数降解缓存 */
   struct {
@@ -904,6 +920,11 @@ struct zan_irgen {
   char target_triple[128];
   /* 后端选用的 CPU/特性（--emit-ir 的产物要靠它自述，见 zan_irgen_write_ir） */
   const char *cpu_profile; /* explicit x86-64 profile, or NULL */
+  const char *target_cpu_override;
+  const char *target_features_override;
+  int code_model_kind;  /* 0=default,1=small,2=kernel,3=medium,4=large */
+  int reloc_model_kind; /* 0=default(pic),1=static,2=pic,3=dynamic-no-pic */
+  bool no_red_zone;     /* --no-red-zone: apply LLVM noredzone to all functions */
   char target_cpu[64];
   char target_features[192];
   bool target_is_windows;
@@ -1086,6 +1107,9 @@ zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit);
 /* 模块初始化解密构造函数 (.ctors) 发射 */
 void zan_irgen_emit_string_deobf(zan_irgen_t *g);
 zan_status_t zan_irgen_write_ir(zan_irgen_t *g, const char *path);
+zan_status_t zan_irgen_write_c_header(zan_irgen_t *g, zan_ast_node_t *unit,
+                                      const char *path);
+zan_status_t zan_irgen_audit_freestanding(zan_irgen_t *g);
 zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path);
 
 typedef struct zan_mf_fn {

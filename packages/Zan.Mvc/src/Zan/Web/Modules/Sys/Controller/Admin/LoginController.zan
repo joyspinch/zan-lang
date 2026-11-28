@@ -1,49 +1,92 @@
 using System;
 using System.Data.Orm;
+using System.Json;
 using System.Web;
 using Zan.Web.Core;
 using Zan.Web.Dao;
+using Zan.Web.Model;
 using Zan.Web.Security;
 using Zan.Web.Services;
 using Zan.Web;
 
 namespace Zan.Web.Admin;
 
-/* 管理台会话端点：/admin/login 与 /admin/logout 的声明区。URL 区籍规则
-   要求 admin/ 前缀端点只能由 Admin 区控制器声明（曾因写在 Account 区被判定为
-   跨区路由）；登录卡片与校验流是 Account 区的共享实现，此处薄壳转发
-   ——两区共用同一 cookie、同一限流与登录日志，页面文案不同而已。视图
-   键沿用 Account.LoginController.Index（登录卡是共享视图资产，键=文件路径）。 */
+/* 管理台会话端点：/admin/login、/admin/login/submit 与 /admin/logout。
+   管理端已全面迁移至 AdminUI SPA：GET /admin/login 直接重定向到 SPA 登录页，
+   POST /admin/login/submit 返回纯 JSON 并签发会话 cookie，不再回退旧 SSR 登录卡。 */
 [Custom(Authorization = CustomAuthorization.None)]
 [Description("管理台登录")]
 public class LoginController : AdminController {
+    private static string SpaLoginUrl() {
+        string baseUrl = Boot.SpaUrl();
+        if (baseUrl == "/") { return "/login"; }
+        return baseUrl + "/login";
+    }
+
     [HttpGet]
     [Route("/admin/login")]
     [Description("登录")]
-    public async void Index() {
+    public void Index() {
         if (this.IsLogin()) {
-            WebApp cur = WebHost.Current();
-            string land = await MenuService.LandingFor(cur, this.uid, this.Held());
-            if (land.Length == 0) {
-                land = Routes.PathOf(typeof(ProfileController), "Index", Routes.Profile);
-            }
-            this.Ctx().Redirect(land);
+            this.Ctx().Redirect(Boot.SpaUrl());
             return;
         }
-        string site = await Settings.Get(SettingKeys.SiteTitle, "ZanWeb");
-        string submitPath = Routes.PathOf(typeof(LoginController), "Submit", Routes.LoginSubmit);
-        this.ViewOf(Zan.Web.Account.LoginController.Tpl,
-            await Zan.Web.Account.LoginController.Form(site, "", this.In("user"),
-                submitPath, "管理后台", true, false));
+        this.Ctx().Redirect(SpaLoginUrl());
     }
 
     [HttpPost]
     [Description("登录提交")]
     public async void Submit() {
-        string submitPath = Routes.PathOf(typeof(LoginController), "Submit", Routes.LoginSubmit);
-        await Zan.Web.Account.LoginController.Attempt(this,
-            submitPath, "管理后台", true, false,
-            "" /* 落地页由账号可达菜单动态决定，见 Attempt */);
+        string user = this.InAny("user").Trim();
+        if (user.Length == 0) { user = this.InAny("username").Trim(); }
+        string pass = this.InAny("pass");
+        if (pass.Length == 0) { pass = this.InAny("password"); }
+        if (user.Length == 0 || pass.Length == 0) {
+            this.Fail(400, "0003", "请输入账号和密码");
+            return;
+        }
+        if (user.Length > 32 || pass.Length > 64) {
+            this.Fail(422, "1003", "账号或密码超出长度限制");
+            return;
+        }
+        string token = await AuthUser.Login(user, pass);
+        if (token.Length == 0) {
+            string reason = LoginThrottle.Blocked(user)
+                ? "尝试过于频繁，请稍后再试" : "账号或密码不正确";
+            await RecordLogin(user, false, reason);
+            if (!AuthToken.Ready()) {
+                this.Fail(503, "1002",
+                    "服务端未配置会话密钥：请在 config/app.json 的 [auth].secret（或环境变量 ZAN_AUTH_SECRET）填入至少 32 字符");
+                return;
+            }
+            this.Fail(401, "1001", reason);
+            return;
+        }
+        await RecordLogin(user, true, "");
+        this.Ctx().SetCookie(Cfg.Auth.cookieName, token, Cfg.Auth.ttlSeconds);
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("token", token);
+        w.WriteProperty("redirect", Boot.SpaUrl());
+        w.WriteEndObject();
+        this.Ctx().Api(Codes.Ok, "ok", w.ToString());
+    }
+
+    private async void RecordLogin(string user, bool ok, string message) {
+        if (this.Held() == null) { return; }
+        SysLoginLog row = new SysLoginLog();
+        row.userId = 0;
+        row.username = user;
+        row.ip = ClientIp.Of(this.Ctx());
+        row.agent = this.Ctx().Header("User-Agent");
+        row.ok = ok ? 1 : 0;
+        row.message = message;
+        row.createdAt = WebApp.NowSeconds();
+        try {
+            int _id = await this.SysLoginLog.Insert(row).ExecuteIdentityAsync();
+        } catch (Exception ex) {
+            Log.Error("[auth] admin login log insert failed: " + ex.Message);
+        }
     }
 
     [HttpGet]
@@ -66,6 +109,6 @@ public class LoginController : AdminController {
             }
         }
         this.Ctx().SetCookie(Cfg.Auth.cookieName, "", 0);
-        this.Ctx().Redirect(Routes.PathOf(typeof(LoginController), "Index", Routes.Login));
+        this.Ctx().Redirect(SpaLoginUrl());
     }
 }

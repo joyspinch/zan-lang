@@ -74,6 +74,122 @@ static int work_fn_index_lookup(const work_fn_index_t *ix, LLVMValueRef key) {
     return -1;
 }
 
+static void apply_method_opt_attrs(zan_irgen_t *g, zan_ast_node_t *member,
+                                   LLVMValueRef fn) {
+    if (!g || !member || !fn) return;
+    if (g->no_red_zone || zan_ast_has_attr(member, "NoRedZone")) {
+        unsigned nrz = LLVMGetEnumAttributeKindForName("noredzone", 9);
+        if (nrz)
+            LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex,
+                                    LLVMCreateEnumAttribute(g->ctx, nrz, 0));
+    }
+    zan_ast_list_t *attrs = zan_ast_attributes(member);
+    if (!attrs || attrs->count == 0) return;
+    bool want_always = false, want_never = false, want_cold = false,
+         want_hot = false, want_noreturn = false;
+    for (int i = 0; i < attrs->count; i++) {
+        zan_ast_node_t *a = attrs->items[i];
+        if (!a || a->kind != AST_ATTRIBUTE || !a->attribute.name) continue;
+        zan_istr_t n = a->attribute.name->ident.name;
+        if (!n.str) continue;
+        if (n.len == 12 && memcmp(n.str, "AlwaysInline", 12) == 0) {
+            want_always = true;
+        } else if (n.len == 8 && memcmp(n.str, "NoInline", 8) == 0) {
+            want_never = true;
+        } else if (n.len == 4 && memcmp(n.str, "Cold", 4) == 0) {
+            want_cold = true;
+        } else if (n.len == 3 && memcmp(n.str, "Hot", 3) == 0) {
+            want_hot = true;
+        } else if (n.len == 8 && memcmp(n.str, "NoReturn", 8) == 0) {
+            want_noreturn = true;
+        } else if (n.len == 6 && memcmp(n.str, "Inline", 6) == 0) {
+            if (a->attribute.args.count == 0) {
+                want_always = true;
+            } else {
+                zan_ast_node_t *arg = a->attribute.args.items[0];
+                zan_istr_t k = {NULL, 0};
+                if (arg->kind == AST_IDENTIFIER) k = arg->ident.name;
+                else if (arg->kind == AST_MEMBER_ACCESS) k = arg->member.name;
+                if (k.str && k.len == 6 && memcmp(k.str, "Always", 6) == 0)
+                    want_always = true;
+                else if (k.str && k.len == 5 && memcmp(k.str, "Never", 5) == 0)
+                    want_never = true;
+            }
+        } else if (n.len == 10 && memcmp(n.str, "MethodImpl", 10) == 0) {
+            for (int j = 0; j < a->attribute.args.count; j++) {
+                zan_ast_node_t *arg = a->attribute.args.items[j];
+                zan_istr_t k = {NULL, 0};
+                if (arg->kind == AST_IDENTIFIER) k = arg->ident.name;
+                else if (arg->kind == AST_MEMBER_ACCESS) k = arg->member.name;
+                if (k.str && k.len == 18 &&
+                    memcmp(k.str, "AggressiveInlining", 18) == 0)
+                    want_always = true;
+                else if (k.str && k.len == 10 &&
+                         memcmp(k.str, "NoInlining", 10) == 0)
+                    want_never = true;
+            }
+        }
+    }
+    if (want_never) want_always = false;
+    if (want_always && !(member->method_decl.modifiers & (MOD_VIRTUAL | MOD_OVERRIDE))) {
+        unsigned ak = LLVMGetEnumAttributeKindForName("alwaysinline", 12);
+        unsigned nk = LLVMGetEnumAttributeKindForName("noinline", 8);
+        if (ak && (!nk || !LLVMGetEnumAttributeAtIndex(fn, LLVMAttributeFunctionIndex, nk)))
+            LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex,
+                                    LLVMCreateEnumAttribute(g->ctx, ak, 0));
+    }
+    if (want_never) {
+        unsigned nk = LLVMGetEnumAttributeKindForName("noinline", 8);
+        unsigned ak = LLVMGetEnumAttributeKindForName("alwaysinline", 12);
+        if (ak)
+            LLVMRemoveEnumAttributeAtIndex(fn, LLVMAttributeFunctionIndex, ak);
+        if (nk)
+            LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex,
+                                    LLVMCreateEnumAttribute(g->ctx, nk, 0));
+    }
+    if (want_cold) {
+        unsigned ck = LLVMGetEnumAttributeKindForName("cold", 4);
+        if (ck)
+            LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex,
+                                    LLVMCreateEnumAttribute(g->ctx, ck, 0));
+    }
+    if (want_hot && !want_cold) {
+        unsigned hk = LLVMGetEnumAttributeKindForName("hot", 3);
+        if (hk)
+            LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex,
+                                    LLVMCreateEnumAttribute(g->ctx, hk, 0));
+    }
+    if (want_noreturn) {
+        unsigned nrk = LLVMGetEnumAttributeKindForName("noreturn", 8);
+        if (nrk)
+            LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex,
+                                    LLVMCreateEnumAttribute(g->ctx, nrk, 0));
+    }
+    {
+        char sec_buf[128];
+        if (zan_ast_attr_string(member, "Section", sec_buf, sizeof(sec_buf))) {
+            LLVMSetSection(fn, sec_buf);
+        }
+    }
+    if (zan_ast_has_attr(member, "Naked")) {
+        unsigned ak = LLVMGetEnumAttributeKindForName("alwaysinline", 12);
+        if (ak)
+            LLVMRemoveEnumAttributeAtIndex(fn, LLVMAttributeFunctionIndex, ak);
+        unsigned nk = LLVMGetEnumAttributeKindForName("noinline", 8);
+        if (nk)
+            LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex,
+                                    LLVMCreateEnumAttribute(g->ctx, nk, 0));
+        unsigned nkd = LLVMGetEnumAttributeKindForName("naked", 5);
+        if (nkd)
+            LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex,
+                                    LLVMCreateEnumAttribute(g->ctx, nkd, 0));
+        unsigned nrz = LLVMGetEnumAttributeKindForName("noredzone", 9);
+        if (nrz)
+            LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex,
+                                    LLVMCreateEnumAttribute(g->ctx, nrz, 0));
+    }
+}
+
 static bool class_ctor_is_live(const work_fn_index_t *ix, const char *cname,
                                const unsigned char *live) {
     if (!ix || !ix->work || !cname) return false;
@@ -218,6 +334,11 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
         g->cur_inst = work[w].cur_inst;
         zan_irgen_note_origin(g, fn, member, work[w].cur_inst, work[w].mbind,
                               work[w].mtps ? work[w].mtps->count : 0);
+        if (zan_ast_has_attr(member, "Alias")) {
+            /* Alias methods lower to LLVM GlobalAlias in emit_target.c after all targets exist. */
+            continue;
+        }
+        apply_method_opt_attrs(g, member, fn);
 
         if (work[w].is_async) {
             emit_async_method_ir(g, &work[w]);
@@ -243,6 +364,7 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
         di_set_loc(g, member->loc);
 
         local_scope_t *locals = local_scope_new(g->arena);
+        zan_fn_reset_alias_scopes(g);
 
         if (!is_static) {
             this_alloca = LLVMBuildAlloca(g->builder, param_types[0], "this");
@@ -256,6 +378,13 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
             if (param->param.by_ref) {
                 local_add(locals, param->param.name,
                           LLVMGetParam(fn, (unsigned)(k + param_offset)), pt);
+                locals->vars[locals->count - 1].is_scoped = param->param.is_scoped;
+                if (param->param.is_noalias) {
+                    unsigned nak = LLVMGetEnumAttributeKindForName("noalias", 7);
+                    if (nak)
+                        LLVMAddAttributeAtIndex(fn, (unsigned)(k + param_offset + 1),
+                                                LLVMCreateEnumAttribute(g->ctx, nak, 0));
+                }
                 if (pt && pt->kind == TYPE_STRING)
                     locals->vars[locals->count - 1].opaque_string = 1;
                 if (is_rc_managed_type(pt))
@@ -271,6 +400,18 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
             LLVMValueRef param_alloca = LLVMBuildAlloca(g->builder, param_types[k + param_offset], "p");
             LLVMBuildStore(g->builder, pv, param_alloca);
             local_add(locals, param->param.name, param_alloca, pt);
+            locals->vars[locals->count - 1].is_scoped = param->param.is_scoped;
+            if (param->param.is_noalias && pt &&
+                (is_span_type(pt) || pt->kind == TYPE_ARRAY)) {
+                locals->vars[locals->count - 1].noalias_scope_id =
+                    zan_fn_alloc_alias_scope(g);
+                if (pt->kind == TYPE_ARRAY) {
+                    unsigned nak = LLVMGetEnumAttributeKindForName("noalias", 7);
+                    if (nak)
+                        LLVMAddAttributeAtIndex(fn, (unsigned)(k + param_offset + 1),
+                                                LLVMCreateEnumAttribute(g->ctx, nak, 0));
+                }
+            }
             if (pt && pt->kind == TYPE_STRING)
                 locals->vars[locals->count - 1].opaque_string = 1;
             box_captured_parameter(g, locals, param, pt,
@@ -279,25 +420,39 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
             if (!locals->vars[locals->count - 1].box_cell && pt &&
                 pt->kind == TYPE_STRUCT &&
                 LLVMGetTypeKind(param_types[k + param_offset]) ==
-                    LLVMStructTypeKind &&
-                type_contains_collection_rc(g, pt, 0)) {
-                locals->vars[locals->count - 1].struct_rc = 1;
-                emit_struct_local_retain(g, pt, param_alloca);
+                    LLVMStructTypeKind) {
+                if (struct_needs_raii_drop(g, pt, 0)) {
+                    emit_arm_drop_flag(g, locals, locals->count - 1, true);
+                } else if (type_contains_collection_rc(g, pt, 0)) {
+                    locals->vars[locals->count - 1].struct_rc = 1;
+                    emit_struct_local_retain(g, pt, param_alloca);
+                }
             }
             own_written_param(g, locals, param, pt,
                               param_types[k + param_offset], pv,
                               member->method_decl.body);
+            if (param->param.is_noescape &&
+                !(member->method_decl.modifiers & (MOD_VIRTUAL | MOD_OVERRIDE))) {
+                unsigned ih = LLVMGetEnumAttributeKindForName("inlinehint", 10);
+                if (ih)
+                    LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex,
+                                            LLVMCreateEnumAttribute(g->ctx, ih, 0));
+            }
         }
 
         LLVMValueRef saved_fn = g->current_fn;
         LLVMTypeRef saved_fn_ret = g->current_fn_ret_type;
         zan_type_t *saved_fn_zan_ret = g->current_fn_zan_ret_type;
+        bool saved_fn_ref_ret = g->current_fn_is_ref_return;
         LLVMValueRef saved_this = g->current_this;
         zan_symbol_t *saved_type_sym = g->current_type_sym;
         zan_ast_node_t *saved_fn_body = g->current_fn_body;
         g->current_fn = fn;
         g->current_fn_ret_type = llvm_ret;
         g->current_fn_zan_ret_type = ret_type;
+        g->current_fn_is_ref_return =
+            member->kind != AST_CONSTRUCTOR_DECL &&
+            member->method_decl.is_ref_return;
         int saved_throw_base = g->throw_locals_base;
         int saved_catch_cc = g->catch_cleanup_count;
         int saved_throw_cb = g->throw_catch_base;
@@ -344,7 +499,12 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
         g->current_type_sym = type_sym;
         g->current_fn_body = member->method_decl.body;
         g->current_fn_is_ctor = member->kind == AST_CONSTRUCTOR_DECL;
-        g->current_fn_no_runtime = zan_ast_has_attr(member, "NoRuntime");
+        bool owner_is_lib = type_sym && type_sym->decl &&
+                            (type_sym->decl->from_stdlib ||
+                             type_sym->decl->from_package);
+        g->current_fn_no_runtime =
+            (g->freestanding && !owner_is_lib) ||
+            zan_ast_has_attr(member, "NoRuntime");
 
         if (member->kind == AST_CONSTRUCTOR_DECL && !is_static) {
             /* A528：结构体构造函数体内写拥有型字段后抛异常，字段引用没人
@@ -543,6 +703,7 @@ static void emit_user_method_bodies(zan_irgen_t *g, method_body_work_t *work,
         g->current_fn = saved_fn;
         g->current_fn_ret_type = saved_fn_ret;
         g->current_fn_zan_ret_type = saved_fn_zan_ret;
+        g->current_fn_is_ref_return = saved_fn_ref_ret;
         g->throw_locals_base = saved_throw_base;
         g->catch_cleanup_count = saved_catch_cc;
         g->throw_catch_base = saved_throw_cb;
@@ -867,6 +1028,11 @@ bool method_is_tp_template(zan_irgen_t *g, zan_ast_node_t *member) {
     if (!member || member->kind != AST_METHOD_DECL) return false;
     zan_ast_list_t *tps = &member->method_decl.type_params;
     if (tps->count == 0 || !member->method_decl.body) return false;
+    for (int i = 0; i < tps->count; i++) {
+        if (tps->items[i] && tps->items[i]->kind == AST_IDENTIFIER &&
+            tps->items[i]->ident.is_const_param)
+            return true;
+    }
     tp_use_scan_t s;
     memset(&s, 0, sizeof(s));
     s.g = g;
@@ -891,8 +1057,17 @@ bool method_is_tp_template(zan_irgen_t *g, zan_ast_node_t *member) {
 static bool class_member_uses_tp(zan_irgen_t *g, zan_ast_node_t *decl,
                                  zan_ast_node_t *member) {
     if (!decl || !member) return false;
+    if (member->kind == AST_METHOD_DECL &&
+        member->method_decl.type_params.count > 0) {
+        if (decl_uses_static_abstract_or_assoc(
+                g, zan_ast_method_where_clauses(member)))
+            return true;
+    }
     zan_ast_list_t *tps = &decl->type_decl.type_params;
     if (tps->count == 0) return false;
+    if (decl_uses_static_abstract_or_assoc(
+            g, zan_ast_type_where_clauses(decl)))
+        return true;
     zan_ast_node_t *body = NULL;
     zan_ast_list_t *params = NULL;
     if (member->kind == AST_METHOD_DECL || member->kind == AST_CONSTRUCTOR_DECL) {
@@ -1070,7 +1245,10 @@ int get_or_create_method_spec(zan_irgen_t *g, zan_symbol_t *msym,
         fn = air->fn;
         fn_type = air->fn_type;
     } else {
-        fn_type = LLVMFunctionType(map_type(g, ret_type), param_types,
+        LLVMTypeRef mret_llvm = member->method_decl.is_ref_return
+            ? LLVMPointerType(map_type(g, ret_type), 0)
+            : map_type(g, ret_type);
+        fn_type = LLVMFunctionType(mret_llvm, param_types,
                                    (unsigned)total_params, 0);
         fn = LLVMAddFunction(g->mod, fn_name, fn_type);
         zan_set_module_local(fn);
@@ -1139,6 +1317,7 @@ static void emit_method_spec_body(zan_irgen_t *g, int idx) {
     di_set_loc(g, member->loc);
 
     local_scope_t *locals = local_scope_new(g->arena);
+    zan_fn_reset_alias_scopes(g);
     int param_count = member->method_decl.params.count;
     unsigned npt = LLVMCountParamTypes(sp.fn_type);
     int this_off = (member->method_decl.modifiers & MOD_STATIC) ? 0 : 1;
@@ -1156,6 +1335,13 @@ static void emit_method_spec_body(zan_irgen_t *g, int idx) {
         unsigned pi = (unsigned)(k + this_off);
         if (param->param.by_ref) {
             local_add(locals, param->param.name, LLVMGetParam(sp.fn, pi), pt);
+            locals->vars[locals->count - 1].is_scoped = param->param.is_scoped;
+            if (param->param.is_noalias) {
+                unsigned nak = LLVMGetEnumAttributeKindForName("noalias", 7);
+                if (nak)
+                    LLVMAddAttributeAtIndex(sp.fn, pi + 1,
+                                            LLVMCreateEnumAttribute(g->ctx, nak, 0));
+            }
             if (pt && pt->kind == TYPE_STRING)
                 locals->vars[locals->count - 1].opaque_string = 1;
             if (is_rc_managed_type(pt))
@@ -1170,14 +1356,29 @@ static void emit_method_spec_body(zan_irgen_t *g, int idx) {
         LLVMValueRef param_alloca = LLVMBuildAlloca(g->builder, param_types[pi], "p");
         LLVMBuildStore(g->builder, pv, param_alloca);
         local_add(locals, param->param.name, param_alloca, pt);
+        locals->vars[locals->count - 1].is_scoped = param->param.is_scoped;
+        if (param->param.is_noalias && pt &&
+            (is_span_type(pt) || pt->kind == TYPE_ARRAY)) {
+            locals->vars[locals->count - 1].noalias_scope_id =
+                zan_fn_alloc_alias_scope(g);
+            if (pt->kind == TYPE_ARRAY) {
+                unsigned nak = LLVMGetEnumAttributeKindForName("noalias", 7);
+                if (nak)
+                    LLVMAddAttributeAtIndex(sp.fn, pi + 1,
+                                            LLVMCreateEnumAttribute(g->ctx, nak, 0));
+            }
+        }
         box_captured_parameter(g, locals, param, pt, param_types[pi], pv,
                                member->method_decl.body);
         if (!locals->vars[locals->count - 1].box_cell && pt &&
             pt->kind == TYPE_STRUCT &&
-            LLVMGetTypeKind(param_types[pi]) == LLVMStructTypeKind &&
-            type_contains_collection_rc(g, pt, 0)) {
-            locals->vars[locals->count - 1].struct_rc = 1;
-            emit_struct_local_retain(g, pt, param_alloca);
+            LLVMGetTypeKind(param_types[pi]) == LLVMStructTypeKind) {
+            if (struct_needs_raii_drop(g, pt, 0)) {
+                emit_arm_drop_flag(g, locals, locals->count - 1, true);
+            } else if (type_contains_collection_rc(g, pt, 0)) {
+                locals->vars[locals->count - 1].struct_rc = 1;
+                emit_struct_local_retain(g, pt, param_alloca);
+            }
         }
         own_written_param(g, locals, param, pt, param_types[pi], pv,
                           member->method_decl.body);
@@ -1192,12 +1393,14 @@ static void emit_method_spec_body(zan_irgen_t *g, int idx) {
     LLVMValueRef saved_fn = g->current_fn;
     LLVMTypeRef saved_fn_ret = g->current_fn_ret_type;
     zan_type_t *saved_fn_zan_ret = g->current_fn_zan_ret_type;
+    bool saved_fn_ref_ret = g->current_fn_is_ref_return;
     LLVMValueRef saved_this = g->current_this;
     zan_symbol_t *saved_type_sym = g->current_type_sym;
     zan_ast_node_t *saved_fn_body = g->current_fn_body;
     g->current_fn = sp.fn;
     g->current_fn_ret_type = llvm_ret;
     g->current_fn_zan_ret_type = ret_type;
+    g->current_fn_is_ref_return = member->method_decl.is_ref_return;
     int saved_throw_base = g->throw_locals_base;
     int saved_catch_cc = g->catch_cleanup_count;
     int saved_throw_cb = g->throw_catch_base;
@@ -1288,6 +1491,7 @@ static void emit_method_spec_body(zan_irgen_t *g, int idx) {
     g->current_fn = saved_fn;
     g->current_fn_ret_type = saved_fn_ret;
     g->current_fn_zan_ret_type = saved_fn_zan_ret;
+    g->current_fn_is_ref_return = saved_fn_ref_ret;
     g->throw_locals_base = saved_throw_base;
     g->catch_cleanup_count = saved_catch_cc;
     g->throw_catch_base = saved_throw_cb;

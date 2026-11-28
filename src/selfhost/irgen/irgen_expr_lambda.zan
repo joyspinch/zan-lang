@@ -262,7 +262,19 @@ partial class Irgen {
         if (HasMod(m, MOD.Static())) { return EmitMethodGroup(owner.sval, cls, m, owner); }
         ExprVal recv;
         if (e.kind == AK.Ident()) { recv = new ExprVal("%this", CurThisTy()); }
-        else { recv = GenExpr(e.a); }
+        else {
+            recv = GenExpr(e.a);
+            if (cls != null && cls.kind == AK.ClassDecl()) {
+                string rrt = MapType(recv.ty);
+                if (IsPtrLL(rrt)) {
+                    string rnm = e.a != null && e.a.kind == AK.Ident() && e.a.sval != ""
+                        ? e.a.sval : e.sval;
+                    string sel = EmitGuardNullObj(e, recv.op, rrt,
+                        "null reference: receiver '" + rnm + "' is null");
+                    recv = new ExprVal(sel, recv.ty);
+                }
+            }
+        }
         return EmitInstanceMethodGroup(recv, cls, m, owner);
     }
 
@@ -367,10 +379,30 @@ partial class Irgen {
         string callRt = rt;
         if (slot >= 0) {
             L("  %vptr = bitcast " + recvTy + " %rcv to i8**");
-            L("  %vtable = load i8*, i8** %vptr");
-            L("  %vslots = bitcast i8* %vtable to i8**");
+            L("  %vtable0 = load i8*, i8** %vptr");
+            string vtOp = "%vtable0";
+            if (!HasMod(cls, MOD.Abstract()) && !HasMod(cls, MOD.Iface())) {
+                List<Node> vms = new List<Node>();
+                CollectVSlotNodes(cls, vms);
+                L("  %vtnull = icmp eq i8* %vtable0, null");
+                L("  %vtable = select i1 %vtnull, i8* bitcast ([" + vms.Count + " x i8*]* @" + owner + "_vtable to i8*), i8* %vtable0");
+                vtOp = "%vtable";
+            } else {
+                L("  %vtnull = icmp eq i8* %vtable0, null");
+                L("  br i1 %vtnull, label %vtnil, label %vtgo");
+                L("vtnil:");
+                if (rt == "void") { L("  ret void"); }
+                else { L("  ret " + rt + " " + ZeroValForLL(rt)); }
+                L("vtgo:");
+            }
+            L("  %vslots = bitcast i8* " + vtOp + " to i8**");
             L("  %vslot = getelementptr i8*, i8** %vslots, i64 " + slot);
             L("  %vraw = load i8*, i8** %vslot");
+            if (HasMod(cls, MOD.Abstract()) || HasMod(cls, MOD.Iface())) {
+                L("  %vfnull = icmp eq i8* %vraw, null");
+                L("  br i1 %vfnull, label %vtnil, label %vtcall");
+                L("vtcall:");
+            }
             L("  %vfn = bitcast i8* %vraw to " + MethodFnTypeThis(m, owner));
             fn = "%vfn"; callRt = MapTypeDecl(m.type, owner);
         }
@@ -735,7 +767,8 @@ partial class Irgen {
         List<string> sCapNames = capNames;
         int sBrk = brkTarget; int sCont = contTarget;
         int sLoopScope = loopScopeBase;
-        List<string> svT = stmtTemps; List<Node> svTT = stmtTempTypes;
+        List<string> svT = stmtTemps; List<string> svTV = stmtTempValues;
+        List<string> svTO = stmtTempOwners; List<Node> svTT = stmtTempTypes;
         List<Node> sFinBodies = finBodies;
         List<int> sFinLive = finLive;
         List<int> sFinActive = finActive;
@@ -872,7 +905,8 @@ partial class Irgen {
             // the caller's (`%t4` here is the exception object, `%t4` there
             // is the closure's function pointer), and the caller would then
             // release a function pointer as if it were an object.
-            stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
+            stmtTemps = new List<string>(); stmtTempValues = new List<string>();
+            stmtTempOwners = new List<string>(); stmtTempTypes = new List<Node>();
             GenStmt(lam.d);
             if (!term) {
                 EmitTempReleases();
@@ -881,7 +915,8 @@ partial class Irgen {
                 else { L("  ret " + curRet + " " + ZeroConst(curRet)); }
             }
         } else {
-            stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
+            stmtTemps = new List<string>(); stmtTempValues = new List<string>();
+            stmtTempOwners = new List<string>(); stmtTempTypes = new List<Node>();
             ExprVal rv = GenExpr(lam.a);
             if (curRet == "void") {
                 EmitTempReleases();
@@ -939,7 +974,7 @@ partial class Irgen {
         locBox = sLocBox; locIter = sLocIter; locCell = sLocCell; capNames = sCapNames;
         brkTarget = sBrk; contTarget = sCont;
         loopScopeBase = sLoopScope;
-        stmtTemps = svT; stmtTempTypes = svTT;
+        stmtTemps = svT; stmtTempValues = svTV; stmtTempOwners = svTO; stmtTempTypes = svTT;
         finBodies = sFinBodies; finLive = sFinLive; finActive = sFinActive;
         finMonSlot = sFinMonSlot;
         catchExcVal = sCatchExcVal; catchExcTid = sCatchExcTid;

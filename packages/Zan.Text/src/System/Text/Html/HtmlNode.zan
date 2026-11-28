@@ -26,12 +26,20 @@ public class HtmlNode {
     public string text;
     // 属性（名字小写 → 值）。同名属性取第一个（HTML 规则）；按需懒建，消除文本/无属性节点字典分配。
     internal Dictionary<string, string> attrsMap;
+    // 热属性缓存（class / id）；未对外暴露 attrs 字典时零哈希直接命中。
+    internal string cachedClass;
+    internal string cachedId;
+    internal bool attrsExposed;
     public Dictionary<string, string> attrs {
         get {
+            this.attrsExposed = true;
             if (this.attrsMap == null) { this.attrsMap = new Dictionary<string, string>(); }
             return this.attrsMap;
         }
-        set { this.attrsMap = value; }
+        set {
+            this.attrsExposed = true;
+            this.attrsMap = value;
+        }
     }
     // 子节点；按需懒建，消除文本/注释/叶子节点列表分配。
     internal List<HtmlNode> childList;
@@ -52,6 +60,9 @@ public class HtmlNode {
         this.tag = "";
         this.text = "";
         this.attrsMap = null;
+        this.cachedClass = null;
+        this.cachedId = null;
+        this.attrsExposed = false;
         this.childList = null;
         this.parentNode = null;
         this.index = 0;
@@ -108,9 +119,37 @@ public class HtmlNode {
         return n;
     }
 
-    // 挂一个子节点（同时维护父指针与 index）。
+    // 挂一个子节点（同时维护父指针与 index；拒绝自环/祖先环并先从旧父摘除）。
     public void AppendChild(HtmlNode child) {
         if (child == null) { return; }
+        if (child == this) {
+            throw new InvalidOperationException("HtmlNode.AppendChild: cannot append a node to itself");
+        }
+        if (child.childList != null && child.childList.Count > 0) {
+            HtmlNode anc = this.parentNode;
+            int guard = 0;
+            while (anc != null && guard < 1024) {
+                if (anc == child) {
+                    throw new InvalidOperationException("HtmlNode.AppendChild: cycle detected");
+                }
+                anc = anc.parentNode;
+                guard = guard + 1;
+            }
+        }
+        HtmlNode oldParent = child.parentNode;
+        if (oldParent != null && oldParent.childList != null) {
+            int oi = child.index;
+            if (oi >= 0 && oi < oldParent.childList.Count && oldParent.childList[oi] == child) {
+                oldParent.RemoveChildAt(oi);
+            } else {
+                for (int i = 0; i < oldParent.childList.Count; i = i + 1) {
+                    if (oldParent.childList[i] == child) {
+                        oldParent.RemoveChildAt(i);
+                        break;
+                    }
+                }
+            }
+        }
         if (this.childList == null) { this.childList = new List<HtmlNode>(); }
         child.index = this.childList.Count;
         this.childList.Add(child);
@@ -146,10 +185,21 @@ public class HtmlNode {
         if (name == null) { return; }
         if (value == null) {
             if (this.attrsMap != null) { this.attrsMap.Remove(name); }
+            if (name == "class") { this.cachedClass = null; }
+            else if (name == "id") { this.cachedId = null; }
             return;
         }
         if (this.attrsMap == null) { this.attrsMap = new Dictionary<string, string>(); }
         this.attrsMap[name] = value;
+        if (name == "class") { this.cachedClass = value; }
+        else if (name == "id") { this.cachedId = value; }
+    }
+
+    internal string GetIdFast() {
+        if (!this.attrsExposed) {
+            return this.cachedId != null ? this.cachedId : "";
+        }
+        return this.Get("id", "");
     }
 
     // class 属性拆成的类名列表。
@@ -167,23 +217,39 @@ public class HtmlNode {
         return out2;
     }
 
-    // 是否带这个类名（原地空白切词比对，零 List/Substring 分配）。
+    // 是否带这个类名（优先走 cachedClass + Span 原地空白切词比对，零字典哈希与零分配）。
     public bool HasClass(string name) {
-        if (name == null || name.Length == 0 || this.attrsMap == null) { return false; }
-        string raw;
-        if (!this.attrsMap.TryGetValue("class", out raw)) { return false; }
+        if (name == null || name.Length == 0) { return false; }
+        string raw = "";
+        if (!this.attrsExposed) {
+            raw = this.cachedClass;
+            if (raw == null) { return false; }
+        } else {
+            if (this.attrsMap == null || !this.attrsMap.TryGetValue("class", out raw)) { return false; }
+        }
         int n = raw.Length;
         int wl = name.Length;
         if (n < wl) { return false; }
+        if (n == wl) { return raw == name; }
+        Span<byte> rb = new Span<byte>((nint)raw, n);
+        Span<byte> nb = new Span<byte>((nint)name, wl);
         int i = 0;
         while (i < n) {
-            while (i < n && HtmlUtil.IsSpace(raw[i] & 255)) { i = i + 1; }
+            while (i < n) {
+                int c = rb[i];
+                if (c != 32 && c != 9 && c != 13 && c != 10) { break; }
+                i = i + 1;
+            }
             int start = i;
-            while (i < n && !HtmlUtil.IsSpace(raw[i] & 255)) { i = i + 1; }
+            while (i < n) {
+                int c = rb[i];
+                if (c == 32 || c == 9 || c == 13 || c == 10) { break; }
+                i = i + 1;
+            }
             if (i - start == wl) {
                 bool eq = true;
                 for (int k = 0; k < wl; k = k + 1) {
-                    if ((raw[start + k] & 255) != (name[k] & 255)) { eq = false; break; }
+                    if (rb[start + k] != nb[k]) { eq = false; break; }
                 }
                 if (eq) { return true; }
             }
@@ -204,16 +270,16 @@ public class HtmlNode {
     // 全部后代文本（拼接）。
     public string TextContent() {
         StringBuilder sb = new StringBuilder();
-        HtmlNode.CollectText(this, sb);
+        HtmlNode.CollectTextDepth(this, sb, 0);
         return sb.ToString();
     }
 
-    static void CollectText(HtmlNode node, StringBuilder sb) {
-        if (node.childList == null) { return; }
+    static void CollectTextDepth(HtmlNode node, StringBuilder sb, int depth) {
+        if (node == null || sb == null || depth > 512 || node.childList == null) { return; }
         for (int i = 0; i < node.childList.Count; i = i + 1) {
             HtmlNode c = node.childList[i];
             if (c.type == HtmlNodeType.Text) { sb.Append(c.text); }
-            else if (c.type == HtmlNodeType.Element) { HtmlNode.CollectText(c, sb); }
+            else if (c.type == HtmlNodeType.Element) { HtmlNode.CollectTextDepth(c, sb, depth + 1); }
         }
     }
 
@@ -222,7 +288,7 @@ public class HtmlNode {
         StringBuilder sb = new StringBuilder();
         if (this.childList != null) {
             for (int i = 0; i < this.childList.Count; i = i + 1) {
-                HtmlNode.WriteOuter(this.childList[i], sb);
+                HtmlNode.WriteOuterDepth(this.childList[i], sb, 0);
             }
         }
         return sb.ToString();
@@ -231,16 +297,21 @@ public class HtmlNode {
     // 本节点序列化（HTML 源码形态）。
     public string OuterHtml() {
         StringBuilder sb = new StringBuilder();
-        HtmlNode.WriteOuter(this, sb);
+        HtmlNode.WriteOuterDepth(this, sb, 0);
         return sb.ToString();
     }
 
     // 序列化一个节点。
     public static void WriteOuter(HtmlNode node, StringBuilder sb) {
+        HtmlNode.WriteOuterDepth(node, sb, 0);
+    }
+
+    private static void WriteOuterDepth(HtmlNode node, StringBuilder sb, int depth) {
+        if (node == null || sb == null || depth > 512) { return; }
         if (node.type == HtmlNodeType.Document) {
             if (node.childList != null) {
                 for (int i = 0; i < node.childList.Count; i = i + 1) {
-                    HtmlNode.WriteOuter(node.childList[i], sb);
+                    HtmlNode.WriteOuterDepth(node.childList[i], sb, depth + 1);
                 }
             }
             return;
@@ -250,8 +321,18 @@ public class HtmlNode {
             return;
         }
         if (node.type == HtmlNodeType.Comment) {
+            string ct = node.text == null ? "" : node.text;
+            if (ct.IndexOf("-->") >= 0) { ct = ct.Replace("-->", "--&gt;"); }
+            if (ct.IndexOf("--!>") >= 0) { ct = ct.Replace("--!>", "--!&gt;"); }
             sb.Append("<!--");
-            sb.Append(node.text);
+            if ((ct.Length > 0 && (ct[0] & 255) == 62)
+                || (ct.Length >= 2 && (ct[0] & 255) == 45 && (ct[1] & 255) == 62)) {
+                sb.Append(" ");
+            }
+            sb.Append(ct);
+            if (ct.Length > 0 && (ct[ct.Length - 1] & 255) == 45) {
+                sb.Append(" ");
+            }
             sb.Append("-->");
             return;
         }
@@ -271,7 +352,7 @@ public class HtmlNode {
         if (HtmlUtil.IsVoidTag(node.tag)) { return; }
         if (node.childList != null) {
             for (int i = 0; i < node.childList.Count; i = i + 1) {
-                HtmlNode.WriteOuter(node.childList[i], sb);
+                HtmlNode.WriteOuterDepth(node.childList[i], sb, depth + 1);
             }
         }
         sb.Append("</");

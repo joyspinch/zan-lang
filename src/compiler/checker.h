@@ -22,6 +22,8 @@ struct zan_checker {
   zan_diag_t *diag;
   zan_type_t *current_return_type;
   bool in_no_runtime;
+  bool in_noalloc;
+  bool freestanding;
   zan_symbol_t *current_type_sym;
   bool in_ctor;
   struct checker_local *locals;
@@ -30,6 +32,7 @@ struct zan_checker {
   /* ref/out bindings retain their lexical slot identity across lambdas. */
   struct checker_byref_parameter *byref_parameters;
   int lambda_depth;
+  int in_noescape_lambda;
   zan_ast_node_t *last_call_node;
   zan_symbol_t *last_call_method;
   /* Immediate consumer must not use a recovery type as navigation evidence. */

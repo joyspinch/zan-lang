@@ -406,6 +406,8 @@ bool types_equal(zan_type_t *a, zan_type_t *b) {
         return true;
     }
     if (a->kind != b->kind) return false;
+    if (a->kind == TYPE_CONST_INT)
+        return a->const_int_val == b->const_int_val;
     if (a->sym && b->sym && a->sym == b->sym) {
         /* 同一类型符号 */
     } else if (a->name.len != b->name.len ||
@@ -549,6 +551,12 @@ void mangle_type_token(char *buf, size_t n, size_t *off, zan_type_t *t) {
     if (!t) return;
     if (t->is_canon) {
         int w = snprintf(buf + (*off < n ? *off : n), (*off < n) ? n - *off : 0, "__Canon");
+        if (w > 0) *off += (size_t)w;
+        return;
+    }
+    if (t->kind == TYPE_CONST_INT) {
+        int w = snprintf(buf + (*off < n ? *off : n), (*off < n) ? n - *off : 0,
+                         "c%lld", (long long)t->const_int_val);
         if (w > 0) *off += (size_t)w;
         return;
     }

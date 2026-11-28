@@ -65,21 +65,63 @@ public static class TwoBoneIk {
 
         Vector3 mid = TwoBoneIk.SolveMidPosition(pRoot, target, pole, upper, lower);
 
-        // 局部 +Y 指向目标，弯曲平面由极向量定。
+        // 弯曲平面法线由 (target - pRoot) 与极向量决定。
+        Vector3 rootToTarget = Vector3.Subtract(target, pRoot);
+        if (rootToTarget.Length() <= 0.00001f) {
+            rootToTarget = new Vector3(0.0f, 1.0f, 0.0f);
+        }
+        Vector3 rootDir = AnimMath.Normalize(rootToTarget);
+        Vector3 perp = TwoBoneIk.PerpendicularComponent(Vector3.Subtract(pole, pRoot), rootDir);
+        Vector3 planeNormal = AnimMath.Normalize(Vector3.Cross(rootDir, perp));
+
+        // 1. 旋转根骨骼（上臂/大腿），将其从当前指向 pMid 的方向最短弧旋向解算出的 mid 点，避免子骨局部平移脱臼。
+        Vector3 curUpper = AnimMath.Normalize(Vector3.Subtract(pMid, pRoot));
+        Vector3 wantUpper = AnimMath.Normalize(Vector3.Subtract(mid, pRoot));
+        Transform3D rootWorld = skeleton.WorldPose(rootBone);
+        if (curUpper.Length() > 0.0f && wantUpper.Length() > 0.0f) {
+            Quaternion swingRoot = TwoBoneIk.ShortestArc(curUpper, wantUpper);
+            Quaternion newRootRot = Quaternion.Normalize(Quaternion.Multiply(swingRoot, rootWorld.Rotation));
+            skeleton.SetWorldPose(rootBone, new Transform3D(pRoot, newRootRot, rootWorld.Scale));
+            skeleton.ComputeWorldPoses();
+        }
+
+        // 2. 旋转中间骨（前臂/小腿），使其局部骨骼轴（pTip - pMid）精确指向目标，并保持在极向量弯曲平面内。
+        Vector3 pMidAfter = skeleton.WorldPosition(midBone);
+        Vector3 pTipAfter = skeleton.WorldPosition(tipBone);
+        Vector3 curLower = AnimMath.Normalize(Vector3.Subtract(pTipAfter, pMidAfter));
         Vector3 dir = Vector3.Subtract(target, mid);
         if (dir.Length() <= 0.00001f) {
             dir = Vector3.Subtract(pTip, pMid);
         }
         dir = AnimMath.Normalize(dir);
 
-        Vector3 rootDir = AnimMath.Normalize(Vector3.Subtract(target, pRoot));
-        Vector3 perp = TwoBoneIk.PerpendicularComponent(Vector3.Subtract(pole, pRoot), rootDir);
-        Vector3 planeNormal = AnimMath.Normalize(Vector3.Cross(rootDir, perp));
-
-        Quaternion rotation = TwoBoneIk.RotationFromDirection(dir, planeNormal);
-        Transform3D world = skeleton.WorldPose(midBone);
-        skeleton.SetWorldPose(midBone, new Transform3D(mid, rotation, world.Scale));
+        Transform3D midWorld = skeleton.WorldPose(midBone);
+        Quaternion midRot;
+        if (curLower.Length() > 0.0f) {
+            Quaternion swingMid = TwoBoneIk.ShortestArc(curLower, dir);
+            midRot = Quaternion.Normalize(Quaternion.Multiply(swingMid, midWorld.Rotation));
+        } else {
+            midRot = TwoBoneIk.RotationFromDirection(dir, planeNormal);
+        }
+        skeleton.SetWorldPose(midBone, new Transform3D(mid, midRot, midWorld.Scale));
         return true;
+    }
+
+    // 计算将单位向量 from 旋到单位向量 to 的最短弧四元数。
+    private static Quaternion ShortestArc(Vector3 from, Vector3 to) {
+        float d = Vector3.Dot(from, to);
+        if (d > 0.999999f) {
+            return Quaternion.Identity;
+        }
+        if (d < -0.999999f) {
+            Vector3 ortho = Vector3.Cross(from, new Vector3(1.0f, 0.0f, 0.0f));
+            if (ortho.Length() <= 0.0001f) {
+                ortho = Vector3.Cross(from, new Vector3(0.0f, 0.0f, 1.0f));
+            }
+            return Quaternion.FromAxisAngle(AnimMath.Normalize(ortho), 3.14159265f);
+        }
+        Vector3 axis = AnimMath.Normalize(Vector3.Cross(from, to));
+        return Quaternion.FromAxisAngle(axis, AnimMath.Acos(AnimMath.Clamp(d, -1.0f, 1.0f)));
     }
 
     // 构造局部 +Y 指向 direction、局部 X 轴位于 (planeNormal, direction) 平面的旋转（最短弧对齐 + 绕轴扭转）。

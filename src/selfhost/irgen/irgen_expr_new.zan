@@ -3,8 +3,49 @@ using System.Collections.Generic;
 namespace Zan;
 
 partial class Irgen {
+    // Unpack a struct-typed container slot (`List<Struct>` / `Dictionary<K, Struct>`):
+    // when an out-of-bounds or missing-key soft guard returns 0, substitute the
+    // zero-filled soft-null scratch buffer instead of a null struct pointer so
+    // subsequent struct field reads yield zero without segfaulting or leaking.
+    ExprVal FromStructSlotSafe(string slot, Node elemTy) {
+        string rty = MapType(elemTy);
+        if (!IsPtrLL(rty)) { return FromSlot(slot, elemTy); }
+        if (!ExternSeen("zan_rt_soft_scratch")) {
+            externDecls.Add("zan_rt_soft_scratch");
+            H("declare i8* @zan_rt_soft_scratch()");
+        }
+        string isz = NT();
+        L("  " + isz + " = icmp eq i64 " + slot + ", 0");
+        int lok = NL(); int lbad = NL(); int ldone = NL();
+        L("  br i1 " + isz + ", label %L" + lbad + ", label %L" + lok);
+        Label(lok);
+        string okp = NT();
+        L("  " + okp + " = inttoptr i64 " + slot + " to " + rty);
+        string okLbl = curLbl;
+        L("  br label %L" + ldone);
+        Label(lbad);
+        string sc = NT();
+        L("  " + sc + " = call i8* @zan_rt_soft_scratch()");
+        string zp = NT();
+        L("  " + zp + " = bitcast i8* " + sc + " to " + rty);
+        string badLbl = curLbl;
+        L("  br label %L" + ldone);
+        Label(ldone);
+        string res = NT();
+        L("  " + res + " = phi " + rty + " [ " + okp + ", %" + okLbl + " ], [ " + zp + ", %" + badLbl + " ]");
+        return new ExprVal(res, elemTy);
+    }
+
     // ---- indexing (string char / list element / array) ----
     ExprVal GenIndex(Node e, bool asPlace = false, bool hold = false) {
+        bool arm = eaActive;
+        if (arm) { EnterCallArm(); }
+        ExprVal res = GenIndexCore(e, asPlace, hold);
+        if (arm) { LeaveCallArm(); }
+        return res;
+    }
+
+    ExprVal GenIndexCore(Node e, bool asPlace = false, bool hold = false) {
         ExprVal obj = GenExpr(e.a);
         if (hold && obj.ty != null && obj.ty.ival >= 1) { HoldArrayPlace(obj); }
         ExprVal idx = GenExpr(e.b);
@@ -65,6 +106,7 @@ partial class Irgen {
             return new ExprVal(z, MkType("char"));
         }
         if (IsListType(obj.ty)) {
+            Node el = ListElem(obj.ty);
             string slot = NT();
             if (runtimeChecks) {
                 EnsureListGetChkHelper();
@@ -74,7 +116,8 @@ partial class Irgen {
             } else {
                 L("  " + slot + " = call i64 @zlist_get(i8* " + obj.op + ", i64 " + idx.op + ")");
             }
-            return FromSlot(slot, ListElem(obj.ty));
+            if (IsStructTy(el)) { return FromStructSlotSafe(slot, el); }
+            return FromSlot(slot, el);
         }
         if (IsSpanType(obj.ty)) {
             Node el = SpanElem(obj.ty);
@@ -158,7 +201,9 @@ partial class Irgen {
             EmitSoftRuntimeError(e, "Dict key not found in indexer read");
             L("  br label %L" + ldone);
             Label(ldone);
-            return FromSlot(slot, DictVal(obj.ty));
+            Node dval = DictVal(obj.ty);
+            if (IsStructTy(dval)) { return FromStructSlotSafe(slot, dval); }
+            return FromSlot(slot, dval);
         }
         // A user class indexer: the parser desugars `this[int i]` into an
         // `op_index` method (and `op_index_set` for the setter). Call it --
@@ -209,6 +254,8 @@ partial class Irgen {
             return new ExprVal("null", MkType("object"));
         }
         if (e.ival != 1 && IsSpanType(ty)) {
+            bool spanArm = eaActive && e.kids.Count > 1;
+            if (spanArm) { EnterCallArm(); }
             string baseOp = "null";
             string lenOp = "0";
             if (e.kids.Count > 0) {
@@ -230,6 +277,7 @@ partial class Irgen {
                 ExprVal l = GenExpr(e.kids[1]);
                 lenOp = l.op;
             }
+            if (spanArm) { LeaveCallArm(); }
             string iv0 = NT();
             L("  " + iv0 + " = insertvalue { i8*, i64 } undef, i8* " + baseOp + ", 0");
             string iv1 = NT();
@@ -295,11 +343,15 @@ partial class Irgen {
             string arr = ArrayAllocate(at, nsz.op);
             string storage = ArrayStorage(elemTy);
             if (init) {
+                string arrGuard = ArmGuardSlot(arr, at, "i64*");
+                if (eaActive) { EnterCallArm(); }
                 int jn = 0;
                 while (jn < e.kids.Count) {
                     InitArrayElement(arr, "" + jn, elemTy, storage, GenExpr(e.kids[jn]));
                     jn = jn + 1;
                 }
+                if (eaActive) { LeaveCallArm(); }
+                RetireGuardSlot(arrGuard, "i64*");
             } else if (storage == "i64" && IsStructTy(elemTy)) {
                 L("  call void @" + elemTy.sval + "_initarr(i64* " + arr + ", i64 " + nsz.op + ")");
             }
@@ -312,6 +364,12 @@ partial class Irgen {
             int ownership = ListSlotOwnership(ListElem(ty));
             string meta = ListTypeMetadata(ty);
             L("  " + t + " = call i8* @zlist_new_typed(i64 " + ownership + ", i8* " + meta + ")");
+            bool listHasInit = (e.ival == 2 && e.kids.Count > 0) || e.kids.Count > 0;
+            string listGuard = "";
+            if (listHasInit) {
+                listGuard = ArmGuardSlot(t, ty, "i8*");
+                if (eaActive) { EnterCallArm(); }
+            }
             if (e.ival == 2) {
                 // collection initializer: append each item
                 int j = 0;
@@ -386,6 +444,10 @@ partial class Irgen {
                     j = j + 1;
                 }
             }
+            if (listHasInit) {
+                if (eaActive) { LeaveCallArm(); }
+                RetireGuardSlot(listGuard, "i8*");
+            }
             AddTemp(t, ty);
             return new ExprVal(t, ty);
         }
@@ -395,6 +457,8 @@ partial class Irgen {
             string meta = DictTypeMetadata(ty);
             L("  " + t + " = call i8* @zdict_new_typed(i64 " + ow + ", i8* " + meta + ")");
             if (e.ival == 2) {
+                string dictGuard = ArmGuardSlot(t, ty, "i8*");
+                if (eaActive) { EnterCallArm(); }
                 // collection initializer: each item is a key/value pair.
                 int j = 0;
                 while (j < e.kids.Count) {
@@ -407,6 +471,8 @@ partial class Irgen {
                     }
                     j = j + 1;
                 }
+                if (eaActive) { LeaveCallArm(); }
+                RetireGuardSlot(dictGuard, "i8*");
             }
             AddTemp(t, ty);
             return new ExprVal(t, ty);
@@ -471,15 +537,8 @@ partial class Irgen {
         // would treat a stmtTemps receiver as stealable via TakeOwnedTemp and
         // drop it mid-construction) and bracket ctor/init calls with
         // EnterCallArm so throwing arguments or constructors unwind cleanly.
-        string objGuard = "";
         string objLt = "%" + cn + "*";
-        if (eaActive) {
-            objGuard = NTS();
-            entryAllocas.Append("  " + objGuard + " = alloca " + objLt + "\n");
-            entryAllocas.Append("  store " + objLt + " null, " + objLt + "* " + objGuard + "\n");
-            L("  store " + objLt + " " + obj + ", " + objLt + "* " + objGuard);
-            ArmLocalSlot(objGuard, ty, false);
-        }
+        string objGuard = ArmGuardSlot(obj, ty, objLt);
         EnterCallArm();
         // The constructor: with an object initializer (ival == 2) the kids are
         // `Field = value` pairs, not ctor args, so only a parameterless ctor
@@ -624,10 +683,7 @@ partial class Irgen {
         // object initializer: store each `Field = value` into the instance
         if (e.ival == 2) { ApplyObjInit(e, obj, ty, cls, cn); }
         LeaveCallArm();
-        if (objGuard != "") {
-            RetireLocalSlot(objGuard, objLt);
-            L("  store " + objLt + " null, " + objLt + "* " + objGuard);
-        }
+        RetireGuardSlot(objGuard, objLt);
         AddTemp(obj, ty);
         // preserve generic type arguments (ty may carry <...>) for the result
         return new ExprVal(obj, ty);
@@ -702,6 +758,7 @@ partial class Irgen {
                 // as a field wrote into a field slot that does not exist
                 // (index -1 -> invalid IR).
                 if (EmitPropSet(obj, ty, it.a.sval, fv)) { j = j + 1; continue; }
+                if (fty0 != null) { fv = NarrowToDeclared(fv, SubstRecvTy(fty0, ty)); }
                 StoreField(obj, cn, it.a.sval, fv);
             }
             j = j + 1;
@@ -712,10 +769,13 @@ partial class Irgen {
     // the initializer (the host's construct_new factory path) -- every item
     // acts on the ONE evaluated object.
     ExprVal GenCallInit(Node e) {
+        bool arm = eaActive;
+        if (arm) { EnterCallArm(); }
         ExprVal r = GenExpr(e.a);
         Node cls = ClassOf(r.ty);
         if (cls == null || r.ty == null) {
             diags.Error("[E3022] object initializer can only continue a call that returns a class instance", e.line, e.col);
+            if (arm) { LeaveCallArm(); }
             return r;
         }
         string cn = cls.sval;
@@ -726,6 +786,7 @@ partial class Irgen {
         string obj = NT();
         L("  " + obj + " = bitcast " + MapType(r.ty) + " " + r.op + " to %" + cn + "*");
         ApplyObjInit(e, obj, r.ty, cls, cn);
+        if (arm) { LeaveCallArm(); }
         return r;
     }
 

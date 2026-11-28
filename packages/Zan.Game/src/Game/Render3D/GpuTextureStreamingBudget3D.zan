@@ -1,0 +1,124 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Render3D;
+
+// 单张受流送预算管理的 3D 纹理槽位（Mip0 最高清，MaxMipLevel 最粗略保底）。
+public class StreamingTextureSlot3D {
+    public string TextureKey;
+    public long BaseSizeBytes;
+    public int MaxMipLevel;
+    public int DesiredMipLevel;
+    public int ResidentMipLevel;
+    public float PriorityScore;
+
+    public StreamingTextureSlot3D(string textureKey, long baseSizeBytes, int maxMipLevel) {
+        this.TextureKey = textureKey;
+        this.BaseSizeBytes = baseSizeBytes > 0L ? baseSizeBytes : 4096L;
+        this.MaxMipLevel = maxMipLevel >= 0 ? maxMipLevel : 4;
+        this.DesiredMipLevel = this.MaxMipLevel;
+        this.ResidentMipLevel = this.MaxMipLevel;
+        this.PriorityScore = 0.0f;
+    }
+
+    public long BytesAtMip(int mipLevel) {
+        int m = mipLevel;
+        if (m < 0) { m = 0; }
+        if (m > this.MaxMipLevel) { m = this.MaxMipLevel; }
+        long bytes = this.BaseSizeBytes;
+        for (int i = 0; i < m; i = i + 1) {
+            bytes = bytes / 4L;
+            if (bytes < 64L) { bytes = 64L; }
+        }
+        return bytes;
+    }
+
+    public long CurrentResidentBytes() {
+        return this.BytesAtMip(this.ResidentMipLevel);
+    }
+}
+
+// 商业 3D 显存纹理 Mipmap 流送预算器：高优先近景纹理自动升清，超预算时自动降级低优先远景 Mip，严守 VRAM 上限。
+public class GpuTextureStreamingBudget3D {
+    private List<StreamingTextureSlot3D> slots;
+    public long MaxVramBytes;
+
+    public GpuTextureStreamingBudget3D(long maxVramBytes) {
+        this.slots = new List<StreamingTextureSlot3D>();
+        this.MaxVramBytes = maxVramBytes > 0L ? maxVramBytes : 67108864L;
+    }
+
+    public void RegisterTexture(string textureKey, long baseSizeBytes, int maxMipLevel) {
+        for (int i = 0; i < this.slots.Count; i = i + 1) {
+            if (this.slots[i].TextureKey == textureKey) { return; }
+        }
+        this.slots.Add(new StreamingTextureSlot3D(textureKey, baseSizeBytes, maxMipLevel));
+    }
+
+    public void UpdateDemand(string textureKey, int desiredMipLevel, float priorityScore) {
+        for (int i = 0; i < this.slots.Count; i = i + 1) {
+            StreamingTextureSlot3D s = this.slots[i];
+            if (s.TextureKey == textureKey) {
+                int m = desiredMipLevel;
+                if (m < 0) { m = 0; }
+                if (m > s.MaxMipLevel) { m = s.MaxMipLevel; }
+                s.DesiredMipLevel = m;
+                s.PriorityScore = priorityScore;
+                return;
+            }
+        }
+    }
+
+    public long TotalResidentBytes() {
+        long sum = 0L;
+        for (int i = 0; i < this.slots.Count; i = i + 1) {
+            sum = sum + this.slots[i].CurrentResidentBytes();
+        }
+        return sum;
+    }
+
+    public int ResidentMipOf(string textureKey) {
+        for (int i = 0; i < this.slots.Count; i = i + 1) {
+            if (this.slots[i].TextureKey == textureKey) { return this.slots[i].ResidentMipLevel; }
+        }
+        return -1;
+    }
+
+    // 执行一轮显存配额重平衡：先按期望降级释放冗余显存，再按优先级降序逐级升清直至逼近 MaxVramBytes。
+    public void RebalanceBudget() {
+        for (int i = 0; i < this.slots.Count; i = i + 1) {
+            StreamingTextureSlot3D s = this.slots[i];
+            if (s.ResidentMipLevel < s.DesiredMipLevel) {
+                s.ResidentMipLevel = s.DesiredMipLevel;
+            }
+        }
+        // 若总显存已超限，反复降级当前优先级最低且未触底的槽位
+        while (this.TotalResidentBytes() > this.MaxVramBytes) {
+            int victimIdx = -1;
+            for (int i = 0; i < this.slots.Count; i = i + 1) {
+                StreamingTextureSlot3D s = this.slots[i];
+                if (s.ResidentMipLevel >= s.MaxMipLevel) { continue; }
+                if (victimIdx < 0 || s.PriorityScore < this.slots[victimIdx].PriorityScore) {
+                    victimIdx = i;
+                }
+            }
+            if (victimIdx < 0) { break; }
+            this.slots[victimIdx].ResidentMipLevel = this.slots[victimIdx].ResidentMipLevel + 1;
+        }
+        // 预算仍有余量时，反复挑选优先级最高且尚未达到期望清晰度的槽位升清
+        while (true) {
+            int bestIdx = -1;
+            for (int i = 0; i < this.slots.Count; i = i + 1) {
+                StreamingTextureSlot3D s = this.slots[i];
+                if (s.ResidentMipLevel <= s.DesiredMipLevel) { continue; }
+                long nextCost = s.BytesAtMip(s.ResidentMipLevel - 1) - s.CurrentResidentBytes();
+                if (this.TotalResidentBytes() + nextCost > this.MaxVramBytes) { continue; }
+                if (bestIdx < 0 || s.PriorityScore > this.slots[bestIdx].PriorityScore) {
+                    bestIdx = i;
+                }
+            }
+            if (bestIdx < 0) { break; }
+            this.slots[bestIdx].ResidentMipLevel = this.slots[bestIdx].ResidentMipLevel - 1;
+        }
+    }
+}

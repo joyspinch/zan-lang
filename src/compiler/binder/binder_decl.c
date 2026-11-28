@@ -365,6 +365,8 @@ static bool binder_type_equal(zan_type_t *a, zan_type_t *b, int depth) {
     return true;
   if (depth > 64 || a->kind != b->kind)
     return false;
+  if (a->kind == TYPE_CONST_INT)
+    return a->const_int_val == b->const_int_val;
   if (a->kind == TYPE_ARRAY || a->kind == TYPE_NULLABLE) {
     if (a->kind == TYPE_ARRAY && a->array_rank != b->array_rank)
       return false;
@@ -561,35 +563,132 @@ static bool class_has_interface_method(zan_binder_t *b, zan_symbol_t *cls,
   return false;
 }
 
+static bool class_has_static_property(zan_binder_t *b, zan_symbol_t *cls,
+                                      zan_ast_node_t *wanted,
+                                      zan_ast_list_t *bind_tps,
+                                      zan_type_t **bind_args) {
+  zan_istr_t wname = wanted->field_decl.name;
+  zan_type_t *wtype = wanted->field_decl.type
+                          ? zan_binder_resolve_type(b, wanted->field_decl.type)
+                          : NULL;
+  if (wtype && bind_tps && bind_tps->count > 0 && bind_args)
+    wtype = zan_binder_subst_named(b, wtype, bind_tps, bind_args);
+  for (zan_symbol_t *s = cls; s;
+       s = (s->type && s->type->base_type) ? s->type->base_type->sym : NULL) {
+    for (int i = 0; i < s->member_count; i++) {
+      zan_symbol_t *m = s->members[i];
+      if (!m || (m->kind != SYM_PROPERTY && m->kind != SYM_FIELD))
+        continue;
+      if (!(m->modifiers & MOD_STATIC))
+        continue;
+      if (m->name.len != wname.len ||
+          memcmp(m->name.str, wname.str, (size_t)wname.len) != 0)
+        continue;
+      if (!wtype || !m->type || wtype->kind == TYPE_TYPE_PARAM ||
+          m->type->kind == TYPE_TYPE_PARAM ||
+          binder_type_equal(m->type, wtype, 0))
+        return true;
+    }
+  }
+  return false;
+}
+
 static void validate_interface_contract(zan_binder_t *b, zan_symbol_t *cls,
                                         zan_ast_node_t *iface, zan_type_t *inst,
                                         int depth) {
   zan_ast_list_t *bind_tps = NULL;
   zan_type_t **bind_args = NULL;
+  zan_ast_list_t combined_tps;
+  zan_ast_list_init(&combined_tps);
+  zan_type_t *combined_args[32];
+  int combined_n = 0;
   if (inst && inst->type_arg_count > 0 &&
       inst->type_arg_count == iface->type_decl.type_params.count) {
-    bind_tps = &iface->type_decl.type_params;
-    bind_args = inst->type_args;
+    for (int k = 0; k < inst->type_arg_count && combined_n < 32; k++) {
+      zan_ast_list_push(&combined_tps, iface->type_decl.type_params.items[k],
+                        b->arena);
+      combined_args[combined_n++] = inst->type_args[k];
+    }
   }
   if (!iface || depth > 64)
     return;
   zan_scope_t *saved = b->current_scope;
   int tp_count = iface->type_decl.type_params.count;
+  b->current_scope = scope_new(b->arena, saved);
   if (tp_count > 0) {
-    b->current_scope = scope_new(b->arena, saved);
     register_type_param_list(b, &iface->type_decl.type_params);
+  }
+  /* Validate associated types first and register them for signature subst */
+  for (int i = 0; i < iface->type_decl.members.count; i++) {
+    zan_ast_node_t *im = iface->type_decl.members.items[i];
+    if (im->kind != AST_ASSOC_TYPE_DECL)
+      continue;
+    zan_istr_t aname = im->field_decl.name;
+    zan_type_t *atp = make_type(b->arena, TYPE_TYPE_PARAM, aname.str, aname.len);
+    zan_symbol_t *asym =
+        make_symbol(b->arena, SYM_TYPE_PARAM, aname, atp, im, 0);
+    scope_add(b->arena, b->current_scope, asym);
+    zan_type_t *impl_t =
+        zan_binder_lookup_assoc_type(b, cls->type, aname);
+    if (!im->field_decl.type) {
+      if (!impl_t || impl_t->kind == TYPE_TYPE_PARAM) {
+        zan_diag_emit_code(
+            b->diag, DIAG_ERROR, cls->decl->loc, 2150,
+            "type '%.*s' does not define associated type '%.*s' required by "
+            "interface '%.*s'",
+            (int)cls->name.len, cls->name.str, (int)aname.len, aname.str,
+            (int)iface->type_decl.name.len, iface->type_decl.name.str);
+      } else if (combined_n < 32) {
+        zan_ast_node_t *id = zan_ast_new(b->arena, AST_IDENTIFIER, im->loc);
+        id->ident.name = aname;
+        zan_ast_list_push(&combined_tps, id, b->arena);
+        combined_args[combined_n++] = impl_t;
+      }
+    }
+  }
+  if (combined_n > 0) {
+    bind_tps = &combined_tps;
+    bind_args = combined_args;
   }
   for (int i = 0; i < iface->type_decl.members.count; i++) {
     zan_ast_node_t *im = iface->type_decl.members.items[i];
-    if (im->kind != AST_METHOD_DECL ||
-        (im->method_decl.modifiers & MOD_STATIC) != 0 || im->method_decl.body)
+    if (im->kind == AST_PROPERTY_DECL &&
+        (im->field_decl.modifiers & (MOD_STATIC | MOD_ABSTRACT)) ==
+            (MOD_STATIC | MOD_ABSTRACT)) {
+      if (!class_has_static_property(b, cls, im, bind_tps, bind_args)) {
+        zan_diag_emit_code(
+            b->diag, DIAG_ERROR, cls->decl->loc, 2149,
+            "type '%.*s' does not implement static abstract property '%.*s' "
+            "from interface '%.*s'",
+            (int)cls->name.len, cls->name.str, (int)im->field_decl.name.len,
+            im->field_decl.name.str, (int)iface->type_decl.name.len,
+            iface->type_decl.name.str);
+      }
+      continue;
+    }
+    if (im->kind != AST_METHOD_DECL || im->method_decl.body)
+      continue;
+    bool is_static_abstract =
+        (im->method_decl.modifiers & (MOD_STATIC | MOD_ABSTRACT)) ==
+        (MOD_STATIC | MOD_ABSTRACT);
+    if ((im->method_decl.modifiers & MOD_STATIC) != 0 && !is_static_abstract)
       continue;
     if (!class_has_interface_method(b, cls, im, bind_tps, bind_args)) {
-      zan_diag_emit_code(
-          b->diag, DIAG_ERROR, cls->decl->loc, 1015,
-          "type '%.*s' does not implement interface method '%.*s'",
-          (int)cls->name.len, cls->name.str, (int)im->method_decl.name.len,
-          im->method_decl.name.str);
+      if (is_static_abstract) {
+        zan_diag_emit_code(
+            b->diag, DIAG_ERROR, cls->decl->loc, 2149,
+            "type '%.*s' does not implement static abstract member '%.*s' "
+            "from interface '%.*s'",
+            (int)cls->name.len, cls->name.str, (int)im->method_decl.name.len,
+            im->method_decl.name.str, (int)iface->type_decl.name.len,
+            iface->type_decl.name.str);
+      } else {
+        zan_diag_emit_code(
+            b->diag, DIAG_ERROR, cls->decl->loc, 1015,
+            "type '%.*s' does not implement interface method '%.*s'",
+            (int)cls->name.len, cls->name.str, (int)im->method_decl.name.len,
+            im->method_decl.name.str);
+      }
     }
   }
   for (int i = 0; i < iface->type_decl.bases.count; i++) {
@@ -778,10 +877,31 @@ static void bind_members(zan_binder_t *b, zan_ast_node_t *type_node) {
     symbol_add_member(b->arena, type_sym, tp_sym);
   }
 
+  /* Pre-pass: register associated types so methods/properties on the same
+   * interface/struct/class can reference them directly by name. */
+  for (int i = 0; i < type_node->type_decl.members.count; i++) {
+    zan_ast_node_t *member = type_node->type_decl.members.items[i];
+    if (member->kind != AST_ASSOC_TYPE_DECL)
+      continue;
+    zan_type_t *assoc_type =
+        member->field_decl.type
+            ? zan_binder_resolve_type(b, member->field_decl.type)
+            : make_type(b->arena, TYPE_TYPE_PARAM, member->field_decl.name.str,
+                        member->field_decl.name.len);
+    zan_symbol_t *assoc_sym =
+        make_symbol(b->arena, SYM_ASSOC_TYPE, member->field_decl.name,
+                    assoc_type, member, member->field_decl.modifiers);
+    scope_add(b->arena, b->current_scope, assoc_sym);
+    symbol_add_member(b->arena, type_sym, assoc_sym);
+    zan_binder_record_reference(b, assoc_sym, member);
+  }
+
   for (int i = 0; i < type_node->type_decl.members.count; i++) {
     zan_ast_node_t *member = type_node->type_decl.members.items[i];
 
     switch (member->kind) {
+    case AST_ASSOC_TYPE_DECL:
+      break;
     case AST_FIELD_DECL:
     case AST_PROPERTY_DECL: {
       zan_type_t *field_type =
@@ -852,17 +972,52 @@ static void bind_members(zan_binder_t *b, zan_ast_node_t *type_node) {
       break;
     }
     case AST_DESTRUCTOR_DECL:
-      /* A517：`~X()` 曾是死语法——解析/检查全过、从不发射、从不调用，
-       * 依赖确定性清理的迁移代码静默失效。ARC 释放链上没有析构钩子，
-       * 实现是独立战线；在那之前当场拒绝，不能停在"静默吞掉"。
-       * 确定性清理用 using / 显式 Close()/Dispose() 形状改写。 */
+      if (type_sym->kind == SYM_STRUCT &&
+          (type_sym->modifiers & MOD_NONCOPYABLE)) {
+        zan_istr_t dname = member->method_decl.name;
+        bool is_deinit =
+            (dname.len == 6 && memcmp(dname.str, "deinit", 6) == 0);
+        if (!is_deinit &&
+            (dname.len != type_sym->name.len ||
+             memcmp(dname.str, type_sym->name.str, (size_t)dname.len) != 0)) {
+          zan_diag_emit_code(
+              b->diag, DIAG_ERROR, member->loc, 1016,
+              "destructor name '~%.*s()' must match enclosing ~Copyable "
+              "struct '%.*s' (or use 'deinit { ... }')",
+              (int)dname.len, dname.str, (int)type_sym->name.len,
+              type_sym->name.str);
+          break;
+        }
+        bool has_dtor = false;
+        for (int mi = 0; mi < type_sym->member_count; mi++) {
+          zan_symbol_t *em = type_sym->members[mi];
+          if (em && em->kind == SYM_METHOD && em->name.len == 6 &&
+              memcmp(em->name.str, "__dtor", 6) == 0) {
+            has_dtor = true;
+            break;
+          }
+        }
+        if (has_dtor) {
+          zan_diag_emit_code(
+              b->diag, DIAG_ERROR, member->loc, 1016,
+              "~Copyable struct '%.*s' cannot define more than one destructor",
+              (int)type_sym->name.len, type_sym->name.str);
+          break;
+        }
+        zan_istr_t canon_dtor = {(char *)"__dtor", 6};
+        zan_symbol_t *dtor_sym = make_symbol(
+            b->arena, SYM_METHOD, canon_dtor, b->type_void, member, MOD_PUBLIC);
+        symbol_add_member(b->arena, type_sym, dtor_sym);
+        zan_binder_record_reference(b, dtor_sym, member);
+        break;
+      }
+      /* Destructors on ARC classes or copyable structs are disallowed:
+       * only ~Copyable structs guarantee single-owner deterministic drop. */
       zan_diag_emit_code(
           b->diag, DIAG_ERROR, member->loc, 1016,
-          "destructors ('~%.*s()') are not supported: the ARC runtime "
-          "has no destructor hook on release -- do deterministic "
-          "cleanup explicitly (using statement or a Close/Dispose "
-          "method) instead of relying on '~%.*s()'",
-          member->method_decl.name.len, member->method_decl.name.str,
+          "destructors ('~%.*s()') are only supported on '~Copyable struct' "
+          "types: ARC classes have no runtime destructor hook on release -- "
+          "use a '~Copyable struct' or explicit using/Close/Dispose instead",
           member->method_decl.name.len, member->method_decl.name.str);
       break;
     case AST_ENUM_MEMBER: {

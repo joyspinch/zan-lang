@@ -4,121 +4,182 @@ using System.Data;
 using System.Data.Orm;
 using System.Web;
 using System.Json;
+using Zan.Web.AdminUi;
 using Zan.Web.Model.Oa;
 using Zan.Web.Model;
 
 namespace Zan.Web.Admin.Oa;
 
-/* 站内私信（T12）：会话列表 + 双向聊天流 + 发送。会话列表内存按对端
-   分组（内部规模依据同 TodoCenter，避开 DISTINCT SQL 谓词缺口）；
-   打开会话即批量已读（收件人维度 UPDATE，勿碰 from 侧——Bug#7 同类
-   谨记：isRead 只属 to）。新私信经 Notify.Send(module="oa", kind=
-   "message") 走铃铛（在线即推、离线未读数），私信历史不进通知中心。
-   已读/送达回执（本单）：对方客户端收帧即 Ack 置送达位、打开会话/会话
-   内新消息即 Read 置已读位，都经 oa_message_event 事件表由 MessageRelay
-   向发送方实时扇出 ack/read 帧；事件表只增不改，回执时序即落库即存证，
-   不另设文件副本（查询全走主库，附件才落文件，见 data/uploads）。
-   一期不做 SearchProvider：私信仅会话双方可见，Provider 权限语义不足。 */
+/* 站内私信（T12）：会话列表 + 双向对话子表弹窗 + 发送 + 送达/已读回执。 */
 [Route("admin/oa/messages/[action]")]
 [Custom(Authorization = CustomAuthorization.Grant)]
 [Description("站内私信")]
 public class Messages : CollabAdminController {
+    static ListPage ScreenDef() {
+        return ListPage.Of()
+            .TbarAdd("发送新私信", "/admin/oa/messages/form")
+            .Col("peerId", "对方ID", "num", "80")
+            .Col("peerName", "对话人", "text", "150")
+            .Col("lastText", "最新消息", "text", "300")
+            .Col("unread", "未读数", "num", "90")
+            .Col("lastAt", "最近时间", "text", "160")
+            .Ops("打开对话", "/admin/oa/messages/chat", "", "peer={peerId}", "");
+    }
+
+    static ListPage ChatDef() {
+        return ListPage.Of()
+            .TbarAdd("回复消息", "/admin/oa/messages/chat/form")
+            .Col("id", "ID", "num", "75")
+            .Col("who", "发送方", "text", "110")
+            .Col("content", "消息内容", "text", "340")
+            .Col("mark", "回执状态", "text", "95")
+            .Col("at", "发送时间", "text", "160");
+    }
+
     [HttpGet]
     [Route("/admin/oa/messages")]
     [Custom(IsMenu = true, Icon = "mdi:email", Perm = PermBit.View)]
     [Description("站内私信")]
-    async void Index() {
+    void Index() {
+        this.Conf();
+    }
+
+    [HttpPut]
+    [Custom(Perm = PermBit.View)]
+    [Description("私信会话表格配置")]
+    public void Conf() {
+        CrudOps.Conf(this, Messages.ScreenDef());
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.View)]
+    [Description("私信会话列表数据")]
+    public async void List() {
+        if (!this.DataReady()) { return; }
         SysUser me = await this.Admin();
-        ViewData d = await this.Layout("站内私信");
-        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
-        /* 全量拉取（id DESC=最新在前），内存按对端分组取最新+未读数。 */
         List<OaMessage> rows = await this.OaMessage
             .Where(a => (a.fromId == me.id || a.toId == me.id))
             .OrderByDescending(a => a.id).ToListAsync();
         List<SysUser> users = await this.SysUser
-            .Where(a => a.status == 1)
-            .ToListAsync();
+            .Where(a => a.status == 1).ToListAsync();
+
         List<int> peers = new List<int>();
         List<int> unread = new List<int>();
-        List<StrMap> items = d.AddList("rows");
+        List<OaMessage> latest = new List<OaMessage>();
         for (int i = 0; i < rows.Count; i = i + 1) {
             OaMessage r = rows[i];
             int peer = r.fromId == me.id ? r.toId : r.fromId;
             int at = Messages.IndexOf(peers, peer);
             if (at < 0) {
-                /* 首见即该会话最新一条（id DESC）。 */
                 peers.Add(peer);
                 unread.Add(0);
-                StrMap m = new StrMap();
-                m.Set("peerId", Convert.ToString(peer));
-                m.Set("peerName", Messages.NameOf(users, peer));
-                m.Set("lastText", Messages.Excerpt(r.content, 60));
-                m.Set("mine", r.fromId == me.id ? "1" : "");
-                m.Set("lastAt", Fmt.Stamp(r.createdAt));
-                m.Set("unread", "0");
-                items.Add(m);
+                latest.Add(r);
                 at = peers.Count - 1;
             }
             if (r.toId == me.id && r.isRead == 0) {
                 unread[at] = unread[at] + 1;
             }
         }
-        for (int i = 0; i < items.Count; i = i + 1) {
-            items[i].Set("unread", Convert.ToString(unread[i]));
+
+        JsonWriter w = new JsonWriter();
+        w.WriteStartArray();
+        for (int i = 0; i < peers.Count; i = i + 1) {
+            OaMessage r = latest[i];
+            w.WriteStartObject();
+            w.WriteProperty("id", peers[i]);
+            w.WriteProperty("peerId", peers[i]);
+            w.WriteProperty("peerName", Messages.NameOf(users, peers[i]));
+            w.WriteProperty("lastText", Messages.Excerpt(r.content, 60));
+            w.WriteProperty("unread", unread[i]);
+            w.WriteProperty("lastAt", Fmt.Stamp(r.createdAt));
+            w.WriteEndObject();
         }
-        d.Set("empty", items.Count == 0 ? "1" : "");
-        this.Page(d);
+        w.WriteEndArray();
+        AdminUiProtocol.WriteListData(this, peers.Count, w.ToString());
     }
 
-    /* 与某人的双向流（按时间正序）+ 打开即批量已读（收件人维度）。
-       对端必须本租户启用账号（跨租户/停用/不存在一律 404）。 */
+    [HttpPut]
+    [Custom(Perm = PermBit.View)]
+    [Description("发送私信表单配置")]
+    public async void FormConf() {
+        SysUser me = await this.Admin();
+        List<SysUser> users = await this.SysUser
+            .Where(a => a.status == 1).OrderBy(a => a.id).ToListAsync();
+        List<StrMap> uopts = new List<StrMap>();
+        for (int i = 0; i < users.Count; i = i + 1) {
+            if (users[i].id == me.id) { continue; }
+            StrMap m = new StrMap();
+            m.Set("id", Convert.ToString(users[i].id));
+            m.Set("name", Fmt.Text(users[i].nickname, users[i].username));
+            uopts.Add(m);
+        }
+        FormPage fp = FormPage.Of("/admin/oa/messages/send")
+            .SelectList("收件人", "peer", uopts).Req()
+            .Area("私信内容", "content").Req().Span().Ph("请输入要发送的私信内容");
+        CrudOps.FormConf(this, fp, "发送私信");
+    }
+
+    /* ---- 双向对话子表弹窗（SubTableModal）---- */
+
     [HttpGet]
     [Custom(IsMenu = false, Perm = PermBit.View)]
     [Description("私信对话")]
-    async void Chat() {
+    void Chat() {
+        this.ChatConf();
+    }
+
+    [HttpPut]
+    [Route("/admin/oa/messages/chat/conf")]
+    [Custom(Perm = PermBit.View)]
+    [Description("私信对话表格配置")]
+    public void ChatConf() {
+        CrudOps.Conf(this, Messages.ChatDef());
+    }
+
+    [HttpPost]
+    [Route("/admin/oa/messages/chat/list")]
+    [Custom(Perm = PermBit.View)]
+    [Description("私信对话消息列表")]
+    public async void ChatList() {
+        if (!this.DataReady()) { return; }
         SysUser me = await this.Admin();
-        int peerId = this.InInt("peer", 0);
+        int peerId = this.InAnyInt("peer", 0);
         SysUser peer = await this.SysUser
-            .Where(a => a.id == peerId
-                && a.status == 1).FirstAsync();
+            .Where(a => a.id == peerId && a.status == 1).FirstAsync();
         if (peer == null) { this.Fail(404, "0404", "对方不存在或已停用"); return; }
         List<SysUser> peerList = new List<SysUser>();
         peerList.Add(peer);
         string peerName = Messages.NameOf(peerList, peer.id);
-        ViewData d = await this.Layout("与 " + peerName);
-        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+
         List<OaMessage> rows = await this.OaMessage
             .Where(a => ((a.fromId == me.id && a.toId == peer.id)
                     || (a.fromId == peer.id && a.toId == me.id)))
-            .OrderBy(a => a.id).ToListAsync();
-        List<StrMap> items = d.AddList("rows");
+            .OrderByDescending(a => a.id).ToListAsync();
+
         int maxUnread = 0;
+        JsonWriter w = new JsonWriter();
+        w.WriteStartArray();
         for (int i = 0; i < rows.Count; i = i + 1) {
             OaMessage r = rows[i];
-            StrMap m = new StrMap();
-            m.Set("content", r.content);
-            m.Set("mine", r.fromId == me.id ? "1" : "");
-            m.Set("who", r.fromId == me.id ? "我" : peerName);
-            m.Set("at", Fmt.Stamp(r.createdAt));
-            m.Set("id", Convert.ToString(r.id));
-            /* 回执标记（我发的消息）：已读 > 已送达，均按 toId 维度状态。 */
-            string mark = "";
+            string mark = "—";
             if (r.fromId == me.id) {
                 if (r.isRead == 1) { mark = "已读"; }
                 else if (r.isAcked == 1) { mark = "已送达"; }
+                else { mark = "已发送"; }
             }
-            m.Set("mark", mark);
             if (r.toId == me.id && r.isRead == 0 && r.id > maxUnread) {
                 maxUnread = r.id;
             }
-            items.Add(m);
+            w.WriteStartObject();
+            w.WriteProperty("id", r.id);
+            w.WriteProperty("who", r.fromId == me.id ? "我" : peerName);
+            w.WriteProperty("content", r.content);
+            w.WriteProperty("mark", mark);
+            w.WriteProperty("at", Fmt.Stamp(r.createdAt));
+            w.WriteEndObject();
         }
-        d.Set("empty", rows.Count == 0 ? "1" : "");
-        d.Set("peerId", Convert.ToString(peer.id));
-        d.Set("peerName", peerName);
-        /* 打开即批量已读：只清 toId==me 侧，from 侧未读属于对方。
-           顺带置送达位（读了必然已收到）；确有新已读才落事件，由
-           MessageRelay 向对端实时扇出 type=read 帧（读到 maxUnread 为止）。 */
+        w.WriteEndArray();
+
         int _n = await this.OaMessage.Update()
             .Set(a => a.isRead, 1)
             .Set(a => a.isAcked, 1)
@@ -127,26 +188,31 @@ public class Messages : CollabAdminController {
         if (_n > 0 && maxUnread > 0) {
             await this.Receipt(Tenant.Cur(), maxUnread, peer.id, me.id, 2);
         }
-        this.Page(d);
+        AdminUiProtocol.WriteListData(this, rows.Count, w.ToString());
     }
 
-    /* 发送：正文必填；对端本租户启用账号校验；INSERT isRead=0 +
-       Notify.Send 走铃铛（kind=message，链接回本会话）。 */
+    [HttpPut]
+    [Route("/admin/oa/messages/chat/formconf")]
+    [Custom(Perm = PermBit.View)]
+    [Description("回复私信表单配置")]
+    public void ChatFormConf() {
+        FormPage fp = FormPage.Of("/admin/oa/messages/send")
+            .Area("回复内容", "content").Req().Span().Ph("请输入回复内容");
+        CrudOps.FormConf(this, fp, "回复消息");
+    }
+
     [HttpPost]
     [Custom(Perm = PermBit.View)]
     [Description("发送私信")]
     async void Send() {
         SysUser me = await this.Admin();
-        int peerId = this.InInt("peer", 0);
-        /* Bug#8：私信正文 textarea 多行语义，Need 内部走 In(Filter.Clean) 会剥
-           换行——InRaw + 同语义空检查（原 Need 文案不变）。 */
-        string content = this.InRaw("content");
+        int peerId = this.InAnyInt("peer", 0);
+        string content = this.InAnyRaw("content");
         if (content.Length == 0) { this.Fail(400, "0003", "私信内容不能为空"); return; }
         if (content.Length > 2048) { content = content.Substring(0, 2048); }
         if (peerId == me.id) { this.Fail(400, "0004", "不能给自己发私信"); return; }
         SysUser peer = await this.SysUser
-            .Where(a => a.id == peerId
-                && a.status == 1).FirstAsync();
+            .Where(a => a.id == peerId && a.status == 1).FirstAsync();
         if (peer == null) { this.Fail(404, "0404", "对方不存在或已停用"); return; }
         OaMessage r = new OaMessage();
         r.tenantId = Tenant.Cur();
@@ -160,32 +226,26 @@ public class Messages : CollabAdminController {
         await Notify.Send(this.Held(), Tenant.Cur(), peer.id, "oa", "message",
             "新私信：" + Fmt.Text(me.nickname, me.username),
             Messages.Excerpt(content, 50),
-            "/admin/oa/messages/chat?peer=" + Convert.ToString(me.id));
-        this.Saved("已发送");
+            "/admin/oa/messages");
+        this.Saved(msgId > 0 ? "已发送" : "发送失败");
     }
 
-    /* 送达回执：收件人客户端收到 type=message 实时帧即打点（chat.js 自动
-       调，不依赖打开会话——在列表页/其他标签收到也算送达）。只按 toId
-       维度写 isAcked（isRead 同款纪律，勿碰发送方状态）；首次确认才落
-       事件+历史，重复调用幂等。 */
     [HttpPost]
     [Custom(IsMenu = false, Perm = PermBit.View)]
     [Description("私信送达回执")]
     async void Ack() {
         SysUser me = await this.Admin();
-        int id = this.InInt("id", 0);
+        int id = this.InAnyInt("id", 0);
         if (id <= 0) { this.Ctx().Json(Envelope("0003")); return; }
         OaMessage r = await this.OaMessage
-            .Where(a => a.id == id)
-            .FirstAsync();
+            .Where(a => a.id == id).FirstAsync();
         if (r == null || r.toId != me.id) {
             this.Ctx().Json(Envelope("0404"));
             return;
         }
         int n = await this.OaMessage.Update()
             .Set(a => a.isAcked, 1)
-            .Where(a => a.id == r.id
-                && a.toId == me.id && a.isAcked == 0)
+            .Where(a => a.id == r.id && a.toId == me.id && a.isAcked == 0)
             .ExecuteAffrowsAsync();
         if (n > 0) {
             await this.Receipt(Tenant.Cur(), r.id, r.fromId, me.id, 1);
@@ -193,15 +253,12 @@ public class Messages : CollabAdminController {
         this.Ctx().Json(Envelope("0000"));
     }
 
-    /* 已读回执（实时）：打开中的会话收到新消息由前端调用——标记已读
-       （顺带送达位）并落已读事件，对端在线即实时点亮「已读」。与 Chat
-       打开时的批量已读同一语义，只按 toId==me 维度写。 */
     [HttpPost]
     [Custom(IsMenu = false, Perm = PermBit.View)]
     [Description("私信已读回执")]
     async void Read() {
         SysUser me = await this.Admin();
-        int peerId = this.InInt("peer", 0);
+        int peerId = this.InAnyInt("peer", 0);
         if (peerId <= 0 || peerId == me.id) {
             this.Ctx().Json(Envelope("0003"));
             return;
@@ -223,7 +280,6 @@ public class Messages : CollabAdminController {
         this.Ctx().Json(Envelope("0000"));
     }
 
-    /* 统一信封：产出 {"code":"...."}。 */
     static string Envelope(string code) {
         JsonWriter w = new JsonWriter();
         w.WriteStartObject();
@@ -232,13 +288,7 @@ public class Messages : CollabAdminController {
         return w.ToJson();
     }
 
-    /* ---- helpers ---- */
-
-    /* 回执事件落库：read/ack 共用。事件表即总线，MessageRelay 水位扫描
-       后向消息发送方（ev.fromId）扇出实时帧；kind 1=送达 2=已读，与
-       OaMessageEvent.kind 对应。只增不改，回执时序即存证（主库可查）。 */
-    private async  void Receipt(int tenantId, int msgId, int senderId, int byId,
-        int kind) {
+    private async void Receipt(int tenantId, int msgId, int senderId, int byId, int kind) {
         OaMessageEvent ev = new OaMessageEvent();
         ev.tenantId = tenantId;
         ev.msgId = msgId;
@@ -256,7 +306,6 @@ public class Messages : CollabAdminController {
         return -1;
     }
 
-    /* 昵称空回退用户名；对端行缺席（已删号的历史会话）显示占位。 */
     static string NameOf(List<SysUser> users, int id) {
         for (int i = 0; i < users.Count; i = i + 1) {
             if (users[i].id == id) { return Fmt.Text(users[i].nickname, users[i].username); }
@@ -264,7 +313,5 @@ public class Messages : CollabAdminController {
         return "用户" + Convert.ToString(id);
     }
 
-    /* 单行摘要：换行折空格，超长截断。截断走 Fmt.Excerpt——按字节截之前
-       先回退到 UTF-8 字符边界，切掉半个汉字会让整个 JSON 应答不可解析。 */
     static string Excerpt(string s, int max) { return WebFmt.Excerpt(s, max); }
 }

@@ -308,6 +308,132 @@ ZAN_GAME_API void zan_game_set_iridescence3d(int32_t enabled,
 ZAN_GAME_API void zan_game_set_post_night_vision3d(float strength, float gain,
     float noise_amount, float seed);
 
+/* GPU 3D 世界空间球面战术声呐脉冲波前（Sonar/Radar Echo Ring，零贴图零额外 Pass）：
+ * enabled != 0 时沿距 (origin_x,origin_y,origin_z) 半径 radius 处渲染高能扫描环及宽度 ring_width 的尾迹。 */
+ZAN_GAME_API void zan_game_set_sonar_pulse3d(int32_t enabled,
+    float origin_x, float origin_y, float origin_z,
+    float radius, float ring_width, float strength, float r, float g, float b);
+
+/* GPU 后处理 45° 半色调漫画网点滤镜（Ben-Day Halftone Print Dots，单 Pass 零额外 FBO）：
+ * strength [0..1] 控制混入强度，dot_scale [2..32] 控制像素网点间距，contrast [0.25..3] 控制网点对比度。 */
+ZAN_GAME_API void zan_game_set_post_halftone_comic3d(float strength,
+    float dot_scale, float contrast);
+
+/* GPU 3D 世界空间科幻六边形能量护盾网格（Hex Force-Field Shield，零贴图零额外 Pass）：
+ * enabled != 0 时按世界坐标生成正六边形晶格边界发光与能量脉冲，edge_width [0.02..0.35]。 */
+ZAN_GAME_API void zan_game_set_force_field_hex3d(int32_t enabled,
+    float scale, float phase, float edge_width, float strength,
+    float r, float g, float b);
+
+/* GPU 后处理赛博故障水平撕裂与 RGB 通道分离（Cyberpunk Glitch RGB Split，单 Pass 零额外 FBO）：
+ * intensity [0..1] 控制触发密度与位移幅度，slice_count [4..128] 控制水平条带数，seed 控制帧随机种子。 */
+ZAN_GAME_API void zan_game_set_post_glitch_rgb3d(float intensity,
+    float slice_count, float seed);
+
+/* GPU 3D 世界空间雨滴水洼同心涟漪（Rain Puddle Ripples，仅投射在朝上表面，零贴图零额外 Pass）：
+ * enabled != 0 时按世界 XZ 单元格生成周期扩散的雨滴同心高光涟漪，strength [0..3]。 */
+ZAN_GAME_API void zan_game_set_rain_ripples3d(int32_t enabled, float scale,
+    float phase, float strength, float r, float g, float b);
+
+/* GPU 后处理微缩移轴景深模糊（Tilt-Shift Diorama Blur，单 Pass 零额外 FBO）：
+ * strength [0..1] 控制模糊强度，focus_y [0..1] 控制清晰焦带中心高度，focus_band [0.02..0.45] 控制焦带半宽。 */
+ZAN_GAME_API void zan_game_set_post_tilt_shift3d(float strength,
+    float focus_y, float focus_band);
+
+/* GPU 3D 战术透视轮廓光（X-Ray Silhouette Rim，零贴图零额外 Pass）：
+ * enabled != 0 时按视角 Fresnel 轮廓叠加高亮光边，power [0.5..8] 控制边缘锐度，strength [0..3]。 */
+ZAN_GAME_API void zan_game_set_xray_silhouette3d(int32_t enabled, float power,
+    float strength, float r, float g, float b);
+
+/* GPU 后处理屏幕边缘冰晶霜冻（Edge Frost Vignette，单 Pass 零额外 FBO）：
+ * intensity [0..1] 控制冰霜不透明度，radius [0.15..0.95] 控制中心清晰区半径，r/g/b 为冰晶色。 */
+ZAN_GAME_API void zan_game_set_post_vignette_frost3d(float intensity,
+    float radius, float r, float g, float b);
+
+/* GPU 3D 传送门螺旋能量漩涡（Portal Vortex Swirl，零贴图零额外 Pass）：
+ * enabled != 0 时按 UV 极坐标生成带旋臂旋转与径向环罩的传送门能量发光，strength [0..3]。 */
+ZAN_GAME_API void zan_game_set_portal_vortex3d(int32_t enabled,
+    float swirl_turns, float phase, float strength, float r, float g, float b);
+
+/* GPU 后处理复古怀旧棕褐色调与胶片划痕（Vintage Sepia Film，单 Pass 零额外 FBO）：
+ * strength [0..1] 控制怀旧棕褐混合强度，scratch_amount [0..1] 控制竖向老胶片划痕密度，seed 控制帧随机。 */
+ZAN_GAME_API void zan_game_set_post_sepia_vintage3d(float strength,
+    float scratch_amount, float seed);
+
+/* GPU 3D 世界空间 CAD 工程蓝图线框网格（Blueprint Wireframe Grid，零贴图零额外 Pass）：
+ * enabled != 0 时按世界三平面法线加权生成不拉伸的工程蓝图正交网格线，strength [0..3]。 */
+ZAN_GAME_API void zan_game_set_blueprint_wire3d(int32_t enabled,
+    float grid_density, float line_width, float strength,
+    float r, float g, float b);
+
+/* GPU 后处理变形宽银幕水平镜头炫光条纹（Anamorphic Lens Streak，单 Pass 零额外 FBO）：
+ * strength [0..3] 控制水平炫光强度，threshold [0..2] 控制高亮提取阈值，r/g/b 为炫光染色。 */
+ZAN_GAME_API void zan_game_set_post_sun_bloom_streak3d(float strength,
+    float threshold, float r, float g, float b);
+
+/* GPU 3D 世界空间热浪对流折射微光（Heat Haze Shimmer，零贴图零额外 Pass）：
+ * enabled != 0 时按世界坐标生成向上漂浮的双波热浪对流微光纹，strength [0..3]。 */
+ZAN_GAME_API void zan_game_set_heat_haze_shimmer3d(int32_t enabled,
+    float freq, float phase, float strength, float r, float g, float b);
+
+/* GPU 后处理电影级阴影/高光分离色调（Cinema Split-Toning，单 Pass 零额外 FBO）：
+ * strength [0..1] 控制分离色调混合强度，balance [-1..1] 控制明暗分割支点，
+ * shadow_r/g/b 染暗部（保留纯黑背景），high_r/g/b 染高光部。 */
+ZAN_GAME_API void zan_game_set_post_split_tone3d(float strength, float balance,
+    float shadow_r, float shadow_g, float shadow_b,
+    float high_r, float high_g, float high_b);
+
+/* GPU 3D 屏幕空间 4x4 Bayer 有序抖动渐隐透明（Ordered Dither Alpha Fade，零贴图零半透明排序伪影）：
+ * enabled != 0 时按屏幕像素坐标与 4x4 Bayer 阈值矩阵精确剔除片段，opacity [0..1]，pixel_scale [1..8]。 */
+ZAN_GAME_API void zan_game_set_pixel_dither_fade3d(int32_t enabled,
+    float opacity, float pixel_scale);
+
+/* GPU 后处理 Kuwahara 保边油画笔触滤镜（Oil-Painting Brushstroke，单 Pass 零额外 FBO）：
+ * strength [0..1] 控制风格化混合强度，radius [1..4] 控制笔触采样半径（保边去噪）。 */
+ZAN_GAME_API void zan_game_set_post_oil_paint3d(float strength, float radius);
+
+/* GPU 3D 屏幕空间漫画/钢笔交叉排线着色（Comic Cross-Hatching Ink，零贴图零额外 Pass）：
+ * enabled != 0 时按片段亮度分级叠加 +45/-45 度手绘排线笔触，亮部高光保持纯净。 */
+ZAN_GAME_API void zan_game_set_crosshatch_ink3d(int32_t enabled, float density,
+    float ink_strength, float r, float g, float b);
+
+/* GPU 后处理瞄准镜/专注外围景深虚化（Peripheral Scope Edge Blur，单 Pass 零额外 FBO）：
+ * strength [0..1] 控制外围虚化强度，clear_radius [0.1..1.0] 控制中心绝对清晰区半径。 */
+ZAN_GAME_API void zan_game_set_post_scope_edge_blur3d(float strength,
+    float clear_radius);
+
+/* GPU 3D 跨平台各向异性拉丝金属与微纹理高光（Anisotropic Brushed Metal，GLSL 330/GLES 3.00 统一）：
+ * enabled != 0 时沿表面切线方向生成拉丝沟槽与 Kajiya-Kay 各向异性高光带。 */
+ZAN_GAME_API void zan_game_set_aniso_brushed3d(int32_t enabled,
+    float grain_freq, float anisotropy, float strength,
+    float r, float g, float b);
+
+/* GPU 后处理跨平台无障碍色盲校正滤镜（LMS Daltonization，GLSL 330/GLES 3.00 统一）：
+ * mode: 0=关, 1=Protanopia(红色盲), 2=Deuteranopia(绿色盲), 3=Tritanopia(蓝色盲)；
+ * strength [0..1] 控制校正混合强度（中性灰保持无偏色）。 */
+ZAN_GAME_API void zan_game_set_post_daltonize3d(float mode, float strength);
+
+/* GPU 3D 跨平台丝绒织物掠射绒毛高光（Charlie/KHR_materials_sheen，GLSL 330/GLES 3.00 统一）：
+ * enabled != 0 时按视线掠射角叠加柔和丝绒包边与细微经纬织物微纹，正面中心保持深沉。 */
+ZAN_GAME_API void zan_game_set_velvet_sheen3d(int32_t enabled,
+    float roughness, float weave_freq, float strength,
+    float r, float g, float b);
+
+/* GPU 后处理跨平台光学桶形/枕形畸变与变焦（Brown-Conrady Lens Distortion，单 Pass 零额外 FBO）：
+ * k1 [-0.6..0.6] 正值桶形/负值枕形畸变，zoom [0.5..1.5] 光学变焦倍率，越界自动黑边裁剪。 */
+ZAN_GAME_API void zan_game_set_post_lens_distort3d(float k1, float zoom);
+
+/* GPU 3D 跨平台次表面散射包裹光照与逆光透射（Subsurface Wrap & Backlit Translucency，GLSL 330/GLES 3.00）：
+ * enabled != 0 时柔化明暗交界并沿逆光视线叠加暖色次表面透光（皮肤/玉石/植被）。 */
+ZAN_GAME_API void zan_game_set_subsurface_wrap3d(int32_t enabled,
+    float wrap, float translucency, float power,
+    float r, float g, float b);
+
+/* GPU 后处理跨平台屏幕空间径向丁达尔光束（Screen-Space Crepuscular God-Rays，单 Pass 零额外 FBO）：
+ * strength [0..2] 光束曝光强度，decay [0.7..0.99] 步进衰减系数，light_x/light_y [0..1] 屏幕光源坐标。 */
+ZAN_GAME_API void zan_game_set_post_god_rays3d(float strength, float decay,
+    float light_x, float light_y);
+
 #ifdef __cplusplus
 }
 #endif

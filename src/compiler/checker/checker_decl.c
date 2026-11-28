@@ -848,13 +848,42 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
       ((obj_type->name.len == 4 &&
         memcmp(obj_type->name.str, "Span", 4) == 0) ||
        (obj_type->name.len == 12 &&
-        memcmp(obj_type->name.str, "ReadOnlySpan", 12) == 0))) {
+        memcmp(obj_type->name.str, "ReadOnlySpan", 12) == 0) ||
+       (obj_type->name.len == 11 &&
+        memcmp(obj_type->name.str, "InlineArray", 11) == 0) ||
+       (obj_type->name.len == 3 &&
+        memcmp(obj_type->name.str, "Vec", 3) == 0))) {
     bool is_len = expr->member.name.len == 6 &&
                   memcmp(expr->member.name.str, "Length", 6) == 0;
     bool is_cnt = expr->member.name.len == 5 &&
                   memcmp(expr->member.name.str, "Count", 5) == 0;
     if (is_len || is_cnt)
       return c->binder->type_int;
+  }
+  if (obj_type && obj_type->kind == TYPE_TYPE_PARAM) {
+    bool is_static = checker_is_tp_type_receiver(c, expr->member.object);
+    zan_type_t *mt = NULL;
+    if (checker_tp_find_constrained_member(
+            c, obj_type, expr->member.name, is_static, in_call_callee,
+            (in_call_callee && call) ? call->call.args.count : -1, &mt, NULL)) {
+      return mt ? mt : c->binder->type_error;
+    }
+    if (!in_call_callee) {
+      zan_diag_emit_code(
+          c->diag, DIAG_ERROR, expr->loc, 2089,
+          "type parameter '%s' has no constrained %s member '%.*s'",
+          type_name(obj_type), is_static ? "static" : "instance",
+          (int)expr->member.name.len, expr->member.name.str);
+      return c->binder->type_error;
+    }
+    if (is_static) {
+      zan_diag_emit_code(
+          c->diag, DIAG_ERROR, expr->loc, 2090,
+          "type parameter '%s' has no constrained static method '%.*s'",
+          type_name(obj_type), (int)expr->member.name.len,
+          expr->member.name.str);
+    }
+    return c->binder->type_error;
   }
   if (obj_type && type_is_scalar_primitive(obj_type)) {
     if (obj_type->kind == TYPE_STRING && expr->member.name.len == 6 &&

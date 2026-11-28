@@ -17,7 +17,7 @@ public class BlockCache {
         this.map = new Dictionary<long, CachePin>();
         this.order = new Queue<long>();
         this.bytes = 0;
-        this.cap = capBytes;
+        this.cap = capBytes > 0L ? capBytes : 0L;
         this.mtx = 0;
         this.gate = new object();
         this.closed = false;
@@ -26,7 +26,7 @@ public class BlockCache {
     // 调整字节上限（立即生效，下次驱逐执行）。
     public void SetCap(long capBytes) {
         lock (this.gate) {
-            this.cap = capBytes;
+            this.cap = capBytes > 0L ? capBytes : 0L;
         }
     }
 
@@ -46,15 +46,16 @@ public class BlockCache {
     // 放入新块并返回已 pin 的条目（接管 buf 所有权，
     // 含将来驱逐时的 Free）。同键已存在时释放新缓冲、返回旧条目。
     public CachePin Insert(long key, ByteBuffer buf) {
+        if (buf == null) { return null; }
         lock (this.gate) {
             if (this.closed) {
-                if (buf != null) { buf.Free(); }
+                buf.Free();
                 return null;
             }
             CachePin old = null;
             if (this.map.TryGetValue(key, out old)) {
                 old.pins = old.pins + 1;
-                if (buf != null) { buf.Free(); }
+                buf.Free();
                 return old;
             }
             CachePin pin = new CachePin(buf, buf.Length());
@@ -77,7 +78,7 @@ public class BlockCache {
                 if (vp.pins == 0) {
                     this.map.Remove(vk);
                     this.bytes = this.bytes - vp.size;
-                    vp.buf.Free();
+                    if (vp.buf != null) { vp.buf.Free(); vp.buf = null; }
                 } else {
                     this.order.Enqueue(vk);
                 }
@@ -94,6 +95,7 @@ public class BlockCache {
                 pin.pins = pin.pins - 1;
                 if (this.closed && pin.pins == 0 && pin.buf != null) {
                     pin.buf.Free();
+                    pin.buf = null;
                 }
             }
         }
@@ -109,6 +111,7 @@ public class BlockCache {
                 CachePin pin = vals[i];
                 if (pin != null && pin.pins == 0 && pin.buf != null) {
                     pin.buf.Free();
+                    pin.buf = null;
                 }
             }
             this.map.Clear();

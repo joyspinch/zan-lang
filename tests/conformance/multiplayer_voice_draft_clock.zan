@@ -1,0 +1,55 @@
+using System;
+using System.Collections.Generic;
+using Game.Net;
+
+class Program {
+    static int Main() {
+        // 1. 战术语音路由：同队可听、敌队隔离、队长发言触发普通队员闪避（Ducking）与近距离衰减
+        NetTeamVoiceChannelRouter voice = new NetTeamVoiceChannelRouter(20.0f, 0.35f);
+        voice.RegisterMember(1, 10, 1, true);  // Team 10 队长
+        voice.RegisterMember(2, 10, 1, false); // Team 10 队员
+        voice.RegisterMember(3, 10, 2, false); // Team 10 另小队听众
+        voice.RegisterMember(4, 20, 1, false); // 敌队
+        voice.SetSpeaking(2, true);
+        voice.SetChannelMode(2, VoiceChannelMode.Team);
+        float gNormal = voice.ComputeListenGain(2, 3, 5.0f); // 1.0
+        float gEnemy = voice.ComputeListenGain(2, 4, 5.0f);  // 0.0
+        voice.SetSpeaking(1, true); // 队长发言 -> 压低普通队员音量至 0.35
+        float gDucked = voice.ComputeListenGain(2, 3, 5.0f);
+        voice.SetSpeaking(1, false);
+        voice.SetChannelMode(2, VoiceChannelMode.Proximity);
+        float gProx = voice.ComputeListenGain(2, 4, 10.0f); // 近距离跨队可听 0.5
+        bool voiceOk = gNormal > 0.99f && gEnemy < 0.01f
+            && gDucked > 0.34f && gDucked < 0.36f
+            && gProx > 0.49f && gProx < 0.51f;
+        Console.WriteLine("voice_router_ok=" + (voiceOk ? "1" : "0"));
+
+        // 2. 竞技 BP 选禁状态机：禁选去重、非法轮次拒绝、超时自动兜底选人
+        NetPickBanDraftController draft = new NetPickBanDraftController();
+        draft.AddStep(1, DraftStepKind.Ban);
+        draft.AddStep(2, DraftStepKind.Pick);
+        draft.AddStep(1, DraftStepKind.Pick);
+        bool wrongTurn = !draft.TrySubmitChoice(2, 101);
+        bool banOk = draft.TrySubmitChoice(1, 101);
+        bool bannedRejected = !draft.TrySubmitChoice(2, 101);
+        bool pickOk = draft.TrySubmitChoice(2, 102);
+        List<int> roster = new List<int>();
+        roster.Add(101);
+        roster.Add(102);
+        roster.Add(103);
+        int autoPicked = draft.AutoResolveTimeout(roster); // 跳过 101/102，自动选中 103
+        bool draftOk = wrongTurn && banOk && bannedRejected && pickOk
+            && autoPicked == 103 && draft.IsFinished();
+        Console.WriteLine("pick_ban_ok=" + (draftOk ? "1" : "0"));
+
+        // 3. 客户端时钟漂移平滑器：拒绝突发延迟毛刺 + 限速平滑收敛
+        NetClientClockDriftSmoother clk = new NetClientClockDriftSmoother(60.0, 20.0);
+        clk.IngestSample(100.0, 0.5);
+        bool spikeRejected = !clk.IngestSample(260.0, 0.5); // 跳变 160ms > 60ms 拒绝
+        bool accepted = clk.IngestSample(130.0, 0.5); // 允许，0.5s 最大步进 10ms -> 110.0
+        bool clkOk = spikeRejected && accepted
+            && clk.CurrentOffsetMs > 109.9 && clk.CurrentOffsetMs < 110.1;
+        Console.WriteLine("clock_drift_ok=" + (clkOk ? "1" : "0"));
+        return 0;
+    }
+}

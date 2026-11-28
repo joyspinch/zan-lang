@@ -3,6 +3,18 @@ using System.Collections.Generic;
 using System.Text;
 namespace Zan;
 
+class BranchTempScope {
+    public List<string> temps;
+    public List<string> vals;
+    public List<string> owners;
+    public List<Node> types;
+    public List<List<string>> armStack;
+    public List<Dictionary<string, bool>> armSets;
+    public List<List<string>> armPending;
+    public List<StringBuilder> armFn;
+    public bool hasPend;
+}
+
 partial class Irgen {
     void EmitArcRuntime() {
         EmitDelegateOwnershipRuntime();
@@ -379,7 +391,7 @@ partial class Irgen {
         string n = t.sval;
         // hardware vectors are first-class values, not ARC-managed heap objects
         if (n == "Vector128" || n == "Vector256" || n == "Span" || n == "ReadOnlySpan") { return false; }
-        if (n == "List" || n == "Dictionary" || n == "Dict" || n == "StringBuilder") { return true; }
+        if (n == "List" || n == "Dictionary" || n == "Dict" || n == "StringBuilder" || n == "Tuple") { return true; }
         Node d = binder.FindType(n);
         if (d != null && (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl())) { return true; }
         return false;
@@ -591,6 +603,13 @@ partial class Irgen {
     public List<Dictionary<string, bool>> callArmSets;
     public List<List<string>> callArmPending;
     public List<StringBuilder> callArmFn;
+    void ResetStmtTemps() {
+        stmtTemps = new List<string>();
+        stmtTempValues = new List<string>();
+        stmtTempOwners = new List<string>();
+        stmtTempTypes = new List<Node>();
+    }
+
     void EnterCallArm() {
         if (callArmStack == null) { callArmStack = new List<List<string>>(); }
         if (callArmSets == null) { callArmSets = new List<Dictionary<string, bool>>(); }
@@ -635,6 +654,48 @@ partial class Irgen {
         }
         hasPendingCallArm = AnyPendingCallArm();
         if (!term) { RetireArgTemps(top); }
+    }
+
+    // Isolate temporaries and exception-owner call-arm state inside a conditional
+    // or short-circuit branch (`?.`, `?:`, `&&`, `||`, `??`) so armed slots are
+    // retired strictly on the path that armed them and never leak on unwind.
+    BranchTempScope EnterBranchTempScope() {
+        if (hasPendingCallArm) { FlushPendingCallArms(); }
+        BranchTempScope s = new BranchTempScope();
+        s.temps = stmtTemps;
+        s.vals = stmtTempValues;
+        s.owners = stmtTempOwners;
+        s.types = stmtTempTypes;
+        s.armStack = callArmStack;
+        s.armSets = callArmSets;
+        s.armPending = callArmPending;
+        s.armFn = callArmFn;
+        s.hasPend = hasPendingCallArm;
+        stmtTemps = new List<string>();
+        stmtTempValues = new List<string>();
+        stmtTempOwners = new List<string>();
+        stmtTempTypes = new List<Node>();
+        callArmStack = null;
+        callArmSets = null;
+        callArmPending = null;
+        callArmFn = null;
+        hasPendingCallArm = false;
+        EnterCallArm();
+        return s;
+    }
+
+    void LeaveBranchTempScope(BranchTempScope s) {
+        LeaveCallArm();
+        if (!term) { EmitTempReleases(); }
+        stmtTemps = s.temps;
+        stmtTempValues = s.vals;
+        stmtTempOwners = s.owners;
+        stmtTempTypes = s.types;
+        callArmStack = s.armStack;
+        callArmSets = s.armSets;
+        callArmPending = s.armPending;
+        callArmFn = s.armFn;
+        hasPendingCallArm = s.hasPend;
     }
 
     // Is this slot already armed by a pending call of the current function?
@@ -719,6 +780,8 @@ partial class Irgen {
             i = i + 1;
         }
         stmtTemps = new List<string>();
+        stmtTempValues = new List<string>();
+        stmtTempOwners = new List<string>();
         stmtTempTypes = new List<Node>();
     }
 

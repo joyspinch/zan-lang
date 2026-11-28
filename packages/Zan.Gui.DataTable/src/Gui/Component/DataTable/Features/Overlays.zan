@@ -73,6 +73,7 @@ public partial class DataTable {
     static readonly int HdrActCfTopPct = 61;
     static readonly int HdrActCfBottomN = 62;
     static readonly int HdrActCfBottomPct = 63;
+    static readonly int HdrActCustomBase = 5000;
 
     // 在表格上显示一条短暂提示消息（toastFrames=90）。
     public static void Flash(DataTableState st, string msg) {
@@ -85,7 +86,7 @@ public partial class DataTable {
     // 只给 256 会与紧跟其后的行菜单块（ctx）的行 id 数值相撞，
     // 两个菜单同开时悬停/按压按 id 匹配会串。
     public static void EnsureMenus(DataTableState st) {
-        if (st.ctxRetainedMenu != null && st.hdrRetainedMenu != null) { return; }
+        if (st.ctxRetainedMenu != null && st.hdrRetainedMenu != null && st.sumRetainedMenu != null) { return; }
         DataTableMenuSession bridge = new DataTableMenuSession();
         bridge.state = st;
         if (st.ctxRetainedMenu == null) {
@@ -98,11 +99,18 @@ public partial class DataTable {
             st.hdrRetainedMenu.ActionSelected.Add(bridge.HeaderSelected);
             st.hdrRetainedMenu.Dismissed.Add(bridge.HeaderDismissed);
         }
+        if (st.sumRetainedMenu == null) {
+            st.sumRetainedMenu = new RichMenu();
+            st.sumRetainedMenu.ActionSelected.Add(bridge.SummarySelected);
+            st.sumRetainedMenu.Dismissed.Add(bridge.SummaryDismissed);
+        }
     }
 
     // 菜单打开点更新模型，准备阶段挂入持久 RichMenu；结果由事件直接提交。
     public static void OpenRowMenu(DataTableState st) {
         st.ctxOpen = true;
+        st.hdrCtxOpen = false;
+        st.sumCtxOpen = false;
         st.tipOi = -1;
         st.tipCol = -1;
         st.hdrTipCol = -1;
@@ -112,6 +120,31 @@ public partial class DataTable {
     // 表头列菜单打开（右键/长按打开点调用）。同上。
     public static void OpenHdrMenu(DataTableState st) {
         st.hdrCtxOpen = true;
+        st.ctxOpen = false;
+        st.sumCtxOpen = false;
+        st.tipOi = -1;
+        st.tipCol = -1;
+        st.hdrTipCol = -1;
+        Tooltip.Cancel();
+    }
+
+    // 程序化在指定锚点打开指定列的表头菜单（走 OverlayHost）。
+    public static void OpenHeaderMenu(DataTableState st, int col, int x, int y) {
+        st.hdrCtxCol = col;
+        st.hdrCtxX = x;
+        st.hdrCtxY = y;
+        st.hitCol = col;
+        DataTable.OpenHdrMenu(st);
+    }
+
+    // 页脚汇总单元格点击打开聚合切换菜单（走 OverlayHost）。
+    public static void OpenSummaryMenu(DataTableState st, int col, int x, int y) {
+        st.sumCtxCol = col;
+        st.sumCtxX = x;
+        st.sumCtxY = y;
+        st.sumCtxOpen = true;
+        st.ctxOpen = false;
+        st.hdrCtxOpen = false;
         st.tipOi = -1;
         st.tipCol = -1;
         st.hdrTipCol = -1;
@@ -291,15 +324,18 @@ public partial class DataTable {
                 DataTable.Flash(st, DataTable.T("Nothing to transpose", "没有可转置的内容"));
             }
         } else if (act == DataTable.RowActPivotDrill) {
-            // 右键命中格（hitRow/hitCol 是透视源空间的行列索引）
+            // 右键命中格（优先使用右键打开时的 ctxRow/ctxCol，回退 hitRow/hitCol）
             // 背后的底层行：退出视图并把维度值钉成精确筛选。
-            DataTable.PivotDrill(st, st.hitRow, st.hitCol);
+            int dr = st.ctxRow >= 0 ? st.ctxRow : st.hitRow;
+            int dc = st.ctxCol >= 0 ? st.ctxCol : st.hitCol;
+            DataTable.PivotDrill(st, dr, dc);
             DataTable.Flash(st, DataTable.T("Drilled into underlying rows", "已下钻到原始行"));
         } else if (act == DataTable.RowActInsert) {
             // 在被点击行的*下方*插入，这是读者
             // 期望新条目出现的位置；锚点行保持原位。
+            int targetRow = st.ctxRow >= 0 ? st.ctxRow : st.hitRow;
             int at = src.RowCount();
-            if (st.hitRow >= 0) { at = st.hitRow + 1; }
+            if (targetRow >= 0) { at = targetRow + 1; }
             int nr = DataTable.InsertRow(st, cols, src, at);
             if (nr >= 0) {
                 DataTable.Recompute(st, cols, src);
@@ -307,8 +343,9 @@ public partial class DataTable {
             }
         } else if (act == DataTable.RowActDelete) {
             int killed = DataTable.DeleteSelectedRows(st, cols, src);
-            if (killed == 0 && st.hitRow >= 0) {
-                if (DataTable.DeleteRow(st, cols, src, st.hitRow)) { killed = 1; }
+            int targetRow = st.ctxRow >= 0 ? st.ctxRow : st.hitRow;
+            if (killed == 0 && targetRow >= 0) {
+                if (DataTable.DeleteRow(st, cols, src, targetRow)) { killed = 1; }
             }
             if (killed > 0) {
                 DataTable.Recompute(st, cols, src);
@@ -360,6 +397,25 @@ public partial class DataTable {
             st.hdrRetainedMenu.SetItems(DataTable.BuildHeaderMenuItems(st, cols, src));
             st.hdrRetainedMenu.ShowAtAnchor(app, st.ownerControl, st.hdrCtxX, st.hdrCtxY);
             st.hdrCtxOpen = st.hdrRetainedMenu.IsOpen();
+        }
+        if (!st.sumCtxOpen || st.sumCtxCol < 0 || st.sumCtxCol >= cols.Count) {
+            st.sumCtxOpen = false;
+            st.sumRetainedMenu.Close();
+        } else if (!st.sumRetainedMenu.IsOpen()) {
+            int curAgg = st.sumCtxCol < st.aggMode.Count ? st.aggMode[st.sumCtxCol] : 0;
+            List<MenuItem> sItems = DataTable.BuildSummaryMenuItems(cols[st.sumCtxCol], curAgg);
+            int sw = app.Scale(140);
+            int sh = RichMenu.ViewHeight(app, sItems, 8);
+            int sx = st.sumCtxX;
+            int sy = st.sumCtxY - sh;
+            if (sy < y) { sy = st.sumCtxY; }
+            if (sx + sw > x + viewW) { sx = x + viewW - sw - app.Scale(2); }
+            if (sx < x) { sx = x; }
+            st.sumRetainedMenu.maxRows = 8;
+            st.sumRetainedMenu.minWidth = sw;
+            st.sumRetainedMenu.SetItems(sItems);
+            st.sumRetainedMenu.ShowAtAnchor(app, st.ownerControl, sx, sy);
+            st.sumCtxOpen = st.sumRetainedMenu.IsOpen();
         }
     }
 
@@ -555,7 +611,9 @@ public partial class DataTable {
 
         // 标题 + 右上角状态词（百分比 / 已完成 / 失败）
         int ty = py + pad;
-        c.DrawText(tx, ty, DataTable.T("Export Excel", "导出 Excel"), sMenu.FgOr(0), fMed);
+        bool isCsvExport = ui.path != null && DataTable.EndsCI(ui.path, ".csv");
+        string expTitle = isCsvExport ? DataTable.T("Export CSV", "导出 CSV") : DataTable.T("Export Excel", "导出 Excel");
+        c.DrawText(tx, ty, expTitle, sMenu.FgOr(0), fMed);
         int pct = 0;
         if (ui.total > 0) {
             pct = ui.done * 100 / ui.total;

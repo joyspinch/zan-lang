@@ -8,6 +8,8 @@ public class XlsxBook {
     public List<XlsxSheet> sheets;
 
     // 静态 OPC 部件字节及预压缩缓存（只读共享，免每次保存重复构造、CRC 与 Deflate）。
+    private static string staticPartsLock = "XlsxBook.staticPartsLock";
+    private static bool staticPartsReady = false;
     private static byte[] cachedRootRels;
     private static byte[] cachedRootRelsZ6;
     private static int cachedRootRelsCrc;
@@ -27,6 +29,61 @@ public class XlsxBook {
     private static byte[] cachedWbRels1Z6;
     private static int cachedWbRels1Crc;
 
+    private static byte[] GrowBuf(byte[] buf, int pos, long needExtra, long pad) {
+        if (pos < 0 || needExtra < 0L || pad < 0L) {
+            throw new IOException("XlsxBook: invalid buffer growth request");
+        }
+        long need = (long)pos + needExtra;
+        if (need > 2147483591L) {
+            throw new IOException("XlsxBook: worksheet XML exceeds maximum buffer size");
+        }
+        if (buf != null && need <= (long)buf.Length) { return buf; }
+        long cap = buf != null && buf.Length > 0 ? (long)buf.Length * 2L : 4096L;
+        long withPad = need + pad;
+        if (withPad > 2147483591L) { withPad = 2147483591L; }
+        if (cap < withPad) { cap = withPad; }
+        if (cap > 2147483591L) { cap = 2147483591L; }
+        byte[] nb = new byte[(int)cap];
+        if (buf != null && pos > 0) {
+            NativeMemory.Copy((nint)nb, (nint)buf, pos);
+        }
+        return nb;
+    }
+
+    // 数值单元格 XML 文本校验：合法数字直接返回（零分配），含 XML 元字符或非法控制符时转义防注入。
+    private static string SafeNumXml(string s) {
+        if (s == null || s.Length == 0) { return ""; }
+        int n = s.Length;
+        for (int i = 0; i < n; i = i + 1) {
+            int c = s[i] & 255;
+            if (c < 32 || c == 38 || c == 60 || c == 62) {
+                return Xlsx.Esc(s);
+            }
+        }
+        return s;
+    }
+
+    // 按 UTF-8 码点边界截断至最多 maxChars 个字符，避免截断多字节序列产生非法 UTF-8。
+    private static string TruncateUtf8Chars(string s, int maxChars) {
+        if (s == null || s.Length == 0 || maxChars <= 0) { return ""; }
+        int n = s.Length;
+        int chars = 0;
+        int i = 0;
+        while (i < n && chars < maxChars) {
+            int b = s[i] & 255;
+            int step = 1;
+            if ((b & 128) == 0) { step = 1; }
+            else if ((b & 224) == 192) { step = 2; }
+            else if ((b & 240) == 224) { step = 3; }
+            else if ((b & 248) == 240) { step = 4; }
+            if (i + step > n) { break; }
+            i = i + step;
+            chars = chars + 1;
+        }
+        if (i == n) { return s; }
+        return s.Substring(0, i);
+    }
+
     // 构造；统一经 <see cref="New"/>/<see cref="FromText"/> 创建。
     public XlsxBook() {
         this.sheets = new List<XlsxSheet>();
@@ -36,30 +93,45 @@ public class XlsxBook {
     public static XlsxBook New() { return new XlsxBook(); }
 
     // 添加工作表并返回它。名字会清洗 Excel 的非法字符
-    // （: \ / ? * [ ] 与首尾撇号）、截到 31 字符，并与已有表名去重。
+    // （: \ / ? * [ ] 与首尾撇号）、按 UTF-8 码点边界截到 31 字符，并与已有表名去重。
     public XlsxSheet AddSheet(string name) {
         if (name == null) { name = ""; }
         int n = name.Length;
-        byte[] buf = new byte[31];
-        int len = 0;
-        for (int i = 0; i < n && len < 31; i = i + 1) {
+        StringBuilder sb = new StringBuilder();
+        int chars = 0;
+        int i = 0;
+        while (i < n && chars < 31) {
             int c = name[i] & 255;
-            if (c == 58 || c == 92 || c == 47 || c == 63 || c == 42
-                || c == 91 || c == 93) {
-                buf[len] = 95; // '_'
-                len = len + 1;
-            } else if (c == 39 && (i == 0 || i == n - 1)) {
-                // Excel 禁止表名以撇号开头或结尾。
+            if (c < 128) {
+                if (c == 58 || c == 92 || c == 47 || c == 63 || c == 42
+                    || c == 91 || c == 93) {
+                    sb.Append("_");
+                    chars = chars + 1;
+                } else if (c == 39 && (i == 0 || i == n - 1)) {
+                    // Excel 禁止表名以撇号开头或结尾。
+                } else if (c >= 32) {
+                    sb.Append(name.Substring(i, 1));
+                    chars = chars + 1;
+                }
+                i = i + 1;
             } else {
-                buf[len] = (byte)c;
-                len = len + 1;
+                int step = 1;
+                if ((c & 224) == 192) { step = 2; }
+                else if ((c & 240) == 224) { step = 3; }
+                else if ((c & 248) == 240) { step = 4; }
+                if (i + step > n) { break; }
+                sb.Append(name.Substring(i, step));
+                i = i + step;
+                chars = chars + 1;
             }
         }
-        string clean = len == 0 ? "Sheet" : NativeMemory.GetString((nint)buf, 0, len);
+        string clean = sb.Length == 0 ? "Sheet" : sb.ToString();
         string unique = clean;
         int dupSuffix = 2;
         while (XlsxBook.IndexOfSheet(sheets, unique) >= 0) {
-            unique = clean + Convert.ToString(dupSuffix);
+            string suf = Convert.ToString(dupSuffix);
+            int maxBase = 31 - suf.Length;
+            unique = XlsxBook.TruncateUtf8Chars(clean, maxBase > 0 ? maxBase : 1) + suf;
             dupSuffix = dupSuffix + 1;
         }
         XlsxSheet s = new XlsxSheet(unique);
@@ -72,13 +144,17 @@ public class XlsxBook {
     public static XlsxBook FromText(List<List<string>> rows, bool firstRowIsHeader) {
         XlsxBook b = new XlsxBook();
         XlsxSheet sh = b.AddSheet("Sheet1");
-        for (int r = 0; r < rows.Count; r = r + 1) {
-            List<XlsxCell> row = new List<XlsxCell>();
-            List<string> src = rows[r];
-            for (int c = 0; c < src.Count; c = c + 1) {
-                row.Add(XlsxCell.Str(src[c]));
+        if (rows != null) {
+            for (int r = 0; r < rows.Count; r = r + 1) {
+                List<XlsxCell> row = new List<XlsxCell>();
+                List<string> src = rows[r];
+                if (src != null) {
+                    for (int c = 0; c < src.Count; c = c + 1) {
+                        row.Add(XlsxCell.Str(src[c]));
+                    }
+                }
+                sh.AddRow(row);
             }
-            sh.AddRow(row);
         }
         if (!firstRowIsHeader) {
             sh.headerBold = false;
@@ -88,36 +164,41 @@ public class XlsxBook {
     }
 
     private static void EnsureStaticParts() {
-        if (XlsxBook.cachedRootRels != null) { return; }
-        byte[] rr = XlsxBook.RootRels().ToBytes();
-        XlsxBook.cachedRootRelsCrc = Crc32.Compute(rr, 0, rr.Length, 0);
-        XlsxBook.cachedRootRelsZ6 = Deflate.Deflate(rr, 6);
-        XlsxBook.cachedRootRels = rr;
+        if (XlsxBook.staticPartsReady) { return; }
+        lock (XlsxBook.staticPartsLock) {
+            if (XlsxBook.staticPartsReady) { return; }
+            byte[] rr = XlsxBook.RootRels().ToBytes();
+            XlsxBook.cachedRootRelsCrc = Crc32.Compute(rr, 0, rr.Length, 0);
+            XlsxBook.cachedRootRelsZ6 = Deflate.Deflate(rr, 6);
+            XlsxBook.cachedRootRels = rr;
 
-        byte[] cp = XlsxBook.CoreProps().ToBytes();
-        XlsxBook.cachedCorePropsCrc = Crc32.Compute(cp, 0, cp.Length, 0);
-        XlsxBook.cachedCorePropsZ6 = Deflate.Deflate(cp, 6);
-        XlsxBook.cachedCoreProps = cp;
+            byte[] cp = XlsxBook.CoreProps().ToBytes();
+            XlsxBook.cachedCorePropsCrc = Crc32.Compute(cp, 0, cp.Length, 0);
+            XlsxBook.cachedCorePropsZ6 = Deflate.Deflate(cp, 6);
+            XlsxBook.cachedCoreProps = cp;
 
-        byte[] ap = XlsxBook.AppProps().ToBytes();
-        XlsxBook.cachedAppPropsCrc = Crc32.Compute(ap, 0, ap.Length, 0);
-        XlsxBook.cachedAppPropsZ6 = Deflate.Deflate(ap, 6);
-        XlsxBook.cachedAppProps = ap;
+            byte[] ap = XlsxBook.AppProps().ToBytes();
+            XlsxBook.cachedAppPropsCrc = Crc32.Compute(ap, 0, ap.Length, 0);
+            XlsxBook.cachedAppPropsZ6 = Deflate.Deflate(ap, 6);
+            XlsxBook.cachedAppProps = ap;
 
-        byte[] st = XlsxBook.StylesXml().ToBytes();
-        XlsxBook.cachedStylesXmlCrc = Crc32.Compute(st, 0, st.Length, 0);
-        XlsxBook.cachedStylesXmlZ6 = Deflate.Deflate(st, 6);
-        XlsxBook.cachedStylesXml = st;
+            byte[] st = XlsxBook.StylesXml().ToBytes();
+            XlsxBook.cachedStylesXmlCrc = Crc32.Compute(st, 0, st.Length, 0);
+            XlsxBook.cachedStylesXmlZ6 = Deflate.Deflate(st, 6);
+            XlsxBook.cachedStylesXml = st;
 
-        byte[] ct1 = XlsxBook.ContentTypes(1).ToBytes();
-        XlsxBook.cachedCt1Crc = Crc32.Compute(ct1, 0, ct1.Length, 0);
-        XlsxBook.cachedCt1Z6 = Deflate.Deflate(ct1, 6);
-        XlsxBook.cachedCt1 = ct1;
+            byte[] ct1 = XlsxBook.ContentTypes(1).ToBytes();
+            XlsxBook.cachedCt1Crc = Crc32.Compute(ct1, 0, ct1.Length, 0);
+            XlsxBook.cachedCt1Z6 = Deflate.Deflate(ct1, 6);
+            XlsxBook.cachedCt1 = ct1;
 
-        byte[] wr1 = XlsxBook.WorkbookRels(1).ToBytes();
-        XlsxBook.cachedWbRels1Crc = Crc32.Compute(wr1, 0, wr1.Length, 0);
-        XlsxBook.cachedWbRels1Z6 = Deflate.Deflate(wr1, 6);
-        XlsxBook.cachedWbRels1 = wr1;
+            byte[] wr1 = XlsxBook.WorkbookRels(1).ToBytes();
+            XlsxBook.cachedWbRels1Crc = Crc32.Compute(wr1, 0, wr1.Length, 0);
+            XlsxBook.cachedWbRels1Z6 = Deflate.Deflate(wr1, 6);
+            XlsxBook.cachedWbRels1 = wr1;
+
+            XlsxBook.staticPartsReady = true;
+        }
     }
 
     private static ZipEntry PartCachedZ6(string name, byte[] raw, byte[] z6, int crc) {
@@ -178,60 +259,71 @@ public class XlsxBook {
     // 输出同样不含时间戳，可复现。
     public bool SaveStreaming(string path, List<XlsxRowSource> sources) {
         XlsxBook.EnsureStaticParts();
+        int maxRows = XlsxBook.maxRowsPerSheet > 0 ? XlsxBook.maxRowsPerSheet : 1048576;
         ZipWriter zw = ZipWriter.Open(path);
-        // 先写工作表部件（zip 内条目顺序无所谓），收集实际写出
-        // 的分表清单，最后按它生成 workbook/rels/content-types。
-        List<XlsxSheet> parts = new List<XlsxSheet>();
-        int partNo = 0;
-        bool cancelled = false;
-        for (int i = 0; i < sheets.Count && !cancelled; i = i + 1) {
-            XlsxRowSource src = i < sources.Count ? sources[i] : new XlsxRowSource();
-            int total = src.RowCount();
-            int done = 0;
-            int round = 0;
-            while ((done < total || round == 0) && !cancelled) {
-                int n = total - done;
-                if (n > XlsxBook.maxRowsPerSheet) { n = XlsxBook.maxRowsPerSheet; }
-                XlsxSheet part = sheets[i];
-                if (round > 0) {
-                    part = new XlsxSheet(XlsxBook.PartName(sheets, parts, sheets[i].name));
-                    part.headerBold = false;
-                    part.freezeHeader = false;
+        try {
+            // 先写工作表部件（zip 内条目顺序无所谓），收集实际写出
+            // 的分表清单，最后按它生成 workbook/rels/content-types。
+            List<XlsxSheet> parts = new List<XlsxSheet>();
+            int partNo = 0;
+            bool cancelled = false;
+            for (int i = 0; i < sheets.Count && !cancelled; i = i + 1) {
+                XlsxRowSource src = (sources != null && i < sources.Count && sources[i] != null)
+                    ? sources[i] : new XlsxRowSource();
+                int total = src.RowCount();
+                if (total < 0) { total = 0; }
+                int done = 0;
+                int round = 0;
+                while ((done < total || round == 0) && !cancelled) {
+                    int n = total - done;
+                    if (n > maxRows) { n = maxRows; }
+                    XlsxSheet part = sheets[i];
+                    if (round > 0) {
+                        part = new XlsxSheet(XlsxBook.PartName(sheets, parts, sheets[i].name));
+                        part.headerBold = false;
+                        part.freezeHeader = false;
+                    }
+                    parts.Add(part);
+                    partNo = partNo + 1;
+                    if (!XlsxBook.StreamSheetPart(part, src, done, n, zw, partNo, total)) {
+                        cancelled = true;
+                    }
+                    done = done + n;
+                    round = round + 1;
                 }
-                parts.Add(part);
-                partNo = partNo + 1;
-                if (!XlsxBook.StreamSheetPart(part, src, done, n, zw, partNo, total)) {
-                    cancelled = true;
-                }
-                done = done + n;
-                round = round + 1;
             }
-        }
-        if (cancelled) {
+            if (cancelled) {
+                zw.Abort();
+                return false;
+            }
+            zw.AddEntry("[Content_Types].xml",
+                XlsxBook.ContentTypes(parts.Count).ToBytes(), 6);
+            zw.AddEntry("_rels/.rels", XlsxBook.cachedRootRels, 6);
+            zw.AddEntry("docProps/core.xml", XlsxBook.cachedCoreProps, 6);
+            zw.AddEntry("docProps/app.xml", XlsxBook.cachedAppProps, 6);
+            zw.AddEntry("xl/workbook.xml", XlsxBook.WorkbookXml(parts).ToBytes(), 6);
+            zw.AddEntry("xl/_rels/workbook.xml.rels",
+                XlsxBook.WorkbookRels(parts.Count).ToBytes(), 6);
+            zw.AddEntry("xl/styles.xml", XlsxBook.cachedStylesXml, 6);
+            zw.Close();
+            return true;
+        } catch (Exception ex) {
             zw.Abort();
-            return false;
+            throw ex;
         }
-        zw.AddEntry("[Content_Types].xml",
-            XlsxBook.ContentTypes(parts.Count).ToBytes(), 6);
-        zw.AddEntry("_rels/.rels", XlsxBook.cachedRootRels, 6);
-        zw.AddEntry("docProps/core.xml", XlsxBook.cachedCoreProps, 6);
-        zw.AddEntry("docProps/app.xml", XlsxBook.cachedAppProps, 6);
-        zw.AddEntry("xl/workbook.xml", XlsxBook.WorkbookXml(parts).ToBytes(), 6);
-        zw.AddEntry("xl/_rels/workbook.xml.rels",
-            XlsxBook.WorkbookRels(parts.Count).ToBytes(), 6);
-        zw.AddEntry("xl/styles.xml", XlsxBook.cachedStylesXml, 6);
-        zw.Close();
-        return true;
     }
 
-    // 分表命名：`baseName` 撞上现有表或已写分表时后缀 2、3……。
+    // 分表命名：`baseName` 撞上现有表或已写分表时后缀 2、3……（严守 Excel 31 字符上限与 UTF-8 码点边界）。
     static string PartName(List<XlsxSheet> sheets, List<XlsxSheet> parts,
                            string baseName) {
-        string unique = baseName;
+        string clean = baseName != null && baseName.Length > 0 ? baseName : "Sheet";
+        string unique = XlsxBook.TruncateUtf8Chars(clean, 31);
         int n = 2;
         while (XlsxBook.IndexOfSheet(sheets, unique) >= 0
                || XlsxBook.IndexOfSheet(parts, unique) >= 0) {
-            unique = baseName + Convert.ToString(n);
+            string suf = Convert.ToString(n);
+            int maxBase = 31 - suf.Length;
+            unique = XlsxBook.TruncateUtf8Chars(clean, maxBase > 0 ? maxBase : 1) + suf;
             n = n + 1;
         }
         return unique;
@@ -361,11 +453,10 @@ public class XlsxBook {
             int row1 = abs + 1;
             int rLen = XlsxBook.FormatPosInt(row1, rbuf);
             int rOff = 12 - rLen;
-            if (pos + 24 > cap) {
-                cap = cap * 2;
-                byte[] nb = new byte[cap];
-                NativeMemory.Copy((nint)nb, bp, pos);
-                buf = nb; bp = (nint)buf;
+            if ((long)pos + 24L > (long)cap) {
+                buf = XlsxBook.GrowBuf(buf, pos, 24L, 4096L);
+                bp = (nint)buf;
+                cap = buf.Length;
             }
             NativeMemory.Copy(bp + (nint)pos, (nint)"<row r=\"", 8);
             pos = pos + 8;
@@ -381,15 +472,17 @@ public class XlsxBook {
                 if (cell == null || cell.kind == 0) { continue; }
                 int kind = cell.kind;
                 if (kind == 1 && (cell.text == null || cell.text.Length == 0)) { continue; }
-                int need = 96;
-                if (kind == 1) { need = 96 + cell.text.Length * 5; }
-                else if (kind == 2 && cell.text != null) { need = 64 + cell.text.Length; }
-                if (pos + need > cap) {
-                    int ncap = cap * 2;
-                    if (ncap < pos + need + 4096) { ncap = pos + need + 4096; }
-                    byte[] nb = new byte[ncap];
-                    NativeMemory.Copy((nint)nb, bp, pos);
-                    buf = nb; bp = (nint)buf; cap = ncap;
+                string numTxt = null;
+                long need = 96L;
+                if (kind == 1) { need = 96L + (long)cell.text.Length * 5L; }
+                else if (kind == 2 && cell.text != null) {
+                    numTxt = XlsxBook.SafeNumXml(cell.text);
+                    need = 64L + (long)numTxt.Length;
+                }
+                if ((long)pos + need > (long)cap) {
+                    buf = XlsxBook.GrowBuf(buf, pos, need, 4096L);
+                    bp = (nint)buf;
+                    cap = buf.Length;
                 }
                 NativeMemory.Copy(bp + (nint)pos, (nint)"<c r=\"", 6);
                 pos = pos + 6;
@@ -470,10 +563,9 @@ public class XlsxBook {
                 } else if (kind == 2) {
                     NativeMemory.Copy(bp + (nint)pos, (nint)"><v>", 4);
                     pos = pos + 4;
-                    string txt = cell.text;
-                    if (txt != null && txt.Length > 0) {
-                        NativeMemory.Copy(bp + (nint)pos, (nint)txt, txt.Length);
-                        pos = pos + txt.Length;
+                    if (numTxt != null && numTxt.Length > 0) {
+                        NativeMemory.Copy(bp + (nint)pos, (nint)numTxt, numTxt.Length);
+                        pos = pos + numTxt.Length;
                     }
                     NativeMemory.Copy(bp + (nint)pos, (nint)"</v></c>", 8);
                     pos = pos + 8;
@@ -495,11 +587,10 @@ public class XlsxBook {
                 }
             }
 
-            if (pos + 8 > cap) {
-                cap = cap * 2;
-                byte[] nb = new byte[cap];
-                NativeMemory.Copy((nint)nb, bp, pos);
-                buf = nb; bp = (nint)buf;
+            if ((long)pos + 8L > (long)cap) {
+                buf = XlsxBook.GrowBuf(buf, pos, 8L, 1024L);
+                bp = (nint)buf;
+                cap = buf.Length;
             }
             NativeMemory.Copy(bp + (nint)pos, (nint)"</row>", 6);
             pos = pos + 6;
@@ -525,8 +616,9 @@ public class XlsxBook {
             tailSb.Append(Convert.ToString(s.mergeCells.Count));
             tailSb.Append("\">");
             for (int mi = 0; mi < s.mergeCells.Count; mi = mi + 1) {
+                string mr = s.mergeCells[mi];
                 tailSb.Append("<mergeCell ref=\"");
-                tailSb.Append(s.mergeCells[mi]);
+                tailSb.Append(Xlsx.EscAttr(mr != null ? mr : ""));
                 tailSb.Append("\"/>");
             }
             tailSb.Append("</mergeCells>");
@@ -663,10 +755,12 @@ public class XlsxBook {
 
     // 单张工作表的完整 worksheet UTF-8 字节（单遍融合列宽采集与 XML 直写，消除二次单元格遍历）。
     private static byte[] SheetXmlBytes(XlsxSheet s) {
-        int rowCount = s.rows.Count;
-        int colEst = s.maxCols > 0 ? s.maxCols : 4;
-        int cap = 1024 + rowCount * (colEst * 44 + 28);
-        if (cap < 2048) { cap = 2048; }
+        int rowCount = (s != null && s.rows != null) ? s.rows.Count : 0;
+        int colEst = (s != null && s.maxCols > 0) ? s.maxCols : 4;
+        long capL = 1024L + (long)rowCount * ((long)colEst * 44L + 28L);
+        if (capL < 2048L) { capL = 2048L; }
+        if (capL > 16777216L) { capL = 16777216L; }
+        int cap = (int)capL;
         byte[] buf = new byte[cap];
         nint bp = (nint)buf;
         int pos = 0;
@@ -675,7 +769,7 @@ public class XlsxBook {
         byte[] lbuf = new byte[24];
         byte[] cbuf = new byte[8];
 
-        bool trackWidths = s.autoWidth && s.maxCols > 0;
+        bool trackWidths = s != null && s.autoWidth && s.maxCols > 0;
         int mc = trackWidths ? s.maxCols : 0;
         int[] widths = trackWidths ? new int[mc] : null;
         if (trackWidths) {
@@ -698,7 +792,7 @@ public class XlsxBook {
         string sBool0 = " t=\"b\"><v>0</v></c>";
         nint pBool0 = (nint)sBool0;
 
-        int hBoldRows2 = s.freezeRows > 0 ? s.freezeRows : 1;
+        int hBoldRows2 = (s != null && s.freezeRows > 0) ? s.freezeRows : 1;
         for (int r = 0; r < rowCount; r = r + 1) {
             List<XlsxCell> row = s.rows[r];
             bool doW = trackWidths && r < widthLimit;
@@ -712,11 +806,10 @@ public class XlsxBook {
                 rn = rq;
                 rLen = rLen + 1;
             }
-            if (pos + 24 > cap) {
-                cap = cap * 2;
-                byte[] nb = new byte[cap];
-                NativeMemory.Copy((nint)nb, bp, pos);
-                buf = nb; bp = (nint)buf;
+            if ((long)pos + 24L > (long)cap) {
+                buf = XlsxBook.GrowBuf(buf, pos, 24L, 4096L);
+                bp = (nint)buf;
+                cap = buf.Length;
             }
             buf[pos] = 60; buf[pos + 1] = 114; buf[pos + 2] = 111; buf[pos + 3] = 119;
             buf[pos + 4] = 32; buf[pos + 5] = 114; buf[pos + 6] = 61; buf[pos + 7] = 34;
@@ -727,7 +820,7 @@ public class XlsxBook {
             pos = pos + 2;
 
             bool bold = s.headerBold && r < hBoldRows2;
-            int rCount = row.Count;
+            int rCount = row != null ? row.Count : 0;
             for (int c = 0; c < rCount; c = c + 1) {
                 XlsxCell cell = row[c];
                 if (cell == null) { continue; }
@@ -745,15 +838,17 @@ public class XlsxBook {
                     if (wlen > widths[c]) { widths[c] = wlen; }
                 }
                 if (kind == 1 && (cell.text == null || cell.text.Length == 0)) { continue; }
-                int need = 96;
-                if (kind == 1) { need = 96 + cell.text.Length * 5; }
-                else if (kind == 2 && cell.text != null) { need = 64 + cell.text.Length; }
-                if (pos + need > cap) {
-                    int ncap = cap * 2;
-                    if (ncap < pos + need + 4096) { ncap = pos + need + 4096; }
-                    byte[] nb = new byte[ncap];
-                    NativeMemory.Copy((nint)nb, bp, pos);
-                    buf = nb; bp = (nint)buf; cap = ncap;
+                string numTxt = null;
+                long need = 96L;
+                if (kind == 1) { need = 96L + (long)cell.text.Length * 5L; }
+                else if (kind == 2 && cell.text != null) {
+                    numTxt = XlsxBook.SafeNumXml(cell.text);
+                    need = 64L + (long)numTxt.Length;
+                }
+                if ((long)pos + need > (long)cap) {
+                    buf = XlsxBook.GrowBuf(buf, pos, need, 4096L);
+                    bp = (nint)buf;
+                    cap = buf.Length;
                 }
                 buf[pos] = 60; buf[pos + 1] = 99; buf[pos + 2] = 32;
                 buf[pos + 3] = 114; buf[pos + 4] = 61; buf[pos + 5] = 34;
@@ -828,13 +923,10 @@ public class XlsxBook {
                 } else if (kind == 2) {
                     buf[pos] = 62; buf[pos + 1] = 60; buf[pos + 2] = 118; buf[pos + 3] = 62;
                     pos = pos + 4;
-                    string txt = cell.text;
-                    if (txt != null) {
-                        int tLen = txt.Length;
-                        if (tLen > 0) {
-                            NativeMemory.Copy(bp + (nint)pos, (nint)txt, tLen);
-                            pos = pos + tLen;
-                        }
+                    if (numTxt != null && numTxt.Length > 0) {
+                        int tLen = numTxt.Length;
+                        NativeMemory.Copy(bp + (nint)pos, (nint)numTxt, tLen);
+                        pos = pos + tLen;
                     }
                     buf[pos] = 60; buf[pos + 1] = 47; buf[pos + 2] = 118; buf[pos + 3] = 62;
                     buf[pos + 4] = 60; buf[pos + 5] = 47; buf[pos + 6] = 99; buf[pos + 7] = 62;
@@ -872,30 +964,28 @@ public class XlsxBook {
                 }
             }
 
-            if (pos + 8 > cap) {
-                cap = cap * 2;
-                byte[] nb = new byte[cap];
-                NativeMemory.Copy((nint)nb, bp, pos);
-                buf = nb; bp = (nint)buf;
+            if ((long)pos + 8L > (long)cap) {
+                buf = XlsxBook.GrowBuf(buf, pos, 8L, 1024L);
+                bp = (nint)buf;
+                cap = buf.Length;
             }
             buf[pos] = 60; buf[pos + 1] = 47; buf[pos + 2] = 114;
             buf[pos + 3] = 111; buf[pos + 4] = 119; buf[pos + 5] = 62;
             pos = pos + 6;
         }
 
-        int tailNeed = 64;
-        if (s.mergeCells != null && s.mergeCells.Count > 0) {
-            tailNeed = tailNeed + 64 + s.mergeCells.Count * 40;
+        long tailNeed = 64L;
+        if (s != null && s.mergeCells != null && s.mergeCells.Count > 0) {
+            tailNeed = tailNeed + 64L + (long)s.mergeCells.Count * 40L;
         }
-        if (pos + tailNeed > cap) {
-            int ncap = pos + tailNeed + 256;
-            byte[] nb = new byte[ncap];
-            NativeMemory.Copy((nint)nb, bp, pos);
-            buf = nb; bp = (nint)buf; cap = ncap;
+        if ((long)pos + tailNeed > (long)cap) {
+            buf = XlsxBook.GrowBuf(buf, pos, tailNeed, 256L);
+            bp = (nint)buf;
+            cap = buf.Length;
         }
         NativeMemory.Copy(bp + (nint)pos, (nint)"</sheetData>", 12);
         pos = pos + 12;
-        if (s.mergeCells != null && s.mergeCells.Count > 0) {
+        if (s != null && s.mergeCells != null && s.mergeCells.Count > 0) {
             NativeMemory.Copy(bp + (nint)pos, (nint)"<mergeCells count=\"", 19);
             pos = pos + 19;
             int mLen = XlsxBook.FormatPosInt(s.mergeCells.Count, rbuf);
@@ -905,19 +995,26 @@ public class XlsxBook {
             buf[pos] = 34; buf[pos + 1] = 62;
             pos = pos + 2;
             for (int mi = 0; mi < s.mergeCells.Count; mi = mi + 1) {
-                string mr = s.mergeCells[mi];
-                if (pos + 24 + mr.Length > cap) {
-                    int ncap = cap * 2 + mr.Length;
-                    byte[] nb = new byte[ncap];
-                    NativeMemory.Copy((nint)nb, bp, pos);
-                    buf = nb; bp = (nint)buf; cap = ncap;
+                string rawMr = s.mergeCells[mi];
+                string mr = Xlsx.EscAttr(rawMr != null ? rawMr : "");
+                if ((long)pos + 24L + (long)mr.Length > (long)cap) {
+                    buf = XlsxBook.GrowBuf(buf, pos, 24L + (long)mr.Length, 256L);
+                    bp = (nint)buf;
+                    cap = buf.Length;
                 }
                 NativeMemory.Copy(bp + (nint)pos, (nint)"<mergeCell ref=\"", 16);
                 pos = pos + 16;
-                NativeMemory.Copy(bp + (nint)pos, (nint)mr, mr.Length);
-                pos = pos + mr.Length;
+                if (mr.Length > 0) {
+                    NativeMemory.Copy(bp + (nint)pos, (nint)mr, mr.Length);
+                    pos = pos + mr.Length;
+                }
                 buf[pos] = 34; buf[pos + 1] = 47; buf[pos + 2] = 62;
                 pos = pos + 3;
+            }
+            if ((long)pos + 32L > (long)cap) {
+                buf = XlsxBook.GrowBuf(buf, pos, 32L, 64L);
+                bp = (nint)buf;
+                cap = buf.Length;
             }
             NativeMemory.Copy(bp + (nint)pos, (nint)"</mergeCells>", 13);
             pos = pos + 13;
@@ -926,7 +1023,11 @@ public class XlsxBook {
         pos = pos + 12;
 
         // 拼装头部（<?xml ...><sheetViews>...<cols>...</cols>）并与 body 一次合成最终字节数组。
-        int headCap = 512 + mc * 64;
+        long headCapL = 512L + (long)mc * 80L;
+        if (headCapL > 2147483591L) {
+            throw new IOException("XlsxBook: worksheet header exceeds maximum buffer size");
+        }
+        int headCap = (int)headCapL;
         byte[] hbuf = new byte[headCap];
         nint hbp = (nint)hbuf;
         int hpos = 0;
@@ -934,8 +1035,8 @@ public class XlsxBook {
         NativeMemory.Copy(hbp, (nint)head, head.Length);
         hpos = head.Length;
 
-        int ySplit2 = s.freezeHeader ? (s.freezeRows > 0 ? s.freezeRows : 1) : s.freezeRows;
-        int xSplit2 = s.freezeCols;
+        int ySplit2 = s != null ? (s.freezeHeader ? (s.freezeRows > 0 ? s.freezeRows : 1) : s.freezeRows) : 0;
+        int xSplit2 = s != null ? s.freezeCols : 0;
         if ((xSplit2 > 0 || ySplit2 > 0) && rowCount > 0) {
             string topL2 = Xlsx.ColRef(xSplit2) + Convert.ToString(ySplit2 + 1);
             string activeP2 = "bottomLeft";
@@ -947,11 +1048,10 @@ public class XlsxBook {
             pane = pane + " topLeftCell=\"" + topL2 + "\" activePane=\"" + activeP2
                 + "\" state=\"frozen\"/><selection pane=\"" + activeP2
                 + "\" activeCell=\"" + topL2 + "\" sqref=\"" + topL2 + "\"/>";
-            if (hpos + pane.Length + 64 > headCap) {
-                headCap = headCap * 2 + pane.Length;
-                byte[] nh = new byte[headCap];
-                NativeMemory.Copy((nint)nh, hbp, hpos);
-                hbuf = nh; hbp = (nint)hbuf;
+            if ((long)hpos + (long)pane.Length + 64L > (long)headCap) {
+                hbuf = XlsxBook.GrowBuf(hbuf, hpos, (long)pane.Length + 64L, 256L);
+                hbp = (nint)hbuf;
+                headCap = hbuf.Length;
             }
             NativeMemory.Copy(hbp + (nint)hpos, (nint)pane, pane.Length);
             hpos = hpos + pane.Length;
@@ -960,6 +1060,11 @@ public class XlsxBook {
         hpos = hpos + 25;
 
         if (trackWidths) {
+            if ((long)hpos + (long)mc * 80L + 32L > (long)headCap) {
+                hbuf = XlsxBook.GrowBuf(hbuf, hpos, (long)mc * 80L + 32L, 256L);
+                hbp = (nint)hbuf;
+                headCap = hbuf.Length;
+            }
             hbuf[hpos] = 60; hbuf[hpos + 1] = 99; hbuf[hpos + 2] = 111; hbuf[hpos + 3] = 108; hbuf[hpos + 4] = 115; hbuf[hpos + 5] = 62;
             hpos = hpos + 6;
             for (int c = 0; c < mc; c = c + 1) {
@@ -989,7 +1094,11 @@ public class XlsxBook {
             hpos = hpos + 7;
         }
 
-        byte[] result = new byte[hpos + pos];
+        long finalLen = (long)hpos + (long)pos;
+        if (finalLen > 2147483591L) {
+            throw new IOException("XlsxBook: worksheet XML exceeds maximum buffer size");
+        }
+        byte[] result = new byte[(int)finalLen];
         nint resPtr = (nint)result;
         NativeMemory.Copy(resPtr, hbp, hpos);
         NativeMemory.Copy(resPtr + (nint)hpos, bp, pos);
@@ -999,8 +1108,8 @@ public class XlsxBook {
     // 兼容辅助：供外部或单格场景按 StringBuilder 追加单元格。
     static void AppendCellXml(StringBuilder sb, XlsxCell cell, int row1,
                               int col, bool bold) {
-        if (cell == null || cell.kind == 0) { return; }
-        if (cell.kind == 1 && cell.text == "") { return; }
+        if (sb == null || cell == null || cell.kind == 0) { return; }
+        if (cell.kind == 1 && (cell.text == null || cell.text.Length == 0)) { return; }
         sb.Append("<c r=\"");
         sb.Append(Xlsx.ColRef(col));
         sb.Append(Convert.ToString(row1));
@@ -1015,8 +1124,8 @@ public class XlsxBook {
         }
         if (cell.kind == 1) {
             sb.Append(" t=\"inlineStr\"><is><t");
-            if ((int)cell.text[0] == 32
-                || (int)cell.text[cell.text.Length - 1] == 32) {
+            if ((int)(cell.text[0] & 255) == 32
+                || (int)(cell.text[cell.text.Length - 1] & 255) == 32) {
                 sb.Append(" xml:space=\"preserve\"");
             }
             sb.Append(">");
@@ -1024,7 +1133,7 @@ public class XlsxBook {
             sb.Append("</t></is></c>");
         } else if (cell.kind == 2) {
             sb.Append("><v>");
-            sb.Append(cell.text);
+            sb.Append(XlsxBook.SafeNumXml(cell.text));
             sb.Append("</v></c>");
         } else if (cell.kind == 3) {
             sb.Append(" t=\"b\"><v>");
@@ -1041,8 +1150,8 @@ public class XlsxBook {
     // 单格的列宽贡献值（8 兜底；文本按显示宽、数字 +1、日期 10）。
     static int CellWidth(XlsxCell cell) {
         if (cell == null || cell.kind == 0) { return 8; }
-        if (cell.kind == 1) { return Xlsx.WideLen(cell.text); }
-        if (cell.kind == 2) { return cell.text.Length + 1; }
+        if (cell.kind == 1) { return cell.text != null ? Xlsx.WideLen(cell.text) : 8; }
+        if (cell.kind == 2) { return cell.text != null ? (cell.text.Length + 1) : 1; }
         if (cell.kind == 4) { return 10; }
         return 8;
     }
@@ -1050,12 +1159,13 @@ public class XlsxBook {
     // 列宽估算：内容显示宽度 + 2 的余量，夹在 [10, 60]。
     // 只扫前 200 行——宽度是观感问题，不值得为十万行扫描。
     static int ColWidth(XlsxSheet s, int col) {
+        if (s == null || s.rows == null) { return 10; }
         int w = 8;
         int limit = s.rows.Count;
         if (limit > 200) { limit = 200; }
         for (int r = 0; r < limit; r = r + 1) {
             List<XlsxCell> row = s.rows[r];
-            if (col >= row.Count) { continue; }
+            if (row == null || col >= row.Count) { continue; }
             int len = XlsxBook.CellWidth(row[col]);
             if (len > w) { w = len; }
         }

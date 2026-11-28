@@ -100,11 +100,22 @@ public partial class DataTable {
     int n, int plotX, int plotY, int plotW, int plotH,
     double posMax, double negMin, int zeroY,
     int spark, int sparkNeg) {
+        DataTable.DrawSparkLineScratch(app, col, seq, n, plotX, plotY, plotW, plotH,
+        posMax, negMin, zeroY, spark, sparkNeg,
+        new List<int>(), new List<int>(), new List<int>(), new List<int>());
+    }
+
+    // 复用调用方坐标临时缓冲的迷你折线/面积图绘制，消除每帧每格 2+2k 次 List<int> 分配。
+    public static void DrawSparkLineScratch(App app, DataColumn col, List<string> seq,
+    int n, int plotX, int plotY, int plotW, int plotH,
+    double posMax, double negMin, int zeroY,
+    int spark, int sparkNeg,
+    List<int> xs, List<int> ys, List<int> nx, List<int> ny) {
         Canvas c = app.canvas;
         int slotW = plotW / n;
         if (slotW < 1) { slotW = 1; }
-        List<int> xs = new List<int>();
-        List<int> ys = new List<int>();
+        xs.Clear();
+        ys.Clear();
         for (int i = 0; i < n; i = i + 1) {
             xs.Add(plotX + slotW * i + slotW / 2);
             ys.Add(DataTable.SparkValueY(DataTable.ParseReal(seq[i]),
@@ -125,8 +136,8 @@ public partial class DataTable {
                     yF = yF + (ys[seg] - ys[seg - 1]) * (x - xs[seg - 1]) * 256
                     / (xs[seg] - xs[seg - 1]);
                 }
-                int col = yF <= zeroY * 256 ? spark : sparkNeg;
-                RenderAA.FillColumnAA(c, x, yF, zeroY, col, false, 45, 45, 45);
+                int colC = yF <= zeroY * 256 ? spark : sparkNeg;
+                RenderAA.FillColumnAA(c, x, yF, zeroY, colC, false, 45, 45, 45);
                 x = x + 1;
             }
         }
@@ -138,8 +149,8 @@ public partial class DataTable {
             if (ys[i2] <= zeroY && ys[i2 + 1] <= zeroY) { i2 = i2 + 1; continue; }
             int j = i2 + 1;
             while (j + 1 < n && ys[j + 1] > zeroY) { j = j + 1; }
-            List<int> nx = new List<int>();
-            List<int> ny = new List<int>();
+            nx.Clear();
+            ny.Clear();
             if (ys[i2] <= zeroY) {
                 double t = (double)(zeroY - ys[i2]) / (double)(ys[i2 + 1] - ys[i2]);
                 nx.Add(xs[i2] + (int)(t * (double)(xs[i2 + 1] - xs[i2])));
@@ -189,6 +200,13 @@ public partial class DataTable {
     public static void DrawCellIndented(App app, DataColumn col, string val, int cx, int cy, int cw, int rowH,
     double cfLo, double cfHi, int fgOverride,
     int indent, bool isTreeCol, bool canExpand, bool expanded) {
+        DataTable.DrawCellIndented(app, col, val, cx, cy, cw, rowH, cfLo, cfHi, fgOverride,
+        indent, isTreeCol, canExpand, expanded, null);
+    }
+
+    public static void DrawCellIndented(App app, DataColumn col, string val, int cx, int cy, int cw, int rowH,
+    double cfLo, double cfHi, int fgOverride,
+    int indent, bool isTreeCol, bool canExpand, bool expanded, DataTableStyleSnapshot styles) {
         Canvas c = app.canvas;
         Theme t = app.theme;
         int pad = t.paddingSmall;
@@ -200,8 +218,8 @@ public partial class DataTable {
             int exY = cy + (rowH - exSz) / 2;
             string chev = "chevron-down";
             if (!expanded) { chev = "chevron-right"; }
-            c.DrawGlyph(chev, exX, exY, exSz, Style.Part(app, "datatable", "icon", "", "", "",
-            Style.SNormal()).FgOr(0));
+            StyleBox sIcon = styles != null ? styles.icon : Style.Part(app, "datatable", "icon", "", "", "", Style.SNormal());
+            c.DrawGlyph(chev, exX, exY, exSz, sIcon.FgOr(0));
             indentPx = indentPx + app.Scale(16);
         } else if (isTreeCol) {
             // 叶子行：与兄弟的箭头对齐的空白边距。
@@ -211,7 +229,7 @@ public partial class DataTable {
         // 对齐全部保持原语义），箭头/缩进已画的部分靠
         // 负偏移保护不被文本覆盖。
         int inner = cx + indentPx;
-        DataTable.DrawCellRangeCtx(app, col, val, inner, cy, cw - indentPx, rowH, cfLo, cfHi, fgOverride, -1, -1, null);
+        DataTable.DrawCellRangeCtx(app, col, val, inner, cy, cw - indentPx, rowH, cfLo, cfHi, fgOverride, -1, -1, null, null, styles);
     }
 
     // DrawCell 的主体（缩进版把 x/宽收缩后委托到这里）。
@@ -220,22 +238,27 @@ public partial class DataTable {
     // （-1 表示调用方没有行上下文——如独立的单元格渲染器，
     // 此时按钮点击仅Raise事件，不设置 HitRow/HitCol）。
     public static void DrawCellRange(App app, DataColumn col, string val, int cx, int cy, int cw, int rowH, double cfLo, double cfHi, int fgOverride) {
-        DataTable.DrawCellRangeCtx(app, col, val, cx, cy, cw, rowH, cfLo, cfHi, fgOverride, -1, -1, null);
+        DataTable.DrawCellRangeCtx(app, col, val, cx, cy, cw, rowH, cfLo, cfHi, fgOverride, -1, -1, null, null, null);
     }
 
     public static void DrawCellRangeCtx(App app, DataColumn col, string val, int cx, int cy, int cw, int rowH, double cfLo, double cfHi, int fgOverride, int rowIdx, int cc, DataTableState st) {
-        DataTable.DrawCellRangeCtx(app, col, val, cx, cy, cw, rowH, cfLo, cfHi, fgOverride, rowIdx, cc, st, null);
+        DataTable.DrawCellRangeCtx(app, col, val, cx, cy, cw, rowH, cfLo, cfHi, fgOverride, rowIdx, cc, st, null, null);
     }
 
     // 带 `src` 的主入口：组件列（cellType 9）需要数据源取稳定
     // 行键做控件池化；其余 cellType 忽略它。
     public static void DrawCellRangeCtx(App app, DataColumn col, string val, int cx, int cy, int cw, int rowH, double cfLo, double cfHi, int fgOverride, int rowIdx, int cc, DataTableState st, DataSource src) {
+        DataTable.DrawCellRangeCtx(app, col, val, cx, cy, cw, rowH, cfLo, cfHi, fgOverride, rowIdx, cc, st, src, null);
+    }
+
+    // 带帧级样式快照的热路径入口：消除每单元格重复 Style.Part 字典查找。
+    public static void DrawCellRangeCtx(App app, DataColumn col, string val, int cx, int cy, int cw, int rowH, double cfLo, double cfHi, int fgOverride, int rowIdx, int cc, DataTableState st, DataSource src, DataTableStyleSnapshot styles) {
         Canvas c = app.canvas;
         Theme t = app.theme;
         int fs = Style.FontFallback(app, "medium");
         int pad = t.paddingSmall;
         int innerW = cw - pad * 2;
-        StyleBox sCell = Style.Part(app, "datatable", "cell", "", "", "",
+        StyleBox sCell = styles != null ? styles.cellBox : Style.Part(app, "datatable", "cell", "", "", "",
         Style.SNormal());
 
         // ---- 条件格式（仅纯文本/数值单元格）----
@@ -284,19 +307,14 @@ public partial class DataTable {
                 c.FillRect(cx, cy, cw, rowH, DataTable.ColorAlpha(col.cfColor, 38));
                 cfText = col.cfColor;
             } else if ((col.cfMode == 5 || col.cfMode == 6) && st != null
-            && rowIdx >= 0 && cc >= 0 && cc * st.order.Count < st.cfRank.Count) {
-                // Top/Bottom：命中判定走 ComputeColStats 缓存的降序
-                // 名次（cfRank 与 min/max 同周期重建，下标是过滤
-                // 集合里的显示序）。N 按项数或百分比解释
-                // （cfRankPct），名次并列全部命中（Excel Top N 语义）。
-                // 显示序走 ComputeColStats 建的字典 O(1) 查表——
-                // 每格对 st.order 线性查找在大表上是每帧的热点。
+            && rowIdx >= 0 && cc >= 0 && st.cfRankOffsets != null
+            && cc < st.cfRankOffsets.Count && st.cfRankOffsets[cc] >= 0) {
+                // Top/Bottom：命中判定走 ComputeColStats 按需缓存的降序
+                // 名次（cfRankOffsets[cc] 定位该列在紧凑 cfRank 中的起点）。
                 int opos = DataTable.CfOrderPos(st, rowIdx);
-                if (opos >= 0) {
-                    // cfRank 与 cfMin/cfMax 同布局：按列分段
-                    // （col 段起点 = col * n），段内下标是过滤
-                    // 集合的显示序（st.order 的位置）。
-                    int rank = st.cfRank[cc * st.order.Count + opos];
+                int rankOff = st.cfRankOffsets[cc];
+                if (opos >= 0 && rankOff + opos < st.cfRank.Count) {
+                    int rank = st.cfRank[rankOff + opos];
                     int n = st.order.Count;
                     int limit = col.cfThreshold;
                     if (col.cfRankPct) {
@@ -333,10 +351,15 @@ public partial class DataTable {
             int ins = app.Scale(3);
             if (col.boolStyle == 1) {
                 // 字形样式：无边框，只有绿色对勾或淡色叉。
-                string mcls = "";
-                if (!on) { mcls = "off"; }
-                StyleBox mark = Style.Part(app, "datatable", "mark", "", mcls, "",
-                Style.SNormal());
+                StyleBox mark;
+                if (styles != null) {
+                    mark = on ? styles.markOn : styles.markOff;
+                } else {
+                    string mcls = "";
+                    if (!on) { mcls = "off"; }
+                    mark = Style.Part(app, "datatable", "mark", "", mcls, "",
+                    Style.SNormal());
+                }
                 string mIco = "close";
                 if (on) { mIco = "check"; }
                 c.DrawGlyph(mIco, bx + ins, by + ins, box - ins * 2, mark.FgOr(0));
@@ -388,7 +411,7 @@ public partial class DataTable {
                 int phH = boxH;
                 if (phH > app.Scale(20)) { phH = app.Scale(20); }
                 if (phW > 0) {
-                    StyleBox ph = Style.Part(app, "datatable",
+                    StyleBox ph = styles != null ? styles.progressTrack : Style.Part(app, "datatable",
                     "progress-track", "", "", "",
                     Style.SNormal());
                     c.FillRoundRect(cx + (cw - phW) / 2,
@@ -407,16 +430,21 @@ public partial class DataTable {
             int barY = cy + (rowH - barH) / 2;
             int barW = innerW - app.Scale(40);
             if (barW < app.Scale(20)) { barW = app.Scale(20); }
-            StyleBox track = Style.Part(app, "datatable", "progress-track", "",
+            StyleBox track = styles != null ? styles.progressTrack : Style.Part(app, "datatable", "progress-track", "",
             "", "", Style.SNormal());
             c.FillRoundRect(cx + pad, barY, barW, barH, barH / 2, track.BgOr(0));
             int fillW = pct * barW / 100;
-            string pcls = "";
-            if (pct >= 100) { pcls = "done"; }
-            StyleBox fill = Style.Part(app, "datatable", "progress-fill", "",
-            pcls, "", Style.SNormal());
+            StyleBox fill;
+            if (styles != null) {
+                fill = pct >= 100 ? styles.progressFillDone : styles.progressFill;
+            } else {
+                string pcls = "";
+                if (pct >= 100) { pcls = "done"; }
+                fill = Style.Part(app, "datatable", "progress-fill", "",
+                pcls, "", Style.SNormal());
+            }
             c.FillRoundRect(cx + pad, barY, fillW, barH, barH / 2, fill.BgOr(0));
-            StyleBox pctS = Style.Part(app, "datatable", "cell", "", "secondary",
+            StyleBox pctS = styles != null ? styles.cellSecondary : Style.Part(app, "datatable", "cell", "", "secondary",
             "", Style.SNormal());
             int txtY = Canvas.CenterTextY(cy, rowH, Style.FontFallback(app, "small"));
             c.DrawText(cx + pad + barW + app.Scale(6), txtY, Convert.ToString(pct) + "%", pctS.FgOr(0), Style.FontFallback(app, "small"));
@@ -424,28 +452,79 @@ public partial class DataTable {
         }
 
         if (col.cellType == 2) {
-            int tc = DataTable.TypeColor(app, col.tagType);
-            StyleBox tagS = Style.Part(app, "datatable", "tag", "", "", "",
+            if (val.Length == 0) { return; }
+            StyleBox tagS = styles != null ? styles.tag : Style.Part(app, "datatable", "tag", "", "", "",
             Style.SNormal());
+            int smallFs = Style.FontFallback(app, "small");
             int tagH = t.heightSmall;
             int tagY = cy + (rowH - tagH) / 2;
-            string label = DataTable.Truncate(val, Style.FontFallback(app, "small"), innerW - pad * 2);
-            int tagW = Canvas.MeasureText(label, Style.FontFallback(app, "small")) + pad * 2;
+            if (col.editorKind == 4) {
+                List<string> toks = DataTable.SplitMultiChoice(val);
+                if (toks.Count == 0) { return; }
+                int curX = cx + pad;
+                int limitR = cx + cw - pad;
+                int gap = app.Scale(4);
+                int padH = app.Scale(6);
+                for (int ti = 0; ti < toks.Count; ti = ti + 1) {
+                    int rem = toks.Count - ti;
+                    string tok = toks[ti];
+                    int cc = DataTable.ChoiceColorOf(col, tok);
+                    int tc = cc != 0 ? cc : (styles != null ? styles.TagTypeColor(col.tagType) : DataTable.TypeColor(app, col.tagType));
+                    int bg = cc != 0 ? DataTable.ColorAlpha(cc, 38) : tagS.BgOr(0);
+                    int bdr = cc != 0 ? DataTable.ColorAlpha(cc, 110) : tc;
+                    int reserve = rem > 1 ? app.Scale(28) : 0;
+                    int avail = limitR - curX - reserve;
+                    if (ti > 0 && avail < app.Scale(24)) {
+                        string more = "+" + Convert.ToString(rem);
+                        int mw = Canvas.MeasureText(more, smallFs) + padH * 2;
+                        if (curX + mw > limitR) { mw = limitR - curX; }
+                        if (mw > app.Scale(14)) {
+                            c.FillRoundRect(curX, tagY, mw, tagH, t.borderRadiusSmall, tagS.BgOr(0));
+                            c.DrawRoundRect(curX, tagY, mw, tagH, t.borderRadiusSmall, tagS.FgOr(0), 1);
+                            c.DrawTextCentered(curX, tagY, mw, tagH, more, tagS.FgOr(0), smallFs);
+                        }
+                        break;
+                    }
+                    int maxTextW = limitR - curX - padH * 2 - (rem > 1 ? app.Scale(28) : 0);
+                    if (maxTextW < app.Scale(12)) { maxTextW = limitR - curX - padH * 2; }
+                    if (maxTextW <= 0) { break; }
+                    string label = DataTable.Truncate(tok, smallFs, maxTextW);
+                    int tagW = Canvas.MeasureText(label, smallFs) + padH * 2;
+                    c.FillRoundRect(curX, tagY, tagW, tagH, t.borderRadiusSmall, bg);
+                    c.DrawRoundRect(curX, tagY, tagW, tagH, t.borderRadiusSmall, bdr, 1);
+                    int txtY = Canvas.CenterTextY(tagY, tagH, smallFs);
+                    c.DrawText(curX + padH, txtY, label, tc, smallFs);
+                    curX = curX + tagW + gap;
+                    if (curX >= limitR) { break; }
+                }
+                return;
+            }
+            int customCol = DataTable.ChoiceColorOf(col, val);
+            int tcSingle = customCol != 0 ? customCol : (styles != null ? styles.TagTypeColor(col.tagType) : DataTable.TypeColor(app, col.tagType));
+            int bgSingle = customCol != 0 ? DataTable.ColorAlpha(customCol, 38) : tagS.BgOr(0);
+            int bdrSingle = customCol != 0 ? DataTable.ColorAlpha(customCol, 110) : tcSingle;
+            string labelSingle = DataTable.Truncate(val, smallFs, innerW - pad * 2);
+            int tagW = Canvas.MeasureText(labelSingle, smallFs) + pad * 2;
             int tagX = cx + pad;
             if (col.align == 1) { tagX = cx + (cw - tagW) / 2; }
-            c.FillRoundRect(tagX, tagY, tagW, tagH, t.borderRadiusSmall, tagS.BgOr(0));
-            c.DrawRoundRect(tagX, tagY, tagW, tagH, t.borderRadiusSmall, tc, 1);
-            int txtY = Canvas.CenterTextY(tagY, tagH, Style.FontFallback(app, "small"));
-            c.DrawText(tagX + pad, txtY, label, tc, Style.FontFallback(app, "small"));
+            c.FillRoundRect(tagX, tagY, tagW, tagH, t.borderRadiusSmall, bgSingle);
+            c.DrawRoundRect(tagX, tagY, tagW, tagH, t.borderRadiusSmall, bdrSingle, 1);
+            int txtYSingle = Canvas.CenterTextY(tagY, tagH, smallFs);
+            c.DrawText(tagX + pad, txtYSingle, labelSingle, tcSingle, smallFs);
             return;
         }
 
         if (col.cellType == 4) {
             int dotR = app.Scale(4);
-            string dcls = "";
-            if (val == "0" || val == "" || val == "Offline" || val == "Idle" || val == "Inactive" || val == "Closed") { dcls = "off"; }
-            int dotColor = Style.Part(app, "datatable", "mark", "", dcls, "",
-            Style.SNormal()).FgOr(0);
+            bool isOff = val == "0" || val == "" || val == "Offline" || val == "Idle" || val == "Inactive" || val == "Closed";
+            int dotColor;
+            if (styles != null) {
+                dotColor = (isOff ? styles.markOff : styles.markOn).FgOr(0);
+            } else {
+                string dcls = isOff ? "off" : "";
+                dotColor = Style.Part(app, "datatable", "mark", "", dcls, "",
+                Style.SNormal()).FgOr(0);
+            }
             int cxc = cx + pad + dotR;
             if (col.align == 1) { cxc = cx + cw / 2 - Canvas.MeasureText(val, fs) / 2 - dotR - app.Scale(4); }
             c.FillCircle(cxc, cy + rowH / 2, dotR, dotColor);
@@ -460,8 +539,8 @@ public partial class DataTable {
                 int gsz = app.Scale(16);
                 int gcol = cfText;
                 if (fgOverride == 0) {
-                    gcol = Style.Part(app, "datatable", "icon", "", "", "",
-                    Style.SNormal()).FgOr(0);
+                    gcol = (styles != null ? styles.icon : Style.Part(app, "datatable", "icon", "", "", "",
+                    Style.SNormal())).FgOr(0);
                 }
                 c.DrawGlyph(val, cx + (cw - gsz) / 2, cy + (rowH - gsz) / 2, gsz, gcol);
             }
@@ -494,22 +573,34 @@ public partial class DataTable {
                 }
                 if (posMax < 1.0) { posMax = 1.0; }
                 int zeroY = DataTable.SparkZeroY(negMin, posMax, plotY, plotH);
-                int accent = Style.Part(app, "datatable", "accent", "", "", "",
-                Style.SNormal()).BgOr(0);
+                int accent = (styles != null ? styles.accent : Style.Part(app, "datatable", "accent", "", "", "",
+                Style.SNormal())).BgOr(0);
                 int spark = accent;
                 if (col.sparkColor != 0) { spark = col.sparkColor; }
                 int sparkNeg = col.sparkNegColor;
                 if (sparkNeg == 0) {
-                    sparkNeg = Style.Part(app, "datatable", "spark-neg", "", "", "",
-                    Style.SNormal()).FgOr(0);
+                    sparkNeg = (styles != null ? styles.sparkNeg : Style.Part(app, "datatable", "spark-neg", "", "", "",
+                    Style.SNormal())).FgOr(0);
                     // 皮肤没给 spark-neg 时退半透明正色，
                     // 至少保住正负分区可辨。
                     if (sparkNeg == 0) { sparkNeg = DataTable.ColorAlpha(spark, 150); }
                 }
                 if (col.sparkKind == 1 || col.sparkKind == 2) {
-                    DataTable.DrawSparkLine(app, col, seq, n, plotX, plotY,
-                    plotW, plotH, posMax, negMin, zeroY,
-                    spark, sparkNeg);
+                    if (st != null) {
+                        if (st.sparkXs == null) {
+                            st.sparkXs = new List<int>();
+                            st.sparkYs = new List<int>();
+                            st.sparkNx = new List<int>();
+                            st.sparkNy = new List<int>();
+                        }
+                        DataTable.DrawSparkLineScratch(app, col, seq, n, plotX, plotY,
+                        plotW, plotH, posMax, negMin, zeroY,
+                        spark, sparkNeg, st.sparkXs, st.sparkYs, st.sparkNx, st.sparkNy);
+                    } else {
+                        DataTable.DrawSparkLine(app, col, seq, n, plotX, plotY,
+                        plotW, plotH, posMax, negMin, zeroY,
+                        spark, sparkNeg);
+                    }
                 } else {
                     DataTable.DrawSparkBars(app, col, seq, n, plotX, plotY,
                     plotW, plotH, posMax, negMin, zeroY,
@@ -575,8 +666,8 @@ public partial class DataTable {
 
         int color = cfText;
         if (col.cellType == 1 && fgOverride == 0) {
-            color = Style.Part(app, "datatable", "cell", "", "link", "",
-            Style.SNormal()).FgOr(0);
+            color = (styles != null ? styles.cellLink : Style.Part(app, "datatable", "cell", "", "link", "",
+            Style.SNormal())).FgOr(0);
         }
         string full = DataTable.FormatCell(col, val);
         // ---- 自动换行（wrapText 列且行高容得下两行以上）：
@@ -609,8 +700,8 @@ public partial class DataTable {
         if (q.Length > 0 && rowIdx >= 0 && cc >= 0 && col.cellType < 6 && !col.isBool) {
             int qLen = q.Length;
             int searchPos = 0;
-            int acc = Style.Part(app, "datatable", "accent", "", "", "",
-            Style.SNormal()).BgOr(0);
+            int acc = (styles != null ? styles.accent : Style.Part(app, "datatable", "accent", "", "", "",
+            Style.SNormal())).BgOr(0);
             while (searchPos < shown.Length) {
                 int mi = DataTable.IndexOfCI(shown.Substring(searchPos), q);
                 if (mi < 0) { break; }

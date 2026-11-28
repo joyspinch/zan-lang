@@ -1,0 +1,159 @@
+using System;
+
+namespace Game.Net;
+
+// 跨平台路径 MTU 探测状态（消除桌面以太网 / 移动 4G-5G / IPv6 VPN 隐式分片丢包）。
+public class NetMtuPathProber {
+    private int lowSafe;
+    private int highBound;
+    private int currentProbe;
+    private bool converged;
+
+    public NetMtuPathProber(int minSafePayload, int maxPayload) {
+        this.lowSafe = minSafePayload < 512 ? 512 : minSafePayload;
+        this.highBound = maxPayload < this.lowSafe ? this.lowSafe : maxPayload;
+        this.currentProbe = (this.lowSafe + this.highBound + 1) / 2;
+        this.converged = this.highBound - this.lowSafe <= 16;
+    }
+
+    public int SafePayloadBytes {
+        get { return this.lowSafe; }
+    }
+
+    public int NextProbeSize {
+        get { return this.converged ? this.lowSafe : this.currentProbe; }
+    }
+
+    public bool Converged {
+        get { return this.converged; }
+    }
+
+    // 收到指定探测包大小 ACK 或超时后收缩二分探测区间。
+    public int ReportProbeResult(int probeBytes, bool acked) {
+        if (this.converged) { return this.lowSafe; }
+        if (acked) {
+            if (probeBytes > this.lowSafe) { this.lowSafe = probeBytes; }
+        } else {
+            if (probeBytes - 1 < this.highBound) { this.highBound = probeBytes - 1; }
+        }
+        if (this.highBound - this.lowSafe <= 16) {
+            this.converged = true;
+            this.currentProbe = this.lowSafe;
+        } else {
+            this.currentProbe = (this.lowSafe + this.highBound + 1) / 2;
+        }
+        return this.lowSafe;
+    }
+}
+
+// 跨平台网络切换（Wi-Fi ↔ 5G / IPv4 ↔ IPv6）连接无缝迁移守卫：
+// - 持有会话令牌（ConnectionToken）与宽限期；
+// - 校验来源迁移令牌并在双路径并行到达时按序号窗口去重。
+public class NetNetworkHandoverGuard {
+    private long sessionToken;
+    private string activeEndpoint;
+    private long graceWindowMs;
+    private long handoverDeadlineMs;
+    private bool inHandover;
+    private int highestAcceptedSeq;
+    private int handoverCount;
+
+    public NetNetworkHandoverGuard(long sessionToken, string initialEndpoint, long graceWindowMs) {
+        this.sessionToken = sessionToken;
+        this.activeEndpoint = initialEndpoint == null ? "" : initialEndpoint;
+        this.graceWindowMs = graceWindowMs < 1000L ? 1000L : graceWindowMs;
+        this.handoverDeadlineMs = 0L;
+        this.inHandover = false;
+        this.highestAcceptedSeq = -1;
+        this.handoverCount = 0;
+    }
+
+    public string ActiveEndpoint { get { return this.activeEndpoint; } }
+    public bool InHandover { get { return this.inHandover; } }
+    public int HandoverCount { get { return this.handoverCount; } }
+
+    public void BeginHandover(long nowMs) {
+        this.inHandover = true;
+        this.handoverDeadlineMs = nowMs + this.graceWindowMs;
+    }
+
+    // 校验来自新地址的迁移包：令牌匹配且未超宽限期即无缝切换端点，保持会话不断线。
+    public bool TryMigrateEndpoint(long nowMs, long token, string newEndpoint) {
+        if (!this.inHandover) { return false; }
+        if (nowMs > this.handoverDeadlineMs) {
+            this.inHandover = false;
+            return false;
+        }
+        if (token != this.sessionToken || newEndpoint == null || newEndpoint.Length == 0) {
+            return false;
+        }
+        this.activeEndpoint = newEndpoint;
+        this.inHandover = false;
+        this.handoverCount = this.handoverCount + 1;
+        return true;
+    }
+
+    // 双路径并发重传序号去重：仅放行严格递增的新序号包。
+    public bool AcceptPacketSequence(int seq) {
+        if (seq <= this.highestAcceptedSeq) { return false; }
+        this.highestAcceptedSeq = seq;
+        return true;
+    }
+}
+
+// 跨平台输入归一化器：
+// 将桌面键鼠、主机/PC 手柄模拟摇杆、移动/鸿蒙触屏虚拟摇杆统一映射为确定性 [-1000, 1000] 定点数，
+// 保证跨平台帧同步与联机输入语义完全一致。
+public class CrossPlatformInputNormalizer {
+    private float radialDeadzone;
+    private float responseExponent;
+
+    public CrossPlatformInputNormalizer(float radialDeadzone, float responseExponent) {
+        this.radialDeadzone = radialDeadzone < 0.0f ? 0.0f : (radialDeadzone > 0.45f ? 0.45f : radialDeadzone);
+        this.responseExponent = responseExponent < 1.0f ? 1.0f : (responseExponent > 3.0f ? 3.0f : responseExponent);
+    }
+
+    public void NormalizeStickToFixed1000(float rawX, float rawY, out int outX, out int outY) {
+        float magSq = rawX * rawX + rawY * rawY;
+        if (magSq <= 0.000001f) {
+            outX = 0;
+            outY = 0;
+            return;
+        }
+        float mag = (float)Math.Sqrt((double)magSq);
+        if (mag <= this.radialDeadzone) {
+            outX = 0;
+            outY = 0;
+            return;
+        }
+        float clampedMag = mag > 1.0f ? 1.0f : mag;
+        float remapped = (clampedMag - this.radialDeadzone) / (1.0f - this.radialDeadzone);
+        float curved = (float)Math.Pow((double)remapped, (double)this.responseExponent);
+        float nx = (rawX / mag) * curved;
+        float ny = (rawY / mag) * curved;
+        outX = Clamp1000((int)(nx * 1000.0f + (nx >= 0.0f ? 0.5f : -0.5f)));
+        outY = Clamp1000((int)(ny * 1000.0f + (ny >= 0.0f ? 0.5f : -0.5f)));
+    }
+
+    public void NormalizeDigitalKeysToFixed1000(bool left, bool right, bool down, bool up,
+    out int outX, out int outY) {
+        float dx = (right ? 1.0f : 0.0f) - (left ? 1.0f : 0.0f);
+        float dy = (up ? 1.0f : 0.0f) - (down ? 1.0f : 0.0f);
+        if (dx == 0.0f && dy == 0.0f) {
+            outX = 0;
+            outY = 0;
+            return;
+        }
+        float inv = 1.0f / (float)Math.Sqrt((double)(dx * dx + dy * dy));
+        float nx = dx * inv;
+        float ny = dy * inv;
+        outX = Clamp1000((int)(nx * 1000.0f + (nx >= 0.0f ? 0.5f : -0.5f)));
+        outY = Clamp1000((int)(ny * 1000.0f + (ny >= 0.0f ? 0.5f : -0.5f)));
+    }
+
+    private static int Clamp1000(int v) {
+        if (v < -1000) { return -1000; }
+        if (v > 1000) { return 1000; }
+        return v;
+    }
+}

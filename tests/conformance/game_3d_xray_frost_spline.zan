@@ -1,0 +1,177 @@
+using System;
+using Gui;
+using Game.Graphics;
+using Game.Render3D;
+
+namespace Conf;
+
+class Game3DXrayFrostSplineTest {
+    [DllImport("zan_gui")]
+    private static extern int zan_gui_read_pixel(int surfaceId, int x, int y);
+
+    static int AbsInt(int v) { return v < 0 ? -v : v; }
+
+    static int PixelDiffRgb(int a, int b) {
+        int dr = AbsInt(((a >> 16) & 255) - ((b >> 16) & 255));
+        int dg = AbsInt(((a >> 8) & 255) - ((b >> 8) & 255));
+        int db = AbsInt((a & 255) - (b & 255));
+        return dr + dg + db;
+    }
+
+    static int BlueOf(int argb) { return argb & 255; }
+
+    static void Main() {
+        Canvas.SetBackend(1);
+        Canvas cv = new Canvas(128, 128);
+        int sid = cv.SurfaceId();
+        Renderer3D ren = new Renderer3D(16);
+        ren.UseCpuLighting = false;
+
+        // 1. GPU 3D 战术透视轮廓光（X-Ray Silhouette Rim）：正面法线弱、掠射法线强烈发光
+        Mesh3D frontQuad = new Mesh3D();
+        frontQuad.Vertex(-1.6f, -1.2f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        frontQuad.Vertex(-0.1f, -1.2f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+        frontQuad.Vertex(-0.1f,  1.2f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        frontQuad.Vertex(-1.6f,  1.2f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f);
+        frontQuad.Triangle(0, 1, 2);
+        frontQuad.Triangle(0, 2, 3);
+        int frontKey = cv.MeshUpload(frontQuad);
+
+        Mesh3D grazeQuad = new Mesh3D();
+        grazeQuad.Vertex(0.1f, -1.2f, 0.0f, 0.0f, 0.866f, 0.5f, 0.0f, 0.0f);
+        grazeQuad.Vertex(1.6f, -1.2f, 0.0f, 0.0f, 0.866f, 0.5f, 1.0f, 0.0f);
+        grazeQuad.Vertex(1.6f,  1.2f, 0.0f, 0.0f, 0.866f, 0.5f, 1.0f, 1.0f);
+        grazeQuad.Vertex(0.1f,  1.2f, 0.0f, 0.0f, 0.866f, 0.5f, 0.0f, 1.0f);
+        grazeQuad.Triangle(0, 1, 2);
+        grazeQuad.Triangle(0, 2, 3);
+        int grazeKey = cv.MeshUpload(grazeQuad);
+
+        Camera3D cam = new Camera3D();
+        cam.Position = new Vector3(0.0f, 0.0f, 3.2f);
+        cam.Target = new Vector3(0.0f, 0.0f, 0.0f);
+        cam.AspectRatio = 1.0f;
+        cam.FieldOfView = 1.1f;
+
+        Material xrMat = Material.Solid(0.0f, 0.0f, 0.0f);
+        xrMat.EmissiveRed = 0.04f;
+        xrMat.EmissiveGreen = 0.04f;
+        xrMat.EmissiveBlue = 0.04f;
+
+        SceneNode root1 = new SceneNode("root1");
+        SceneNode nFront = new SceneNode("front");
+        nFront.MeshKey = frontKey;
+        nFront.BoundsRadius = 4.0f;
+        nFront.Material = xrMat;
+        SceneNode nGraze = new SceneNode("graze");
+        nGraze.MeshKey = grazeKey;
+        nGraze.BoundsRadius = 4.0f;
+        nGraze.Material = xrMat;
+        root1.AddChild(nFront);
+        root1.AddChild(nGraze);
+
+        RenderPlan plan1 = new RenderPlan(cam);
+        cv.Clear(unchecked((int)0xFF000000));
+        plan1.Build(root1);
+        ren.Draw(cv, plan1);
+        int frontBase = zan_gui_read_pixel(sid, 36, 64);
+        int grazeBase = zan_gui_read_pixel(sid, 92, 64);
+
+        xrMat.XraySilhouetteEnabled = true;
+        xrMat.XraySilhouettePower = 2.0f;
+        xrMat.XraySilhouetteStrength = 2.5f;
+        xrMat.XraySilhouetteRed = 0.1f;
+        xrMat.XraySilhouetteGreen = 0.85f;
+        xrMat.XraySilhouetteBlue = 1.0f;
+
+        cv.Clear(unchecked((int)0xFF000000));
+        plan1.Build(root1);
+        ren.Draw(cv, plan1);
+        int frontLit = zan_gui_read_pixel(sid, 36, 64);
+        int grazeLit = zan_gui_read_pixel(sid, 92, 64);
+
+        int frontDiff = PixelDiffRgb(frontLit, frontBase);
+        int grazeDiff = PixelDiffRgb(grazeLit, grazeBase);
+        bool xrayOk = frontDiff < 25 && grazeDiff >= 180 && grazeDiff > frontDiff + 150;
+        Console.WriteLine("xray_silhouette_ok=" + Convert.ToString(xrayOk ? 1 : 0));
+
+        // 2. GPU 后处理屏幕边缘冰晶霜冻（Vignette Frost）：中心保持纯净零变化，四角结出高能冰蓝霜冻
+        Mesh3D fullQuad = new Mesh3D();
+        fullQuad.Vertex(-3.0f, -3.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        fullQuad.Vertex( 3.0f, -3.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+        fullQuad.Vertex( 3.0f,  3.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        fullQuad.Vertex(-3.0f,  3.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f);
+        fullQuad.Triangle(0, 1, 2);
+        fullQuad.Triangle(0, 2, 3);
+        int fullKey = cv.MeshUpload(fullQuad);
+
+        Material darkMat = Material.Solid(0.0f, 0.0f, 0.0f);
+        darkMat.EmissiveRed = 0.04f;
+        darkMat.EmissiveGreen = 0.04f;
+        darkMat.EmissiveBlue = 0.04f;
+
+        SceneNode root2 = new SceneNode("root2");
+        SceneNode bgNode = new SceneNode("bg");
+        bgNode.MeshKey = fullKey;
+        bgNode.BoundsRadius = 6.0f;
+        bgNode.Material = darkMat;
+        root2.AddChild(bgNode);
+
+        RenderPlan plan2 = new RenderPlan(cam);
+        cv.Clear(unchecked((int)0xFF000000));
+        plan2.Build(root2);
+        ren.Draw(cv, plan2);
+        int centerBase = zan_gui_read_pixel(sid, 64, 64);
+        int cornerBase = zan_gui_read_pixel(sid, 6, 6);
+
+        PostProcess post = new PostProcess();
+        post.FrostIntensity = 1.0f;
+        post.FrostRadius = 0.35f;
+        post.FrostRed = 0.45f;
+        post.FrostGreen = 0.88f;
+        post.FrostBlue = 1.0f;
+        ren.PostProcess = post;
+
+        cv.Clear(unchecked((int)0xFF000000));
+        plan2.Build(root2);
+        ren.Draw(cv, plan2);
+        int centerFrost = zan_gui_read_pixel(sid, 64, 64);
+        int cornerFrost = zan_gui_read_pixel(sid, 6, 6);
+
+        int centerDiff = PixelDiffRgb(centerFrost, centerBase);
+        int cornerDiff = PixelDiffRgb(cornerFrost, cornerBase);
+        bool frostOk = centerDiff == 0 && cornerDiff >= 180 && BlueOf(cornerFrost) >= 165;
+        Console.WriteLine("post_frost_ok=" + Convert.ToString(frostOk ? 1 : 0));
+
+        ren.Dispose();
+
+        // 3. SplinePathTrack3D：Catmull-Rom 等弧长采样、单位切线与闭环回绕
+        SplinePathTrack3D openTrack = new SplinePathTrack3D(false);
+        openTrack.AddPoint(0.0f, 0.0f, 0.0f);
+        openTrack.AddPoint(0.0f, 0.0f, 10.0f);
+        openTrack.AddPoint(10.0f, 0.0f, 10.0f);
+        openTrack.AddPoint(10.0f, 0.0f, 0.0f);
+        openTrack.RebuildArcLengthTable(96);
+
+        SplineSample3D s0 = openTrack.SampleAtDistance(0.0f);
+        SplineSample3D sEnd = openTrack.SampleAtDistance(openTrack.TotalLength);
+        SplineSample3D sMid = openTrack.SampleAtDistance(openTrack.TotalLength * 0.5f);
+        float tanLen = (float)Math.Sqrt((double)(sMid.TanX * sMid.TanX + sMid.TanY * sMid.TanY + sMid.TanZ * sMid.TanZ));
+        bool openOk = openTrack.PointCount() == 4 && openTrack.TotalLength > 28.0f
+            && Math.Abs((double)s0.PosX) < 0.05 && Math.Abs((double)s0.PosZ) < 0.05
+            && Math.Abs((double)(sEnd.PosX - 10.0f)) < 0.1 && Math.Abs((double)sEnd.PosZ) < 0.1
+            && tanLen > 0.99f && tanLen < 1.01f;
+
+        SplinePathTrack3D loopTrack = new SplinePathTrack3D(true);
+        loopTrack.AddPoint(0.0f, 0.0f, 0.0f);
+        loopTrack.AddPoint(10.0f, 0.0f, 0.0f);
+        loopTrack.AddPoint(10.0f, 0.0f, 10.0f);
+        loopTrack.AddPoint(0.0f, 0.0f, 10.0f);
+        loopTrack.RebuildArcLengthTable(96);
+        SplineSample3D wA = loopTrack.SampleAtDistance(5.0f);
+        SplineSample3D wB = loopTrack.SampleAtDistance(loopTrack.TotalLength + 5.0f);
+        bool loopOk = Math.Abs((double)(wA.PosX - wB.PosX)) < 0.05
+            && Math.Abs((double)(wA.PosZ - wB.PosZ)) < 0.05;
+
+        Console.WriteLine("spline_track_ok=" + Convert.ToString((openOk && loopOk) ? 1 : 0));
+    }
+}

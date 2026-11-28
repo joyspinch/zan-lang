@@ -225,8 +225,23 @@ static zan_ast_node_t *parse_embedded_stmt(zan_parser_t *p) {
 
 static bool looks_like_var_decl(zan_parser_t *p) {
   if (parser_check(p, TK_VAR) || parser_check(p, TK_LET) ||
-      parser_check(p, TK_CONST)) {
+      parser_check(p, TK_CONST) || parser_check(p, TK_REF)) {
     return true;
+  }
+  /* Fixed-size value array local declaration: `[N]T name` */
+  if (parser_check(p, TK_LBRACKET)) {
+    zan_token_t t1 = zan_lexer_peek(p->lex);
+    zan_token_t t2 = zan_lexer_peek2(p->lex);
+    if ((t1.kind == TK_INT_LIT || t1.kind == TK_IDENT) &&
+        t2.kind == TK_RBRACKET) {
+      zan_token_t t3 = zan_lexer_peek_n(p->lex, 3);
+      if (t3.kind == TK_IDENT || t3.kind == TK_INT || t3.kind == TK_LONG ||
+          t3.kind == TK_SHORT || t3.kind == TK_BYTE || t3.kind == TK_UINT ||
+          t3.kind == TK_ULONG || t3.kind == TK_USHORT || t3.kind == TK_SBYTE ||
+          t3.kind == TK_FLOAT || t3.kind == TK_DOUBLE || t3.kind == TK_BOOL ||
+          t3.kind == TK_CHAR || t3.kind == TK_STRING || t3.kind == TK_LBRACKET)
+        return true;
+    }
   }
   switch (p->current.kind) {
   case TK_INT:
@@ -515,6 +530,7 @@ static zan_ast_node_t *parse_var_decl(zan_parser_t *p) {
   zan_loc_t loc = p->current.loc;
   bool is_const = parser_match(p, TK_CONST);
   bool is_let = parser_match(p, TK_LET);
+  bool is_ref = parser_match(p, TK_REF);
 
   zan_ast_node_t *type = NULL;
   if (!is_let || parser_check(p, TK_IDENT)) {
@@ -526,7 +542,7 @@ static zan_ast_node_t *parse_var_decl(zan_parser_t *p) {
     type = NULL;
   }
 
-  if (type == NULL && parser_check(p, TK_LPAREN) && !is_const) {
+  if (type == NULL && parser_check(p, TK_LPAREN) && !is_const && !is_ref) {
     return parse_tuple_decon_body(p, loc, type);
   }
 
@@ -541,6 +557,8 @@ static zan_ast_node_t *parse_var_decl(zan_parser_t *p) {
 
   zan_ast_node_t *init = NULL;
   if (parser_match(p, TK_EQ)) {
+    if (is_ref)
+      parser_match(p, TK_REF);
     init = parse_expression(p);
   }
 
@@ -551,6 +569,7 @@ static zan_ast_node_t *parse_var_decl(zan_parser_t *p) {
   decl->var_decl.initializer = init;
   decl->var_decl.is_const = is_const;
   decl->var_decl.is_let = is_let;
+  decl->var_decl.is_ref = is_ref;
 
   zan_ast_list_init(&p->pending_stmts);
   while (parser_match(p, TK_COMMA)) {

@@ -42,6 +42,36 @@ LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr,
                 }
             }
         }
+        /* MemoryOrder.Relaxed / Acquire / Release / AcqRel / SeqCst */
+        if (expr->member.object->kind == AST_IDENTIFIER &&
+            expr->member.object->ident.name.len == 11 &&
+            memcmp(expr->member.object->ident.name.str, "MemoryOrder", 11) == 0 &&
+            !local_find(locals, expr->member.object->ident.name)) {
+            zan_istr_t mn = expr->member.name;
+            int mo = -1;
+            if (mn.len == 7 && memcmp(mn.str, "Relaxed", 7) == 0) mo = 0;
+            else if (mn.len == 7 && memcmp(mn.str, "Acquire", 7) == 0) mo = 1;
+            else if (mn.len == 7 && memcmp(mn.str, "Release", 7) == 0) mo = 2;
+            else if (mn.len == 6 && memcmp(mn.str, "AcqRel", 6) == 0) mo = 3;
+            else if (mn.len == 6 && memcmp(mn.str, "SeqCst", 6) == 0) mo = 4;
+            if (mo >= 0)
+                return LLVMConstInt(LLVMInt32TypeInContext(g->ctx),
+                                    (unsigned long long)mo, 0);
+        }
+        /* Parallel.ProcessorCount */
+        if (expr->member.object->kind == AST_IDENTIFIER &&
+            expr->member.object->ident.name.len == 8 &&
+            memcmp(expr->member.object->ident.name.str, "Parallel", 8) == 0 &&
+            !local_find(locals, expr->member.object->ident.name) &&
+            expr->member.name.len == 14 &&
+            memcmp(expr->member.name.str, "ProcessorCount", 14) == 0) {
+            LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+            LLVMTypeRef fty = LLVMFunctionType(i32t, NULL, 0, 0);
+            LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "zan_parallel_processor_count");
+            if (!fn) fn = LLVMAddFunction(g->mod, "zan_parallel_processor_count", fty);
+            g->uses_sync_runtime = true;
+            return zan_call2(g->builder, fty, fn, NULL, 0, "par.ncpu");
+        }
         /* Vector128.Zero / Vector128.AllBitsSet */
         {
             if (is_target_class_obj(expr->member.object, "Vector128", 9, locals)) {
@@ -245,14 +275,26 @@ LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr,
             }
         }
 
-        if (expr->member.name.len == 6 &&
-            memcmp(expr->member.name.str, "Length", 6) == 0) {
+        if ((expr->member.name.len == 6 &&
+             memcmp(expr->member.name.str, "Length", 6) == 0) ||
+            (expr->member.name.len == 5 &&
+             memcmp(expr->member.name.str, "Count", 5) == 0)) {
             zan_type_t *st = infer_expr_type(g, expr->member.object, locals);
             if (is_span_type(st)) {
                 LLVMValueRef span_val = emit_guarded_member_object(g, expr, locals);
                 LLVMValueRef len = LLVMBuildExtractValue(g->builder, span_val, 1, "sp.len");
                 return LLVMBuildTrunc(g->builder, len,
                     LLVMInt32TypeInContext(g->ctx), "sp.len32");
+            }
+            if (is_inline_array_type(st)) {
+                int64_t n = inline_array_len(st);
+                return LLVMConstInt(LLVMInt32TypeInContext(g->ctx),
+                                    (unsigned long long)n, 1);
+            }
+            if (is_vec_type(st)) {
+                int64_t n = vec_len(st);
+                return LLVMConstInt(LLVMInt32TypeInContext(g->ctx),
+                                    (unsigned long long)n, 1);
             }
         }
 
@@ -509,6 +551,24 @@ LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr,
             }
         }
 
+        /* 泛型类型参数静态数值常量：T.Zero / T.One 降级为原生 LLVM 零开销常量 */
+        if (expr->member.object->kind == AST_IDENTIFIER &&
+            !receiver_local(expr->member.object, locals)) {
+            zan_type_t *tp_ct = resolve_tp_ident_type(g, expr->member.object);
+            if (tp_ct && tp_ct->kind != TYPE_CLASS && tp_ct->kind != TYPE_STRUCT) {
+                LLVMTypeRef lt = map_type(g, tp_ct);
+                bool is_fp = (tp_ct->kind == TYPE_FLOAT || tp_ct->kind == TYPE_DOUBLE);
+                if (expr->member.name.len == 4 &&
+                    memcmp(expr->member.name.str, "Zero", 4) == 0) {
+                    return is_fp ? LLVMConstReal(lt, 0.0) : LLVMConstInt(lt, 0, 0);
+                }
+                if (expr->member.name.len == 3 &&
+                    memcmp(expr->member.name.str, "One", 3) == 0) {
+                    return is_fp ? LLVMConstReal(lt, 1.0) : LLVMConstInt(lt, 1, 0);
+                }
+            }
+        }
+
         /* 静态字段访问：ClassName.StaticField 直接读取全局变量 */
         if (expr->member.object->kind == AST_IDENTIFIER) {
             zan_symbol_t *cs = receiver_type_symbol(g, expr->member.object, locals);
@@ -584,6 +644,7 @@ LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr,
                                 (fsym && (fsym->modifiers & MOD_WEAK))
                                 ? emit_weak_field_load(g, field_ptr, field_type)
                                 : LLVMBuildLoad2(g->builder, field_type, field_ptr, "fval");
+                            apply_pack_field_align(g, type_sym, fv0, field_type);
                             LLVMValueRef fv = promote_loaded(g, fv0, fty);
                             return fv;
                         }
@@ -628,6 +689,7 @@ LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr,
                                 (gpsym && (gpsym->modifiers & MOD_WEAK))
                                 ? emit_weak_field_load(g, field_ptr, ft)
                                 : LLVMBuildLoad2(g->builder, ft, field_ptr, "gfval");
+                            apply_pack_field_align(g, cls, gfv0, ft);
                             /* F()[i].x：读完字段再释放临时数组。只对不含受管字段
                              * 的值结构体放开——含受管字段时取出的字段仍借用数组。 */
                             zan_ast_node_t *ix_obj = expr->member.object->index.object;
@@ -680,6 +742,7 @@ LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr,
                             (fsym && (fsym->modifiers & MOD_WEAK))
                             ? emit_weak_field_load(g, field_ptr, ft)
                             : LLVMBuildLoad2(g->builder, ft, field_ptr, "gfval");
+                        apply_pack_field_align(g, cls, gfv0, ft);
                         LLVMValueRef gfv = promote_loaded(g, gfv0, fty);
                         return finish_member_of_temp(g, expr, locals, rct,
                                                      obj_val, gfv);

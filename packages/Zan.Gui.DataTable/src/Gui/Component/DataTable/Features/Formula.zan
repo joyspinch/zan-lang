@@ -1,4 +1,5 @@
 using System;
+using System.Threading;
 
 namespace Gui.Component.DataTable;
 
@@ -38,42 +39,51 @@ public partial class DataTable {
 
     // ---------- Formula 求值 ----------
 
-    // 对编译好的表达式按行求值。返回 false 表示该行结果
-    // 无效（除以 0），调用方渲染空文本。解析已失败的表达式
-    // 由 FormulaExprOf 缓存为 null，不会进入这里。
-    public static bool FormulaEval(FormulaExpr e, DataSource src, int row, out double value) {
+    // 对编译好的表达式按行求值（使用调用方复用的 scratch 栈与游标指针，
+    // 消除热循环里每行 new List<double>() 与 RemoveAt 的堆分配与移位开销）。
+    public static bool FormulaEvalScratch(FormulaExpr e, DataSource src, int row,
+                                          List<double> st, out double value) {
         value = 0.0;
         if (e == null || e.err) { return false; }
-        List<double> st = new List<double>();
+        if (st == null) { st = new List<double>(); }
+        int sp = 0;
         int n = e.ops.Count;
         for (int i = 0; i < n; i = i + 1) {
             int op = e.ops[i];
-            if (op == 0) { st.Add(e.nums[i]); }
-            else if (op == 1) { st.Add(src.CellReal(row, e.colIdx[i])); }
+            if (op == 0) {
+                double nv = e.nums[i];
+                if (sp < st.Count) { st[sp] = nv; } else { st.Add(nv); }
+                sp = sp + 1;
+            }
+            else if (op == 1) {
+                double cv = src.CellReal(row, e.colIdx[i]);
+                if (sp < st.Count) { st[sp] = cv; } else { st.Add(cv); }
+                sp = sp + 1;
+            }
             else if (op == 2 || op == 3 || op == 4 || op == 5) {
-                if (st.Count < 2) { return false; }
-                double b = st[st.Count - 1];
-                double a = st[st.Count - 2];
-                st.RemoveAt(st.Count - 1);
-                st.RemoveAt(st.Count - 1);
-                if (op == 2) { st.Add(a + b); }
-                else if (op == 3) { st.Add(a - b); }
-                else if (op == 4) { st.Add(a * b); }
+                if (sp < 2) { return false; }
+                double b = st[sp - 1];
+                double a = st[sp - 2];
+                double r = 0.0;
+                if (op == 2) { r = a + b; }
+                else if (op == 3) { r = a - b; }
+                else if (op == 4) { r = a * b; }
                 else {
                     // 除以 0：该行公式无效（fail-soft 显示空）。
                     if (b == 0.0) { return false; }
-                    st.Add(a / b);
+                    r = a / b;
                 }
+                st[sp - 2] = r;
+                sp = sp - 1;
             }
             else if (op == 6) {
-                if (st.Count < 1) { return false; }
-                int last = st.Count - 1;
-                st[last] = 0.0 - st[last];
+                if (sp < 1) { return false; }
+                st[sp - 1] = 0.0 - st[sp - 1];
             }
             else {
                 int argc = e.argc[i];
-                if (st.Count < argc) { return false; }
-                int base2 = st.Count - argc;
+                if (sp < argc) { return false; }
+                int base2 = sp - argc;
                 double v = 0.0;
                 if (op == 7) {
                     v = st[base2];
@@ -123,14 +133,21 @@ public partial class DataTable {
                 } else {
                     return false;
                 }
-                // 先弹出全部实参再压入结果（RemoveAt 自高向低）。
-                for (int k = 0; k < argc; k = k + 1) { st.RemoveAt(st.Count - 1); }
-                st.Add(v);
+                st[base2] = v;
+                sp = base2 + 1;
             }
         }
-        if (st.Count != 1) { return false; }
+        if (sp != 1) { return false; }
         value = st[0];
         return true;
+    }
+
+    // 对编译好的表达式按行求值（线程安全便捷入口）。返回 false 表示该行结果
+    // 无效（除以 0），调用方渲染空文本。解析已失败的表达式
+    // 由 FormulaExprOf 缓存为 null，不会进入这里。
+    public static bool FormulaEval(FormulaExpr e, DataSource src, int row, out double value) {
+        List<double> st = new List<double>();
+        return DataTable.FormulaEvalScratch(e, src, row, st, out value);
     }
 
     // ---------- Formula 路由入口 ----------
@@ -139,6 +156,14 @@ public partial class DataTable {
     public static bool IsFormula(List<DataColumn> cols, int col) {
         if (col < 0 || col >= cols.Count) { return false; }
         return cols[col].formula.Length > 0;
+    }
+
+    // 计算列在 `row` 行的显示文本（复用预取的 FormulaExpr 与求值栈，消除热循环锁竞争与每行堆分配）。
+    public static string FormulaTextScratch(FormulaExpr e, DataColumn col, DataSource src, int row, List<double> st) {
+        if (e == null || col == null) { return ""; }
+        double v;
+        if (!DataTable.FormulaEvalScratch(e, src, row, st, out v)) { return ""; }
+        return DataTable.FormatCell(col, DataTable.FormatReal(v, col.decimals));
     }
 
     // 计算列在 `row` 行的显示文本。非计算列返回 null（调用方
@@ -162,18 +187,35 @@ public partial class DataTable {
         return DataTable.FormulaEval(e, src, row, out v);
     }
 
-    // 每列表达式编译缓存。表达式对象不可变，列列表或表达式
-    // 字符串变更时由 InvalidateFormulaCache 整体作废。
-    static FormulaCacheEntry sFormulaCache;
+    // 每列表达式编译缓存（Mutex 保护 + 最多 4 张表的循环槽位，
+    // 防止多表同屏互相覆盖抖动，也防止后台导出线程与 UI 线程并发读写竞态）。
+    static nint sFormulaLock;
+    static List<FormulaCacheEntry> sFormulaCacheList;
+
+    private static void EnsureFormulaLock() {
+        if (DataTable.sFormulaLock == 0) {
+            DataTable.sFormulaLock = Mutex.Create();
+        }
+    }
 
     // 取列的编译结果；缓存按列列表指针与列数整体命中，
     // 未命中则整表重编译。非计算列缓存为 null。
     public static FormulaExpr FormulaExprOf(List<DataColumn> cols, int col) {
-        FormulaCacheEntry entry = DataTable.sFormulaCache;
-        if (entry != null && entry.cols == cols && entry.exprs.Count == cols.Count) {
-            return entry.exprs[col];
+        if (cols == null || col < 0 || col >= cols.Count) { return null; }
+        DataTable.EnsureFormulaLock();
+        Mutex.Lock(DataTable.sFormulaLock);
+        if (DataTable.sFormulaCacheList != null) {
+            for (int ci = 0; ci < DataTable.sFormulaCacheList.Count; ci = ci + 1) {
+                FormulaCacheEntry existing = DataTable.sFormulaCacheList[ci];
+                if (existing != null && existing.cols == cols && existing.exprs.Count == cols.Count) {
+                    FormulaExpr hit = existing.exprs[col];
+                    Mutex.Unlock(DataTable.sFormulaLock);
+                    return hit;
+                }
+            }
         }
-        entry = new FormulaCacheEntry();
+        Mutex.Unlock(DataTable.sFormulaLock);
+        FormulaCacheEntry entry = new FormulaCacheEntry();
         entry.cols = cols;
         entry.exprs = new List<FormulaExpr>();
         for (int i = 0; i < cols.Count; i = i + 1) {
@@ -184,13 +226,27 @@ public partial class DataTable {
                 entry.exprs.Add(null);
             }
         }
-        DataTable.sFormulaCache = entry;
-        return entry.exprs[col];
+        FormulaExpr result = entry.exprs[col];
+        Mutex.Lock(DataTable.sFormulaLock);
+        if (DataTable.sFormulaCacheList == null) {
+            DataTable.sFormulaCacheList = new List<FormulaCacheEntry>();
+        }
+        if (DataTable.sFormulaCacheList.Count >= 4) {
+            DataTable.sFormulaCacheList.RemoveAt(0);
+        }
+        DataTable.sFormulaCacheList.Add(entry);
+        Mutex.Unlock(DataTable.sFormulaLock);
+        return result;
     }
 
     // 修改任意列的 formula 字段后调用：整体作废编译缓存。
     // FormulaText/FormulaTryReal 在下一次调用时重新编译。
     public static void InvalidateFormulaCache() {
-        DataTable.sFormulaCache = null;
+        DataTable.EnsureFormulaLock();
+        Mutex.Lock(DataTable.sFormulaLock);
+        if (DataTable.sFormulaCacheList != null) {
+            DataTable.sFormulaCacheList.Clear();
+        }
+        Mutex.Unlock(DataTable.sFormulaLock);
     }
 }

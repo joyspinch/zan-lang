@@ -22,6 +22,11 @@ internal class DataTableFeaturePopup : Control {
     private List<string> rowValues = new List<string>();
     private string listStamp = "";
     private bool syncing;
+    private int customTabsCol = -1;
+    private List<HeaderPanelTab> customTabs;
+    private List<string> customControlKeys = new List<string>();
+    private List<Control> customControlVals = new List<Control>();
+    private HeaderPanelContext customContext;
 
     internal DataTableFeaturePopup() { this.InitControl("datatable-feature"); }
 
@@ -155,9 +160,32 @@ internal class DataTableFeaturePopup : Control {
             return check;
         }
         if (kind == 4) {
+            DataColumn col = context.columns[state.editCol];
+            string label = rowValues[index];
+            int cc = DataTable.ChoiceColorOf(col, label);
+            if (col.editorKind == 4) {
+                DataTablePopupCheck check = new DataTablePopupCheck(this, 41, index);
+                check.SetLabel(label);
+                check.SetChecked(DataTable.MultiChoiceHas(state.editBuf, label));
+                if (cc == 0) { return check; }
+                Panel row = Panel.Row(); row.Pad(2); row.Gap(6);
+                DataTableColorDot dot = new DataTableColorDot(cc);
+                dot.Width(14);
+                row.Add(dot);
+                check.Grow();
+                row.Add(check);
+                return row;
+            }
             DataTablePopupButton button = new DataTablePopupButton(this, 40, index);
-            button.SetText(rowValues[index]);
-            return button;
+            button.SetText(label);
+            if (cc == 0) { return button; }
+            Panel srow = Panel.Row(); srow.Pad(2); srow.Gap(6);
+            DataTableColorDot sdot = new DataTableColorDot(cc);
+            sdot.Width(14);
+            srow.Add(sdot);
+            button.Grow();
+            srow.Add(button);
+            return srow;
         }
         DataTablePopupCheck valueCheck = new DataTablePopupCheck(this, 10, index);
         valueCheck.SetLabel(rowValues[index]);
@@ -184,12 +212,91 @@ internal class DataTableFeaturePopup : Control {
         ButtonAt("close", "Close", 1, 0, p + bw + gap, by, bw, app.Scale(28), false);
     }
 
+    private void ClearCustomHeaderPanels() {
+        customTabsCol = -1;
+        customTabs = null;
+        customContext = null;
+        customControlKeys.Clear();
+        customControlVals.Clear();
+    }
+
+    internal void CloseFromCustom() {
+        Close();
+    }
+
+    private Control GetOrBuildCustomHeaderPanel(App app, HeaderPanelTab tab) {
+        if (tab == null || tab.build == null) { return null; }
+        string k = tab.key != "" ? tab.key : tab.title;
+        for (int i = 0; i < customControlKeys.Count; i = i + 1) {
+            if (customControlKeys[i] == k) { return customControlVals[i]; }
+        }
+        Control built = tab.build(app, customContext);
+        if (built != null) {
+            customControlKeys.Add(k);
+            customControlVals.Add(built);
+        }
+        return built;
+    }
+
     private void PrepareFilter(App app) {
         int p = app.Scale(12); int gap = app.Scale(6); int rh = app.Scale(28);
         int box = app.Scale(28); int mi = column;
         DataColumn col = context.columns[mi];
         ColFilter filter = state.filters[mi];
-        prefW = app.Scale(348); prefH = app.Scale(360);
+
+        if (customTabsCol != mi || customTabs == null) {
+            ClearCustomHeaderPanels();
+            customTabsCol = mi;
+            customTabs = DataTable.ResolveHeaderPanels(state, context.columns, context.source, mi);
+            DataTableHeaderPanelCloser closer = new DataTableHeaderPanelCloser(this);
+            customContext = new HeaderPanelContext(state, context.columns, context.source, mi, closer.Close);
+        }
+
+        bool showBuiltIn = col.filterable || customTabs.Count == 0;
+        int builtInCount = showBuiltIn ? 4 : 0;
+        List<string> tabs = new List<string>();
+        if (showBuiltIn) {
+            tabs.Add("Values"); tabs.Add("Text"); tabs.Add("Batch"); tabs.Add("Rules");
+        }
+        for (int i = 0; i < customTabs.Count; i = i + 1) {
+            string title = customTabs[i].title;
+            if (title == "") { title = customTabs[i].key; }
+            tabs.Add(title);
+        }
+
+        if (state.openMenuTabKey != null && state.openMenuTabKey != "") {
+            string targetKey = state.openMenuTabKey;
+            state.openMenuTabKey = "";
+            if (showBuiltIn) {
+                if (targetKey == "values") { state.filterTab = 0; }
+                else if (targetKey == "text") { state.filterTab = 1; }
+                else if (targetKey == "batch") { state.filterTab = 2; }
+                else if (targetKey == "rules") { state.filterTab = 3; }
+            }
+            for (int i = 0; i < customTabs.Count; i = i + 1) {
+                if (customTabs[i].key == targetKey) {
+                    state.filterTab = builtInCount + i;
+                    break;
+                }
+            }
+        }
+        if (state.filterTab < 0) { state.filterTab = 0; }
+        if (tabs.Count > 0 && state.filterTab >= tabs.Count) { state.filterTab = tabs.Count - 1; }
+
+        bool isCustom = state.filterTab >= builtInCount && (state.filterTab - builtInCount) < customTabs.Count;
+        HeaderPanelTab activeCustom = isCustom ? customTabs[state.filterTab - builtInCount] : null;
+
+        int perRow = tabs.Count <= 4 ? tabs.Count : (tabs.Count <= 6 ? 3 : 4);
+        if (perRow < 1) { perRow = 1; }
+        int tabRows = tabs.Count > 1 ? ((tabs.Count + perRow - 1) / perRow) : 0;
+        int tabStripH = tabRows > 0 ? (tabRows * rh + (tabRows - 1) * gap + app.Scale(10)) : 0;
+
+        prefW = app.Scale(300);
+        if (tabs.Count >= 4) { prefW = app.Scale(348); }
+        if (activeCustom != null && activeCustom.prefWidth > 0) {
+            prefW = app.Scale(activeCustom.prefWidth);
+            if (tabs.Count >= 4 && prefW < app.Scale(348)) { prefW = app.Scale(348); }
+        }
         int cwW = app.canvas != null ? app.canvas.Width() : 0;
         int cwH = app.canvas != null ? (app.canvas.Height() - app.ContentTop()) : 0;
         int maxW = cwW > app.Scale(80) ? cwW : viewW;
@@ -197,13 +304,21 @@ internal class DataTableFeaturePopup : Control {
         if (maxW > app.Scale(80) && prefW > maxW - app.Scale(16)) {
             prefW = maxW - app.Scale(16);
         }
-        if (state.filterTab == 3) {
-            prefH = p + rh + app.Scale(8) + rh + app.Scale(10)
+
+        prefH = app.Scale(360);
+        if (!isCustom && showBuiltIn && state.filterTab == 3) {
+            prefH = p + rh + app.Scale(8) + tabStripH
             + DataTable.RulesTabHeight(app, filter, col) + app.Scale(44);
+        } else if (activeCustom != null && activeCustom.prefHeight > 0) {
+            prefH = app.Scale(activeCustom.prefHeight);
+            if (tabRows > 1) { prefH = prefH + (tabRows - 1) * (rh + gap); }
+        } else if (tabRows > 1) {
+            prefH = prefH + (tabRows - 1) * (rh + gap);
         }
         if (maxH > app.Scale(80) && prefH > maxH - app.Scale(16)) {
             prefH = maxH - app.Scale(16);
         }
+
         int inner = prefW - p * 2;
         int sortBtnW = app.Scale(28);
         int titleW = col.sortable ? (inner - sortBtnW * 2 - gap * 2) : inner;
@@ -215,18 +330,33 @@ internal class DataTableFeaturePopup : Control {
             IconButtonAt("desc", "arrow-down", 2, 2, prefW - p - sortBtnW, p, sortBtnW, rh, sdir == 2);
         }
         int cy = p + rh + app.Scale(8);
-        List<string> tabs = new List<string>{"Values", "Text", "Batch", "Rules"};
-        int totalGap = gap * (tabs.Count - 1);
-        int tw = (inner - totalGap) / tabs.Count;
-        for (int i = 0; i < tabs.Count; i = i + 1) {
-            int tx = p + (tw + gap) * i;
-            int wj = (i == tabs.Count - 1) ? (inner - (tw + gap) * i) : tw;
-            ButtonAt("tab" + Convert.ToString(i), tabs[i], 3, i, tx, cy,
-            wj, rh, state.filterTab == i);
+        if (tabs.Count > 1) {
+            for (int r = 0; r < tabRows; r = r + 1) {
+                int start = r * perRow;
+                int count = DataTable.MinI(perRow, tabs.Count - start);
+                int totalGap = gap * (count - 1);
+                int tw = (inner - totalGap) / count;
+                for (int j = 0; j < count; j = j + 1) {
+                    int idx = start + j;
+                    int tx = p + (tw + gap) * j;
+                    int wj = (j == count - 1) ? (inner - (tw + gap) * j) : tw;
+                    ButtonAt("tab" + Convert.ToString(idx), tabs[idx], 3, idx, tx, cy,
+                    wj, rh, state.filterTab == idx);
+                }
+                cy = cy + rh + (r + 1 < tabRows ? gap : app.Scale(10));
+            }
         }
-        cy = cy + rh + app.Scale(10);
-        int bottom = prefH - app.Scale(44);
-        if (state.filterTab == 0) {
+        bool hideFooter = activeCustom != null && activeCustom.hideFooter;
+        int bottom = hideFooter ? (prefH - p) : (prefH - app.Scale(44));
+        if (isCustom && activeCustom != null) {
+            Control customCtrl = GetOrBuildCustomHeaderPanel(app, activeCustom);
+            if (customCtrl != null) {
+                int bodyH = bottom - cy;
+                if (bodyH < app.Scale(24)) { bodyH = app.Scale(24); }
+                string partKey = "custom:" + (activeCustom.key != "" ? activeCustom.key : Convert.ToString(state.filterTab));
+                Place(partKey, customCtrl, p, cy, inner, bodyH);
+            }
+        } else if (state.filterTab == 0) {
             InputAt("search", state.searchText, "Search values...", 1, p, cy, inner, box);
             cy = cy + box + app.Scale(8);
             CheckAt("select-all", "(Select All)", filter.hidden.Count == 0, 11, 0,
@@ -274,9 +404,17 @@ internal class DataTableFeaturePopup : Control {
             ButtonAt("keep", "Keep matching", 13, 1, p, cy, bw, box, true);
             ButtonAt("exclude", "Exclude", 13, 0, p + bw + app.Scale(6), cy, bw, box, false);
         } else { PrepareRules(app, filter, p, cy, inner); }
-        int bw = (inner - gap) / 2; int by = bottom + app.Scale(6);
-        ButtonAt("clear", "Clear Filter", 14, 0, p, by, bw, app.Scale(28), false);
-        ButtonAt("close", "Close", 1, 0, p + bw + gap, by, inner - bw - gap, app.Scale(28), false);
+
+        if (!hideFooter) {
+            int by = bottom + app.Scale(6);
+            if (showBuiltIn) {
+                int bw = (inner - gap) / 2;
+                ButtonAt("clear", "Clear Filter", 14, 0, p, by, bw, app.Scale(28), false);
+                ButtonAt("close", "Close", 1, 0, p + bw + gap, by, inner - bw - gap, app.Scale(28), false);
+            } else {
+                ButtonAt("close", "Close", 1, 0, p, by, inner, app.Scale(28), false);
+            }
+        }
     }
 
     private void PrepareRules(App app, ColFilter filter, int p, int cy, int inner) {
@@ -360,14 +498,46 @@ internal class DataTableFeaturePopup : Control {
             Place("calendar", calendar, 0, 0, prefW, prefH);
         } else {
             rowValues = new List<string>();
-            for (int i = 0; i < state.edPopItems.Count; i = i + 1) {
-                rowValues.Add(col.choices[state.edPopItems[i]]);
+            if (col.editorKind == 4) {
+                state.edPopItems = new List<int>();
+                for (int i = 0; i < col.choices.Count; i = i + 1) {
+                    state.edPopItems.Add(i);
+                    rowValues.Add(col.choices[i]);
+                }
+            } else {
+                for (int i = 0; i < state.edPopItems.Count; i = i + 1) {
+                    rowValues.Add(col.choices[state.edPopItems[i]]);
+                }
             }
-            prefW = app.Scale(240); prefH = DataTable.MinI(app.Scale(240), rowValues.Count * app.Scale(28));
-            if (prefH < app.Scale(28)) { prefH = app.Scale(28); }
-            string stamp = "editor:" + state.editBuf;
-            for (int i = 0; i < rowValues.Count; i = i + 1) { stamp = stamp + ":" + rowValues[i]; }
-            ListAt(app, stamp, rowValues.Count, 28, 0, 0, prefW, prefH);
+            bool multi = col.editorKind == 4;
+            bool canCreate = col.allowCreateChoice;
+            int p = (multi || canCreate) ? app.Scale(6) : 0;
+            int gap = app.Scale(6);
+            int rowH = 28;
+            int listH = DataTable.MinI(app.Scale(220), rowValues.Count * app.Scale(rowH));
+            if (listH < app.Scale(rowH)) { listH = app.Scale(rowH); }
+            int createH = canCreate ? app.Scale(28) + gap : 0;
+            int footerH = multi ? app.Scale(28) + gap : 0;
+            prefW = app.Scale(240);
+            prefH = p * 2 + listH + createH + footerH;
+            string stamp = "editor:" + Convert.ToString(col.editorKind) + ":" + state.editBuf;
+            for (int i = 0; i < rowValues.Count; i = i + 1) {
+                stamp = stamp + ":" + rowValues[i] + "#" + Convert.ToString(DataTable.ChoiceColorOf(col, rowValues[i]));
+            }
+            ListAt(app, stamp, rowValues.Count, rowH, p, p, prefW - p * 2, listH);
+            int curY = p + listH + gap;
+            if (canCreate) {
+                int addW = app.Scale(32);
+                InputAt("newchoice", state.edNewChoiceBuf, DataTable.T("New option...", "新增选项..."), 21,
+                p, curY, prefW - p * 2 - addW - gap, app.Scale(28));
+                ButtonAt("addchoice", "+", 44, 0, prefW - p - addW, curY, addW, app.Scale(28), false);
+                curY = curY + app.Scale(28) + gap;
+            }
+            if (multi) {
+                int bw = (prefW - p * 2 - gap) / 2;
+                ButtonAt("clearmulti", DataTable.T("Clear", "清空"), 42, 0, p, curY, bw, app.Scale(28), false);
+                ButtonAt("donemulti", DataTable.T("Done", "完成"), 43, 0, p + bw + gap, curY, bw, app.Scale(28), true);
+            }
         }
     }
 
@@ -455,6 +625,42 @@ internal class DataTableFeaturePopup : Control {
             st.editBuf = rowValues[argument]; st.editCur = st.editBuf.Length;
             st.edPopSel = st.edPopItems[argument]; st.edPopOpen = false;
             closeAfter = true;
+        } else if (action == 41) {
+            st.editBuf = DataTable.MultiChoiceToggle(st.editBuf, rowValues[argument]);
+            st.editCur = st.editBuf.Length;
+            st.editError = "";
+        } else if (action == 42) {
+            st.editBuf = "";
+            st.editCur = 0;
+            st.editError = "";
+        } else if (action == 43) {
+            DataTable.CommitEdit(st, proof.columns, proof.source);
+            closeAfter = !st.editing;
+        } else if (action == 44) {
+            DataColumn col = proof.columns[st.editCol];
+            string added = DataTable.TrimSpace(st.edNewChoiceBuf);
+            if (added.Length > 0) {
+                if (DataTable.IndexOfChoice(col, added) < 0) {
+                    col.choices.Add(added);
+                    st.lastCreatedChoiceCol = st.editCol;
+                    st.lastCreatedChoiceText = added;
+                    st.ChoiceCreated.Raise(st.host);
+                }
+                st.edNewChoiceBuf = "";
+                st.edPopItems = DataTable.FilterChoices(col, "");
+                if (col.editorKind == 4) {
+                    if (!DataTable.MultiChoiceHas(st.editBuf, added)) {
+                        st.editBuf = DataTable.MultiChoiceToggle(st.editBuf, added);
+                        st.editCur = st.editBuf.Length;
+                    }
+                } else {
+                    st.editBuf = added;
+                    st.editCur = added.Length;
+                    st.edPopSel = DataTable.IndexOfChoice(col, added);
+                    st.edPopOpen = false;
+                    closeAfter = true;
+                }
+            }
         }
         if (st.retainedTree != null) { st.retainedTree.InputChanged(); }
         if (closeAfter) { Close(); }
@@ -488,6 +694,8 @@ internal class DataTableFeaturePopup : Control {
             if (st.retainedTree != null) { st.retainedTree.InputChanged(); }
             Close();
             return;
+        } else if (field == 21) {
+            st.edNewChoiceBuf = text;
         }
         if (st.retainedTree != null) { st.retainedTree.InputChanged(); }
         if (this.App != null) { this.App.RequestRedraw(); }
@@ -503,7 +711,12 @@ internal class DataTableFeaturePopup : Control {
 
     private void Close() {
         if (state == null) { return; }
-        if (kind == 1) { state.openMenu = -1; state.editFocus = 0; }
+        if (kind == 1) {
+            state.openMenu = -1;
+            state.openMenuTabKey = "";
+            state.editFocus = 0;
+            ClearCustomHeaderPanels();
+        }
         else if (kind == 2) { state.colChooserOpen = false; }
         else if (kind == 3) { state.cfClearOpen = false; }
         else if (kind == 4) { state.edPopOpen = false; }
@@ -514,6 +727,7 @@ internal class DataTableFeaturePopup : Control {
             app.overlayHost.Hide(this);
             app.RequestRedraw();
         }
+        if (kind == 1 && state.featurePopup == this) { state.featurePopup = null; }
     }
 
     public override bool DismissOnOutsideClick() { return kind != 6; }
@@ -522,14 +736,28 @@ internal class DataTableFeaturePopup : Control {
         return false;
     }
     public override void OnPopupDismissed() {
+        if (kind == 1) { ClearCustomHeaderPanels(); }
         if (state == null || state.featurePopup != this) { return; }
-        if (kind == 1 && state.openMenu == column) { state.openMenu = -1; state.editFocus = 0; }
+        if (kind == 1 && state.openMenu == column) { state.openMenu = -1; state.openMenuTabKey = ""; state.editFocus = 0; }
         else if (kind == 2) { state.colChooserOpen = false; }
         else if (kind == 3) { state.cfClearOpen = false; }
-        else if (kind == 4) { state.edPopOpen = false; }
+        else if (kind == 4) {
+            state.edPopOpen = false;
+            if (state.editing && context != null && state.editCol >= 0 && state.editCol < context.columns.Count
+            && context.columns[state.editCol].editorKind == 4) {
+                DataTable.CommitEdit(state, context.columns, context.source);
+            }
+        }
         else if (kind == 5) { state.chartOpen = false; }
         else if (kind == 6 && state.exportUi != null && state.exportUi.finished) { state.exportUi.visible = false; }
+        if (kind == 1) { state.featurePopup = null; }
     }
+}
+
+internal class DataTableHeaderPanelCloser {
+    private weak DataTableFeaturePopup popup;
+    internal DataTableHeaderPanelCloser(DataTableFeaturePopup popup) { this.popup = popup; }
+    internal void Close() { if (popup != null) { popup.CloseFromCustom(); } }
 }
 
 internal class DataTablePopupPart {
@@ -611,6 +839,19 @@ internal class DataTablePopupCalendar : Calendar {
     internal DataTablePopupCalendar(DataTableFeaturePopup popup) {
         DataTablePopupRelay relay = new DataTablePopupRelay(popup, 20, 0);
         this.Change.Add(relay.DateChanged);
+    }
+}
+
+internal class DataTableColorDot : Control {
+    internal int color;
+    internal DataTableColorDot(int color) {
+        this.InitControl("datatable-color-dot");
+        this.color = color;
+    }
+    public override int InputFocusCapabilities() { return 0; }
+    public override void OnPaint(App app) {
+        int r = app.Scale(4);
+        app.canvas.FillCircle(bx + bw / 2, by + bh / 2, r, color);
     }
 }
 

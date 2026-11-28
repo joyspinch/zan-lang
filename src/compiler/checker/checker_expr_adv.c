@@ -16,6 +16,14 @@ case AST_NEW_EXPR: {
     if (expr->new_expr.is_array && type && type->kind != TYPE_ERROR &&
         type->kind != TYPE_ARRAY)
       type = zan_binder_make_array_type(c->binder, type);
+    if (c->in_noalloc && type && type->kind != TYPE_ERROR) {
+      if (expr->new_expr.is_array || type->kind == TYPE_ARRAY) {
+        no_alloc_reject(c, expr->loc, "heap array allocation (`new T[]`)");
+      } else if (type->kind == TYPE_CLASS || type->kind == TYPE_OBJECT ||
+                 type->kind == TYPE_STRING) {
+        no_alloc_reject(c, expr->loc, "heap object allocation (`new`)");
+      }
+    }
     /* 类型参数不能实例化（**标量**形态）：类型参数没有构造器，
        irgen 侧只会造出一个 null 引用——运行期第一次成员访问就崩
        进程（0xC0000005）。数组形态 `new T[n]` 不在此列：元素类型
@@ -54,6 +62,12 @@ case AST_NEW_EXPR: {
                   (type->name.len == 12 &&
                    memcmp(type->name.str, "ReadOnlySpan", 12) == 0))) {
         missing_tps = 1;
+      } else if (type->kind == TYPE_STRUCT && !type->sym &&
+                 ((type->name.len == 11 &&
+                   memcmp(type->name.str, "InlineArray", 11) == 0) ||
+                  (type->name.len == 3 &&
+                   memcmp(type->name.str, "Vec", 3) == 0))) {
+        missing_tps = 2;
       }
       if (missing_tps > 0) {
         zan_diag_emit_code(
@@ -64,6 +78,7 @@ case AST_NEW_EXPR: {
       }
     }
     check_generic_constraints(c, type, expr->loc);
+    checker_check_ownership_type_ref(c, type, expr->loc);
     if (type && type->kind == TYPE_CLASS && type->sym &&
         checker_class_is_abstract(type->sym)) {
       zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2058,
@@ -281,6 +296,8 @@ case AST_CONDITIONAL: {
 
 case AST_LAMBDA:
 no_runtime_reject(c, expr->loc, "a lambda");
+if (!expr->lambda.is_noescape)
+  no_alloc_reject(c, expr->loc, "an escaping lambda closure");
 /* B-ID65：调用实参位置的显式树类型 lambda（`(ExprNode x) => …` /
  * `(Expr<T> x) => …`）不查体——树 lambda 在 irgen 发射口降级为
  * ExprNode 构造树；此刻查体会把 x.F 误报成 ExprNode 上无成员
@@ -307,7 +324,9 @@ if (c->in_call_args && expr->lambda.params.count == 1 && expr->lambda.body &&
    * 出 lambda 时把链头还原，外层的作用域原样留着。 */
   struct checker_local *saved_locals = c->locals;
   struct checker_byref_parameter *saved_byref = c->byref_parameters;
+  int saved_in_noescape = c->in_noescape_lambda;
   c->lambda_depth++;
+  c->in_noescape_lambda = expr->lambda.is_noescape ? 1 : 0;
   zan_type_t *saved_ret = c->current_return_type;
   c->current_return_type = NULL;
   zan_ast_node_t *saved_body = c->current_body;
@@ -340,6 +359,7 @@ if (c->in_call_args && expr->lambda.params.count == 1 && expr->lambda.body &&
   c->current_return_type = saved_ret;
   c->locals = saved_locals;
   c->byref_parameters = saved_byref;
+  c->in_noescape_lambda = saved_in_noescape;
   c->lambda_depth--;
 }
 return c->binder->type_error;
@@ -413,6 +433,13 @@ case AST_TUPLE_EXPR: {
 
 case AST_SWITCH_EXPR: {
   zan_type_t *disc_type = zan_checker_check_expr(c, expr->switch_expr.expr);
+  zan_adt_info_t *adt_info = checker_type_adt_info(disc_type);
+  bool *adt_covered = NULL;
+  if (adt_info && adt_info->variant_count > 0) {
+    adt_covered = (bool *)zan_arena_alloc(
+        c->arena, sizeof(bool) * (size_t)adt_info->variant_count);
+    memset(adt_covered, 0, sizeof(bool) * (size_t)adt_info->variant_count);
+  }
   zan_type_t *merged = NULL;
   bool has_result = false;
   bool seen_wildcard = false;
@@ -427,7 +454,20 @@ case AST_SWITCH_EXPR: {
                          "matches all remaining values");
     }
 
-    if (arm->switch_arm.pattern) {
+    if (adt_info && (arm->switch_arm.adt_pat ||
+                     (arm->switch_arm.pattern && !arm->switch_arm.is_default))) {
+      int tag = checker_bind_adt_pattern(
+          c, disc_type, arm->loc, arm->switch_arm.adt_pat,
+          arm->switch_arm.pattern);
+      if (tag >= 0 && tag < adt_info->variant_count &&
+          arm->switch_arm.when_cond == NULL) {
+        if (adt_covered[tag]) {
+          zan_diag_emit_code(c->diag, DIAG_ERROR, arm->loc, 2065,
+                             "duplicate pattern in switch expression");
+        }
+        adt_covered[tag] = true;
+      }
+    } else if (arm->switch_arm.pattern) {
       zan_checker_check_expr(c, arm->switch_arm.pattern);
       if (arm->switch_arm.when_cond == NULL) {
         for (int prev = 0; prev < i; prev++) {
@@ -480,6 +520,20 @@ case AST_SWITCH_EXPR: {
     }
   }
 
+  if (adt_info && adt_covered && !seen_wildcard) {
+    for (int vi = 0; vi < adt_info->variant_count; vi++) {
+      if (!adt_covered[vi]) {
+        zan_diag_emit_code(
+            c->diag, DIAG_ERROR, expr->loc, 2146,
+            "non-exhaustive switch expression on ADT '%.*s': missing variant "
+            "'%.*s'; handle all variants or add '_' discard arm",
+            (int)disc_type->sym->name.len, disc_type->sym->name.str,
+            (int)adt_info->variants[vi].name.len,
+            adt_info->variants[vi].name.str);
+      }
+    }
+  }
+
   if (disc_type && disc_type->kind == TYPE_ENUM && disc_type->sym &&
       !seen_wildcard) {
     zan_symbol_t *esym = disc_type->sym;
@@ -522,14 +576,43 @@ case AST_SWITCH_EXPR: {
 }
 
 case AST_SIZEOF_EXPR: {
-  /* sizeof(T)：值类型才有固定非托管尺寸；string、类、委托、数组是
-   * 引用形态，编译期拒绝（对齐 C# 对引用类型抛 ArgumentException）。
-   * 类型形参放行——泛型方法体内的 sizeof(T) 在实例化点定型。 */
+  /* sizeof(T) / alignof(T) / offsetof(T, Field)：值类型才有固定非托管布局；
+   * 类型形参放行——泛型实例化点定型。 */
+  const char *op_name = expr->cast.layout_op == 1 ? "alignof"
+                      : expr->cast.layout_op == 2 ? "offsetof"
+                                                  : "sizeof";
   zan_type_t *t = expr->cast.type
                       ? zan_binder_resolve_type(c->binder, expr->cast.type)
                       : NULL;
   if (!t || t->kind == TYPE_ERROR)
     return c->binder->type_int;
+  if (expr->cast.layout_op == 2) {
+    if (t->kind != TYPE_STRUCT || !t->sym) {
+      zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 4002,
+                         "offsetof: target type '%s' must be a struct",
+                         type_name(t));
+      return c->binder->type_int;
+    }
+    zan_istr_t fn = expr->cast.field_name;
+    bool found = false;
+    for (int mi = 0; mi < t->sym->member_count; mi++) {
+      zan_symbol_t *m = t->sym->members[mi];
+      if (!m || (m->kind != SYM_FIELD && m->kind != SYM_PROPERTY))
+        continue;
+      if (m->modifiers & MOD_STATIC)
+        continue;
+      if (m->name.len == fn.len && memcmp(m->name.str, fn.str, (size_t)fn.len) == 0) {
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2012,
+                         "offsetof: struct '%s' has no instance field '%.*s'",
+                         type_name(t), (int)fn.len, fn.str ? fn.str : "");
+    }
+    return c->binder->type_int;
+  }
   if (t->kind != TYPE_TYPE_PARAM &&
       (t->kind == TYPE_VOID || t->kind == TYPE_STRING ||
        t->kind == TYPE_CLASS || t->kind == TYPE_INTERFACE ||
@@ -537,11 +620,37 @@ case AST_SIZEOF_EXPR: {
        t->kind == TYPE_OBJECT || t->kind == TYPE_TASK)) {
     zan_diag_emit_code(
         c->diag, DIAG_ERROR, expr->loc, 4002,
-        "sizeof: type '%s' has no fixed unmanaged size -- only value types "
-        "(structs, primitives, enums) can be marshaled",
-        type_name(t));
+        "%s: type '%s' has no fixed unmanaged layout -- only value types "
+        "(structs, primitives, enums) are supported",
+        op_name, type_name(t));
   }
   return c->binder->type_int;
+}
+
+case AST_STACKALLOC_EXPR: {
+  zan_type_t *et = expr->cast.type
+                       ? zan_binder_resolve_type(c->binder, expr->cast.type)
+                       : NULL;
+  zan_type_t *ct = expr->cast.expr ? zan_checker_check_expr(c, expr->cast.expr)
+                                   : NULL;
+  if (ct && !type_is_integral(ct) && ct->kind != TYPE_ERROR) {
+    zan_diag_emit_code(c->diag, DIAG_ERROR, expr->cast.expr->loc, 2040,
+                       "stackalloc length must be an integer, got '%s'",
+                       type_name(ct));
+  }
+  if (!et || et->kind == TYPE_ERROR)
+    return c->binder->type_error;
+  if (et->kind != TYPE_TYPE_PARAM &&
+      (et->kind == TYPE_VOID || et->kind == TYPE_STRING ||
+       et->kind == TYPE_CLASS || et->kind == TYPE_INTERFACE ||
+       et->kind == TYPE_DELEGATE || et->kind == TYPE_ARRAY ||
+       et->kind == TYPE_OBJECT || et->kind == TYPE_TASK)) {
+    zan_diag_emit_code(
+        c->diag, DIAG_ERROR, expr->loc, 2160,
+        "stackalloc element type '%s' must be an unmanaged value type",
+        type_name(et));
+  }
+  return zan_binder_make_span_type(c->binder, et);
 }
 
 case AST_WITH_EXPR: {
@@ -619,6 +728,8 @@ case AST_CAST_EXPR: {
     checker_check_assignable(c, dst, src, expr->cast.expr, expr->loc, "cast");
     return dst;
   }
+  if (checker_check_ownership_boxing(c, dst, src, expr->loc))
+    return dst;
   if (!checker_cast_is_valid(c, dst, src)) {
     if (dst->kind == TYPE_OBJECT && !checker_type_is_ref(src))
       zan_diag_emit_code(c->diag, DIAG_ERROR, expr->loc, 2070,

@@ -828,7 +828,8 @@ static zan_ast_node_t *clone_ast_subst_impl(zan_ast_node_t *node,
   }
   case AST_CAST_EXPR:
   case AST_TYPEOF_EXPR:
-  case AST_SIZEOF_EXPR: {
+  case AST_SIZEOF_EXPR:
+  case AST_STACKALLOC_EXPR: {
     zan_ast_node_t *res = zan_ast_new(ctx->arena, node->kind, node->loc);
     *res = *node;
     res->cast.type = clone_ast_subst(node->cast.type, ctx);
@@ -922,6 +923,16 @@ static zan_ast_node_t *clone_ast_subst_impl(zan_ast_node_t *node,
     res->switch_case.when_cond =
         clone_ast_subst(node->switch_case.when_cond, ctx);
     res->switch_case.body = clone_ast_subst(node->switch_case.body, ctx);
+    if (node->switch_case.adt_pat) {
+      zan_adt_pat_t *np = (zan_adt_pat_t *)zan_arena_alloc(ctx->arena, sizeof(zan_adt_pat_t));
+      np->variant = node->switch_case.adt_pat->variant;
+      zan_ast_list_init(&np->bindings);
+      for (int i = 0; i < node->switch_case.adt_pat->bindings.count; i++)
+        zan_ast_list_push(&np->bindings,
+                          clone_ast_subst(node->switch_case.adt_pat->bindings.items[i], ctx),
+                          ctx->arena);
+      res->switch_case.adt_pat = np;
+    }
     return res;
   }
   case AST_SWITCH_EXPR: {
@@ -944,6 +955,16 @@ static zan_ast_node_t *clone_ast_subst_impl(zan_ast_node_t *node,
     res->switch_arm.when_cond =
         clone_ast_subst(node->switch_arm.when_cond, ctx);
     res->switch_arm.result = clone_ast_subst(node->switch_arm.result, ctx);
+    if (node->switch_arm.adt_pat) {
+      zan_adt_pat_t *np = (zan_adt_pat_t *)zan_arena_alloc(ctx->arena, sizeof(zan_adt_pat_t));
+      np->variant = node->switch_arm.adt_pat->variant;
+      zan_ast_list_init(&np->bindings);
+      for (int i = 0; i < node->switch_arm.adt_pat->bindings.count; i++)
+        zan_ast_list_push(&np->bindings,
+                          clone_ast_subst(node->switch_arm.adt_pat->bindings.items[i], ctx),
+                          ctx->arena);
+      res->switch_arm.adt_pat = np;
+    }
     return res;
   }
   case AST_LAMBDA: {

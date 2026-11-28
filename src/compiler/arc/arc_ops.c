@@ -473,6 +473,169 @@ void emit_struct_local_release(zan_irgen_t *g, zan_type_t *type,
                                LLVMValueRef slot) {
   emit_struct_local_release_ex(g, type, slot, false);
 }
+
+static zan_symbol_t *find_struct_dtor_sym(zan_type_t *type) {
+  if (!type || type->kind != TYPE_STRUCT || !type->sym)
+    return NULL;
+  zan_istr_t dn = {(char *)"__dtor", 6};
+  for (int i = 0; i < type->sym->member_count; i++) {
+    zan_symbol_t *m = type->sym->members[i];
+    if (m && m->kind == SYM_METHOD && m->name.len == dn.len &&
+        memcmp(m->name.str, dn.str, (size_t)dn.len) == 0)
+      return m;
+  }
+  return NULL;
+}
+
+bool struct_needs_raii_drop(zan_irgen_t *g, zan_type_t *type, int depth) {
+  if (!type || type->kind != TYPE_STRUCT || !type->sym || depth > 8)
+    return false;
+  if (find_struct_dtor_sym(type) != NULL)
+    return true;
+  zan_symbol_t *sym = type->sym;
+  for (int i = 0; i < sym->member_count; i++) {
+    zan_symbol_t *m = sym->members[i];
+    if (!m || m->kind != SYM_FIELD || field_member_is_static(m))
+      continue;
+    zan_type_t *ft = subst_type_param_deep(g, m->type, type);
+    if (struct_needs_raii_drop(g, ft, depth + 1))
+      return true;
+  }
+  return false;
+}
+
+void emit_arm_drop_flag(zan_irgen_t *g, local_scope_t *locals, int var_idx,
+                        bool initial_alive) {
+  if (!locals || var_idx < 0 || var_idx >= locals->count)
+    return;
+  LLVMTypeRef i1 = LLVMInt1TypeInContext(g->ctx);
+  zan_builder_point_t pt = zan_builder_save(g);
+  LLVMValueRef fn = pt.bb ? LLVMGetBasicBlockParent(pt.bb) : g->current_fn;
+  LLVMBasicBlockRef entry = LLVMGetEntryBasicBlock(fn);
+  LLVMValueRef term = LLVMGetBasicBlockTerminator(entry);
+  if (term)
+    LLVMPositionBuilderBefore(g->builder, term);
+  else
+    LLVMPositionBuilderAtEnd(g->builder, entry);
+  LLVMValueRef flag = LLVMBuildAlloca(g->builder, i1, "drop.flag");
+  LLVMBuildStore(g->builder, LLVMConstInt(i1, 0, 0), flag);
+  zan_builder_restore(g, pt);
+  if (initial_alive)
+    LLVMBuildStore(g->builder, LLVMConstInt(i1, 1, 0), flag);
+  locals->vars[var_idx].drop_flag = flag;
+  lpad_register_local(g, &locals->vars[var_idx]);
+}
+
+void emit_move_clear_drop_flag(zan_irgen_t *g, zan_ast_node_t *expr,
+                               local_scope_t *locals) {
+  if (!expr || !locals || expr->kind != AST_IDENTIFIER)
+    return;
+  local_var_t *lv = local_find(locals, expr->ident.name);
+  if (lv && lv->drop_flag) {
+    LLVMTypeRef i1 = LLVMInt1TypeInContext(g->ctx);
+    LLVMBuildStore(g->builder, LLVMConstInt(i1, 0, 0), lv->drop_flag);
+  }
+}
+
+void emit_raii_drop_value_at(zan_irgen_t *g, zan_type_t *type,
+                             LLVMValueRef slot_ptr, bool is_volatile) {
+  if (!type || type->kind != TYPE_STRUCT || !type->sym || !slot_ptr)
+    return;
+  zan_symbol_t *sym = type->sym;
+  LLVMTypeRef st = get_struct_llvm_type(g, sym);
+  if (!st)
+    st = map_type(g, type);
+  if (!st || LLVMGetTypeKind(st) != LLVMStructTypeKind)
+    return;
+  LLVMValueRef typed_slot = slot_ptr;
+  if (LLVMTypeOf(typed_slot) != LLVMPointerType(st, 0))
+    typed_slot = LLVMBuildBitCast(g->builder, typed_slot,
+                                  LLVMPointerType(st, 0), "drop.self");
+
+  /* 1. Call user-defined destructor ~T() / deinit first (outer before fields). */
+  zan_symbol_t *dtor_sym = find_struct_dtor_sym(type);
+  if (dtor_sym) {
+    int fi = irgen_find_function(g, dtor_sym);
+    if (fi >= 0) {
+      LLVMTypeRef ft = g->functions[fi].fn_type;
+      LLVMValueRef fn = g->functions[fi].fn;
+      if (type->type_arg_count > 0)
+        fn = route_generic_method(g, type, dtor_sym, fn, ft, &ft);
+      LLVMValueRef gctx_arg =
+          type->type_arg_count > 0
+              ? route_generic_method_gctx(g, type, dtor_sym)
+              : NULL;
+      LLVMValueRef args[2] = {typed_slot, gctx_arg};
+      unsigned np = LLVMCountParamTypes(ft);
+      if (np > 0) {
+        LLVMTypeRef *pts = (LLVMTypeRef *)calloc(np, sizeof(LLVMTypeRef));
+        LLVMGetParamTypes(ft, pts);
+        if (LLVMTypeOf(args[0]) != pts[0])
+          args[0] = LLVMBuildBitCast(g->builder, args[0], pts[0], "dtor.this");
+        free(pts);
+      }
+      if (gctx_arg && np == 2)
+        zan_call2(g->builder, ft, fn, args, 2, "");
+      else
+        zan_call2(g->builder, ft, fn, args, 1, "");
+    }
+  }
+
+  /* 2. Drop nested RAII struct fields in reverse declaration order. */
+  int fidxs[128];
+  zan_type_t *ftypes[128];
+  int fcount = 0;
+  int fi = 0;
+  for (int i = 0; i < sym->member_count; i++) {
+    zan_symbol_t *m = sym->members[i];
+    if (!m || m->kind != SYM_FIELD || field_member_is_static(m))
+      continue;
+    zan_type_t *ft = subst_type_param_deep(g, m->type, type);
+    if (fcount < 128 && struct_needs_raii_drop(g, ft, 0)) {
+      fidxs[fcount] = fi;
+      ftypes[fcount] = ft;
+      fcount++;
+    }
+    fi++;
+  }
+  for (int i = fcount - 1; i >= 0; i--) {
+    LLVMValueRef fptr =
+        emit_field_ptr(g, sym, st, typed_slot, fidxs[i], "drop.fld");
+    emit_raii_drop_value_at(g, ftypes[i], fptr, is_volatile);
+  }
+
+  /* 3. Release any ARC-managed fields inside this struct (and zero them). */
+  if (type_contains_collection_rc(g, type, 0))
+    emit_struct_local_release_ex(g, type, typed_slot, is_volatile);
+}
+
+void emit_raii_drop_local_ex(zan_irgen_t *g, local_var_t *v, bool is_volatile) {
+  if (!v || !v->drop_flag || !v->alloca || !v->type)
+    return;
+  LLVMTypeRef i1 = LLVMInt1TypeInContext(g->ctx);
+  LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+  LLVMValueRef alive = LLVMBuildLoad2(g->builder, i1, v->drop_flag, "drop.chk");
+  if (is_volatile)
+    LLVMSetVolatile(alive, 1);
+  LLVMBasicBlockRef drop_bb =
+      LLVMAppendBasicBlockInContext(g->ctx, fn, "raii.drop");
+  LLVMBasicBlockRef cont_bb =
+      LLVMAppendBasicBlockInContext(g->ctx, fn, "raii.cont");
+  LLVMBuildCondBr(g->builder, alive, drop_bb, cont_bb);
+  LLVMPositionBuilderAtEnd(g->builder, drop_bb);
+  LLVMValueRef clr =
+      LLVMBuildStore(g->builder, LLVMConstInt(i1, 0, 0), v->drop_flag);
+  if (is_volatile)
+    LLVMSetVolatile(clr, 1);
+  emit_raii_drop_value_at(g, v->type, v->alloca, is_volatile);
+  if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
+    LLVMBuildBr(g->builder, cont_bb);
+  LLVMPositionBuilderAtEnd(g->builder, cont_bb);
+}
+
+void emit_raii_drop_local(zan_irgen_t *g, local_var_t *v) {
+  emit_raii_drop_local_ex(g, v, false);
+}
 void emit_struct_local_retain(zan_irgen_t *g, zan_type_t *type,
                               LLVMValueRef slot) {
   LLVMTypeRef st =

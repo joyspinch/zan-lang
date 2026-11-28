@@ -31,51 +31,59 @@ public class ZstdFrame {
         return v;
     }
 
-    // 解码整个输入（可能含多个帧与可跳过帧）。
+    // 解码整个输入（可能含多个帧与可跳过帧；默认总输出上限 256 MiB）。
     // 失败抛 ZstdException。
     public static byte[] Decode(byte[] src) {
+        return ZstdFrame.DecodeBounded(src, 268435456);
+    }
+
+    // 带总输出上限的 zstd 解码，防 RLE/压缩炸弹与恶意 FCS 预分配 OOM。
+    public static byte[] DecodeBounded(byte[] src, int maxOut) {
         if (src == null) {
             throw new ZstdException(ZstdError.NotZstd, "zstd: null input");
+        }
+        if (maxOut <= 0 || maxOut > 268435456) {
+            throw new ZstdException(ZstdError.SizeMismatch, "zstd: invalid maxOut limit");
         }
         ZstdBuffer sink = new ZstdBuffer();
         int pos = 0;
         while (pos < src.Length) {
-            if (pos + 4 > src.Length) {
+            if (src.Length - pos < 4) {
                 throw new ZstdException(ZstdError.Truncated, "zstd: trailing bytes are not a frame");
             }
             int magic = ReadLE32(src, pos);
             if (magic >= ZstdFrame.SKIP_MAGIC_LOW && magic <= ZstdFrame.SKIP_MAGIC_HIGH) {
                 // 可跳过帧：整段忽略
-                if (pos + 8 > src.Length) {
+                if (src.Length - pos < 8) {
                     throw new ZstdException(ZstdError.Truncated, "zstd: skippable frame truncated");
                 }
                 int size = ReadLE32(src, pos + 4);
                 if (size < 0) {
                     throw new ZstdException(ZstdError.Truncated, "zstd: skippable frame size out of range");
                 }
-                long next = (long)pos + 8 + (long)size;
-                if (next > src.Length) {
+                long next = (long)pos + 8L + (long)size;
+                if (next > (long)src.Length) {
                     throw new ZstdException(ZstdError.Truncated, "zstd: skippable frame truncated");
                 }
                 pos = (int)next;
                 continue;
             }
-            if (src[pos] != ZstdFrame.MAGIC[0] || src[pos + 1] != ZstdFrame.MAGIC[1]
-                || src[pos + 2] != ZstdFrame.MAGIC[2] || src[pos + 3] != ZstdFrame.MAGIC[3]) {
+            if ((src[pos] & 255) != 0x28 || (src[pos + 1] & 255) != 0xB5
+                || (src[pos + 2] & 255) != 0x2F || (src[pos + 3] & 255) != 0xFD) {
                 throw new ZstdException(ZstdError.NotZstd, "zstd: bad magic number");
             }
-            pos = ZstdFrame.DecodeFrame(src, pos, sink);
+            pos = ZstdFrame.DecodeFrame(src, pos, sink, maxOut);
         }
         return sink.ToArray();
     }
 
     // 解码一个 zstd 帧（src[pos] 是魔数），结果追加进 sink。
     // 返回帧结束后的位置。
-    static int DecodeFrame(byte[] src, int pos, ZstdBuffer sink) {
-        int p = pos + 4;
-        if (p >= src.Length) {
+    static int DecodeFrame(byte[] src, int pos, ZstdBuffer sink, int maxOut) {
+        if (src.Length - pos < 5) {
             throw new ZstdException(ZstdError.Truncated, "zstd: frame header truncated");
         }
+        int p = pos + 4;
         int fhd = src[p] & 255;
         p = p + 1;
         int fcsFlag = (fhd >> 6) & 3;
@@ -106,7 +114,7 @@ public class ZstdFrame {
         else if (didFlag == 2) { didSize = 2; }
         else if (didFlag == 3) { didSize = 4; }
         if (didSize > 0) {
-            if (p + didSize > src.Length) {
+            if (src.Length - p < didSize) {
                 throw new ZstdException(ZstdError.Truncated, "zstd: dictionary id truncated");
             }
             long did = ZstdFrame.ReadLE(src, p, didSize);
@@ -124,7 +132,7 @@ public class ZstdFrame {
         bool hasFcs = fcsSize > 0;
         long fcs = -1;
         if (hasFcs) {
-            if (p + fcsSize > src.Length) {
+            if (src.Length - p < fcsSize) {
                 throw new ZstdException(ZstdError.Truncated, "zstd: frame content size truncated");
             }
             fcs = ZstdFrame.ReadLE(src, p, fcsSize);
@@ -141,11 +149,24 @@ public class ZstdFrame {
             throw new ZstdException(ZstdError.BadFrameHeader, "zstd: window size out of range");
         }
         int frameStart = sink.Length();
-        if (fcs > 0 && fcs <= 67108864) {
-            if (frameStart == 0) {
-                sink.ReserveExact((int)fcs);
-            } else {
-                sink.Ensure((int)fcs);
+        long remainingBudget = (long)maxOut - (long)frameStart;
+        if (hasFcs && fcs > remainingBudget) {
+            throw new ZstdException(ZstdError.SizeMismatch,
+                "zstd: frame content size exceeds maximum allowed output size");
+        }
+        if (fcs > 0L) {
+            // 按剩余输入规模与 4 MiB 双重封顶预分配，防止 14 字节恶意帧头直接触发 64 MiB 预分配 OOM。
+            long remIn = (long)(src.Length - p);
+            long cap = remIn * 16L + 4096L;
+            if (cap > 4194304L) { cap = 4194304L; }
+            if (cap > remainingBudget) { cap = remainingBudget; }
+            long hint = fcs < cap ? fcs : cap;
+            if (hint > 0L) {
+                if (frameStart == 0 && hint == fcs) {
+                    sink.ReserveExact((int)hint);
+                } else {
+                    sink.Ensure((int)hint);
+                }
             }
         }
         ZstdBlockDecoder dec = new ZstdBlockDecoder(sink, frameStart, windowSize);
@@ -154,7 +175,7 @@ public class ZstdFrame {
             blockMax = (int)windowSize;
         }
         while (true) {
-            if (p + 3 > src.Length) {
+            if (src.Length - p < 3) {
                 throw new ZstdException(ZstdError.Truncated, "zstd: block header truncated");
             }
             int bh = (src[p] & 255) | ((src[p + 1] & 255) << 8) | ((src[p + 2] & 255) << 16);
@@ -165,8 +186,18 @@ public class ZstdFrame {
             if (btype == 3) {
                 throw new ZstdException(ZstdError.BadBlock, "zstd: reserved block type");
             }
+            int payloadBytes = btype == 1 ? 1 : bsize;
+            if (bsize > blockMax || payloadBytes > src.Length - p) {
+                throw new ZstdException(ZstdError.Truncated, "zstd: block size exceeds bounds");
+            }
+            if ((btype == 0 || btype == 1) && bsize > maxOut - sink.Length()) {
+                throw new ZstdException(ZstdError.SizeMismatch, "zstd: decoded output exceeds maximum allowed size");
+            }
             dec.DecodeBlock(src, p, bsize, btype, blockMax);
-            p = p + (btype == 1 ? 1 : bsize);
+            if (sink.Length() > maxOut) {
+                throw new ZstdException(ZstdError.SizeMismatch, "zstd: decoded output exceeds maximum allowed size");
+            }
+            p = p + payloadBytes;
             if (last) { break; }
         }
         long produced = (long)sink.Length() - (long)frameStart;
@@ -175,7 +206,7 @@ public class ZstdFrame {
                 "zstd: decoded size does not match the frame content size");
         }
         if (hasChecksum) {
-            if (p + 4 > src.Length) {
+            if (src.Length - p < 4) {
                 throw new ZstdException(ZstdError.Truncated, "zstd: content checksum truncated");
             }
             int stored = ZstdFrame.ReadLE32(src, p);

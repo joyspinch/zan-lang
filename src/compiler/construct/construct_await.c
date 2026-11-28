@@ -5,16 +5,20 @@ static LLVMValueRef coerce_ternary_value(zan_irgen_t *g, LLVMValueRef v,
     return v;
   int vk = LLVMGetTypeKind(LLVMTypeOf(v));
   int tk = LLVMGetTypeKind(target);
+  /* 结构体构造表达式 (new S(...)) 产出栈槽指针，而结构体调用/局部变量产出按值结构体；
+   * 汇入按值结构体 PHI 前须从栈槽加载，避免 ptr 与 %struct.S 混入同一 PHI（E3090）。 */
+  if (vk == LLVMPointerTypeKind && tk == LLVMStructTypeKind &&
+      !llvm_is_nullable(target)) {
+    if (LLVMIsNull(v))
+      return LLVMConstNull(target);
+    return LLVMBuildLoad2(g->builder, target, v, "tern.sv");
+  }
   if (vk == LLVMIntegerTypeKind &&
       (tk == LLVMFloatTypeKind || tk == LLVMDoubleTypeKind))
     return LLVMBuildSIToFP(g->builder, v, target, "tern.sitofp");
   if ((vk == LLVMFloatTypeKind || vk == LLVMDoubleTypeKind) &&
       tk == LLVMIntegerTypeKind)
     return emit_fptosi_guarded(g, v, target, (zan_loc_t){0}, NULL);
-  /* 结构体臂：`new S(...)` 产出栈槽指针，属性/字段读产出按值结构体；
-   * PHI 取按值类型，指针臂就地 load（`c ? Vector3.Zero : new Vector3(..)`）。 */
-  if (vk == LLVMPointerTypeKind && tk == LLVMStructTypeKind)
-    return LLVMBuildLoad2(g->builder, target, v, "tern.sload");
   return coerce_int_to(g, v, target);
 }
 LLVMValueRef emit_expr_conditional(zan_irgen_t *g, zan_ast_node_t *expr,
@@ -108,7 +112,10 @@ LLVMValueRef emit_expr_conditional_typed(zan_irgen_t *g, zan_ast_node_t *expr,
     }
     if (phi_ty == tty) {
       int tk = LLVMGetTypeKind(tty), ek = LLVMGetTypeKind(ety);
-      if (tk == LLVMIntegerTypeKind && ek == LLVMIntegerTypeKind) {
+      if (tk == LLVMPointerTypeKind && ek == LLVMStructTypeKind &&
+          !llvm_is_nullable(ety)) {
+        phi_ty = ety;
+      } else if (tk == LLVMIntegerTypeKind && ek == LLVMIntegerTypeKind) {
         if (LLVMGetIntTypeWidth(ety) > LLVMGetIntTypeWidth(tty))
           phi_ty = ety;
       } else if ((tk == LLVMFloatTypeKind || tk == LLVMDoubleTypeKind) &&
@@ -179,6 +186,7 @@ LLVMValueRef emit_expr_switch_expr(zan_irgen_t *g, zan_ast_node_t *expr,
     sc->switch_case.type_pattern = arm->switch_arm.type_pattern;
     sc->switch_case.when_cond = arm->switch_arm.when_cond;
     sc->switch_case.var_name = arm->switch_arm.var_name;
+    sc->switch_case.adt_pat = arm->switch_arm.adt_pat;
 
     /* body: { __swx = result; break; } */
     zan_ast_node_t *block = zan_ast_new(g->arena, AST_BLOCK, arm->loc);

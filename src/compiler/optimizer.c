@@ -1746,7 +1746,7 @@ static void zan_opt_mark_huge(LLVMModuleRef mod) {
 }
 
 zan_status_t zan_opt_validate_cpu(zan_irgen_t *g, LLVMModuleRef mod) {
-  if (!g->cpu_profile)
+  if (!g->cpu_profile && !g->target_cpu_override && !g->target_features_override)
     return ZAN_OK;
   /* Also preserve explicit requirements for external consumers of --emit-ir.
    * The TargetMachine remains authoritative for optimization and emission. */
@@ -1764,7 +1764,7 @@ zan_status_t zan_opt_validate_cpu(zan_irgen_t *g, LLVMModuleRef mod) {
                                 ctx, "target-features", 15, g->target_features,
                                 (unsigned)strlen(g->target_features)));
   }
-  if (strcmp(g->cpu_profile, "baseline") != 0)
+  if (!g->cpu_profile || strcmp(g->cpu_profile, "baseline") != 0)
     return ZAN_OK;
   for (LLVMValueRef fn = LLVMGetFirstFunction(mod); fn;
        fn = LLVMGetNextFunction(fn)) {

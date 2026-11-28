@@ -1,0 +1,155 @@
+using System;
+using System.Collections.Generic;
+
+namespace SelfhostInitTupleIndexOwnership;
+
+class Box {
+    public int Val;
+    public Box(int v) { this.Val = v; }
+}
+
+struct PairVal {
+    public Box Item;
+    public int Tag;
+    public PairVal(Box b, int t) { this.Item = b; this.Tag = t; }
+}
+
+class Holder {
+    public Box A;
+    public Box B;
+    public List<Box> Items;
+    public Holder() { this.Items = new List<Box>(); }
+    public static Holder Make() { return new Holder(); }
+}
+
+record Rec(string A, string B);
+
+class Program {
+    static Box MakeBox(int v) { return new Box(v); }
+    static string MakeStr(int v) { return "k_" + v.ToString(); }
+    static Box[] MakeArr() { return new Box[] { MakeBox(1), MakeBox(2) }; }
+    static List<Box> MakeList() { return new List<Box> { MakeBox(3) }; }
+    static Dictionary<string, Box> MakeDict() {
+        return new Dictionary<string, Box> { { MakeStr(1), MakeBox(4) } };
+    }
+    static Rec MakeRec(int a, int b) { return new Rec(MakeStr(a), MakeStr(b)); }
+    static Box BoomBox() { throw new Exception("boom_box"); }
+    static string BoomStr() { throw new Exception("boom_str"); }
+    static int BoomInt() { throw new Exception("boom_int"); }
+    static int VarArgs(params Box[] items) { return items.Length; }
+
+    static (Box, string, Box[]) MakeRichTuple(int baseVal) {
+        return (MakeBox(baseVal), MakeStr(baseVal), new Box[] { MakeBox(baseVal + 1) });
+    }
+
+    static int TestContainerInitUnwind() {
+        int sum = 0;
+        try {
+            List<Box> xs = new List<Box> { MakeBox(1), MakeBox(2), BoomBox() };
+            sum = sum + xs.Count;
+        } catch (Exception e) { sum = sum + e.Message.Length; }
+        try {
+            List<Box> xs2 = new List<Box>(MakeBox(1), BoomBox());
+            sum = sum + xs2.Count;
+        } catch (Exception e) { sum = sum + e.Message.Length; }
+        try {
+            List<Box> xs3 = new List<Box>(BoomBox());
+            sum = sum + xs3.Count;
+        } catch (Exception e) { sum = sum + e.Message.Length; }
+        try {
+            Dictionary<string, Box> d = new Dictionary<string, Box> {
+                { MakeStr(1), MakeBox(1) },
+                { MakeStr(2), BoomBox() }
+            };
+            sum = sum + d.Count;
+        } catch (Exception e) { sum = sum + e.Message.Length; }
+        try {
+            Box[] arr = new Box[] { MakeBox(1), MakeBox(2), BoomBox() };
+            sum = sum + arr.Length;
+        } catch (Exception e) { sum = sum + e.Message.Length; }
+        try {
+            sum = sum + VarArgs(MakeBox(1), MakeBox(2), BoomBox());
+        } catch (Exception e) { sum = sum + e.Message.Length; }
+        try {
+            Box[,] grid = new Box[2, 2] { { MakeBox(1), MakeBox(2) }, { MakeBox(3), BoomBox() } };
+            sum = sum + grid.GetLength(0);
+        } catch (Exception e) { sum = sum + e.Message.Length; }
+        try {
+            Box[,] grid2 = new Box[MakeBox(2).Val, BoomInt()];
+            sum = sum + grid2.GetLength(0);
+        } catch (Exception e) { sum = sum + e.Message.Length; }
+        return sum;
+    }
+
+    static int TestCallInitWithIndexUnwind() {
+        int sum = 0;
+        try {
+            Holder h = Holder.Make() { A = MakeBox(1), B = BoomBox() };
+            sum = sum + h.A.Val;
+        } catch (Exception e) { sum = sum + e.Message.Length; }
+        try {
+            Rec r = MakeRec(1, 2);
+            Rec r2 = r with { A = MakeStr(3), B = BoomStr() };
+            sum = sum + r2.A.Length;
+        } catch (Exception e) { sum = sum + e.Message.Length; }
+        try {
+            Rec r3 = MakeRec(4, 5) with { B = BoomStr() };
+            sum = sum + r3.A.Length;
+        } catch (Exception e) { sum = sum + e.Message.Length; }
+        try {
+            Box b = MakeArr()[BoomInt()];
+            sum = sum + b.Val;
+        } catch (Exception e) { sum = sum + e.Message.Length; }
+        try {
+            Box b = MakeList()[BoomInt()];
+            sum = sum + b.Val;
+        } catch (Exception e) { sum = sum + e.Message.Length; }
+        try {
+            Box b = MakeDict()[BoomStr()];
+            sum = sum + b.Val;
+        } catch (Exception e) { sum = sum + e.Message.Length; }
+        try {
+            Box b = MakeArr()[99];
+            sum = sum + b.Val;
+        } catch (Exception e) { sum = sum + (e.Message.Length > 0 ? 1 : 0); }
+        return sum;
+    }
+
+    static int TestTupleOwnership() {
+        int sum = 0;
+        // 1. Tuple without deconstruction (must free tuple + all managed elements)
+        (Box, string) t1 = (MakeBox(10), MakeStr(10));
+        sum = sum + t1.Item1.Val + t1.Item2.Length;
+
+        // 2. Repeated deconstruction + use after inner scope drops copies (no double-free/UAF)
+        (Box, Box) t2 = (MakeBox(20), MakeBox(30));
+        {
+            var (a, b) = t2;
+            sum = sum + a.Val + b.Val;
+        }
+        var (c, d) = t2;
+        sum = sum + c.Val + d.Val + t2.Item1.Val;
+
+        // 3. Direct deconstruction of temporary rich tuple (Box, string, Box[])
+        var (rb, rs, ra) = MakeRichTuple(5);
+        sum = sum + rb.Val + rs.Length + ra[0].Val;
+
+        // 4. Nested tuple + struct element
+        (PairVal, (Box, string)) nested = (new PairVal(MakeBox(7), 3), (MakeBox(8), MakeStr(8)));
+        sum = sum + nested.Item1.Item.Val + nested.Item1.Tag + nested.Item2.Item1.Val + nested.Item2.Item2.Length;
+
+        // 5. Mid-tuple throw unwind (0 leaks)
+        try {
+            (Box, string) bad = (MakeBox(99), BoomStr());
+            sum = sum + bad.Item1.Val;
+        } catch (Exception e) { sum = sum + e.Message.Length; }
+
+        return sum;
+    }
+
+    static void Main() {
+        Console.WriteLine("init=" + TestContainerInitUnwind().ToString());
+        Console.WriteLine("expr=" + TestCallInitWithIndexUnwind().ToString());
+        Console.WriteLine("tuple=" + TestTupleOwnership().ToString());
+    }
+}

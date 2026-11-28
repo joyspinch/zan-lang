@@ -47,8 +47,12 @@ public class HpackContext {
 
     private void RebuildDynIndex() {
         int dynCount = this.dynamicTable.Count;
-        int needCap = this.ringCap < 256 ? 256 : this.ringCap;
-        while (needCap <= dynCount) { needCap = needCap * 2; }
+        long needCapL = this.ringCap < 256 ? 256L : (long)this.ringCap;
+        while (needCapL <= (long)dynCount) {
+            needCapL = needCapL * 2L;
+            if (needCapL > 1073741824L) { throw new IOException("HPACK dynamic table index overflow"); }
+        }
+        int needCap = (int)needCapL;
         if (this.bucketHead == null) {
             this.bucketHead = new long[256];
         } else {
@@ -116,7 +120,7 @@ public class HpackContext {
         if (this.bucketHead == null || newCount >= this.ringCap) {
             this.RebuildDynIndex();
         } else {
-            int b = HpackContext.HashBucket(name);
+            int b = HpackContext.HashBucket(entry.name);
             int slot = (int)(this.insertSeq & (long)this.ringMask);
             this.prevSeq[slot] = this.bucketHead[b];
             this.bucketHead[b] = this.insertSeq;
@@ -188,6 +192,9 @@ public class HpackContext {
 
     // RFC 7541 §5.1: 变长整数编码
     public static void EncodeInt(List<int> outBytes, int initialByte, int prefixBits, int val) {
+        if (outBytes == null || prefixBits < 1 || prefixBits > 8 || val < 0) {
+            throw new IOException("Invalid HPACK integer");
+        }
         int maxPrefix = (1 << prefixBits) - 1;
         if (val < maxPrefix) {
             outBytes.Add(initialByte | val);
@@ -237,6 +244,7 @@ public class HpackContext {
 
     // RFC 7541 §5.2: 字符串字面量编码
     public static void EncodeString(List<int> outBytes, string s, bool useHuffman) {
+        if (outBytes == null) { throw new IOException("Invalid HPACK output buffer"); }
         if (s == null) { s = ""; }
         if (useHuffman) {
             int hlen = HpackHuffman.EncodedLength(s);
@@ -259,16 +267,26 @@ public class HpackContext {
     }
 
     private static byte[] EnsureBufRoom(byte[] buf, int pos, int extra) {
-        int need = pos + extra;
-        if (need <= buf.Length) { return buf; }
-        int c = buf.Length * 2;
-        while (c < need) { c = c * 2; }
-        byte[] grown = new byte[c];
-        NativeMemory.Copy((nint)grown, (nint)buf, pos);
+        if (buf == null || pos < 0 || extra < 0 || pos > buf.Length) {
+            throw new IOException("Invalid HPACK buffer state");
+        }
+        long need = (long)pos + (long)extra;
+        if (need > 2147483591L) { throw new IOException("HPACK buffer size overflow"); }
+        if (need <= (long)buf.Length) { return buf; }
+        long c = buf.Length > 0 ? (long)buf.Length * 2L : 64L;
+        while (c < need) {
+            c = c * 2L;
+            if (c > 2147483591L) { c = 2147483591L; break; }
+        }
+        byte[] grown = new byte[(int)c];
+        if (pos > 0) { NativeMemory.Copy((nint)grown, (nint)buf, pos); }
         return grown;
     }
 
     private static byte[] WriteIntBuf(byte[] buf, ref int pos, int initialByte, int prefixBits, int val) {
+        if (prefixBits < 1 || prefixBits > 8 || val < 0) {
+            throw new IOException("Invalid HPACK integer");
+        }
         buf = HpackContext.EnsureBufRoom(buf, pos, 8);
         int maxPrefix = (1 << prefixBits) - 1;
         if (val < maxPrefix) {
@@ -375,9 +393,14 @@ public class HpackContext {
                 if (indexed) { throw new IOException("Zero HPACK index"); }
                 name = HpackContext.ReadStringRef(buf, ref pos, end, this.maxHeaderBytes - bytes);
             }
-            if (!indexed) { value = HpackContext.ReadStringRef(buf, ref pos, end, this.maxHeaderBytes - bytes - name.Length); }
-            if (name.Length == 0 || name.Length + value.Length + 32 > this.maxHeaderBytes - bytes) { throw new IOException("HPACK header list limit"); }
-            bytes = bytes + name.Length + value.Length + 32;
+            if (!indexed) {
+                int valBudget = this.maxHeaderBytes - bytes - name.Length;
+                if (valBudget < 0) { throw new IOException("HPACK header list limit"); }
+                value = HpackContext.ReadStringRef(buf, ref pos, end, valBudget);
+            }
+            long entryCost = (long)name.Length + (long)value.Length + 32L;
+            if (name.Length == 0 || entryCost > (long)(this.maxHeaderBytes - bytes)) { throw new IOException("HPACK header list limit"); }
+            bytes = bytes + (int)entryCost;
             if (insert) { this.AddHeader(name, value); }
             headers.Add(new HpackHeader(name, value));
         }
@@ -388,27 +411,32 @@ public class HpackContext {
     public byte[] EncodeHeaders(List<HpackHeader> headers, bool useHuffman) {
         if (headers == null || headers.Count == 0) { return new byte[0]; }
         int hCount = headers.Count;
-        byte[] outBuf = new byte[hCount * 32 + 64];
+        long initCapL = (long)hCount * 32L + 64L;
+        if (initCapL > 65536L) { initCapL = 65536L; }
+        byte[] outBuf = new byte[(int)initCapL];
         int pos = 0;
 
         for (int i = 0; i < hCount; i = i + 1) {
             HpackHeader h = headers[i];
+            if (h == null) { throw new IOException("Null HPACK header"); }
+            string hName = h.name != null ? h.name : "";
+            string hVal = h.value != null ? h.value : "";
             int nameIdx = 0;
-            int exactIdx = this.FindFast(h.name, h.value, out nameIdx);
+            int exactIdx = this.FindFast(hName, hVal, out nameIdx);
             if (exactIdx > 0) {
                 // 完全命中：以 Indexed Header Field (1xxxxxxx, prefix 7) 编码
                 outBuf = HpackContext.WriteIntBuf(outBuf, ref pos, 128, 7, exactIdx);
             } else if (nameIdx > 0) {
                 // 名称命中：以 Literal Header Field with Incremental Indexing (01xxxxxx, prefix 6) 编码
                 outBuf = HpackContext.WriteIntBuf(outBuf, ref pos, 64, 6, nameIdx);
-                outBuf = HpackContext.WriteStringBuf(outBuf, ref pos, h.value, useHuffman);
-                this.AddHeader(h.name, h.value);
+                outBuf = HpackContext.WriteStringBuf(outBuf, ref pos, hVal, useHuffman);
+                this.AddHeader(hName, hVal);
             } else {
                 // 全新头部：Literal with Incremental Indexing (01000000, index 0)
                 outBuf = HpackContext.WriteIntBuf(outBuf, ref pos, 64, 6, 0);
-                outBuf = HpackContext.WriteStringBuf(outBuf, ref pos, h.name, useHuffman);
-                outBuf = HpackContext.WriteStringBuf(outBuf, ref pos, h.value, useHuffman);
-                this.AddHeader(h.name, h.value);
+                outBuf = HpackContext.WriteStringBuf(outBuf, ref pos, hName, useHuffman);
+                outBuf = HpackContext.WriteStringBuf(outBuf, ref pos, hVal, useHuffman);
+                this.AddHeader(hName, hVal);
             }
         }
 

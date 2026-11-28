@@ -1,0 +1,405 @@
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+
+namespace Game.Render3D;
+
+// Forward+ 空间分簇动态百灯 Top-K 裁剪与照度排序器（突破单 Pass 4 点光 + 4 聚光硬件槽位限制，零 C 驱动 ABI 破坏）：
+// - 支持场景同时挂载数百盏动态/静态点光源（爆炸火光、枪口焰、廊灯）与聚光灯（战术手电、载具车灯、探照灯）
+// - 采用 4-Wide SIMD（Vec<4, float>）并行执行球盒距离裁剪，微秒级剔除射程外无效光源
+// - 聚光灯额外执行圆锥-包围球解析角度剔除（Cone-Sphere Culling），杜绝背向探照灯占用宝贵 Shader 槽位
+// - 按目标区域感知照度（Rec.709 亮度权重 * 平滑平方反比衰减 * 聚光锥平滑衰减）精选贡献最高的 Top-K 光源
+// - 双输出通道：既可填充 RenderPlan.Lights（无缝对接 Renderer3D），也可直接零分配写出 GPU Uniform 数组
+public class LightClusterCuller3D {
+    public const int MaxHardwarePointLights = 4;
+    public const int MaxHardwareSpotLights = 4;
+
+    private Light[] lights;
+    // 4-Wide SoA 热缓存（按 4 对齐填充，供 Vec<4, float> 单指令扫描 4 盏灯）
+    private float[] posX;
+    private float[] posY;
+    private float[] posZ;
+    private float[] rangeSq;
+    private float[] invRange;
+    private float[] luminance;
+    private byte[] kindCode;     // 0=Disabled/Dir, 1=Point, 2=Spot
+    private Light primaryDirectional;
+
+    private int lightCount;
+    private int paddedCapacity;
+    private bool soaDirty;
+
+    public LightClusterCuller3D() : this(64) {
+    }
+
+    public LightClusterCuller3D(int initialCapacity) {
+        int cap = ((initialCapacity > 16 ? initialCapacity : 16) + 3) & ~3;
+        this.paddedCapacity = cap;
+        this.lights = new Light[cap];
+        this.posX = new float[cap];
+        this.posY = new float[cap];
+        this.posZ = new float[cap];
+        this.rangeSq = new float[cap];
+        this.invRange = new float[cap];
+        this.luminance = new float[cap];
+        this.kindCode = new byte[cap];
+        this.lightCount = 0;
+        this.primaryDirectional = null;
+        this.soaDirty = true;
+    }
+
+    public int Count() { return this.lightCount; }
+
+    public void Clear() {
+        for (int i = 0; i < this.lightCount; i = i + 1) {
+            this.lights[i] = null;
+            this.kindCode[i] = (byte)0;
+        }
+        this.lightCount = 0;
+        this.primaryDirectional = null;
+        this.soaDirty = true;
+    }
+
+    private void EnsureCapacity(int needed) {
+        if (needed <= this.paddedCapacity) { return; }
+        int newCap = this.paddedCapacity * 2;
+        while (newCap < needed) { newCap = newCap * 2; }
+        newCap = (newCap + 3) & ~3;
+
+        Light[] nl = new Light[newCap];
+        Array.Copy(this.lights, 0, nl, 0, this.lightCount);
+        this.lights = nl;
+
+        this.posX = new float[newCap];
+        this.posY = new float[newCap];
+        this.posZ = new float[newCap];
+        this.rangeSq = new float[newCap];
+        this.invRange = new float[newCap];
+        this.luminance = new float[newCap];
+        this.kindCode = new byte[newCap];
+        this.paddedCapacity = newCap;
+        this.soaDirty = true;
+    }
+
+    public int AddLight(Light light) {
+        if (light == null) { return -1; }
+        this.EnsureCapacity(this.lightCount + 1);
+        int id = this.lightCount;
+        this.lightCount = id + 1;
+        this.lights[id] = light;
+        this.soaDirty = true;
+        return id;
+    }
+
+    public void SetLights(List<Light> sceneLights) {
+        this.Clear();
+        if (sceneLights == null) { return; }
+        this.EnsureCapacity(sceneLights.Count);
+        for (int i = 0; i < sceneLights.Count; i = i + 1) {
+            Light lt = sceneLights[i];
+            if (lt != null) {
+                this.lights[this.lightCount] = lt;
+                this.lightCount = this.lightCount + 1;
+            }
+        }
+        this.soaDirty = true;
+    }
+
+    // 动态光源（枪口焰、火箭尾焰、移动车灯）每帧更新坐标/开关后调用以刷新 SIMD 热表。
+    public void MarkDirty() {
+        this.soaDirty = true;
+    }
+
+    private void RefreshSoaIfNeeded() {
+        if (!this.soaDirty) { return; }
+        this.soaDirty = false;
+        this.primaryDirectional = null;
+        float bestDirLum = -1.0f;
+
+        int n = this.lightCount;
+        for (int i = 0; i < n; i = i + 1) {
+            Light lt = this.lights[i];
+            if (lt == null || !lt.Enabled || lt.Intensity <= 1e-5f) {
+                this.kindCode[i] = (byte)0;
+                this.rangeSq[i] = -1.0f;
+                continue;
+            }
+
+            float lum = (0.2126f * Math.Max(0.0f, lt.Red)
+                       + 0.7152f * Math.Max(0.0f, lt.Green)
+                       + 0.0722f * Math.Max(0.0f, lt.Blue)) * lt.Intensity;
+            if (lum <= 1e-5f) {
+                this.kindCode[i] = (byte)0;
+                this.rangeSq[i] = -1.0f;
+                continue;
+            }
+
+            if (lt.Kind == LightKind.Directional) {
+                this.kindCode[i] = (byte)0;
+                this.rangeSq[i] = -1.0f;
+                if (lum > bestDirLum) {
+                    bestDirLum = lum;
+                    this.primaryDirectional = lt;
+                }
+                continue;
+            }
+
+            float r = lt.Range > 0.0f ? lt.Range : 1000.0f;
+            this.posX[i] = lt.Position.X;
+            this.posY[i] = lt.Position.Y;
+            this.posZ[i] = lt.Position.Z;
+            this.rangeSq[i] = r * r;
+            this.invRange[i] = 1.0f / r;
+            this.luminance[i] = lum;
+            this.kindCode[i] = lt.Kind == LightKind.Point ? (byte)1 : (byte)2;
+        }
+
+        int padEnd = (n + 3) & ~3;
+        for (int i = n; i < padEnd; i = i + 1) {
+            this.kindCode[i] = (byte)0;
+            this.rangeSq[i] = -1.0f;
+        }
+    }
+
+    // 针对目标包围盒（房间/区块/角色簇/视锥包围盒）与视觉焦点精选贡献度最高的 Top-K 点光源与聚光灯，直接写入 RenderPlan.Lights。
+    public void SelectTopLights(Vector3 boundsMin, Vector3 boundsMax, Vector3 focusPoint,
+                                int maxPointLights, int maxSpotLights, List<Light> outLights) {
+        if (outLights == null) { return; }
+        outLights.Clear();
+        this.RefreshSoaIfNeeded();
+
+        if (this.primaryDirectional != null) {
+            outLights.Add(this.primaryDirectional);
+        }
+
+        int capPt = Math.Max(0, Math.Min(MaxHardwarePointLights, maxPointLights));
+        int capSp = Math.Max(0, Math.Min(MaxHardwareSpotLights, maxSpotLights));
+        if (this.lightCount <= 0 || (capPt == 0 && capSp == 0)) { return; }
+
+        [4]int topPtIdx = new InlineArray<4, int>();
+        [4]float topPtScore = new InlineArray<4, float>();
+        int ptFound = 0;
+
+        [4]int topSpIdx = new InlineArray<4, int>();
+        [4]float topSpScore = new InlineArray<4, float>();
+        int spFound = 0;
+
+        this.CullAndRankCore(boundsMin, boundsMax, focusPoint, capPt, capSp,
+                             ref topPtIdx, ref topPtScore, out ptFound,
+                             ref topSpIdx, ref topSpScore, out spFound);
+
+        for (int i = 0; i < ptFound; i = i + 1) {
+            outLights.Add(this.lights[topPtIdx[i]]);
+        }
+        for (int i = 0; i < spFound; i = i + 1) {
+            outLights.Add(this.lights[topSpIdx[i]]);
+        }
+    }
+
+    // 零堆分配直接将目标簇 Top-4 点光与 Top-4 聚光打包为 zan_game 原生 Shader Uniform 数组格式。
+    public void PackTopLightsToUniforms(
+        Vector3 boundsMin, Vector3 boundsMax, Vector3 focusPoint,
+        float[] outPointPosRange16, float[] outPointColors12, out int outPointCount,
+        float[] outSpotPosRange16, float[] outSpotDirCosInner16, float[] outSpotColorCosOuter16, out int outSpotCount) {
+        this.RefreshSoaIfNeeded();
+
+        [4]int topPtIdx = new InlineArray<4, int>();
+        [4]float topPtScore = new InlineArray<4, float>();
+        int ptFound = 0;
+
+        [4]int topSpIdx = new InlineArray<4, int>();
+        [4]float topSpScore = new InlineArray<4, float>();
+        int spFound = 0;
+
+        if (this.lightCount > 0) {
+            this.CullAndRankCore(boundsMin, boundsMax, focusPoint,
+                                 MaxHardwarePointLights, MaxHardwareSpotLights,
+                                 ref topPtIdx, ref topPtScore, out ptFound,
+                                 ref topSpIdx, ref topSpScore, out spFound);
+        }
+
+        outPointCount = ptFound;
+        if (outPointPosRange16 != null && outPointColors12 != null) {
+            for (int i = 0; i < ptFound; i = i + 1) {
+                Light lt = this.lights[topPtIdx[i]];
+                int p4 = i * 4;
+                int c3 = i * 3;
+                outPointPosRange16[p4 + 0] = lt.Position.X;
+                outPointPosRange16[p4 + 1] = lt.Position.Y;
+                outPointPosRange16[p4 + 2] = lt.Position.Z;
+                outPointPosRange16[p4 + 3] = lt.Range > 0.0f ? lt.Range : 1000.0f;
+                float e = lt.Intensity;
+                outPointColors12[c3 + 0] = lt.Red * e;
+                outPointColors12[c3 + 1] = lt.Green * e;
+                outPointColors12[c3 + 2] = lt.Blue * e;
+            }
+        }
+
+        outSpotCount = spFound;
+        if (outSpotPosRange16 != null && outSpotDirCosInner16 != null && outSpotColorCosOuter16 != null) {
+            for (int i = 0; i < spFound; i = i + 1) {
+                Light lt = this.lights[topSpIdx[i]];
+                int o4 = i * 4;
+                outSpotPosRange16[o4 + 0] = lt.Position.X;
+                outSpotPosRange16[o4 + 1] = lt.Position.Y;
+                outSpotPosRange16[o4 + 2] = lt.Position.Z;
+                outSpotPosRange16[o4 + 3] = lt.Range > 0.0f ? lt.Range : 1000.0f;
+
+                Vector3 d = lt.Direction.LengthSquared() > 1e-10f ? Vector3.Normalize(lt.Direction) : new Vector3(0.0f, -1.0f, 0.0f);
+                float cosIn = (float)Math.Cos((double)lt.InnerAngle);
+                float cosOut = (float)Math.Cos((double)lt.OuterAngle);
+                if (cosIn < cosOut) { float t = cosIn; cosIn = cosOut; cosOut = t; }
+
+                outSpotDirCosInner16[o4 + 0] = d.X;
+                outSpotDirCosInner16[o4 + 1] = d.Y;
+                outSpotDirCosInner16[o4 + 2] = d.Z;
+                outSpotDirCosInner16[o4 + 3] = cosIn;
+
+                float e = lt.Intensity;
+                outSpotColorCosOuter16[o4 + 0] = lt.Red * e;
+                outSpotColorCosOuter16[o4 + 1] = lt.Green * e;
+                outSpotColorCosOuter16[o4 + 2] = lt.Blue * e;
+                outSpotColorCosOuter16[o4 + 3] = cosOut;
+            }
+        }
+    }
+
+    private void CullAndRankCore(
+        Vector3 boundsMin, Vector3 boundsMax, Vector3 focusPoint,
+        int capPt, int capSp,
+        ref [4]int topPtIdx, ref [4]float topPtScore, out int ptFound,
+        ref [4]int topSpIdx, ref [4]float topSpScore, out int spFound) {
+        ptFound = 0;
+        spFound = 0;
+
+        float minX = Math.Min(boundsMin.X, boundsMax.X);
+        float minY = Math.Min(boundsMin.Y, boundsMax.Y);
+        float minZ = Math.Min(boundsMin.Z, boundsMax.Z);
+        float maxX = Math.Max(boundsMin.X, boundsMax.X);
+        float maxY = Math.Max(boundsMin.Y, boundsMax.Y);
+        float maxZ = Math.Max(boundsMin.Z, boundsMax.Z);
+
+        float boxCx = (minX + maxX) * 0.5f;
+        float boxCy = (minY + maxY) * 0.5f;
+        float boxCz = (minZ + maxZ) * 0.5f;
+        float hx = (maxX - minX) * 0.5f;
+        float hy = (maxY - minY) * 0.5f;
+        float hz = (maxZ - minZ) * 0.5f;
+        float boxRadius = MathF.Sqrt(hx * hx + hy * hy + hz * hz);
+
+        Vec<4, float> vMinX = Vec<4, float>.Splat(minX);
+        Vec<4, float> vMinY = Vec<4, float>.Splat(minY);
+        Vec<4, float> vMinZ = Vec<4, float>.Splat(minZ);
+        Vec<4, float> vMaxX = Vec<4, float>.Splat(maxX);
+        Vec<4, float> vMaxY = Vec<4, float>.Splat(maxY);
+        Vec<4, float> vMaxZ = Vec<4, float>.Splat(maxZ);
+
+        int padEnd = (this.lightCount + 3) & ~3;
+        for (int baseIdx = 0; baseIdx < padEnd; baseIdx = baseIdx + 4) {
+            Vec<4, float> lx = Vec<4, float>.Load(this.posX, baseIdx);
+            Vec<4, float> ly = Vec<4, float>.Load(this.posY, baseIdx);
+            Vec<4, float> lz = Vec<4, float>.Load(this.posZ, baseIdx);
+            Vec<4, float> rSq = Vec<4, float>.Load(this.rangeSq, baseIdx);
+
+            // 4-Wide SIMD 最近点夹紧：clamped = min(max(lightPos, boxMin), boxMax)
+            Vec<4, float> cx = Vec<4, float>.Min(Vec<4, float>.Max(lx, vMinX), vMaxX) - lx;
+            Vec<4, float> cy = Vec<4, float>.Min(Vec<4, float>.Max(ly, vMinY), vMaxY) - ly;
+            Vec<4, float> cz = Vec<4, float>.Min(Vec<4, float>.Max(lz, vMinZ), vMaxZ) - lz;
+            Vec<4, float> dBoxSq = cx * cx + cy * cy + cz * cz;
+
+            for (int lane = 0; lane < 4; lane = lane + 1) {
+                float boxDistSq = dBoxSq[lane];
+                float maxRSq = rSq[lane];
+                if (boxDistSq > maxRSq) { continue; }
+
+                int idx = baseIdx + lane;
+                byte kind = this.kindCode[idx];
+                if (kind == (byte)0) { continue; }
+                if (kind == (byte)1 && capPt <= 0) { continue; }
+                if (kind == (byte)2 && capSp <= 0) { continue; }
+
+                Light lt = this.lights[idx];
+                float invR = this.invRange[idx];
+                float fdx = focusPoint.X - this.posX[idx];
+                float fdy = focusPoint.Y - this.posY[idx];
+                float fdz = focusPoint.Z - this.posZ[idx];
+                float focusDist = MathF.Sqrt(fdx * fdx + fdy * fdy + fdz * fdz);
+                float boxDist = boxDistSq > 1e-10f ? MathF.Sqrt(boxDistSq) : 0.0f;
+
+                // 综合包围盒最近距离与相机焦点距离计算衰减权重，兼顾脚下贴身火光与大区块边缘光源
+                float effDist = Math.Min(focusDist, boxDist * 0.65f + focusDist * 0.35f);
+                float normDist = Math.Min(0.995f, effDist * invR);
+                float falloff = (1.0f - normDist) * (1.0f - normDist);
+                float score = this.luminance[idx] * falloff;
+
+                if (kind == (byte)2) {
+                    // 聚光灯圆锥-包围球剔除与锥角衰减评估
+                    Vector3 spotDir = lt.Direction.LengthSquared() > 1e-10f
+                        ? Vector3.Normalize(lt.Direction)
+                        : new Vector3(0.0f, -1.0f, 0.0f);
+                    float toBoxX = boxCx - this.posX[idx];
+                    float toBoxY = boxCy - this.posY[idx];
+                    float toBoxZ = boxCz - this.posZ[idx];
+                    float toBoxLen = MathF.Sqrt(toBoxX * toBoxX + toBoxY * toBoxY + toBoxZ * toBoxZ);
+
+                    float outerAngle = Math.Max(lt.InnerAngle, lt.OuterAngle);
+                    if (toBoxLen > boxRadius + 1e-4f) {
+                        float cosToCenter = (toBoxX * spotDir.X + toBoxY * spotDir.Y + toBoxZ * spotDir.Z) / toBoxLen;
+                        float angularRadius = (float)Math.Asin(Math.Min(1.0, (double)(boxRadius / toBoxLen)));
+                        double sumAng = (double)outerAngle + (double)angularRadius;
+                        if (sumAng > 3.141592653589793) { sumAng = 3.141592653589793; }
+                        float maxAcceptCos = (float)Math.Cos(sumAng);
+                        if (cosToCenter < maxAcceptCos) {
+                            continue;
+                        }
+                    }
+
+                    if (focusDist > 1e-4f) {
+                        float cosFocus = (fdx * spotDir.X + fdy * spotDir.Y + fdz * spotDir.Z) / focusDist;
+                        float cosOut = (float)Math.Cos((double)outerAngle);
+                        if (cosFocus > cosOut) {
+                            float cosIn = (float)Math.Cos((double)Math.Min(lt.InnerAngle, outerAngle));
+                            float coneFactor = cosIn > cosOut + 1e-4f
+                                ? Math.Min(1.0f, (cosFocus - cosOut) / (cosIn - cosOut))
+                                : 1.0f;
+                            score = score * (0.25f + 0.75f * coneFactor);
+                        } else {
+                            score = score * 0.15f;
+                        }
+                    }
+                }
+
+                if (kind == (byte)1) {
+                    LightClusterCuller3D.InsertTopK(idx, score, capPt, ref topPtIdx, ref topPtScore, ref ptFound);
+                } else {
+                    LightClusterCuller3D.InsertTopK(idx, score, capSp, ref topSpIdx, ref topSpScore, ref spFound);
+                }
+            }
+        }
+    }
+
+    private static void InsertTopK(int lightIdx, float score, int kLimit,
+                                   ref [4]int idxArr, ref [4]float scoreArr, ref int count) {
+        if (count < kLimit) {
+            int pos = count;
+            count = count + 1;
+            while (pos > 0 && score > scoreArr[pos - 1]) {
+                scoreArr[pos] = scoreArr[pos - 1];
+                idxArr[pos] = idxArr[pos - 1];
+                pos = pos - 1;
+            }
+            scoreArr[pos] = score;
+            idxArr[pos] = lightIdx;
+            return;
+        }
+        if (score <= scoreArr[kLimit - 1]) { return; }
+        int p = kLimit - 1;
+        while (p > 0 && score > scoreArr[p - 1]) {
+            scoreArr[p] = scoreArr[p - 1];
+            idxArr[p] = idxArr[p - 1];
+            p = p - 1;
+        }
+        scoreArr[p] = score;
+        idxArr[p] = lightIdx;
+    }
+}

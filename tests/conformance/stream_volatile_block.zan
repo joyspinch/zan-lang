@@ -1,0 +1,42 @@
+using System;
+
+class Program {
+    [NoAlloc]
+    static long RunStreamingAndVolatileBlocks(nint buf) {
+        // Guaranteed volatile zeroing (cannot be eliminated by DSE)
+        Volatile.InitBlock(buf, 0x5A, 64L);
+        byte b0 = Volatile.ReadAt<byte>(buf);
+        byte b63 = Volatile.ReadAt<byte>(buf + (nint)63);
+
+        // Non-temporal streaming stores & loads (!nontemporal)
+        NativeMemory.StreamStore<long>(buf + (nint)64, 0x1122334455667788L);
+        NativeMemory.StreamStore<int>(buf + (nint)72, 987654);
+        Atomic.Fence(MemoryOrder.Release);
+
+        long s0 = NativeMemory.StreamLoad<long>(buf + (nint)64);
+        int s1 = NativeMemory.StreamLoad<int>(buf + (nint)72);
+
+        // Volatile bulk block copy (llvm.memmove(..., volatile = true))
+        Volatile.CopyBlock(buf + (nint)128, buf + (nint)64, 16L);
+        long c0 = Volatile.ReadAt<long>(buf + (nint)128);
+        int c1 = Volatile.ReadAt<int>(buf + (nint)136);
+
+        // Wipe secret buffer via Volatile.InitBlock
+        Volatile.InitBlock(buf + (nint)128, 0, 16L);
+        long wiped = Volatile.ReadAt<long>(buf + (nint)128);
+
+        int ok = (b0 == 0x5A && b63 == 0x5A &&
+                  s0 == 0x1122334455667788L && s1 == 987654 &&
+                  c0 == 0x1122334455667788L && c1 == 987654 &&
+                  wiped == 0L) ? 1 : 0;
+        return (long)ok * 1000000L + (long)s1;
+    }
+
+    static int Main() {
+        nint buf = NativeMemory.AlignedAlloc(256L, 64L);
+        long r = RunStreamingAndVolatileBlocks(buf);
+        NativeMemory.AlignedFree(buf);
+        Console.WriteLine($"r={r}");
+        return 0;
+    }
+}

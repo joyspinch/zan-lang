@@ -721,6 +721,73 @@ int is_span_type(zan_type_t *t) {
     if (t->name.len == 12 && memcmp(t->name.str, "ReadOnlySpan", 12) == 0) return 1;
     return 0;
 }
+int is_inline_array_type(zan_type_t *t) {
+    return t && t->kind == TYPE_STRUCT && t->name.len == 11 &&
+           memcmp(t->name.str, "InlineArray", 11) == 0 &&
+           t->type_args && t->type_arg_count >= 2;
+}
+int64_t inline_array_len(zan_type_t *t) {
+    if (!is_inline_array_type(t)) return 0;
+    zan_type_t *nt = t->type_args[0];
+    if (nt && nt->kind == TYPE_CONST_INT && nt->const_int_val > 0)
+        return nt->const_int_val;
+    return 0;
+}
+zan_type_t *inline_array_elem(zan_type_t *t) {
+    if (!is_inline_array_type(t)) return NULL;
+    return t->type_args[1];
+}
+int is_vec_type(zan_type_t *t) {
+    return t && t->kind == TYPE_STRUCT && t->name.len == 3 &&
+           memcmp(t->name.str, "Vec", 3) == 0 &&
+           t->type_args && t->type_arg_count >= 2;
+}
+int64_t vec_len(zan_type_t *t) {
+    if (!is_vec_type(t)) return 0;
+    zan_type_t *nt = t->type_args[0];
+    if (nt && nt->kind == TYPE_CONST_INT && nt->const_int_val > 0)
+        return nt->const_int_val;
+    return 0;
+}
+zan_type_t *vec_elem(zan_type_t *t) {
+    if (!is_vec_type(t)) return NULL;
+    return t->type_args[1];
+}
+bool resolve_const_param_val(zan_irgen_t *g, zan_istr_t name, int64_t *out) {
+    if (!g || !name.str || name.len <= 0) return false;
+    if (g->cur_mtps && g->cur_mbind) {
+        for (int i = 0; i < g->cur_mtps->count; i++) {
+            zan_ast_node_t *tp = g->cur_mtps->items[i];
+            if (tp && tp->kind == AST_IDENTIFIER && tp->ident.is_const_param &&
+                tp->ident.name.len == name.len &&
+                memcmp(tp->ident.name.str, name.str, (size_t)name.len) == 0) {
+                zan_type_t *bt = g->cur_mbind[i];
+                if (bt && bt->kind == TYPE_CONST_INT) {
+                    if (out) *out = bt->const_int_val;
+                    return true;
+                }
+            }
+        }
+    }
+    if (g->cur_inst && g->cur_inst->sym && g->cur_inst->sym->decl &&
+        (g->cur_inst->sym->decl->kind == AST_CLASS_DECL ||
+         g->cur_inst->sym->decl->kind == AST_STRUCT_DECL)) {
+        zan_ast_list_t *tps = &g->cur_inst->sym->decl->type_decl.type_params;
+        for (int i = 0; i < tps->count && i < g->cur_inst->type_arg_count; i++) {
+            zan_ast_node_t *tp = tps->items[i];
+            if (tp && tp->kind == AST_IDENTIFIER && tp->ident.is_const_param &&
+                tp->ident.name.len == name.len &&
+                memcmp(tp->ident.name.str, name.str, (size_t)name.len) == 0) {
+                zan_type_t *bt = g->cur_inst->type_args[i];
+                if (bt && bt->kind == TYPE_CONST_INT) {
+                    if (out) *out = bt->const_int_val;
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
 zan_type_t *dict_key_type(zan_irgen_t *g, zan_type_t *t) {
     if (!t || !t->type_args || t->type_arg_count < 1) return g ? g->binder->type_string : NULL;
     return t->type_args[0];

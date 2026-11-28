@@ -163,8 +163,12 @@ public class VectorIndex {
 
     private void RegisterNodeMeta(int slot, int id, int active, double invNorm, double qScale, double qOffset, long qCodeSum) {
         if (slot >= this.nodeIds.Length) {
-            int cap = this.nodeIds.Length * 2;
-            while (cap <= slot) { cap = cap * 2; }
+            long capL = (long)this.nodeIds.Length * 2L;
+            while (capL <= (long)slot) { capL = capL * 2L; }
+            if (capL > 2147483647L || capL * (long)this.l0Cap > 2147483647L) {
+                throw new InvalidOperationException("VectorIndex node metadata capacity overflow");
+            }
+            int cap = (int)capL;
             int[] nIds = new int[cap];
             byte[] nAct = new byte[cap];
             double[] nInv = new double[cap];
@@ -592,6 +596,7 @@ public class VectorIndex {
     bool activeOnly, VectorFilter filter, VectorHeap candidates, VectorHeap nearest) {
         candidates.count = 0;
         nearest.count = 0;
+        if (start < 0 || start >= this.nodes.Count || ef <= 0) { return; }
         int epoch = work.epoch + 1;
         work.epoch = epoch;
         work.visited[start] = epoch;
@@ -887,7 +892,10 @@ public class VectorIndex {
         if (efSearch < limit) { efSearch = limit; }
         if (efSearch > this.nodes.Count) { efSearch = this.nodes.Count; }
         VectorWorkspace work = this.QueryWorkspace(query);
-        if (limit == 0) { this.lastDistanceCount.Store(0); return new List<VectorHit>(); }
+        if (limit == 0 || this.entry < 0 || this.entry >= this.nodes.Count) {
+            this.lastDistanceCount.Store(0);
+            return new List<VectorHit>();
+        }
         int current = this.entry;
         for (int layer = this.maxLevel; layer > 0; layer = layer - 1) {
             current = this.Greedy(work, current, layer);
@@ -938,6 +946,7 @@ public class VectorIndex {
             dot = dot + (double)work.query[work.offset + i] * (double)vector[i];
             nv = nv + (double)vector[i] * (double)vector[i];
         }
+        if (nv <= 0.0) { return 1.0; }
         double distance = 1.0 - dot * work.inverseNorm / Math.Sqrt(nv);
         if (distance < 0) { return 0; }
         if (distance > 2) { return 2; }
@@ -1268,10 +1277,16 @@ public class VectorIndex {
         ByteBuffer b = ByteBuffer.FromStr(payload);
         try {
             while (b.Remaining() > 0) {
+                if (!b.CanRead(2)) {
+                    throw new ArgumentException("Truncated checkpoint record header");
+                }
                 int active = b.ReadU8();
                 int level = b.ReadU8();
                 if (active > 1 || level < 0 || level > 32) {
                     throw new ArgumentException("Invalid checkpoint record header");
+                }
+                if (!b.CanRead(1)) {
+                    throw new ArgumentException("Truncated checkpoint record id");
                 }
                 long id = b.ReadVarInt();
                 if (id < 0 || id > 2147483646) {
@@ -1326,6 +1341,9 @@ public class VectorIndex {
                 }
                 this.pendingEdgeBase.Add(this.pendingEdges.Count);
                 for (int layer = 0; layer <= level; layer = layer + 1) {
+                    if (!b.CanRead(1)) {
+                        throw new ArgumentException("Truncated checkpoint edge count");
+                    }
                     long count = b.ReadVarInt();
                     // 层容量上界 = m×2 ≤ 256（options.Validate 保证），
                     // 越界即格式损坏，直接拒绝。
@@ -1334,7 +1352,14 @@ public class VectorIndex {
                     }
                     this.pendingEdges.Add((int)count);
                     for (int i = 0; i < (int)count; i = i + 1) {
-                        this.pendingEdges.Add((int)b.ReadVarInt());
+                        if (!b.CanRead(1)) {
+                            throw new ArgumentException("Truncated checkpoint edge target");
+                        }
+                        long target = b.ReadVarInt();
+                        if (target < 0L || target > 2147483646L) {
+                            throw new ArgumentException("Invalid checkpoint edge target");
+                        }
+                        this.pendingEdges.Add((int)target);
                     }
                 }
             }
@@ -1353,6 +1378,9 @@ public class VectorIndex {
         if ((long)this.nodes.Count != expectedCount) {
             throw new ArgumentException("Vector checkpoint slot count mismatch");
         }
+        if (this.pendingEdgeBase.Count != this.nodes.Count) {
+            throw new ArgumentException("Vector checkpoint edge table mismatch");
+        }
         int highest = -1;
         for (int slot = 0; slot < this.nodes.Count; slot = slot + 1) {
             if (this.nodes[slot].level > highest) { highest = this.nodes[slot].level; }
@@ -1361,10 +1389,13 @@ public class VectorIndex {
             VectorNode node = this.nodes[slot];
             int cursor = this.pendingEdgeBase[slot];
             for (int layer = 0; layer <= node.level; layer = layer + 1) {
+                if (cursor < 0 || cursor >= this.pendingEdges.Count) {
+                    throw new ArgumentException("Truncated checkpoint edge table");
+                }
                 int count = this.pendingEdges[cursor];
                 cursor = cursor + 1;
                 VectorNeighbors neighbors = node.layers[layer];
-                if (count > neighbors.slots.Length) {
+                if (count < 0 || count > neighbors.slots.Length || cursor + count > this.pendingEdges.Count) {
                     throw new ArgumentException("Checkpoint neighbor bound exceeded");
                 }
                 for (int i = 0; i < count; i = i + 1) {

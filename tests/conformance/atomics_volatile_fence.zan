@@ -1,0 +1,108 @@
+using System;
+
+struct SpinCounter {
+    public int LockFlag;
+    public long Total;
+    public int MaxVal;
+
+    [Inline(Always)]
+    public void Lock() {
+        while (Atomic.Exchange(ref LockFlag, 1, MemoryOrder.Acquire) != 0) {
+            while (Atomic.Load(ref LockFlag, MemoryOrder.Relaxed) != 0) {
+                Atomic.Pause();
+            }
+        }
+    }
+
+    [Inline(Always)]
+    public void Unlock() {
+        Atomic.Store(ref LockFlag, 0, MemoryOrder.Release);
+    }
+}
+
+class Program {
+    static int SharedCounter = 0;
+    static long SharedSum = 0;
+    static int SharedMax = 0;
+    static SpinCounter Spin;
+
+    static void Main() {
+        // 1. Volatile Read/Write across primitive types
+        int vi = 10;
+        double vd = 1.5;
+        bool vb = false;
+        Volatile.Write(ref vi, 42);
+        Volatile.Write(ref vd, 3.25);
+        Volatile.Write(ref vb, true);
+        Console.WriteLine($"vol={Volatile.Read(ref vi)},{Volatile.Read(ref vd)},{Volatile.Read(ref vb)}");
+
+        // 2. Atomic Load/Store/Exchange/CompareExchange on local, array, Span, inline array
+        int a = 5;
+        Atomic.Store(ref a, 12, MemoryOrder.Release);
+        int aLoad = Atomic.Load(ref a, MemoryOrder.Acquire);
+        int oldEx = Atomic.Exchange(ref a, 20, MemoryOrder.AcqRel);
+        int cxOld1 = Atomic.CompareExchange(ref a, 20, 35, MemoryOrder.AcqRel, MemoryOrder.Acquire);
+        bool cxOk1 = Atomic.CompareExchangeBool(ref a, 35, 50, MemoryOrder.SeqCst, MemoryOrder.Acquire);
+        bool cxOk2 = Atomic.CompareExchangeBool(ref a, 99, 60, MemoryOrder.Relaxed, MemoryOrder.Relaxed);
+        Console.WriteLine($"cas={aLoad},{oldEx},{cxOld1},{cxOk1},{cxOk2},{Atomic.Load(ref a, MemoryOrder.Relaxed)}");
+
+        // 3. RMW arithmetic, bitwise, signed/unsigned min/max
+        int s = 100;
+        int prevAdd = Atomic.FetchAdd(ref s, 25, MemoryOrder.Relaxed);
+        int prevSub = Atomic.FetchSub(ref s, 5, MemoryOrder.Relaxed);
+        int prevOr = Atomic.FetchOr(ref s, 0x0F, MemoryOrder.Relaxed);
+        int prevAnd = Atomic.FetchAnd(ref s, 0xFF, MemoryOrder.Relaxed);
+        int prevXor = Atomic.FetchXor(ref s, 0x05, MemoryOrder.Relaxed);
+        int prevMin = Atomic.FetchMin(ref s, -10, MemoryOrder.Relaxed);
+        int prevMax = Atomic.FetchMax(ref s, 77, MemoryOrder.Relaxed);
+        Console.WriteLine($"rmw={prevAdd},{prevSub},{prevOr},{prevAnd},{prevXor},{prevMin},{prevMax},{s}");
+
+        uint u = 10u;
+        Atomic.FetchMax(ref u, 0x80000000u, MemoryOrder.Relaxed);
+        uint uAfterMax = Atomic.Load(ref u, MemoryOrder.Relaxed);
+        Atomic.FetchMin(ref u, 5u, MemoryOrder.Relaxed);
+        Console.WriteLine($"urmw={uAfterMax == 0x80000000u},{Atomic.Load(ref u, MemoryOrder.Relaxed)}");
+
+        // 4. Span<long> + stackalloc + [4]int inline array atomics
+        Span<long> sp = stackalloc long[4];
+        Atomic.Store(ref sp[2], 1000L, MemoryOrder.Release);
+        Atomic.FetchAdd(ref sp[2], 234L, MemoryOrder.AcqRel);
+        [4]int fixedBuf = new InlineArray<4, int>();
+        fixedBuf[1] = 7;
+        Atomic.FetchAdd(ref fixedBuf[1], 3, MemoryOrder.Relaxed);
+        Console.WriteLine($"buf={Atomic.Load(ref sp[2], MemoryOrder.Acquire)},{Atomic.Load(ref fixedBuf[1], MemoryOrder.Relaxed)}");
+
+        // 5. Fences & Pause
+        Atomic.Fence(MemoryOrder.Acquire);
+        Atomic.Fence(MemoryOrder.Release);
+        Atomic.Fence(MemoryOrder.AcqRel);
+        Atomic.Fence();
+        Atomic.CompilerFence();
+        Atomic.Pause();
+
+        // 6. Real multi-threaded stress test: lock-free CAS + zero-heap SpinLock
+        SharedCounter = 0;
+        SharedSum = 0;
+        SharedMax = 0;
+        Spin.LockFlag = 0;
+        Spin.Total = 0;
+        Spin.MaxVal = 0;
+
+        int N = 20000;
+        Parallel.For(0, N, (int i) => {
+            Atomic.FetchAdd(ref SharedCounter, 1, MemoryOrder.Relaxed);
+            Atomic.FetchAdd(ref SharedSum, (long)i, MemoryOrder.Relaxed);
+            Atomic.FetchMax(ref SharedMax, i, MemoryOrder.Relaxed);
+
+            // SpinLock-guarded update
+            Spin.Lock();
+            Spin.Total = Spin.Total + (long)i;
+            if (i > Spin.MaxVal) Spin.MaxVal = i;
+            Spin.Unlock();
+        });
+
+        long expectedSum = (long)N * (long)(N - 1) / 2L;
+        Console.WriteLine($"par={SharedCounter == N},{SharedSum == expectedSum},{SharedMax == N - 1}");
+        Console.WriteLine($"spin={Spin.Total == expectedSum},{Spin.MaxVal == N - 1},{Atomic.Load(ref Spin.LockFlag, MemoryOrder.Acquire)}");
+    }
+}

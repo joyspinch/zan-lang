@@ -566,6 +566,7 @@ static void pi_seed_chain(const zan_ast_node_t *n, int in_chain) {
   case AST_CAST_EXPR:
   case AST_TYPEOF_EXPR:
   case AST_SIZEOF_EXPR:
+  case AST_STACKALLOC_EXPR:
     pi_seed_ast(n->cast.type);
     pi_seed_ast(n->cast.expr);
     return;

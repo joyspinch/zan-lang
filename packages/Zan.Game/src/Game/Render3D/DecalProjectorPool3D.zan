@@ -1,0 +1,120 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Render3D;
+
+// 3D 表面贴花实例（弹孔、焦痕、脚印、血迹等生命周期与尾段淡出控制）。
+public class DecalInstance3D {
+    public int DecalId;
+    public Vector3 Position;
+    public Vector3 Normal;
+    public float Size;
+    public float LifetimeSec;
+    public float AgeSec;
+    public float FadeOutSec;
+    public string Category;
+
+    public DecalInstance3D(int decalId, Vector3 position, Vector3 normal,
+                           float size, float lifetimeSec, float fadeOutSec, string category) {
+        this.DecalId = decalId;
+        this.Position = position;
+        this.Normal = normal;
+        this.Size = size > 0.01f ? size : 0.25f;
+        this.LifetimeSec = lifetimeSec > 0.05f ? lifetimeSec : 10.0f;
+        this.AgeSec = 0.0f;
+        this.FadeOutSec = fadeOutSec >= 0.0f ? fadeOutSec : 1.0f;
+        this.Category = category;
+    }
+
+    // 返回当前不透明度 [0..1]：生命末段 FadeOutSec 内平滑线性淡出。
+    public float CurrentAlpha() {
+        float rem = this.LifetimeSec - this.AgeSec;
+        if (rem <= 0.0f) { return 0.0f; }
+        if (this.FadeOutSec <= 0.0001f || rem >= this.FadeOutSec) { return 1.0f; }
+        return rem / this.FadeOutSec;
+    }
+}
+
+// 商业定长 3D 贴花投射池：满容自动淘汰最旧实例（LRU）、逐帧超时清理、按类别清理与球体范围查询。
+public class DecalProjectorPool3D {
+    private List<DecalInstance3D> active;
+    private int capacity;
+    private int nextId;
+    public int EvictedCount;
+
+    public DecalProjectorPool3D(int capacity) {
+        this.active = new List<DecalInstance3D>();
+        this.capacity = capacity > 0 ? capacity : 64;
+        this.nextId = 1;
+        this.EvictedCount = 0;
+    }
+
+    public int ActiveCount() { return this.active.Count; }
+
+    public DecalInstance3D Spawn(Vector3 position, Vector3 normal,
+                                 float size, float lifetimeSec, float fadeOutSec, string category) {
+        while (this.active.Count >= this.capacity) {
+            this.active.RemoveAt(0);
+            this.EvictedCount = this.EvictedCount + 1;
+        }
+        int id = this.nextId;
+        this.nextId = this.nextId + 1;
+        DecalInstance3D inst = new DecalInstance3D(id, position, normal, size, lifetimeSec, fadeOutSec, category);
+        this.active.Add(inst);
+        return inst;
+    }
+
+    public DecalInstance3D FindById(int decalId) {
+        for (int i = 0; i < this.active.Count; i = i + 1) {
+            if (this.active[i].DecalId == decalId) { return this.active[i]; }
+        }
+        return null;
+    }
+
+    public int Step(float dtSec) {
+        if (dtSec <= 0.0f) { return 0; }
+        int expired = 0;
+        int i = 0;
+        while (i < this.active.Count) {
+            DecalInstance3D d = this.active[i];
+            d.AgeSec = d.AgeSec + dtSec;
+            if (d.AgeSec >= d.LifetimeSec) {
+                this.active.RemoveAt(i);
+                expired = expired + 1;
+            } else {
+                i = i + 1;
+            }
+        }
+        return expired;
+    }
+
+    public int ClearCategory(string category) {
+        int removed = 0;
+        int i = 0;
+        while (i < this.active.Count) {
+            if (this.active[i].Category == category) {
+                this.active.RemoveAt(i);
+                removed = removed + 1;
+            } else {
+                i = i + 1;
+            }
+        }
+        return removed;
+    }
+
+    public List<DecalInstance3D> QueryWithinRadius(Vector3 center, float radius) {
+        List<DecalInstance3D> result = new List<DecalInstance3D>();
+        if (radius < 0.0f) { return result; }
+        float rSq = radius * radius;
+        for (int i = 0; i < this.active.Count; i = i + 1) {
+            DecalInstance3D d = this.active[i];
+            float dx = d.Position.X - center.X;
+            float dy = d.Position.Y - center.Y;
+            float dz = d.Position.Z - center.Z;
+            if (dx * dx + dy * dy + dz * dz <= rSq) {
+                result.Add(d);
+            }
+        }
+        return result;
+    }
+}

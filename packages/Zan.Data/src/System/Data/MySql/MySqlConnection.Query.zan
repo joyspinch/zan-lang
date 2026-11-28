@@ -19,14 +19,24 @@ public partial class MySqlConnection : IDbConnection {
         this.hadError = false;
         this.lastAffected = 0;
         this.lastError = "";
+        if (sql == null) {
+            this.hadError = true;
+            this.lastError = "sql is null";
+            this.fail();
+        }
         if (!this.connected) {
             this.hadError = true;
             this.lastError = "not connected";
             this.fail();
         }
-        await this.comQuery(sql);
+        if (await this.comQuery(sql) <= 0) {
+            this.hadError = true;
+            this.lastError = "failed to send query";
+            this.connected = false;
+            this.fail();
+        }
         byte[] first = await this.readPacket();
-        if (first == null) {
+        if (first == null || this.lastLen < 1) {
             this.hadError = true;
             this.lastError = "connection closed";
             this.connected = false;
@@ -34,9 +44,9 @@ public partial class MySqlConnection : IDbConnection {
         }
         int b0 = first[0] & 255;
         if (b0 == 255) {
-            int code = (first[1]&255)|((first[2]&255)<<8);
+            int code = this.lastLen >= 3 ? ((first[1]&255)|((first[2]&255)<<8)) : 0;
             this.lastError = "err " + Convert.ToString(code) + ": "
-                + MySqlWire.bytesToStr(first, 9, this.lastLen - 9);
+                + (this.lastLen > 9 ? MySqlWire.bytesToStr(first, 9, this.lastLen - 9) : "");
             this.hadError = true;
             this.lastNumber = code;
             this.fail();
@@ -49,7 +59,14 @@ public partial class MySqlConnection : IDbConnection {
         }
         // 结果集：首个数据包为列数（lenenc）。
         int pcc = 0;
-        int ncols = (int)MySqlWire.readLenencRaw(first, ref pcc);
+        long ncolsL = MySqlWire.readLenencRaw(first, ref pcc);
+        if (ncolsL < 0 || ncolsL > 65535) {
+            this.lastError = "invalid column count";
+            this.hadError = true;
+            this.connected = false;
+            this.fail();
+        }
+        int ncols = (int)ncolsL;
         result.SetColumnCount(ncols);
         List<int> colTypes = new List<int>();
         List<int> colFlags = new List<int>();
@@ -217,7 +234,7 @@ public partial class MySqlConnection : IDbConnection {
 
     internal static long ReadBinLongBounded(string buf, int blen, ref int p, int type, int flags) {
         bool uns = (flags & 32) != 0;
-        if (buf == null || blen < 0) { return 0L; }
+        if (buf == null || blen < 0 || p < 0 || p > blen) { return 0L; }
         if (type == 1) {
             if (p + 1 > blen) { p = blen; return 0L; }
             int v = buf[p] & 255; p = p + 1;
@@ -261,7 +278,7 @@ public partial class MySqlConnection : IDbConnection {
 
     internal static string ReadBinValueBounded(string buf, int blen, ref int p, int type, int flags) {
         bool uns = (flags & 32) != 0;
-        if (buf == null || blen < 0) { return ""; }
+        if (buf == null || blen < 0 || p < 0 || p > blen) { return ""; }
         if (type == 1) {
             if (p + 1 > blen) { p = blen; return "0"; }
             int v = buf[p] & 255; p = p + 1;
@@ -341,20 +358,22 @@ public partial class MySqlConnection : IDbConnection {
     // out[2]=numParams 并返回 true。跳过 prepare 响应中
     // 的参数/列定义包。
     internal async bool stmtPrepare(string sql, List<int> outIds) {
+        if (sql == null) { this.lastError = "sql is null"; return false; }
         int len = sql.Length + 1;
         byte[] pay = new byte[len + 1];
         pay[0] = (byte)(22);  // COM_STMT_PREPARE
         for (int i = 0; i < sql.Length; i = i + 1) { pay[i+1] = (byte)(sql[i] & 255); }
-        await this.writePacket(pay, len, 0);
+        if (await this.writePacket(pay, len, 0) <= 0) { this.lastError = "failed to send prepare"; this.connected = false; return false; }
         byte[] r = await this.readPacket();
-        if (r == null) { this.lastError = "connection closed"; this.connected = false; return false; }
+        if (r == null || this.lastLen < 1) { this.lastError = "connection closed"; this.connected = false; return false; }
         int b0 = r[0] & 255;
         if (b0 == 255) {
-            int code = (r[1]&255)|((r[2]&255)<<8);
+            int code = this.lastLen >= 3 ? ((r[1]&255)|((r[2]&255)<<8)) : 0;
             this.lastError = "prepare err " + Convert.ToString(code) + ": "
-                + MySqlWire.bytesToStr(r, 9, this.lastLen - 9);
+                + (this.lastLen > 9 ? MySqlWire.bytesToStr(r, 9, this.lastLen - 9) : "");
             return false;
         }
+        if (this.lastLen < 9) { this.lastError = "truncated prepare response"; this.connected = false; return false; }
         int stmtId = (r[1]&255) | ((r[2]&255)<<8) | ((r[3]&255)<<16) | ((r[4]&255)<<24);
         int numCols = (r[5]&255) | ((r[6]&255)<<8);
         int numParams = (r[7]&255) | ((r[8]&255)<<8);
@@ -373,7 +392,7 @@ public partial class MySqlConnection : IDbConnection {
     // 整数用 LONGLONG，文本/浮点用 VAR_STRING（长度编码，
     // 服务器将文本转换到列类型），NULL 通过 null bitmap 标记。
     internal async int stmtExecute(int stmtId, DbParams prms) {
-        int n = prms.Count();
+        int n = prms != null ? prms.Count() : 0;
         int bitmapLen = (n + 7) / 8;
         long totalL = 10L;
         if (n > 0) {
@@ -492,6 +511,11 @@ public partial class MySqlConnection : IDbConnection {
         this.hadError = false;
         this.lastAffected = 0;
         this.lastError = "";
+        if (sql == null) {
+            this.hadError = true;
+            this.lastError = "sql is null";
+            this.fail();
+        }
         if (!this.connected) {
             this.hadError = true;
             this.lastError = "not connected";
@@ -508,9 +532,14 @@ public partial class MySqlConnection : IDbConnection {
             stmtId = ids[0];
             await this.stmtCacheAdd(sql, stmtId);
         }
-        await this.stmtExecute(stmtId, prms);
+        if (await this.stmtExecute(stmtId, prms) <= 0) {
+            this.hadError = true;
+            if (this.lastError.Length == 0) { this.lastError = "failed to send prepared execute"; }
+            this.connected = false;
+            this.fail();
+        }
         byte[] first = await this.readPacket();
-        if (first == null) {
+        if (first == null || this.lastLen < 1) {
             this.hadError = true;
             this.lastError = "connection closed";
             this.connected = false;
@@ -518,9 +547,9 @@ public partial class MySqlConnection : IDbConnection {
         }
         int b0 = first[0] & 255;
         if (b0 == 255) {
-            int code = (first[1]&255)|((first[2]&255)<<8);
+            int code = this.lastLen >= 3 ? ((first[1]&255)|((first[2]&255)<<8)) : 0;
             this.lastError = "err " + Convert.ToString(code) + ": "
-                + MySqlWire.bytesToStr(first, 9, this.lastLen - 9);
+                + (this.lastLen > 9 ? MySqlWire.bytesToStr(first, 9, this.lastLen - 9) : "");
             this.hadError = true;
             this.lastNumber = code;
             this.stmtCacheRemove(stmtId);
@@ -533,7 +562,14 @@ public partial class MySqlConnection : IDbConnection {
             return result;
         }
         int pcc = 0;
-        int ncols = (int)MySqlWire.readLenencRaw(first, ref pcc);
+        long ncolsL = MySqlWire.readLenencRaw(first, ref pcc);
+        if (ncolsL < 0 || ncolsL > 65535) {
+            this.lastError = "invalid column count";
+            this.hadError = true;
+            this.connected = false;
+            this.fail();
+        }
+        int ncols = (int)ncolsL;
         result.SetColumnCount(ncols);
         List<int> colTypes = new List<int>();
         List<int> colFlags = new List<int>();
@@ -760,16 +796,16 @@ public partial class MySqlConnection : IDbConnection {
     // 若当前有活跃持锁者，其底层 I/O 会因关套接字立即返回并通过 finally { ReleaseLock(); } 串行唤醒等待者。
     public void Close() {
         this.connected = false;
-        if (this.tls != null) {
-            this.tls.Close();
-            this.tls = null;
-        }
-        if (this.sock >= 0) {
-            Socket.Close(this.sock);
-            this.sock = -1;
-        }
-        // 服务端语句随连接一起销毁。
+        TlsStream t = this.tls;
+        this.tls = null;
+        nint s = this.sock;
+        this.sock = -1;
         this.stmtCache = new List<PreparedStmt>();
+        try {
+            if (t != null) { t.Close(); }
+        } finally {
+            if (s >= 0) { Socket.Close(s); }
+        }
     }
 
     // 释放连接持有的资源（实现 IDisposable，等同于 Close）。

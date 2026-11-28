@@ -1,0 +1,585 @@
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+
+namespace Game.Animation;
+
+// 骨骼权重遮罩：按骨骼下标存放 [0..1] 混合权重，支持按骨骼子树一键设置上下半身分离遮罩。
+public class BoneMask {
+    internal float[] Weights;
+
+    public BoneMask(int boneCount, float defaultWeight) {
+        int n = boneCount > 0 ? boneCount : 0;
+        this.Weights = new float[n];
+        float w = AnimMath.Clamp01(defaultWeight);
+        for (int i = 0; i < n; i = i + 1) {
+            this.Weights[i] = w;
+        }
+    }
+
+    public int Count() { return this.Weights.Length; }
+
+    public float WeightAt(int boneIndex) {
+        if (boneIndex < 0 || boneIndex >= this.Weights.Length) { return 0.0f; }
+        return this.Weights[boneIndex];
+    }
+
+    public void SetWeight(int boneIndex, float weight) {
+        if (boneIndex < 0 || boneIndex >= this.Weights.Length) { return; }
+        this.Weights[boneIndex] = AnimMath.Clamp01(weight);
+    }
+
+    // 递归将 rootBoneIndex 及其全部后代骨骼设置为指定权重（因 Skeleton 保证父在子前，单趟线性扫描即可完成）。
+    public void SetSubtreeWeight(Skeleton skeleton, int rootBoneIndex, float weight) {
+        if (skeleton == null || rootBoneIndex < 0 || rootBoneIndex >= skeleton.Count()) { return; }
+        int count = skeleton.Count();
+        if (this.Weights.Length < count) {
+            float[] grown = new float[count];
+            for (int i = 0; i < this.Weights.Length; i = i + 1) { grown[i] = this.Weights[i]; }
+            this.Weights = grown;
+        }
+        bool[] inSubtree = new bool[count];
+        inSubtree[rootBoneIndex] = true;
+        float w = AnimMath.Clamp01(weight);
+        this.Weights[rootBoneIndex] = w;
+        for (int i = rootBoneIndex + 1; i < count; i = i + 1) {
+            Bone b = skeleton.At(i);
+            if (b != null && b.ParentIndex >= 0 && inSubtree[b.ParentIndex]) {
+                inSubtree[i] = true;
+                this.Weights[i] = w;
+            }
+        }
+    }
+
+    // 便捷：以某根骨骼名（例如 "spine_01"）为根生成子树遮罩，其余骨骼权重为 0。
+    public static BoneMask FromSubtree(Skeleton skeleton, string rootBoneName, float subtreeWeight) {
+        if (skeleton == null) { return new BoneMask(0, 0.0f); }
+        BoneMask mask = new BoneMask(skeleton.Count(), 0.0f);
+        int idx = skeleton.IndexOf(rootBoneName);
+        if (idx >= 0) {
+            mask.SetSubtreeWeight(skeleton, idx, subtreeWeight);
+        }
+        return mask;
+    }
+}
+
+// 预烘焙扁平骨骼动作轨道（连续数组 + 预归一化四元数 + 预计算时间跨度倒数 + O(log K) 二分检索，采样期零除法零超越函数）。
+internal class BakedBoneTrack {
+    public float[] PosTimes;
+    public float[] PosInvSpans;
+    public Vector3[] PosValues;
+
+    public float[] RotTimes;
+    public float[] RotInvSpans;
+    public Quaternion[] RotValues;
+
+    public float[] SclTimes;
+    public float[] SclInvSpans;
+    public Vector3[] SclValues;
+
+    public static BakedBoneTrack FromTrack(AnimationTrack src) {
+        if (src == null) { return null; }
+        BakedBoneTrack b = new BakedBoneTrack();
+
+        int pn = src.positionTimes.Count;
+        if (pn > 0) {
+            b.PosTimes = new float[pn];
+            b.PosValues = new Vector3[pn];
+            b.PosInvSpans = pn > 1 ? new float[pn - 1] : null;
+            for (int i = 0; i < pn; i = i + 1) {
+                b.PosTimes[i] = src.positionTimes[i];
+                b.PosValues[i] = src.positionValues[i];
+            }
+            for (int i = 0; i + 1 < pn; i = i + 1) {
+                float sp = b.PosTimes[i + 1] - b.PosTimes[i];
+                b.PosInvSpans[i] = sp > 1e-8f ? (1.0f / sp) : 0.0f;
+            }
+        }
+
+        int rn = src.rotationTimes.Count;
+        if (rn > 0) {
+            b.RotTimes = new float[rn];
+            b.RotValues = new Quaternion[rn];
+            b.RotInvSpans = rn > 1 ? new float[rn - 1] : null;
+            for (int i = 0; i < rn; i = i + 1) {
+                b.RotTimes[i] = src.rotationTimes[i];
+                b.RotValues[i] = LayeredAnimator3D.FastNormalize(src.rotationValues[i]);
+            }
+            for (int i = 0; i + 1 < rn; i = i + 1) {
+                float sp = b.RotTimes[i + 1] - b.RotTimes[i];
+                b.RotInvSpans[i] = sp > 1e-8f ? (1.0f / sp) : 0.0f;
+            }
+        }
+
+        int sn = src.scaleTimes.Count;
+        if (sn > 0) {
+            b.SclTimes = new float[sn];
+            b.SclValues = new Vector3[sn];
+            b.SclInvSpans = sn > 1 ? new float[sn - 1] : null;
+            for (int i = 0; i < sn; i = i + 1) {
+                b.SclTimes[i] = src.scaleTimes[i];
+                b.SclValues[i] = src.scaleValues[i];
+            }
+            for (int i = 0; i + 1 < sn; i = i + 1) {
+                float sp = b.SclTimes[i + 1] - b.SclTimes[i];
+                b.SclInvSpans[i] = sp > 1e-8f ? (1.0f / sp) : 0.0f;
+            }
+        }
+
+        return b;
+    }
+
+    public Transform3D SampleFast(float time, Transform3D fallback) {
+        Vector3 pos = this.PosTimes != null
+            ? BakedBoneTrack.SampleVecFast(this.PosTimes, this.PosInvSpans, this.PosValues, time)
+            : fallback.Position;
+        Quaternion rot = this.RotTimes != null
+            ? BakedBoneTrack.SampleRotFast(this.RotTimes, this.RotInvSpans, this.RotValues, time)
+            : fallback.Rotation;
+        Vector3 scl = this.SclTimes != null
+            ? BakedBoneTrack.SampleVecFast(this.SclTimes, this.SclInvSpans, this.SclValues, time)
+            : fallback.Scale;
+        return new Transform3D(pos, rot, scl);
+    }
+
+    private static int FindSegment(float[] times, int last, float time) {
+        if (last == 1) { return 0; }
+        int lo = 0;
+        int hi = last;
+        while (lo + 1 < hi) {
+            int mid = (lo + hi) >> 1;
+            if (times[mid] <= time) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        return lo;
+    }
+
+    private static Vector3 SampleVecFast(float[] times, float[] invSpans, Vector3[] vals, float time) {
+        int last = times.Length - 1;
+        if (last == 0 || time <= times[0]) { return vals[0]; }
+        if (time >= times[last]) { return vals[last]; }
+        int idx = BakedBoneTrack.FindSegment(times, last, time);
+        float t = (time - times[idx]) * invSpans[idx];
+        Vector3 a = vals[idx];
+        Vector3 b = vals[idx + 1];
+        return new Vector3(
+            a.X + (b.X - a.X) * t,
+            a.Y + (b.Y - a.Y) * t,
+            a.Z + (b.Z - a.Z) * t);
+    }
+
+    private static Quaternion SampleRotFast(float[] times, float[] invSpans, Quaternion[] vals, float time) {
+        int last = times.Length - 1;
+        if (last == 0 || time <= times[0]) { return vals[0]; }
+        if (time >= times[last]) { return vals[last]; }
+        int idx = BakedBoneTrack.FindSegment(times, last, time);
+        float t = (time - times[idx]) * invSpans[idx];
+        return LayeredAnimator3D.FastSlerpUnit(vals[idx], vals[idx + 1], t);
+    }
+}
+
+// 动作片段与目标骨架的骨骼下标直连预烘焙轨道缓存项。
+internal class ClipBoneBinding {
+    public AnimationClip Clip;
+    public int KnownTrackCount;
+    public int KnownBoneCount;
+    public float KnownDuration;
+    public BakedBoneTrack[] TracksByBone;
+}
+
+// 3D 枪战/动作角色高性能分层骨骼动画混合器（零每帧堆分配、零字符串哈希、零超越函数采样）：
+// - 骨骼下标直连预烘焙轨道（BakedBoneTrack 连续数组 + 二分查找 + 预计算跨度倒数）
+// - 遮罩前剪枝（权重为 0 或无增量轨道的骨骼零采样）
+// - Kapoulkine 时间扭曲多项式快速 Slerp + 融合单趟世界姿势提交
+public class LayeredAnimator3D {
+    private Skeleton skeleton;
+    private Bone[] cachedBones;
+    private Transform3D[] workPoses;
+    private PoseBuffer finalPose;
+    private bool poseBufferDirty;
+
+    private ClipBoneBinding[] bindings;
+    private int bindingCount;
+
+    public LayeredAnimator3D(Skeleton skeleton) {
+        if (skeleton == null) {
+            throw new AnimationException("skeleton must not be null");
+        }
+        this.skeleton = skeleton;
+        int n = skeleton.Count();
+        this.cachedBones = new Bone[0];
+        this.workPoses = new Transform3D[n];
+        this.finalPose = new PoseBuffer(n);
+        this.poseBufferDirty = true;
+        this.bindings = new ClipBoneBinding[8];
+        this.bindingCount = 0;
+        this.SyncCapacity();
+        this.ResetToBindPose();
+    }
+
+    public Skeleton TargetSkeleton() { return this.skeleton; }
+
+    public PoseBuffer OutputPose() {
+        if (this.poseBufferDirty) {
+            int n = this.workPoses.Length;
+            this.finalPose.EnsureSize(n);
+            for (int i = 0; i < n; i = i + 1) {
+                this.finalPose.Set(i, this.workPoses[i]);
+            }
+            this.poseBufferDirty = false;
+        }
+        return this.finalPose;
+    }
+
+    private void SyncCapacity() {
+        int n = this.skeleton.Count();
+        if (this.cachedBones.Length != n) {
+            Bone[] bones = new Bone[n];
+            Transform3D[] grownPoses = new Transform3D[n];
+            int copyCount = this.workPoses.Length < n ? this.workPoses.Length : n;
+            for (int i = 0; i < n; i = i + 1) {
+                Bone b = this.skeleton.At(i);
+                bones[i] = b;
+                grownPoses[i] = i < copyCount ? this.workPoses[i] : b.BindPose;
+            }
+            this.cachedBones = bones;
+            this.workPoses = grownPoses;
+            this.poseBufferDirty = true;
+        }
+    }
+
+    private BakedBoneTrack[] ResolveClipTracks(AnimationClip clip) {
+        int boneCount = this.cachedBones.Length;
+        int trackCount = clip.TrackCount();
+        float dur = clip.Duration;
+        ClipBoneBinding[] arr = this.bindings;
+        int count = this.bindingCount;
+
+        for (int i = 0; i < count; i = i + 1) {
+            ClipBoneBinding entry = arr[i];
+            if (entry.Clip == clip) {
+                if (entry.KnownTrackCount != trackCount || entry.KnownBoneCount != boneCount || entry.KnownDuration != dur) {
+                    BakedBoneTrack[] rebuilt = new BakedBoneTrack[boneCount];
+                    Bone[] bones = this.cachedBones;
+                    for (int b = 0; b < boneCount; b = b + 1) {
+                        rebuilt[b] = BakedBoneTrack.FromTrack(clip.Track(bones[b].Name));
+                    }
+                    entry.TracksByBone = rebuilt;
+                    entry.KnownTrackCount = trackCount;
+                    entry.KnownBoneCount = boneCount;
+                    entry.KnownDuration = dur;
+                }
+                return entry.TracksByBone;
+            }
+        }
+
+        BakedBoneTrack[] tracks = new BakedBoneTrack[boneCount];
+        Bone[] skBones = this.cachedBones;
+        for (int b = 0; b < boneCount; b = b + 1) {
+            tracks[b] = BakedBoneTrack.FromTrack(clip.Track(skBones[b].Name));
+        }
+
+        if (count >= arr.Length) {
+            ClipBoneBinding[] grown = new ClipBoneBinding[arr.Length * 2];
+            for (int i = 0; i < count; i = i + 1) {
+                grown[i] = arr[i];
+            }
+            this.bindings = grown;
+            arr = grown;
+        }
+        ClipBoneBinding created = new ClipBoneBinding();
+        created.Clip = clip;
+        created.KnownTrackCount = trackCount;
+        created.KnownBoneCount = boneCount;
+        created.KnownDuration = dur;
+        created.TracksByBone = tracks;
+        arr[count] = created;
+        this.bindingCount = count + 1;
+        return tracks;
+    }
+
+    // 用绑定姿势初始化当前合成缓冲。
+    public void ResetToBindPose() {
+        this.SyncCapacity();
+        Bone[] bones = this.cachedBones;
+        Transform3D[] poses = this.workPoses;
+        int n = bones.Length;
+        for (int i = 0; i < n; i = i + 1) {
+            poses[i] = bones[i].BindPose;
+        }
+        this.poseBufferDirty = true;
+    }
+
+    // 采样基础全身片段作为底层姿势。
+    public void SetBaseClip(AnimationClip clip, float time) {
+        this.SyncCapacity();
+        if (clip == null) {
+            this.ResetToBindPose();
+            return;
+        }
+        BakedBoneTrack[] tracks = this.ResolveClipTracks(clip);
+        Bone[] bones = this.cachedBones;
+        Transform3D[] poses = this.workPoses;
+        int n = bones.Length;
+        for (int i = 0; i < n; i = i + 1) {
+            BakedBoneTrack tr = tracks[i];
+            Transform3D bind = bones[i].BindPose;
+            poses[i] = tr != null ? tr.SampleFast(time, bind) : bind;
+        }
+        this.poseBufferDirty = true;
+    }
+
+    // 将双片段线性混合作为底层姿势。
+    public void SetBaseBlend(AnimationClip clipA, float timeA, AnimationClip clipB, float timeB, float blendT) {
+        this.SyncCapacity();
+        if (clipA == null && clipB == null) {
+            this.ResetToBindPose();
+            return;
+        }
+        float k = AnimMath.Clamp01(blendT);
+        if (clipA == null || k >= 0.9999f) {
+            this.SetBaseClip(clipB, timeB);
+            return;
+        }
+        if (clipB == null || k <= 0.0001f) {
+            this.SetBaseClip(clipA, timeA);
+            return;
+        }
+
+        BakedBoneTrack[] tracksA = this.ResolveClipTracks(clipA);
+        BakedBoneTrack[] tracksB = this.ResolveClipTracks(clipB);
+        Bone[] bones = this.cachedBones;
+        Transform3D[] poses = this.workPoses;
+        int n = bones.Length;
+
+        for (int i = 0; i < n; i = i + 1) {
+            Transform3D bind = bones[i].BindPose;
+            BakedBoneTrack ta = tracksA[i];
+            BakedBoneTrack tb = tracksB[i];
+            if (ta == null && tb == null) {
+                poses[i] = bind;
+            } else {
+                Transform3D pa = ta != null ? ta.SampleFast(timeA, bind) : bind;
+                Transform3D pb = tb != null ? tb.SampleFast(timeB, bind) : bind;
+                poses[i] = LayeredAnimator3D.FastBlendPose(pa, pb, k);
+            }
+        }
+        this.poseBufferDirty = true;
+    }
+
+    // 按骨骼遮罩叠加 Override 覆盖层（权重为 0 跳过采样；权重为 1 免除混合）。
+    public void ApplyOverrideLayer(AnimationClip overrideClip, float time, BoneMask mask, float layerWeight) {
+        if (overrideClip == null || layerWeight <= 0.0001f) { return; }
+        this.SyncCapacity();
+        float globalW = AnimMath.Clamp01(layerWeight);
+        BakedBoneTrack[] tracks = this.ResolveClipTracks(overrideClip);
+        Bone[] bones = this.cachedBones;
+        Transform3D[] poses = this.workPoses;
+        int n = bones.Length;
+        float[] maskWeights = mask != null ? mask.Weights : null;
+        int maskLen = maskWeights != null ? maskWeights.Length : 0;
+
+        for (int i = 0; i < n; i = i + 1) {
+            float mw = maskWeights != null ? (i < maskLen ? maskWeights[i] : 0.0f) : 1.0f;
+            float w = globalW * mw;
+            if (w <= 0.0001f) { continue; }
+
+            Transform3D bind = bones[i].BindPose;
+            BakedBoneTrack tr = tracks[i];
+            Transform3D ovr = tr != null ? tr.SampleFast(time, bind) : bind;
+            if (w >= 0.9999f) {
+                poses[i] = ovr;
+            } else {
+                poses[i] = LayeredAnimator3D.FastBlendPose(poses[i], ovr, w);
+            }
+        }
+        this.poseBufferDirty = true;
+    }
+
+    // 叠加 Additive 增量动画层（遮罩剪枝 + 无轨道骨骼零开销直通）。
+    public void ApplyAdditiveLayer(AnimationClip additiveClip, float time,
+                                   AnimationClip refClip, float refTime,
+                                   BoneMask mask, float layerWeight) {
+        if (additiveClip == null || layerWeight <= 0.0001f) { return; }
+        this.SyncCapacity();
+        float globalW = AnimMath.Clamp01(layerWeight);
+        BakedBoneTrack[] addTracks = this.ResolveClipTracks(additiveClip);
+        BakedBoneTrack[] refTracks = refClip != null ? this.ResolveClipTracks(refClip) : null;
+
+        Bone[] bones = this.cachedBones;
+        Transform3D[] poses = this.workPoses;
+        int n = bones.Length;
+        float[] maskWeights = mask != null ? mask.Weights : null;
+        int maskLen = maskWeights != null ? maskWeights.Length : 0;
+
+        for (int i = 0; i < n; i = i + 1) {
+            float mw = maskWeights != null ? (i < maskLen ? maskWeights[i] : 0.0f) : 1.0f;
+            float w = globalW * mw;
+            if (w <= 0.0001f) { continue; }
+
+            BakedBoneTrack addTr = addTracks[i];
+            BakedBoneTrack refTr = refTracks != null ? refTracks[i] : null;
+            if (addTr == null && refTr == null) { continue; }
+
+            Transform3D bind = bones[i].BindPose;
+            Transform3D basePose = poses[i];
+            Transform3D addPose = addTr != null ? addTr.SampleFast(time, bind) : bind;
+            Transform3D refPose = refTr != null ? refTr.SampleFast(refTime, bind) : bind;
+
+            Vector3 outPos = new Vector3(
+                basePose.Position.X + (addPose.Position.X - refPose.Position.X) * w,
+                basePose.Position.Y + (addPose.Position.Y - refPose.Position.Y) * w,
+                basePose.Position.Z + (addPose.Position.Z - refPose.Position.Z) * w);
+
+            Quaternion invRef = new Quaternion(-refPose.Rotation.X, -refPose.Rotation.Y, -refPose.Rotation.Z, refPose.Rotation.W);
+            Quaternion deltaRot = LayeredAnimator3D.FastNormalize(Quaternion.Multiply(invRef, addPose.Rotation));
+            Quaternion weightedDelta = LayeredAnimator3D.FastSlerpUnit(Quaternion.Identity, deltaRot, w);
+            Quaternion outRot = LayeredAnimator3D.FastNormalize(Quaternion.Multiply(basePose.Rotation, weightedDelta));
+
+            float rsx = Math.Abs(refPose.Scale.X) > 0.0001f ? (addPose.Scale.X / refPose.Scale.X) : 1.0f;
+            float rsy = Math.Abs(refPose.Scale.Y) > 0.0001f ? (addPose.Scale.Y / refPose.Scale.Y) : 1.0f;
+            float rsz = Math.Abs(refPose.Scale.Z) > 0.0001f ? (addPose.Scale.Z / refPose.Scale.Z) : 1.0f;
+            Vector3 outScale = new Vector3(
+                basePose.Scale.X * (1.0f + (rsx - 1.0f) * w),
+                basePose.Scale.Y * (1.0f + (rsy - 1.0f) * w),
+                basePose.Scale.Z * (1.0f + (rsz - 1.0f) * w));
+
+            poses[i] = new Transform3D(outPos, outRot, outScale);
+        }
+        this.poseBufferDirty = true;
+    }
+
+    // 程序化脊柱瞄准偏移（Aim Offset）。
+    public void ApplySpineAimOffset(int[] spineBoneIndices, float pitchRadians, float yawRadians, float weight) {
+        if (spineBoneIndices == null || spineBoneIndices.Length == 0 || weight <= 0.0001f) { return; }
+        this.SyncCapacity();
+        float w = AnimMath.Clamp01(weight);
+        float invCount = w / (float)spineBoneIndices.Length;
+        float stepPitch = pitchRadians * invCount;
+        float stepYaw = yawRadians * invCount;
+        Quaternion qPitch = Quaternion.FromAxisAngle(new Vector3(1.0f, 0.0f, 0.0f), stepPitch);
+        Quaternion qYaw = Quaternion.FromAxisAngle(new Vector3(0.0f, 1.0f, 0.0f), stepYaw);
+        Quaternion aimStep = LayeredAnimator3D.FastNormalize(Quaternion.Multiply(qYaw, qPitch));
+
+        Transform3D[] poses = this.workPoses;
+        int total = poses.Length;
+        for (int k = 0; k < spineBoneIndices.Length; k = k + 1) {
+            int bi = spineBoneIndices[k];
+            if (bi < 0 || bi >= total) { continue; }
+            Transform3D cur = poses[bi];
+            Quaternion nextRot = LayeredAnimator3D.FastNormalize(Quaternion.Multiply(cur.Rotation, aimStep));
+            poses[bi] = new Transform3D(cur.Position, nextRot, cur.Scale);
+        }
+        this.poseBufferDirty = true;
+    }
+
+    // 融合单趟提交：直接遍历连续 Bone[] 写入局部姿势并同步递推世界姿势，免除全部 List<Bone> 二次寻址。
+    public void CommitToSkeleton() {
+        this.SyncCapacity();
+        Bone[] bones = this.cachedBones;
+        Transform3D[] poses = this.workPoses;
+        int n = bones.Length;
+        for (int i = 0; i < n; i = i + 1) {
+            Bone b = bones[i];
+            Transform3D local = poses[i];
+            b.LocalPose = local;
+            if (b.ParentIndex < 0) {
+                b.WorldPose = local;
+            } else {
+                b.WorldPose = LayeredAnimator3D.FastCompose(bones[b.ParentIndex].WorldPose, local);
+            }
+        }
+        this.skeleton.worldDirty = false;
+    }
+
+    private static Transform3D FastCompose(Transform3D parent, Transform3D child) {
+        float sx = parent.Scale.X * child.Scale.X;
+        float sy = parent.Scale.Y * child.Scale.Y;
+        float sz = parent.Scale.Z * child.Scale.Z;
+
+        // v = parent.Scale * child.Position, 再用单位四元数 q 极速旋转: v' = v + 2 * cross(q.xyz, cross(q.xyz, v) + q.w * v)
+        float vx = parent.Scale.X * child.Position.X;
+        float vy = parent.Scale.Y * child.Position.Y;
+        float vz = parent.Scale.Z * child.Position.Z;
+        float qx = parent.Rotation.X; float qy = parent.Rotation.Y; float qz = parent.Rotation.Z; float qw = parent.Rotation.W;
+
+        float tx = 2.0f * (qy * vz - qz * vy);
+        float ty = 2.0f * (qz * vx - qx * vz);
+        float tz = 2.0f * (qx * vy - qy * vx);
+
+        Vector3 pos = new Vector3(
+            parent.Position.X + vx + qw * tx + (qy * tz - qz * ty),
+            parent.Position.Y + vy + qw * ty + (qz * tx - qx * tz),
+            parent.Position.Z + vz + qw * tz + (qx * ty - qy * tx));
+
+        Quaternion rot = new Quaternion(
+            qw * child.Rotation.X + qx * child.Rotation.W + qy * child.Rotation.Z - qz * child.Rotation.Y,
+            qw * child.Rotation.Y - qx * child.Rotation.Z + qy * child.Rotation.W + qz * child.Rotation.X,
+            qw * child.Rotation.Z + qx * child.Rotation.Y - qy * child.Rotation.X + qz * child.Rotation.W,
+            qw * child.Rotation.W - qx * child.Rotation.X - qy * child.Rotation.Y - qz * child.Rotation.Z);
+
+        return new Transform3D(pos, rot, new Vector3(sx, sy, sz));
+    }
+
+    private static Transform3D FastBlendPose(Transform3D a, Transform3D b, float k) {
+        Vector3 pos = new Vector3(
+            a.Position.X + (b.Position.X - a.Position.X) * k,
+            a.Position.Y + (b.Position.Y - a.Position.Y) * k,
+            a.Position.Z + (b.Position.Z - a.Position.Z) * k);
+        Quaternion rot = LayeredAnimator3D.FastSlerpUnit(a.Rotation, b.Rotation, k);
+        Vector3 scl = new Vector3(
+            a.Scale.X + (b.Scale.X - a.Scale.X) * k,
+            a.Scale.Y + (b.Scale.Y - a.Scale.Y) * k,
+            a.Scale.Z + (b.Scale.Z - a.Scale.Z) * k);
+        return new Transform3D(pos, rot, scl);
+    }
+
+    internal static Quaternion FastNormalize(Quaternion q) {
+        float lenSq = q.X * q.X + q.Y * q.Y + q.Z * q.Z + q.W * q.W;
+        if (lenSq <= 1e-12f) { return Quaternion.Identity; }
+        float inv = 1.0f / MathF.Sqrt(lenSq);
+        return new Quaternion(q.X * inv, q.Y * inv, q.Z * inv, q.W * inv);
+    }
+
+    // 针对已知单位四元数的无分支输入极速 Kapoulkine Slerp（内部热路径专用）。
+    internal static Quaternion FastSlerpUnit(Quaternion a, Quaternion b, float t) {
+        float ax = a.X; float ay = a.Y; float az = a.Z; float aw = a.W;
+        float bx = b.X; float by = b.Y; float bz = b.Z; float bw = b.W;
+
+        float d = ax * bx + ay * by + az * bz + aw * bw;
+        if (d < 0.0f) {
+            d = -d;
+            bx = -bx; by = -by; bz = -bz; bw = -bw;
+        }
+
+        float ot = t;
+        if (d < 0.9995f) {
+            float ca = 1.0904f + d * (-3.2452f + d * (3.55645f - d * 1.43519f));
+            float cb = 0.848013f + d * (-1.06021f + d * 0.215638f);
+            float tm = t - 0.5f;
+            float k = ca * tm * tm + cb;
+            ot = t + t * tm * (t - 1.0f) * k;
+        }
+
+        float omt = 1.0f - ot;
+        float rx = ax * omt + bx * ot;
+        float ry = ay * omt + by * ot;
+        float rz = az * omt + bz * ot;
+        float rw = aw * omt + bw * ot;
+        float rLenSq = rx * rx + ry * ry + rz * rz + rw * rw;
+        if (rLenSq <= 1e-12f) { return Quaternion.Identity; }
+        float invR = 1.0f / MathF.Sqrt(rLenSq);
+        return new Quaternion(rx * invR, ry * invR, rz * invR, rw * invR);
+    }
+
+    // 公开通用版快速球面线性插值（自动兼容非单位输入四元数，最大角度误差 < 5e-5 rad）。
+    public static Quaternion FastSlerp(Quaternion a, Quaternion b, float t) {
+        return LayeredAnimator3D.FastSlerpUnit(
+            LayeredAnimator3D.FastNormalize(a),
+            LayeredAnimator3D.FastNormalize(b),
+            t);
+    }
+}
