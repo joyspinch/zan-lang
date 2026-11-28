@@ -34,69 +34,82 @@ public class Gbk {
     static Dictionary<int, int> reverseSupp;
     // 后继字节 0..255 → 列号（0..189）或 -1，消除解码热循环内每次 3 条分支判断。
     static int[] trailCol;
+    private static string tableLock = "Zan.Gbk.Tables";
 
     static int[] TrailColTable() {
-        if (Gbk.trailCol == null) {
-            int[] t = new int[256];
-            for (int b = 0; b < 256; b = b + 1) {
-                if (b < 0x40 || b > 0xFE || b == 0x7F) {
-                    t[b] = -1;
-                } else if (b > 0x7F) {
-                    t[b] = b - 0x41;
-                } else {
-                    t[b] = b - 0x40;
+        int[] cached = Gbk.trailCol;
+        if (cached != null) { return cached; }
+        lock (Gbk.tableLock) {
+            if (Gbk.trailCol == null) {
+                int[] t = new int[256];
+                for (int b = 0; b < 256; b = b + 1) {
+                    if (b < 0x40 || b > 0xFE || b == 0x7F) {
+                        t[b] = -1;
+                    } else if (b > 0x7F) {
+                        t[b] = b - 0x41;
+                    } else {
+                        t[b] = b - 0x40;
+                    }
                 }
+                Gbk.trailCol = t;
             }
-            Gbk.trailCol = t;
+            return Gbk.trailCol;
         }
-        return Gbk.trailCol;
     }
 
     // 整表码点：把表字符串按码点切开。表里每个槽位一个码点，U+FFFD 表示
     // 该槽位未映射（CP936 本身不映射任何字符到 U+FFFD）。
     static int[] Codes() {
-        if (Gbk.codes == null) {
-            string t = GbkTable.All();
-            int[] arr = new int[GbkTable.SlotCount];
-            int bi = 0;
-            for (int i = 0; i < GbkTable.SlotCount; i = i + 1) {
-                long dec = Encoding.DecodeCodePointFast(t, bi);
-                int used = (int)(dec >> 32);
-                if (used <= 0) { break; }
-                arr[i] = (int)(dec & 0xFFFFFFFFL);
-                bi = bi + used;
+        int[] cached = Gbk.codes;
+        if (cached != null) { return cached; }
+        lock (Gbk.tableLock) {
+            if (Gbk.codes == null) {
+                string t = GbkTable.All();
+                int[] arr = new int[GbkTable.SlotCount];
+                int bi = 0;
+                for (int i = 0; i < GbkTable.SlotCount; i = i + 1) {
+                    long dec = Encoding.DecodeCodePointFast(t, bi);
+                    int used = (int)(dec >> 32);
+                    if (used <= 0) { break; }
+                    arr[i] = (int)(dec & 0xFFFFFFFFL);
+                    bi = bi + used;
+                }
+                Gbk.codes = arr;
             }
-            Gbk.codes = arr;
+            return Gbk.codes;
         }
-        return Gbk.codes;
     }
 
     // 反查表：BMP 码点 → 打包的 GBK 字节对 ((lead << 8) | trail)，-1 表示未映射。
     static int[] ReverseBmp() {
-        if (Gbk.reverseBmp == null) {
-            int[] bmp = new int[65536];
-            for (int i = 0; i < 65536; i = i + 1) { bmp[i] = -1; }
-            int[] cs = Gbk.Codes();
-            Dictionary<int, int> supp = null;
-            int trailCnt = GbkTable.TrailCount;
-            for (int i = 0; i < cs.Length; i = i + 1) {
-                int cp = cs[i];
-                if (cp != GbkTable.Unmapped) {
-                    int lead = (i / trailCnt) + 0x80;
-                    int trail = Gbk.TrailByte(i % trailCnt);
-                    int packed = (lead << 8) | trail;
-                    if (cp >= 0 && cp < 65536) {
-                        bmp[cp] = packed;
-                    } else {
-                        if (supp == null) { supp = new Dictionary<int, int>(); }
-                        supp[cp] = packed;
+        int[] cached = Gbk.reverseBmp;
+        if (cached != null) { return cached; }
+        lock (Gbk.tableLock) {
+            if (Gbk.reverseBmp == null) {
+                int[] bmp = new int[65536];
+                for (int i = 0; i < 65536; i = i + 1) { bmp[i] = -1; }
+                int[] cs = Gbk.Codes();
+                Dictionary<int, int> supp = null;
+                int trailCnt = GbkTable.TrailCount;
+                for (int i = 0; i < cs.Length; i = i + 1) {
+                    int cp = cs[i];
+                    if (cp != GbkTable.Unmapped) {
+                        int lead = (i / trailCnt) + 0x80;
+                        int trail = Gbk.TrailByte(i % trailCnt);
+                        int packed = (lead << 8) | trail;
+                        if (cp >= 0 && cp < 65536) {
+                            bmp[cp] = packed;
+                        } else {
+                            if (supp == null) { supp = new Dictionary<int, int>(); }
+                            supp[cp] = packed;
+                        }
                     }
                 }
+                Gbk.reverseSupp = supp;
+                Gbk.reverseBmp = bmp;
             }
-            Gbk.reverseSupp = supp;
-            Gbk.reverseBmp = bmp;
+            return Gbk.reverseBmp;
         }
-        return Gbk.reverseBmp;
     }
 
     // 后继字节 → 表里的列号：trail 取 0x40..0xFE 去掉 0x7F，所以

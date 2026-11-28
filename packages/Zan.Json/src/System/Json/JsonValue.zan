@@ -56,75 +56,96 @@ public partial class JsonValue {
     static JsonValue falseVal;
     static JsonValue zeroVal;
     static JsonValue oneVal;
+    private static string singletonLock = "Zan.JsonValue.Singletons";
 
     // 全局单例只读 null 值（kind 0）。
     public static JsonValue NullVal {
         get {
-            if (JsonValue.nullVal == null) {
-                JsonValue v = new JsonValue();
-                v.kind = 0;
-                v.isReadOnly = true;
-                JsonValue.nullVal = v;
+            JsonValue cached = JsonValue.nullVal;
+            if (cached != null) { return cached; }
+            lock (JsonValue.singletonLock) {
+                if (JsonValue.nullVal == null) {
+                    JsonValue v = new JsonValue();
+                    v.kind = 0;
+                    v.isReadOnly = true;
+                    JsonValue.nullVal = v;
+                }
+                return JsonValue.nullVal;
             }
-            return JsonValue.nullVal;
         }
     }
 
     // 全局单例只读 true 值（kind 1）。
     public static JsonValue TrueVal {
         get {
-            if (JsonValue.trueVal == null) {
-                JsonValue v = new JsonValue();
-                v.kind = 1;
-                v.boolVal = true;
-                v.isReadOnly = true;
-                JsonValue.trueVal = v;
+            JsonValue cached = JsonValue.trueVal;
+            if (cached != null) { return cached; }
+            lock (JsonValue.singletonLock) {
+                if (JsonValue.trueVal == null) {
+                    JsonValue v = new JsonValue();
+                    v.kind = 1;
+                    v.boolVal = true;
+                    v.isReadOnly = true;
+                    JsonValue.trueVal = v;
+                }
+                return JsonValue.trueVal;
             }
-            return JsonValue.trueVal;
         }
     }
 
     // 全局单例只读 false 值（kind 1）。
     public static JsonValue FalseVal {
         get {
-            if (JsonValue.falseVal == null) {
-                JsonValue v = new JsonValue();
-                v.kind = 1;
-                v.boolVal = false;
-                v.isReadOnly = true;
-                JsonValue.falseVal = v;
+            JsonValue cached = JsonValue.falseVal;
+            if (cached != null) { return cached; }
+            lock (JsonValue.singletonLock) {
+                if (JsonValue.falseVal == null) {
+                    JsonValue v = new JsonValue();
+                    v.kind = 1;
+                    v.boolVal = false;
+                    v.isReadOnly = true;
+                    JsonValue.falseVal = v;
+                }
+                return JsonValue.falseVal;
             }
-            return JsonValue.falseVal;
         }
     }
 
     // 全局单例只读整数 0 值（kind 2）。
     public static JsonValue ZeroVal {
         get {
-            if (JsonValue.zeroVal == null) {
-                JsonValue v = new JsonValue();
-                v.kind = 2;
-                v.numI = 0L;
-                v.numIsInt = true;
-                v.isReadOnly = true;
-                JsonValue.zeroVal = v;
+            JsonValue cached = JsonValue.zeroVal;
+            if (cached != null) { return cached; }
+            lock (JsonValue.singletonLock) {
+                if (JsonValue.zeroVal == null) {
+                    JsonValue v = new JsonValue();
+                    v.kind = 2;
+                    v.numI = 0L;
+                    v.numIsInt = true;
+                    v.isReadOnly = true;
+                    JsonValue.zeroVal = v;
+                }
+                return JsonValue.zeroVal;
             }
-            return JsonValue.zeroVal;
         }
     }
 
     // 全局单例只读整数 1 值（kind 2）。
     public static JsonValue OneVal {
         get {
-            if (JsonValue.oneVal == null) {
-                JsonValue v = new JsonValue();
-                v.kind = 2;
-                v.numI = 1L;
-                v.numIsInt = true;
-                v.isReadOnly = true;
-                JsonValue.oneVal = v;
+            JsonValue cached = JsonValue.oneVal;
+            if (cached != null) { return cached; }
+            lock (JsonValue.singletonLock) {
+                if (JsonValue.oneVal == null) {
+                    JsonValue v = new JsonValue();
+                    v.kind = 2;
+                    v.numI = 1L;
+                    v.numIsInt = true;
+                    v.isReadOnly = true;
+                    JsonValue.oneVal = v;
+                }
+                return JsonValue.oneVal;
             }
-            return JsonValue.oneVal;
         }
     }
 
@@ -140,9 +161,10 @@ public partial class JsonValue {
         }
     }
 
-    // 递归检测 target 节点是否已作为子孙节点出现在 root 树中（防止 ARC 有向成环导致永久内存泄漏）。
+    // 递归检测 target 节点是否已作为子孙节点出现在 root 树中（超深 > 512 按 fail-closed 拒绝，防止绕过环检测）。
     public static bool TreeContains(JsonValue root, JsonValue target, int depth) {
-        if (root == null || target == null || depth > 32) { return false; }
+        if (root == null || target == null) { return false; }
+        if (depth > 512) { return true; }
         if (root == target) { return true; }
         if (root.kind == 4) {
             if (root.items != null) {
@@ -277,8 +299,13 @@ public partial class JsonValue {
         return v;
     }
 
-    // 深拷贝当前 JsonValue 及其所有子节点（对象和数组递归克隆）。
+    // 深拷贝当前 JsonValue 及其所有子节点（对象和数组递归克隆，限深 512 防栈溢出）。
     public JsonValue Clone() {
+        return this.CloneDepth(0);
+    }
+
+    private JsonValue CloneDepth(int depth) {
+        if (depth > 512) { throw new JsonException("JsonValue.Clone nesting depth exceeds 512"); }
         if (this.kind == 0) { return JsonValue.NewNull(); }
         if (this.kind == 1) { return JsonValue.NewBool(this.boolVal); }
         if (this.kind == 2) {
@@ -294,18 +321,24 @@ public partial class JsonValue {
         if (this.kind == 4) {
             if (this.numArr != null) { return JsonValue.NewDoubleArray(this.numArr); }
             JsonValue arr = JsonValue.NewArray();
-            int n = this.items.Count;
-            for (int i = 0; i < n; i = i + 1) {
-                arr.items.Add(this.items[i].Clone());
+            if (this.items != null) {
+                int n = this.items.Count;
+                for (int i = 0; i < n; i = i + 1) {
+                    JsonValue elem = this.items[i];
+                    arr.items.Add(elem != null ? elem.CloneDepth(depth + 1) : JsonValue.NewNull());
+                }
             }
             return arr;
         }
         if (this.kind == 5) {
             JsonValue obj = JsonValue.NewObject();
-            int n = this.keys.Count;
-            for (int i = 0; i < n; i = i + 1) {
-                obj.keys.Add(this.keys[i]);
-                obj.vals.Add(this.vals[i].Clone());
+            if (this.keys != null && this.vals != null) {
+                int n = this.keys.Count;
+                for (int i = 0; i < n; i = i + 1) {
+                    obj.keys.Add(this.keys[i]);
+                    JsonValue val = this.vals[i];
+                    obj.vals.Add(val != null ? val.CloneDepth(depth + 1) : JsonValue.NewNull());
+                }
             }
             return obj;
         }
@@ -319,18 +352,19 @@ public partial class JsonValue {
     // 是否为数字值（kind 2）。
     public bool IsNumber() { return kind == 2; }
     // 是否为整型形态的数字：NewInt、整数字面量解析产物，
-    // 或无小数点/指数记号的 NewNum 手工字面量；NewDouble 永远不是
-    // （数值恰为整数也保持浮点形态）。二进制序列化据此选择整数/
-    // 浮点线格式。
+    // 或严格十进制整数形态的 NewNum 手工字面量（排除 Infinity/NaN/小数/指数）；
+    // NewDouble 永远不是（数值恰为整数也保持浮点形态）。
     public bool IsInt() {
         if (kind != 2) { return false; }
         if (numIsInt) { return numRaw == null || numRaw.Length == 0; }
         if (numRaw == null || numRaw.Length == 0) { return false; }
         int i = 0;
         int n = numRaw.Length;
+        if ((numRaw[0] & 255) == 45) { i = 1; }
+        if (i >= n) { return false; }
         while (i < n) {
             int c = numRaw[i] & 255;
-            if (c == 46 || c == 101 || c == 69) { return false; }  // . e E
+            if (c < 48 || c > 57) { return false; }
             i = i + 1;
         }
         return true;

@@ -7,36 +7,49 @@ namespace System.IO.Watch;
 public delegate void FileChangeFn(string name, int change);
 // 且必须是非捕获（non-capturing）的。
 public class DirectoryWatcher {
+    // 跨线程保护静态状态的 .rodata 监视器键（零堆分配）。
+    private static string gate = "Zan.DirectoryWatcher.Gate";
     // 上一份快照；轮询线程每轮与它合并比较后替换。
     static List<FileSnapshot> lastSnapshot = new List<FileSnapshot>();
     // 监听运行标志；Stop 置 false，轮询线程据此退出。
     static bool watching = false;
     // 轮询线程活跃标志；Stop 等待其归零，防止重入 Watch 与旧线程并发踩踏静态状态。
     static bool running = false;
+    // 代数序号，避免超时残留线程在退出时误清新一代状态。
+    static long generation = 0L;
 
     // 开始监听 `path`。以下情况返回 false：
-    // 目录不存在或已有监听器在运行。
+    // 参数非法、目录不存在或已有监听器在运行。
     public static bool Watch(string path, FileChangeFn callback) {
-        if (watching || running) { return false; }
-        if (!Directory.Exists(path)) { return false; }
-        DirectoryWatcher.dir = path;
-        DirectoryWatcher.cb = callback;
-        DirectoryWatcher.lastSnapshot = DirectoryWatcher.Snapshot();
-        watching = true;
-        running = true;
-        if (!Thread.Start(DirectoryWatcher.Poll)) {
-            watching = false;
-            running = false;
-            return false;
+        if (path == null || path.Length == 0 || callback == null) { return false; }
+        lock (DirectoryWatcher.gate) {
+            if (watching || running) { return false; }
+            if (!Directory.Exists(path)) { return false; }
+            DirectoryWatcher.dir = path;
+            DirectoryWatcher.cb = callback;
+            DirectoryWatcher.lastSnapshot = DirectoryWatcher.Snapshot(path);
+            DirectoryWatcher.generation = DirectoryWatcher.generation + 1L;
+            watching = true;
+            running = true;
+            if (!Thread.Start(DirectoryWatcher.Poll)) {
+                watching = false;
+                running = false;
+                return false;
+            }
+            return true;
         }
-        return true;
     }
 
     // 停止监听并等待轮询线程退出，确保返回后不再投递回调且可安全重新 Watch。
     public static void Stop() {
-        watching = false;
+        lock (DirectoryWatcher.gate) {
+            watching = false;
+        }
         int waited = 0;
-        while (running && waited < 2000) {
+        while (waited < 2000) {
+            bool stillRunning = false;
+            lock (DirectoryWatcher.gate) { stillRunning = running; }
+            if (!stillRunning) { break; }
             Thread.Sleep(10);
             waited = waited + 10;
         }
@@ -44,19 +57,50 @@ public class DirectoryWatcher {
 
     // 轮询线程主体：每 250 ms（分片睡眠以快速响应 Stop）拍一次快照并与上一份合并比较。
     private static void Poll() {
+        long myGen = 0L;
+        string watchDir = "";
+        FileChangeFn callback = null;
+        List<FileSnapshot> prevSnap = null;
+        lock (DirectoryWatcher.gate) {
+            myGen = DirectoryWatcher.generation;
+            watchDir = DirectoryWatcher.dir;
+            callback = DirectoryWatcher.cb;
+            prevSnap = DirectoryWatcher.lastSnapshot;
+        }
         try {
-            while (DirectoryWatcher.watching) {
-                for (int s = 0; s < 10 && DirectoryWatcher.watching; s = s + 1) {
+            while (true) {
+                bool active = false;
+                lock (DirectoryWatcher.gate) {
+                    active = DirectoryWatcher.watching && DirectoryWatcher.generation == myGen;
+                }
+                if (!active) { break; }
+                for (int s = 0; s < 10; s = s + 1) {
+                    lock (DirectoryWatcher.gate) {
+                        active = DirectoryWatcher.watching && DirectoryWatcher.generation == myGen;
+                    }
+                    if (!active) { break; }
                     Thread.Sleep(25);
                 }
-                if (!DirectoryWatcher.watching) { break; }
-                List<FileSnapshot> snapshot = DirectoryWatcher.Snapshot();
-                if (!DirectoryWatcher.watching) { break; }
-                DirectoryWatcher.Compare(snapshot);
-                DirectoryWatcher.lastSnapshot = snapshot;
+                if (!active) { break; }
+                List<FileSnapshot> snapshot = DirectoryWatcher.Snapshot(watchDir);
+                lock (DirectoryWatcher.gate) {
+                    active = DirectoryWatcher.watching && DirectoryWatcher.generation == myGen;
+                }
+                if (!active) { break; }
+                DirectoryWatcher.Compare(prevSnap, snapshot, callback);
+                prevSnap = snapshot;
+                lock (DirectoryWatcher.gate) {
+                    if (DirectoryWatcher.generation == myGen) {
+                        DirectoryWatcher.lastSnapshot = snapshot;
+                    }
+                }
             }
         } finally {
-            DirectoryWatcher.running = false;
+            lock (DirectoryWatcher.gate) {
+                if (DirectoryWatcher.generation == myGen) {
+                    DirectoryWatcher.running = false;
+                }
+            }
         }
     }
 
@@ -64,13 +108,14 @@ public class DirectoryWatcher {
     // 文件的大小或（秒级精度）写入时间发生变化时即视为
     // “已修改”；同一秒内大小不变的重写无法
     // 通过轮询检测到——这是文档所述的延迟/精度权衡。
-    private static List<FileSnapshot> Snapshot() {
+    private static List<FileSnapshot> Snapshot(string targetDir) {
         List<FileSnapshot> snapshot = new List<FileSnapshot>();
-        List<string> files = Directory.GetFileNames(DirectoryWatcher.dir);
+        if (targetDir == null || targetDir.Length == 0) { return snapshot; }
+        List<string> files = Directory.GetFileNames(targetDir);
         for (int i = 0; i < files.Count; i = i + 1) {
             // GetFiles 返回不带路径的条目名；拼接上被监听的目录
             // 以便 stat 调用读取到正确的文件。
-            string full = Path.Combine(DirectoryWatcher.dir, files[i]);
+            string full = Path.Combine(targetDir, files[i]);
             snapshot.Add(new FileSnapshot(
                 files[i], FileInfo.GetLastWriteTime(full), FileInfo.GetLength(full)));
         }
@@ -90,31 +135,31 @@ public class DirectoryWatcher {
     }
 
     // 合并上一份与当前快照，对差异触发回调。
-    private static void Compare(List<FileSnapshot> current) {
+    private static void Compare(List<FileSnapshot> prev, List<FileSnapshot> current, FileChangeFn callback) {
+        if (callback == null || prev == null || current == null) { return; }
         int i = 0;  // 上一份快照的索引
         int j = 0;  // 当前快照的索引
-        while (i < DirectoryWatcher.lastSnapshot.Count || j < current.Count) {
-            if (i >= DirectoryWatcher.lastSnapshot.Count) {
-                DirectoryWatcher.cb(current[j].name, FileChange.Added());
+        while (i < prev.Count || j < current.Count) {
+            if (i >= prev.Count) {
+                callback(current[j].name, FileChange.Added());
                 j = j + 1;
             } else if (j >= current.Count) {
-                DirectoryWatcher.cb(
-                    DirectoryWatcher.lastSnapshot[i].name, FileChange.Removed());
+                callback(prev[i].name, FileChange.Removed());
                 i = i + 1;
             } else {
-                FileSnapshot previous = DirectoryWatcher.lastSnapshot[i];
+                FileSnapshot previous = prev[i];
                 FileSnapshot next = current[j];
                 int cmp = previous.name.CompareTo(next.name);
                 if (cmp < 0) {
-                    DirectoryWatcher.cb(previous.name, FileChange.Removed());
+                    callback(previous.name, FileChange.Removed());
                     i = i + 1;
                 } else if (cmp > 0) {
-                    DirectoryWatcher.cb(next.name, FileChange.Added());
+                    callback(next.name, FileChange.Added());
                     j = j + 1;
                 } else {
                     if (previous.lastWriteTime != next.lastWriteTime
                         || previous.size != next.size) {
-                        DirectoryWatcher.cb(next.name, FileChange.Modified());
+                        callback(next.name, FileChange.Modified());
                     }
                     i = i + 1;
                     j = j + 1;

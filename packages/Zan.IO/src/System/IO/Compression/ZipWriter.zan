@@ -38,6 +38,7 @@ public class ZipWriter : IDisposable {
     List<long> usizes;
 
     // 进行中的分块条目状态（Begin/End 之间有效）。
+    bool inEntry;
     string curName;
     int curMethod;
     int curLevel;
@@ -50,6 +51,7 @@ public class ZipWriter : IDisposable {
     // 构造空写出器；实例经 Open 创建。
     public ZipWriter() {
         this.fp = 0;
+        this.inEntry = false;
         this.offsets = new List<long>();
         this.names = new List<string>();
         this.methods = new List<int>();
@@ -61,6 +63,9 @@ public class ZipWriter : IDisposable {
 
     // 创建/截断归档文件。打不开时抛 IOException。
     public static ZipWriter Open(string path) {
+        if (path == null || path.Length == 0) {
+            throw new IOException("ZipWriter: empty path");
+        }
         nint h = ZipWriter.fopen(path, "w+b");
         if (h == 0) { throw new IOException("Could not open file for writing: " + path); }
         ZipWriter w = new ZipWriter();
@@ -72,12 +77,15 @@ public class ZipWriter : IDisposable {
     // 一次性写入整个条目（内容已在内存）。级别 0 存储，
     // 1-9 deflate；内容 < 64 字节时自动转为存储。
     public void AddEntry(string name, byte[] data, int level) {
+        if (this.fp == 0) { throw new IOException("ZipWriter: archive is closed"); }
+        if (this.inEntry) { throw new IOException("ZipWriter: finish current entry before AddEntry"); }
         if (name == null || name.Length > 65535) {
             throw new IOException("ZipWriter: entry name exceeds 16-bit ZIP limit");
         }
         if (this.names.Count >= 65535) {
             throw new IOException("ZipWriter: entry count exceeds 16-bit ZIP limit");
         }
+        if (data == null) { data = new byte[0]; }
         int crc = Crc32.Compute(data, 0, data.Length, 0);
         int method = Zip.MethodStored;
         byte[] payload = data;
@@ -86,6 +94,9 @@ public class ZipWriter : IDisposable {
             payload = Deflate.Deflate(data, level);
         }
         long hpos = this.Tell();
+        if (hpos < 0 || hpos > 2147483647L) {
+            throw new IOException("ZipWriter: entry offset exceeds 32-bit ZIP limit");
+        }
         this.WriteHeader(name, method, crc, payload.Length, data.Length);
         this.WriteRaw(payload, payload.Length);
         this.RecordEntry(hpos, name, method, crc, payload.Length, data.Length);
@@ -94,11 +105,17 @@ public class ZipWriter : IDisposable {
     // 开始一个分块条目（先写占位本地头，EndEntry 时回填 CRC 与尺寸），配合 WriteData 喂数据；
     // 级别 0 表示存储，1-9 分块 deflate。
     public void BeginEntry(string name, int level) {
+        if (this.fp == 0) { throw new IOException("ZipWriter: archive is closed"); }
+        if (this.inEntry) { throw new IOException("ZipWriter: nested BeginEntry is not supported"); }
         if (name == null || name.Length > 65535) {
             throw new IOException("ZipWriter: entry name exceeds 16-bit ZIP limit");
         }
         if (this.names.Count >= 65535) {
             throw new IOException("ZipWriter: entry count exceeds 16-bit ZIP limit");
+        }
+        long hpos = this.Tell();
+        if (hpos < 0 || hpos > 2147483647L) {
+            throw new IOException("ZipWriter: entry offset exceeds 32-bit ZIP limit");
         }
         this.curName = name;
         this.curMethod = level > 0 ? Zip.MethodDeflate : Zip.MethodStored;
@@ -111,13 +128,20 @@ public class ZipWriter : IDisposable {
         } else {
             this.curChunker = null;
         }
-        this.curHdrPos = this.Tell();
+        this.curHdrPos = hpos;
         this.WriteHeader(name, this.curMethod, 0, 0, 0);
+        this.inEntry = true;
     }
 
     // 向进行中的分块条目追加一块数据。
     public void WriteData(byte[] chunk, int len) {
-        if (len <= 0) { return; }
+        if (this.fp == 0) { throw new IOException("ZipWriter: archive is closed"); }
+        if (!this.inEntry) { throw new IOException("ZipWriter: WriteData called without active entry"); }
+        if (len < 0) { throw new ArgumentOutOfRangeException("len"); }
+        if (len == 0) { return; }
+        if (chunk == null || len > chunk.Length) {
+            throw new ArgumentOutOfRangeException("len");
+        }
         this.curCrc = Crc32.Compute(chunk, 0, len, this.curCrc);
         this.curUsize = this.curUsize + len;
         if (this.curMethod == Zip.MethodDeflate) {
@@ -133,6 +157,9 @@ public class ZipWriter : IDisposable {
     // 结束进行中的分块条目：冲出压缩尾块、回填本地头的
     // CRC/尺寸、登记中央目录。
     public void EndEntry() {
+        if (this.fp == 0) { throw new IOException("ZipWriter: archive is closed"); }
+        if (!this.inEntry) { throw new IOException("ZipWriter: EndEntry called without active entry"); }
+        this.inEntry = false;
         if (this.curMethod == Zip.MethodDeflate) {
             byte[] tail = this.curChunker.Finish();
             this.WriteRaw(tail, tail.Length);
@@ -223,11 +250,15 @@ public class ZipWriter : IDisposable {
 
     // 关闭并删除半成品归档（导出被取消/出错时用）。
     public void Abort() {
+        this.inEntry = false;
+        this.curChunker = null;
         if (this.fp != 0) {
             ZipWriter.fclose(this.fp);
             this.fp = 0;
         }
-        ZipWriter.remove(this.path);
+        if (this.path != null && this.path.Length > 0) {
+            ZipWriter.remove(this.path);
+        }
     }
 
     public void Dispose() {
@@ -267,15 +298,33 @@ public class ZipWriter : IDisposable {
     }
 
     // 当前写入位置（距文件头的 64 位字节偏移）。
-    long Tell() { return ZipWriter.ftell64(this.fp); }
+    long Tell() {
+        if (this.fp == 0) { throw new IOException("ZipWriter: archive is closed"); }
+        return ZipWriter.ftell64(this.fp);
+    }
 
     // 定位到绝对偏移（回填本地头用）。
-    void Seek(long pos) { ZipWriter.fseek64(this.fp, pos, 0); }
+    void Seek(long pos) {
+        if (this.fp == 0) { throw new IOException("ZipWriter: archive is closed"); }
+        if (ZipWriter.fseek64(this.fp, pos, 0) != 0) {
+            throw new IOException("ZipWriter: seek failed");
+        }
+    }
     // 定位到文件尾（继续追加条目）。
-    void SeekEnd() { ZipWriter.fseek64(this.fp, 0L, 2); }
+    void SeekEnd() {
+        if (this.fp == 0) { throw new IOException("ZipWriter: archive is closed"); }
+        if (ZipWriter.fseek64(this.fp, 0L, 2) != 0) {
+            throw new IOException("ZipWriter: seek end failed");
+        }
+    }
 
     // 写入 len 字节；写不满抛 IOException。
     void WriteRaw(byte[] data, int len) {
+        if (this.fp == 0) { throw new IOException("ZipWriter: archive is closed"); }
+        if (len <= 0) { return; }
+        if (data == null || len > data.Length) {
+            throw new ArgumentOutOfRangeException("len");
+        }
         long put = ZipWriter.fwrite(data, 1, len, this.fp);
         if (put != len) {
             throw new IOException("ZipWriter: short write (" + Convert.ToString(put)

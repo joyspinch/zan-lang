@@ -25,25 +25,29 @@ public class Deflate {
     static int[] encDistLarge;
     static int[] encDistRev5;
 
+    // 惰性初始化查找表的零分配 .rodata 监视器键（锁保护 + 哨兵末位发布）。
+    private static string tableGate = "Zan.Deflate.Tables";
+
     // 惰性构建 256 项 8 位位反转表，消除 Huffman 写出时的逐位移位循环。
     private static int[] RevTable() {
-        if (Deflate.revTable != null) { return Deflate.revTable; }
-        int[] t = new int[256];
-        for (int i = 0; i < 256; i = i + 1) {
-            int r = 0;
-            int v = i;
-            for (int k = 0; k < 8; k = k + 1) {
-                r = (r << 1) | (v & 1);
-                v = v >> 1;
+        int[] cached = Deflate.revTable;
+        if (cached != null) { return cached; }
+        lock (Deflate.tableGate) {
+            if (Deflate.revTable != null) { return Deflate.revTable; }
+            int[] t = new int[256];
+            for (int i = 0; i < 256; i = i + 1) {
+                int r = 0;
+                int v = i;
+                for (int k = 0; k < 8; k = k + 1) {
+                    r = (r << 1) | (v & 1);
+                    v = v >> 1;
+                }
+                t[i] = r;
             }
-            t[i] = r;
+            Deflate.revTable = t;
+            return t;
         }
-        Deflate.revTable = t;
-        return t;
     }
-
-    // 惰性初始化固定 Huffman 压缩查找表（O(1) 查表，零循环；锁保护 + 哨兵末位发布）。
-    private static object tableGate = new object();
 
     private static void EnsureEncodeTables() {
         if (Deflate.encLitBits != null) { return; }
@@ -647,7 +651,9 @@ public class Deflate {
     // LZ77 + 固定 Huffman。输出一个最终块；字面量和长度/
     // 距离对用固定表编码。
     private static byte[] FixedCompress(byte[] src, int level) {
-        byte[] out2 = new byte[src.Length + src.Length / 2 + 64];
+        long outCap = (long)src.Length + (long)(src.Length / 2) + 64L;
+        if (outCap > 2147483647L) { throw new ArgumentOutOfRangeException("src"); }
+        byte[] out2 = new byte[(int)outCap];
         int bitPos = 0;
         // 块头：BFINAL=1, BTYPE=01（固定）。
         Deflate.WriteBits(out2, ref bitPos, 1, 1);

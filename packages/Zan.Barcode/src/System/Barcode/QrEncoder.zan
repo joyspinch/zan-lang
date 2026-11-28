@@ -11,20 +11,28 @@ public class QrEncoder {
 
     static string ALNUM_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:";
     static int[] alnumLut = null;
+    private static string lutLock = "Zan.QrEncoder.AlnumLut";
 
     static int[] GetAlnumLut() {
         int[] t = QrEncoder.alnumLut;
         if (t != null) { return t; }
-        int[] lut = new int[128];
-        for (int i = 0; i < 128; i = i + 1) { lut[i] = -1; }
-        for (int i = 0; i < 45; i = i + 1) {
-            lut[ALNUM_CHARS[i] & 127] = i;
+        lock (QrEncoder.lutLock) {
+            if (QrEncoder.alnumLut != null) { return QrEncoder.alnumLut; }
+            int[] lut = new int[128];
+            for (int i = 0; i < 128; i = i + 1) { lut[i] = -1; }
+            for (int i = 0; i < 45; i = i + 1) {
+                lut[ALNUM_CHARS[i] & 127] = i;
+            }
+            QrEncoder.alnumLut = lut;
+            return lut;
         }
-        QrEncoder.alnumLut = lut;
-        return lut;
     }
 
     public static QrMatrix Encode(string text, QrEcl ecl) {
+        // QR Version 40-L 最大可编码 7089 个数字字符；超限直接拒绝，避免位长计算溢出。
+        if (text != null && text.Length > 7089) {
+            throw new BarcodeException(BarcodeError.TooLong, "content too long for QR version 40");
+        }
         int segCount = 0;
         int[] segModes = null;
         int[] segStarts = null;
@@ -152,28 +160,31 @@ public class QrEncoder {
         return g == 0 ? 8 : 16;
     }
 
-    static int SegmentDataBits(int mode, int chars) {
+    static long SegmentDataBits(int mode, int chars) {
+        if (chars <= 0) { return 0L; }
+        long c = (long)chars;
         if (mode == MODE_NUMERIC) {
-            int rem = chars % 3;
-            return (chars / 3) * 10 + (rem == 2 ? 7 : (rem == 1 ? 4 : 0));
+            long rem = c % 3L;
+            return (c / 3L) * 10L + (rem == 2L ? 7L : (rem == 1L ? 4L : 0L));
         }
         if (mode == MODE_ALNUM) {
-            return (chars / 2) * 11 + ((chars & 1) != 0 ? 6 : 0);
+            return (c / 2L) * 11L + ((c & 1L) != 0L ? 6L : 0L);
         }
-        return chars * 8;
+        return c * 8L;
     }
 
     static int PickVersionSpans(int[] modes, int[] lens, int count, QrEcl ecl) {
-        int baseBits = 0;
+        long baseBits = 0L;
         for (int i = 0; i < count; i = i + 1) {
-            baseBits = baseBits + 4 + QrEncoder.SegmentDataBits(modes[i], lens[i]);
+            baseBits = baseBits + 4L + QrEncoder.SegmentDataBits(modes[i], lens[i]);
+            if (baseBits > 2956L * 8L) { return -1; }
         }
         for (int ver = 1; ver <= 40; ver = ver + 1) {
-            int need = baseBits;
+            long need = baseBits;
             for (int i = 0; i < count; i = i + 1) {
-                need = need + QrEncoder.CharCountBits(modes[i], ver);
+                need = need + (long)QrEncoder.CharCountBits(modes[i], ver);
             }
-            if (need <= QrSpec.DataCapacity(ver, ecl) * 8) { return ver; }
+            if (need <= (long)QrSpec.DataCapacity(ver, ecl) * 8L) { return ver; }
         }
         return -1;
     }

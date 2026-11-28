@@ -544,21 +544,26 @@ public class BZip2Decoder {
             }
             if (sym == eob) { break; }
             if (sym == 0 || sym == 1) {
-                // RUNA / RUNB：二进制增量编码的重复次数。
-                runLen = runLen + ((sym + 1) << runBit);
-                runBit = runBit + 1;
-                if (runBit > 30) {
+                // RUNA / RUNB：二进制增量编码的重复次数（防 int32 移位/累加溢出导致 ttArr 越界写）。
+                if (runBit > 20) {
                     this.bitBuf = bbuf; this.bitCnt = bcnt; this.inPos = ipos;
                     return false;
                 }
+                long addRun = ((long)(sym + 1)) << runBit;
+                if (addRun > (long)(blockSize - nblock) - (long)runLen) {
+                    this.bitBuf = bbuf; this.bitCnt = bcnt; this.inPos = ipos;
+                    return false;
+                }
+                runLen = runLen + (int)addRun;
+                runBit = runBit + 1;
             } else {
                 if (runLen > 0) {
                     int ch = mtfArr[0] & 255;
-                    int need = nblock + runLen;
-                    if (need > blockSize) {
+                    if (runLen > blockSize - nblock) {
                         this.bitBuf = bbuf; this.bitCnt = bcnt; this.inPos = ipos;
                         return false;
                     }
+                    int need = nblock + runLen;
                     if (need > ttCap) {
                         ttArr = this.GrowTt(ttArr, nblock, need, blockSize);
                         ttCap = ttArr.Length;
@@ -606,8 +611,8 @@ public class BZip2Decoder {
         this.inPos = ipos;
         if (runLen > 0) {
             int ch = mtfArr[0] & 255;
+            if (runLen > blockSize - nblock) { return false; }
             int need = nblock + runLen;
-            if (need > blockSize) { return false; }
             if (need > ttCap) {
                 ttArr = this.GrowTt(ttArr, nblock, need, blockSize);
                 ttCap = ttArr.Length;
@@ -746,6 +751,8 @@ public class BZip2Decoder {
         int[] lut = this.fastLut;
         for (int l = minLen; l <= maxLen; l = l + 1) {
             int countL = cnt[l + 1] - cnt[l];
+            // 校验 Kraft 码空间上界，防止过订阅 Huffman 码表导致 fastLut 堆越界写。
+            if (countL < 0 || vec > (1 << l) - countL) { return false; }
             if (l <= FastBits && countL > 0) {
                 int shift = FastBits - l;
                 int span = 1 << shift;

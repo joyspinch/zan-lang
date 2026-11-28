@@ -229,7 +229,7 @@ public class Zip {
             e.crc32 = crc;
             e.compressedSize = csize;
             e.uncompressedSize = usize;
-            e.isDirectory = name.EndsWith("/");
+            e.isDirectory = name.EndsWith("/") || name.EndsWith("\\");
             e.localHeaderOffset = lho;
             entries.Add(e);
             p = p + 46 + nameLen + extraLen + commentLen;
@@ -240,15 +240,15 @@ public class Zip {
     // 提取单个条目的内容（必要时解压）。
     // 条目无法定位或已损坏时返回 null。
     public static byte[] Extract(byte[] zip, ZipEntry e) {
-        if (e.isDirectory) { return null; }
+        if (zip == null || e == null || e.isDirectory || e.name == null) { return null; }
         // 优先使用中央目录记录的本地头相对偏移（O(1) 直跳定位）；
         // 校验该偏移处签名与名称是否与条目一致。若不匹配或未初始化，
         // 则回退到全包扫描查找。
         int lho = e.localHeaderOffset;
         bool valid = false;
-        if (lho >= 0 && lho + 30 <= zip.Length && Zip.ReadU32(zip, lho) == Zip.SigLocal) {
+        if (lho >= 0 && (long)lho + 30L <= (long)zip.Length && Zip.ReadU32(zip, lho) == Zip.SigLocal) {
             int nLen = Zip.ReadU16(zip, lho + 26);
-            if (lho + 30 + nLen <= zip.Length && nLen == e.name.Length) {
+            if ((long)lho + 30L + (long)nLen <= (long)zip.Length && nLen == e.name.Length) {
                 bool nameMatch = true;
                 for (int k = 0; k < nLen; k = k + 1) {
                     if ((byte)e.name[k] != zip[lho + 30 + k]) { nameMatch = false; break; }
@@ -261,7 +261,7 @@ public class Zip {
         }
         if (lho < 0) { return null; }
         // 读取固定字段前，先保证 local header 的固定部分存在。
-        if (lho + 30 > zip.Length) { return null; }
+        if ((long)lho + 30L > (long)zip.Length) { return null; }
         int method = Zip.ReadU16(zip, lho + 8);
         int csize = (int)Zip.ReadU32(zip, lho + 18);
         int usize = (int)Zip.ReadU32(zip, lho + 22);
@@ -312,14 +312,19 @@ public class Zip {
     // ".." 段的相对路径，否则整包按损坏处理——一个精心构造的归档否则能
     // 写到目标目录之外。
     public static int ExtractToDirectory(string zipPath, string destDir) {
+        if (zipPath == null || zipPath.Length == 0 || destDir == null || destDir.Length == 0) {
+            return 0 - 1;
+        }
         byte[] zip = File.ReadAllBytes(zipPath);
         if (zip == null || zip.Length == 0) { return 0 - 1; }
         List<ZipEntry> entries = Zip.Read(zip);
-        if (entries == null) { return 0 - 1; }
+        if (entries == null || entries.Count > 65535) { return 0 - 1; }
         string root = destDir;
         if (!root.EndsWith("/") && !root.EndsWith("\\")) { root = root + "/"; }
         Directory.CreateDirectoryRecursive(root);
         int count = 0;
+        long totalExtracted = 0L;
+        long maxTotalBytes = 536870912L; // 512 MiB 累计解压预算，防御多条目压缩炸弹
         for (int i = 0; i < entries.Count; i = i + 1) {
             ZipEntry e = entries[i];
             if (!Tar.SafeName(e.name)) { return 0 - 1; }
@@ -328,12 +333,17 @@ public class Zip {
                 Directory.CreateDirectoryRecursive(outPath);
                 count = count + 1;
             } else {
+                if (e.uncompressedSize < 0 || totalExtracted + (long)e.uncompressedSize > maxTotalBytes) {
+                    return 0 - 1;
+                }
                 int slash = Tar.LastSlash(outPath);
                 if (slash > 0) {
                     Directory.CreateDirectoryRecursive(outPath.Substring(0, slash));
                 }
                 byte[] content = Zip.Extract(zip, e);
                 if (content == null) { return 0 - 1; }
+                totalExtracted = totalExtracted + (long)content.Length;
+                if (totalExtracted > maxTotalBytes) { return 0 - 1; }
                 File.WriteAllBytes(outPath, content);
                 count = count + 1;
             }
@@ -343,12 +353,12 @@ public class Zip {
 
     // 从头扫描本地文件头签名找名称匹配的条目，返回其偏移；找不到返回 -1。
     private static int FindLocal(byte[] zip, string name) {
-        for (int i = 0; i + 30 <= zip.Length; i = i + 1) {
+        for (int i = 0; (long)i + 30L <= (long)zip.Length; i = i + 1) {
             if (Zip.ReadU32(zip, i) == Zip.SigLocal) {
                 int nameLen = Zip.ReadU16(zip, i + 26);
                 // 本地头本身 30 字节 + 名称必须落在归档内，
                 // 否则按损坏跳过，继续扫描下一个签名。
-                if (i + 30 + nameLen > zip.Length) { continue; }
+                if ((long)i + 30L + (long)nameLen > (long)zip.Length) { continue; }
                 if (nameLen == name.Length) {
                     bool same = true;
                     for (int k = 0; k < nameLen; k = k + 1) {

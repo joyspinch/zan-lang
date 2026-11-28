@@ -116,36 +116,49 @@ public class VideoBatch {
         } else {
             nint nextIdx = AtomicInt.NativeCreate(0);
             nint doneCount = AtomicInt.NativeCreate(0);
-            nint activeWorkers = AtomicInt.NativeCreate(workers);
+            nint activeWorkers = AtomicInt.NativeCreate(0);
             try {
+                if (nextIdx == 0 || doneCount == 0 || activeWorkers == 0) {
+                    throw new InvalidOperationException("VideoBatch: failed to allocate native atomics");
+                }
                 for (int w = 0; w < workers; w = w + 1) {
-                    bool started = Thread.Start(() => {
-                        try {
-                            while (true) {
-                                int idx = (int)AtomicInt.NativeAdd(nextIdx, 1) - 1;
-                                if (idx >= total) break;
-                                VideoBatchItemResult item = VideoBatch.ProcessOne(files[idx], outputPaths[idx], options);
-                                slots[idx] = item;
-                                int done = (int)AtomicInt.NativeAdd(doneCount, 1);
-                                if (options.OnProgress != null) {
-                                    options.OnProgress(done, total, item.InputPath, item.Succeeded);
+                    AtomicInt.NativeAdd(activeWorkers, 1);
+                    bool started = false;
+                    try {
+                        started = Thread.Start(() => {
+                            try {
+                                while (true) {
+                                    int idx = (int)AtomicInt.NativeAdd(nextIdx, 1) - 1;
+                                    if (idx >= total) break;
+                                    VideoBatchItemResult item = VideoBatch.ProcessOne(files[idx], outputPaths[idx], options);
+                                    slots[idx] = item;
+                                    int done = (int)AtomicInt.NativeAdd(doneCount, 1);
+                                    if (options.OnProgress != null) {
+                                        try {
+                                            options.OnProgress(done, total, item.InputPath, item.Succeeded);
+                                        } catch (Exception ex) { }
+                                    }
                                 }
+                            } finally {
+                                AtomicInt.NativeAdd(activeWorkers, -1);
                             }
-                        } finally {
+                        });
+                    } finally {
+                        if (!started) {
                             AtomicInt.NativeAdd(activeWorkers, -1);
                         }
-                    });
-                    if (!started) {
-                        AtomicInt.NativeAdd(activeWorkers, -1);
                     }
                 }
-                while (AtomicInt.NativeLoad(activeWorkers) > 0) {
-                    Thread.Sleep(5);
-                }
             } finally {
-                AtomicInt.NativeDestroy(nextIdx);
-                AtomicInt.NativeDestroy(doneCount);
-                AtomicInt.NativeDestroy(activeWorkers);
+                // 等待所有已启动工作线程退出后再销毁原生 AtomicInt，防止中途启动异常触发 UAF。
+                if (activeWorkers != 0) {
+                    while (AtomicInt.NativeLoad(activeWorkers) > 0) {
+                        Thread.Sleep(5);
+                    }
+                    AtomicInt.NativeDestroy(activeWorkers);
+                }
+                if (doneCount != 0) { AtomicInt.NativeDestroy(doneCount); }
+                if (nextIdx != 0) { AtomicInt.NativeDestroy(nextIdx); }
             }
         }
 

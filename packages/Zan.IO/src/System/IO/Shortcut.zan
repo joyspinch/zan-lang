@@ -40,13 +40,9 @@ public class Shortcut {
     // IPersistFile vtable 槽位 6：Save（写出 .lnk 文件）。
     private static int SlotSave() { return 6; }
 
-    static bool comReady = false;
-
-    // 首次使用时初始化 COM（进程内只做一次）。
+    // COM 按线程单元初始化，每次调用确保当前线程已初始化（CoInitializeEx 幂等）。
     private static void InitCom() {
-        if (Shortcut.comReady) { return; }
         Com.Initialize();
-        Shortcut.comReady = true;
     }
 
     // 在 `lnkPath` 处创建（或覆盖）一个指向
@@ -123,26 +119,45 @@ public class Shortcut {
     #endif
 
     #if LINUX || MACOS
+    // 拒绝含换行/空字节的 Desktop Entry 字段，防止 .desktop 行注入。
+    private static bool IsSafeDesktopField(string s) {
+        if (s == null) { return true; }
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i] & 255;
+            if (c == 0 || c == 10 || c == 13) { return false; }
+        }
+        return true;
+    }
+
     // freedesktop Desktop Entry Specification：一个带 [Desktop Entry] 头的
     // INI 文件，Type=Application 时 Exec 是要执行的命令行。
     private static bool WriteDesktopEntry(string path, string target, string arguments,
                                   string workingDir, string iconPath,
                                   string description) {
-        if (target == "") { return false; }
+        if (path == null || path == "" || target == null || target == "") { return false; }
+        string entryName = Shortcut.EntryName(path);
+        if (!Shortcut.IsSafeDesktopField(entryName)
+            || !Shortcut.IsSafeDesktopField(target)
+            || !Shortcut.IsSafeDesktopField(arguments)
+            || !Shortcut.IsSafeDesktopField(workingDir)
+            || !Shortcut.IsSafeDesktopField(iconPath)
+            || !Shortcut.IsSafeDesktopField(description)) {
+            return false;
+        }
         string exec = Shortcut.QuoteArg(target);
-        if (arguments != "") { exec = exec + " " + arguments; }
+        if (arguments != null && arguments != "") { exec = exec + " " + arguments; }
         StringBuilder sb = new StringBuilder();
         sb.Append("[Desktop Entry]\n");
         sb.Append("Version=1.0\n");
         sb.Append("Type=Application\n");
         sb.Append("Name=");
-        sb.Append(Shortcut.EntryName(path));
+        sb.Append(entryName);
         sb.Append("\nExec=");
         sb.Append(exec);
         sb.Append("\n");
-        if (workingDir != "") { sb.Append("Path="); sb.Append(workingDir); sb.Append("\n"); }
-        if (iconPath != "") { sb.Append("Icon="); sb.Append(iconPath); sb.Append("\n"); }
-        if (description != "") { sb.Append("Comment="); sb.Append(description); sb.Append("\n"); }
+        if (workingDir != null && workingDir != "") { sb.Append("Path="); sb.Append(workingDir); sb.Append("\n"); }
+        if (iconPath != null && iconPath != "") { sb.Append("Icon="); sb.Append(iconPath); sb.Append("\n"); }
+        if (description != null && description != "") { sb.Append("Comment="); sb.Append(description); sb.Append("\n"); }
         sb.Append("Terminal=false\n");
         try {
             File.WriteAllText(path, sb.ToString());
@@ -284,10 +299,12 @@ public class Shortcut {
     #if WINDOWS
     private static string GetPath(nint shell) {
         nint buf = NativeMemory.Alloc(2048 * 2 + 2);
+        if (buf == 0) { return ""; }
+        NativeMemory.Fill(buf, 0, 2);
         string s = "";
         try {
             int hr = Com.Call4(shell, Shortcut.SlotGetPath(), buf, 2048, 0, 0);
-            if (Com.Ok(hr)) { s = Wide.Read(buf); }
+            if (hr == 0) { s = Wide.Read(buf); }
         } finally {
             NativeMemory.Free(buf);
         }
@@ -297,10 +314,12 @@ public class Shortcut {
     // 形状为 (LPWSTR, int cch) 的 getter。
     private static string GetText(nint shell, int slot) {
         nint buf = NativeMemory.Alloc(2048 * 2 + 2);
+        if (buf == 0) { return ""; }
+        NativeMemory.Fill(buf, 0, 2);
         string s = "";
         try {
             int hr = Com.Call2(shell, slot, buf, 2048);
-            if (Com.Ok(hr)) { s = Wide.Read(buf); }
+            if (hr == 0) { s = Wide.Read(buf); }
         } finally {
             NativeMemory.Free(buf);
         }
@@ -311,10 +330,17 @@ public class Shortcut {
     private static string GetIconPath(nint shell) {
         nint buf = NativeMemory.Alloc(2048 * 2 + 2);
         nint idx = NativeMemory.Alloc(4);
+        if (buf == 0 || idx == 0) {
+            if (idx != 0) { NativeMemory.Free(idx); }
+            if (buf != 0) { NativeMemory.Free(buf); }
+            return "";
+        }
+        NativeMemory.Fill(buf, 0, 2);
+        NativeMemory.Fill(idx, 0, 4);
         string s = "";
         try {
             int hr = Com.Call3(shell, Shortcut.SlotGetIconLocation(), buf, 2048, idx);
-            if (Com.Ok(hr)) { s = Wide.Read(buf); }
+            if (hr == 0) { s = Wide.Read(buf); }
         } finally {
             NativeMemory.Free(idx);
             NativeMemory.Free(buf);
@@ -326,10 +352,17 @@ public class Shortcut {
     private static int GetIconIndex(nint shell) {
         nint buf = NativeMemory.Alloc(2048 * 2 + 2);
         nint idx = NativeMemory.Alloc(4);
+        if (buf == 0 || idx == 0) {
+            if (idx != 0) { NativeMemory.Free(idx); }
+            if (buf != 0) { NativeMemory.Free(buf); }
+            return 0;
+        }
+        NativeMemory.Fill(buf, 0, 2);
+        NativeMemory.Fill(idx, 0, 4);
         int v = 0;
         try {
             int hr = Com.Call3(shell, Shortcut.SlotGetIconLocation(), buf, 2048, idx);
-            if (Com.Ok(hr)) { v = new Span<int>(idx, 1)[0]; }
+            if (hr == 0) { v = new Span<int>(idx, 1)[0]; }
         } finally {
             NativeMemory.Free(idx);
             NativeMemory.Free(buf);

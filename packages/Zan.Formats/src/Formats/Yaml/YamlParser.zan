@@ -18,6 +18,7 @@ public class YamlParser {
     List<string> lineTexts;
     List<int> lineNos;
     Dict<string, JsonValue> anchors;
+    int aliasExpansions;
     string[] keyCache;
     int cur;
     int lineCount;
@@ -32,10 +33,12 @@ public class YamlParser {
 
     // 构造并做行切分与前导处理（BOM/指令/前导注释/一个 --- 起始符）。
     public YamlParser(string src) {
+        if (src == null) { src = ""; }
         lineIndents = new List<int>();
         lineTexts = new List<string>();
         lineNos = new List<int>();
         anchors = new Dict<string, JsonValue>();
+        aliasExpansions = 0;
         keyCache = null;
         // BOM 是编码标记不是内容：文件路径已由 File.ReadAllText 剥过，
         // 网络/内嵌文本（Windows 工具常带 EF BB BF）在这里兜底，不剥
@@ -371,6 +374,11 @@ public class YamlParser {
     // ===== 锚点/别名 =====
 
     JsonValue ResolveAlias(string rest) {
+        aliasExpansions = aliasExpansions + 1;
+        if (aliasExpansions > 10000) {
+            throw new YamlException("YAML alias expansion limit exceeded (line "
+                + Convert.ToString(lastLineNo) + ")");
+        }
         string trimmed = StripComment(rest);
         string name = trimmed.Substring(1);
         JsonValue found = null;
@@ -746,6 +754,10 @@ public class YamlParser {
     }
 
     JsonValue ResolveAliasFlow(string s, ref int at) {
+        aliasExpansions = aliasExpansions + 1;
+        if (aliasExpansions > 10000) {
+            throw new YamlException("YAML alias expansion limit exceeded");
+        }
         int start = at;
         at = at + 1;
         int n = s.Length;
@@ -792,9 +804,8 @@ public class YamlParser {
                 }
                 at = at + 1;
             }
-            if (sb == null) { return JsonValue.NewStr(s.Substring(chunkStart, at - chunkStart)); }
-            if (at > chunkStart) { sb.Append(new StringView(sp + (nint)chunkStart, at - chunkStart)); }
-            return JsonValue.NewStr(sb.ToString());
+            throw new YamlException("unterminated double-quoted string (line "
+                + Convert.ToString(lastLineNo) + ")");
         }
         if (c == 39) {  // 单引
             StringBuilder sb = null;
@@ -824,9 +835,8 @@ public class YamlParser {
                 }
                 at = at + 1;
             }
-            if (sb == null) { return JsonValue.NewStr(s.Substring(chunkStart, at - chunkStart)); }
-            if (at > chunkStart) { sb.Append(new StringView(sp + (nint)chunkStart, at - chunkStart)); }
-            return JsonValue.NewStr(sb.ToString());
+            throw new YamlException("unterminated single-quoted string (line "
+                + Convert.ToString(lastLineNo) + ")");
         }
         int start = at;
         int m = s.Length;
@@ -941,9 +951,8 @@ public class YamlParser {
             }
             at = at + 1;
         }
-        if (sb == null) { return NativeMemory.GetString(tp, start, at - start); }
-        if (at > start) { sb.Append(new StringView(tp + (nint)start, at - start)); }
-        return sb.ToString();
+        throw new YamlException("unterminated double-quoted string (line "
+            + Convert.ToString(lastLineNo) + ")");
     }
 
     // 单引标量（整段含首尾引号）解码：'' → '（无转义快路径零 StringBuilder，转义段走 StringView）。
@@ -973,9 +982,8 @@ public class YamlParser {
             }
             at = at + 1;
         }
-        if (sb == null) { return NativeMemory.GetString(tp, start, at - start); }
-        if (at > start) { sb.Append(new StringView(tp + (nint)start, at - start)); }
-        return sb.ToString();
+        throw new YamlException("unterminated single-quoted string (line "
+            + Convert.ToString(lastLineNo) + ")");
     }
 
     // 反斜杠转义（s[at] 在转义符上），解码追加到 sb。
@@ -1196,16 +1204,27 @@ public class YamlParser {
                 }
             } else {
                 int k = i;
+                bool isMinI64 = false;
                 while (k < n) {
                     int c = s[k] & 255;
                     if (c < 48 || c > 57) { isInt = false; break; }
-                    if (v > 922337203685477579L) { overflow = true; }
-                    v = v * 10 + (c - 48);
+                    int d = c - 48;
+                    if (v > 922337203685477580L) {
+                        overflow = true;
+                    } else if (v == 922337203685477580L) {
+                        if (neg && d == 8) { isMinI64 = true; v = 0L; }
+                        else if (d > 7) { overflow = true; }
+                        else { v = v * 10L + (long)d; }
+                    } else {
+                        if (isMinI64) { overflow = true; }
+                        v = v * 10L + (long)d;
+                    }
                     k = k + 1;
                 }
                 if (isInt) {
                     if (overflow) { return JsonValue.NewStr(s); }
-                    return JsonValue.NewInt(neg ? (0 - v) : v);
+                    if (isMinI64) { return JsonValue.NewInt(-9223372036854775807L - 1L); }
+                    return JsonValue.NewInt(neg ? (0L - v) : v);
                 }
             }
         }
@@ -1252,9 +1271,14 @@ public class YamlParser {
             if (ex > 324) {
                 acc = eneg ? 0.0 : (acc == 0.0 ? 0.0 : NativeMemory.AsF64(0x7FF0000000000000L));
             } else if (ex > 0) {
+                // 分段缩防 10^ex 在 309..324 区间溢出为 Inf 导致有效次正规数归零。
+                int e = ex;
+                if (eneg && e > 300) {
+                    acc = acc / 1.0e300;
+                    e = e - 300;
+                }
                 double p = 1.0;
                 double base10 = 10.0;
-                int e = ex;
                 while (e > 0) {
                     if ((e & 1) != 0) { p = p * base10; }
                     base10 = base10 * base10;
