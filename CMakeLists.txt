@@ -3622,6 +3622,19 @@ add_test(NAME conformance_gui_css_color_inherit
 set_tests_properties(conformance_gui_css_color_inherit PROPERTIES
     TIMEOUT 240 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
+# 圆形/大圆角定宽按钮：圆角安全内边距（3/4 半径）曾把内容区挤到 1/4 宽，
+# 单字图标与两位数字被裁成空白；留白必须让位给内容的首选宽度。
+add_test(NAME conformance_gui_button_round_caption
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/button_round_caption_test.zan
+    "-DZANC_ARGS=--auto-stdlib"
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_button_round_caption.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_button_round_caption${_exe_ext}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+set_tests_properties(conformance_gui_button_round_caption PROPERTIES
+    TIMEOUT 240 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
 set(_cw_publish_doc "${CMAKE_SOURCE_DIR}/tests/gui/cwpublish")
 set(_cw_publish_cwd "${CMAKE_BINARY_DIR}/cases/cwpublish_cwd")
 file(MAKE_DIRECTORY "${_cw_publish_cwd}")
