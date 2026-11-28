@@ -2,7 +2,9 @@ using System;
 using System.Collections.Generic;
 using System.Data.Orm;
 using System.Data;
+using System.Json;
 using System.Web;
+using Zan.Web.AdminUi;
 using Zan.Web.Core;
 using Zan.Web.Dao;
 using Zan.Web.Model;
@@ -11,65 +13,70 @@ using Zan.Web;
 
 namespace Zan.Web.Admin;
 
-/* /admin 仪表盘：系统当前持有的内容与运行状态；实时数字与监控同取一份快照，经 metrics 事件流推送，避免定时重载。登录后的落地页不是固定 URL——Attempt 按账号可达菜单动态解析（MenuBuilder.LandingFor），本屏无需承接区根。 */
+/* /admin/dashboard 仪表盘：纯 JSON 协议，由 adminUI DynamicDashboardPage 渲染。 */
 [Custom(Authorization = CustomAuthorization.Login)]
 [Description("仪表盘")]
 public class DashboardController : AdminController {
-    /* 侧边栏条目即此属性——见 AdminController.Layout，向 MenuBuilder 询问该账号可到达的项。 */
+    /* 侧边栏菜单发现锚点。 */
     [HttpGet]
     [Custom(IsMenu = true, Icon = "mdi:gauge")]
     [Description("仪表盘")]
     public async void Index() {
-        ViewData d = await this.Layout("仪表盘");
+        await this.Summary();
+    }
 
+    [HttpPut]
+    [Description("仪表盘页面配置")]
+    public void Conf() {
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("PageType", "dashboard");
+        w.WriteProperty("mode", "overview");
+        w.WriteProperty("title", "仪表盘");
+        w.WriteProperty("subtitle", "系统运行概览与近期登录活动");
+        w.WriteProperty("dataUrl", "summary");
+        w.WriteProperty("streamUrl", "/admin/monitor/monitor/stream");
+        w.WriteProperty("alertsUrl", "/admin/monitor/monitor/alerts");
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(this, w.ToString());
+    }
+
+    [HttpGet]
+    [Description("仪表盘汇总数据")]
+    public async void Summary() {
         JsonDoc m = JsonDoc.Parse(WebHost.Current().MetricsJson());
         long totalReq = m != null ? m.PathLong("requests.count", 0L) : 0L;
         long totalErr = m != null ? m.PathLong("requests.errors", 0L) : 0L;
         long avgUs = m != null ? m.PathLong("requests.avg_us", 0L) : 0L;
         long uptimeMs = m != null ? m.PathLong("uptime_ms", 0L) : 0L;
 
-        d.Set("requests", Convert.ToString(totalReq));
-        d.Set("errors", Convert.ToString(totalErr));
-        d.Set("avg", Fmt.Dur(avgUs));
-        d.Set("uptime", Fmt.Uptime(uptimeMs));
-
-        /* 错误率：KPI 卡的第二行。没有请求时写 0.0%，不写"—"——
-           "0 错误 / 0 请求"的比值是 0%，不是未知。 */
         string rate = "0.0%";
         if (totalReq > 0) {
             long permille = totalErr * 1000 / totalReq;
             rate = Convert.ToString(permille / 10) + "."
                 + Convert.ToString(permille % 10) + "%";
         }
-        d.Set("errorRate", rate);
 
-        d.Set("users", "—");
+        string usersText = "—";
+        bool dbDown = true;
+        List<string> extraKeys = new List<string>();
+        Dictionary<string, string> extra = new Dictionary<string, string>();
+        List<Zan.Web.Model.SysLoginLog> logins = new List<Zan.Web.Model.SysLoginLog>();
+
         if (this.DbReady()) {
+            dbDown = false;
             DataScope sc = await this.Scope();
             List<int> scoped = sc.Depts();
             int mine = sc.UserId();
 
             int users = await this.SysUser.CountScoped(sc.ByDept(), scoped, sc.Mine(), mine);
-            d.Set("users", Convert.ToString(users));
+            usersText = Convert.ToString(users);
 
             if (MvcHooks.HasSummaryHooks()) {
-                Dictionary<string, string> extra = new Dictionary<string, string>();
                 await MvcHooks.RunSummaryHooks(this.Held(), sc, extra);
-                List<StrMap> stats = d.AddList("stats");
-                List<string> keys = extra.Keys;
-                for (int i = 0; i < keys.Count; i = i + 1) {
-                    string k = keys[i];
-                    if (k == null || k.Length == 0) { continue; }
-                    string v = "";
-                    extra.TryGetValue(k, out v);
-                    StrMap item = new StrMap();
-                    item.Set("label", k);
-                    item.Set("value", v == null ? "" : v);
-                    stats.Add(item);
-                }
+                extraKeys = extra.Keys;
             }
 
-            /* 登录记录按用户名匹配（非归属）：一条登录行写于对应账号确认之前，故用本 scope 覆盖的用户名匹配——与登录日志屏同一规则。 */
             List<string> names = new List<string>();
             if (!sc.Any()) {
                 List<Zan.Web.Model.SysUser> members = await this.SysUser
@@ -81,16 +88,54 @@ public class DashboardController : AdminController {
             }
             bool byName = !sc.Any() && names.Count > 0;
             bool nothing = !sc.Any() && names.Count == 0;
-            List<Zan.Web.Model.SysLoginLog> logins = await this.SysLoginLog
+            logins = await this.SysLoginLog
                 .WhereIf(byName, a => names.Contains(a.username))
                 .WhereIf(nothing, a => a.id < 0)
                 .OrderByDescending(a => a.id).Take(8).ToListAsync();
-            List<StrMap> lrows = d.AddList("logins");
-            Rows.Project(logins, lrows);
-            if (logins.Count == 0) { d.Set("noLogins", "1"); }
-        } else {
-            d.Set("dbDown", "1");
         }
-        this.Page(d);
+
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("requests", totalReq);
+        w.WriteProperty("errors", totalErr);
+        w.WriteProperty("errorRate", rate);
+        w.WriteProperty("avg", Fmt.Dur(avgUs));
+        w.WriteProperty("avgUs", avgUs);
+        w.WriteProperty("uptime", Fmt.Uptime(uptimeMs));
+        w.WriteProperty("uptimeMs", uptimeMs);
+        w.WriteProperty("users", usersText);
+        w.WriteProperty("dbDown", dbDown);
+
+        w.WritePropertyName("stats");
+        w.WriteStartArray();
+        for (int i = 0; i < extraKeys.Count; i = i + 1) {
+            string k = extraKeys[i];
+            if (k == null || k.Length == 0) { continue; }
+            string v = "";
+            extra.TryGetValue(k, out v);
+            w.WriteStartObject();
+            w.WriteProperty("label", k);
+            w.WriteProperty("value", v == null ? "" : v);
+            w.WriteEndObject();
+        }
+        w.WriteEndArray();
+
+        w.WritePropertyName("logins");
+        w.WriteStartArray();
+        for (int i = 0; i < logins.Count; i = i + 1) {
+            Zan.Web.Model.SysLoginLog r = logins[i];
+            w.WriteStartObject();
+            w.WriteProperty("id", r.id);
+            w.WriteProperty("username", r.username);
+            w.WriteProperty("ip", r.ip);
+            w.WriteProperty("ok", r.ok);
+            w.WriteProperty("reason", r.message == null ? "" : r.message);
+            w.WriteProperty("createdAt", Fmt.Stamp(r.createdAt));
+            w.WriteEndObject();
+        }
+        w.WriteEndArray();
+
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(this, w.ToString());
     }
 }

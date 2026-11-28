@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 
-for (const layout of ['layout.html', 'Admin/layout.html', 'Account/layout.html']) {
+for (const layout of ['layout.html', 'Account/layout.html']) {
   const source = fs.readFileSync(path.join(__dirname, '../../packages/Zan.Mvc/views', layout), 'utf8');
   assert.ok(source.includes('/static/js/csrf.js'), layout + ' wires CSRF transport');
 }

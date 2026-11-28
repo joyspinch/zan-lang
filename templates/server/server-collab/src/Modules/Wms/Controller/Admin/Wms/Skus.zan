@@ -1,30 +1,67 @@
 using System;
+using Formats.Csv;
 using System.Data;
 using System.Data.Orm;
+using System.Json;
 using System.Web;
 using Zan.Web;
+using Zan.Web.AdminUi;
 using Zan.Web.Dao.Wms;
 using Zan.Web.Model;
 using Zan.Web.Model.Wms;
 
 namespace Zan.Web.Admin.Wms;
 
-/* /admin/wms/skus 商品(SKU)主数据：搜索、建、编、删。库存数量不在此表，由流水汇总到 wms_inventory。 */
+/* /admin/wms/skus 商品(SKU)主数据：搜索、建、编、删、导入导出。 */
 [Route("admin/wms/skus/[action]")]
 [Custom(Authorization = CustomAuthorization.Grant)]
 [Description("商品管理")]
 public class Skus : CollabAdminController {
+    static ListPage ScreenDef() {
+        return ListPage.Of()
+            .Text("名称 / SKU", "kw", "name|sku", "搜索商品名称或 SKU")
+            .TbarAdd("新增商品", "/admin/wms/skus/form")
+            .TbarDownload("导出 Excel", "/admin/wms/skus/export?xlsx=1")
+            .TbarDownload("下载模板", "/admin/wms/skus/template")
+            .Col("id", "ID", "num", "75")
+            .Col("sku", "SKU 编码", "text", "150")
+            .Col("name", "商品名称", "text", "200")
+            .Col("unit", "单位", "text", "85")
+            .Col("spec", "规格", "text", "200")
+            .OpsEdit("/admin/wms/skus/form")
+            .OpsDel("/admin/wms/skus/delete", "确认删除该商品吗？");
+    }
+
+    static FormPage FormDef() {
+        return FormPage.Of("/admin/wms/skus/save")
+            .Text("SKU 编码", "sku").Req().Ph("例如：SKU-0001")
+            .Text("商品名称", "name").Req().Ph("请输入商品名称")
+            .Text("计量单位", "unit").Ph("例如：件、箱、台")
+            .Text("规格说明", "spec").Ph("例如：10cm x 20cm");
+    }
+
     [HttpGet]
     [Route("/admin/wms/skus")]
     [Custom(IsMenu = true, Icon = "mdi:barcode", Perm = PermBit.View)]
     [Description("商品管理")]
-    async void Index() {
-        ViewData d = await this.Layout("商品管理");
-        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+    void Index() {
+        this.Conf();
+    }
 
-        ListQuery q = this.Paged("id", 20);
+    [HttpPut]
+    [Custom(Perm = PermBit.View)]
+    [Description("商品表格配置")]
+    public void Conf() {
+        CrudOps.Conf(this, Skus.ScreenDef());
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.View)]
+    [Description("商品列表数据")]
+    public async void List() {
+        if (!this.DataReady()) { return; }
+        ListQuery q = this.PagedAny("id", 20);
         string kw = q.Kw();
-        /* 租户硬边（#34）：列表只出本租户行。 */
         List<WmsSku> rows = await this.WmsSku
             .Where(a => a.tenantId == Tenant.Cur())
             .WhereIf(kw.Length > 0, a => a.name.Contains(kw) || a.sku.Contains(kw))
@@ -35,55 +72,58 @@ public class Skus : CollabAdminController {
             .WhereIf(kw.Length > 0, a => a.name.Contains(kw) || a.sku.Contains(kw))
             .CountAsync();
 
-        List<StrMap> items = d.AddList("rows");
+        JsonWriter w = new JsonWriter();
+        w.WriteStartArray();
         for (int i = 0; i < rows.Count; i = i + 1) {
             WmsSku s = rows[i];
-            StrMap row = new StrMap();
-            row.Set("id", Convert.ToString(s.id));
-            row.Set("sku", s.sku);
-            row.Set("name", s.name);
-            row.Set("unit", Fmt.Dash(s.unit));
-            row.Set("spec", Fmt.Dash(s.spec));
-            items.Add(row);
+            w.WriteStartObject();
+            w.WriteProperty("id", s.id);
+            w.WriteProperty("sku", s.sku);
+            w.WriteProperty("name", s.name);
+            w.WriteProperty("unit", Fmt.Dash(s.unit));
+            w.WriteProperty("spec", Fmt.Dash(s.spec));
+            w.WriteEndObject();
         }
-        this.Pager(d, q, total);
-        this.Page(d);
+        w.WriteEndArray();
+        AdminUiProtocol.WriteListData(this, total, w.ToString());
     }
 
-    [HttpGet]
+    [HttpPut]
     [Custom(Perm = PermBit.Create | PermBit.Update)]
-    [Description("商品表单")]
-    async void Form() {
-        int id = this.InInt("id", 0);
-        ViewData d = new ViewData();
-        d.Set("id", Convert.ToString(id));
-        d.Set("dialogTitle", "新增商品");
-        d.Set("new", "1");
-        if (id > 0) {
-            WmsSku s = await this.WmsSku
-                .Where(a => a.id == id && a.tenantId == Tenant.Cur())
-                .FirstAsync();
-            if (s == null) { this.Fail(404, "0404", "商品不存在"); }
-            d.Set("dialogTitle", "编辑商品");
-            d.Set("sku", s.sku);
-            d.Set("name", s.name);
-            d.Set("unit", s.unit);
-            d.Set("spec", s.spec);
-            d.Set("edit", "1");
-            d.Set("new", "");
-        }
-        this.Dialog(d);
+    [Description("商品表单配置")]
+    public void FormConf() {
+        CrudOps.FormConf(this, Skus.FormDef(), "商品");
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.View)]
+    [Description("商品编辑回显")]
+    public async void Edit() {
+        int id = this.InAnyInt("id", 0);
+        WmsSku s = await this.WmsSku
+            .Where(a => a.id == id && a.tenantId == Tenant.Cur())
+            .FirstAsync();
+        if (s == null) { this.Fail(404, "0404", "商品不存在"); return; }
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("id", s.id);
+        w.WriteProperty("sku", s.sku);
+        w.WriteProperty("name", s.name);
+        w.WriteProperty("unit", s.unit);
+        w.WriteProperty("spec", s.spec);
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(this, w.ToString());
     }
 
     [HttpPost]
     [Custom(Perm = PermBit.Create | PermBit.Update)]
     [Description("保存商品")]
     async void Save() {
-        int id = this.InInt("id", 0);
-        string sku = this.Need("sku", "SKU 编码");
-        string name = this.Need("name", "商品名称");
-        string unit = this.In("unit");
-        string spec = this.In("spec");
+        int id = this.InAnyInt("id", 0);
+        string sku = this.NeedAny("sku", "SKU 编码");
+        string name = this.NeedAny("name", "商品名称");
+        string unit = this.InAny("unit");
+        string spec = this.InAny("spec");
         if (id > 0) {
             int n = await this.WmsSku.Update()
                 .Set(a => a.sku, sku)
@@ -114,11 +154,11 @@ public class Skus : CollabAdminController {
     [Custom(Perm = PermBit.Delete)]
     [Description("删除商品")]
     async void Delete() {
-        int id = this.InInt("id", 0);
+        int id = this.InAnyInt("id", 0);
         WmsSku s = await this.WmsSku
             .Where(a => a.id == id && a.tenantId == Tenant.Cur())
             .FirstAsync();
-        if (s == null) { this.Fail(404, "0404", "商品不存在"); }
+        if (s == null) { this.Fail(404, "0404", "商品不存在"); return; }
         int n = await this.WmsSku.Delete()
             .Where(a => a.id == id && a.tenantId == Tenant.Cur())
             .ExecuteAffrowsAsync();
@@ -143,7 +183,6 @@ public class Skus : CollabAdminController {
         return r;
     }
 
-    /* ImportRow 处理器：同步 + 强类型 ImportRecord 容器。 */
     static string SaveRow(IDbConnection db, int tenantId, SysUser me,
                           ImportRecord rec) {
         string sku = ExcelIo.Rec(rec, "SKU编码");
@@ -165,7 +204,7 @@ public class Skus : CollabAdminController {
     [Custom(Perm = PermBit.Export)]
     [Description("导出商品")]
     async void Export() {
-        bool xlsx = this.InInt("xlsx", 0) == 1;
+        bool xlsx = this.InAnyInt("xlsx", 0) == 1;
         List<WmsSku> rows = await this.WmsSku
             .Where(a => a.tenantId == Tenant.Cur())
             .OrderBy(a => a.id).ToListAsync();
@@ -196,6 +235,7 @@ public class Skus : CollabAdminController {
         SysUser me = await this.Admin();
         if (this.ctx.UploadPath().Length == 0) {
             this.Fail(400, "1002", "没有上传内容");
+            return;
         }
         string text = File.ReadAllText(this.ctx.UploadPath());
         int batchId = await ExcelIo.Import(this.Held(), Tenant.Cur(),

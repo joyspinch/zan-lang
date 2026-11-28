@@ -205,6 +205,8 @@ public class Boot {
             /* 静态文件挂载：仅静态根目录可被外部访问；支持 staticDir 优先、回退到 baseStaticDir / extraStaticDirs。 */
             StaticFiles.MaxAge(Cfg.Server.staticMaxAge);
             MountLayeredStatic(app);
+            /* 通用前端 SPA 壳静态托管（如 adminUI/dist）：仅当 server.spaDir 配置且目录存在时生效。 */
+            MountAdminSpa(app);
         } else {
             Console.WriteLine("[server] mode=api (headless): views and static assets bypassed");
         }
@@ -486,6 +488,107 @@ public class Boot {
         return StaticFiles.ServeFile(ctx, rel, Cfg.Server.staticDir, Cfg.Server.staticUrl, Cfg.Server.staticMaxAge);
     }
 
+    private static string resolvedSpaUrl = "";
+    private static string resolvedSpaDir = "";
+
+    /* 规范化管理端 SPA 入口根路径（默认 /ui）。 */
+    public static string SpaUrl() {
+        string url = resolvedSpaUrl;
+        if (url.Length == 0 && Cfg.Server != null && Cfg.Server.spaUrl != null) {
+            url = Cfg.Server.spaUrl.Trim();
+        }
+        if (url.Length == 0) { url = "/ui"; }
+        if (!url.StartsWith("/")) { url = "/" + url; }
+        while (url.Length > 1 && url.EndsWith("/")) {
+            url = url.Substring(0, url.Length - 1);
+        }
+        return url;
+    }
+
+    /* 通用管理端 SPA 壳静态托管 + History API 回退（如 adminUI/dist 挂到 /ui）：
+       - 命中真实静态文件（assets/js/css/img/fonts 等）时直接流式返回；
+       - 命中前端虚拟路由（非静态资产后缀）时回退返回 index.html（Cache-Control: no-cache）；
+       - 未配置 spaDir 或目录不含 index.html 时零介入，不改变既有 SSR 行为。 */
+    public static void MountAdminSpa(WebApp app) {
+        if (app == null) { return; }
+        string dir = Cfg.Server.spaDir != null ? Cfg.Server.spaDir.Trim() : "";
+        if (dir.Length == 0) { return; }
+        string indexFull = Directory.ReadPath(dir + "/index.html");
+        if (!File.Exists(indexFull) && !File.EmbedExists(indexFull)) { return; }
+        string url = Cfg.Server.spaUrl != null ? Cfg.Server.spaUrl.Trim() : "/ui";
+        if (url.Length == 0) { url = "/ui"; }
+        if (!url.StartsWith("/")) { url = "/" + url; }
+        while (url.Length > 1 && url.EndsWith("/")) {
+            url = url.Substring(0, url.Length - 1);
+        }
+        resolvedSpaUrl = url;
+        resolvedSpaDir = dir;
+        app.Before(AdminSpaHook);
+        Log.Debug("[spa] mounted " + resolvedSpaUrl + " -> " + resolvedSpaDir);
+    }
+
+    public static bool AdminSpaHook(HttpContext ctx) {
+        if (ctx == null || resolvedSpaDir.Length == 0) { return true; }
+        string method = ctx.Method();
+        if (method != "GET" && method != "HEAD") { return true; }
+        string path = ctx.Path();
+        if (resolvedSpaUrl == "/") {
+            if (PathIs(path, "/api") || PathIs(path, "/admin") || PathIs(path, "/users")
+                || PathIs(path, "/route") || PathIs(path, Cfg.Server.staticUrl)
+                || path == "/health" || path == "/login" || path == "/register") {
+                return true;
+            }
+            string relRoot = path.Length > 1 ? path.Substring(1) : "";
+            return ServeSpaPath(ctx, relRoot);
+        }
+        if (path == "/admin" || path == "/admin/") {
+            ctx.Redirect(resolvedSpaUrl);
+            return false;
+        }
+        if (path == resolvedSpaUrl) {
+            return ServeSpaIndex(ctx);
+        }
+        string prefix = resolvedSpaUrl + "/";
+        if (!path.StartsWith(prefix)) { return true; }
+        string rel = path.Substring(prefix.Length);
+        return ServeSpaPath(ctx, rel);
+    }
+
+    private static bool ServeSpaPath(HttpContext ctx, string rel) {
+        if (rel.Length == 0) { return ServeSpaIndex(ctx); }
+        if (!StaticFiles.IsSafe(rel)) {
+            ctx.Status(404, "Not Found").Text("not found");
+            return false;
+        }
+        string full = Directory.ReadPath(resolvedSpaDir + "/" + rel);
+        if (File.Exists(full) || File.EmbedExists(full)) {
+            int age = rel.StartsWith("assets/") ? 31536000 : Cfg.Server.staticMaxAge;
+            return StaticFiles.ServeFile(ctx, rel, resolvedSpaDir, resolvedSpaUrl, age);
+        }
+        if (LooksLikeAsset(rel)) {
+            ctx.Status(404, "Not Found").Text("not found");
+            return false;
+        }
+        return ServeSpaIndex(ctx);
+    }
+
+    private static bool ServeSpaIndex(HttpContext ctx) {
+        ctx.SetHeader("Cache-Control", "no-cache");
+        return StaticFiles.ServeFile(ctx, "index.html", resolvedSpaDir, resolvedSpaUrl, 0);
+    }
+
+    private static bool LooksLikeAsset(string rel) {
+        int slash = rel.LastIndexOf("/");
+        string name = slash >= 0 ? rel.Substring(slash + 1) : rel;
+        int dot = name.LastIndexOf(".");
+        if (dot <= 0 || dot >= name.Length - 1) { return false; }
+        string ext = name.Substring(dot + 1).ToLower();
+        return ext == "js" || ext == "mjs" || ext == "css" || ext == "map"
+            || ext == "png" || ext == "jpg" || ext == "jpeg" || ext == "gif"
+            || ext == "webp" || ext == "svg" || ext == "ico"
+            || ext == "woff" || ext == "woff2" || ext == "ttf" || ext == "json";
+    }
+
     // double-submit 闸的浏览器形态过滤：真闸在 Csrf.Guard。
     private static bool CsrfGuard(HttpContext ctx) {
         bool safe = ctx.Method() == "GET" || ctx.Method() == "HEAD"
@@ -510,7 +613,8 @@ public class Boot {
        允许同源提交，跨站由 Csrf.Guard 把守。 */
     public static bool SecurityHeaders(HttpContext ctx) {
         ctx.SetHeader("X-Content-Type-Options", "nosniff");
-        ctx.SetHeader("X-Frame-Options", "DENY");
+        string xfo = (Cfg.Server.spaDir != null && Cfg.Server.spaDir.Trim().Length > 0) ? "SAMEORIGIN" : "DENY";
+        ctx.SetHeader("X-Frame-Options", xfo);
         // no-referrer makes native form POSTs send Origin:null under Fetch's Origin algorithm.
         ctx.SetHeader("Referrer-Policy", "strict-origin-when-cross-origin");
         if (Cfg.Security.csp) {

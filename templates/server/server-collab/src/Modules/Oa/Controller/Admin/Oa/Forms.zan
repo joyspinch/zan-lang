@@ -2,29 +2,58 @@ using System;
 using System.Collections;
 using System.Data;
 using System.Data.Orm;
+using System.Json;
 using System.Web;
+using Zan.Web.AdminUi;
 using Zan.Web.Model.Flow;
 using Zan.Web.Model.Oa;
 using Zan.Web.Model;
 
 namespace Zan.Web.Admin.Oa;
 
-/* 表单定义：TEXT 存 JSON。schemaJson 经 FormSchema.Parse 结构校验非法不入库；
-   code 租户内 UNIQUE。有提交记录禁删改 schema。
-   预览与填报/详情共用 FormSchema.Render。 */
+/* 表单定义：JSON Schema 校验、绑定流程、启停与防误删保护。 */
 [Route("admin/oa/forms/[action]")]
 [Custom(Authorization = CustomAuthorization.Grant)]
 [Description("表单定义")]
 public class Forms : CollabAdminController {
+    static ListPage ScreenDef() {
+        return ListPage.Of()
+            .Text("表单名称", "kw", "name", "搜索表单名称")
+            .TbarAdd("新建表单", "/admin/oa/forms/form")
+            .Col("id", "ID", "num", "75")
+            .Col("code", "表单标识", "text", "140")
+            .Col("name", "表单名称", "text", "180")
+            .Col("flowName", "绑定流程", "text", "150")
+            .Col("subs", "提交数", "num", "90")
+            .Tag("status", "状态", "1=启用|ok,0=停用|off", "85")
+            .Col("description", "说明", "text", "200")
+            .Col("createdAt", "创建时间", "text", "160")
+            .OpsEdit("/admin/oa/forms/form")
+            .Ops("启停", "/admin/oa/forms/status", "确认切换该表单启停状态吗？", "id={id}", "u")
+            .OpsDel("/admin/oa/forms/delete", "确认删除该表单定义吗？");
+    }
+
     [HttpGet]
     [Route("/admin/oa/forms")]
     [Custom(IsMenu = true, Icon = "mdi:form-textbox", Perm = PermBit.View)]
     [Description("表单定义")]
-    public async void Index() {
-        SysUser me = await this.Admin();
-        ViewData d = await this.Layout("表单定义");
-        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
-        ListQuery q = this.Paged("id", 20);
+    public void Index() {
+        this.Conf();
+    }
+
+    [HttpPut]
+    [Custom(Perm = PermBit.View)]
+    [Description("表单定义表格配置")]
+    public void Conf() {
+        CrudOps.Conf(this, Forms.ScreenDef());
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.View)]
+    [Description("表单定义列表数据")]
+    public async void List() {
+        if (!this.DataReady()) { return; }
+        ListQuery q = this.PagedAny("id", 20);
         string kw = q.Kw();
         List<OaFormDef> rows = await this.OaFormDef
             .Where(a => a.tenantId == Tenant.Cur())
@@ -34,92 +63,74 @@ public class Forms : CollabAdminController {
         int total = await this.OaFormDef
             .Where(a => a.tenantId == Tenant.Cur())
             .WhereIf(kw.Length > 0, a => a.name.Contains(kw)).CountAsync();
-        d.Set("kw", kw);
-        d.Set("empty", total == 0 ? "1" : "");
-        d.Set("canCreate", await this.Can(PermBit.Create) ? "1" : "");
-        d.Set("canUpdate", await this.Can(PermBit.Update) ? "1" : "");
-        d.Set("canDelete", await this.Can(PermBit.Delete) ? "1" : "");
         List<FlowDef> defs = await this.FlowDef
             .Where(a => a.tenantId == Tenant.Cur()).ToListAsync();
-        List<StrMap> items = d.AddList("rows");
+
+        JsonWriter w = new JsonWriter();
+        w.WriteStartArray();
         for (int i = 0; i < rows.Count; i = i + 1) {
             OaFormDef r = rows[i];
-            StrMap m = new StrMap();
-            m.Set("id", r.id.ToString());
-            m.Set("code", r.code);
-            m.Set("name", r.name);
-            m.Set("description", r.description);
-            m.Set("flowName", Forms.FlowName(defs, r.flowDefId));
-            m.Set("statusText", r.status == 1 ? "启用" : "停用");
-            m.Set("status", r.status == 1 ? "1" : "");
-            m.Set("statusNext", r.status == 1 ? "停用" : "启用");
-            m.Set("createdAt", Fmt.Stamp(r.createdAt));
             int subs = await this.OaFormData
                 .Where(a => a.tenantId == Tenant.Cur() && a.formId == r.id)
                 .CountAsync();
-            m.Set("subs", subs.ToString());
-            m.Set("locked", subs > 0 ? "1" : "");
-            m.Set("canEdit", await this.Can(PermBit.Update) ? "1" : "");
-            m.Set("canDel", await this.Can(PermBit.Delete) ? "1" : "");
-            items.Add(m);
+            w.WriteStartObject();
+            w.WriteProperty("id", r.id);
+            w.WriteProperty("code", r.code);
+            w.WriteProperty("name", r.name);
+            w.WriteProperty("description", Fmt.Dash(r.description));
+            w.WriteProperty("flowName", Forms.FlowName(defs, r.flowDefId));
+            w.WriteProperty("status", Convert.ToString(r.status));
+            w.WriteProperty("subs", subs);
+            w.WriteProperty("createdAt", Fmt.Stamp(r.createdAt));
+            w.WriteEndObject();
         }
-        this.Pager(d, q, total);
-        this.Page(d);
+        w.WriteEndArray();
+        AdminUiProtocol.WriteListData(this, total, w.ToString());
     }
 
-    [HttpGet]
-    [Custom(IsMenu = false, Perm = PermBit.View)]
-    [Description("表单定义表单")]
-    public async void Form() {
-        int id = this.InInt("id", 0);
-        OaFormDef r = null;
-        if (id > 0) {
-            r = await this.OaFormDef
-                .Where(a => a.id == id && a.tenantId == Tenant.Cur())
-                .FirstAsync();
-            if (r == null) { this.Fail(404, "0404", "表单不存在"); return; }
-        }
-        int subs = 0;
-        if (r != null) {
-            subs = await this.OaFormData
-                .Where(a => a.tenantId == Tenant.Cur() && a.formId == r.id)
-                .CountAsync();
-        }
-        ViewData d = new ViewData();
-        d.Set("id", id.ToString());
-        d.Set("dialogTitle", id > 0 ? "编辑表单" : "新建表单");
-        d.Set("code", r == null ? "" : r.code);
-        d.Set("name", r == null ? "" : r.name);
-        d.Set("description", r == null ? "" : r.description);
-        d.Set("schemaJson", r == null ? "" : r.schemaJson);
-        d.Set("flowDefId", r == null ? "0" : r.flowDefId.ToString());
-        d.Set("locked", subs > 0 ? "1" : "");
+    [HttpPut]
+    [Custom(Perm = PermBit.Create | PermBit.Update)]
+    [Description("表单定义表单配置")]
+    public async void FormConf() {
         List<FlowDef> defs = await this.FlowDef
-            .Where(a => a.tenantId == Tenant.Cur() && a.status == 1)
-            .ToListAsync();
-        int curFlow = r == null ? 0 : r.flowDefId;
-        List<StrMap> flows = d.AddList("flows");
+            .Where(a => a.tenantId == Tenant.Cur()).OrderBy(a => a.id).ToListAsync();
+        List<StrMap> fopts = new List<StrMap>();
+        StrMap f0 = new StrMap(); f0.Set("id", "0"); f0.Set("name", "不绑流程"); fopts.Add(f0);
         for (int i = 0; i < defs.Count; i = i + 1) {
-            if (defs[i].id == curFlow) { continue; }
             StrMap m = new StrMap();
-            m.Set("id", defs[i].id.ToString());
-            m.Set("name", defs[i].name);
-            m.Set("sel", "");
-            flows.Add(m);
+            m.Set("id", Convert.ToString(defs[i].id));
+            m.Set("name", defs[i].status == 1 ? defs[i].name : defs[i].name + "（已停用）");
+            fopts.Add(m);
         }
-        if (curFlow > 0) {
-            FlowDef cur = await this.FlowDef
-                .Where(a => a.id == curFlow && a.tenantId == Tenant.Cur())
-                .FirstAsync();
-            if (cur != null) {
-                StrMap m = new StrMap();
-                m.Set("id", cur.id.ToString());
-                m.Set("name", cur.name + "（已停用）");
-                m.Set("sel", "1");
-                flows.Add(m);
-            }
-        }
-        this.Dialog(d);
+        FormPage fp = FormPage.Of("/admin/oa/forms/save")
+            .Wide()
+            .Text("表单标识", "code").Req().Ph("仅限 [a-z0-9_]，如 leave_apply")
+            .Text("表单名称", "name").Req().Ph("例如：请假申请单")
+            .SelectList("绑定流程", "flowDefId", fopts).Val("0")
+            .Text("表单说明", "description").Ph("用途说明")
+            .Area("Schema JSON", "schemaJson").Span().Ph("{\"fields\":[{\"name\":\"reason\",\"label\":\"事由\",\"type\":\"text\"}]}");
+        CrudOps.FormConf(this, fp, "表单定义");
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.View)]
+    [Description("表单定义编辑回显")]
+    public async void Edit() {
+        int id = this.InAnyInt("id", 0);
+        OaFormDef r = await this.OaFormDef
+            .Where(a => a.id == id && a.tenantId == Tenant.Cur())
+            .FirstAsync();
+        if (r == null) { this.Fail(404, "0404", "表单不存在"); return; }
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("id", r.id);
+        w.WriteProperty("code", r.code);
+        w.WriteProperty("name", r.name);
+        w.WriteProperty("description", r.description);
+        w.WriteProperty("schemaJson", r.schemaJson);
+        w.WriteProperty("flowDefId", Convert.ToString(r.flowDefId));
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(this, w.ToString());
     }
 
     [HttpPost]
@@ -127,22 +138,21 @@ public class Forms : CollabAdminController {
     [Description("保存表单定义")]
     public async void Save() {
         SysUser me = await this.Admin();
-        int id = this.InInt("id", 0);
-        string code = this.Need("code", "表单标识");
-        string name = this.Need("name", "表单名称");
+        int id = this.InAnyInt("id", 0);
+        string code = this.NeedAny("code", "表单标识");
+        string name = this.NeedAny("name", "表单名称");
         if (!FormSchema.CodeOk(code)) {
             this.Fail(400, "0004", "表单标识需为 [a-z0-9_] 且 1~64 位"); return;
         }
         if (name.Length > 128) { this.Fail(400, "0004", "表单名称过长"); return; }
-        string description = this.In("description");
+        string description = this.InAny("description");
         if (description.Length > 512) { description = description.Substring(0, 512); }
-        string schemaJson = this.InRaw("schemaJson");
+        string schemaJson = this.InAnyRaw("schemaJson");
         if (schemaJson.Length > 60000) {
-            this.Fail(400, "0004", "schema 过大（60000 字符上限，MySQL 行限兜底）");
-            return;
+            this.Fail(400, "0004", "schema 过大（60000 字符上限）"); return;
         }
         FormSchemaDef _schema = FormSchema.Parse(schemaJson);
-        int flowDefId = this.InInt("flowDefId", 0);
+        int flowDefId = this.InAnyInt("flowDefId", 0);
         if (flowDefId > 0) {
             FlowDef fd = await this.FlowDef
                 .Where(a => a.id == flowDefId && a.tenantId == Tenant.Cur())
@@ -202,7 +212,7 @@ public class Forms : CollabAdminController {
     [Custom(Perm = PermBit.Update)]
     [Description("表单启停")]
     public async void Status() {
-        int id = this.InInt("id", 0);
+        int id = this.InAnyInt("id", 0);
         OaFormDef r = await this.OaFormDef
             .Where(a => a.id == id && a.tenantId == Tenant.Cur())
             .FirstAsync();
@@ -220,7 +230,7 @@ public class Forms : CollabAdminController {
     [Custom(Perm = PermBit.Delete)]
     [Description("删除表单定义")]
     public async void Delete() {
-        int id = this.InInt("id", 0);
+        int id = this.InAnyInt("id", 0);
         OaFormDef r = await this.OaFormDef
             .Where(a => a.id == id && a.tenantId == Tenant.Cur())
             .FirstAsync();
@@ -244,18 +254,19 @@ public class Forms : CollabAdminController {
     [Custom(IsMenu = false, Perm = PermBit.View)]
     [Description("表单预览")]
     public async void Preview() {
-        int id = this.InInt("id", 0);
+        int id = this.InAnyInt("id", 0);
         OaFormDef r = await this.OaFormDef
             .Where(a => a.id == id && a.tenantId == Tenant.Cur())
             .FirstAsync();
         if (r == null) { this.Fail(404, "0404", "表单不存在"); return; }
-        FormSchemaDef schema = FormSchema.Parse(r.schemaJson);
-        List<SysDictItem> dicts = await FormSchema.DictsFor(this.Held(), schema);
-        ViewData d = new ViewData();
-        d.Set("dialogTitle", "预览：" + r.name);
-        d.Set("name", r.name);
-        FormSchema.Render(d, schema, "", 0, dicts);
-        this.Dialog(d);
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("id", r.id);
+        w.WriteProperty("code", r.code);
+        w.WriteProperty("name", r.name);
+        w.WriteProperty("schemaJson", r.schemaJson);
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(this, w.ToString());
     }
 
     public static string FlowName(List<FlowDef> defs, int flowDefId) {

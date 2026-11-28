@@ -3420,9 +3420,9 @@ set_tests_properties(server_mvc_readonly_action_lease PROPERTIES TIMEOUT 180
 
 foreach(_mvc_case security_bootstrap security_verify_code security_routes
                   security_http_policy verify_code_issuance permission_branches security_csp
-                  admin_gate geo_sources data_grant startup_hooks route_verbs extensibility_hooks)
+                  admin_gate admin_ui_shell geo_sources data_grant startup_hooks route_verbs extensibility_hooks)
   set(_mvc_args "")
-  if(_mvc_case MATCHES "^(admin_gate|security_routes|extensibility_hooks)$")
+  if(_mvc_case MATCHES "^(admin_gate|admin_ui_shell|security_routes|extensibility_hooks)$")
     set(_mvc_args -DMVC_TOOL=${_mvc_tool} -DMVC_MODE=framework)
   elseif(_mvc_case MATCHES "^(permission_branches|route_verbs)$")
     set(_mvc_args -DMVC_TOOL=${_mvc_tool} -DMVC_MODE=app)

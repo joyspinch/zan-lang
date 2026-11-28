@@ -2,84 +2,112 @@ using System;
 using System.Collections;
 using System.Data;
 using System.Data.Orm;
+using System.Json;
 using System.Web;
+using Zan.Web.AdminUi;
 using Zan.Web.Model.Oa;
 using Zan.Web.Model;
 
 namespace Zan.Web.Admin.Oa;
 
-/* /admin/oa/docs 文档中心（T9）：空间内文档的列表/阅读/整页编辑/版本历史。
-   读端点一律 (id, tenantId) 双条件（BatchReport 范式，ExcelIo.zan:267-271）。
-   渲染经 Blocks（escape-first + 链接 SafeUrl 白名单），视图以 {{{html}}}
-   原样输出。Save 每次 version+1 并落 oa_doc_rev 快照；Delete 闸后显式
-   受控级联删版本行（Bug#5 教训）。 */
+/* /admin/oa/docs 文档中心（T9/T10）：文档列表 + 弹窗编辑（含乐观锁）+ 版本历史子表弹窗。 */
 [Route("admin/oa/docs/[action]")]
 [Custom(Authorization = CustomAuthorization.Grant)]
 [Description("文档中心")]
 public class Docs : CollabAdminController {
+    static ListPage HistoryDef() {
+        return ListPage.Of()
+            .Col("version", "版本号", "num", "90")
+            .Col("title", "标题", "text", "240")
+            .Col("editor", "编辑人", "text", "120")
+            .Tag("current", "状态", "1=当前版本|ok,0=历史快照|off", "105")
+            .Col("createdAt", "保存时间", "text", "160");
+    }
+
     [HttpGet]
     [Route("/admin/oa/docs")]
     [Custom(IsMenu = true, Icon = "mdi:file-document", Perm = PermBit.View)]
     [Description("文档中心")]
     async void Index() {
-        ViewData d = await this.Layout("文档中心");
-        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
-
-        List<OaSpace> spaces = await this.MySpaces();
-        int spaceId = this.InInt("spaceId", 0);
-        OaSpace cur = null;
-        for (int i = 0; i < spaces.Count; i = i + 1) {
-            if (spaces[i].id == spaceId) { cur = spaces[i]; break; }
-        }
-        if (cur == null && spaces.Count > 0) { cur = spaces[0]; }
-
-        List<StrMap> srows = d.AddList("spaces");
-        for (int i = 0; i < spaces.Count; i = i + 1) {
-            OaSpace s = spaces[i];
-            StrMap r = new StrMap();
-            r.Set("id", Convert.ToString(s.id));
-            r.Set("name", s.name);
-            r.Set("cur", (cur != null && s.id == cur.id) ? "1" : "");
-            srows.Add(r);
-        }
-
-        List<OaDoc> docs = new List<OaDoc>();
-        if (cur != null) {
-            docs = await this.OaDoc
-                .Where(a => a.tenantId == Tenant.Cur() && a.spaceId == cur.id)
-                .OrderByDescending(a => a.updatedAt).ToListAsync();
-        }
-        List<SysUser> users = await this.SysUser
-            .ToListAsync();
-        List<StrMap> list = d.AddList("rows");
-        for (int i = 0; i < docs.Count; i = i + 1) {
-            OaDoc doc = docs[i];
-            StrMap r = new StrMap();
-            r.Set("id", Convert.ToString(doc.id));
-            r.Set("title", doc.title);
-            r.Set("version", Convert.ToString(doc.version));
-            r.Set("updatedAt", Fmt.Stamp(doc.updatedAt));
-            r.Set("editor", Docs.NameOf(users, doc.updatedBy));
-            r.Set("excerpt", Prose.Excerpt(doc.contentText, 60));
-            list.Add(r);
-        }
-        d.Set("spaceId", Convert.ToString(cur == null ? 0 : cur.id));
-        d.Set("spaceName", cur == null ? "" : cur.name);
-        d.Set("hasDocs", docs.Count > 0 ? "1" : "");
-        d.Set("empty", (cur != null && docs.Count == 0) ? "1" : "");
-        d.Set("noSpace", cur == null ? "1" : "");
-        d.Set("canCreate", await this.Can(PermBit.Create) ? "1" : "");
-        d.Set("canUpdate", await this.Can(PermBit.Update) ? "1" : "");
-        d.Set("canDelete", await this.Can(PermBit.Delete) ? "1" : "");
-        this.Page(d);
+        await this.Conf();
     }
 
-    /* 阅读页：Blocks 渲染（escape-first），{{{html}}} 原样输出。 */
+    [HttpPut]
+    [Custom(Perm = PermBit.View)]
+    [Description("文档中心表格配置")]
+    public async void Conf() {
+        List<OaSpace> spaces = await this.MySpaces();
+        string spaceOpts = "";
+        for (int i = 0; i < spaces.Count; i = i + 1) {
+            if (i > 0) { spaceOpts = spaceOpts + ","; }
+            spaceOpts = spaceOpts + Convert.ToString(spaces[i].id) + "=" + spaces[i].name;
+        }
+        ListPage lp = ListPage.Of()
+            .Text("文档标题", "kw", "title", "搜索文档标题")
+            .TbarAdd("新建文档", "/admin/oa/docs/form")
+            .Col("id", "ID", "num", "75")
+            .Col("title", "文档标题", "text", "220")
+            .Col("spaceName", "所属空间", "text", "140")
+            .Col("version", "版本", "num", "80")
+            .Col("editor", "最近编辑", "text", "120")
+            .Col("excerpt", "内容摘要", "text", "260")
+            .Col("updatedAt", "更新时间", "text", "160")
+            .OpsEdit("/admin/oa/docs/form")
+            .Ops("版本历史", "/admin/oa/docs/history", "", "id={id}", "")
+            .OpsDel("/admin/oa/docs/delete", "确认删除该文档及其全部历史版本吗？");
+        if (spaceOpts.Length > 0) {
+            lp.Select("文档空间", "spaceId", "spaceId", spaceOpts);
+        }
+        CrudOps.Conf(this, lp);
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.View)]
+    [Description("文档列表数据")]
+    public async void List() {
+        if (!this.DataReady()) { return; }
+        ListQuery q = this.PagedAny("updatedAt", 20);
+        string kw = q.Kw();
+        int spaceId = this.InAnyInt("spaceId", 0);
+        List<OaSpace> spaces = await this.MySpaces();
+        List<OaDoc> docs = await this.OaDoc
+            .Where(a => a.tenantId == Tenant.Cur())
+            .WhereIf(spaceId > 0, a => a.spaceId == spaceId)
+            .WhereIf(kw.Length > 0, a => a.title.Contains(kw))
+            .OrderByDescending(a => a.updatedAt)
+            .Skip(q.Skip()).Take(q.Limit()).ToListAsync();
+        int total = await this.OaDoc
+            .Where(a => a.tenantId == Tenant.Cur())
+            .WhereIf(spaceId > 0, a => a.spaceId == spaceId)
+            .WhereIf(kw.Length > 0, a => a.title.Contains(kw))
+            .CountAsync();
+        List<SysUser> users = await this.SysUser.ToListAsync();
+
+        JsonWriter w = new JsonWriter();
+        w.WriteStartArray();
+        for (int i = 0; i < docs.Count; i = i + 1) {
+            OaDoc doc = docs[i];
+            w.WriteStartObject();
+            w.WriteProperty("id", doc.id);
+            w.WriteProperty("spaceId", Convert.ToString(doc.spaceId));
+            w.WriteProperty("spaceName", Docs.SpaceName(spaces, doc.spaceId));
+            w.WriteProperty("title", doc.title);
+            w.WriteProperty("version", doc.version);
+            w.WriteProperty("editor", Docs.NameOf(users, doc.updatedBy));
+            w.WriteProperty("excerpt", Prose.Excerpt(doc.contentText, 60));
+            w.WriteProperty("updatedAt", Fmt.Stamp(doc.updatedAt));
+            w.WriteEndObject();
+        }
+        w.WriteEndArray();
+        AdminUiProtocol.WriteListData(this, total, w.ToString());
+    }
+
+    /* 文档阅读 JSON 端点（Blocks 渲染 html + 元信息）。 */
     [HttpGet]
     [Custom(IsMenu = false, Perm = PermBit.View)]
     [Description("阅读文档")]
     async void Read() {
-        int id = this.InInt("id", 0);
+        int id = this.InAnyInt("id", 0);
         OaDoc doc = await this.OaDoc
             .Where(a => a.id == id && a.tenantId == Tenant.Cur())
             .FirstAsync();
@@ -87,83 +115,70 @@ public class Docs : CollabAdminController {
         OaSpace sp = await this.OaSpace
             .Where(a => a.id == doc.spaceId && a.tenantId == Tenant.Cur())
             .FirstAsync();
-        ViewData d = await this.Layout(doc.title);
-        d.Set("id", Convert.ToString(doc.id));
-        d.Set("title", doc.title);
-        d.Set("version", Convert.ToString(doc.version));
-        d.Set("updatedAt", Fmt.Stamp(doc.updatedAt));
-        d.Set("spaceId", Convert.ToString(doc.spaceId));
-        d.Set("spaceName", sp == null ? "" : sp.name);
-        d.Set("html", Blocks.Render(doc.content));
-        d.Set("canUpdate", await this.Can(PermBit.Update) ? "1" : "");
-        this.Page(d);
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("id", doc.id);
+        w.WriteProperty("title", doc.title);
+        w.WriteProperty("version", doc.version);
+        w.WriteProperty("updatedAt", Fmt.Stamp(doc.updatedAt));
+        w.WriteProperty("spaceId", doc.spaceId);
+        w.WriteProperty("spaceName", sp == null ? "" : sp.name);
+        w.WriteProperty("html", Blocks.Render(doc.content));
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(this, w.ToString());
     }
 
-    /* 整页编辑壳；?id=0 为新建（spaceId 经查询串带入）。 */
-    [HttpGet]
-    [Custom(IsMenu = false, Perm = PermBit.View)]
-    [Description("编辑文档")]
-    async void Edit() {
-        int id = this.InInt("id", 0);
-        OaDoc doc = null;
-        if (id > 0) {
-            doc = await this.OaDoc
-                .Where(a => a.id == id && a.tenantId == Tenant.Cur())
-                .FirstAsync();
-            if (doc == null) { this.Fail(404, "0404", "文档不存在"); return; }
-        }
-        ViewData d = await this.Layout(id > 0 ? "编辑文档" : "新建文档");
-        d.Set("id", Convert.ToString(id));
-        d.Set("title", doc == null ? "" : doc.title);
-        d.Set("content", doc == null ? "" : doc.content);
-        d.Set("version", doc == null ? "" : Convert.ToString(doc.version));
-        /* 乐观锁基准（T10）：页面载入时的版本号，Save 提交比对。 */
-        d.Set("baseVersion", Convert.ToString(doc == null ? 0 : doc.version));
-        d.Set("spaceId", Convert.ToString(doc == null
-            ? this.InInt("spaceId", 0) : doc.spaceId));
-        this.Page(d);
-    }
-
-    /* 新建文档弹窗（选空间 + 标题 + 可选初始内容）。 */
-    [HttpGet]
-    [Custom(IsMenu = false, Perm = PermBit.View)]
-    [Description("新建文档")]
-    async void Form() {
+    [HttpPut]
+    [Custom(Perm = PermBit.Create | PermBit.Update)]
+    [Description("文档表单配置")]
+    public async void FormConf() {
         List<OaSpace> spaces = await this.MySpaces();
-        int pick = this.InInt("spaceId", 0);
-        ViewData d = new ViewData();
-        d.Set("dialogTitle", "新建文档");
-        d.Set("hasSpaces", spaces.Count > 0 ? "1" : "");
-        List<StrMap> srows = d.AddList("spaces");
+        List<StrMap> sopts = new List<StrMap>();
         for (int i = 0; i < spaces.Count; i = i + 1) {
-            OaSpace s = spaces[i];
-            StrMap r = new StrMap();
-            r.Set("id", Convert.ToString(s.id));
-            r.Set("name", s.name);
-            r.Set("cur", s.id == pick ? "selected" : "");
-            srows.Add(r);
+            StrMap m = new StrMap();
+            m.Set("id", Convert.ToString(spaces[i].id));
+            m.Set("name", spaces[i].name);
+            sopts.Add(m);
         }
-        this.Dialog(d);
+        FormPage fp = FormPage.Of("/admin/oa/docs/save")
+            .Wide()
+            .SelectList("所属空间", "spaceId", sopts).Req()
+            .Text("文档标题", "title").Req().Ph("请输入文档标题")
+            .Area("文档正文", "content").Span().Ph("支持行式块文本语法（# 标题、- 列表、``` 代码块等）");
+        CrudOps.FormConf(this, fp, "文档");
     }
 
-    /* 保存：新建 version=1 落首版快照；编辑带乐观锁（T10）——提交
-       baseVersion 须等于库内 version 才写，否则 409 拒写（前端保留
-       草稿提示刷新，双标签对敲场景）。content 经 Blocks.Validate
-       （30KB 软上限）+ Normalize + TextOf。 */
+    [HttpPost]
+    [Custom(Perm = PermBit.View)]
+    [Description("文档编辑回显")]
+    public async void Edit() {
+        int id = this.InAnyInt("id", 0);
+        OaDoc doc = await this.OaDoc
+            .Where(a => a.id == id && a.tenantId == Tenant.Cur())
+            .FirstAsync();
+        if (doc == null) { this.Fail(404, "0404", "文档不存在"); return; }
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("id", doc.id);
+        w.WriteProperty("spaceId", Convert.ToString(doc.spaceId));
+        w.WriteProperty("title", doc.title);
+        w.WriteProperty("content", doc.content);
+        w.WriteProperty("version", doc.version);
+        w.WriteProperty("baseVersion", doc.version);
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(this, w.ToString());
+    }
+
     [HttpPost]
     [Custom(Perm = PermBit.Create | PermBit.Update)]
     [Description("保存文档")]
     async void Save() {
-        int id = this.InInt("id", 0);
-        int baseVersion = this.InInt("baseVersion", 0);
+        int id = this.InAnyInt("id", 0);
+        int baseVersion = this.InAnyInt("baseVersion", 0);
         SysUser me = await this.Admin();
-        string title = this.Need("title", "文档标题");
+        string title = this.NeedAny("title", "文档标题");
         if (title.Length == 0) { this.Fail(400, "0004", "请填写文档标题"); return; }
-        /* Bug#8：正文是多行语义（行式块语法按 \n 分块），In 的 Filter.Clean
-           会剥净 \r\n 致入库即坍缩单行——改 InRaw 保留原始换行。XSS 面不扩：
-           escape-first 管线首步 HtmlEscape（Blocks.Render / 视图 {{x}}），
-           InRaw 只影响入库原文，不改渲染侧转义。 */
-        string content = this.InRaw("content");
+        string content = this.InAnyRaw("content");
         string err = Blocks.Validate(content);
         if (err.Length > 0) { this.Fail(400, "0004", err); return; }
         string norm = Blocks.Normalize(content);
@@ -174,8 +189,7 @@ public class Docs : CollabAdminController {
                 .Where(a => a.id == id && a.tenantId == Tenant.Cur())
                 .FirstAsync();
             if (doc == null) { this.Fail(404, "0404", "文档不存在"); return; }
-            /* 乐观锁：版本不一致=并发修改已在库中落地，本提交作废。 */
-            if (doc.version != baseVersion) {
+            if (baseVersion > 0 && doc.version != baseVersion) {
                 this.Fail(409, "0409", "文档已被他人修改（当前 v"
                     + Convert.ToString(doc.version) + "），请刷新对比后重试");
                 return;
@@ -203,7 +217,7 @@ public class Docs : CollabAdminController {
             this.Saved("已保存为 v" + Convert.ToString(ver));
             return;
         }
-        int spaceId = this.InInt("spaceId", 0);
+        int spaceId = this.InAnyInt("spaceId", 0);
         OaSpace sp = await this.OaSpace
             .Where(a => a.id == spaceId && a.tenantId == Tenant.Cur())
             .FirstAsync();
@@ -232,12 +246,29 @@ public class Docs : CollabAdminController {
         this.Saved("文档已创建");
     }
 
-    /* 版本历史：按 version 倒序；只增不改（一期不提供回滚）。 */
+    /* 版本历史子表（SubTableModal） */
     [HttpGet]
     [Custom(IsMenu = false, Perm = PermBit.View)]
     [Description("版本历史")]
-    async void History() {
-        int id = this.InInt("id", 0);
+    void History() {
+        this.HistoryConf();
+    }
+
+    [HttpPut]
+    [Route("/admin/oa/docs/history/conf")]
+    [Custom(Perm = PermBit.View)]
+    [Description("版本历史表格配置")]
+    public void HistoryConf() {
+        CrudOps.Conf(this, Docs.HistoryDef());
+    }
+
+    [HttpPost]
+    [Route("/admin/oa/docs/history/list")]
+    [Custom(Perm = PermBit.View)]
+    [Description("版本历史列表数据")]
+    public async void HistoryList() {
+        if (!this.DataReady()) { return; }
+        int id = this.InAnyInt("id", 0);
         OaDoc doc = await this.OaDoc
             .Where(a => a.id == id && a.tenantId == Tenant.Cur())
             .FirstAsync();
@@ -245,32 +276,29 @@ public class Docs : CollabAdminController {
         List<OaDocRev> revs = await this.OaDocRev
             .Where(a => a.docId == doc.id && a.tenantId == Tenant.Cur())
             .OrderByDescending(a => a.version).ToListAsync();
-        List<SysUser> users = await this.SysUser
-            .ToListAsync();
-        ViewData d = await this.Layout("版本历史");
-        d.Set("docId", Convert.ToString(doc.id));
-        d.Set("title", doc.title);
-        List<StrMap> list = d.AddList("rows");
+        List<SysUser> users = await this.SysUser.ToListAsync();
+        JsonWriter w = new JsonWriter();
+        w.WriteStartArray();
         for (int i = 0; i < revs.Count; i = i + 1) {
             OaDocRev rev = revs[i];
-            StrMap r = new StrMap();
-            r.Set("version", Convert.ToString(rev.version));
-            r.Set("title", rev.title);
-            r.Set("editor", Docs.NameOf(users, rev.editorId));
-            r.Set("createdAt", Fmt.Stamp(rev.createdAt));
-            r.Set("current", rev.version == doc.version ? "1" : "");
-            list.Add(r);
+            w.WriteStartObject();
+            w.WriteProperty("id", rev.id);
+            w.WriteProperty("version", rev.version);
+            w.WriteProperty("title", rev.title);
+            w.WriteProperty("editor", Docs.NameOf(users, rev.editorId));
+            w.WriteProperty("current", rev.version == doc.version ? "1" : "0");
+            w.WriteProperty("createdAt", Fmt.Stamp(rev.createdAt));
+            w.WriteEndObject();
         }
-        d.Set("empty", revs.Count == 0 ? "1" : "");
-        this.Page(d);
+        w.WriteEndArray();
+        AdminUiProtocol.WriteListData(this, revs.Count, w.ToString());
     }
 
-    /* 删除：先 (id, tenantId) 闸，再受控级联删版本行（Bug#5 范式）。 */
     [HttpPost]
     [Custom(Perm = PermBit.Delete)]
     [Description("删除文档")]
     async void Delete() {
-        int id = this.InInt("id", 0);
+        int id = this.InAnyInt("id", 0);
         OaDoc doc = await this.OaDoc
             .Where(a => a.id == id && a.tenantId == Tenant.Cur())
             .FirstAsync();
@@ -284,18 +312,23 @@ public class Docs : CollabAdminController {
         this.Saved(n > 0 ? "已删除" : "文档不存在");
     }
 
-    /* 本租户空间清单（Index/Form 公用）。 */
-    private async  List<OaSpace> MySpaces() {
+    private async List<OaSpace> MySpaces() {
         return await this.OaSpace
             .Where(a => a.tenantId == Tenant.Cur())
             .OrderBy(a => a.id).ToListAsync();
     }
 
-    /* 编辑人昵称：本租户用户表整表取回循环匹配（模板规模小，免 join）。 */
+    static string SpaceName(List<OaSpace> spaces, int id) {
+        for (int i = 0; i < spaces.Count; i = i + 1) {
+            if (spaces[i].id == id) { return spaces[i].name; }
+        }
+        return "—";
+    }
+
     static string NameOf(List<SysUser> users, int id) {
         for (int i = 0; i < users.Count; i = i + 1) {
-            if (users[i].id == id) { return users[i].nickname; }
+            if (users[i].id == id) { return Fmt.Text(users[i].nickname, users[i].username); }
         }
-        return "";
+        return "—";
     }
 }

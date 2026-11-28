@@ -3,6 +3,7 @@ using System.Data.Orm;
 using System.IO;
 using System.Json;
 using System.Web;
+using Zan.Web.AdminUi;
 using Zan.Web.Model.Oa;
 using Zan.Web.Model;
 
@@ -84,7 +85,7 @@ public class Attachments : CollabAdminController {
     [Description("下载附件")]
     public async void Download() {
         SysUser me = await this.Admin();
-        int id = this.InInt("id", 0);
+        int id = this.InAnyInt("id", 0);
         OaAttachment att = await this.OaAttachment.ById(id);
         if (att == null) { this.Fail(404, "0404", "附件不存在"); return; }
         DataScope sc = await this.Scope();
@@ -106,7 +107,7 @@ public class Attachments : CollabAdminController {
     [Description("删除附件")]
     public async void Delete() {
         SysUser me = await this.Admin();
-        int id = this.InInt("id", 0);
+        int id = this.InAnyInt("id", 0);
         OaAttachment att = await this.OaAttachment.ById(id);
         if (att == null) { this.Fail(404, "0404", "附件不存在"); return; }
         if (me.isSuper != 1) {
@@ -127,36 +128,38 @@ public class Attachments : CollabAdminController {
         this.Saved("已删除");
     }
 
-    /* 附件区片段：详情页 [data-attach] 容器由 attach.js 拉本动作回填
-       （X-Fragment 语义与外壳同款）。列表按 id 倒序，删除按钮只给
-       上传者本人与超管。 */
+    /* 附件列表（AdminUI JSON 协议）：按 id 倒序，返回可删标识与格式化大小。 */
     [HttpGet]
     [Custom(Perm = PermBit.View)]
     [Description("附件区")]
     public async void Blob() {
         SysUser me = await this.Admin();
-        string module = Fmt.Text(this.In("module"), "");
-        int relatedId = this.InInt("relatedId", 0);
-        ViewData d = new ViewData();
+        string module = Fmt.Text(this.InAny("module"), "");
+        int relatedId = this.InAnyInt("relatedId", 0);
         List<OaAttachment> rows = await this.OaAttachment
             .Where(a => a.tenantId == Tenant.Cur() && a.module == module
                 && a.relatedId == relatedId)
             .OrderByDescending(a => a.id).ToListAsync();
-        List<StrMap> items = d.AddList("rows");
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("module", module);
+        w.WriteProperty("relatedId", relatedId);
+        w.WritePropertyName("rows");
+        w.WriteStartArray();
         for (int i = 0; i < rows.Count; i = i + 1) {
             OaAttachment a = rows[i];
-            StrMap m = new StrMap();
-            m.Set("id", a.id.ToString());
-            m.Set("fileName", a.fileName);
-            m.Set("sizeText", Fmt.Bytes(a.size));
-            m.Set("createdAt", Fmt.Day(a.createdAt));
-            m.Set("canDel", (a.uploaderId == me.id || me.isSuper == 1)
-                ? "1" : "");
-            items.Add(m);
+            w.WriteStartObject();
+            w.WriteProperty("id", a.id);
+            w.WriteProperty("fileName", a.fileName);
+            w.WriteProperty("mime", a.mime);
+            w.WriteProperty("size", a.size);
+            w.WriteProperty("sizeText", Fmt.Bytes(a.size));
+            w.WriteProperty("createdAt", Fmt.Day(a.createdAt));
+            w.WriteProperty("canDel", a.uploaderId == me.id || me.isSuper == 1);
+            w.WriteEndObject();
         }
-        d.Set("empty", rows.Count == 0 ? "1" : "");
-        d.Set("module", module);
-        d.Set("relatedId", relatedId.ToString());
-        this.FragmentOf("Admin.Oa.Attachments.Blob", d);
+        w.WriteEndArray();
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(this, w.ToString());
     }
 }

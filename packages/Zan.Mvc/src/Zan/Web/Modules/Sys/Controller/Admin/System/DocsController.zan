@@ -1,5 +1,7 @@
 using System;
+using System.Json;
 using System.Web;
+using Zan.Web.AdminUi;
 using Zan.Web.Core;
 using Zan.Web.Security;
 using Zan.Web;
@@ -14,90 +16,221 @@ public class DocsController : AdminController {
     [HttpGet]
     [Custom(IsMenu = true, Icon = "mdi:api", Perm = PermBit.View)]
     [Description("接口文档")]
-    public async void Index() {
-        ViewData d = await this.Layout("接口文档");
+    public void Index() {
+        this.Conf();
+    }
 
+    [HttpPut]
+    [Custom(Perm = PermBit.View)]
+    [Description("接口文档表格配置")]
+    public void Conf() {
         List<Route> routes = WebHost.Current().Router().All();
-        string kw = this.In("kw");
-        d.Set("kw", kw);
+        List<string> groups = new List<string>();
+        for (int i = 0; i < routes.Count; i = i + 1) {
+            if (!IsApiRoute(routes[i])) { continue; }
+            string g = Section(routes[i].Pattern());
+            if (!HasPath(groups, g)) { groups.Add(g); }
+        }
+        SortPaths(groups);
 
-        /* 按路径前缀分组、一次一组显示；整面在一页上是滚动，非引用。 */
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("PageType", "apidocs");
+
+        w.WritePropertyName("Conf");
+        w.WriteStartObject();
+        w.WriteProperty("showPages", true);
+        w.WriteProperty("pageSize", 50);
+        w.WriteProperty("pageSizes", "20,50,100,200");
+        w.WriteProperty("Local", false);
+        w.WriteProperty("TreeData", false);
+        w.WriteProperty("import", false);
+        w.WriteProperty("export", true);
+        w.WriteProperty("innerKey", "id");
+        w.WriteProperty("innerName", "接口");
+        w.WriteProperty("openapiUrl", "/api/docs.json");
+        w.WriteProperty("listUrl", "/admin/system/docs/list");
+        w.WriteEndObject();
+
+        w.WritePropertyName("Columns");
+        w.WriteStartArray();
+        WriteDocCol(w, "方法", "method", "dict", 85, "GET=GET,POST=POST,PUT=PUT,DELETE=DELETE");
+        WriteDocCol(w, "路径", "path", "text", 260, "");
+        WriteDocCol(w, "摘要", "title", "text", 180, "");
+        WriteDocCol(w, "认证", "authText", "dict", 100, "公开=公开,需要登录=需要登录,需要权限=需要权限");
+        WriteDocCol(w, "分组", "block", "text", 160, "");
+        WriteDocCol(w, "Query / Path 参数", "params", "text", 220, "");
+        WriteDocCol(w, "Body 参数", "requestBody", "text", 220, "");
+        WriteDocCol(w, "控制器动作", "action", "text", 200, "");
+        w.WriteEndArray();
+
+        w.WritePropertyName("Filters");
+        w.WriteStartArray();
+        w.WriteStartObject();
+        w.WriteProperty("Name", "关键词");
+        w.WriteProperty("Field", "kw");
+        w.WriteProperty("Type", "Input");
+        w.WriteProperty("placeholder", "搜索路径或接口描述");
+        w.WriteEndObject();
+        w.WriteEndArray();
+
+        w.WritePropertyName("FilterRight");
+        w.WriteStartArray();
+        w.WriteEndArray();
+
+        w.WritePropertyName("Tools");
+        w.WriteStartArray();
+        AdminUiProtocol.WriteDownloadAction(w, "导出 OpenAPI JSON", "info", "/api/docs.json");
+        w.WriteEndArray();
+
+        w.WritePropertyName("MenuItems");
+        w.WriteStartArray();
+        AdminUiProtocol.WriteDetailAction(w, "查看接口详情", "");
+        w.WriteEndArray();
+
+        w.WritePropertyName("Tabs");
+        w.WriteStartArray();
+        w.WriteStartObject();
+        w.WriteProperty("Name", "全部");
+        w.WriteProperty("Field", "g");
+        w.WriteProperty("Value", "");
+        w.WriteEndObject();
+        for (int i = 0; i < groups.Count; i = i + 1) {
+            w.WriteStartObject();
+            w.WriteProperty("Name", groups[i]);
+            w.WriteProperty("Field", "g");
+            w.WriteProperty("Value", groups[i]);
+            w.WriteEndObject();
+        }
+        w.WriteEndArray();
+
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(this, w.ToString());
+    }
+
+    private static void WriteDocCol(JsonWriter w, string header, string field, string type, int width, string opts) {
+        w.WriteStartObject();
+        w.WriteProperty("headerName", header);
+        w.WriteProperty("field", field);
+        w.WriteProperty("type", type);
+        w.WriteProperty("width", width);
+        if (opts.Length > 0) {
+            w.WritePropertyName("options");
+            AdminUiProtocol.WriteOptArray(w, opts);
+        }
+        w.WriteEndObject();
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.View)]
+    [Description("接口文档列表数据")]
+    public void List() {
+        List<Route> routes = WebHost.Current().Router().All();
+        string kw = this.InAny("kw").Trim();
+        string g = this.InAny("g").Trim();
+        ListQuery q = this.PagedAny("id", 50);
+
         List<string> paths = new List<string>();
         for (int i = 0; i < routes.Count; i = i + 1) {
+            if (!IsApiRoute(routes[i])) { continue; }
             if (!Match(routes[i], kw)) { continue; }
             string p = routes[i].Pattern();
+            if (g.Length > 0 && Section(p) != g) { continue; }
             if (!HasPath(paths, p)) { paths.Add(p); }
         }
         SortPaths(paths);
 
-        List<string> groups = new List<string>();
+        List<Route> matched = new List<Route>();
         for (int i = 0; i < paths.Count; i = i + 1) {
-            string g = Section(paths[i]);
-            if (!HasPath(groups, g)) { groups.Add(g); }
-        }
-        /* 默认管理面：最大组且读者多找这一组。 */
-        string active = this.In("g");
-        if (!HasPath(groups, active)) {
-            active = "";
-            if (HasPath(groups, "/admin")) { active = "/admin"; }
-            else if (groups.Count > 0) { active = groups[0]; }
-        }
-        d.Set("docsGroup", active);
-
-        List<StrMap> tabs = d.AddList("groups");
-        for (int i = 0; i < groups.Count; i = i + 1) {
-            int n = 0;
             for (int j = 0; j < routes.Count; j = j + 1) {
+                if (!IsApiRoute(routes[j])) { continue; }
+                if (routes[j].Pattern() != paths[i]) { continue; }
                 if (!Match(routes[j], kw)) { continue; }
-                if (Section(routes[j].Pattern()) != groups[i]) { continue; }
-                n = n + 1;
+                matched.Add(routes[j]);
             }
-            StrMap t = new StrMap();
-            t.Set("name", groups[i]);
-            t.Set("count", Convert.ToString(n));
-            t.Set("kw", kw);
-            if (groups[i] == active) { t.Set("active", "1"); }
-            tabs.Add(t);
         }
 
-        /* 标签内按第二段分块（/admin/system/users 等），使一组读作几张小表而非一条长条。 */
-        List<StrMap> rows = d.AddList("endpoints");
-        int shown = 0;
-        string block = "";
-        for (int i = 0; i < paths.Count; i = i + 1) {
-            string path = paths[i];
-            if (Section(path) != active) { continue; }
-            string sub = Block(path);
-            if (sub != block) {
-                block = sub;
-                StrMap head = new StrMap();
-                head.Set("block", sub);
-                if (rows.Count == 0) { head.Set("first", "1"); }
-                rows.Add(head);
-            }
-            for (int j = 0; j < routes.Count; j = j + 1) {
-                Route r = routes[j];
-                if (r.Pattern() != path) { continue; }
-                if (!Match(r, kw)) { continue; }
-                StrMap row = new StrMap();
-                row.Set("path", path);
-                row.Set("method", r.Method());
-                row.Set("methodClass", MethodClass(r.Method()));
-                row.Set("title", Fmt.Dash(r.GetTitle()));
-                row.Set("action", r.Action());
-                row.Set("authText", AuthText(r));
-                row.Set("authClass", AuthClass(r));
-                row.Set("params", Params(r, false));
-                row.Set("requestBody", Params(r, true));
-                row.Set("responses", Responses(r));
-                row.Set("sample", Sample(r));
-                rows.Add(row);
-                shown = shown + 1;
-            }
+        int total = matched.Count;
+        bool fetchAll = this.InAny("all").Trim() == "1";
+        int start = fetchAll ? 0 : q.Skip();
+        int end = fetchAll ? total : start + q.Limit();
+        if (end > total) { end = total; }
+
+        JsonWriter w = new JsonWriter();
+        w.WriteStartArray();
+        for (int i = start; i < end; i = i + 1) {
+            Route r = matched[i];
+            string path = r.Pattern();
+            w.WriteStartObject();
+            w.WriteProperty("id", i + 1);
+            w.WriteProperty("method", r.Method());
+            w.WriteProperty("path", path);
+            w.WriteProperty("title", Fmt.Dash(r.GetTitle()));
+            w.WriteProperty("authText", AuthText(r));
+            w.WriteProperty("section", Section(path));
+            w.WriteProperty("block", Block(path));
+            w.WriteProperty("params", Params(r, false));
+            w.WriteProperty("requestBody", Params(r, true));
+            w.WritePropertyName("paramItems");
+            WriteParamItems(w, r);
+            w.WriteProperty("responses", Responses(r));
+            w.WriteProperty("sample", Sample(r));
+            w.WriteProperty("action", r.Action());
+            w.WriteEndObject();
         }
-        d.Set("total", Convert.ToString(shown));
-        if (shown == 0) { d.Set("empty", "1"); }
-        this.Page(d);
+        w.WriteEndArray();
+        AdminUiProtocol.WriteListData(this, total, w.ToString());
+    }
+
+    private static void WriteParamItems(JsonWriter w, Route r) {
+        bool form = r.Method() != "GET" && r.Method() != "HEAD";
+        w.WriteStartArray();
+        for (int i = 0; i < r.DocParams().Count; i = i + 1) {
+            ApiParam p = r.DocParams()[i];
+            string loc = p.Source();
+            if (loc.Length == 0) {
+                loc = form ? "body" : "query";
+            } else if (form && loc != "path") {
+                loc = "body";
+            }
+            w.WriteStartObject();
+            w.WriteProperty("name", p.Name());
+            w.WriteProperty("in", loc);
+            w.WriteProperty("type", p.JsonType());
+            w.WriteProperty("required", p.Required());
+            w.WriteProperty("default", p.Default());
+            w.WriteProperty("description", p.Desc());
+            w.WriteEndObject();
+        }
+        w.WriteEndArray();
+    }
+
+    /* 接口文档仅展示真实 API / 业务动作接口，过滤静态文件、SEO 元文件与纯 HTML 页面入口。 */
+    private static bool IsApiRoute(Route r) {
+        string p = r.Pattern();
+        string m = r.Method();
+        if (p == "/" || p.Length == 0) { return false; }
+        if (p.Length >= 13 && p.Substring(0, 13) == "/.well-known/") { return false; }
+        if (EndsWith(p, ".txt") || EndsWith(p, ".xml") || EndsWith(p, ".ico")
+            || EndsWith(p, ".html") || EndsWith(p, ".css") || EndsWith(p, ".js") || EndsWith(p, ".map")) {
+            return false;
+        }
+        if (m == "GET" && (p == "/login" || p == "/login/index"
+            || p == "/register" || p == "/register/index"
+            || p == "/forgot" || p == "/forgot/index"
+            || p == "/admin/login" || p == "/admin/logout")) {
+            return false;
+        }
+        /* 过滤与主路径等价的 /index 兼容别名，避免接口列表重复展示。 */
+        if (p.Length > 6 && EndsWith(p, "/index")) {
+            return false;
+        }
+        return true;
+    }
+
+    private static bool EndsWith(string s, string suffix) {
+        if (s.Length < suffix.Length) { return false; }
+        return s.Substring(s.Length - suffix.Length) == suffix;
     }
 
     private static bool Match(Route r, string kw) {
@@ -158,7 +291,14 @@ public class DocsController : AdminController {
     }
 
     private static bool IsJson(Route r) {
-        if (r.Pattern().Length >= 5 && r.Pattern().Substring(0, 5) == "/api/") {
+        string p = r.Pattern();
+        if (p.Length >= 5 && p.Substring(0, 5) == "/api/") {
+            return true;
+        }
+        if (p == "/admin/login" || p == "/admin/logout") {
+            return false;
+        }
+        if (p.Length >= 6 && p.Substring(0, 6) == "/admin") {
             return true;
         }
         return r.Method() != "GET";

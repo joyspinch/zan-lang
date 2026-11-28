@@ -1,26 +1,73 @@
 using System;
 using System.Data;
 using System.Data.Orm;
+using System.Json;
 using System.Web;
 using Zan.Web;
+using Zan.Web.AdminUi;
 using Zan.Web.Model.Ecbi;
 
 namespace Zan.Web.Admin.Ecbi;
 
-/* /admin/ecbi/products 内部商品主档 + 平台链接映射。同一商品可关联 N 条店铺链接（ods_shop_product），不同平台链接不同。 */
+/* /admin/ecbi/products 内部商品主档 + 平台链接映射（子表弹窗，零跳页）。 */
 [Route("admin/ecbi/products/[action]")]
 [Custom(Authorization = CustomAuthorization.Grant)]
 [Description("商品主档")]
 public class Products : CollabAdminController {
+    static ListPage ScreenDef() {
+        return ListPage.Of()
+            .Text("商品名 / SKU", "kw", "name|sku", "搜索商品名称或 SKU")
+            .TbarAdd("新增商品", "/admin/ecbi/products/form")
+            .Col("id", "ID", "num", "75")
+            .Col("name", "商品名称", "text", "220")
+            .Col("sku", "内部 SKU", "text", "150")
+            .Col("category", "类目", "text", "130")
+            .Col("linkCount", "平台链接数", "num", "110")
+            .OpsEdit("/admin/ecbi/products/form")
+            .Ops("平台链接", "/admin/ecbi/products/links", "", "productId={id}", "")
+            .OpsDel("/admin/ecbi/products/delete", "确认删除该商品及其全部平台链接吗？");
+    }
+
+    static FormPage FormDef() {
+        return FormPage.Of("/admin/ecbi/products/save")
+            .Text("商品名称", "name").Req().Ph("请输入商品名称")
+            .Text("内部 SKU", "sku").Ph("例如：SKU-1001")
+            .Text("商品类目", "category").Ph("例如：3C数码 / 服饰");
+    }
+
+    static ListPage LinksDef() {
+        return ListPage.Of()
+            .TbarAdd("新增链接", "/admin/ecbi/products/links/form")
+            .Col("id", "ID", "num", "75")
+            .Col("platform", "所属平台", "text", "130")
+            .Col("shop", "所属店铺", "text", "160")
+            .Col("outerCode", "外部编码", "text", "160")
+            .Col("url", "商品链接", "text", "260")
+            .OpsEdit("/admin/ecbi/products/links/form")
+            .OpsDel("/admin/ecbi/products/links/delete", "确认删除该平台链接吗？");
+    }
+
     [HttpGet]
     [Route("/admin/ecbi/products")]
     [Custom(IsMenu = true, Icon = "mdi:package-variant-closed", Perm = PermBit.View)]
     [Description("商品主档")]
-    async void Index() {
-        ViewData d = await this.Layout("商品主档");
-        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+    void Index() {
+        this.Conf();
+    }
 
-        ListQuery q = this.Paged("id", 20);
+    [HttpPut]
+    [Custom(Perm = PermBit.View)]
+    [Description("商品主档表格配置")]
+    public void Conf() {
+        CrudOps.Conf(this, Products.ScreenDef());
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.View)]
+    [Description("商品主档列表数据")]
+    public async void List() {
+        if (!this.DataReady()) { return; }
+        ListQuery q = this.PagedAny("id", 20);
         string kw = q.Kw();
         /* 租户硬边（#34）：列表只出本租户行，链接统计同链。 */
         List<OdsProduct> rows = await this.OdsProduct
@@ -32,67 +79,68 @@ public class Products : CollabAdminController {
             .Where(a => a.tenantId == Tenant.Cur())
             .WhereIf(kw.Length > 0, a => a.name.Contains(kw) || a.sku.Contains(kw))
             .CountAsync();
-
-        /* 每个商品统计已关联的店铺链接数。 */
         List<OdsShopProduct> links = await this.OdsShopProduct
             .Where(a => a.tenantId == Tenant.Cur()).ToListAsync();
-        List<StrMap> items = d.AddList("rows");
+
+        JsonWriter w = new JsonWriter();
+        w.WriteStartArray();
         for (int i = 0; i < rows.Count; i = i + 1) {
             OdsProduct p = rows[i];
-            StrMap row = new StrMap();
-            row.Set("id", Convert.ToString(p.id));
-            row.Set("name", p.name);
-            row.Set("sku", Fmt.Dash(p.sku));
-            row.Set("category", Fmt.Dash(p.category));
-            row.Set("linkCount", Convert.ToString(Products.LinkCount(links, p.id)));
-            items.Add(row);
+            w.WriteStartObject();
+            w.WriteProperty("id", p.id);
+            w.WriteProperty("name", p.name);
+            w.WriteProperty("sku", Fmt.Dash(p.sku));
+            w.WriteProperty("category", Fmt.Dash(p.category));
+            w.WriteProperty("linkCount", Products.LinkCount(links, p.id));
+            w.WriteEndObject();
         }
-        this.Pager(d, q, total);
-        this.Page(d);
+        w.WriteEndArray();
+        AdminUiProtocol.WriteListData(this, total, w.ToString());
     }
 
-    [HttpGet]
+    [HttpPut]
     [Custom(Perm = PermBit.Create | PermBit.Update)]
-    [Description("商品表单")]
-    async void Form() {
-        int id = this.InInt("id", 0);
-        ViewData d = new ViewData();
-        d.Set("id", Convert.ToString(id));
-        d.Set("dialogTitle", "新增商品");
-        d.Set("new", "1");
-        if (id > 0) {
-            OdsProduct p = await this.OdsProduct
-                .Where(a => a.id == id && a.tenantId == Tenant.Cur())
-                .FirstAsync();
-            if (p == null) { this.Fail(404, "0404", "商品不存在"); }
-            d.Set("dialogTitle", "编辑商品");
-            d.Set("name", p.name);
-            d.Set("sku", p.sku);
-            d.Set("category", p.category);
-            d.Set("edit", "1");
-            d.Set("new", "");
-        }
-        this.Dialog(d);
+    [Description("商品表单配置")]
+    public void FormConf() {
+        CrudOps.FormConf(this, Products.FormDef(), "商品");
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.View)]
+    [Description("商品编辑回显")]
+    public async void Edit() {
+        int id = this.InAnyInt("id", 0);
+        OdsProduct p = await this.OdsProduct
+            .Where(a => a.id == id && a.tenantId == Tenant.Cur())
+            .FirstAsync();
+        if (p == null) { this.Fail(404, "0404", "商品不存在"); return; }
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("id", p.id);
+        w.WriteProperty("name", p.name);
+        w.WriteProperty("sku", p.sku);
+        w.WriteProperty("category", p.category);
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(this, w.ToString());
     }
 
     [HttpPost]
     [Custom(Perm = PermBit.Create | PermBit.Update)]
     [Description("保存商品")]
     async void Save() {
-        int id = this.InInt("id", 0);
-        string name = this.Need("name", "商品名称");
-        string sku = this.In("sku");
-        string category = this.In("category");
+        int id = this.InAnyInt("id", 0);
+        string name = this.NeedAny("name", "商品名称");
+        string sku = this.InAny("sku");
+        string category = this.InAny("category");
 
         if (id > 0) {
-            /* 租户硬边（#34）：跨租户商品更新落空即 404。 */
             int n = await this.OdsProduct.Update()
                 .Set(a => a.name, name)
                 .Set(a => a.sku, sku)
                 .Set(a => a.category, category)
                 .Where(a => a.id == id && a.tenantId == Tenant.Cur())
                 .ExecuteAffrowsAsync();
-            if (n <= 0) { this.Fail(404, "0404", "商品不存在"); }
+            if (n <= 0) { this.Fail(404, "0404", "商品不存在"); return; }
             await this.Note("编辑商品", "#" + Convert.ToString(id) + " " + name, n > 0, "");
             this.Saved("商品已保存");
             return;
@@ -113,11 +161,10 @@ public class Products : CollabAdminController {
     [Custom(Perm = PermBit.Delete)]
     [Description("删除商品")]
     async void Delete() {
-        int id = this.InInt("id", 0);
-        /* 租户硬边（#34）：读行与两段删除均限本租户，链接删除按 (productId, tenantId)。 */
+        int id = this.InAnyInt("id", 0);
         OdsProduct p = await this.OdsProduct
             .Where(a => a.id == id && a.tenantId == Tenant.Cur()).FirstAsync();
-        if (p == null) { this.Fail(404, "0404", "商品不存在"); }
+        if (p == null) { this.Fail(404, "0404", "商品不存在"); return; }
         int n = await this.OdsProduct.Delete()
             .Where(a => a.id == id && a.tenantId == Tenant.Cur())
             .ExecuteAffrowsAsync();
@@ -128,22 +175,34 @@ public class Products : CollabAdminController {
         this.Saved("商品及其平台链接已删除");
     }
 
-    /* ---- 平台链接映射 ---- */
+    /* ---- 平台链接映射子表（SubTableModal）---- */
 
     [HttpGet]
     [Custom(Perm = PermBit.View)]
     [Description("平台链接")]
-    async void Links() {
-        ViewData d = await this.Layout("平台链接");
-        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
-        int productId = this.InInt("productId", 0);
-        /* 租户硬边（#34）：宿主商品与链接、店铺、平台下拉全限本租户。 */
+    void Links() {
+        this.LinksConf();
+    }
+
+    [HttpPut]
+    [Route("/admin/ecbi/products/links/conf")]
+    [Custom(Perm = PermBit.View)]
+    [Description("平台链接表格配置")]
+    public void LinksConf() {
+        CrudOps.Conf(this, Products.LinksDef());
+    }
+
+    [HttpPost]
+    [Route("/admin/ecbi/products/links/list")]
+    [Custom(Perm = PermBit.View)]
+    [Description("平台链接列表数据")]
+    public async void LinksList() {
+        if (!this.DataReady()) { return; }
+        int productId = this.InAnyInt("productId", 0);
         OdsProduct p = await this.OdsProduct
             .Where(a => a.id == productId && a.tenantId == Tenant.Cur()).FirstAsync();
-        if (p == null) { this.Fail(404, "0404", "商品不存在"); }
+        if (p == null) { this.Fail(404, "0404", "商品不存在"); return; }
 
-        d.Set("productId", Convert.ToString(productId));
-        d.Set("productName", p.name);
         List<OdsShopProduct> rows = await this.OdsShopProduct
             .Where(a => a.productId == productId && a.tenantId == Tenant.Cur())
             .OrderBy(a => a.id).ToListAsync();
@@ -152,84 +211,90 @@ public class Products : CollabAdminController {
         List<OdsPlatform> plats = await this.OdsPlatform
             .Where(a => a.tenantId == Tenant.Cur()).OrderBy(a => a.id).ToListAsync();
 
-        List<StrMap> items = d.AddList("rows");
+        JsonWriter w = new JsonWriter();
+        w.WriteStartArray();
         for (int i = 0; i < rows.Count; i = i + 1) {
             OdsShopProduct l = rows[i];
-            StrMap row = new StrMap();
-            row.Set("id", Convert.ToString(l.id));
-            row.Set("shop", Products.ShopName(shops, l.shopId));
-            row.Set("platform", Products.PlatOfShop(shops, plats, l.shopId));
-            row.Set("outerCode", Fmt.Dash(l.outerCode));
-            row.Set("url", Fmt.Dash(l.url));
-            items.Add(row);
+            w.WriteStartObject();
+            w.WriteProperty("id", l.id);
+            w.WriteProperty("productId", l.productId);
+            w.WriteProperty("shopId", Convert.ToString(l.shopId));
+            w.WriteProperty("shop", Products.ShopName(shops, l.shopId));
+            w.WriteProperty("platform", Products.PlatOfShop(shops, plats, l.shopId));
+            w.WriteProperty("outerCode", Fmt.Dash(l.outerCode));
+            w.WriteProperty("url", Fmt.Dash(l.url));
+            w.WriteEndObject();
         }
-        this.Page(d);
+        w.WriteEndArray();
+        AdminUiProtocol.WriteListData(this, rows.Count, w.ToString());
     }
 
-    [HttpGet]
+    [HttpPut]
+    [Route("/admin/ecbi/products/links/formconf")]
     [Custom(Perm = PermBit.Create | PermBit.Update)]
-    [Description("链接表单")]
-    async void LinkForm() {
-        int id = this.InInt("id", 0);
-        int productId = this.InInt("productId", 0);
-        OdsShopProduct l = null;
-        if (id > 0) {
-            /* 租户硬边（#34）：跨租户链接按不存在处理。 */
-            l = await this.OdsShopProduct
-                .Where(a => a.id == id && a.tenantId == Tenant.Cur()).FirstAsync();
-            if (l == null) { this.Fail(404, "0404", "链接不存在"); }
-            productId = l.productId;
-        }
-        ViewData d = new ViewData();
-        d.Set("id", Convert.ToString(id));
-        d.Set("productId", Convert.ToString(productId));
-        d.Set("dialogTitle", id > 0 ? "编辑平台链接" : "新增平台链接");
-        if (id <= 0) { d.Set("new", "1"); }
-
+    [Description("平台链接表单配置")]
+    public async void LinksFormConf() {
         List<OdsShop> shops = await this.OdsShop
             .Where(a => a.status == 1 && a.tenantId == Tenant.Cur())
             .OrderBy(a => a.id).ToListAsync();
         List<OdsPlatform> plats = await this.OdsPlatform
             .Where(a => a.tenantId == Tenant.Cur()).OrderBy(a => a.id).ToListAsync();
-        List<StrMap> sopts = d.AddList("shops");
+        List<StrMap> sopts = new List<StrMap>();
         for (int i = 0; i < shops.Count; i = i + 1) {
             StrMap opt = new StrMap();
             opt.Set("id", Convert.ToString(shops[i].id));
             opt.Set("name", shops[i].name + "（"
                 + Products.PlatName(plats, shops[i].platformId) + "）");
-            if (l != null && shops[i].id == l.shopId) { opt.Set("selected", "selected"); }
             sopts.Add(opt);
         }
-        if (l != null) {
-            d.Set("outerCode", l.outerCode);
-            d.Set("url", l.url);
-            d.Set("edit", "1");
-            d.Set("new", "");
-        }
-        this.Dialog(d);
+        FormPage fp = FormPage.Of("/admin/ecbi/products/links/save")
+            .SelectList("所属店铺", "shopId", sopts).Req()
+            .Text("外部商品编码", "outerCode").Ph("平台侧商品 ID / 编码")
+            .Text("商品链接", "url").Ph("https://...");
+        CrudOps.FormConf(this, fp, "平台链接");
     }
 
     [HttpPost]
+    [Route("/admin/ecbi/products/links/edit")]
+    [Custom(Perm = PermBit.View)]
+    [Description("平台链接编辑回显")]
+    public async void LinksEdit() {
+        int id = this.InAnyInt("id", 0);
+        OdsShopProduct l = await this.OdsShopProduct
+            .Where(a => a.id == id && a.tenantId == Tenant.Cur()).FirstAsync();
+        if (l == null) { this.Fail(404, "0404", "链接不存在"); return; }
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("id", l.id);
+        w.WriteProperty("productId", l.productId);
+        w.WriteProperty("shopId", Convert.ToString(l.shopId));
+        w.WriteProperty("outerCode", l.outerCode);
+        w.WriteProperty("url", l.url);
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(this, w.ToString());
+    }
+
+    [HttpPost]
+    [Route("/admin/ecbi/products/links/save")]
     [Custom(Perm = PermBit.Create | PermBit.Update)]
     [Description("保存链接")]
     async void LinkSave() {
-        int id = this.InInt("id", 0);
-        int productId = this.InInt("productId", 0);
-        int shopId = this.InInt("shopId", 0);
-        string outerCode = this.In("outerCode");
-        string url = this.In("url");
-        if (shopId <= 0) { this.Fail(400, "0004", "请选择店铺"); }
-        if (id <= 0 && productId <= 0) { this.Fail(400, "0004", "缺少商品"); }
+        int id = this.InAnyInt("id", 0);
+        int productId = this.InAnyInt("productId", 0);
+        int shopId = this.InAnyInt("shopId", 0);
+        string outerCode = this.InAny("outerCode");
+        string url = this.InAny("url");
+        if (shopId <= 0) { this.Fail(400, "0004", "请选择店铺"); return; }
+        if (id <= 0 && productId <= 0) { this.Fail(400, "0004", "缺少商品"); return; }
 
         if (id > 0) {
-            /* 租户硬边（#34）：跨租户链接更新落空即 404。 */
             int n = await this.OdsShopProduct.Update()
                 .Set(a => a.shopId, shopId)
                 .Set(a => a.outerCode, outerCode)
                 .Set(a => a.url, url)
                 .Where(a => a.id == id && a.tenantId == Tenant.Cur())
                 .ExecuteAffrowsAsync();
-            if (n <= 0) { this.Fail(404, "0404", "链接不存在"); }
+            if (n <= 0) { this.Fail(404, "0404", "链接不存在"); return; }
             await this.Note("编辑平台链接", "#" + Convert.ToString(id), n > 0, "");
             this.Saved("链接已保存");
             return;
@@ -247,15 +312,15 @@ public class Products : CollabAdminController {
     }
 
     [HttpPost]
+    [Route("/admin/ecbi/products/links/delete")]
     [Custom(Perm = PermBit.Delete)]
     [Description("删除链接")]
     async void LinkDelete() {
-        int id = this.InInt("id", 0);
-        /* 租户硬边（#34）：跨租户链接删除落空即 404。 */
+        int id = this.InAnyInt("id", 0);
         int n = await this.OdsShopProduct.Delete()
             .Where(a => a.id == id && a.tenantId == Tenant.Cur())
             .ExecuteAffrowsAsync();
-        if (n <= 0) { this.Fail(404, "0404", "链接不存在"); }
+        if (n <= 0) { this.Fail(404, "0404", "链接不存在"); return; }
         await this.Note("删除平台链接", "#" + Convert.ToString(id), n > 0, "");
         this.Saved("链接已删除");
     }

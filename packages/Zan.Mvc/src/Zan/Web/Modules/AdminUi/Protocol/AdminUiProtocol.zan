@@ -1,0 +1,198 @@
+using System;
+using System.Json;
+using System.Web;
+
+namespace Zan.Web.AdminUi;
+
+/* adminUI 通用壳唯一协议出口（Single Envelope & Serializer Gateway, v1.2）：
+   所有面向通用前端壳的 JSON 响应（认证、菜单、字典、列表配置、动作描述、表单 schema）
+   一律经本类产出，避免多个控制器各自拼装信封或动作格式导致口径漂移。 */
+public class AdminUiProtocol {
+    public static const string Version = "1.2";
+    public static const string OkCode = "0000";
+
+    /* 统一成功信封：{ resp_code:"0000", status:200, msg, url:"", dynamicToken:"", t:0, data } */
+    public static void Ok(Controller c, string dataJson) {
+        OkMsg(c, "ok", dataJson);
+    }
+
+    public static void OkMsg(Controller c, string msg, string dataJson) {
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("resp_code", OkCode);
+        w.WriteProperty("status", 200);
+        w.WriteProperty("msg", msg != null && msg.Length > 0 ? msg : "ok");
+        w.WriteProperty("url", "");
+        w.WriteProperty("dynamicToken", "");
+        w.WriteProperty("t", 0);
+        if (dataJson != null && dataJson.Length > 0) {
+            w.WriteRawProperty("data", dataJson);
+        }
+        w.WriteEndObject();
+        c.Json(w.ToString());
+    }
+
+    /* 统一错误信封（携带 HTTP 状态码与业务码）。 */
+    public static void Error(Controller c, int httpStatus, string code, string msg) {
+        string reason = "Error";
+        if (httpStatus == 400) { reason = "Bad Request"; }
+        else if (httpStatus == 401) { reason = "Unauthorized"; }
+        else if (httpStatus == 403) { reason = "Forbidden"; }
+        else if (httpStatus == 404) { reason = "Not Found"; }
+        else if (httpStatus == 422) { reason = "Unprocessable Entity"; }
+        else if (httpStatus == 503) { reason = "Service Unavailable"; }
+        c.Ctx().Status(httpStatus, reason);
+
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("resp_code", code != null && code.Length > 0 ? code : "9999");
+        w.WriteProperty("status", httpStatus);
+        w.WriteProperty("msg", msg != null ? msg : "error");
+        w.WriteProperty("url", "");
+        w.WriteProperty("dynamicToken", "");
+        w.WriteProperty("t", 0);
+        w.WriteEndObject();
+        c.Json(w.ToString());
+    }
+
+    /* "1=启用|ok,0=禁用|err" → [{value:"1",label:"启用"},{value:"0",label:"禁用"}]
+       自动剥离 SSR 徽章后缀 |tone，供表格列、筛选下拉、弹窗表单复用。 */
+    public static void WriteOptArray(JsonWriter w, string opts) {
+        w.WriteStartArray();
+        string rest = opts != null ? opts : "";
+        while (rest.Length > 0) {
+            string pair = rest;
+            int comma = rest.IndexOf(",");
+            if (comma >= 0) {
+                pair = rest.Substring(0, comma);
+                rest = rest.Substring(comma + 1);
+            } else {
+                rest = "";
+            }
+            int eq = pair.IndexOf("=");
+            if (eq <= 0) { continue; }
+            string val = pair.Substring(0, eq).Trim();
+            string lbl = pair.Substring(eq + 1).Trim();
+            int bar = lbl.IndexOf("|");
+            if (bar >= 0) { lbl = lbl.Substring(0, bar).Trim(); }
+            w.WriteStartObject();
+            w.WriteProperty("value", val);
+            w.WriteProperty("label", lbl);
+            w.WriteEndObject();
+        }
+        w.WriteEndArray();
+    }
+
+    /* v1.1 表单动作原语（mode: "form"）。 */
+    public static void WriteFormAction(JsonWriter w, string name, string action, string btnType,
+                                       string confUrl, string saveUrl, bool needRow) {
+        WriteFormActionEx(w, name, action, btnType, confUrl, "", saveUrl, needRow);
+    }
+
+    /* v1.2 表单动作扩展原语（支持自定义 editUrl 与 confUrl / saveUrl）。 */
+    public static void WriteFormActionEx(JsonWriter w, string name, string action, string btnType,
+                                         string confUrl, string editUrl, string saveUrl, bool needRow) {
+        w.WriteStartObject();
+        w.WriteProperty("Name", name);
+        w.WriteProperty("Action", action);
+        w.WriteProperty("Type", btnType);
+        w.WriteProperty("mode", "form");
+        if (needRow) { w.WriteProperty("needRow", true); }
+        if (confUrl != null && confUrl.Length > 0) { w.WriteProperty("confUrl", confUrl); }
+        if (editUrl != null && editUrl.Length > 0) { w.WriteProperty("editUrl", editUrl); }
+        if (saveUrl != null && saveUrl.Length > 0) { w.WriteProperty("saveUrl", saveUrl); }
+        w.WriteEndObject();
+    }
+
+    /* v1.2 列表页内下钻动作原语（mode: "navigate"），替代旧版 iframe 子页。 */
+    public static void WriteNavigateAction(JsonWriter w, string name, string btnType,
+                                           string targetUrl, string argsTemplate, bool needRow) {
+        w.WriteStartObject();
+        w.WriteProperty("Name", name);
+        w.WriteProperty("Action", "Navigate");
+        w.WriteProperty("Type", btnType);
+        w.WriteProperty("mode", "navigate");
+        if (needRow) { w.WriteProperty("needRow", true); }
+        if (targetUrl != null && targetUrl.Length > 0) { w.WriteProperty("targetUrl", targetUrl); }
+        if (argsTemplate != null && argsTemplate.Length > 0) { w.WriteProperty("argsTemplate", argsTemplate); }
+        w.WriteEndObject();
+    }
+
+    /* v1.2 文件下载动作原语（mode: "download"）。 */
+    public static void WriteDownloadAction(JsonWriter w, string name, string btnType, string url) {
+        w.WriteStartObject();
+        w.WriteProperty("Name", name);
+        w.WriteProperty("Action", "Download");
+        w.WriteProperty("Type", btnType);
+        w.WriteProperty("mode", "download");
+        if (url != null && url.Length > 0) { w.WriteProperty("actionUrl", url); }
+        w.WriteEndObject();
+    }
+
+    /* v1.2 行级文件下载动作原语（mode: "download" + needRow + argsTemplate）。 */
+    public static void WriteRowDownloadAction(JsonWriter w, string name, string btnType, string url, string argsTemplate) {
+        w.WriteStartObject();
+        w.WriteProperty("Name", name);
+        w.WriteProperty("Action", "Download");
+        w.WriteProperty("Type", btnType);
+        w.WriteProperty("mode", "download");
+        w.WriteProperty("needRow", true);
+        if (url != null && url.Length > 0) { w.WriteProperty("actionUrl", url); }
+        if (argsTemplate != null && argsTemplate.Length > 0) { w.WriteProperty("argsTemplate", argsTemplate); }
+        w.WriteEndObject();
+    }
+
+    /* 通用列表分页数据信封：{ total, data: [...] } */
+    public static void WriteListData(Controller c, int total, string rowsArrayJson) {
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("total", total);
+        w.WriteRawProperty("data", rowsArrayJson != null && rowsArrayJson.Length > 0 ? rowsArrayJson : "[]");
+        w.WriteEndObject();
+        Ok(c, w.ToString());
+    }
+
+    /* v1.1 直发批量/行确认动作原语（mode: "confirm"），覆盖批量启停、批量删除、自定义直发操作。 */
+    public static void WriteConfirmAction(JsonWriter w, string name, string action, string btnType,
+                                          string actionUrl, string confirmText, bool needRow,
+                                          bool dangerGuard, string payloadJson, string argsTemplate) {
+        w.WriteStartObject();
+        w.WriteProperty("Name", name);
+        w.WriteProperty("Action", action);
+        w.WriteProperty("Type", btnType);
+        w.WriteProperty("mode", "confirm");
+        if (needRow) { w.WriteProperty("needRow", true); }
+        if (dangerGuard) { w.WriteProperty("dangerGuard", true); }
+        if (actionUrl != null && actionUrl.Length > 0) { w.WriteProperty("actionUrl", actionUrl); }
+        if (confirmText != null && confirmText.Length > 0) { w.WriteProperty("confirmText", confirmText); }
+        if (argsTemplate != null && argsTemplate.Length > 0) { w.WriteProperty("argsTemplate", argsTemplate); }
+        if (payloadJson != null && payloadJson.Length > 0) { w.WriteRawProperty("payload", payloadJson); }
+        w.WriteEndObject();
+    }
+
+    /* v1.1 只读详情动作原语（mode: "detail"）。 */
+    public static void WriteDetailAction(JsonWriter w, string name, string detailUrl) {
+        w.WriteStartObject();
+        w.WriteProperty("Name", name);
+        w.WriteProperty("Action", "Detail");
+        w.WriteProperty("Type", "default");
+        w.WriteProperty("mode", "detail");
+        w.WriteProperty("needRow", true);
+        if (detailUrl != null && detailUrl.Length > 0) { w.WriteProperty("detailUrl", detailUrl); }
+        w.WriteEndObject();
+    }
+
+    /* v1.1 子页弹窗动作原语（mode: "iframe"），用于运行日志、报表、复杂 SSR 子屏弹窗内嵌。 */
+    public static void WriteIframeAction(JsonWriter w, string name, string btnType,
+                                         string url, string argsTemplate, bool needRow) {
+        w.WriteStartObject();
+        w.WriteProperty("Name", name);
+        w.WriteProperty("Action", "Iframe");
+        w.WriteProperty("Type", btnType);
+        w.WriteProperty("mode", "iframe");
+        if (needRow) { w.WriteProperty("needRow", true); }
+        if (url != null && url.Length > 0) { w.WriteProperty("url", url); }
+        if (argsTemplate != null && argsTemplate.Length > 0) { w.WriteProperty("argsTemplate", argsTemplate); }
+        w.WriteEndObject();
+    }
+}

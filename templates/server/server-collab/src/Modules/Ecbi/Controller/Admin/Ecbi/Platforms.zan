@@ -1,8 +1,10 @@
 using System;
 using System.Data;
 using System.Data.Orm;
+using System.Json;
 using System.Web;
 using Zan.Web;
+using Zan.Web.AdminUi;
 using Zan.Web.Model.Ecbi;
 
 namespace Zan.Web.Admin.Ecbi;
@@ -12,80 +14,106 @@ namespace Zan.Web.Admin.Ecbi;
 [Custom(Authorization = CustomAuthorization.Grant)]
 [Description("平台管理")]
 public class Platforms : CollabAdminController {
+    static ListPage ScreenDef() {
+        return ListPage.Of()
+            .TbarAdd("新增平台", "/admin/ecbi/platforms/form")
+            .Col("id", "ID", "num", "75")
+            .Col("name", "平台名称", "text", "180")
+            .Col("code", "编码", "text", "140")
+            .Tag("status", "状态", "1=启用|ok,0=禁用|off", "90")
+            .OpsEdit("/admin/ecbi/platforms/form")
+            .Ops("切换状态", "/admin/ecbi/platforms/status", "确认切换该平台启停状态吗？", "id={id}&status={nextStatus}", "u");
+    }
+
+    static FormPage FormDef() {
+        return FormPage.Of("/admin/ecbi/platforms/save")
+            .Text("平台名称", "name").Req().Ph("例如：淘宝、京东、抖音")
+            .Text("平台编码", "code").Ph("例如：taobao、jd、douyin")
+            .Select("状态", "status", "1=启用,0=禁用").Val("1");
+    }
+
     [HttpGet]
     [Route("/admin/ecbi/platforms")]
     [Custom(IsMenu = true, Icon = "mdi:storefront", Perm = PermBit.View)]
     [Description("平台管理")]
-    async void Index() {
-        ViewData d = await this.Layout("平台管理");
-        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+    void Index() {
+        this.Conf();
+    }
 
+    [HttpPut]
+    [Custom(Perm = PermBit.View)]
+    [Description("平台表格配置")]
+    public void Conf() {
+        CrudOps.Conf(this, Platforms.ScreenDef());
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.View)]
+    [Description("平台列表数据")]
+    public async void List() {
+        if (!this.DataReady()) { return; }
         /* 租户硬边（#34）：列表只出本租户平台。 */
         List<OdsPlatform> rows = await this.OdsPlatform
             .Where(a => a.tenantId == Tenant.Cur()).OrderBy(a => a.id).ToListAsync();
-        List<StrMap> items = d.AddList("rows");
+        JsonWriter w = new JsonWriter();
+        w.WriteStartArray();
         for (int i = 0; i < rows.Count; i = i + 1) {
             OdsPlatform p = rows[i];
-            StrMap row = new StrMap();
-            row.Set("id", Convert.ToString(p.id));
-            row.Set("name", p.name);
-            row.Set("code", Fmt.Dash(p.code));
-            row.Set("statusText", p.status == 1 ? "启用" : "禁用");
-            row.Set("statusClass", p.status == 1 ? "ok" : "off");
-            row.Set("nextStatus", p.status == 1 ? "0" : "1");
-            row.Set("toggleText", p.status == 1 ? "禁用" : "启用");
-            items.Add(row);
+            w.WriteStartObject();
+            w.WriteProperty("id", p.id);
+            w.WriteProperty("name", p.name);
+            w.WriteProperty("code", Fmt.Dash(p.code));
+            w.WriteProperty("status", Convert.ToString(p.status));
+            w.WriteProperty("nextStatus", p.status == 1 ? 0 : 1);
+            w.WriteEndObject();
         }
-        d.Set("total", Convert.ToString(rows.Count));
-        this.Page(d);
+        w.WriteEndArray();
+        AdminUiProtocol.WriteListData(this, rows.Count, w.ToString());
     }
 
-    [HttpGet]
+    [HttpPut]
     [Custom(Perm = PermBit.Create | PermBit.Update)]
-    [Description("平台表单")]
-    async void Form() {
-        int id = this.InInt("id", 0);
-        ViewData d = new ViewData();
-        d.Set("id", Convert.ToString(id));
-        d.Set("dialogTitle", "新增平台");
-        d.Set("new", "1");
-        d.Set("status1", "selected");
-        if (id > 0) {
-            /* 租户硬边（#34）：跨租户平台按不存在处理。 */
-            OdsPlatform p = await this.OdsPlatform
-                .Where(a => a.id == id && a.tenantId == Tenant.Cur()).FirstAsync();
-            if (p == null) { this.Fail(404, "0404", "平台不存在"); }
-            d.Set("dialogTitle", "编辑平台");
-            d.Set("name", p.name);
-            d.Set("code", p.code);
-            d.Set("edit", "1");
-            d.Set("new", "");
-            d.Set("status1", "");
-            if (p.status == 1) { d.Set("status1", "selected"); }
-            else { d.Set("status0", "selected"); }
-        }
-        this.Dialog(d);
+    [Description("平台表单配置")]
+    public void FormConf() {
+        CrudOps.FormConf(this, Platforms.FormDef(), "平台");
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.View)]
+    [Description("平台编辑回显")]
+    public async void Edit() {
+        int id = this.InAnyInt("id", 0);
+        OdsPlatform p = await this.OdsPlatform
+            .Where(a => a.id == id && a.tenantId == Tenant.Cur()).FirstAsync();
+        if (p == null) { this.Fail(404, "0404", "平台不存在"); return; }
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("id", p.id);
+        w.WriteProperty("name", p.name);
+        w.WriteProperty("code", p.code);
+        w.WriteProperty("status", Convert.ToString(p.status));
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(this, w.ToString());
     }
 
     [HttpPost]
     [Custom(Perm = PermBit.Create | PermBit.Update)]
     [Description("保存平台")]
     async void Save() {
-        int id = this.InInt("id", 0);
-        string name = this.Need("name", "平台名称");
-        string code = this.In("code");
-        int status = this.InInt("status", 1);
+        int id = this.InAnyInt("id", 0);
+        string name = this.NeedAny("name", "平台名称");
+        string code = this.InAny("code");
+        int status = this.InAnyInt("status", 1);
         if (status != 1) { status = 0; }
 
         if (id > 0) {
-            /* 租户硬边（#34）：跨租户平台更新落空即 404。 */
             int n = await this.OdsPlatform.Update()
                 .Set(a => a.name, name)
                 .Set(a => a.code, code)
                 .Set(a => a.status, status)
                 .Where(a => a.id == id && a.tenantId == Tenant.Cur())
                 .ExecuteAffrowsAsync();
-            if (n <= 0) { this.Fail(404, "0404", "平台不存在"); }
+            if (n <= 0) { this.Fail(404, "0404", "平台不存在"); return; }
             await this.Note("编辑平台", "#" + Convert.ToString(id) + " " + name, n > 0, "");
             this.Saved("平台已保存");
             return;
@@ -105,14 +133,14 @@ public class Platforms : CollabAdminController {
     [Custom(Perm = PermBit.Update)]
     [Description("启用或禁用平台")]
     async void Status() {
-        int id = this.InInt("id", 0);
-        int status = this.InInt("status", 1);
+        int id = this.InAnyInt("id", 0);
+        int status = this.InAnyInt("status", 1);
         if (status != 1) { status = 0; }
         int n = await this.OdsPlatform.Update()
             .Set(a => a.status, status)
             .Where(a => a.id == id && a.tenantId == Tenant.Cur())
             .ExecuteAffrowsAsync();
-        if (n <= 0) { this.Fail(404, "0404", "平台不存在"); }
+        if (n <= 0) { this.Fail(404, "0404", "平台不存在"); return; }
         await this.Note("启用或禁用平台", "#" + Convert.ToString(id), n > 0,
             status == 1 ? "启用" : "禁用");
         this.Saved(status == 1 ? "平台已启用" : "平台已禁用");

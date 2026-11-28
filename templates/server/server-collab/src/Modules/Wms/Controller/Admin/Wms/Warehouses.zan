@@ -1,29 +1,63 @@
 using System;
 using System.Data;
 using System.Data.Orm;
+using System.Json;
 using System.Web;
 using Zan.Web;
+using Zan.Web.AdminUi;
 using Zan.Web.Model;
 using Zan.Web.Model.Wms;
 
 namespace Zan.Web.Admin.Wms;
 
-/* /admin/wms/warehouses 仓库管理：搜索、建、编、启禁。列表为投影，永非实体。 */
+/* /admin/wms/warehouses 仓库管理：搜索、建、编、启禁。 */
 [Route("admin/wms/warehouses/[action]")]
 [Custom(Authorization = CustomAuthorization.Grant)]
 [Description("仓库管理")]
 public class Warehouses : CollabAdminController {
+    static ListPage ScreenDef() {
+        return ListPage.Of()
+            .Text("仓库名称", "kw", "name", "按仓库名称搜索")
+            .TbarAdd("新增仓库", "/admin/wms/warehouses/form")
+            .Col("id", "ID", "num", "75")
+            .Col("name", "仓库名称", "text", "180")
+            .Col("code", "编码", "text", "130")
+            .Col("location", "库位/地址", "text", "220")
+            .Tag("status", "状态", "1=启用|ok,0=禁用|off", "90")
+            .OpsEdit("/admin/wms/warehouses/form")
+            .Ops("切换状态", "/admin/wms/warehouses/status", "确认切换该仓库启停状态吗？", "id={id}&status={nextStatus}", "u");
+    }
+
+    static FormPage FormDef() {
+        return FormPage.Of("/admin/wms/warehouses/save")
+            .Text("仓库名称", "name").Req().Ph("请输入仓库名称")
+            .Text("仓库编码", "code").Ph("例如：WH-01")
+            .Text("仓库地址", "location").Ph("仓库所在位置或地址")
+            .Select("状态", "status", "1=启用,0=禁用").Val("1");
+    }
+
     [HttpGet]
     [Route("/admin/wms/warehouses")]
     [Custom(IsMenu = true, Icon = "mdi:warehouse", Perm = PermBit.View)]
     [Description("仓库管理")]
-    async void Index() {
-        ViewData d = await this.Layout("仓库管理");
-        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
+    void Index() {
+        this.Conf();
+    }
 
-        ListQuery q = this.Paged("id", 20);
+    [HttpPut]
+    [Custom(Perm = PermBit.View)]
+    [Description("仓库表格配置")]
+    public void Conf() {
+        CrudOps.Conf(this, Warehouses.ScreenDef());
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.View)]
+    [Description("仓库列表数据")]
+    public async void List() {
+        if (!this.DataReady()) { return; }
+        ListQuery q = this.PagedAny("id", 20);
         string kw = q.Kw();
-        /* 租户硬边（#34）：列表只出本租户行。 */
         List<WmsWarehouse> rows = await this.WmsWarehouse
             .Where(a => a.tenantId == Tenant.Cur())
             .WhereIf(kw.Length > 0, a => a.name.Contains(kw))
@@ -34,62 +68,59 @@ public class Warehouses : CollabAdminController {
             .WhereIf(kw.Length > 0, a => a.name.Contains(kw))
             .CountAsync();
 
-        List<StrMap> items = d.AddList("rows");
+        JsonWriter w = new JsonWriter();
+        w.WriteStartArray();
         for (int i = 0; i < rows.Count; i = i + 1) {
-            WmsWarehouse w = rows[i];
-            StrMap row = new StrMap();
-            row.Set("id", Convert.ToString(w.id));
-            row.Set("name", w.name);
-            row.Set("code", Fmt.Dash(w.code));
-            row.Set("location", Fmt.Dash(w.location));
-            row.Set("statusText", w.status == 1 ? "启用" : "禁用");
-            row.Set("statusClass", w.status == 1 ? "ok" : "off");
-            row.Set("nextStatus", w.status == 1 ? "0" : "1");
-            row.Set("toggleText", w.status == 1 ? "禁用" : "启用");
-            items.Add(row);
+            WmsWarehouse wh = rows[i];
+            w.WriteStartObject();
+            w.WriteProperty("id", wh.id);
+            w.WriteProperty("name", wh.name);
+            w.WriteProperty("code", Fmt.Dash(wh.code));
+            w.WriteProperty("location", Fmt.Dash(wh.location));
+            w.WriteProperty("status", Convert.ToString(wh.status));
+            w.WriteProperty("nextStatus", wh.status == 1 ? 0 : 1);
+            w.WriteEndObject();
         }
-        this.Pager(d, q, total);
-        this.Page(d);
+        w.WriteEndArray();
+        AdminUiProtocol.WriteListData(this, total, w.ToString());
     }
 
-    /* 新建/编辑对话框；片段非页。 */
-    [HttpGet]
+    [HttpPut]
     [Custom(Perm = PermBit.Create | PermBit.Update)]
-    [Description("仓库表单")]
-    async void Form() {
-        int id = this.InInt("id", 0);
-        ViewData d = new ViewData();
-        d.Set("id", Convert.ToString(id));
-        d.Set("dialogTitle", "新增仓库");
-        d.Set("new", "1");
-        d.Set("status1", "selected");
-        if (id > 0) {
-            WmsWarehouse w = await this.WmsWarehouse
-                .Where(a => a.id == id && a.tenantId == Tenant.Cur())
-                .FirstAsync();
-            if (w == null) { this.Fail(404, "0404", "仓库不存在"); }
-            d.Set("dialogTitle", "编辑仓库");
-            d.Set("name", w.name);
-            d.Set("code", w.code);
-            d.Set("location", w.location);
-            d.Set("edit", "1");
-            d.Set("new", "");
-            d.Set("status1", "");
-            if (w.status == 1) { d.Set("status1", "selected"); }
-            else { d.Set("status0", "selected"); }
-        }
-        this.Dialog(d);
+    [Description("仓库表单配置")]
+    public void FormConf() {
+        CrudOps.FormConf(this, Warehouses.FormDef(), "仓库");
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.View)]
+    [Description("仓库编辑回显")]
+    public async void Edit() {
+        int id = this.InAnyInt("id", 0);
+        WmsWarehouse wh = await this.WmsWarehouse
+            .Where(a => a.id == id && a.tenantId == Tenant.Cur())
+            .FirstAsync();
+        if (wh == null) { this.Fail(404, "0404", "仓库不存在"); return; }
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("id", wh.id);
+        w.WriteProperty("name", wh.name);
+        w.WriteProperty("code", wh.code);
+        w.WriteProperty("location", wh.location);
+        w.WriteProperty("status", Convert.ToString(wh.status));
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(this, w.ToString());
     }
 
     [HttpPost]
     [Custom(Perm = PermBit.Create | PermBit.Update)]
     [Description("保存仓库")]
     async void Save() {
-        int id = this.InInt("id", 0);
-        string name = this.Need("name", "仓库名称");
-        string code = this.In("code");
-        string location = this.In("location");
-        int status = this.InInt("status", 1);
+        int id = this.InAnyInt("id", 0);
+        string name = this.NeedAny("name", "仓库名称");
+        string code = this.InAny("code");
+        string location = this.InAny("location");
+        int status = this.InAnyInt("status", 1);
         if (status != 1) { status = 0; }
 
         if (id > 0) {
@@ -105,15 +136,15 @@ public class Warehouses : CollabAdminController {
             this.Saved("仓库已保存");
             return;
         }
-        WmsWarehouse w = new WmsWarehouse();
-        w.tenantId = Tenant.Cur();
-        w.name = name;
-        w.code = code;
-        w.location = location;
-        w.status = status;
-        w.createdAt = WebApp.NowSeconds();
-        w.updatedAt = w.createdAt;
-        int newId = await this.WmsWarehouse.Insert(w).ExecuteIdentityAsync();
+        WmsWarehouse wh = new WmsWarehouse();
+        wh.tenantId = Tenant.Cur();
+        wh.name = name;
+        wh.code = code;
+        wh.location = location;
+        wh.status = status;
+        wh.createdAt = WebApp.NowSeconds();
+        wh.updatedAt = wh.createdAt;
+        int newId = await this.WmsWarehouse.Insert(wh).ExecuteIdentityAsync();
         await this.Note("新增仓库", "#" + Convert.ToString(newId) + " " + name, newId > 0, "");
         this.Saved("仓库已创建");
     }
@@ -122,8 +153,8 @@ public class Warehouses : CollabAdminController {
     [Custom(Perm = PermBit.Update)]
     [Description("启用或禁用仓库")]
     async void Status() {
-        int id = this.InInt("id", 0);
-        int status = this.InInt("status", 1);
+        int id = this.InAnyInt("id", 0);
+        int status = this.InAnyInt("status", 1);
         if (status != 1) { status = 0; }
         int n = await this.WmsWarehouse.Update()
             .Set(a => a.status, status)

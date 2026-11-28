@@ -1,59 +1,93 @@
 using System;
 using System.Text;
 using System.Data.Orm;
+using System.Json;
 using System.Web;
+using Zan.Web.AdminUi;
 using Zan.Web.Model.Oa;
 using Zan.Web.Model;
 
 namespace Zan.Web.Admin.Oa;
 
-/* 待办中心（架构 §2.4 WP-4 / T5）：聚合页读 Feature.TodoCenter.Gather
-   （manual 真行 + 各注册源实时流），来源徽标 + 截止排序 + 整行跳转；
-   完成/忽略：manual 改真行，虚拟源落标记行（Gather 按键过滤）。顶部
-   附个人待办新增表单（manual 源的入口）。
-   授权用 Login 而非 Grant（与全站 Grant 惯例的偏差，有意为之）：待办是
-   纯个人视图、无跨人数据面，且新增屏走 Grant 需要角色授权迁移才能到达；
-   写操作均限本人行（userId==me.id），越权无从谈起。 */
+/* 待办中心（架构 §2.4 WP-4 / T5）：聚合多模块待办源 + 新增个人待办 + 完成/忽略。 */
 [Route("admin/oa/todocenter/[action]")]
 [Custom(Authorization = CustomAuthorization.Login)]
 [Description("待办中心")]
 public class TodoCenter : CollabAdminController {
+    static ListPage ScreenDef() {
+        return ListPage.Of()
+            .TbarAdd("新增个人待办", "/admin/oa/todocenter/form")
+            .Col("src", "来源", "text", "100")
+            .Col("title", "待办内容", "text", "300")
+            .Col("due", "截止日期", "text", "125")
+            .Tag("overdue", "紧迫度", "1=已逾期|off,0=正常|ok", "95")
+            .Col("link", "关联入口", "text", "180")
+            .Ops("完成", "/admin/oa/todocenter/done", "确认将该待办标记为已完成吗？",
+                "source={source}&id={rowId}&relatedType={relatedType}&relatedId={relatedId}&title={title}", "")
+            .Ops("忽略", "/admin/oa/todocenter/ignore", "确认忽略该待办吗？",
+                "source={source}&id={rowId}&relatedType={relatedType}&relatedId={relatedId}&title={title}", "");
+    }
 
-    /* 聚合页：按截止升序（无截止垫后），逾期行标红。 */
     [HttpGet]
     [Route("/admin/oa/todocenter")]
+    [Custom(IsMenu = true, Icon = "mdi:checkbox-marked-circle-outline", Perm = PermBit.View)]
     [Description("待办中心")]
-    async void Index() {
+    void Index() {
+        this.Conf();
+    }
+
+    [HttpPut]
+    [Description("待办中心表格配置")]
+    public void Conf() {
+        CrudOps.Conf(this, TodoCenter.ScreenDef());
+    }
+
+    [HttpPost]
+    [Description("待办中心列表数据")]
+    public async void List() {
+        if (!this.DataReady()) { return; }
         SysUser me = await this.Admin();
-        ViewData d = await this.Layout("待办中心");
-        if (!this.DbReady()) { d.Set("dbDown", "1"); this.Page(d); return; }
         List<TodoItem> items = await Zan.Web.TodoCenter.Gather(this.Held(),
             Tenant.Cur(), me);
         long now = WebApp.NowSeconds();
-        List<StrMap> rows = d.AddList("rows");
+
+        JsonWriter w = new JsonWriter();
+        w.WriteStartArray();
         for (int i = 0; i < items.Count; i = i + 1) {
             TodoItem it = items[i];
-            StrMap m = new StrMap();
-            m.Set("src", TodoCenter.SrcText(it.source));
-            m.Set("title", it.title);
-            m.Set("link", it.link.Length > 0 ? it.link : "#");
-            m.Set("due", it.dueAt > 0 ? Fmt.Day(it.dueAt) : "—");
-            m.Set("overdue", it.dueAt > 0 && it.dueAt < now ? "1" : "");
-            m.Set("args", TodoCenter.ArgsOf(it));
-            rows.Add(m);
+            w.WriteStartObject();
+            w.WriteProperty("id", i + 1);
+            w.WriteProperty("rowId", it.rowId);
+            w.WriteProperty("source", it.source);
+            w.WriteProperty("src", TodoCenter.SrcText(it.source));
+            w.WriteProperty("relatedType", it.relatedType);
+            w.WriteProperty("relatedId", it.relatedId);
+            w.WriteProperty("title", it.title);
+            w.WriteProperty("link", it.link.Length > 0 ? it.link : "—");
+            w.WriteProperty("due", it.dueAt > 0 ? Fmt.Day(it.dueAt) : "—");
+            w.WriteProperty("overdue", (it.dueAt > 0 && it.dueAt < now) ? "1" : "0");
+            w.WriteEndObject();
         }
-        d.Set("empty", items.Count == 0 ? "1" : "");
-        this.Page(d);
+        w.WriteEndArray();
+        AdminUiProtocol.WriteListData(this, items.Count, w.ToString());
     }
 
-    /* 新增个人待办（manual 源）。 */
+    [HttpPut]
+    [Description("新增待办表单配置")]
+    public void FormConf() {
+        FormPage fp = FormPage.Of("/admin/oa/todocenter/add")
+            .Text("待办内容", "title").Req().Ph("请输入个人待办事项")
+            .Text("关联链接", "link").Ph("可选，如 /admin/crm/customers");
+        CrudOps.FormConf(this, fp, "新增个人待办");
+    }
+
     [HttpPost]
     [Description("新增待办")]
     async void Add() {
         SysUser me = await this.Admin();
-        string title = this.Need("title", "内容");
-        if (title.Length == 0) { this.Fail(400, "0003", "请填写待办内容"); }
-        string link = this.In("link");
+        string title = this.NeedAny("title", "内容");
+        if (title.Length == 0) { this.Fail(400, "0003", "请填写待办内容"); return; }
+        string link = this.InAny("link");
         if (link.Length > 64) { link = link.Substring(0, 64); }
         OaTodo t = new OaTodo();
         t.tenantId = Tenant.Cur();
@@ -72,8 +106,6 @@ public class TodoCenter : CollabAdminController {
         this.Saved("已添加");
     }
 
-    /* 完成：manual 改真行；虚拟源 upsert 标记行（source/relatedType/
-       relatedId 由聚合页随行携带——只接受已注册来源，防捏造键）。 */
     [HttpPost]
     [Description("完成待办")]
     async void Done() {
@@ -81,7 +113,6 @@ public class TodoCenter : CollabAdminController {
         this.Saved("已完成");
     }
 
-    /* 忽略：同完成，仅标记值不同（屏蔽后聚合页不再出现）。 */
     [HttpPost]
     [Description("忽略待办")]
     async void Ignore() {
@@ -89,10 +120,9 @@ public class TodoCenter : CollabAdminController {
         this.Saved("已忽略");
     }
 
-    /* Done/Ignore 公共体：入参校验 + 标记落库 + 审计。 */
     private async bool Change(int status) {
         SysUser me = await this.Admin();
-        string source = this.In("source");
+        string source = this.InAny("source");
         if (source.Length == 0) { source = "manual"; }
         if (!Zan.Web.TodoCenter.HasSource(source)) {
             this.Fail(400, "0003", "未知待办来源");
@@ -101,36 +131,25 @@ public class TodoCenter : CollabAdminController {
         string relatedType = source;
         int relatedId = 0;
         if (source == "manual") {
-            relatedId = this.InInt("id", 0);
+            relatedId = this.InAnyInt("id", 0);
             relatedType = "manual";
         } else {
-            relatedType = this.In("relatedType");
-            relatedId = this.InInt("relatedId", 0);
+            relatedType = this.InAny("relatedType");
+            relatedId = this.InAnyInt("relatedId", 0);
             if (relatedType.Length == 0 || relatedId == 0) {
                 this.Fail(400, "0003", "缺少待办回链参数");
                 return false;
             }
         }
+        string title = this.InAny("title");
         bool ok = await Zan.Web.TodoCenter.Mark(this.Held(), Tenant.Cur(),
-            me.id, source, relatedType, relatedId, status, this.In("title"));
+            me.id, source, relatedType, relatedId, status, title);
         if (!ok) {
             this.Fail(404, "0404", "待办不存在或不属于你");
             return false;
         }
-        await this.Note(status == 1 ? "完成待办" : "忽略待办",
-            this.In("title"), true, "");
+        await this.Note(status == 1 ? "完成待办" : "忽略待办", title, true, "");
         return true;
-    }
-
-    /* 行携带参数：manual 传 id，虚拟源传 source/relatedType/relatedId/title。 */
-    static string ArgsOf(TodoItem it) {
-        if (it.source == "manual") {
-            return "source=manual&id=" + Convert.ToString(it.rowId)
-                + "&title=" + Encoding.UrlEncode(it.title);
-        }
-        return "source=" + it.source + "&relatedType=" + it.relatedType
-            + "&relatedId=" + Convert.ToString(it.relatedId)
-            + "&title=" + Encoding.UrlEncode(it.title);
     }
 
     static string SrcText(string source) {
@@ -138,6 +157,7 @@ public class TodoCenter : CollabAdminController {
         if (source == "flow") { return "流程"; }
         if (source == "crm") { return "商机"; }
         if (source == "wms") { return "库存"; }
+        if (source == "calendar") { return "日程"; }
         return source;
     }
 }

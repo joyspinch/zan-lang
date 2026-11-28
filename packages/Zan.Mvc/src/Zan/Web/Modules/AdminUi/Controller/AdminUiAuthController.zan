@@ -1,0 +1,226 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+using System.Threading;
+using System.Web;
+using Zan.Web.AdminUi;
+using Zan.Web.Core;
+using Zan.Web.Model;
+using Zan.Web.Security;
+using Zan.Web;
+
+namespace Zan.Web.Api;
+
+/* 通用前端壳认证与个人偏好控制器（规范前缀 /api/shell/...）：
+     POST /api/shell/login : 登录签发 Bearer Token + 同源会话 Cookie（支撑 iframe 内嵌 SSR 页）
+     GET  /api/shell/me    : 获取当前登录用户资料
+     GET  /api/shell/prefs : 读取当前用户 Theme / Config 偏好
+     POST /api/shell/prefs : 保存当前用户 Theme / Config 偏好
+   路由均位于 /admin 与 /api/admin 之外，不改变既有管理区守门基线。 */
+[Custom(Authorization = CustomAuthorization.None)]
+[Description("通用前端壳认证")]
+public class AdminUiAuthController : Zan.Web.AdminApiController {
+    [HttpPost]
+    [Route("/api/shell/login")]
+    [Custom(Authorization = CustomAuthorization.None)]
+    [Description("壳登录")]
+    public async void ShellLogin() { await HandleLogin(); }
+
+    [HttpPost]
+    [Route("/api/shell/logout")]
+    [Custom(Authorization = CustomAuthorization.None)]
+    [Description("壳退出登录")]
+    public async void ShellLogout() { await HandleLogout(); }
+
+    [HttpGet]
+    [Route("/api/shell/me")]
+    [Custom(Authorization = CustomAuthorization.Login)]
+    [Description("当前用户资料")]
+    public async void ShellMe() { await HandleUserInfo(); }
+
+    [HttpGet]
+    [Route("/api/shell/prefs")]
+    [Custom(Authorization = CustomAuthorization.Login)]
+    [Description("读取个人偏好")]
+    public async void ShellGetPrefs() { await HandleGetConfig(); }
+
+    [HttpPost]
+    [Route("/api/shell/prefs")]
+    [Custom(Authorization = CustomAuthorization.Login)]
+    [Description("保存个人偏好")]
+    public async void ShellSavePrefs() { await HandleSaveConfig(); }
+
+    private async Task HandleLogin() {
+        string user = this.InAny("userName").Trim();
+        if (user.Length == 0) { user = this.InAny("username").Trim(); }
+        if (user.Length == 0) { user = this.InAny("user").Trim(); }
+        string pass = this.InAny("password");
+        if (pass.Length == 0) { pass = this.InAny("pass"); }
+        if (user.Length == 0 || pass.Length == 0) {
+            AdminUiProtocol.Error(this, 400, "0003", "用户名或密码不能为空");
+            return;
+        }
+        if (user.Length > 64 || pass.Length > 128) {
+            AdminUiProtocol.Error(this, 422, "1003", "用户名或密码长度超出限制");
+            return;
+        }
+
+        string token = await AuthUser.Login(user, pass);
+        if (token.Length == 0) {
+            if (!AuthToken.Ready()) {
+                AdminUiProtocol.Error(this, 503, "1002", "认证密钥未配置（auth.secret / ZAN_AUTH_SECRET 至少 32 字符）");
+                return;
+            }
+            await RecordLogin(user, 0, false, "用户名或密码错误");
+            AdminUiProtocol.Error(this, 401, "1001", "用户名或密码错误");
+            return;
+        }
+
+        this.Ctx().SetCookie(Cfg.Auth.cookieName, token, Cfg.Auth.ttlSeconds);
+
+        SysUser me = await AuthUser.ByUsername(user);
+        int userId = me != null ? me.id : 0;
+        await RecordLogin(user, userId, true, "管理后台登录");
+        string nick = me != null && me.nickname.Length > 0 ? me.nickname : user;
+        string uname = me != null && me.username.Length > 0 ? me.username : user;
+        long createdAt = me != null ? me.createdAt : 0L;
+        int roleId = await FirstRoleId(userId);
+        long expires = WebApp.NowSeconds() + (long)Cfg.Auth.ttlSeconds;
+
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("UserID", userId);
+        w.WriteProperty("RoleID", roleId);
+        w.WriteProperty("NickName", nick);
+        w.WriteProperty("UserName", uname);
+        w.WriteProperty("CreateAt", createdAt > 0 ? Convert.ToString(createdAt) : "");
+        w.WriteProperty("AccessToken", token);
+        w.WriteProperty("Expires", Convert.ToString(expires));
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(this, w.ToString());
+    }
+
+    private async Task RecordLogin(string user, int userId, bool ok, string message) {
+        if (!this.DbReady() || this.Held() == null) { return; }
+        SysLoginLog row = new SysLoginLog();
+        row.userId = userId;
+        row.username = user;
+        row.ip = ClientIp.Of(this.Ctx());
+        row.agent = this.Ctx().Header("User-Agent");
+        row.ok = ok ? 1 : 0;
+        row.message = message;
+        row.createdAt = WebApp.NowSeconds();
+        try {
+            int _id = await this.SysLoginLog.Insert(row).ExecuteIdentityAsync();
+        } catch (Exception _ex) {
+            /* 登录日志写入失败不阻断登录主流程。 */
+        }
+    }
+
+    private async Task HandleLogout() {
+        if (this.uid != null && this.uid.Length > 0) {
+            int uidInt = Filter.ToInt(this.uid, 0);
+            if (uidInt > 0 && this.DbReady()) {
+                try {
+                    int _n = await this.SysUser.BumpTokenVersion(uidInt);
+                } catch (Exception _ex) {
+                    /* 忽略数据库不可用或未建表态，仍清 Cookie。 */
+                }
+                AuthUser.Forget(this.uid);
+            }
+        }
+        this.Ctx().SetCookie(Cfg.Auth.cookieName, "", 0);
+        AdminUiProtocol.Ok(this, "{}");
+    }
+
+    private async Task HandleUserInfo() {
+        SysUser me = null;
+        if (this.DbReady()) {
+            me = await this.Admin();
+        }
+        int userId = me != null ? me.id : Filter.ToInt(this.uid, 0);
+        string uname = me != null ? me.username : this.uid;
+        string nick = me != null && me.nickname.Length > 0 ? me.nickname : uname;
+        long createdAt = me != null ? me.createdAt : 0L;
+        int roleId = await FirstRoleId(userId);
+
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("UserID", userId);
+        w.WriteProperty("RoleID", roleId);
+        w.WriteProperty("NickName", nick);
+        w.WriteProperty("UserName", uname);
+        w.WriteProperty("CreateAt", createdAt > 0 ? Convert.ToString(createdAt) : "");
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(this, w.ToString());
+    }
+
+    private async Task HandleGetConfig() {
+        string theme = "";
+        string cfg = "";
+        if (this.DbReady() && this.uid.Length > 0) {
+            try {
+                SysSiteSetting sTheme = await this.SysSiteSetting.ByName("adminui.theme." + this.uid);
+                if (sTheme != null && sTheme.value != null) { theme = sTheme.value; }
+                SysSiteSetting sCfg = await this.SysSiteSetting.ByName("adminui.config." + this.uid);
+                if (sCfg != null && sCfg.value != null) { cfg = sCfg.value; }
+            } catch (Exception _ex) {
+                /* 未初始化 sys_site_setting 时降级返回空串，前端回退本地默认主题。 */
+            }
+        }
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("Theme", theme);
+        w.WriteProperty("Config", cfg);
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(this, w.ToString());
+    }
+
+    private async Task HandleSaveConfig() {
+        string field = this.InAny("field").Trim();
+        string val = this.InAny("value");
+        if (field != "Theme" && field != "Config") {
+            AdminUiProtocol.Error(this, 400, "0004", "不支持的配置字段");
+            return;
+        }
+        if (val.Length > 1950) {
+            AdminUiProtocol.Error(this, 400, "0004", "配置内容超出长度限制");
+            return;
+        }
+        if (this.DbReady() && this.uid.Length > 0) {
+            string key = (field == "Theme" ? "adminui.theme." : "adminui.config.") + this.uid;
+            long now = WebApp.NowSeconds();
+            try {
+                SysSiteSetting existing = await this.SysSiteSetting.ByName(key);
+                if (existing != null) {
+                    int _u = await this.SysSiteSetting.UpdateValueById(existing.id, val, now);
+                } else {
+                    SysSiteSetting row = new SysSiteSetting();
+                    row.name = key;
+                    row.value = val;
+                    row.groupName = "adminui";
+                    row.label = "AdminUI " + field + " #" + this.uid;
+                    row.kind = "textarea";
+                    row.tip = "adminUI 用户界面偏好";
+                    row.sortOrder = 999;
+                    row.updatedAt = now;
+                    int _ins = await this.SysSiteSetting.Insert(row).ExecuteIdentityAsync();
+                }
+            } catch (Exception _ex) {
+                /* 降级：配置存储异常时不阻断前端正常使用。 */
+            }
+        }
+        AdminUiProtocol.Ok(this, "{}");
+    }
+
+    private async int FirstRoleId(int userId) {
+        if (userId <= 0 || !this.DbReady()) { return 0; }
+        try {
+            List<SysUserRole> rs = await this.SysUserRole.ByUserId(userId);
+            if (rs != null && rs.Count > 0) { return rs[0].roleId; }
+        } catch (Exception _ex) {
+            /* 忽略未建表降级态。 */
+        }
+        return 0;
+    }
+}

@@ -4,7 +4,9 @@ using System.Data;
 using System.Data.Orm;
 using System.Web;
 using System.Json;
+using Zan.Web.AdminUi;
 using Zan.Web.Core;
+using Zan.Web.Modules.Crud.Engine;
 
 namespace Zan.Web;
 
@@ -86,39 +88,30 @@ public class CrudOps {
 
     /* adminUI ZanTable 契约：把本屏声明投影为 ListConfData JSON。
        信封 {resp_code,status,msg,url,dynamicToken,t,data}，data =
-       {conf, columns, filters, tools}；列类型映射 text/muted→text、
-       num→number、time→date、tag/flag→dict；筛选映射 Input/Select/
-       DateRange/Select(remote)。editable 只对 EditFields 白名单为真。 */
+       {Conf, Columns, Filters, FilterRight, Tools, MenuItems, Tabs}；
+       列类型映射 text/muted→text、num→number、time→date、tag/flag→dict；
+       筛选映射 Input/Select/DateRange/Select(OptionsUrl)；
+       工具栏按 ListButton / ListOps 映射为 Add/Edit/Delete，并附带
+       confUrl="formconf" / saveUrl="save" / deleteUrl="batch" 直连既有 CRUD 路由。 */
     public static void Conf(AdminController c, ListPage lp) {
         JsonWriter w = new JsonWriter();
         w.WriteStartObject();
-        w.WriteProperty("resp_code", "0000");
-        w.WriteProperty("status", 200);
-        w.WriteProperty("msg", "ok");
-        w.WriteProperty("url", "");
-        w.WriteProperty("dynamicToken", "");
-        w.WriteProperty("t", 0);
+        w.WriteProperty("PageType", "table");
 
-        w.WritePropertyName("data");
-        w.WriteStartObject();
-
-        w.WritePropertyName("conf");
+        w.WritePropertyName("Conf");
         w.WriteStartObject();
         w.WriteProperty("showPages", true);
         w.WriteProperty("pageSize", 20);
-        w.WritePropertyName("pageSizes");
-        w.WriteStartArray();
-        w.WriteInt(10);
-        w.WriteInt(20);
-        w.WriteInt(50);
-        w.WriteInt(100);
-        w.WriteEndArray();
-        w.WriteProperty("local", false);
+        w.WriteProperty("pageSizes", "10,20,50,100");
+        w.WriteProperty("Local", false);
+        w.WriteProperty("TreeData", false);
         w.WriteProperty("import", false);
-        w.WriteProperty("export", false);
+        w.WriteProperty("export", true);
+        w.WriteProperty("innerKey", lp.KeyName().Length > 0 ? lp.KeyName() : "id");
+        w.WriteProperty("innerName", "标题");
         w.WriteEndObject();
 
-        w.WritePropertyName("columns");
+        w.WritePropertyName("Columns");
         w.WriteStartArray();
         for (int i = 0; i < lp.Cols().Count; i = i + 1) {
             ListCol col = lp.Cols()[i];
@@ -130,62 +123,279 @@ public class CrudOps {
             else if (col.kind == "time") { type = "date"; }
             else if (col.kind == "tag" || col.kind == "flag") { type = "dict"; }
             w.WriteProperty("type", type);
-            w.WriteProperty("sortable", col.kind == "num");
-            w.WriteProperty("editable", Find(lp, col.field) != null);
+            w.WriteProperty("sortable", col.kind == "num" || col.kind == "time");
+            bool isEditable = Find(lp, col.field) != null;
+            w.WriteProperty("editable", isEditable);
             if (col.width.Length > 0) {
                 string wn = WidthNum(col.width);
-                if (wn.Length > 0) {
+                if (wn.Length > 0 && wn != "0") {
                     w.WriteRawProperty("width", wn);
                 }
             }
-            if (col.opts.Length > 0) {
-                w.WriteProperty("options", col.opts);
+            if (col.dictCode != null && col.dictCode.Length > 0) {
+                w.WriteProperty("dictKey", col.dictCode);
+                w.WriteProperty("DictKey", col.dictCode);
+            }
+            if (col.opts != null && col.opts.Length > 0) {
+                w.WritePropertyName("options");
+                AdminUiProtocol.WriteOptArray(w, col.opts);
+                if (isEditable) {
+                    w.WriteProperty("cellEditor", "agSelectCellEditor");
+                }
             }
             w.WriteEndObject();
         }
         w.WriteEndArray();
 
-        w.WritePropertyName("filters");
+        w.WritePropertyName("Filters");
         w.WriteStartArray();
         for (int i = 0; i < lp.Filters().Count; i = i + 1) {
             ListFilter f = lp.Filters()[i];
             w.WriteStartObject();
-            w.WriteProperty("title", f.title);
-            w.WriteProperty("name", f.name);
+            w.WriteProperty("Name", f.title);
+            w.WriteProperty("Field", f.name);
             if (f.type == "text") {
-                w.WriteProperty("type", "Input");
+                w.WriteProperty("Type", "Input");
                 w.WriteProperty("placeholder", f.ph);
             } else if (f.type == "select") {
-                w.WriteProperty("type", "Select");
-                w.WriteProperty("options", f.options);
+                w.WriteProperty("Type", "Select");
+                if (f.dictCode != null && f.dictCode.Length > 0) {
+                    w.WriteProperty("DictKey", f.dictCode);
+                }
+                if (f.options != null && f.options.Length > 0) {
+                    w.WritePropertyName("Options");
+                    AdminUiProtocol.WriteOptArray(w, f.options);
+                }
             } else if (f.type == "time") {
-                w.WriteProperty("type", "DateRange");
+                w.WriteProperty("Type", "DateRange");
             } else if (f.type == "pick") {
-                w.WriteProperty("type", "Select");
-                w.WriteProperty("remote", f.url);
+                w.WriteProperty("Type", "Select");
+                w.WriteProperty("OptionsUrl", f.url);
             }
             w.WriteEndObject();
         }
         w.WriteEndArray();
 
-        w.WritePropertyName("tools");
+        w.WritePropertyName("FilterRight");
         w.WriteStartArray();
+        w.WriteEndArray();
+
+        w.WritePropertyName("Tools");
+        w.WriteStartArray();
+        bool hasAdd = false;
+        bool hasEdit = false;
+        bool hasDelete = false;
+        string opsDelUrl = "";
+        string opsDelConfirm = "删除后不可恢复，确认删除所选记录吗？";
         for (int i = 0; i < lp.Buttons().Count; i = i + 1) {
             ListButton b = lp.Buttons()[i];
-            if (b.type == "sep") { continue; }
+            if (b.type == "sep" || b.type == "reload") { continue; }
+            if (b.type == "add") {
+                hasAdd = true;
+                AdminUiProtocol.WriteFormAction(w, b.name.Length > 0 ? b.name : "新增", "Add", "primary", "formconf", "save", false);
+            } else if (b.type == "del" || b.type == "delete" || (b.type == "batch" && b.value.Length == 0)) {
+                hasDelete = true;
+                string delUrl = b.url.Length > 0 ? b.url : "batch";
+                AdminUiProtocol.WriteConfirmAction(w, b.name.Length > 0 ? b.name : "删除", "Delete", "danger",
+                    delUrl, b.confirm, true, true, "{\"op\":\"delete\"}", "");
+            } else if (b.type == "batch" && b.value.Length > 0) {
+                string bUrl = b.url.Length > 0 ? b.url : "batch";
+                string bType = b.value == "0" ? "warning" : "success";
+                AdminUiProtocol.WriteConfirmAction(w, b.name, "BatchConfirm", bType,
+                    bUrl, b.confirm, true, false, "{\"value\":\"" + b.value + "\"}", "");
+            } else if (b.type == "download") {
+                AdminUiProtocol.WriteDownloadAction(w, b.name, "info", b.url);
+            } else if (b.type == "custom") {
+                if (b.confirm.Length > 0) {
+                    AdminUiProtocol.WriteConfirmAction(w, b.name, "Custom", "default", b.url, b.confirm, false, false, "", "");
+                } else {
+                    AdminUiProtocol.WriteNavigateAction(w, b.name, "default", b.url, "", false);
+                }
+            }
+        }
+        for (int i = 0; i < lp.Operations().Count; i = i + 1) {
+            ListOps op = lp.Operations()[i];
+            if (op.url.EndsWith("/form")) {
+                hasEdit = true;
+            } else if (op.url.EndsWith("/delete")) {
+                hasDelete = true;
+                opsDelUrl = op.url;
+                if (op.confirm.Length > 0) { opsDelConfirm = op.confirm; }
+            } else if (op.perm == "u" && op.url.Length == 0) {
+                hasEdit = true;
+            } else if (op.perm == "d" && op.url.Length == 0) {
+                hasDelete = true;
+            }
+        }
+        if (hasEdit) {
+            AdminUiProtocol.WriteFormAction(w, "编辑", "Edit", "info", "formconf", "save", true);
+        }
+        for (int i = 0; i < lp.Operations().Count; i = i + 1) {
+            ListOps op = lp.Operations()[i];
+            if (op.url.Length == 0 || op.url.EndsWith("/form") || op.url.EndsWith("/delete")) { continue; }
+            if (op.url.EndsWith("/download")) {
+                AdminUiProtocol.WriteRowDownloadAction(w, op.name, "info", op.url, op.args);
+            } else if (op.confirm.Length > 0) {
+                AdminUiProtocol.WriteConfirmAction(w, op.name, "Custom", "info", op.url, op.confirm, true, false, "", op.args);
+            } else {
+                AdminUiProtocol.WriteNavigateAction(w, op.name, "default", op.url, op.args, true);
+            }
+        }
+        if (hasDelete && !HasDeleteButton(lp)) {
+            string delUrl = opsDelUrl.Length > 0 ? opsDelUrl : "batch";
+            string delPayload = opsDelUrl.Length > 0 ? "" : "{\"op\":\"delete\"}";
+            string delArgs = opsDelUrl.Length > 0 ? "id={id}" : "";
+            AdminUiProtocol.WriteConfirmAction(w, "删除", "Delete", "danger", delUrl,
+                opsDelConfirm, true, true, delPayload, delArgs);
+        }
+        if (!hasAdd && !hasEdit && !hasDelete && lp.Edits().Count > 0) {
+            AdminUiProtocol.WriteFormAction(w, "新增", "Add", "primary", "formconf", "save", false);
+            AdminUiProtocol.WriteFormAction(w, "编辑", "Edit", "info", "formconf", "save", true);
+            AdminUiProtocol.WriteConfirmAction(w, "删除", "Delete", "danger", "batch",
+                "删除后不可恢复，确认删除所选记录吗？", true, true, "{\"op\":\"delete\"}", "");
+        }
+        w.WriteEndArray();
+
+        /* 服务端右键菜单（MenuItems）：自动提供详情查看 + 行内编辑/自定义操作/批量启停/删除，零重复配置。 */
+        w.WritePropertyName("MenuItems");
+        w.WriteStartArray();
+        AdminUiProtocol.WriteDetailAction(w, "查看详情", "");
+        if (hasEdit || (!hasAdd && !hasEdit && !hasDelete && lp.Edits().Count > 0)) {
+            AdminUiProtocol.WriteFormAction(w, "编辑", "Edit", "info", "formconf", "save", true);
+        }
+        for (int i = 0; i < lp.Operations().Count; i = i + 1) {
+            ListOps op = lp.Operations()[i];
+            if (op.url.Length == 0 || op.url.EndsWith("/form") || op.url.EndsWith("/delete")) { continue; }
+            if (op.url.EndsWith("/download")) {
+                AdminUiProtocol.WriteRowDownloadAction(w, op.name, "info", op.url, op.args);
+            } else if (op.confirm.Length > 0) {
+                AdminUiProtocol.WriteConfirmAction(w, op.name, "Custom", "info", op.url, op.confirm, true, false, "", op.args);
+            } else {
+                AdminUiProtocol.WriteNavigateAction(w, op.name, "default", op.url, op.args, true);
+            }
+        }
+        for (int i = 0; i < lp.Buttons().Count; i = i + 1) {
+            ListButton b = lp.Buttons()[i];
+            if (b.type == "batch" && b.value.Length > 0) {
+                string bUrl = b.url.Length > 0 ? b.url : "batch";
+                string bType = b.value == "0" ? "warning" : "success";
+                AdminUiProtocol.WriteConfirmAction(w, b.name, "BatchConfirm", bType,
+                    bUrl, b.confirm, true, false, "{\"value\":\"" + b.value + "\"}", "");
+            }
+        }
+        if (hasDelete || (!hasAdd && !hasEdit && !hasDelete && lp.Edits().Count > 0)) {
+            string delUrl = opsDelUrl.Length > 0 && !HasDeleteButton(lp) ? opsDelUrl : "batch";
+            string delPayload = opsDelUrl.Length > 0 && !HasDeleteButton(lp) ? "" : "{\"op\":\"delete\"}";
+            string delArgs = opsDelUrl.Length > 0 && !HasDeleteButton(lp) ? "id={id}" : "";
+            AdminUiProtocol.WriteConfirmAction(w, "删除", "Delete", "danger", delUrl,
+                opsDelConfirm, true, true, delPayload, delArgs);
+        }
+        w.WriteEndArray();
+
+        w.WritePropertyName("Tabs");
+        w.WriteStartArray();
+        for (int i = 0; i < lp.Tabs().Count; i = i + 1) {
+            StrMap tab = lp.Tabs()[i];
             w.WriteStartObject();
-            w.WriteProperty("name", b.name);
-            w.WriteProperty("url", b.url);
-            w.WriteProperty("type", b.type);
-            if (b.value.Length > 0) { w.WriteProperty("value", b.value); }
-            if (b.confirm.Length > 0) { w.WriteProperty("confirm", b.confirm); }
+            w.WriteProperty("Name", tab.Get("name"));
+            w.WriteProperty("Field", tab.Get("field"));
+            w.WriteProperty("Value", tab.Get("value"));
             w.WriteEndObject();
         }
         w.WriteEndArray();
 
-        w.WriteEndObject(); // end data
-        w.WriteEndObject(); // end root
-        c.Json(w.ToString());
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(c, w.ToString());
+    }
+
+    /* adminUI 表单配置投影（PUT {api}/formconf）：把 FormPage 声明投影为
+       GeneralForm / FormModal 消费的 JSON schema（支持 select / SelectList /
+       onlyNew / onlyEdit / visibleWhen / 校验规则）。 */
+    public static void FormConf(AdminController c, FormPage fp, string title) {
+        bool isEdit = c.InAnyInt("id", 0) > 0;
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("title", title != null && title.Length > 0 ? title : "表单");
+        w.WriteProperty("width", fp.IsWide() ? "720px" : "600px");
+        w.WriteProperty("labelWidth", 100);
+        w.WriteProperty("size", "medium");
+        w.WriteProperty("cols", 24);
+        if (fp.Action() != null && fp.Action().Length > 0) {
+            w.WriteProperty("saveUrl", fp.Action());
+        }
+        w.WritePropertyName("formItems");
+        w.WriteStartArray();
+        List<FormField> fs = fp.Fields();
+        for (int i = 0; i < fs.Count; i = i + 1) {
+            FormField f = fs[i];
+            if (f.kind == "hint") { continue; }
+            if (f.onlyNew && isEdit) { continue; }
+            if (f.onlyEdit && !isEdit) { continue; }
+            w.WriteStartObject();
+            w.WriteProperty("field", f.name);
+            w.WriteProperty("label", f.label);
+            string comp = "input";
+            if (f.type == "int" || f.kind == "int") { comp = "input-number"; }
+            else if (f.kind == "area") { comp = "textarea"; }
+            else if (f.kind == "pass") { comp = "password"; }
+            else if (f.kind == "select" || f.kind == "list") { comp = "select"; }
+            w.WriteProperty("component", comp);
+            w.WriteProperty("span", f.span || f.kind == "area" ? 24 : (fp.IsWide() ? 12 : 24));
+            w.WriteProperty("required", f.required);
+            if (f.ph != null && f.ph.Length > 0) { w.WriteProperty("placeholder", f.ph); }
+            if (f.value != null && f.value.Length > 0) { w.WriteProperty("defaultValue", f.value); }
+            if (f.showWhenField != null && f.showWhenField.Length > 0) {
+                w.WritePropertyName("visibleWhen");
+                w.WriteStartObject();
+                w.WriteProperty("field", f.showWhenField);
+                w.WriteProperty("values", f.showWhenValues);
+                w.WriteEndObject();
+            }
+            if (f.kind == "select") {
+                w.WritePropertyName("options");
+                AdminUiProtocol.WriteOptArray(w, f.options);
+            } else if (f.kind == "list") {
+                w.WritePropertyName("options");
+                w.WriteStartArray();
+                if (f.blank != null && f.blank.Length > 0) {
+                    w.WriteStartObject();
+                    w.WriteProperty("value", "0");
+                    w.WriteProperty("label", f.blank);
+                    w.WriteEndObject();
+                }
+                if (f.rows != null) {
+                    for (int ri = 0; ri < f.rows.Count; ri = ri + 1) {
+                        StrMap r = f.rows[ri];
+                        w.WriteStartObject();
+                        w.WriteProperty("value", r.Get("id"));
+                        w.WriteProperty("label", r.Get("name"));
+                        w.WriteEndObject();
+                    }
+                }
+                w.WriteEndArray();
+            }
+            w.WritePropertyName("rules");
+            w.WriteStartArray();
+            if (f.required) {
+                w.WriteStartObject();
+                w.WriteProperty("required", true);
+                w.WriteProperty("message", "请填写" + f.label);
+                w.WriteEndObject();
+            }
+            w.WriteEndArray();
+            w.WriteEndObject();
+        }
+        w.WriteEndArray();
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(c, w.ToString());
+    }
+
+    private static bool HasDeleteButton(ListPage lp) {
+        for (int i = 0; i < lp.Buttons().Count; i = i + 1) {
+            ListButton b = lp.Buttons()[i];
+            if (b.type == "del" || b.type == "delete" || (b.type == "batch" && b.value.Length == 0)) { return true; }
+        }
+        return false;
     }
 
     /* "130px" → 130；非数字宽度（auto 等）不产出 width 键。 */

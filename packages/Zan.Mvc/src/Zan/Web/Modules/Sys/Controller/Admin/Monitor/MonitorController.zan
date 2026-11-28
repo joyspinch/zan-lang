@@ -1,8 +1,10 @@
 using System;
 using System.Diagnostics;
+using System.Json;
 using System.Text;
 using System.Threading;
 using System.Web;
+using Zan.Web.AdminUi;
 using Zan.Web.Core;
 using Zan.Web.Modules.Sys.Controller.Admin.Monitor;
 using Zan.Web.Security;
@@ -11,7 +13,7 @@ using Zan.Web;
 
 namespace Zan.Web.Admin.Monitor;
 
-/* /admin/monitor 服务器监控：吞吐量、错误、延迟、查询、CPU/内存，以图表呈现；页面向 /admin/monitor/stream 订阅一次，服务器经 Server-Sent Events 每几秒推一份快照——轮询等价于每 tick 每标签页一次完整请求（路由、授权解析、记日志），流只占一条连接且仅在有数据时发送，空闲时发注释行让代理不误判断连。 */
+/* /admin/monitor/monitor 服务器监控：吞吐量、错误、延迟、查询、CPU/内存，纯 JSON 协议 + SSE 实时流。 */
 [Custom(Authorization = CustomAuthorization.Grant, Group = "运行监控", GroupOrder = 80)]
 [Description("运行监控")]
 public class MonitorController : AdminController {
@@ -20,33 +22,47 @@ public class MonitorController : AdminController {
 
     [HttpGet]
     [Custom(IsMenu = true, Icon = "mdi:chart-line", Perm = PermBit.View)]
-    [Description("运行监控")]
+    [Description("实时监控")]
     public async void Index() {
-        ViewData d = await this.Layout("运行监控");
+        await this.Conf();
+    }
+
+    [HttpPut]
+    [Custom(Perm = PermBit.View)]
+    [Description("运行监控页面配置")]
+    public async void Conf() {
         JsonDoc m = JsonDoc.Parse(await MetricsCluster.SnapshotJson());
         long workers = m != null ? m.PathLong("workers", 1L) : 1L;
-        d.Set("workers", Convert.ToString(workers));
         string wl = m != null ? m.PathStr("worker_list", "") : "";
         if (wl.Length == 0) { wl = Convert.ToString(m != null ? m.PathLong("worker_id", 0L) : 0L); }
-        d.Set("worker", wl);
-        d.Set("pid", Convert.ToString(m != null ? m.PathLong("pid", 0L) : 0L));
-        d.Set("slow", Fmt.Dur(m != null ? m.PathLong("requests.slow_threshold_us", 0L) : 0L));
+        long pid = m != null ? m.PathLong("pid", 0L) : 0L;
+        string slow = Fmt.Dur(m != null ? m.PathLong("requests.slow_threshold_us", 0L) : 0L);
+        WebApp app = this.Ctx().App();
+        bool profileEnabled = app != null && app.RequestProfile() != null;
 
-        /* 当日四个数字随页渲出，首次绘制即为当日汇总而非本 worker 计数器（新派 worker 从 0 起），页后续由 /admin/monitor/today 保持更新。 */
-        long now = (long)WebApp.NowSeconds();
-        long today = Today(now);
-        long from = PickedDay(this.In("d"), today);
-        long to = DayEnd(from, today, now);
-        int _f = await MetricsStore.Flush();
-        MetricMinute day = await MetricsStore.WindowTotals(from, to, "", "");
-        d.Set("day", Fmt.Day(from));
-        d.Set("d", Fmt.Day(from));
-        if (from < today) { d.Set("past", "1"); }
-        d.Set("dayCalls", Convert.ToString(day.calls));
-        d.Set("dayErrors", Convert.ToString(day.errors));
-        d.Set("dayAvg", Fmt.Dur(Avg(day.totalUs, day.calls)));
-        d.Set("dayMax", Fmt.Dur(day.maxUs));
-        this.Page(d);
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("PageType", "dashboard");
+        w.WriteProperty("mode", "monitor");
+        w.WriteProperty("title", "实时监控");
+        w.WriteProperty("subtitle", "集群实时吞吐、延迟、资源占用与当日接口排行");
+        w.WriteProperty("todayUrl", "/admin/monitor/monitor/today");
+        w.WriteProperty("snapshotUrl", "/admin/monitor/monitor/snapshot");
+        w.WriteProperty("seriesUrl", "/admin/monitor/monitor/series");
+        w.WriteProperty("streamUrl", "/admin/monitor/monitor/stream");
+        w.WriteProperty("tracesUrl", "/admin/monitor/request-traces");
+        w.WriteProperty("diagnosticsUrl", "/admin/monitor/route-diagnostics");
+        w.WriteProperty("alertsUrl", "/admin/monitor/monitor/alerts");
+        w.WritePropertyName("meta");
+        w.WriteStartObject();
+        w.WriteProperty("workers", workers);
+        w.WriteProperty("worker", wl);
+        w.WriteProperty("pid", pid);
+        w.WriteProperty("slow", slow);
+        w.WriteProperty("requestProfileEnabled", profileEnabled);
+        w.WriteEndObject();
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(this, w.ToString());
     }
 
     /* 指标快照 JSON（README "Observability" 承诺的形状）：吞吐/延迟/ 查询/CPU/内存/慢操作与 top 排行，监控屏取数的同一来源。会话 + View 权限位守门——内部计时与路径不对外。 */
@@ -239,35 +255,56 @@ public class MonitorController : AdminController {
         this.Json(await MetricsCluster.SeriesJson(this.InInt("sec", 120)));
     }
 
-    /* 流无法完成的分析：哪小时/日承载多少流量、吞吐与延迟、由哪些接口承载；两表由数据库按时间桶与接口分组，非屏幕端拼分钟行。接口即 method+path；无路径的请求从未被登记，故无扫描器 URL。 */
+    /* 历史统计（纯 JSON 协议） */
     [HttpGet]
     [Custom(IsMenu = true, Icon = "mdi:chart-timeline-variant", Perm = PermBit.View)]
     [Description("历史统计")]
-    public async void History() {
-        ViewData d = await this.Layout("历史统计");
-        string method = this.In("m");
-        string route = this.In("route");
-        /* 两种取窗方式：h 为"过去 N 小时"，d/d2 为日历日期；日历窗两端闭合，故每次打开桶相同，滚动窗则不然。 */
-        MetricWindow w = Window(this.In("d"), this.In("d2"),
-            this.InInt("h", 24));
-        string gran = Gran(this.In("g"), w.hours);
-        long step = Step(gran);
-        long from = w.from;
-        long to = w.to;
+    public void History() {
+        this.HistoryConf();
+    }
 
-        /* 先刷窗，使"过去一小时"含正在填充的分钟而非止于十分钟前。 */
+    [HttpPut]
+    [Route("/admin/monitor/monitor/history/conf")]
+    [Custom(Perm = PermBit.View)]
+    [Description("历史统计页面配置")]
+    public void HistoryConf() {
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("PageType", "dashboard");
+        w.WriteProperty("mode", "history");
+        w.WriteProperty("title", "历史统计");
+        w.WriteProperty("subtitle", "按时间桶与接口维度分析历史吞吐、错误率与分位延迟");
+        w.WriteProperty("dataUrl", "/admin/monitor/monitor/history/data");
+        w.WriteProperty("exportCsvUrl", "/admin/monitor/monitor/export");
+        w.WriteProperty("exportJsonUrl", "/admin/monitor/monitor/export?format=json");
+        w.WriteProperty("diagnosticsUrl", "/admin/monitor/route-diagnostics");
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(this, w.ToString());
+    }
+
+    [HttpPost]
+    [Route("/admin/monitor/monitor/history/data")]
+    [Custom(Perm = PermBit.View)]
+    [Description("历史统计查询数据")]
+    public async void HistoryData() {
+        string method = this.InAny("m");
+        string route = this.InAny("route");
+        MetricWindow win = Window(this.InAny("d"), this.InAny("d2"),
+            this.InAnyInt("h", 24));
+        string gran = Gran(this.InAny("g"), win.hours);
+        long step = Step(gran);
+        long from = win.from;
+        long to = win.to;
+
         int _w = await MetricsStore.Flush();
         List<MetricMinute> rows = await MetricsStore.HistoryBuckets(from, to,
             method, route, step, MaxRows);
-        /* 两种顺序：哪个接口被调最多、哪个接口占窗内服务器时间；参数以名称切换，不进入语句。 */
         string by = "calls";
-        if (this.In("by") == "time") { by = "time"; }
+        if (this.InAny("by") == "time") { by = "time"; }
         List<MetricMinute> tops = await MetricsStore.RouteTotalsBy(from, to,
             method, route, MaxRoutes, by);
-        /* 日历窗展示其含的全部桶，含无流量者——"03:00 无数据"是事实，跳过这些小时会被误读为时间线。 */
-        if (w.dated) { rows = FillGaps(rows, from, to, step); }
+        if (win.dated) { rows = FillGaps(rows, from, to, step); }
 
-        List<StrMap> items = d.AddList("rows");
         long calls = 0;
         long errors = 0;
         long peakQps10 = 0;
@@ -277,72 +314,85 @@ public class MonitorController : AdminController {
             errors = errors + b.errors;
             long qps10 = b.calls * 10 / step;
             if (qps10 > peakQps10) { peakQps10 = qps10; }
-            StrMap r = new StrMap();
-            r.Set("bucket", BucketLabel(b.minute, gran));
-            r.Set("calls", Convert.ToString(b.calls));
-            r.Set("qps", Tenths(qps10));
-            r.Set("errors", Convert.ToString(b.errors));
-            r.Set("errRate", Rate(b.errors, b.calls));
-            r.Set("avg", Fmt.Dur(Avg(b.totalUs, b.calls)));
-            r.Set("p95", Fmt.Dur(b.p95Us));
-            r.Set("max", Fmt.Dur(b.maxUs));
-            r.Set("frames", Convert.ToString(b.frames));
-            r.Set("bytes", Fmt.Bytes(b.bytes));
-            items.Add(r);
         }
-
-        List<StrMap> routes = d.AddList("routes");
-        for (int i = 0; i < tops.Count; i = i + 1) {
-            MetricMinute b = tops[i];
-            StrMap r = new StrMap();
-            /* 两格：动作与接口；为兼容未更新的视图，仍把两值拼入老 route 格。 */
-            r.Set("method", b.method);
-            r.Set("path", b.path);
-            r.Set("route", b.method + " " + b.path);
-            r.Set("calls", Convert.ToString(b.calls));
-            r.Set("share", Rate(b.calls, calls));
-            r.Set("errors", Convert.ToString(b.errors));
-            r.Set("errRate", Rate(b.errors, b.calls));
-            r.Set("avg", Fmt.Dur(Avg(b.totalUs, b.calls)));
-            r.Set("p95", Fmt.Dur(b.p95Us));
-            r.Set("max", Fmt.Dur(b.maxUs));
-            r.Set("total", Fmt.Dur(b.totalUs));
-            r.Set("frames", Convert.ToString(b.frames));
-            r.Set("bytes", Fmt.Bytes(b.bytes));
-            routes.Add(r);
-        }
-
-        d.Set("by", by);
-        d.Set("by_" + by, "1");
-        d.Set("hours", Convert.ToString(w.hours));
-        d.Set("m", method);
-        d.Set("route", route);
-        d.Set("g", gran);
-        d.Set("g_" + gran, "1");
-        d.Set("d", w.day);
-        d.Set("d2", w.day2);
-        d.Set("from", Fmt.Stamp(from));
-        d.Set("to", Fmt.Stamp(to));
-        if (w.dated) { d.Set("dated", "1"); }
-        if (w.invalid) { d.Set("badDate", "1"); }
-        /* 窗标签在此构建，模板无 {{else}}，故不能让 KPI 对日历查询读作"24 小时"。 */
-        string label = Convert.ToString(w.hours) + " 小时";
-        if (w.dated) {
-            label = w.day;
-            if (w.day2 != w.day) { label = label + " → " + w.day2; }
-        }
-        d.Set("window", label);
-        d.Set("calls", Convert.ToString(calls));
-        d.Set("errors", Convert.ToString(errors));
         long windowQps10 = 0;
         long span = to - from;
         if (span > 0) { windowQps10 = calls * 10 / span; }
-        d.Set("avgQps", Tenths(windowQps10));
-        d.Set("peakQps", Tenths(peakQps10));
-        d.Set("shown", Convert.ToString(rows.Count));
-        if (calls == 0) { d.Set("empty", "1"); }
-        if (rows.Count >= MaxRows) { d.Set("capped", "1"); }
-        this.Page(d);
+
+        string label = Convert.ToString(win.hours) + " 小时";
+        if (win.dated) {
+            label = win.day;
+            if (win.day2 != win.day) { label = label + " → " + win.day2; }
+        }
+
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("window", label);
+        w.WriteProperty("hours", win.hours);
+        w.WriteProperty("gran", gran);
+        w.WriteProperty("by", by);
+        w.WriteProperty("day", win.day);
+        w.WriteProperty("day2", win.day2);
+        w.WriteProperty("from", Fmt.Stamp(from));
+        w.WriteProperty("to", Fmt.Stamp(to));
+        w.WriteProperty("dated", win.dated);
+        w.WriteProperty("badDate", win.invalid);
+        w.WriteProperty("calls", calls);
+        w.WriteProperty("errors", errors);
+        w.WriteProperty("errRate", Rate(errors, calls));
+        w.WriteProperty("avgQps", Tenths(windowQps10));
+        w.WriteProperty("peakQps", Tenths(peakQps10));
+        w.WriteProperty("shown", rows.Count);
+        w.WriteProperty("capped", rows.Count >= MaxRows);
+
+        w.WritePropertyName("rows");
+        w.WriteStartArray();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            MetricMinute b = rows[i];
+            long qps10 = b.calls * 10 / step;
+            w.WriteStartObject();
+            w.WriteProperty("bucket", BucketLabel(b.minute, gran));
+            w.WriteProperty("t", b.minute);
+            w.WriteProperty("calls", b.calls);
+            w.WriteProperty("qps", Tenths(qps10));
+            w.WriteProperty("errors", b.errors);
+            w.WriteProperty("errRate", Rate(b.errors, b.calls));
+            w.WriteProperty("avgUs", Avg(b.totalUs, b.calls));
+            w.WriteProperty("avg", Fmt.Dur(Avg(b.totalUs, b.calls)));
+            w.WriteProperty("p95Us", b.p95Us);
+            w.WriteProperty("p95", Fmt.Dur(b.p95Us));
+            w.WriteProperty("maxUs", b.maxUs);
+            w.WriteProperty("max", Fmt.Dur(b.maxUs));
+            w.WriteProperty("frames", b.frames);
+            w.WriteProperty("bytes", Fmt.Bytes(b.bytes));
+            w.WriteEndObject();
+        }
+        w.WriteEndArray();
+
+        w.WritePropertyName("routes");
+        w.WriteStartArray();
+        for (int i = 0; i < tops.Count; i = i + 1) {
+            MetricMinute b = tops[i];
+            w.WriteStartObject();
+            w.WriteProperty("method", b.method);
+            w.WriteProperty("path", b.path);
+            w.WriteProperty("route", b.method + " " + b.path);
+            w.WriteProperty("calls", b.calls);
+            w.WriteProperty("share", Rate(b.calls, calls));
+            w.WriteProperty("errors", b.errors);
+            w.WriteProperty("errRate", Rate(b.errors, b.calls));
+            w.WriteProperty("avg", Fmt.Dur(Avg(b.totalUs, b.calls)));
+            w.WriteProperty("p95", Fmt.Dur(b.p95Us));
+            w.WriteProperty("max", Fmt.Dur(b.maxUs));
+            w.WriteProperty("total", Fmt.Dur(b.totalUs));
+            w.WriteProperty("frames", b.frames);
+            w.WriteProperty("bytes", Fmt.Bytes(b.bytes));
+            w.WriteEndObject();
+        }
+        w.WriteEndArray();
+
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(this, w.ToString());
     }
 
     /* 与屏同窗的文件导出；受同条行数上限约束，一次请求无法拉出整库。 */
@@ -415,125 +465,274 @@ public class MonitorController : AdminController {
             sb.ToString());
     }
 
-    /* 服务器捕获的所有错误，按分发器喂给 sink 的持久化形式；存储前已脱敏，此屏不含密钥、令牌或密码。 */
+    /* 服务器捕获的所有错误（纯 JSON 表格协议） */
     [HttpGet]
     [Custom(IsMenu = true, Icon = "mdi:alert-circle-outline", Perm = PermBit.View)]
     [Description("错误日志")]
-    public async void Errors() {
-        ViewData d = await this.Layout("错误日志");
-        int hours = Hours(this.InInt("h", 24));
+    public void Errors() {
+        this.ErrorsConf();
+    }
+
+    [HttpPut]
+    [Route("/admin/monitor/monitor/errors/conf")]
+    [Custom(Perm = PermBit.View)]
+    [Description("错误日志表格配置")]
+    public void ErrorsConf() {
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("PageType", "table");
+        w.WritePropertyName("Conf");
+        w.WriteStartObject();
+        w.WriteProperty("showPages", true);
+        w.WriteProperty("pageSize", 50);
+        w.WriteProperty("pageSizes", "20,50,100");
+        w.WriteProperty("Local", false);
+        w.WriteProperty("TreeData", false);
+        w.WriteProperty("import", false);
+        w.WriteProperty("export", true);
+        w.WriteProperty("innerKey", "id");
+        w.WriteProperty("innerName", "错误日志");
+        w.WriteEndObject();
+
+        w.WritePropertyName("Columns");
+        w.WriteStartArray();
+        WriteMonCol(w, "ID", "id", "number", 80);
+        WriteMonCol(w, "时间", "ts", "text", 170);
+        WriteMonCol(w, "来源", "origin", "text", 220);
+        WriteMonCol(w, "详情", "detail", "text", 520);
+        w.WriteEndArray();
+
+        w.WritePropertyName("Filters");
+        w.WriteStartArray();
+        w.WriteStartObject();
+        w.WriteProperty("Name", "关键词");
+        w.WriteProperty("Field", "kw");
+        w.WriteProperty("Type", "Input");
+        w.WriteProperty("placeholder", "搜索来源或错误详情");
+        w.WriteEndObject();
+        w.WriteEndArray();
+
+        w.WritePropertyName("FilterRight");
+        w.WriteStartArray();
+        w.WriteEndArray();
+
+        w.WritePropertyName("Tools");
+        w.WriteStartArray();
+        w.WriteEndArray();
+
+        w.WritePropertyName("MenuItems");
+        w.WriteStartArray();
+        AdminUiProtocol.WriteDetailAction(w, "查看错误详情", "");
+        w.WriteEndArray();
+
+        w.WritePropertyName("Tabs");
+        w.WriteStartArray();
+        WriteTab(w, "近 24 小时", "h", "24");
+        WriteTab(w, "近 1 小时", "h", "1");
+        WriteTab(w, "近 6 小时", "h", "6");
+        WriteTab(w, "近 3 天", "h", "72");
+        WriteTab(w, "近 7 天", "h", "168");
+        w.WriteEndArray();
+
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(this, w.ToString());
+    }
+
+    [HttpPost]
+    [Route("/admin/monitor/monitor/errors/list")]
+    [Custom(Perm = PermBit.View)]
+    [Description("错误日志分页数据")]
+    public async void ErrorsList() {
+        int hours = Hours(this.InAnyInt("h", 24));
+        string kw = this.InAny("kw").Trim();
+        ListQuery q = this.PagedAny("id", 50);
         long to = (long)WebApp.NowSeconds();
         long from = to - (long)hours * 3600;
         int _w = await MetricsStore.Flush();
-        List<MetricError> rows = await MetricsStore.Errors(from, to,
-            MaxRows);
-        List<StrMap> items = d.AddList("rows");
+        List<MetricError> rows = await MetricsStore.Errors(from, to, MaxRows);
+
+        List<MetricError> matched = new List<MetricError>();
         for (int i = 0; i < rows.Count; i = i + 1) {
             MetricError e = rows[i];
-            StrMap r = new StrMap();
-            r.Set("id", Convert.ToString(e.id));
-            r.Set("ts", Fmt.Stamp(e.ts));
-            r.Set("origin", e.origin);
-            r.Set("detail", e.detail);
-            items.Add(r);
+            if (kw.Length > 0 && !e.origin.Contains(kw) && !e.detail.Contains(kw)) { continue; }
+            matched.Add(e);
         }
-        d.Set("hours", Convert.ToString(hours));
-        d.Set("shown", Convert.ToString(rows.Count));
-        if (rows.Count == 0) { d.Set("empty", "1"); }
-        this.Page(d);
+
+        int total = matched.Count;
+        int start = q.Skip();
+        int end = start + q.Limit();
+        if (end > total) { end = total; }
+
+        JsonWriter w = new JsonWriter();
+        w.WriteStartArray();
+        for (int i = start; i < end; i = i + 1) {
+            MetricError e = matched[i];
+            w.WriteStartObject();
+            w.WriteProperty("id", e.id);
+            w.WriteProperty("ts", Fmt.Stamp(e.ts));
+            w.WriteProperty("origin", e.origin);
+            w.WriteProperty("detail", e.detail);
+            w.WriteEndObject();
+        }
+        w.WriteEndArray();
+        AdminUiProtocol.WriteListData(this, total, w.ToString());
     }
 
-    /* SQL 模板统计屏：metrics_sql_day 的唯一读者。语句已规范化（字面量折叠， 不存用户输入），按天跨重启跨 worker 累积——实时面板的 top_sql 只见本 进程内存 ring、重启清零，隔天查慢 SQL 要看这里。 */
+    /* SQL 模板统计屏（纯 JSON 表格协议） */
     [HttpGet]
     [Custom(IsMenu = true, Icon = "mdi:database-search", Perm = PermBit.View)]
     [Description("SQL 统计")]
-    public async void Sql() {
-        ViewData d = await this.Layout("SQL 统计");
-        MetricWindow w = Window(this.In("d"), this.In("d2"),
-            this.InInt("h", 24));
-        /* 三种排序回答三个问题：谁被调最多、谁占用服务器最多、谁最常慢——
- 慢率高的未必慢（低频慢 query），占时多的才拖整体。 */
-        string by = "calls";
-        if (this.In("by") == "time") { by = "time"; }
-        if (this.In("by") == "slow") { by = "slow"; }
-        int _w = await MetricsStore.Flush();
-        List<MetricSql> tops = await MetricsStore.SqlTotals(w.from, w.to,
-            MaxRoutes, by);
-
-        List<StrMap> items = d.AddList("rows");
-        long calls = 0;
-        long slow = 0;
-        long totalUs = 0;
-        long maxUs = 0;
-        for (int i = 0; i < tops.Count; i = i + 1) {
-            MetricSql e = tops[i];
-            calls = calls + e.calls;
-            slow = slow + e.slow;
-            totalUs = totalUs + e.totalUs;
-            if (e.maxUs > maxUs) { maxUs = e.maxUs; }
-            StrMap r = new StrMap();
-            r.Set("sql", e.sql);
-            r.Set("detailUrl", "/admin/monitor/sql/detail?h="
-                + Convert.ToString(w.hours) + "&d=" + Encoding.UrlEncode(w.day)
-                + "&d2=" + Encoding.UrlEncode(w.day2) + "&by=" + by
-                + "&sql=" + Encoding.UrlEncode(e.sql));
-            r.Set("calls", Convert.ToString(e.calls));
-            r.Set("slow", Convert.ToString(e.slow));
-            r.Set("slowRate", Rate(e.slow, e.calls));
-            r.Set("avg", Fmt.Dur(Avg(e.totalUs, e.calls)));
-            r.Set("max", Fmt.Dur(e.maxUs));
-            r.Set("total", Fmt.Dur(e.totalUs));
-            items.Add(r);
-        }
-
-        d.Set("by", by);
-        d.Set("by_" + by, "1");
-        d.Set("hours", Convert.ToString(w.hours));
-        d.Set("d", w.day);
-        d.Set("d2", w.day2);
-        /* 窗标签与历史统计同构：日历窗标日期，滚动窗标小时数。 */
-        string label = Convert.ToString(w.hours) + " 小时";
-        if (w.dated) {
-            label = w.day;
-            if (w.day2 != w.day) { label = label + " → " + w.day2; }
-        }
-        d.Set("window", label);
-        d.Set("shapes", Convert.ToString(tops.Count));
-        d.Set("calls", Convert.ToString(calls));
-        d.Set("slow", Convert.ToString(slow));
-        d.Set("slowRate", Rate(slow, calls));
-        d.Set("total", Fmt.Dur(totalUs));
-        d.Set("max", Fmt.Dur(maxUs));
-        if (tops.Count == 0) { d.Set("empty", "1"); }
-        if (tops.Count >= MaxRoutes) { d.Set("capped", "1"); }
-        this.Page(d);
+    public void Sql() {
+        this.SqlConf();
     }
 
-    /* SQL 详情只从当前窗口重新查找已保存的模板；不接受任意文本回显。
- 详情是片段，始终走 View 权限与 Dialog 渲染。 */
+    [HttpPut]
+    [Route("/admin/monitor/monitor/sql/conf")]
+    [Custom(Perm = PermBit.View)]
+    [Description("SQL 统计表格配置")]
+    public void SqlConf() {
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("PageType", "table");
+        w.WritePropertyName("Conf");
+        w.WriteStartObject();
+        w.WriteProperty("showPages", true);
+        w.WriteProperty("pageSize", 50);
+        w.WriteProperty("pageSizes", "20,50,100");
+        w.WriteProperty("Local", false);
+        w.WriteProperty("TreeData", false);
+        w.WriteProperty("import", false);
+        w.WriteProperty("export", true);
+        w.WriteProperty("innerKey", "id");
+        w.WriteProperty("innerName", "SQL 模板");
+        w.WriteEndObject();
+
+        w.WritePropertyName("Columns");
+        w.WriteStartArray();
+        WriteMonCol(w, "SQL 模板", "sql", "text", 420);
+        WriteMonCol(w, "执行次数", "calls", "number", 100);
+        WriteMonCol(w, "慢查询数", "slow", "number", 100);
+        WriteMonCol(w, "慢查询率", "slowRate", "text", 100);
+        WriteMonCol(w, "平均耗时", "avg", "text", 110);
+        WriteMonCol(w, "最大耗时", "max", "text", 110);
+        WriteMonCol(w, "总耗时", "total", "text", 120);
+        w.WriteEndArray();
+
+        w.WritePropertyName("Filters");
+        w.WriteStartArray();
+        w.WriteStartObject();
+        w.WriteProperty("Name", "时间窗");
+        w.WriteProperty("Field", "h");
+        w.WriteProperty("Type", "Select");
+        w.WritePropertyName("Options");
+        AdminUiProtocol.WriteOptArray(w, "24=近 24 小时,1=近 1 小时,6=近 6 小时,72=近 3 天,168=近 7 天");
+        w.WriteEndObject();
+        w.WriteStartObject();
+        w.WriteProperty("Name", "SQL 关键词");
+        w.WriteProperty("Field", "kw");
+        w.WriteProperty("Type", "Input");
+        w.WriteProperty("placeholder", "过滤 SQL 语句");
+        w.WriteEndObject();
+        w.WriteEndArray();
+
+        w.WritePropertyName("FilterRight");
+        w.WriteStartArray();
+        w.WriteEndArray();
+
+        w.WritePropertyName("Tools");
+        w.WriteStartArray();
+        AdminUiProtocol.WriteDownloadAction(w, "导出 CSV", "info", "/admin/monitor/monitor/sqlexport");
+        w.WriteEndArray();
+
+        w.WritePropertyName("MenuItems");
+        w.WriteStartArray();
+        AdminUiProtocol.WriteDetailAction(w, "查看 SQL 详情", "");
+        w.WriteEndArray();
+
+        w.WritePropertyName("Tabs");
+        w.WriteStartArray();
+        WriteTab(w, "按调用次数", "by", "calls");
+        WriteTab(w, "按总耗时", "by", "time");
+        WriteTab(w, "按慢查询数", "by", "slow");
+        w.WriteEndArray();
+
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(this, w.ToString());
+    }
+
+    [HttpPost]
+    [Route("/admin/monitor/monitor/sql/list")]
+    [Custom(Perm = PermBit.View)]
+    [Description("SQL 统计分页数据")]
+    public async void SqlList() {
+        MetricWindow win = Window(this.InAny("d"), this.InAny("d2"),
+            this.InAnyInt("h", 24));
+        string by = "calls";
+        if (this.InAny("by") == "time") { by = "time"; }
+        if (this.InAny("by") == "slow") { by = "slow"; }
+        string kw = this.InAny("kw").Trim();
+        ListQuery q = this.PagedAny("id", 50);
+
+        int _w = await MetricsStore.Flush();
+        List<MetricSql> tops = await MetricsStore.SqlTotals(win.from, win.to,
+            MaxRoutes, by);
+
+        List<MetricSql> matched = new List<MetricSql>();
+        for (int i = 0; i < tops.Count; i = i + 1) {
+            if (kw.Length > 0 && !tops[i].sql.Contains(kw)) { continue; }
+            matched.Add(tops[i]);
+        }
+
+        int total = matched.Count;
+        int start = q.Skip();
+        int end = start + q.Limit();
+        if (end > total) { end = total; }
+
+        JsonWriter w = new JsonWriter();
+        w.WriteStartArray();
+        for (int i = start; i < end; i = i + 1) {
+            MetricSql e = matched[i];
+            w.WriteStartObject();
+            w.WriteProperty("id", i + 1);
+            w.WriteProperty("sql", e.sql);
+            w.WriteProperty("calls", e.calls);
+            w.WriteProperty("slow", e.slow);
+            w.WriteProperty("slowRate", Rate(e.slow, e.calls));
+            w.WriteProperty("avg", Fmt.Dur(Avg(e.totalUs, e.calls)));
+            w.WriteProperty("max", Fmt.Dur(e.maxUs));
+            w.WriteProperty("total", Fmt.Dur(e.totalUs));
+            w.WriteEndObject();
+        }
+        w.WriteEndArray();
+        AdminUiProtocol.WriteListData(this, total, w.ToString());
+    }
+
+    /* SQL 详情 JSON：从当前窗口查找已保存模板，不回显任意输入。 */
     [HttpGet]
     [Route("/admin/monitor/sql/detail")]
     [Custom(Perm = PermBit.View)]
     [Description("SQL 模板详情")]
     public async void SqlDetail() {
-        MetricWindow w = Window(this.In("d"), this.In("d2"),
-            this.InInt("h", 24));
+        MetricWindow win = Window(this.InAny("d"), this.InAny("d2"),
+            this.InAnyInt("h", 24));
         int _w = await MetricsStore.Flush();
-        MetricSql e = await MetricsStore.SqlOne(w.from, w.to, this.In("sql"));
+        MetricSql e = await MetricsStore.SqlOne(win.from, win.to, this.InAny("sql"));
         if (e == null) { this.Fail(404, "0404", "SQL 模板不存在或已超出统计窗口"); return; }
-        ViewData d = new ViewData();
-        string label = Convert.ToString(w.hours) + " 小时";
-        if (w.dated) {
-            label = w.day;
-            if (w.day2 != w.day) { label = label + " → " + w.day2; }
+        string label = Convert.ToString(win.hours) + " 小时";
+        if (win.dated) {
+            label = win.day;
+            if (win.day2 != win.day) { label = label + " → " + win.day2; }
         }
-        d.Set("window", label);
-        d.Set("sql", e.sql);
-        d.Set("calls", Convert.ToString(e.calls));
-        d.Set("slow", Convert.ToString(e.slow));
-        d.Set("avg", Fmt.Dur(Avg(e.totalUs, e.calls)));
-        d.Set("max", Fmt.Dur(e.maxUs));
-        this.Dialog(d);
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("window", label);
+        w.WriteProperty("sql", e.sql);
+        w.WriteProperty("calls", e.calls);
+        w.WriteProperty("slow", e.slow);
+        w.WriteProperty("avg", Fmt.Dur(Avg(e.totalUs, e.calls)));
+        w.WriteProperty("max", Fmt.Dur(e.maxUs));
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(this, w.ToString());
     }
 
     /* 与屏同窗的 SQL 统计导出；同一条目上限，查询串不能一次拉走整库。 */
@@ -630,64 +829,154 @@ public class MonitorController : AdminController {
         this.Json(w.ToString());
     }
 
-    /* 本进程映射的共享内存（只读）：每表一行，含所存内容与所耗成本；映射是预留地址空间（行可寻址但未必已占用），故创建大小与实际驻留为两列。数字按进程计：各 worker 在同驻留映射各自表。 */
+    /* 本进程映射的共享内存（纯 JSON 表格协议） */
     [HttpGet]
     [Custom(IsMenu = true, Icon = "mdi:memory", Perm = PermBit.View)]
     [Description("共享内存表")]
-    public async void Tables() {
-        ViewData d = await this.Layout("共享内存表");
-        List<StrMap> items = d.AddList("rows");
+    public void Tables() {
+        this.TablesConf();
+    }
+
+    [HttpPut]
+    [Route("/admin/monitor/monitor/tables/conf")]
+    [Custom(Perm = PermBit.View)]
+    [Description("共享内存表配置")]
+    public void TablesConf() {
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("PageType", "table");
+        w.WritePropertyName("Conf");
+        w.WriteStartObject();
+        w.WriteProperty("showPages", false);
+        w.WriteProperty("pageSize", 100);
+        w.WriteProperty("pageSizes", "50,100");
+        w.WriteProperty("Local", false);
+        w.WriteProperty("TreeData", false);
+        w.WriteProperty("import", false);
+        w.WriteProperty("export", true);
+        w.WriteProperty("innerKey", "id");
+        w.WriteProperty("innerName", "共享内存表");
+        w.WriteEndObject();
+
+        w.WritePropertyName("Columns");
+        w.WriteStartArray();
+        WriteMonCol(w, "表名", "name", "text", 200);
+        WriteMonCol(w, "已用行", "used", "number", 100);
+        WriteMonCol(w, "容量", "capacity", "number", 100);
+        WriteMonCol(w, "填充率", "fill", "text", 90);
+        WriteMonCol(w, "行步长", "stride", "number", 90);
+        WriteMonCol(w, "键长", "keySize", "number", 80);
+        WriteMonCol(w, "列数", "columns", "number", 80);
+        WriteMonCol(w, "预留空间", "reserved", "text", 110);
+        WriteMonCol(w, "实际驻留", "resident", "text", 110);
+        w.WriteStartObject();
+        w.WriteProperty("headerName", "状态");
+        w.WriteProperty("field", "state");
+        w.WriteProperty("type", "dict");
+        w.WriteProperty("width", 100);
+        w.WritePropertyName("options");
+        AdminUiProtocol.WriteOptArray(w, "正常=正常,接近容量=接近容量");
+        w.WriteEndObject();
+        w.WriteEndArray();
+
+        w.WritePropertyName("Filters");
+        w.WriteStartArray();
+        w.WriteEndArray();
+        w.WritePropertyName("FilterRight");
+        w.WriteStartArray();
+        w.WriteEndArray();
+        w.WritePropertyName("Tools");
+        w.WriteStartArray();
+        w.WriteEndArray();
+        w.WritePropertyName("MenuItems");
+        w.WriteStartArray();
+        AdminUiProtocol.WriteDetailAction(w, "查看详情", "");
+        w.WriteEndArray();
+        w.WritePropertyName("Tabs");
+        w.WriteStartArray();
+        w.WriteEndArray();
+
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(this, w.ToString());
+    }
+
+    [HttpPost]
+    [Route("/admin/monitor/monitor/tables/list")]
+    [Custom(Perm = PermBit.View)]
+    [Description("共享内存表数据")]
+    public void TablesList() {
         long reserved = 0;
         long resident = 0;
         long usedTotal = 0;
         long capacityTotal = 0;
         int pressure = 0;
-        bool partial = false;
         int n = SharedTable.OpenCount();
+
+        JsonWriter rows = new JsonWriter();
+        rows.WriteStartArray();
         for (int i = 0; i < n; i = i + 1) {
             long res = SharedTable.OpenStat(i, SharedTable.STAT_RESERVED);
             long live = SharedTable.OpenStat(i, SharedTable.STAT_RESIDENT);
             long cap = SharedTable.OpenStat(i, SharedTable.STAT_CAPACITY);
             long used = SharedTable.OpenStat(i, SharedTable.STAT_COUNT);
-            StrMap r = new StrMap();
-            r.Set("name", SharedTable.OpenLabel(i));
-            r.Set("used", Convert.ToString(used));
-            r.Set("capacity", Convert.ToString(cap));
-            r.Set("fill", Rate(used, cap));
-            r.Set("stride", Convert.ToString(
-                SharedTable.OpenStat(i, SharedTable.STAT_ROW_STRIDE)));
-            r.Set("keySize", Convert.ToString(
-                SharedTable.OpenStat(i, SharedTable.STAT_KEY_SIZE)));
-            r.Set("columns", Convert.ToString(
-                SharedTable.OpenStat(i, SharedTable.STAT_COLUMNS)));
-            r.Set("reserved", Fmt.Bytes(res));
-            r.Set("resident", Fmt.Bytes(live));
             long pct = cap > 0 ? used * 100 / cap : 0;
-            if (pct >= 80) {
-                r.Set("state", "接近容量");
-                r.Set("stateClass", "warn");
-                pressure = pressure + 1;
-            } else {
-                r.Set("state", "正常");
-                r.Set("stateClass", "ok");
-            }
-            items.Add(r);
+            string state = pct >= 80 ? "接近容量" : "正常";
+            if (pct >= 80) { pressure = pressure + 1; }
             usedTotal = usedTotal + used;
             capacityTotal = capacityTotal + cap;
             reserved = reserved + res;
-            /* 平台不可报告驻留时答 -1；一条未知行使总数为低估而非谎言。 */
-            if (live < 0) { partial = true; } else { resident = resident + live; }
+            if (live >= 0) { resident = resident + live; }
+
+            rows.WriteStartObject();
+            rows.WriteProperty("id", i + 1);
+            rows.WriteProperty("name", SharedTable.OpenLabel(i));
+            rows.WriteProperty("used", used);
+            rows.WriteProperty("capacity", cap);
+            rows.WriteProperty("fill", Rate(used, cap));
+            rows.WriteProperty("stride", SharedTable.OpenStat(i, SharedTable.STAT_ROW_STRIDE));
+            rows.WriteProperty("keySize", SharedTable.OpenStat(i, SharedTable.STAT_KEY_SIZE));
+            rows.WriteProperty("columns", SharedTable.OpenStat(i, SharedTable.STAT_COLUMNS));
+            rows.WriteProperty("reserved", Fmt.Bytes(res));
+            rows.WriteProperty("resident", Fmt.Bytes(live));
+            rows.WriteProperty("state", state);
+            rows.WriteEndObject();
         }
-        d.Set("count", Convert.ToString(n));
-        d.Set("usedTotal", Convert.ToString(usedTotal));
-        d.Set("capacityTotal", Convert.ToString(capacityTotal));
-        d.Set("fillTotal", Rate(usedTotal, capacityTotal));
-        d.Set("pressure", Convert.ToString(pressure));
-        d.Set("reserved", Fmt.Bytes(reserved));
-        d.Set("resident", Fmt.Bytes(resident));
-        if (partial) { d.Set("partial", "1"); }
-        if (n == 0) { d.Set("empty", "1"); }
-        this.Page(d);
+        rows.WriteEndArray();
+
+        JsonWriter sum = new JsonWriter();
+        sum.WriteStartArray();
+        WriteSum(sum, "映射表数", Convert.ToString(n));
+        WriteSum(sum, "总填充率", Rate(usedTotal, capacityTotal));
+        WriteSum(sum, "预留空间", Fmt.Bytes(reserved));
+        WriteSum(sum, "实际驻留", Fmt.Bytes(resident));
+        WriteSum(sum, "高压表", Convert.ToString(pressure));
+        sum.WriteEndArray();
+
+        AdminUiProtocol.Ok(this, "{\"total\":" + Convert.ToString(n) + ",\"data\":" + rows.ToString() + ",\"Summary\":" + sum.ToString() + "}");
+    }
+
+    private static void WriteMonCol(JsonWriter w, string header, string field, string type, int width) {
+        w.WriteStartObject();
+        w.WriteProperty("headerName", header);
+        w.WriteProperty("field", field);
+        w.WriteProperty("type", type);
+        w.WriteProperty("width", width);
+        w.WriteEndObject();
+    }
+
+    private static void WriteTab(JsonWriter w, string name, string field, string val) {
+        w.WriteStartObject();
+        w.WriteProperty("Name", name);
+        w.WriteProperty("Field", field);
+        w.WriteProperty("Value", val);
+        w.WriteEndObject();
+    }
+
+    private static void WriteSum(JsonWriter w, string label, string val) {
+        w.WriteStartObject();
+        w.WriteProperty("label", label);
+        w.WriteProperty("value", val);
+        w.WriteEndObject();
     }
 
     /* 导出与屏幕可请求的最大窗与页；查询串不得决定一次请求读取多少数据。 */

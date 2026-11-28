@@ -1,7 +1,9 @@
 using System;
 using System.Data;
 using System.Data.Orm;
+using System.Json;
 using System.Web;
+using Zan.Web.AdminUi;
 using Zan.Web.Core;
 using Zan.Web.Dao;
 using Zan.Web.Model;
@@ -17,38 +19,356 @@ public class RolesController : AdminController {
     [HttpGet]
     [Custom(IsMenu = true, Icon = "mdi:shield-account", Perm = PermBit.View)]
     [Description("角色管理")]
-    public async void Index() {
-        ViewData d = await this.Layout("角色管理");
-        if (!this.PageReady(d)) { return; }
+    public void Index() {
+        this.Conf();
+    }
 
-        ListQuery q = this.Paged("rank", 20);
+    [HttpPut]
+    [Custom(Perm = PermBit.View)]
+    [Description("角色表格配置")]
+    public void Conf() {
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("PageType", "table");
+
+        w.WritePropertyName("Conf");
+        w.WriteStartObject();
+        w.WriteProperty("showPages", true);
+        w.WriteProperty("pageSize", 20);
+        w.WriteProperty("pageSizes", "10,20,50,100");
+        w.WriteProperty("Local", false);
+        w.WriteProperty("TreeData", false);
+        w.WriteProperty("import", false);
+        w.WriteProperty("export", true);
+        w.WriteProperty("innerKey", "id");
+        w.WriteProperty("innerName", "角色");
+        w.WriteEndObject();
+
+        w.WritePropertyName("Columns");
+        w.WriteStartArray();
+        WriteRoleCol(w, "ID", "id", "number", 70, "");
+        WriteRoleCol(w, "角色名称", "name", "text", 140, "");
+        WriteRoleCol(w, "角色标识", "code", "text", 130, "");
+        WriteRoleCol(w, "排序", "rank", "number", 80, "");
+        WriteRoleCol(w, "数据范围", "dataScope", "dict", 130, "0=全部数据,1=本部门及以下,2=仅本部门,3=仅本人,4=自定义部门");
+        WriteRoleCol(w, "权限数", "perms", "number", 85, "");
+        WriteRoleCol(w, "账号数", "users", "number", 85, "");
+        WriteRoleCol(w, "状态", "status", "dict", 90, "1=启用,0=禁用");
+        WriteRoleCol(w, "说明", "description", "text", 200, "");
+        w.WriteEndArray();
+
+        w.WritePropertyName("Filters");
+        w.WriteStartArray();
+        w.WriteStartObject();
+        w.WriteProperty("Name", "角色名称");
+        w.WriteProperty("Field", "kw");
+        w.WriteProperty("Type", "Input");
+        w.WriteProperty("placeholder", "搜索角色名称");
+        w.WriteEndObject();
+        w.WriteEndArray();
+
+        w.WritePropertyName("FilterRight");
+        w.WriteStartArray();
+        w.WriteEndArray();
+
+        w.WritePropertyName("Tools");
+        w.WriteStartArray();
+        AdminUiProtocol.WriteFormAction(w, "新增角色", "Add", "primary", "formconf", "save", false);
+        AdminUiProtocol.WriteFormActionEx(w, "编辑", "Edit", "info", "formconf", "edit", "save", true);
+        AdminUiProtocol.WriteFormActionEx(w, "权限配置", "Grant", "warning", "grantconf", "grantedit", "grantsave", true);
+        AdminUiProtocol.WriteConfirmAction(w, "删除", "Delete", "danger", "delete", "删除后不可恢复，确认删除所选角色吗？", true, false, "", "id={id}");
+        w.WriteEndArray();
+
+        w.WritePropertyName("MenuItems");
+        w.WriteStartArray();
+        AdminUiProtocol.WriteDetailAction(w, "查看详情", "");
+        AdminUiProtocol.WriteFormActionEx(w, "编辑", "Edit", "info", "formconf", "edit", "save", true);
+        AdminUiProtocol.WriteFormActionEx(w, "权限配置", "Grant", "warning", "grantconf", "grantedit", "grantsave", true);
+        AdminUiProtocol.WriteConfirmAction(w, "删除", "Delete", "danger", "delete", "删除后不可恢复，确认删除该角色吗？", true, false, "", "id={id}");
+        w.WriteEndArray();
+
+        w.WritePropertyName("Tabs");
+        w.WriteStartArray();
+        w.WriteEndArray();
+
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(this, w.ToString());
+    }
+
+    private static void WriteRoleCol(JsonWriter w, string header, string field, string type, int width, string opts) {
+        w.WriteStartObject();
+        w.WriteProperty("headerName", header);
+        w.WriteProperty("field", field);
+        w.WriteProperty("type", type);
+        w.WriteProperty("width", width);
+        if (opts.Length > 0) {
+            w.WritePropertyName("options");
+            AdminUiProtocol.WriteOptArray(w, opts);
+        }
+        w.WriteEndObject();
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.View)]
+    [Description("角色列表数据")]
+    public async void List() {
+        if (!this.DataReady()) { return; }
+        ListQuery q = this.PagedAny("rank", 20);
         string kw = q.Kw();
         int total = await this.SysRole
             .WhereIf(kw.Length > 0, a => a.name.Contains(kw)).CountAsync();
         List<SysRole> rows = await this.SysRole
             .WhereIf(kw.Length > 0, a => a.name.Contains(kw))
             .OrderBy(a => a.rank).Skip(q.Skip()).Take(q.Limit()).ToListAsync();
-        List<StrMap> items = d.AddList("rows");
-        Rows.Project(rows, items);
+
+        Dictionary<int, int> permCounts = new Dictionary<int, int>();
+        Dictionary<int, int> userCounts = new Dictionary<int, int>();
         if (rows.Count > 0) {
             List<int> ids = new List<int>();
             for (int i = 0; i < rows.Count; i = i + 1) { ids.Add(rows[i].id); }
-
             IDbConnection db = this.Held();
-            Dictionary<int, int> permCounts = await CountByRole(db.Select<SysRoleGrant>().inner, ids);
-            Dictionary<int, int> userCounts = await CountByRole(db.Select<SysUserRole>().inner, ids);
-            for (int i = 0; i < rows.Count; i = i + 1) {
-                int id = rows[i].id;
-                int perms = 0;
-                int users = 0;
-                permCounts.TryGetValue(id, out perms);
-                userCounts.TryGetValue(id, out users);
-                items[i].Set("perms", Convert.ToString(perms));
-                items[i].Set("users", Convert.ToString(users));
+            permCounts = await CountByRole(db.Select<SysRoleGrant>().inner, ids);
+            userCounts = await CountByRole(db.Select<SysUserRole>().inner, ids);
+        }
+
+        JsonWriter w = new JsonWriter();
+        w.WriteStartArray();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            SysRole r = rows[i];
+            int perms = 0;
+            int users = 0;
+            permCounts.TryGetValue(r.id, out perms);
+            userCounts.TryGetValue(r.id, out users);
+            w.WriteStartObject();
+            w.WriteProperty("id", r.id);
+            w.WriteProperty("name", r.name);
+            w.WriteProperty("code", r.code);
+            w.WriteProperty("rank", r.rank);
+            w.WriteProperty("dataScope", Convert.ToString(r.dataScope));
+            w.WriteProperty("perms", perms);
+            w.WriteProperty("users", users);
+            w.WriteProperty("status", Convert.ToString(r.status));
+            w.WriteProperty("description", r.description);
+            w.WriteEndObject();
+        }
+        w.WriteEndArray();
+        AdminUiProtocol.WriteListData(this, total, w.ToString());
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.View)]
+    [Description("角色编辑回显")]
+    public async void Edit() {
+        int id = this.InAnyInt("id", 0);
+        SysRole r = await this.Find(id);
+        int scope = r.dataScope;
+        if (scope < DataScope.RoleAll || scope > DataScope.RoleCustom) { scope = DataScope.RoleSelf; }
+        string picked = Fmt.Text(r.scopeDepts, "");
+        List<SysDepartment> depts = await this.SysDepartment.OrderBy(a => a.sortOrder).ToListAsync();
+
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("id", r.id);
+        w.WriteProperty("name", r.name);
+        w.WriteProperty("code", r.code);
+        w.WriteProperty("rank", r.rank);
+        w.WriteProperty("status", Convert.ToString(r.status));
+        w.WriteProperty("dataScope", Convert.ToString(scope));
+        w.WriteProperty("description", r.description);
+        w.WritePropertyName("scopeDepts");
+        w.WriteStartArray();
+        for (int i = 0; i < depts.Count; i = i + 1) {
+            string did = Convert.ToString(depts[i].id);
+            if (AuthUser.Holds(picked, did)) { w.WriteString(did); }
+        }
+        w.WriteEndArray();
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(this, w.ToString());
+    }
+
+    [HttpPut]
+    [Custom(Perm = PermBit.Create | PermBit.Update)]
+    [Description("角色表单配置")]
+    public async void FormConf() {
+        int id = this.InAnyInt("id", 0);
+        List<SysDepartment> depts = await this.SysDepartment.OrderBy(a => a.sortOrder).ToListAsync();
+
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("title", id > 0 ? "编辑角色" : "新增角色");
+        w.WriteProperty("width", "620px");
+        w.WriteProperty("labelWidth", 95);
+        w.WriteProperty("cols", 24);
+        w.WritePropertyName("formItems");
+        w.WriteStartArray();
+
+        w.WriteStartObject();
+        w.WriteProperty("field", "name");
+        w.WriteProperty("label", "角色名称");
+        w.WriteProperty("component", "input");
+        w.WriteProperty("span", 12);
+        w.WriteProperty("required", true);
+        w.WriteEndObject();
+
+        w.WriteStartObject();
+        w.WriteProperty("field", "code");
+        w.WriteProperty("label", "角色标识");
+        w.WriteProperty("component", "input");
+        w.WriteProperty("span", 12);
+        w.WriteProperty("required", true);
+        w.WriteEndObject();
+
+        w.WriteStartObject();
+        w.WriteProperty("field", "rank");
+        w.WriteProperty("label", "排序");
+        w.WriteProperty("component", "input-number");
+        w.WriteProperty("span", 12);
+        w.WriteProperty("defaultValue", 10);
+        w.WriteEndObject();
+
+        w.WriteStartObject();
+        w.WriteProperty("field", "status");
+        w.WriteProperty("label", "状态");
+        w.WriteProperty("component", "select");
+        w.WriteProperty("span", 12);
+        w.WriteProperty("defaultValue", "1");
+        w.WritePropertyName("options");
+        AdminUiProtocol.WriteOptArray(w, "1=启用,0=禁用");
+        w.WriteEndObject();
+
+        w.WriteStartObject();
+        w.WriteProperty("field", "dataScope");
+        w.WriteProperty("label", "数据权限");
+        w.WriteProperty("component", "select");
+        w.WriteProperty("span", 24);
+        w.WriteProperty("defaultValue", "0");
+        w.WritePropertyName("options");
+        AdminUiProtocol.WriteOptArray(w, "0=全部数据,1=本部门及以下,2=仅本部门,3=仅本人,4=自定义部门");
+        w.WriteEndObject();
+
+        w.WriteStartObject();
+        w.WriteProperty("field", "scopeDepts");
+        w.WriteProperty("label", "自定义部门");
+        w.WriteProperty("component", "checkbox-group");
+        w.WriteProperty("span", 24);
+        w.WritePropertyName("visibleWhen");
+        w.WriteStartObject();
+        w.WriteProperty("field", "dataScope");
+        w.WriteProperty("equals", "4");
+        w.WriteEndObject();
+        w.WritePropertyName("options");
+        w.WriteStartArray();
+        for (int i = 0; i < depts.Count; i = i + 1) {
+            w.WriteStartObject();
+            w.WriteProperty("value", Convert.ToString(depts[i].id));
+            w.WriteProperty("label", depts[i].name);
+            w.WriteEndObject();
+        }
+        w.WriteEndArray();
+        w.WriteEndObject();
+
+        w.WriteStartObject();
+        w.WriteProperty("field", "description");
+        w.WriteProperty("label", "说明");
+        w.WriteProperty("component", "textarea");
+        w.WriteProperty("span", 24);
+        w.WriteEndObject();
+
+        w.WriteEndArray();
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(this, w.ToString());
+    }
+
+    [HttpPut]
+    [Custom(Perm = PermBit.Update)]
+    [Description("角色授权矩阵配置")]
+    public void GrantConf() {
+        List<string> screens = Perm.Screens();
+        List<int> order = Perm.Order();
+        List<string> gaps = Perm.Unmarked();
+
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("title", "角色权限配置");
+        w.WriteProperty("width", "860px");
+        w.WriteProperty("labelWidth", 90);
+        w.WriteProperty("cols", 24);
+        w.WritePropertyName("formItems");
+        w.WriteStartArray();
+
+        w.WriteStartObject();
+        w.WriteProperty("field", "permIds");
+        w.WriteProperty("label", "功能权限");
+        w.WriteProperty("component", "perm-matrix");
+        w.WriteProperty("customType", "perm-matrix");
+        w.WriteProperty("span", 24);
+        w.WritePropertyName("props");
+        w.WriteStartObject();
+        if (gaps.Count > 0) {
+            w.WriteProperty("unmarked", Perm.Join(gaps, 20));
+        }
+        w.WritePropertyName("screens");
+        w.WriteStartArray();
+        for (int i = 0; i < screens.Count; i = i + 1) {
+            string screen = screens[i];
+            int exists = Perm.MaskOf(screen);
+            w.WriteStartObject();
+            w.WriteProperty("screen", screen);
+            w.WriteProperty("name", Perm.TitleOf(screen));
+            w.WritePropertyName("bits");
+            w.WriteStartArray();
+            for (int b = 0; b < order.Count; b = b + 1) {
+                int bit = order[b];
+                if ((exists & bit) == 0) { continue; }
+                w.WriteStartObject();
+                w.WriteProperty("bit", bit);
+                w.WriteProperty("name", Perm.BitName(bit));
+                w.WriteProperty("value", screen + ":" + Convert.ToString(bit));
+                w.WriteEndObject();
+            }
+            w.WriteEndArray();
+            w.WriteEndObject();
+        }
+        w.WriteEndArray();
+        w.WriteEndObject();
+        w.WriteEndObject();
+
+        w.WriteEndArray();
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(this, w.ToString());
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.Update)]
+    [Description("角色授权回显")]
+    public async void GrantEdit() {
+        int id = this.InAnyInt("id", 0);
+        SysRole r = await this.Find(id);
+        List<SysRoleGrant> held = await this.SysRoleGrant
+            .Where(a => a.roleId == r.id).ToListAsync();
+        List<string> screens = Perm.Screens();
+        List<int> order = Perm.Order();
+        StringBuilder picked = new StringBuilder();
+        for (int i = 0; i < screens.Count; i = i + 1) {
+            string screen = screens[i];
+            int exists = Perm.MaskOf(screen);
+            int mine = 0;
+            for (int j = 0; j < held.Count; j = j + 1) {
+                if (held[j].action == screen) { mine = mine | held[j].mask; }
+            }
+            for (int b = 0; b < order.Count; b = b + 1) {
+                int bit = order[b];
+                if ((exists & bit) == 0 || (mine & bit) == 0) { continue; }
+                if (picked.Length > 0) { picked.Append(","); }
+                picked.Append(screen + ":" + Convert.ToString(bit));
             }
         }
-        this.Pager(d, q, total);
-        this.Page(d);
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("id", r.id);
+        w.WriteProperty("permIds", picked.ToString());
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(this, w.ToString());
     }
 
     private static async Dictionary<int, int> CountByRole(Select query, List<int> ids) {
@@ -64,66 +384,21 @@ public class RolesController : AdminController {
         return counts;
     }
 
-    [HttpGet]
-    [Custom(Perm = PermBit.Create | PermBit.Update)]
-    [Description("角色表单")]
-    public async void Form() {
-        int id = this.InInt("id", 0);
-        if (!await this.Can(id > 0 ? (int)PermBit.Update : (int)PermBit.Create)) {
-            this.Fail(403, "0403", "无操作权限"); return;
-        }
-        ViewData d = new ViewData();
-        d.Set("id", Convert.ToString(id));
-        d.Set("dialogTitle", "新增角色");
-        d.Set("rank", "10");
-        d.Set("status1", "selected");
-        int scope = DataScope.RoleAll;
-        string picked = "";
-        if (id > 0) {
-            SysRole r = await this.Find(id);
-            d.Set("dialogTitle", "编辑角色");
-            d.Set("name", r.name);
-            d.Set("code", r.code);
-            d.Set("rank", Convert.ToString(r.rank));
-            d.Set("description", r.description);
-            d.Set("status1", "");
-            if (r.status == 1) { d.Set("status1", "selected"); }
-            else { d.Set("status0", "selected"); }
-            scope = r.dataScope;
-            if (scope < DataScope.RoleAll || scope > DataScope.RoleCustom) { scope = DataScope.RoleSelf; }
-            picked = Fmt.Text(r.scopeDepts, "");
-        }
-        /* 数据范围与自定义选项所指的部门；勾选框总是渲染，模板只在该选项选中时显示。 */
-        d.Set("scope" + Convert.ToString(scope), "selected");
-        List<SysDepartment> depts = await this.SysDepartment.OrderBy(a => a.sortOrder).ToListAsync();
-        List<StrMap> opts = d.AddList("depts");
-        for (int i = 0; i < depts.Count; i = i + 1) {
-            StrMap o = new StrMap();
-            o.Set("id", Convert.ToString(depts[i].id));
-            o.Set("name", depts[i].name);
-            if (AuthUser.Holds(picked, Convert.ToString(depts[i].id))) {
-                o.Set("checked", "checked");
-            }
-            opts.Add(o);
-        }
-        this.Dialog(d);
-    }
-
     [HttpPost]
     [Custom(Perm = PermBit.Create | PermBit.Update)]
     [Description("保存角色")]
     public async void Save() {
-        int id = this.InInt("id", 0);
+        int id = this.InAnyInt("id", 0);
         if (!await this.Can(id > 0 ? (int)PermBit.Update : (int)PermBit.Create)) {
             this.Fail(403, "0403", "无操作权限"); return;
         }
-        string name = this.Need("name", "角色名称");
-        string code = this.Need("code", "角色标识");
-        int rank = this.InInt("rank", 10);
-        int status = this.InInt("status", 1);
-        string description = this.In("description");
+        string name = this.NeedAny("name", "角色名称");
+        string code = this.NeedAny("code", "角色标识");
+        int rank = this.InAnyInt("rank", 10);
+        int status = this.InAnyInt("status", 1);
+        string description = this.InAny("description");
         if (status != 1) { status = 0; }
-        int dataScope = this.InInt("dataScope", 0);
+        int dataScope = this.InAnyInt("dataScope", 0);
         if (dataScope < DataScope.RoleAll || dataScope > DataScope.RoleCustom) {
             this.Fail(400, Codes.BadInput, "请选择有效的数据权限范围");
             return;
@@ -131,7 +406,7 @@ public class RolesController : AdminController {
         /* 仅自定义保留部门列表，切离不会留下后续重用的旧集。 */
         string scopeDepts = "";
         if (dataScope == DataScope.RoleCustom) {
-            scopeDepts = await this.ScopeDepts(this.In("scopeDepts"));
+            scopeDepts = await this.ScopeDepts(this.InAny("scopeDepts"));
             if (scopeDepts.Length == 0) {
                 this.Fail(400, Codes.BadInput, "自定义数据权限至少要选一个部门");
             }
@@ -168,7 +443,11 @@ public class RolesController : AdminController {
     [Custom(Perm = PermBit.Delete)]
     [Description("删除角色")]
     public async void Delete() {
-        int id = this.InInt("id", 0);
+        int id = this.InAnyInt("id", 0);
+        if (id <= 0) {
+            List<int> ids = this.Ids("ids");
+            if (ids.Count > 0) { id = ids[0]; }
+        }
         SysRole r = await this.Find(id);
         int held = await this.SysUserRole.Where(a => a.roleId == id).CountAsync();
         if (held > 0) {
@@ -185,55 +464,13 @@ public class RolesController : AdminController {
         this.Saved("角色已删除");
     }
 
-    /* 授权对话框：每屏一行、每按钮一格（查/增/改/删/导出），按该角色持位的勾选；某屏的位来自动作自身的 [Custom(Perm=...)]，故新屏幕一编译即出现。 */
-    [HttpGet]
-    [Custom(Perm = PermBit.Update)]
-    [Description("角色授权")]
-    public async void Grant() {
-        int id = this.InInt("id", 0);
-        SysRole r = await this.Find(id);
-        ViewData d = new ViewData();
-        d.Set("id", Convert.ToString(id));
-        d.Set("name", r.name);
-        List<SysRoleGrant> held = await this.SysRoleGrant
-            .Where(a => a.roleId == id).ToListAsync();
-
-        List<StrMap> rows = d.AddList("perms");
-        List<string> screens = Perm.Screens();
-        List<int> order = Perm.Order();
-        for (int i = 0; i < screens.Count; i = i + 1) {
-            string screen = screens[i];
-            int exists = Perm.MaskOf(screen);
-            int mine = 0;
-            for (int j = 0; j < held.Count; j = j + 1) {
-                if (held[j].action == screen) { mine = mine | held[j].mask; }
-            }
-            StrMap row = new StrMap();
-            row.Set("screen", screen);
-            row.Set("name", Perm.TitleOf(screen));
-            for (int b = 0; b < order.Count; b = b + 1) {
-                int bit = order[b];
-                string nm = Perm.BitName(bit);
-                if ((exists & bit) == 0) { continue; }
-                row.Set("has" + nm, "1");
-                row.Set("val" + nm, screen + ":" + Convert.ToString(bit));
-                if ((mine & bit) != 0) { row.Set("on" + nm, "checked"); }
-            }
-            rows.Add(row);
-        }
-        /* 受保护却未声明位的动作无法授权；在此展示使操作员找到遗漏的声明。 */
-        List<string> gaps = Perm.Unmarked();
-        if (gaps.Count > 0) { d.Set("unmarked", Perm.Join(gaps, 20)); }
-        this.Dialog(d);
-    }
-
     [HttpPost]
     [Custom(Perm = PermBit.Update)]
     [Description("保存角色授权")]
     public async void GrantSave() {
-        int id = this.InInt("id", 0);
+        int id = this.InAnyInt("id", 0);
         SysRole r = await this.Find(id);
-        string picked = this.In("permIds");
+        string picked = this.InAny("permIds");
         if (!await this.Begin()) { this.Fail(503, "2001", "数据库不可用"); }
         int _cleared = await this.SysRoleGrant.Delete()
             .Where(a => a.roleId == id).ExecuteAffrowsAsync();

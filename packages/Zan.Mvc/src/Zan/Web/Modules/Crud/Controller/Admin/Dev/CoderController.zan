@@ -6,6 +6,7 @@ using System.Json;
 using System.Security.Cryptography;
 using System.Text;
 using System.Web;
+using Zan.Web.AdminUi;
 using Zan.Web.Ai;
 using Zan.Web.Core;
 using Zan.Web.Dao;
@@ -17,7 +18,7 @@ using Zan.Web;
 
 namespace Zan.Web.Admin.Dev;
 
-/* /admin/dev/coder 表设计器：设计表（列及其在管理界面的角色）→ 建入数据库 → 通用屏不够用时写出 .zan 源码。三步各为一键，各成本不同：保存设计仅触及 sys_gen_*，迁移发 DDL，生成写文件须重建生效。不会自动丢弃或重写：设计器只做加法。 */
+/* /admin/dev/coder 表设计器：纯 JSON 协议（设计表 → 字段行内编辑/AI 字段设计 → 同步数据库 → 预览/生成代码）。 */
 [Custom(Authorization = CustomAuthorization.Grant, Group = "开发工具", GroupOrder = 100)]
 [Description("代码生成")]
 public class CoderController : AdminController {
@@ -29,168 +30,191 @@ public class CoderController : AdminController {
     [Custom(IsMenu = true, Icon = "mdi:table-cog", Perm = PermBit.View)]
     [Description("表设计与生成")]
     public async void Index() {
-        ViewData d = await this.Layout("表设计与生成");
-        if (!this.PageReady(d)) { return; }
-
-        List<SysGenTable> rows = await this.SysGenTable.OrderBy(a => a.id).ToListAsync();
-        List<StrMap> list = d.AddList("tables");
-        Rows.Project(rows, list);
-        for (int i = 0; i < rows.Count; i = i + 1) {
-            int cols = await this.SysGenColumn
-                .Where(a => a.tableId == rows[i].id).CountAsync();
-            list[i].Set("columns", Convert.ToString(cols));
-        }
-        if (rows.Count == 0) { d.Set("empty", "1"); }
-        this.Page(d);
+        await this.Conf();
     }
 
-    [HttpGet]
-    [Custom(Perm = PermBit.Create | PermBit.Update)]
-    [Description("表信息表单")]
-    public async void TableForm() {
-        int id = this.InInt("id", 0);
-        if (!await this.Can(id > 0 ? (int)PermBit.Update : (int)PermBit.Create)) {
-            this.Fail(403, "0403", "无操作权限"); return;
+    [HttpPut]
+    [Custom(Perm = PermBit.View)]
+    [Description("表设计器页面配置")]
+    public async void Conf() {
+        bool aiOn = await Ai.Ready();
+        bool canCreate = await this.Can((int)PermBit.Create);
+        bool canUpdate = await this.Can((int)PermBit.Update);
+        bool canDelete = await this.Can((int)PermBit.Delete);
+        List<SysDictType> dicts = await this.SysDictType.Where(a => a.status == 1).ToListAsync();
+
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("PageType", "coder");
+        w.WriteProperty("title", "表设计与生成");
+        w.WriteProperty("tablesUrl", "tables");
+        w.WriteProperty("tableSaveUrl", "tablesave");
+        w.WriteProperty("tableDeleteUrl", "tabledelete");
+        w.WriteProperty("columnsUrl", "columns");
+        w.WriteProperty("columnSaveUrl", "columnsave");
+        w.WriteProperty("columnDeleteUrl", "columndelete");
+        w.WriteProperty("columnFieldUrl", "columnfield");
+        w.WriteProperty("aiDesignUrl", "aidesign");
+        w.WriteProperty("aiApplyUrl", "aiapply");
+        w.WriteProperty("migrateUrl", "migrate");
+        w.WriteProperty("buildUrl", "build");
+        w.WriteProperty("previewUrl", "preview");
+        w.WriteProperty("ownUrl", "own");
+        w.WriteProperty("dataBaseUrl", "/admin/monitor/data");
+        w.WriteProperty("aiReady", aiOn);
+        w.WriteProperty("canCreate", canCreate);
+        w.WriteProperty("canUpdate", canUpdate);
+        w.WriteProperty("canDelete", canDelete);
+        w.WritePropertyName("dicts");
+        w.WriteStartArray();
+        for (int i = 0; i < dicts.Count; i = i + 1) {
+            w.WriteStartObject();
+            w.WriteProperty("code", dicts[i].code);
+            w.WriteProperty("name", dicts[i].name);
+            w.WriteEndObject();
         }
-        ViewData d = new ViewData();
-        d.Set("id", Convert.ToString(id));
-        d.Set("dialogTitle", "新建数据表");
-        d.Set("section", "content");
-        d.Set("apiChecked", "checked");
-        d.Set("exportChecked", "checked");
-        d.Set("createChecked", "checked");
-        d.Set("editChecked", "checked");
-        d.Set("deleteChecked", "checked");
-        d.Set("menuChecked", "checked");
-        d.Set("pageSize", "20");
-        d.Set("orderColumn", "id");
-        d.Set("orderDescValue", "1");
-        d.Set("descSel", "selected");
-        d.Set("ascSel", "");
-        if (id > 0) {
-            SysGenTable t = await this.SysGenTable.ById(id);
-            if (t == null) { this.Fail(404, "0404", "设计不存在"); }
-            d.Set("dialogTitle", "编辑表信息");
-            d.Set("tableName", t.tableName);
-            d.Set("entityName", t.entityName);
-            d.Set("title", t.title);
-            d.Set("section", t.section);
-            d.Set("apiChecked", "");
-            if (t.apiEnabled == 1) { d.Set("apiChecked", "checked"); }
-            d.Set("exportChecked", "");
-            if (t.exportEnabled == 1) { d.Set("exportChecked", "checked"); }
-            d.Set("createChecked", ColumnDraft.Checked(t.hasCreate));
-            d.Set("editChecked", ColumnDraft.Checked(t.hasEdit));
-            d.Set("deleteChecked", ColumnDraft.Checked(t.hasDelete));
-            d.Set("menuChecked", ColumnDraft.Checked(t.menuEnabled));
-            d.Set("pageSize", Convert.ToString(t.pageSize > 0 ? t.pageSize : 20));
-            d.Set("labelColumn", t.labelColumn == null ? "" : t.labelColumn);
-            d.Set("menuIcon", t.menuIcon == null ? "" : t.menuIcon);
-            d.Set("orderColumn", t.orderColumn != null && t.orderColumn.Length > 0
-                ? t.orderColumn : "id");
-            d.Set("orderDescValue", t.orderDesc == 1 ? "1" : "0");
-            d.Set("descSel", t.orderDesc == 1 ? "selected" : "");
-            d.Set("ascSel", t.orderDesc == 1 ? "" : "selected");
-            string orderColumn = t.orderColumn != null && t.orderColumn.Length > 0
-                ? t.orderColumn : "id";
-            string tabColumn = t.tabColumn == null ? "" : t.tabColumn;
-            /* 排序列/页签列下拉：排序列=全部列，页签列仅字典与布尔列可充当。 */
-            List<SysGenColumn> cols = await this.SysGenColumn
-                .Where(a => a.tableId == id).OrderBy(a => a.sortOrder).ToListAsync();
-            List<StrMap> orderCols = d.AddList("orderCols");
-            StrMap oid = new StrMap();
-            oid.Set("v", "id"); oid.Set("label", "id");
-            if (orderColumn == "id") { oid.Set("selected", "1"); }
-            orderCols.Add(oid);
-            List<StrMap> tabCols = d.AddList("tabCols");
-            StrMap tnone = new StrMap();
-            tnone.Set("v", ""); tnone.Set("label", "不启用");
-            if (tabColumn.Length == 0) { tnone.Set("selected", "1"); }
-            tabCols.Add(tnone);
-            for (int i = 0; i < cols.Count; i = i + 1) {
-                StrMap o = new StrMap();
-                o.Set("v", cols[i].name);
-                o.Set("label", cols[i].name);
-                if (cols[i].name == orderColumn) { o.Set("selected", "1"); }
-                orderCols.Add(o);
-                if (cols[i].kind == "bool"
-                    || (cols[i].dictType.Length > 0 && Gen.Safe(cols[i].dictType))) {
-                    StrMap tb = new StrMap();
-                    tb.Set("v", cols[i].name);
-                    tb.Set("label", cols[i].label + "（" + cols[i].name + "）");
-                    if (cols[i].name == tabColumn) { tb.Set("selected", "1"); }
-                    tabCols.Add(tb);
-                }
-            }
+        w.WriteEndArray();
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(this, w.ToString());
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.View)]
+    [Description("设计表列表")]
+    public async void Tables() {
+        List<SysGenTable> rows = await this.SysGenTable.OrderBy(a => a.id).ToListAsync();
+        JsonWriter w = new JsonWriter();
+        w.WriteStartArray();
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            SysGenTable t = rows[i];
+            int cols = await this.SysGenColumn.Where(a => a.tableId == t.id).CountAsync();
+            w.WriteStartObject();
+            w.WriteProperty("id", t.id);
+            w.WriteProperty("tableName", t.tableName);
+            w.WriteProperty("entityName", t.entityName);
+            w.WriteProperty("title", t.title);
+            w.WriteProperty("section", t.section);
+            w.WriteProperty("pageSize", t.pageSize > 0 ? t.pageSize : 20);
+            w.WriteProperty("orderColumn", t.orderColumn != null && t.orderColumn.Length > 0 ? t.orderColumn : "id");
+            w.WriteProperty("orderDesc", t.orderDesc);
+            w.WriteProperty("labelColumn", t.labelColumn == null ? "" : t.labelColumn);
+            w.WriteProperty("menuIcon", t.menuIcon == null ? "" : t.menuIcon);
+            w.WriteProperty("tabColumn", t.tabColumn == null ? "" : t.tabColumn);
+            w.WriteProperty("exportEnabled", t.exportEnabled);
+            w.WriteProperty("apiEnabled", t.apiEnabled);
+            w.WriteProperty("hasCreate", t.hasCreate);
+            w.WriteProperty("hasEdit", t.hasEdit);
+            w.WriteProperty("hasDelete", t.hasDelete);
+            w.WriteProperty("menuEnabled", t.menuEnabled);
+            w.WriteProperty("migrated", t.migrated);
+            w.WriteProperty("generatedAt", t.generatedAt);
+            w.WriteProperty("columns", cols);
+            w.WriteEndObject();
         }
-        this.Dialog(d);
+        w.WriteEndArray();
+        AdminUiProtocol.Ok(this, w.ToString());
+    }
+
+    [HttpPost]
+    [Custom(Perm = PermBit.View)]
+    [Description("设计表字段列表")]
+    public async void Columns() {
+        int tableId = this.InAnyInt("tableId", 0);
+        SysGenTable t = await this.SysGenTable.ById(tableId);
+        if (t == null) { this.Fail(404, "0404", "设计不存在"); return; }
+        List<SysGenColumn> cols = await this.SysGenColumn
+            .Where(a => a.tableId == tableId).OrderBy(a => a.sortOrder).ToListAsync();
+        JsonWriter w = new JsonWriter();
+        w.WriteStartArray();
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            SysGenColumn c = cols[i];
+            w.WriteStartObject();
+            w.WriteProperty("id", c.id);
+            w.WriteProperty("tableId", c.tableId);
+            w.WriteProperty("name", c.name);
+            w.WriteProperty("label", c.label);
+            w.WriteProperty("kind", c.kind);
+            w.WriteProperty("size", c.size);
+            w.WriteProperty("widget", c.widget);
+            w.WriteProperty("defValue", c.defValue);
+            w.WriteProperty("dictType", c.dictType);
+            w.WriteProperty("relTable", c.relTable);
+            w.WriteProperty("relValue", c.relValue);
+            w.WriteProperty("relLabel", c.relLabel);
+            w.WriteProperty("filterOp", c.filterOp.Length > 0 ? c.filterOp : "auto");
+            w.WriteProperty("listWidth", c.listWidth == null ? "" : c.listWidth);
+            w.WriteProperty("tabGroup", c.tabGroup == null ? "" : c.tabGroup);
+            w.WriteProperty("sortOrder", c.sortOrder);
+            w.WriteProperty("nullable", c.nullable);
+            w.WriteProperty("inList", c.inList);
+            w.WriteProperty("inFilter", c.inFilter);
+            w.WriteProperty("inCreate", c.inCreate);
+            w.WriteProperty("inEdit", c.inEdit);
+            w.WriteProperty("inQuick", c.inQuick);
+            w.WriteProperty("required", c.required);
+            w.WriteEndObject();
+        }
+        w.WriteEndArray();
+        AdminUiProtocol.Ok(this, w.ToString());
     }
 
     [HttpPost]
     [Custom(Perm = PermBit.Create | PermBit.Update)]
     [Description("保存表信息")]
     public async void TableSave() {
-        int id = this.InInt("id", 0);
+        int id = this.InAnyInt("id", 0);
         if (!await this.Can(id > 0 ? (int)PermBit.Update : (int)PermBit.Create)) {
             this.Fail(403, "0403", "无操作权限"); return;
         }
-        string tableName = this.Need("tableName", "表名");
-        string title = this.Need("title", "名称");
+        string tableName = this.NeedAny("tableName", "表名");
+        string title = this.NeedAny("title", "名称");
         if (!Gen.Safe(tableName)) {
-            this.Fail(400, "0004", "表名只能用小写字母、数字和下划线，且以字母开头");
+            this.Fail(400, "0004", "表名只能用小写字母、数字和下划线，且以字母开头"); return;
         }
         if (tableName.ToLower().StartsWith("sys_")) {
-            this.Fail(400, "0004", "不能设计系统表");
+            this.Fail(400, "0004", "不能设计系统表"); return;
         }
-        string entityName = this.In("entityName");
+        string entityName = this.InAny("entityName");
         if (entityName.Length == 0) { entityName = ColumnDraft.Pascal(tableName); }
         if (!Gen.SafeCode(entityName) || entityName == "RowView"
             || entityName == "AdminController" || entityName == "AppController"
             || entityName == "Gen") {
-            this.Fail(400, "0004", "实体名不是安全的 Zan 类型名");
+            this.Fail(400, "0004", "实体名不是安全的 Zan 类型名"); return;
         }
-        /* URL 段落而非标签：侧边栏分区由此派生。 */
-        string section = this.In("section");
+        string section = this.InAny("section");
         if (!Gen.Safe(section)) { section = "content"; }
-        int api = 0;
-        if (this.In("apiEnabled") == "1") { api = 1; }
-        int export = 0;
-        if (this.In("exportEnabled") == "1") { export = 1; }
-        /* 功能开关随设计落 sys_gen_table：生成器与通用数据入口都读它。
-           模型默认 0，未经表单的写入路径（AI/行内）必须显式带上。 */
-        int hasCreate = ColumnDraft.Flag(this.In("hasCreate"));
-        int hasEdit = ColumnDraft.Flag(this.In("hasEdit"));
-        int hasDelete = ColumnDraft.Flag(this.In("hasDelete"));
-        int menuEnabled = ColumnDraft.Flag(this.In("menuEnabled"));
-        /* 页大小在保存与生成两处都钳。 */
-        int pageSize = this.InInt("pageSize", 20);
+        int api = FlagAny("apiEnabled");
+        int export = FlagAny("exportEnabled");
+        int hasCreate = FlagAny("hasCreate");
+        int hasEdit = FlagAny("hasEdit");
+        int hasDelete = FlagAny("hasDelete");
+        int menuEnabled = FlagAny("menuEnabled");
+        int pageSize = this.InAnyInt("pageSize", 20);
         if (pageSize <= 0) { pageSize = 20; }
         if (pageSize > 200) { pageSize = 200; }
-        string labelColumn = this.In("labelColumn").Trim();
+        string labelColumn = this.InAny("labelColumn").Trim();
         if (labelColumn.Length > 0 && !Gen.SafeCode(labelColumn)) {
-            this.Fail(400, "0004", "标签列不是安全的字段名");
+            this.Fail(400, "0004", "标签列不是安全的字段名"); return;
         }
-        string orderColumn = this.In("orderColumn").Trim();
+        string orderColumn = this.InAny("orderColumn").Trim();
         if (orderColumn.Length == 0) { orderColumn = "id"; }
-        /* "id" 是合法缺省排序列，不在标识符白名单内，单独放行。 */
         if (orderColumn != "id" && !Gen.SafeCode(orderColumn)) {
-            this.Fail(400, "0004", "排序列不是安全的字段名");
+            this.Fail(400, "0004", "排序列不是安全的字段名"); return;
         }
-        int orderDesc = this.In("orderDesc") == "0" ? 0 : 1;
-        string tabColumn = this.In("tabColumn").Trim();
+        int orderDesc = this.InAny("orderDesc") == "0" ? 0 : 1;
+        string tabColumn = this.InAny("tabColumn").Trim();
         if (tabColumn.Length > 0 && !Gen.SafeCode(tabColumn)) {
-            this.Fail(400, "0004", "页签列不是安全的字段名");
+            this.Fail(400, "0004", "页签列不是安全的字段名"); return;
         }
-        string menuIcon = this.In("menuIcon").Trim();
+        string menuIcon = this.InAny("menuIcon").Trim();
         for (int i = 0; i < menuIcon.Length; i = i + 1) {
             string ch = menuIcon.Substring(i, 1);
             if ((ch < "a" || ch > "z") && (ch < "0" || ch > "9")
                 && ch != "-" && ch != ":") {
-                this.Fail(400, "0004", "图标名只能用小写字母、数字、冒号和横线");
+                this.Fail(400, "0004", "图标名只能用小写字母、数字、冒号和横线"); return;
             }
         }
         if (menuIcon.Length > 32) { menuIcon = menuIcon.Substring(0, 32); }
-        /* 编辑时排序列/页签列须真实存在于列清单（页签列限字典或布尔）。 */
         if (id > 0 && (orderColumn != "id" || tabColumn.Length > 0)) {
             List<SysGenColumn> cols = await this.SysGenColumn
                 .Where(a => a.tableId == id).ToListAsync();
@@ -199,7 +223,7 @@ public class CoderController : AdminController {
                 for (int i = 0; i < cols.Count; i = i + 1) {
                     if (cols[i].name == orderColumn) { colOk = true; }
                 }
-                if (!colOk) { this.Fail(400, "0004", "排序列不存在"); }
+                if (!colOk) { this.Fail(400, "0004", "排序列不存在"); return; }
             }
             if (tabColumn.Length > 0) {
                 bool tabOk = false;
@@ -210,20 +234,20 @@ public class CoderController : AdminController {
                         tabOk = true;
                     }
                 }
-                if (!tabOk) { this.Fail(400, "0004", "页签列须为字典列或布尔列"); }
+                if (!tabOk) { this.Fail(400, "0004", "页签列须为字典列或布尔列"); return; }
             }
         }
 
         SysGenTable clash = await this.SysGenTable
             .Where(a => a.tableName == tableName).FirstAsync();
         if (clash != null && clash.id != id) {
-            this.Fail(400, "0004", "表 " + tableName + " 已经设计过了");
+            this.Fail(400, "0004", "表 " + tableName + " 已经设计过了"); return;
         }
         if (id > 0) {
             SysGenTable current = await this.SysGenTable.ById(id);
-            if (current == null) { this.Fail(404, "0404", "设计不存在"); }
+            if (current == null) { this.Fail(404, "0404", "设计不存在"); return; }
             if (current.migrated == 1 && current.tableName != tableName) {
-                this.Fail(409, "0004", "已建表不能更改表名");
+                this.Fail(409, "0004", "已建表不能更改表名"); return;
             }
             int n = await this.SysGenTable.Update()
                 .Set(a => a.tableName, tableName)
@@ -277,9 +301,9 @@ public class CoderController : AdminController {
     [Custom(Perm = PermBit.Delete)]
     [Description("删除表设计")]
     public async void TableDelete() {
-        int id = this.InInt("id", 0);
+        int id = this.InAnyInt("id", 0);
         SysGenTable t = await this.SysGenTable.ById(id);
-        if (t == null) { this.Fail(404, "0404", "设计不存在"); }
+        if (t == null) { this.Fail(404, "0404", "设计不存在"); return; }
         int n = await this.SysGenTable.Delete().Where(a => a.id == id)
             .ExecuteAffrowsAsync();
         int _c = await this.SysGenColumn.Delete().Where(a => a.tableId == id)
@@ -289,185 +313,98 @@ public class CoderController : AdminController {
         this.Saved("设计已删除，数据库中的表保留");
     }
 
-    [HttpGet]
-    [Custom(Perm = PermBit.View)]
-    [Description("字段设计")]
-    public async void Design() {
-        bool inDialog = this.In("as") == "dialog";
-        ViewData d = inDialog ? new ViewData() : await this.Layout("字段设计");
-        if (inDialog) { d.Set("dialogTitle", "字段设计"); await this.Buttons(d); }
-        int id = this.InInt("id", 0);
-        SysGenTable t = await this.SysGenTable.ById(id);
-        if (t == null) { this.Fail(404, "0404", "设计不存在"); }
-        d.Set("id", Convert.ToString(t.id));
-        d.Set("tableName", t.tableName);
-        d.Set("entityName", t.entityName);
-        d.Set("tableTitle", t.title);
-        if (t.migrated == 1) { d.Set("migrated", "1"); }
-        /* AI 生成入口：服务已配置且此屏可增改时出现；权限在各动作上再拦一道。 */
-        if (await Ai.Ready() && (await this.Can((int)PermBit.Create)
-                || await this.Can((int)PermBit.Update))) {
-            d.Set("canAi", "1");
-        }
-
-        List<SysGenColumn> cols = await this.SysGenColumn
-            .Where(a => a.tableId == id).OrderBy(a => a.sortOrder).ToListAsync();
-        /* 行内控件（勾选/名称/类型/控件/排序）只对可更新者可用，只读者拿到禁用态。 */
-        bool canEdit = await this.Can((int)PermBit.Update);
-        List<StrMap> list = d.AddList("columns");
-        Rows.Project(cols, list);
-        if (!canEdit) {
-            for (int i = 0; i < list.Count; i = i + 1) {
-                list[i].Set("dis", "disabled");
-            }
-        }
-        if (cols.Count == 0) { d.Set("empty", "1"); }
-        d.Set("showBar", inDialog ? "" : "1");
-        if (inDialog) { this.Dialog(d); return; }
-        this.Page(d);
-    }
-
-    [HttpGet]
-    [Custom(Perm = PermBit.Create | PermBit.Update)]
-    [Description("字段表单")]
-    public async void ColumnForm() {
-        int id = this.InInt("id", 0);
-        if (!await this.Can(id > 0 ? (int)PermBit.Update : (int)PermBit.Create)) {
-            this.Fail(403, "0403", "无操作权限"); return;
-        }
-        int tableId = this.InInt("tableId", 0);
-        ViewData d = new ViewData();
-        d.Set("id", Convert.ToString(id));
-        d.Set("tableId", Convert.ToString(tableId));
-        d.Set("dialogTitle", "新增字段");
-        d.Set("size", "255");
-        d.Set("sortOrder", "10");
-        d.Set("filterOpValue", "auto");
-        d.Set("inListChecked", "checked");
-        d.Set("inCreateChecked", "checked");
-        d.Set("inEditChecked", "checked");
-        d.Set("inQuickChecked", "checked");
-        if (id > 0) {
-            SysGenColumn c = await this.SysGenColumn.ById(id);
-            if (c == null) { this.Fail(404, "0404", "字段不存在"); }
-            d.Set("dialogTitle", "编辑字段");
-            d.Set("tableId", Convert.ToString(c.tableId));
-            d.Set("name", c.name);
-            d.Set("label", c.label);
-            d.Set("kindValue", c.kind);
-            d.Set("widgetValue", c.widget);
-            d.Set("size", Convert.ToString(c.size));
-            d.Set("defValue", c.defValue);
-            d.Set("dictType", c.dictType);
-            d.Set("relTable", c.relTable);
-            d.Set("relValue", c.relValue);
-            d.Set("relLabel", c.relLabel);
-            d.Set("filterOpValue", c.filterOp.Length > 0 ? c.filterOp : "auto");
-            d.Set("listWidth", c.listWidth == null ? "" : c.listWidth);
-            d.Set("tabGroup", c.tabGroup == null ? "" : c.tabGroup);
-            d.Set("sortOrder", Convert.ToString(c.sortOrder));
-            d.Set("inListChecked", ColumnDraft.Checked(c.inList));
-            d.Set("inFilterChecked", ColumnDraft.Checked(c.inFilter));
-            d.Set("inCreateChecked", ColumnDraft.Checked(c.inCreate));
-            d.Set("inEditChecked", ColumnDraft.Checked(c.inEdit));
-            d.Set("inQuickChecked", ColumnDraft.Checked(c.inQuick));
-            d.Set("requiredChecked", ColumnDraft.Checked(c.required));
-            d.Set("nullableChecked", ColumnDraft.Checked(c.nullable));
-        }
-
-        /* 关联选择器列出该管理后台所知的表，使外键为选择而非手输。 */
-        List<SysGenTable> tables = await this.SysGenTable.OrderBy(a => a.id).ToListAsync();
-        List<StrMap> opts = d.AddList("tables");
-        Rows.Project(tables, opts);
-        this.Dialog(d);
+    private int FlagAny(string name) {
+        string v = this.InAny(name).Trim().ToLower();
+        if (v == "1" || v == "true" || v == "on") { return 1; }
+        return 0;
     }
 
     [HttpPost]
     [Custom(Perm = PermBit.Create | PermBit.Update)]
     [Description("保存字段")]
     public async void ColumnSave() {
-        int id = this.InInt("id", 0);
+        int id = this.InAnyInt("id", 0);
         if (!await this.Can(id > 0 ? (int)PermBit.Update : (int)PermBit.Create)) {
             this.Fail(403, "0403", "无操作权限"); return;
         }
-        int tableId = this.InInt("tableId", 0);
-        string name = this.Need("name", "字段名");
+        int tableId = this.InAnyInt("tableId", 0);
+        string name = this.NeedAny("name", "字段名");
         if (!Gen.SafeCode(name)) {
-            this.Fail(400, "0004", "字段名不是安全的 Zan 字段名");
+            this.Fail(400, "0004", "字段名不是安全的 Zan 字段名"); return;
         }
-        string kind = this.In("kind");
+        string kind = this.InAny("kind");
         if (kind.Length == 0) { kind = "string"; }
         if (!ColumnDraft.InList(kind, "string,text,int,long,decimal,bool,datetime")) {
-            this.Fail(400, "0004", "不支持的存储类型");
+            this.Fail(400, "0004", "不支持的存储类型"); return;
         }
         if (tableId <= 0 || await this.SysGenTable.ById(tableId) == null) {
-            this.Fail(404, "0404", "设计不存在");
+            this.Fail(404, "0404", "设计不存在"); return;
         }
         SysGenColumn clash = await this.SysGenColumn
             .Where(a => a.tableId == tableId).Where(a => a.name == name).FirstAsync();
         if (clash != null && clash.id != id) {
-            this.Fail(400, "0004", "字段 " + name + " 已存在");
+            this.Fail(400, "0004", "字段 " + name + " 已存在"); return;
         }
-        string relTable = this.In("relTable");
+        string relTable = this.InAny("relTable");
         if (relTable.Length > 0 && !Gen.Safe(relTable)) {
-            this.Fail(400, "0004", "关联表名不合法");
+            this.Fail(400, "0004", "关联表名不合法"); return;
         }
-        string relValue = this.In("relValue");
-        string relLabel = this.In("relLabel");
+        string relValue = this.InAny("relValue");
+        string relLabel = this.InAny("relLabel");
         if (relTable.Length > 0) {
             if (relValue.Length == 0) { relValue = "id"; }
             if (relLabel.Length == 0) { relLabel = "name"; }
             if (!Gen.Safe(relValue) || !Gen.Safe(relLabel)) {
-                this.Fail(400, "0004", "关联字段名不合法");
+                this.Fail(400, "0004", "关联字段名不合法"); return;
             }
         }
-        string filterOp = this.In("filterOp");
+        string filterOp = this.InAny("filterOp");
         if (filterOp.Length == 0) { filterOp = "auto"; }
         if (!ColumnDraft.InList(filterOp, "auto,like,eq,select,range")) {
-            this.Fail(400, "0004", "不支持的筛选算子");
+            this.Fail(400, "0004", "不支持的筛选算子"); return;
         }
-        string listWidth = ColumnDraft.Clip(this.In("listWidth").Trim(), 16);
+        string listWidth = ColumnDraft.Clip(this.InAny("listWidth").Trim(), 16);
         if (listWidth.Length > 0 && Gen.WidthOf(listWidth).Length == 0) {
-            this.Fail(400, "0004", "列宽只支持「数字+px/em/%」形态（如 140px）");
+            this.Fail(400, "0004", "列宽只支持「数字+px/em/%」形态（如 140px）"); return;
         }
-        string tabGroup = ColumnDraft.Clip(this.In("tabGroup").Trim(), 16);
+        string tabGroup = ColumnDraft.Clip(this.InAny("tabGroup").Trim(), 16);
 
         SysGenColumn c = new SysGenColumn();
         if (id > 0) {
             SysGenColumn cur = await this.SysGenColumn.ById(id);
             if (cur == null || cur.tableId != tableId) {
-                this.Fail(404, "0404", "字段不存在");
+                this.Fail(404, "0404", "字段不存在"); return;
             }
             c = cur;
         }
         c.tableId = tableId;
         c.name = name;
         c.kind = kind;
-        c.size = this.InInt("size", 255);
-        if (c.size < 0 || c.size > 4000) { this.Fail(400, "0004", "字段长度不合法"); }
-        c.defValue = this.In("defValue");
-        c.label = this.In("label");
-        c.widget = this.In("widget");
+        c.size = this.InAnyInt("size", 255);
+        if (c.size < 0 || c.size > 4000) { this.Fail(400, "0004", "字段长度不合法"); return; }
+        c.defValue = this.InAny("defValue");
+        c.label = this.InAny("label");
+        c.widget = this.InAny("widget");
         if (c.widget.Length == 0) { c.widget = "text"; }
         if (!ColumnDraft.InList(c.widget,
                 "text,textarea,number,select,switch,date,richtext,upload")) {
-            this.Fail(400, "0004", "不支持的控件");
+            this.Fail(400, "0004", "不支持的控件"); return;
         }
-        c.dictType = this.In("dictType");
+        c.dictType = this.InAny("dictType");
         c.relTable = relTable;
         c.relValue = relValue;
         c.relLabel = relLabel;
         c.filterOp = filterOp;
         c.listWidth = listWidth;
         c.tabGroup = tabGroup;
-        c.sortOrder = this.InInt("sortOrder", 10);
-        c.nullable = ColumnDraft.Flag(this.In("nullable"));
-        c.inList = ColumnDraft.Flag(this.In("inList"));
-        c.inFilter = ColumnDraft.Flag(this.In("inFilter"));
-        c.inCreate = ColumnDraft.Flag(this.In("inCreate"));
-        c.inEdit = ColumnDraft.Flag(this.In("inEdit"));
-        c.inQuick = ColumnDraft.Flag(this.In("inQuick"));
-        c.required = ColumnDraft.Flag(this.In("required"));
+        c.sortOrder = this.InAnyInt("sortOrder", 10);
+        c.nullable = FlagAny("nullable");
+        c.inList = FlagAny("inList");
+        c.inFilter = FlagAny("inFilter");
+        c.inCreate = FlagAny("inCreate");
+        c.inEdit = FlagAny("inEdit");
+        c.inQuick = FlagAny("inQuick");
+        c.required = FlagAny("required");
 
         if (id > 0) {
             int n = await this.SysGenColumn.Update()
@@ -506,9 +443,9 @@ public class CoderController : AdminController {
     [Custom(Perm = PermBit.Delete)]
     [Description("删除字段")]
     public async void ColumnDelete() {
-        int id = this.InInt("id", 0);
+        int id = this.InAnyInt("id", 0);
         SysGenColumn c = await this.SysGenColumn.ById(id);
-        if (c == null) { this.Fail(404, "0404", "字段不存在"); }
+        if (c == null) { this.Fail(404, "0404", "字段不存在"); return; }
         int n = await this.SysGenColumn.Delete().Where(a => a.id == id)
             .ExecuteAffrowsAsync();
         await this.Note("删除字段", c.name, n > 0,
@@ -516,19 +453,15 @@ public class CoderController : AdminController {
         this.Saved("字段已从设计中移除，数据库中的列保留");
     }
 
-    /* 行内快速改：设计表里的勾选/名称/类型/控件/排序就地提交，免去为一个小开关
-       开一次编辑框。只放行白名单列，每列单独校验后单独更新；列名永不来自请求，
-       更新构造器按字段写死，调用方无法指定任意列。深度属性（默认值/长度/字典/
-       关联）仍走编辑对话框。 */
     [HttpPost]
     [Custom(Perm = PermBit.Update)]
     [Description("字段行内修改")]
     public async void ColumnField() {
-        int id = this.InInt("id", 0);
-        string field = this.Need("field", "属性");
-        string value = this.In("value");
+        int id = this.InAnyInt("id", 0);
+        string field = this.NeedAny("field", "属性");
+        string value = this.InAny("value");
         SysGenColumn c = await this.SysGenColumn.ById(id);
-        if (c == null) { this.Fail(404, "0404", "字段不存在"); }
+        if (c == null) { this.Fail(404, "0404", "字段不存在"); return; }
 
         if (field == "label") {
             string label = ColumnDraft.Clip(value, 64);
@@ -541,7 +474,7 @@ public class CoderController : AdminController {
             return;
         }
         if (field == "sortOrder") {
-            int sort = this.InInt("value", c.sortOrder);
+            int sort = this.InAnyInt("value", c.sortOrder);
             if (sort < 0) { sort = 0; }
             if (sort > 9999999) { sort = 9999999; }
             int n = await this.SysGenColumn.Update()
@@ -554,7 +487,7 @@ public class CoderController : AdminController {
         }
         if (field == "kind") {
             if (!ColumnDraft.InList(value, "string,text,int,long,decimal,bool,datetime")) {
-                this.Fail(400, "0004", "不支持的存储类型");
+                this.Fail(400, "0004", "不支持的存储类型"); return;
             }
             int n = await this.SysGenColumn.Update()
                 .Set(a => a.kind, value)
@@ -566,7 +499,7 @@ public class CoderController : AdminController {
         if (field == "widget") {
             if (!ColumnDraft.InList(value,
                     "text,textarea,number,select,switch,date,richtext,upload")) {
-                this.Fail(400, "0004", "不支持的控件");
+                this.Fail(400, "0004", "不支持的控件"); return;
             }
             int n = await this.SysGenColumn.Update()
                 .Set(a => a.widget, value)
@@ -577,7 +510,7 @@ public class CoderController : AdminController {
         }
         if (field == "filterOp") {
             if (!ColumnDraft.InList(value, "auto,like,eq,select,range")) {
-                this.Fail(400, "0004", "不支持的筛选算子");
+                this.Fail(400, "0004", "不支持的筛选算子"); return;
             }
             int n = await this.SysGenColumn.Update()
                 .Set(a => a.filterOp, value)
@@ -598,7 +531,7 @@ public class CoderController : AdminController {
         if (field == "inList" || field == "inFilter" || field == "inCreate"
             || field == "inEdit" || field == "inQuick" || field == "required"
             || field == "nullable") {
-            int v = ColumnDraft.Flag(value);
+            int v = (value == "1" || value == "true" || value == "on") ? 1 : 0;
             int n = 0;
             if (field == "inList") {
                 n = await this.SysGenColumn.Update().Set(a => a.inList, v)
@@ -630,42 +563,20 @@ public class CoderController : AdminController {
         this.Fail(400, "0004", "不支持行内修改的属性");
     }
 
-    /* AI 字段设计：一句话业务 → 整表字段草稿。AI 只出草案，且过三道关才落设计：
-       服务器按设计器契约重验每一列（不信任模型输出，与数据屏同一纪律），
-       人在审核表里逐列勾选，应用时对浏览器回传的清单再验一遍。 */
-    [HttpGet]
-    [Custom(Perm = PermBit.Create | PermBit.Update)]
-    [Description("AI 字段设计表单")]
-    public async void AiForm() {
-        int tableId = this.InInt("tableId", 0);
-        SysGenTable t = await this.SysGenTable.ById(tableId);
-        if (t == null) { this.Fail(404, "0404", "设计不存在"); }
-        if (!await Ai.Ready()) {
-            this.Fail(400, "0005", "尚未配置 AI 服务，先到「站点设置 → AI」启用");
-        }
-        ViewData d = new ViewData();
-        d.Set("tableId", Convert.ToString(tableId));
-        d.Set("tableTitle", t.title);
-        d.Set("tableName", t.tableName);
-        this.Dialog(d);
-    }
-
     [HttpPost]
     [Custom(Perm = PermBit.Create | PermBit.Update)]
     [Description("AI 生成字段设计")]
     public async void AiDesign() {
-        int tableId = this.InInt("tableId", 0);
-        string desc = this.Need("desc", "业务描述");
+        int tableId = this.InAnyInt("tableId", 0);
+        string desc = this.NeedAny("desc", "业务描述");
         SysGenTable t = await this.SysGenTable.ById(tableId);
-        if (t == null) { this.Fail(404, "0404", "设计不存在"); }
-        if (!await Ai.Ready()) { this.Fail(400, "0005", "尚未配置 AI 服务"); }
+        if (t == null) { this.Fail(404, "0404", "设计不存在"); return; }
+        if (!await Ai.Ready()) { this.Fail(400, "0005", "尚未配置 AI 服务"); return; }
         if (desc.Length > 2000) { desc = desc.Substring(0, 2000); }
 
         List<SysGenColumn> cols = await this.SysGenColumn
             .Where(a => a.tableId == tableId).OrderBy(a => a.sortOrder)
             .ToListAsync();
-        /* 字典类型与已设计表作为取值范围给模型：下拉建议落在真实存在的
-           字典/表上，而不是编一个不存在的类型码。 */
         List<SysDictType> dicts = await this.SysDictType
             .Where(a => a.status == 1).ToListAsync();
         List<SysGenTable> tables = await this.SysGenTable.OrderBy(a => a.id)
@@ -673,18 +584,18 @@ public class CoderController : AdminController {
 
         AiReply r = await Ai.CompleteRaw(DesignPrompt(),
             DesignAsk(t, desc, cols, dicts, tables));
-        if (!r.ok) { this.Fail(400, "0005", r.text); }
+        if (!r.ok) { this.Fail(400, "0005", r.text); return; }
         JsonDoc root = DesignJson(r.text);
         if (root == null || root.KindAt(root.root) != 5) {
-            this.Fail(400, "0005", "AI 返回的内容无法解析为字段设计，请重试或换个描述");
+            this.Fail(400, "0005", "AI 返回的内容无法解析为字段设计，请重试或换个描述"); return;
         }
         int colsArr = root.Get("columns");
         if (colsArr < 0 || root.KindAt(colsArr) != 4) {
-            this.Fail(400, "0005", "AI 返回的内容无法解析为字段设计，请重试或换个描述");
+            this.Fail(400, "0005", "AI 返回的内容无法解析为字段设计，请重试或换个描述"); return;
         }
         ColumnDraft draft = ColumnDraft.Sanitize(root, colsArr, cols, tables);
         if (draft.cols.Count == 0) {
-            this.Fail(400, "0005", "AI 给出的字段全部无效（重名或类型不合法），请换个描述再试");
+            this.Fail(400, "0005", "AI 给出的字段全部无效（重名或类型不合法），请换个描述再试"); return;
         }
 
         JsonWriter w = new JsonWriter();
@@ -697,17 +608,17 @@ public class CoderController : AdminController {
         w.WriteEndArray();
         w.WriteProperty("dropped", (long)draft.dropped);
         w.WriteEndObject();
-        this.Ok(w.ToString());
+        AdminUiProtocol.Ok(this, w.ToString());
     }
 
     [HttpPost]
     [Custom(Perm = PermBit.Create | PermBit.Update)]
     [Description("应用 AI 字段设计")]
     public async void AiApply() {
-        int tableId = this.InInt("tableId", 0);
-        string listJson = this.Need("columns", "字段清单");
+        int tableId = this.InAnyInt("tableId", 0);
+        string listJson = this.NeedAny("columns", "字段清单");
         SysGenTable t = await this.SysGenTable.ById(tableId);
-        if (t == null) { this.Fail(404, "0404", "设计不存在"); }
+        if (t == null) { this.Fail(404, "0404", "设计不存在"); return; }
         List<SysGenColumn> cols = await this.SysGenColumn
             .Where(a => a.tableId == tableId).OrderBy(a => a.sortOrder)
             .ToListAsync();
@@ -715,12 +626,11 @@ public class CoderController : AdminController {
             .ToListAsync();
         JsonDoc arrDoc = JsonDoc.Parse(listJson);
         if (arrDoc == null || arrDoc.KindAt(arrDoc.root) != 4) {
-            this.Fail(400, "0004", "字段清单无法解析");
+            this.Fail(400, "0004", "字段清单无法解析"); return;
         }
-        /* 浏览器回传的数据同样不被信任：与生成走同一个清洗器。 */
         ColumnDraft draft = ColumnDraft.Sanitize(arrDoc, arrDoc.root, cols, tables);
         if (draft.cols.Count == 0) {
-            this.Fail(400, "0004", "没有可应用的有效字段");
+            this.Fail(400, "0004", "没有可应用的有效字段"); return;
         }
 
         int sort = 10;
@@ -748,17 +658,17 @@ public class CoderController : AdminController {
     [Custom(Perm = PermBit.Update)]
     [Description("同步到数据库")]
     public async void Migrate() {
-        int id = this.InInt("id", 0);
+        int id = this.InAnyInt("id", 0);
         SysGenTable t = await this.SysGenTable.ById(id);
-        if (t == null) { this.Fail(404, "0404", "设计不存在"); }
+        if (t == null) { this.Fail(404, "0404", "设计不存在"); return; }
         List<SysGenColumn> cols = await this.SysGenColumn
             .Where(a => a.tableId == id).OrderBy(a => a.sortOrder).ToListAsync();
-        if (cols.Count == 0) { this.Fail(400, "0004", "先添加字段"); }
-        if (!Gen.Valid(t, cols)) { this.Fail(400, "0004", "表或字段设计不合法"); }
+        if (cols.Count == 0) { this.Fail(400, "0004", "先添加字段"); return; }
+        if (!Gen.Valid(t, cols)) { this.Fail(400, "0004", "表或字段设计不合法"); return; }
         IDbConnection db = await this.Conn();
-        if (db == null) { this.Fail(503, "2001", "数据库不可用"); }
+        if (db == null) { this.Fail(503, "2001", "数据库不可用"); return; }
         if (t.migrated != 1 && await DbSchema.TableExistsAsync(db, t.tableName)) {
-            this.Fail(409, "0004", "数据库中已存在同名表，不能由设计器接管");
+            this.Fail(409, "0004", "数据库中已存在同名表，不能由设计器接管"); return;
         }
 
         int changed = await Gen.Migrate(db, t, cols);
@@ -771,14 +681,13 @@ public class CoderController : AdminController {
         this.Saved("已同步到数据库，可以在「数据管理」里维护数据了");
     }
 
-    /* 写出生成源码；须重建后生效，消息直接说明而非暗示已在运行中变更。
-       force=1 时覆盖既有目标（仅 Design 页「覆盖重新生成」按钮显式确认后走）。 */
+    /* 写出生成源码；须重建后生效。 */
     [HttpPost]
     [Custom(Perm = PermBit.Update)]
     [Description("生成代码")]
     public async void Build() {
-        int id = this.InInt("id", 0);
-        int force = this.InInt("force", 0);
+        int id = this.InAnyInt("id", 0);
+        int force = this.InAnyInt("force", 0);
         SysGenTable t = await this.SysGenTable.ById(id);
         if (t == null) { this.Fail(404, "0404", "设计不存在"); }
         List<SysGenColumn> cols = await this.SysGenColumn
@@ -790,15 +699,14 @@ public class CoderController : AdminController {
         List<SysGenTable> tabs = await this.SysGenTable.OrderBy(a => a.id).ToListAsync();
 
         /* gen.root 相对当前服务工作目录解释（开发时从 build/ 运行，".." 即项目根）；
-           生产发布目录没有 src/views 布局，必须在站点设置里配置真实源码根目录。 */
+           生产发布目录没有 src 布局，必须在站点设置里配置真实源码根目录。 */
         string root = (await Settings.Get(SettingKeys.GenRoot, "..")).Trim();
         if (root.Length == 0) {
             this.Fail(400, "0004", "未配置源码目录，请在站点设置的「开发」中填写 gen.root");
             return;
         }
-        if (!Directory.ExistsOnDisk(root + "/src")
-            || !Directory.ExistsOnDisk(root + "/views")) {
-            this.Fail(400, "0004", "gen.root 不是应用源码根目录（需要已有 src 和 views）："
+        if (!Directory.ExistsOnDisk(root + "/src")) {
+            this.Fail(400, "0004", "gen.root 不是应用源码根目录（需要已有 src 目录）："
                 + root + "；请在站点设置的「开发」中配置");
             return;
         }
@@ -807,7 +715,6 @@ public class CoderController : AdminController {
             Directory.CreateDirectoryRecursive(root + "/src/Controller/Admin");
             if (t.apiEnabled == 1) { Directory.CreateDirectoryRecursive(root + "/src/Controller/Api"); }
             Directory.CreateDirectoryRecursive(root + "/src/Dao/Gen");
-            Directory.CreateDirectoryRecursive(root + "/views/Admin");
         } catch (Exception ex) {
             this.Fail(500, "2001", "无法创建源码目录（gen.root=" + root + "）：" + ex.Message);
             return;
@@ -835,35 +742,31 @@ public class CoderController : AdminController {
             + "请将源码纳入工程并重新编译后生效");
     }
 
-    /* 生成源码清单，顺序与 TargetPaths 一一对应：模型/后台控制器/Dao/后台
-       视图×2 恒有；apiEnabled=1 加 JSON 接口。 */
+    /* 生成源码清单（纯 AdminUI JSON 架构），顺序与 TargetPaths 一一对应：
+       模型/后台控制器/Dao 恒有；apiEnabled=1 加 JSON 接口。 */
     static List<string> SourceList(SysGenTable t, List<SysGenColumn> cols,
         List<SysGenTable> designed) {
         List<string> sources = new List<string>();
         sources.Add(Gen.ModelSource(t, cols));
         sources.Add(Gen.ControllerSource(t, cols, designed));
         sources.Add(Gen.DaoSource(t, cols));
-        sources.Add(Gen.ListViewSource(t, cols));
-        sources.Add(Gen.FormViewSource(t, cols, designed));
         if (t.apiEnabled == 1) { sources.Add(Gen.ApiSource(t, cols, designed)); }
         return sources;
     }
 
     /* 文件构成说明（保存消息用）。 */
     private static string FileMix(SysGenTable t) {
-        string mix = "模型/后台控制器/Dao/后台视图×2";
+        string mix = "模型/后台控制器/Dao";
         if (t.apiEnabled == 1) { mix = mix + "/JSON接口"; }
         return mix;
     }
 
-    /* Directory=URL 前缀，file=class+Controller=route 段落=view 键段，生成表与手写表同构。 */
+    /* Directory=URL 前缀，file=class+Controller=route 段落，生成表与手写表同构。 */
     public static List<string> TargetPaths(SysGenTable t, string root) {
         List<string> paths = new List<string>();
         paths.Add(root + "/src/Model/Gen/" + t.entityName + ".zan");
         paths.Add(root + "/src/Controller/Admin/" + t.entityName + "Controller.zan");
         paths.Add(root + "/src/Dao/Gen/" + t.entityName + "Dao.zan");
-        paths.Add(root + "/views/Admin/" + t.entityName + "Controller.Index.html");
-        paths.Add(root + "/views/Admin/" + t.entityName + "Controller.Form.html");
         if (t.apiEnabled == 1) {
             paths.Add(root + "/src/Controller/Api/" + t.entityName + "ApiController.zan");
         }
@@ -909,52 +812,65 @@ public class CoderController : AdminController {
         }
     }
 
-    /* 写出前预览设计将产生的源码。 */
-    [HttpGet]
+    /* 写出前预览设计将产生的源码（纯 JSON）。 */
+    [HttpPost]
     [Custom(Perm = PermBit.View)]
     [Description("预览生成代码")]
     public async void Preview() {
-        int id = this.InInt("id", 0);
+        int id = this.InAnyInt("id", 0);
         SysGenTable t = await this.SysGenTable.ById(id);
-        if (t == null) { this.Fail(404, "0404", "设计不存在"); }
+        if (t == null) { this.Fail(404, "0404", "设计不存在"); return; }
         List<SysGenColumn> cols = await this.SysGenColumn
             .Where(a => a.tableId == id).OrderBy(a => a.sortOrder).ToListAsync();
         List<SysGenTable> tabs = await this.SysGenTable.OrderBy(a => a.id).ToListAsync();
         List<string> sources = SourceList(t, cols, tabs);
-        ViewData d = new ViewData();
-        d.Set("dialogTitle", t.tableName + " 生成预览");
-        d.Set("model", sources[0]);
-        d.Set("controller", sources[1]);
-        d.Set("dao", sources[2]);
-        d.Set("list", sources[3]);
-        d.Set("form", sources[4]);
-        if (t.apiEnabled == 1 && sources.Count > 5) { d.Set("api", sources[5]); }
+        string existsNote = "";
         string root = (await Settings.Get(SettingKeys.GenRoot, "..")).Trim();
-        if (root.Length > 0 && Directory.ExistsOnDisk(root + "/src")
-            && Directory.ExistsOnDisk(root + "/views")) {
+        if (root.Length > 0 && Directory.ExistsOnDisk(root + "/src")) {
             List<string> paths = TargetPaths(t, root);
             int existN = 0;
             for (int i = 0; i < paths.Count; i = i + 1) {
                 if (File.Exists(paths[i])) { existN = existN + 1; }
             }
             if (existN > 0) {
-                d.Set("existsNote", "已有 " + Convert.ToString(existN) + "/"
+                existsNote = "已有 " + Convert.ToString(existN) + "/"
                     + Convert.ToString(paths.Count)
-                    + " 个目标文件存在；默认拒绝覆盖，可在字段设计页用「覆盖重新生成」");
+                    + " 个目标文件存在；默认拒绝覆盖，可在工作台用「覆盖重新生成」";
             }
         }
-        this.Dialog(d);
+
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("tableName", t.tableName);
+        w.WriteProperty("existsNote", existsNote);
+        w.WritePropertyName("files");
+        w.WriteStartArray();
+        WritePreviewFile(w, "Model (" + t.entityName + ".zan)", sources[0]);
+        WritePreviewFile(w, "Controller (" + t.entityName + "Controller.zan)", sources[1]);
+        WritePreviewFile(w, "Dao (" + t.entityName + "Dao.zan)", sources[2]);
+        if (t.apiEnabled == 1 && sources.Count > 3) {
+            WritePreviewFile(w, "Api (" + t.entityName + "ApiController.zan)", sources[3]);
+        }
+        w.WriteEndArray();
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(this, w.ToString());
     }
 
-    /* 人工确认生成模块已编译部署后置位 generatedAt：通用数据入口随 IsMenu
-       隐藏；再点一次恢复。生成≠部署，所以不由 Build 自动写。 */
+    private static void WritePreviewFile(JsonWriter w, string name, string content) {
+        w.WriteStartObject();
+        w.WriteProperty("name", name);
+        w.WriteProperty("content", content);
+        w.WriteEndObject();
+    }
+
+    /* 人工确认生成模块已编译部署后置位 generatedAt：通用数据入口随 IsMenu 隐藏；再点一次恢复。 */
     [HttpPost]
     [Custom(Perm = PermBit.Update)]
     [Description("标记生成模块接管")]
     public async void Own() {
-        int id = this.InInt("id", 0);
+        int id = this.InAnyInt("id", 0);
         SysGenTable t = await this.SysGenTable.ById(id);
-        if (t == null) { this.Fail(404, "0404", "设计不存在"); }
+        if (t == null) { this.Fail(404, "0404", "设计不存在"); return; }
         int next = t.generatedAt > 0 ? 0 : WebApp.NowSeconds();
         await this.SysGenTable.Update()
             .Set(a => a.generatedAt, next)

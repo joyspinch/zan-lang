@@ -21,6 +21,30 @@ class RouteInput {
     }
 }
 
+class CrudFieldSpec {
+    public string Name;
+    public string Label;
+    public string Type;
+    public bool Required;
+    public bool ReadOnly;
+    public bool Virtual;
+    public bool TimeCol;
+    public bool Searchable;
+    public string DefaultValue;
+
+    public CrudFieldSpec(string name, string label) {
+        this.Name = name;
+        this.Label = label;
+        this.Type = "string";
+        this.Required = false;
+        this.ReadOnly = false;
+        this.Virtual = false;
+        this.TimeCol = false;
+        this.Searchable = false;
+        this.DefaultValue = "";
+    }
+}
+
 partial class MvcRoutesGenerator {
     static string Literal(JsonValue expr) {
         if (Text(expr, "k") == "uni" && Text(expr, "op") == "-") { return "-" + Literal(expr.Get("o")); }
@@ -51,40 +75,241 @@ partial class MvcRoutesGenerator {
         inputs.Add(input);
     }
 
-    static void AddBodyInputs(JsonValue method, List<RouteInput> inputs) {
+    static JsonValue FindOwnerMethod(JsonValue owner, string name) {
+        if (owner == null || name == "") { return null; }
+        JsonValue methods = owner.Get("methods");
+        if (methods == null) { return null; }
+        for (int i = 0; i < methods.Count(); i++) {
+            JsonValue m = methods.At(i);
+            if (Text(m, "name") == name) { return m; }
+        }
+        return null;
+    }
+
+    // Extract fluent CrudConf.Of(...).Col(...).Req().Int().Search(...) chain from owner.Def().
+    static List<CrudFieldSpec> ExtractCrudFields(JsonValue owner) {
+        List<CrudFieldSpec> fields = new List<CrudFieldSpec>();
+        JsonValue defMethod = FindOwnerMethod(owner, "Def");
+        if (defMethod == null) { return fields; }
+        JsonValue expressions = defMethod.Get("body_expressions");
+        if (expressions == null) { return fields; }
+
+        // Find the longest/outermost CrudConf fluent chain expressions (or individual c.Col(...) chains).
+        // Each call in body_expressions is exported as a full tree; walk receiver chains from innermost to outermost.
+        CrudFieldSpec cur = null;
+        HashSet<string> seenCols = new HashSet<string>();
+
+        // Collect all root-to-leaf call sequences that contain at least one .Col(...) call.
+        for (int i = 0; i < expressions.Count(); i++) {
+            JsonValue expr = expressions.At(i);
+            if (Text(expr, "k") != "call") { continue; }
+            List<JsonValue> chain = new List<JsonValue>();
+            JsonValue node = expr;
+            while (node != null && Text(node, "k") == "call") {
+                chain.Add(node);
+                JsonValue fn = node.Get("f");
+                if (fn != null && Text(fn, "k") == "mem") {
+                    node = fn.Get("o");
+                } else {
+                    break;
+                }
+            }
+            // Only process chains rooted at CrudConf.Of(...) or an identifier (e.g., conf.Col(...))
+            // and process from innermost call to outermost call.
+            bool hasCol = false;
+            for (int j = chain.Count - 1; j >= 0; j--) {
+                JsonValue f = chain[j].Get("f");
+                if (f != null && Text(f, "k") == "mem" && Text(f, "n") == "Col") {
+                    hasCol = true;
+                    break;
+                }
+            }
+            if (!hasCol) { continue; }
+            for (int j = chain.Count - 1; j >= 0; j--) {
+                JsonValue call = chain[j];
+                JsonValue f = call.Get("f");
+                if (f == null || Text(f, "k") != "mem") { continue; }
+                string mname = Text(f, "n");
+                JsonValue args = call.Get("a");
+                int argCount = args == null ? 0 : args.Count();
+                if (mname == "Col" && argCount >= 2) {
+                    string colName = Literal(args.At(0));
+                    string colLabel = Literal(args.At(1));
+                    if (colName == "") { continue; }
+                    if (seenCols.Contains(colName)) {
+                        cur = null;
+                        for (int k = 0; k < fields.Count; k++) {
+                            if (fields[k].Name == colName) { cur = fields[k]; break; }
+                        }
+                    } else {
+                        seenCols.Add(colName);
+                        cur = new CrudFieldSpec(colName, colLabel);
+                        fields.Add(cur);
+                    }
+                } else if (cur != null) {
+                    if (mname == "Int") { cur.Type = "int"; }
+                    else if (mname == "Req") { cur.Required = true; }
+                    else if (mname == "Ro") { cur.ReadOnly = true; }
+                    else if (mname == "V") { cur.Virtual = true; }
+                    else if (mname == "Time") { cur.TimeCol = true; cur.ReadOnly = true; }
+                    else if (mname == "Search" || mname == "Pick" || mname == "Opts" || mname == "Dict") {
+                        cur.Searchable = true;
+                    } else if (mname == "Def" && argCount >= 1) {
+                        cur.DefaultValue = Literal(args.At(0));
+                    } else if (mname == "Order" || mname == "Label" || mname == "Toggle"
+                               || mname == "Created" || mname == "Updated"
+                               || mname.StartsWith("Tbar") || mname.StartsWith("Ops")
+                               || mname == "Scope" || mname == "FormWidth" || mname == "Wide") {
+                        cur = null;
+                    }
+                }
+            }
+        }
+        return fields;
+    }
+
+    static void AddPagedInputs(List<RouteInput> inputs, string order, string limit, bool includePageSize) {
+        AddInput(inputs, new RouteInput("page", "int", "query", false, "1", "页码，从 1 开始"), false);
+        if (includePageSize) {
+            AddInput(inputs, new RouteInput("pageSize", "int", "query", false, limit, "每页条数"), false);
+        }
+        AddInput(inputs, new RouteInput("limit", "int", "query", false, limit, "每页条数（兼容参数）"), false);
+        AddInput(inputs, new RouteInput("order", "string", "query", false, order, "排序字段"), false);
+        AddInput(inputs, new RouteInput("dir", "string", "query", false, "desc", "排序方向：desc 或 asc"), false);
+        AddInput(inputs, new RouteInput("kw", "string", "query", false, "", "搜索关键词"), false);
+    }
+
+    static void AddCrudMethodInputs(JsonValue owner, string doMethod, List<RouteInput> inputs) {
+        if (doMethod == "DoListData" || doMethod == "DoList" || doMethod == "DoListAsync") {
+            AddPagedInputs(inputs, "id", "20", true);
+            List<CrudFieldSpec> fields = ExtractCrudFields(owner);
+            for (int i = 0; i < fields.Count; i++) {
+                CrudFieldSpec f = fields[i];
+                if (!f.Searchable) { continue; }
+                AddInput(inputs, new RouteInput(f.Name, f.Type, "query", false, "",
+                    f.Label.Length > 0 ? "筛选：" + f.Label : ""), false);
+            }
+        } else if (doMethod == "DoSave") {
+            AddInput(inputs, new RouteInput("id", "int", "query", false, "0", "记录 ID（新增不传或传 0，编辑必传）"), false);
+            List<CrudFieldSpec> fields = ExtractCrudFields(owner);
+            for (int i = 0; i < fields.Count; i++) {
+                CrudFieldSpec f = fields[i];
+                if (f.Name == "id" || f.ReadOnly || f.Virtual) { continue; }
+                AddInput(inputs, new RouteInput(f.Name, f.Type, "query", f.Required, f.DefaultValue, f.Label), true);
+            }
+        } else if (doMethod == "DoEdit") {
+            AddInput(inputs, new RouteInput("id", "int", "query", true, "", "记录 ID"), true);
+        } else if (doMethod == "DoForm" || doMethod == "DoFormConf" || doMethod == "DoFormConfAsync") {
+            AddInput(inputs, new RouteInput("id", "int", "query", false, "0", "记录 ID（新增传 0，编辑传目标 ID）"), false);
+        } else if (doMethod == "DoDelete") {
+            AddInput(inputs, new RouteInput("id", "int", "query", true, "", "记录 ID"), true);
+        } else if (doMethod == "DoBatch") {
+            AddInput(inputs, new RouteInput("ids", "string", "query", true, "", "批量记录 ID（逗号分隔或 JSON 数组）"), true);
+            AddInput(inputs, new RouteInput("op", "string", "query", false, "", "批量操作类型（如 delete）"), false);
+            AddInput(inputs, new RouteInput("value", "string", "query", false, "", "批量更新目标值"), false);
+        } else if (doMethod == "DoField") {
+            AddInput(inputs, new RouteInput("id", "int", "query", true, "", "记录 ID"), true);
+            AddInput(inputs, new RouteInput("field", "string", "query", true, "", "待修改字段名"), true);
+            AddInput(inputs, new RouteInput("value", "string", "query", false, "", "字段新值"), false);
+        } else if (doMethod == "DoOptions") {
+            AddInput(inputs, new RouteInput("kw", "string", "query", false, "", "搜索关键词"), false);
+            AddInput(inputs, new RouteInput("id", "int", "query", false, "", "按 ID 精确回显单条选项"), false);
+        }
+    }
+
+    static bool IsCrudDelegateMethod(string reader) {
+        return reader == "DoListData" || reader == "DoList" || reader == "DoListAsync"
+            || reader == "DoSave" || reader == "DoEdit" || reader == "DoForm"
+            || reader == "DoFormConf" || reader == "DoFormConfAsync"
+            || reader == "DoDelete" || reader == "DoBatch" || reader == "DoField"
+            || reader == "DoOptions";
+    }
+
+    static void AddBodyInputs(JsonValue owner, JsonValue method, List<RouteInput> inputs) {
+        HashSet<string> visited = new HashSet<string>();
+        string mname = Text(method, "name");
+        if (mname != "") { visited.Add(mname); }
+        AddBodyInputsRec(owner, method, inputs, visited, 0);
+    }
+
+    static void AddBodyInputsRec(JsonValue owner, JsonValue method, List<RouteInput> inputs,
+                                 HashSet<string> visited, int depth) {
+        if (method == null || depth > 4) { return; }
         JsonValue expressions = method.Get("body_expressions");
         if (expressions == null) { return; }
         for (int i = 0; i < expressions.Count(); i++) {
             JsonValue expression = expressions.At(i);
             if (Text(expression, "k") != "call") { continue; }
             JsonValue callee = expression.Get("f");
-            if (Text(callee, "k") != "mem" || !InputReceiver(callee.Get("o"))) { continue; }
+            string calleeKind = Text(callee, "k");
+
+            // Support bare same-class helper calls like HandleLogin() or SavePrefs().
+            if (calleeKind == "id") {
+                string helperName = Text(callee, "n");
+                if (IsCrudDelegateMethod(helperName)) {
+                    AddCrudMethodInputs(owner, helperName, inputs);
+                    continue;
+                }
+                if (helperName != "" && !visited.Contains(helperName)) {
+                    JsonValue helper = FindOwnerMethod(owner, helperName);
+                    if (helper != null) {
+                        visited.Add(helperName);
+                        AddBodyInputsRec(owner, helper, inputs, visited, depth + 1);
+                    }
+                }
+                continue;
+            }
+
+            if (calleeKind != "mem") { continue; }
+            JsonValue recv = callee.Get("o");
             string reader = Text(callee, "n");
             JsonValue args = expression.Get("a");
             int argCount = args == null ? 0 : args.Count();
-            if (reader == "Paged") {
+
+            if (!InputReceiver(recv)) { continue; }
+
+            // Same-class helper method calls via this.Helper() or CrudScreenController.Do*().
+            if (Text(recv, "k") == "this") {
+                if (IsCrudDelegateMethod(reader)) {
+                    AddCrudMethodInputs(owner, reader, inputs);
+                    continue;
+                }
+                if (reader != "" && !visited.Contains(reader)) {
+                    JsonValue helper = FindOwnerMethod(owner, reader);
+                    if (helper != null) {
+                        visited.Add(reader);
+                        AddBodyInputsRec(owner, helper, inputs, visited, depth + 1);
+                    }
+                }
+            }
+
+            if (reader == "Paged" || reader == "PagedAny") {
                 string order = argCount > 0 ? Literal(args.At(0)) : "";
                 string limit = argCount > 1 ? Literal(args.At(1)) : "";
-                AddInput(inputs, new RouteInput("page", "int", "query", false, "1", "页码，从 1 开始"), false);
-                AddInput(inputs, new RouteInput("limit", "int", "query", false, limit, "每页条数"), false);
-                AddInput(inputs, new RouteInput("order", "string", "query", false, order, "排序字段"), false);
-                AddInput(inputs, new RouteInput("dir", "string", "query", false, "desc", "排序方向：desc 或 asc"), false);
-                AddInput(inputs, new RouteInput("kw", "string", "query", false, "", "搜索关键词"), false);
+                AddPagedInputs(inputs, order, limit, reader == "PagedAny");
                 continue;
             }
             if (argCount == 0) { continue; }
             JsonValue key = args.At(0);
             string name = Text(key, "t") == "str" ? Text(key, "v") : "";
             if (name == "") { continue; }
+
+            if (reader == "Ids") {
+                AddInput(inputs, new RouteInput(name, "string", "query", true, "", "逗号分隔或 JSON 数组形式的 ID 列表"), true);
+                continue;
+            }
+
             bool required = reader == "Param" || reader.StartsWith("Need");
             string type = "";
             // A presence check can document the name without claiming a boolean value.
             if (reader == "In" || reader == "InText" || reader == "InRaw" || reader == "HasIn"
-                || reader == "Need" || reader == "NeedText" || reader == "Param") { type = "string"; }
-            else if (reader == "InInt" || reader == "NeedInt") { type = "int"; }
-            else if (reader == "InLong" || reader == "NeedLong") { type = "long"; }
-            else if (reader == "InDouble" || reader == "NeedDouble") { type = "number"; }
-            else if (reader == "InBool" || reader == "NeedBool") { type = "bool"; }
+                || reader == "InAny" || reader == "HasInAny"
+                || reader == "Need" || reader == "NeedText" || reader == "NeedAny"
+                || reader == "Param") { type = "string"; }
+            else if (reader == "InInt" || reader == "NeedInt" || reader == "InAnyInt" || reader == "NeedAnyInt") { type = "int"; }
+            else if (reader == "InLong" || reader == "NeedLong" || reader == "InAnyLong" || reader == "NeedAnyLong") { type = "long"; }
+            else if (reader == "InDouble" || reader == "NeedDouble" || reader == "InAnyDouble" || reader == "NeedAnyDouble") { type = "number"; }
+            else if (reader == "InBool" || reader == "NeedBool" || reader == "InAnyBool" || reader == "NeedAnyBool") { type = "bool"; }
             if (type == "") { continue; }
             string extra = argCount > 1 ? Literal(args.At(1)) : "";
             bool hasDefault = !required && type != "string";

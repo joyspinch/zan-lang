@@ -1,8 +1,10 @@
 using System;
 using System.Data;
 using System.Data.Orm;
+using System.Json;
 using System.Security.Cryptography;
 using System.Web;
+using Zan.Web.AdminUi;
 using Zan.Web.Core;
 using Zan.Web.Dao;
 using Zan.Web.Model;
@@ -19,30 +21,104 @@ public class ProfileController : AdminController {
     [Custom(IsMenu = true, Hidden = true, Icon = "mdi:account-circle")]
     [Description("个人资料")]
     public async void Index() {
-        ViewData d = await this.Layout("个人资料");
-        SysUser me = await this.Admin();
-        d.Set("username", me.username);
-        d.Set("nickname", me.nickname);
-        d.Set("email", me.email);
-        d.Set("mobile", me.mobile);
-        d.Set("createdAt", Fmt.Stamp(me.createdAt));
-        if (me.isSuper == 1) { d.Set("super", "1"); }
+        await this.Conf();
+    }
 
+    [HttpPut]
+    [Description("个人资料表单配置")]
+    public async void Conf() {
+        SysUser me = await this.Admin();
+        if (me == null) { this.Fail(403, "0403", "登录状态已失效"); }
+        StringBuilder roleText = new StringBuilder();
         if (this.DbReady()) {
-            int uid = me.id;
             List<SysRole> roles = await this.SysRole.All();
-            List<SysUserRole> mine = await this.SysUserRole.ByUserId(uid);
-            List<SysRole> held = new List<SysRole>();
+            List<SysUserRole> mine = await this.SysUserRole.ByUserId(me.id);
             for (int i = 0; i < mine.Count; i = i + 1) {
                 for (int j = 0; j < roles.Count; j = j + 1) {
-                    if (roles[j].id == mine[i].roleId) { held.Add(roles[j]); }
+                    if (roles[j].id == mine[i].roleId) {
+                        if (roleText.Length > 0) { roleText.Append("、"); }
+                        roleText.Append(roles[j].name);
+                    }
                 }
             }
-            List<StrMap> rows = d.AddList("roles");
-            Rows.Project(held, rows);
-            if (held.Count == 0) { d.Set("noRoles", "1"); }
         }
-        this.Page(d);
+
+        JsonWriter w = new JsonWriter();
+        w.WriteStartObject();
+        w.WriteProperty("PageType", "form");
+        w.WriteProperty("title", "个人资料");
+        w.WriteProperty("subtitle", "管理当前登录账号的基本信息与登录密码");
+
+        w.WritePropertyName("summary");
+        w.WriteStartArray();
+        WriteProfTag(w, "账号", me.username, "info");
+        WriteProfTag(w, "身份", me.isSuper == 1 ? "超级管理员" : "普通管理员", me.isSuper == 1 ? "warning" : "default");
+        WriteProfTag(w, "角色", roleText.Length > 0 ? roleText.ToString() : "无", "success");
+        WriteProfTag(w, "注册时间", Fmt.Stamp(me.createdAt), "default");
+        w.WriteEndArray();
+
+        w.WritePropertyName("tabs");
+        w.WriteStartArray();
+
+        w.WriteStartObject();
+        w.WriteProperty("key", "basic");
+        w.WriteProperty("label", "基本资料");
+        w.WriteProperty("submitUrl", "save");
+        w.WriteProperty("submitLabel", "保存资料");
+        w.WritePropertyName("formItems");
+        w.WriteStartArray();
+        WriteProfField(w, "nickname", "姓名", "input", 12, false, "展示昵称");
+        WriteProfField(w, "email", "邮箱", "input", 12, false, "contact@example.com");
+        WriteProfField(w, "mobile", "手机号", "input", 12, false, "");
+        w.WriteEndArray();
+        w.WriteEndObject();
+
+        w.WriteStartObject();
+        w.WriteProperty("key", "password");
+        w.WriteProperty("label", "修改密码");
+        w.WriteProperty("description", "修改密码后当前会话会失效，请使用新密码重新登录。");
+        w.WriteProperty("submitUrl", "password");
+        w.WriteProperty("submitLabel", "修改密码");
+        w.WriteProperty("resetAfterSubmit", true);
+        w.WritePropertyName("formItems");
+        w.WriteStartArray();
+        WriteProfField(w, "current", "当前密码", "password", 24, true, "请输入当前登录密码");
+        WriteProfField(w, "password", "新密码", "password", 24, true, "至少 8 位");
+        w.WriteEndArray();
+        w.WriteEndObject();
+
+        w.WriteEndArray();
+
+        w.WritePropertyName("values");
+        w.WriteStartObject();
+        w.WriteProperty("nickname", me.nickname);
+        w.WriteProperty("email", me.email);
+        w.WriteProperty("mobile", me.mobile);
+        w.WriteProperty("current", "");
+        w.WriteProperty("password", "");
+        w.WriteEndObject();
+
+        w.WriteEndObject();
+        AdminUiProtocol.Ok(this, w.ToString());
+    }
+
+    private static void WriteProfTag(JsonWriter w, string label, string val, string tone) {
+        w.WriteStartObject();
+        w.WriteProperty("label", label);
+        w.WriteProperty("value", val);
+        w.WriteProperty("tone", tone);
+        w.WriteEndObject();
+    }
+
+    private static void WriteProfField(JsonWriter w, string field, string label, string comp, int span, bool req, string ph) {
+        w.WriteStartObject();
+        w.WriteProperty("field", field);
+        w.WriteProperty("label", label);
+        w.WriteProperty("component", comp);
+        w.WriteProperty("span", span);
+        if (req) { w.WriteProperty("required", true); }
+        if (ph.Length > 0) { w.WriteProperty("placeholder", ph); }
+        w.WriteEndObject();
     }
 
     [HttpPost]
@@ -50,9 +126,9 @@ public class ProfileController : AdminController {
     public async void Save() {
         SysUser me = await this.Admin();
         if (me == null) { this.Fail(403, "0403", "登录状态已失效"); }
-        string nickname = this.In("nickname");
-        string email = this.In("email");
-        string mobile = this.In("mobile");
+        string nickname = this.InAny("nickname");
+        string email = this.InAny("email");
+        string mobile = this.InAny("mobile");
         int id = me.id;
         int n = await this.SysUser.UpdatePersonal(id, nickname, email, mobile, WebApp.NowSeconds());
         await this.Note("修改个人资料", me.username, n > 0, "");
@@ -65,8 +141,8 @@ public class ProfileController : AdminController {
     public async void Password() {
         SysUser me = await this.Admin();
         if (me == null) { this.Fail(403, "0403", "登录状态已失效"); }
-        string current = this.Need("current", "当前密码");
-        string next = this.Need("password", "新密码");
+        string current = this.NeedAny("current", "当前密码");
+        string next = this.NeedAny("password", "新密码");
         if (next.Length < 8) { this.Fail(400, "0004", "新密码至少 8 位"); }
         if (!AuthUser.Verify(current, me.passwordHash)) {
             await this.Note("修改密码", me.username, false,
