@@ -1,16 +1,30 @@
 using System;
 using System.Collections.Generic;
-using Gui;
-using Gui.Widget;
 using Game.Tactics;
 using Game.Core;
 
+// 单位数据（仿真层，不碰界面）。类型、阵营、位置、血量、火力、行军令与采矿状态。
+//
+// 兵种克制三角：步兵 > 炮兵 > 坦克 > 步兵（RtsUnit.CounterMul）。
+//   步兵 Infantry  便宜、快、近射程速射；贴脸撕炮兵，打坦克刮痧
+//   坦克 Tank      皮厚、中射程重炮；碾压步兵
+//   炮兵 Artillery 超远射程溅射、最小射程内打不到；专拆坦克与建筑
+//   采矿车 Miner   不带武器，自动往返矿区与指挥中心
+//   指挥中心 Hq    建筑：生产单位、收矿、自带一门防御炮；被摧毁即败
 public class RtsUnit {
+    public const int Infantry = 0;
+    public const int Tank = 1;
+    public const int Miner = 2;
+    public const int Artillery = 3;
+    public const int Hq = 4;
+
     int id;
-    int type;  // 0: 陆战步兵, 1: 重装坦克, 2: 采矿战车
-    int team;  // 0: 蓝军(玩家), 1: 红军(敌方)
+    int type;
+    int team;  // 0 蓝军（玩家）, 1 红军（AI）
     double x;
     double y;
+    double prevX;
+    double prevY;
     double radius;
     double speed;
     int hp;
@@ -18,66 +32,205 @@ public class RtsUnit {
     bool selected;
     int rvoSlot;
 
-    // 火力：射程（像素）、单发伤害、装填（秒）与剩余冷却；采矿车不带武器（射程 0）
+    // 火力：射程、最小射程、单发伤害、溅射半径、装填（秒）与剩余冷却
     double range;
+    double minRange;
     int damage;
+    double splash;
     double reload;
     double cooldown;
 
-    // 行军令（null = 原地驻守）与驻防点（红军脱战后回防）
+    // 朝向（弧度，0 = 向右）：移动时跟速度，开火时转向目标
+    double facing;
+    // 最近一次中弹的仿真帧（界面画受击闪白与血条）
+    int hitTick;
+
+    // 行军令（null = 驻守）与驻守锚点（守卫半径以它为圆心）
     RtsOrder order;
     double homeX;
     double homeY;
+    // 红军：属于哪一波进攻（0 = 守家）
+    int wave;
 
-    RtsUnit(int id, int type, int team, double x, double y, double r, double spd, int maxHp,
-            double range, int damage, double reload) {
+    // 采矿车：0 去矿区, 1 采矿中, 2 运回指挥中心
+    int mineState;
+    int mineTimer;
+    int carry;
+    int patch;
+
+    RtsUnit(int id, int type, int team, double x, double y) {
         this.id = id;
         this.type = type;
         this.team = team;
         this.x = x;
         this.y = y;
-        this.radius = r;
-        this.speed = spd;
-        this.hp = maxHp;
-        this.maxHp = maxHp;
+        this.prevX = x;
+        this.prevY = y;
+        this.radius = RtsUnit.RadiusOf(type);
+        this.speed = RtsUnit.SpeedOf(type);
+        this.maxHp = RtsUnit.MaxHpOf(type);
+        this.hp = this.maxHp;
         this.selected = false;
         this.rvoSlot = -1;
-        this.range = range;
-        this.damage = damage;
-        this.reload = reload;
+        this.range = RtsUnit.RangeOf(type);
+        this.minRange = type == Artillery ? 70.0 : 0.0;
+        this.damage = RtsUnit.DamageOf(type);
+        this.splash = type == Artillery ? 34.0 : 0.0;
+        this.reload = RtsUnit.ReloadOf(type);
         // 首发错开，免得整条战线同一帧齐射
         this.cooldown = (double)(id % 7) * 0.1;
+        this.facing = team == 0 ? 0.0 : Math.PI;
+        this.hitTick = -100;
         this.order = null;
         this.homeX = x;
         this.homeY = y;
+        this.wave = 0;
+        this.mineState = 0;
+        this.mineTimer = 0;
+        this.carry = 0;
+        this.patch = -1;
     }
 
-    static RtsUnit Create(int id, int type, int team, double x, double y) {
-        if (type == 1) {  // 坦克：远射程重炮
-            return new RtsUnit(id, type, team, x, y, 16.0, 90.0, 300, 150.0, 34, 1.6);
-        } else if (type == 2) {  // 采矿车：不参战
-            return new RtsUnit(id, type, team, x, y, 18.0, 75.0, 450, 0.0, 0, 1.0);
+    public static RtsUnit Create(int id, int type, int team, double x, double y) {
+        return new RtsUnit(id, type, team, x, y);
+    }
+
+    // ---- 兵种数值表 ----
+
+    public static double RadiusOf(int type) {
+        if (type == Tank) { return 14.0; }
+        if (type == Miner) { return 12.0; }
+        if (type == Artillery) { return 12.0; }
+        if (type == Hq) { return 46.0; }
+        return 8.0;
+    }
+    public static double SpeedOf(int type) {
+        if (type == Tank) { return 78.0; }
+        if (type == Miner) { return 92.0; }
+        if (type == Artillery) { return 62.0; }
+        if (type == Hq) { return 0.0; }
+        return 104.0;
+    }
+    public static int MaxHpOf(int type) {
+        if (type == Tank) { return 340; }
+        if (type == Miner) { return 160; }
+        if (type == Artillery) { return 130; }
+        if (type == Hq) { return 6000; }
+        return 90;
+    }
+    public static double RangeOf(int type) {
+        if (type == Tank) { return 135.0; }
+        if (type == Miner) { return 0.0; }
+        if (type == Artillery) { return 250.0; }
+        if (type == Hq) { return 175.0; }
+        return 100.0;
+    }
+    public static int DamageOf(int type) {
+        if (type == Tank) { return 30; }
+        if (type == Artillery) { return 44; }
+        if (type == Hq) { return 28; }
+        if (type == Miner) { return 0; }
+        return 10;
+    }
+    public static double ReloadOf(int type) {
+        if (type == Tank) { return 1.5; }
+        if (type == Artillery) { return 2.8; }
+        if (type == Hq) { return 0.8; }
+        return 0.75;
+    }
+    public static int CostOf(int type) {
+        if (type == Tank) { return 150; }
+        if (type == Miner) { return 60; }
+        if (type == Artillery) { return 125; }
+        return 50;
+    }
+    public static int SupplyOf(int type) {
+        if (type == Tank) { return 3; }
+        if (type == Artillery) { return 2; }
+        if (type == Hq) { return 0; }
+        return 1;
+    }
+    // 生产耗时（仿真帧，20 帧/秒）
+    public static int BuildTicksOf(int type) {
+        if (type == Tank) { return 100; }
+        if (type == Miner) { return 60; }
+        if (type == Artillery) { return 90; }
+        return 50;
+    }
+    public static string NameOf(int type) {
+        if (type == Tank) { return "坦克"; }
+        if (type == Miner) { return "采矿车"; }
+        if (type == Artillery) { return "炮兵"; }
+        if (type == Hq) { return "指挥中心"; }
+        return "步兵";
+    }
+
+    // 克制倍率：攻击方兵种打目标兵种的伤害系数（三角：步兵 > 炮兵 > 坦克 > 步兵）。
+    public static double CounterMul(int attacker, int target) {
+        if (attacker == Infantry) {
+            if (target == Artillery) { return 2.2; }
+            if (target == Tank) { return 0.5; }
+            return 1.0;
         }
-        // 默认步兵：近射程速射
-        return new RtsUnit(id, type, team, x, y, 9.0, 110.0, 80, 100.0, 9, 0.8);
+        if (attacker == Tank) {
+            if (target == Infantry) { return 2.0; }
+            if (target == Tank) { return 0.9; }
+            return 1.0;
+        }
+        if (attacker == Artillery) {
+            if (target == Tank) { return 2.0; }
+            if (target == Infantry) { return 0.45; }
+            if (target == Hq) { return 1.6; }
+            return 1.0;
+        }
+        return 1.0;
     }
 
-    int Id { get { return id; } }
-    int Type { get { return type; } }
-    int Team { get { return team; } }
-    double X { get { return x; } set { x = value; } }
-    double Y { get { return y; } set { y = value; } }
-    double Radius { get { return radius; } }
-    double Speed { get { return speed; } }
-    int Hp { get { return hp; } set { hp = value; } }
-    int MaxHp { get { return maxHp; } }
-    bool Selected { get { return selected; } set { selected = value; } }
-    int RvoSlot { get { return rvoSlot; } set { rvoSlot = value; } }
-    double Range { get { return range; } }
-    int Damage { get { return damage; } }
-    double Reload { get { return reload; } }
-    double Cooldown { get { return cooldown; } set { cooldown = value; } }
-    RtsOrder Order { get { return order; } set { order = value; } }
-    double HomeX { get { return homeX; } }
-    double HomeY { get { return homeY; } }
+    // 该兵种克制谁 / 被谁克制（界面提示用；没有返回 -1）
+    public static int Beats(int type) {
+        if (type == Infantry) { return Artillery; }
+        if (type == Tank) { return Infantry; }
+        if (type == Artillery) { return Tank; }
+        return -1;
+    }
+    public static int BeatenBy(int type) {
+        if (type == Infantry) { return Tank; }
+        if (type == Tank) { return Artillery; }
+        if (type == Artillery) { return Infantry; }
+        return -1;
+    }
+
+    public bool IsBuilding() { return type == Hq; }
+    public bool IsCombat() { return type == Infantry || type == Tank || type == Artillery; }
+    public bool Armed() { return range > 0.0; }
+
+    public int Id { get { return id; } }
+    public int Type { get { return type; } }
+    public int Team { get { return team; } }
+    public double X { get { return x; } set { x = value; } }
+    public double Y { get { return y; } set { y = value; } }
+    public double PrevX { get { return prevX; } set { prevX = value; } }
+    public double PrevY { get { return prevY; } set { prevY = value; } }
+    public double Radius { get { return radius; } }
+    public double Speed { get { return speed; } }
+    public int Hp { get { return hp; } set { hp = value; } }
+    public int MaxHp { get { return maxHp; } }
+    public bool Selected { get { return selected; } set { selected = value; } }
+    public int RvoSlot { get { return rvoSlot; } set { rvoSlot = value; } }
+    public double Range { get { return range; } }
+    public double MinRange { get { return minRange; } }
+    public int Damage { get { return damage; } }
+    public double Splash { get { return splash; } }
+    public double Reload { get { return reload; } }
+    public double Cooldown { get { return cooldown; } set { cooldown = value; } }
+    public double Facing { get { return facing; } set { facing = value; } }
+    public int HitTick { get { return hitTick; } set { hitTick = value; } }
+    public RtsOrder Order { get { return order; } set { order = value; } }
+    public double HomeX { get { return homeX; } set { homeX = value; } }
+    public double HomeY { get { return homeY; } set { homeY = value; } }
+    public int Wave { get { return wave; } set { wave = value; } }
+    public int MineState { get { return mineState; } set { mineState = value; } }
+    public int MineTimer { get { return mineTimer; } set { mineTimer = value; } }
+    public int Carry { get { return carry; } set { carry = value; } }
+    public int Patch { get { return patch; } set { patch = value; } }
 }

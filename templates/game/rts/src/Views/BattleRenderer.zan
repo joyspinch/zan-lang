@@ -1,0 +1,378 @@
+// 战场绘制（纯表现层，世界美术画在画布上；界面控件不在这里画）：
+// 地面底图 + 阵营区染色 → 裂谷 → 晶矿 → 上行链路 → 焦痕 → 选中圈 → 单位阴影与本体（按 Y 排序）
+// → 血条（仅受伤或选中时）→ 采矿激光 → 空中特效 → 框选框 → 暗角。
+// 单位位置在两个仿真帧之间插值（alpha），50ms 定步的仿真在高刷屏上也是连续运动。
+using System;
+using System.Collections.Generic;
+using Gui;
+using Game.Kit;
+
+public class BattleRenderer {
+    public RtsBattle battle;
+    public SpriteBank sprites;
+    public BattleFx fx;
+    public string bgPath;
+    public double time = 0.0;
+    List<RtsUnit> order = new List<RtsUnit>();
+
+    public static int TeamColor(int team) { return team == 0 ? 0xFF3FB8FF : 0xFFFF4A5E; }
+    public static int TeamGlow(int team) { return team == 0 ? 0x003FD6FF : 0x00FF4A5E; }
+
+    static int A(int alpha, int rgb) {
+        if (alpha < 0) { alpha = 0; }
+        if (alpha > 255) { alpha = 255; }
+        return (alpha << 24) | (rgb & 0x00FFFFFF);
+    }
+
+    public double DrawX(RtsUnit u, double alpha) { return u.PrevX + (u.X - u.PrevX) * alpha; }
+    public double DrawY(RtsUnit u, double alpha) { return u.PrevY + (u.Y - u.PrevY) * alpha; }
+
+    public void Render(Canvas c, int bx, int by, int bw, int bh, double camX, double camY, double alpha) {
+        RtsBattle b = this.battle;
+        double ox = camX - (double)bx + this.fx.ShakeX();
+        double oy = camY - (double)by + this.fx.ShakeY();
+        c.PushClip(bx, by, bw, bh);
+        c.FillRect(bx, by, bw, bh, 0xFF070D14);
+
+        // 1. 地面
+        int gx = (int)(-ox);
+        int gy = (int)(-oy);
+        if (this.bgPath != null) {
+            CDraw.BlitImage(c, this.bgPath, gx, gy, b.worldWidth, b.worldHeight);
+        } else {
+            c.FillVGrad(gx, gy, b.worldWidth, b.worldHeight, 0xFF16222E, 0xFF0C141C);
+        }
+        // 阵营区：两端基地的冷蓝 / 暗红地面光
+        c.FillRadial((int)(b.teams[0].hq.X - ox), (int)(b.teams[0].hq.Y - oy), 360, 0x2A1E78C8, 70);
+        c.FillRadial((int)(b.teams[1].hq.X - ox), (int)(b.teams[1].hq.Y - oy), 360, 0x2AC81E3C, 70);
+        // 战术网格（每 64px 一道，很淡）
+        for (int x = 0; x <= b.worldWidth; x = x + 64) { c.FillRect((int)((double)x - ox), gy, 1, b.worldHeight, 0x0F5FDCFF); }
+        for (int y = 0; y <= b.worldHeight; y = y + 64) { c.FillRect(gx, (int)((double)y - oy), b.worldWidth, 1, 0x0F5FDCFF); }
+
+        this.RenderCanyon(c, ox, oy);
+        this.RenderPatches(c, ox, oy);
+        this.RenderUplink(c, ox, oy);
+        this.fx.RenderGround(c, ox, oy);
+
+        // 集结点旗标（选中指挥中心时显示）
+        if (b.HqSelected()) {
+            int rx = (int)(b.teams[0].rallyX - ox);
+            int ry = (int)(b.teams[0].rallyY - oy);
+            c.DrawLine((int)(b.teams[0].hq.X - ox), (int)(b.teams[0].hq.Y - oy), rx, ry, 0x555FDCFF, 1);
+            c.FillRect(rx, ry - 18, 2, 18, 0xFF9FE8FF);
+            c.FillRect(rx + 2, ry - 18, 10, 7, 0xFF3FB8FF);
+            c.DrawCircle(rx, ry, 5, 0xFF5FDCFF, 1);
+        }
+
+        // 2. 单位：按 Y 排序（近处压远处）
+        this.order.Clear();
+        for (int i = 0; i < b.units.Count; i = i + 1) {
+            RtsUnit u = b.units[i];
+            double uy = this.DrawY(u, alpha);
+            int at = this.order.Count;
+            while (at > 0 && this.DrawY(this.order[at - 1], alpha) > uy) { at = at - 1; }
+            this.order.Insert(at, u);
+        }
+        // 选中圈画在所有单位之下
+        for (int i = 0; i < this.order.Count; i = i + 1) {
+            RtsUnit u = this.order[i];
+            if (!u.Selected) { continue; }
+            int ux = (int)(this.DrawX(u, alpha) - ox);
+            int uy = (int)(this.DrawY(u, alpha) - oy);
+            int r = (int)u.Radius + (u.IsBuilding() ? 10 : 5);
+            c.FillCircle(ux, uy + 2, r, 0x2846F0A0);
+            c.DrawCircle(ux, uy + 2, r, 0xEE46F0A0, 2);
+            if (u.IsBuilding()) {
+                int spin = (int)(this.time * 60.0) % 360;
+                c.DrawArc(ux, uy, r + 4, r + 7, spin, spin + 40, 0xFF9FFFD0, 1);
+                c.DrawArc(ux, uy, r + 4, r + 7, spin + 180, spin + 220, 0xFF9FFFD0, 1);
+            }
+        }
+        for (int i = 0; i < this.order.Count; i = i + 1) {
+            RtsUnit u = this.order[i];
+            if (u.IsBuilding()) { this.RenderHq(c, u, ox, oy); } else { this.RenderUnit(c, u, ox, oy, alpha); }
+        }
+        // 血条：只在受伤或选中时出现
+        for (int i = 0; i < this.order.Count; i = i + 1) {
+            RtsUnit u = this.order[i];
+            if (u.Hp >= u.MaxHp && !u.Selected) { continue; }
+            this.RenderBar(c, u, (int)(this.DrawX(u, alpha) - ox), (int)(this.DrawY(u, alpha) - oy));
+        }
+
+        // 3. 空中特效
+        this.fx.Render(c, ox, oy);
+
+        // 4. 暗角：视口四边压暗，聚焦中央
+        c.FillVGrad(bx, by, bw, 26, 0x88000000, 0x00000000);
+        c.FillVGrad(bx, by + bh - 34, bw, 34, 0x00000000, 0x99000000);
+        c.PopClip();
+    }
+
+    // 裂谷：按连续悬崖段合并成竖条，暗色深渊 + 地层纹 + 冷青崖边 + 段端警示灯。
+    void RenderCanyon(Canvas c, double ox, double oy) {
+        RtsBattle b = this.battle;
+        int cs = b.cellSize;
+        int x = (int)((double)(b.CanyonCol() * cs) - ox);
+        int w = cs * 2;
+        int r = 0;
+        while (r < b.Rows()) {
+            if (!b.IsCanyonRow(r)) {
+                r = r + 1;
+                continue;
+            }
+            int start = r;
+            while (r < b.Rows() && b.IsCanyonRow(r)) { r = r + 1; }
+            int y = (int)((double)(start * cs) - oy);
+            int h = (r - start) * cs;
+            c.FillRect(x - 8, y, w + 16, h, 0x44000000);
+            c.FillRect(x - 3, y, w + 6, h, 0x88050A10);
+            c.FillVGrad(x, y, w, h, 0xFF03070C, 0xFF0A1622);
+            for (int k = 6; k < h; k = k + 11) {
+                c.FillRect(x + 6, y + k, w - 12, 1, 0x22406080);
+            }
+            c.FillRect(x + w / 2 - 6, y, 12, h, 0x66000000);
+            c.FillRect(x - 1, y, 2, h, 0x995FDCFF);
+            c.FillRect(x + w - 1, y, 2, h, 0x995FDCFF);
+            c.FillRect(x - 4, y, 3, h, 0x223FD6FF);
+            c.FillRect(x + w + 1, y, 3, h, 0x223FD6FF);
+            int blink = ((int)(this.time * 2.0) % 2 == 0) ? 0xFFFFB547 : 0x88FFB547;
+            if (start > 0) {
+                c.FillRect(x - 2, y, w + 4, 3, 0xCCFFB547);
+                c.FillCircle(x - 2, y + 1, 3, blink);
+                c.FillCircle(x + w + 2, y + 1, 3, blink);
+            }
+            if (r < b.Rows()) {
+                c.FillRect(x - 2, y + h - 3, w + 4, 3, 0xCCFFB547);
+                c.FillCircle(x - 2, y + h - 2, 3, blink);
+                c.FillCircle(x + w + 2, y + h - 2, 3, blink);
+            }
+        }
+    }
+
+    void RenderPatches(Canvas c, double ox, double oy) {
+        RtsBattle b = this.battle;
+        for (int i = 0; i < b.patches.Count; i = i + 1) {
+            RtsPatch p = b.patches[i];
+            int x = (int)(p.x - ox);
+            int y = (int)(p.y - oy);
+            double frac = (double)p.amount / (double)p.initial;
+            c.FillCircle(x + 3, y + 6, 22, 0x55000000);
+            if (p.amount > 0) {
+                int glow = 60 + (int)(30.0 * Math.Sin(this.time * 2.0 + (double)i));
+                c.FillRadial(x, y, 34, A(glow, 0x3FD6FF), glow);
+            }
+            int size = (int)(30.0 + 22.0 * frac);
+            string key = p.amount > 0 ? this.sprites.crystalKey : this.sprites.crystalDimKey;
+            if (key != "") {
+                c.BlitImage(key, x - size / 2, y - size + size / 6, size, size, 0, 0, 0, 0);
+            } else {
+                c.FillCircle(x, y, size / 3, p.amount > 0 ? 0xFF3FD6FF : 0xFF3A4652);
+            }
+        }
+    }
+
+    // 上行链路：底座 + 旋转刻度环 + 占领进度扇区（阵营色）+ 中央信标。
+    void RenderUplink(Canvas c, double ox, double oy) {
+        RtsBattle b = this.battle;
+        int x = (int)(b.uplinkX - ox);
+        int y = (int)(b.uplinkY - oy);
+        int r = (int)RtsBattle.UplinkRadius;
+        int own = b.uplinkOwner < 0 ? 0xFFCFE4F1 : BattleRenderer.TeamColor(b.uplinkOwner);
+        c.FillCircle(x, y, r, 0x30060E18);
+        c.DrawCircle(x, y, r, A(120, own), 2);
+        int spin = (int)(this.time * 25.0) % 360;
+        for (int k = 0; k < 12; k = k + 1) {
+            int a0 = spin + k * 30;
+            c.DrawArc(x, y, r - 8, r - 3, a0, a0 + 14, A(150, own), 1);
+        }
+        if (b.capture != 0) {
+            int team = b.capture > 0 ? 0 : 1;
+            int span = (b.capture < 0 ? -b.capture : b.capture) * 360 / 100;
+            c.FillSector(x, y, r - 20, r - 11, -90, -90 + span, A(220, BattleRenderer.TeamColor(team)));
+        }
+        c.DrawCircle(x, y, r - 21, 0x553FD6FF, 1);
+        // 底座八角台 + 信标
+        c.FillCircle(x + 4, y + 6, 24, 0x66000000);
+        c.FillCircle(x, y, 24, 0xFF1A2836);
+        c.DrawCircle(x, y, 24, 0xFF41617E, 2);
+        c.FillCircle(x, y, 15, 0xFF243A50);
+        double pulse = 0.5 + 0.5 * Math.Sin(this.time * 4.0);
+        c.FillRadial(x, y, 30 + (int)(pulse * 10.0), A(120 + (int)(pulse * 100.0), own), 200);
+        c.FillCircle(x, y, 6, own);
+        c.FillCircle(x - 2, y - 2, 2, 0xFFFFFFFF);
+    }
+
+    void RenderHq(Canvas c, RtsUnit u, double ox, double oy) {
+        int x = (int)(u.X - ox);
+        int y = (int)(u.Y - oy);
+        int r = (int)u.Radius;
+        int team = BattleRenderer.TeamColor(u.Team);
+        bool hit = this.battle.ticks - u.HitTick <= 1;
+        // 阴影 + 底座外环
+        c.FillCircle(x + 8, y + 10, r + 4, 0x77000000);
+        c.FillRadial(x, y, r + 30, A(70, team), 60);
+        c.FillCircle(x, y, r, 0xFF141E29);
+        c.DrawCircle(x, y, r, 0xFF34495E, 3);
+        c.DrawCircle(x, y, r - 4, A(170, team), 2);
+        // 四座塔楼
+        for (int k = 0; k < 4; k = k + 1) {
+            double a = Math.PI / 4.0 + (double)k * Math.PI / 2.0;
+            int tx = x + (int)(Math.Cos(a) * (double)(r - 10));
+            int ty = y + (int)(Math.Sin(a) * (double)(r - 10));
+            c.FillCircle(tx, ty, 8, 0xFF263646);
+            c.DrawCircle(tx, ty, 8, 0xFF4E6A84, 1);
+            bool on = ((int)(this.time * 2.0) + k) % 2 == 0;
+            c.FillCircle(tx, ty, 3, on ? team : A(90, team));
+        }
+        // 主楼：圆角方块 + 顶部受光
+        c.FillRoundRect(x - 26, y - 26, 52, 52, 10, 0xFF22303F);
+        c.FillVGrad(x - 24, y - 24, 48, 20, 0x553E5A74, 0x00000000);
+        c.DrawRoundRect(x - 26, y - 26, 52, 52, 10, 0xFF56728E, 2);
+        // 能量核心 + 旋转雷达
+        double pulse = 0.5 + 0.5 * Math.Sin(this.time * 3.0 + (double)u.Team);
+        c.FillRadial(x, y, 20, A(150 + (int)(pulse * 90.0), team), 220);
+        c.FillCircle(x, y, 9, team);
+        c.FillCircle(x - 3, y - 3, 3, 0xCCFFFFFF);
+        double ang = this.time * 1.6 * (u.Team == 0 ? 1.0 : -1.0);
+        int dx = (int)(Math.Cos(ang) * 22.0);
+        int dy = (int)(Math.Sin(ang) * 22.0);
+        c.DrawLine(x, y, x + dx, y + dy, 0xFFB8C8D8, 3);
+        c.FillCircle(x + dx, y + dy, 4, 0xFFDDE8F2);
+        // 生产中：出厂口闪烁
+        RtsTeam t = this.battle.teams[u.Team];
+        if (t.queue.Count > 0) {
+            int side = u.Team == 0 ? 1 : -1;
+            int gx = x + side * (r + 2);
+            double p = (double)t.progress / (double)RtsUnit.BuildTicksOf(t.queue[0]);
+            c.FillRect(gx - (side > 0 ? 0 : 6), y - 14, 6, 28, 0xFF1A2836);
+            c.FillRect(gx - (side > 0 ? 0 : 6), y + 14 - (int)(28.0 * p), 6, (int)(28.0 * p), team);
+        }
+        if (hit) { c.FillCircle(x, y, r - 6, 0x40FFFFFF); }
+    }
+
+    void RenderUnit(Canvas c, RtsUnit u, double ox, double oy, double alpha) {
+        int x = (int)(this.DrawX(u, alpha) - ox);
+        int y = (int)(this.DrawY(u, alpha) - oy);
+        int r = (int)u.Radius;
+        int team = BattleRenderer.TeamColor(u.Team);
+        // 采矿激光：采矿车在矿片上时一束闪烁的冷青光
+        if (u.Type == RtsUnit.Miner && u.MineState == 1 && u.Patch >= 0) {
+            RtsPatch p = this.battle.patches[u.Patch];
+            int flick = 120 + (int)(100.0 * Math.Abs(Math.Sin(this.time * 18.0 + (double)u.Id)));
+            c.DrawLine(x, y, (int)(p.x - ox), (int)(p.y - 10.0 - oy), A(flick, 0x7FE6FF), 2);
+            c.FillRadial((int)(p.x - ox), (int)(p.y - 10.0 - oy), 8, A(flick, 0xBFF6FF), 200);
+        }
+        // 阴影 + 阵营底环
+        c.FillCircle(x + 3, y + 5, r + 1, 0x66000000);
+        c.DrawCircle(x, y, r + 2, A(u.Team == 0 ? 130 : 170, team), 1);
+        string key = this.sprites.Key(u.Type, u.Team, u.Facing);
+        if (key != null) {
+            int s = this.sprites.Size(u.Type);
+            c.BlitImage(key, x - s / 2, y - s / 2, s, s, 0, 0, 0, 0);
+        } else {
+            int body = u.Team == 0 ? 0xFF1E4A7A : 0xFF7A1E2A;
+            c.FillCircle(x, y, r, body);
+            c.DrawCircle(x, y, r, team, 2);
+            int bx = x + (int)(Math.Cos(u.Facing) * (double)(r + 4));
+            int by = y + (int)(Math.Sin(u.Facing) * (double)(r + 4));
+            c.DrawLine(x, y, bx, by, 0xFFDDE8F2, u.Type == RtsUnit.Infantry ? 1 : 3);
+        }
+        if (u.Type == RtsUnit.Miner && u.Carry > 0) {
+            c.FillCircle(x, y - r - 2, 4, 0xFF3FD6FF);
+            c.FillCircle(x - 1, y - r - 3, 1, 0xFFFFFFFF);
+        }
+        if (this.battle.ticks - u.HitTick <= 1) { c.FillCircle(x, y, r, 0x70FFFFFF); }
+    }
+
+    // 血条：分段刻度，我军按血量绿→黄→红，敌军猩红。
+    void RenderBar(Canvas c, RtsUnit u, int x, int y) {
+        int w = u.IsBuilding() ? 84 : Math.Max(20, (int)u.Radius * 2 + 6);
+        int h = u.IsBuilding() ? 6 : 4;
+        int top = y - (int)u.Radius - (u.IsBuilding() ? 16 : 10);
+        int left = x - w / 2;
+        double f = (double)u.Hp / (double)u.MaxHp;
+        if (f < 0.0) { f = 0.0; }
+        int col;
+        if (u.Team == 1) {
+            col = 0xFFFF4A5E;
+        } else if (f > 0.6) {
+            col = 0xFF46F0A0;
+        } else if (f > 0.3) {
+            col = 0xFFFFC94A;
+        } else {
+            col = 0xFFFF5468;
+        }
+        c.FillRect(left - 1, top - 1, w + 2, h + 2, 0xCC000000);
+        c.FillRect(left, top, w, h, 0xFF1A222C);
+        c.FillRect(left, top, (int)((double)w * f), h, col);
+        c.FillRect(left, top, (int)((double)w * f), 1, 0x66FFFFFF);
+        int seg = u.IsBuilding() ? 10 : 4;
+        for (int k = 1; k < seg; k = k + 1) { c.FillRect(left + w * k / seg, top, 1, h, 0x88000000); }
+    }
+
+    // 小地图：缩略底图 + 裂谷 + 晶矿 + 链路 + 基地 + 单位光点 + 警报环 + 镜头框。
+    public void RenderMinimap(Canvas c, int mx, int my, int mw, int mh, double camX, double camY, int viewW, int viewH,
+                              List<double> alerts) {
+        RtsBattle b = this.battle;
+        double sx = (double)mw / (double)b.worldWidth;
+        double sy = (double)mh / (double)b.worldHeight;
+        c.FillRect(mx, my, mw, mh, 0xFF050B12);
+        if (this.bgPath != null) { CDraw.BlitImage(c, this.bgPath, mx, my, mw, mh); }
+        c.FillRect(mx, my, mw, mh, 0x88050B12);
+        // 阵营区
+        c.FillRadial(mx + (int)(b.teams[0].hq.X * sx), my + (int)(b.teams[0].hq.Y * sy), 60, 0x403FB8FF, 80);
+        c.FillRadial(mx + (int)(b.teams[1].hq.X * sx), my + (int)(b.teams[1].hq.Y * sy), 60, 0x40FF4A5E, 80);
+        // 裂谷
+        int cx = mx + (int)((double)(b.CanyonCol() * b.cellSize) * sx);
+        int cw = Math.Max(3, (int)((double)(b.cellSize * 2) * sx));
+        for (int r = 0; r < b.Rows(); r = r + 1) {
+            if (!b.IsCanyonRow(r)) { continue; }
+            int ry = my + (int)((double)(r * b.cellSize) * sy);
+            int rh = (int)((double)((r + 1) * b.cellSize) * sy) - (int)((double)(r * b.cellSize) * sy);
+            c.FillRect(cx, ry, cw, rh, 0xFF02050A);
+            c.FillRect(cx - 1, ry, 1, rh, 0x995FDCFF);
+            c.FillRect(cx + cw, ry, 1, rh, 0x995FDCFF);
+        }
+        for (int i = 0; i < b.patches.Count; i = i + 1) {
+            RtsPatch p = b.patches[i];
+            if (p.amount <= 0) { continue; }
+            c.FillRect(mx + (int)(p.x * sx) - 2, my + (int)(p.y * sy) - 2, 4, 4, 0xFF3FD6FF);
+        }
+        int ux = mx + (int)(b.uplinkX * sx);
+        int uy = my + (int)(b.uplinkY * sy);
+        int own = b.uplinkOwner < 0 ? 0xFFCFE4F1 : BattleRenderer.TeamColor(b.uplinkOwner);
+        c.DrawCircle(ux, uy, (int)(RtsBattle.UplinkRadius * sx), own, 1);
+        c.FillCircle(ux, uy, 2, own);
+        for (int i = 0; i < b.units.Count; i = i + 1) {
+            RtsUnit u = b.units[i];
+            int px = mx + (int)(u.X * sx);
+            int py = my + (int)(u.Y * sy);
+            int col = BattleRenderer.TeamColor(u.Team);
+            if (u.IsBuilding()) {
+                c.FillRect(px - 5, py - 5, 10, 10, col);
+                c.DrawRect(px - 5, py - 5, 10, 10, 0xFFFFFFFF, 1);
+            } else if (u.Selected) {
+                c.FillRect(px - 1, py - 1, 3, 3, 0xFF9FFFD0);
+            } else {
+                int s = u.Type == RtsUnit.Tank || u.Type == RtsUnit.Artillery ? 3 : 2;
+                c.FillRect(px - 1, py - 1, s, s, u.Type == RtsUnit.Miner ? A(170, col) : col);
+            }
+        }
+        // 警报：我军遭袭的位置，红环外扩
+        for (int i = 0; i + 2 < alerts.Count; i = i + 3) {
+            double life = alerts[i + 2];
+            int ax = mx + (int)(alerts[i] * sx);
+            int ay = my + (int)(alerts[i + 1] * sy);
+            int rr = 4 + (int)((1.0 - life) * 14.0);
+            c.DrawCircle(ax, ay, rr, A((int)(255.0 * life), 0xFF5468), 2);
+        }
+        // 镜头框
+        int vx = mx + (int)(camX * sx);
+        int vy = my + (int)(camY * sy);
+        int vw = (int)((double)viewW * sx);
+        int vh = (int)((double)viewH * sy);
+        c.DrawRect(vx, vy, vw, vh, 0xFFFFFFFF, 1);
+        c.FillRect(vx, vy, vw, vh, 0x14FFFFFF);
+        c.DrawRect(mx, my, mw, mh, 0xFF2F6A8E, 1);
+    }
+}

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using Gui;
+using Gui.Backend;
 using Gui.Widget;
 using Game.Tactics;
 using Game.Core;
@@ -9,12 +10,14 @@ using Game.Kit;
 using Game.Foundation;
 using Game.Audio;
 
-public class Program {
+// {{NAME}}：裂谷战役。入口 + 帧循环 + 对局流程（作战地图 → 交战 ⇄ 暂停 → 战报）+ 输入 + 档案。
+// 界面搭建与 HUD 同步在 ProgramUi.zan（同一个 partial class），战场美术在 Views/。
+public partial class Program {
     Form form;
     App app;
     BattlefieldView view;
+    MinimapView minimap;
 
-    // 美术素材：盘上找不到就退回矢量绘制（assets/ 会被 zanc 自动内嵌进 exe）
     string bgPath;
     string infantryPath;
     string tankPath;
@@ -23,48 +26,51 @@ public class Program {
     // 战场仿真（无界面，RtsBattle）：界面只读它、把指令转给它
     RtsBattle battle;
     BattleFx fx = new BattleFx();
+    SpriteBank sprites = new SpriteBank();
+    BattleRenderer renderer = new BattleRenderer();
 
-    // 对局流程：简报 → 交战 ⇄ 暂停 → 战报。胜负由 RtsBattle.Outcome（一方全灭）
-    // 与界面层的时限共同决定；时限按仿真帧计（20 帧/秒），暂停不走表。
-    const int StateBriefing = 0;
+    // 流程：作战地图（选关 + 难度）→ 交战 ⇄ 暂停 → 战报。仿真 50ms 定步，界面按显示帧
+    // 插值渲染；暂停不走表，时限按仿真帧计。
+    const int StateMenu = 0;
     const int StatePlaying = 1;
     const int StatePaused = 2;
     const int StateResults = 3;
     const int TickMs = 50;
-    const int TimeLimitTicks = 3600;  // 3 分钟
     int state = 0;
-    int ticks = 0;
+    int missionIndex = 0;
+    int difficulty = 1;
     bool lastWindowFocused = false;
+    int lastMs = 0;
+    int accMs = 0;
+    double alpha = 0.0;
 
-    // 档案（最快胜利、局数、胜场、静音）与音效：都在界面层，仿真不碰
+    // 镜头（世界坐标左上角）与方向键平移
+    double camX = 0.0;
+    double camY = 0.0;
+    bool panLeft = false;
+    bool panRight = false;
+    bool panUp = false;
+    bool panDown = false;
+
+    // 警报：小地图红环（x, y, 剩余寿命 三元组）+ 顶栏提示
+    List<double> alerts = new List<double>();
+    string alertText = "";
+    bool alertRed = false;
+    double alertLeft = 0.0;
+    int lastHqAlertTick = -1000;
+    int lastUnitAlertTick = -1000;
+
+    // 档案（每关每难度最佳星数与最快胜利、通关解锁、局数、静音、上次难度）与音效：界面层
     GameProfile profile;
     AudioBus bus;
     SfxBank sfx;
     bool muted = false;
 
-    // HUD
-    Label lblMin;
-    Label lblPop;
-    Label lblForces;
-    Label lblTime;
-    Label lblBest;
-    Button btnReinforce;
-    Button btnPause;
-    Button btnMute;
-
-    // 流程弹层（标准 Modal + Label + Button，经 overlayHost 盖在战场上）
-    RtsModal cardBrief;
-    RtsModal cardPause;
-    RtsModal cardResult;
-    RtsModal shownCard;
-    Label lblBriefBest;
-    Label lblBriefTip;
-    Label lblResultHead;
-    Label lblResultTime;
-    Label lblResultLost;
-    Label lblResultKills;
-    Label lblResultBest;
-    Label lblResultNew;
+    // 调试（默认关闭）：RTS_DEBUG_AUTOPLAY=1 由教练机器人代打；RTS_DEBUG_SKIP=秒 开局快进；
+    // RTS_DEBUG_UNLOCK=1 解锁全部关卡；RTS_DEBUG_MISSION=1..3 / RTS_DEBUG_DIFF=0..2 预选。
+    bool debugAutoplay = false;
+    int debugSkipTicks = 0;
+    bool debugUnlock = false;
 
     static void Main() {
         Program p = new Program();
@@ -72,11 +78,11 @@ public class Program {
     }
 
     void Run() {
-        // 战场是 1024×600 的世界：窗口留足高度，让整个战场（含底部守军）都在视口里
-        form = Form.CreateDark("{{NAME}} · 即时战略引擎", 1040, 760);
+        form = Form.CreateDark("{{NAME}} · 裂谷战役", 1280, 800);
         app = form.GetApp();
-        app.UseSkin("graphite");
-        Gui.Backend.UiDriver.Enable(app);
+        // 游戏自己的战术皮肤（不叠桌面皮肤）：未声明的部分落回 Gui 内嵌的 base.css。
+        app.UseCss(RtsSkin.Css());
+        UiDriver.Enable(app);
 
         // 素材：assets/ 会被 zanc 自动内嵌进 exe，运行时盘上优先
         this.bgPath = Program.FindAsset("assets/bg_field.jpg");
@@ -84,100 +90,292 @@ public class Program {
         this.tankPath = Program.FindAsset("assets/unit_tank.png");
         this.minerPath = Program.FindAsset("assets/unit_miner.png");
         Canvas.SetBackend(1);  // GL 硬件加速后端
+        sprites.Build(this.infantryPath, this.tankPath, this.minerPath);
+        renderer.sprites = sprites;
+        renderer.fx = fx;
+        renderer.bgPath = this.bgPath;
+
+        debugAutoplay = Environment.GetEnvironmentVariable("RTS_DEBUG_AUTOPLAY") == "1";
+        debugUnlock = Environment.GetEnvironmentVariable("RTS_DEBUG_UNLOCK") == "1";
+        debugSkipTicks = Program.EnvInt("RTS_DEBUG_SKIP", 0) * 20;
 
         // 档案落在用户应用数据目录（ZAN_GAME_DATA_DIR 可改），从不写工作目录
         profile = GameProfile.Open("rts");
         muted = profile.Flag("muted", false);
+        difficulty = (int)profile.Counter("difficulty");
+        if (difficulty < 0 || difficulty > 2) { difficulty = 1; }
+        missionIndex = this.HighestUnlocked();
+        int dm = Program.EnvInt("RTS_DEBUG_MISSION", 0);
+        if (dm >= 1 && dm <= RtsMission.Count) { missionIndex = dm - 1; }
+        int dd = Program.EnvInt("RTS_DEBUG_DIFF", -1);
+        if (dd >= 0 && dd <= 2) { difficulty = dd; }
+
         bus = new AudioBus();
         bus.SetSfxMuted(muted);
         sfx = new SfxBank(bus);
-        sfx.AddPresets(new string[] { "click", "select", "hit", "explode", "success", "fail", "error" });
-        // 本作的开火声：比通用 hit 更长更闷的远处炮口声
-        SynthOptions shot = SfxPresets.Hit().WithDuration(0.07).WithEnvelope(0.001, 0.060, 0.0, 0.050);
-        shot.filter = new BiquadFilter(FilterKind.LowPass, 1100.0, 0.8, 44100, 1);
-        sfx.AddSynth("hit", shot);
+        sfx.AddPresets(new string[] { "click", "select", "hit", "explode", "success", "fail", "error", "coin", "powerup" });
+        this.TuneSfx();
         sfx.Warm();
 
-        // 流场 + RVO 避障器、峡谷地形与两军都在 RtsBattle 里
-        battle = new RtsBattle();
+        battle = new RtsBattle(missionIndex, difficulty, 1);
+        renderer.battle = battle;
 
         BuildUi();
-        ShowBriefing();
+        this.CenterOn(battle.teams[0].hq.X + 260.0, battle.teams[0].hq.Y);
+        ShowMenu();
 
-        // 核心游戏逻辑帧驱动（50ms / 20Hz 定步循环）
-        form.Every(TickMs, () => { Frame(); });
-
+        lastMs = Window.GetTickMs();
+        form.Every(15, () => { Frame(); });
         form.Run();
+    }
+
+    // 本作音色：枪声短促、炮声低闷、警报上扬方波、出厂提示上扬三角波。
+    void TuneSfx() {
+        SynthOptions shot = SfxPresets.Hit().WithDuration(0.05).WithEnvelope(0.001, 0.040, 0.0, 0.030);
+        shot.filter = new BiquadFilter(FilterKind.LowPass, 1800.0, 0.8, 44100, 1);
+        sfx.AddSynth("hit", shot);
+        SynthOptions cannon = SfxPresets.Explode().WithDuration(0.09).WithEnvelope(0.001, 0.090, 0.1, 0.120).WithGain(0.30);
+        cannon.filter = new BiquadFilter(FilterKind.LowPass, 600.0, 0.9, 44100, 1);
+        sfx.AddSynth("cannon", cannon);
+        sfx.AddSynth("alarm", SfxPresets.PowerUp().WithWaveform(Waveform.Square).WithSweep(520.0, 880.0)
+            .WithDuration(0.32).WithGain(0.12));
+        sfx.AddSynth("ready", SfxPresets.Success().WithSweep(660.0, 990.0).WithDuration(0.12).WithGain(0.16));
+        sfx.AddSynth("capture", SfxPresets.Success().WithSweep(392.0, 1175.0).WithDuration(0.45).WithGain(0.26));
+        sfx.AddSynth("lost", SfxPresets.Fail().WithSweep(440.0, 180.0).WithDuration(0.35));
+        sfx.AddSynth("coin", SfxPresets.Coin().WithGain(0.07));
+    }
+
+    static int EnvInt(string name, int fallback) {
+        string v = Environment.GetEnvironmentVariable(name);
+        if (v == null || v == "") { return fallback; }
+        int n = 0;
+        for (int i = 0; i < v.Length; i = i + 1) {
+            int ch = (int)v[i];
+            if (ch < 48 || ch > 57) { return fallback; }
+            n = n * 10 + (ch - 48);
+        }
+        return n;
     }
 
     // ---- 帧 ----
 
     void Frame() {
-        // 失焦自动暂停：只在"有焦点 → 失焦"的边沿触发。自动化脚本会话不跟随桌面焦点
-        // （别的窗口抢走焦点不该让脚本里的对局停下）。
+        int now = Window.GetTickMs();
+        int dtMs = now - lastMs;
+        lastMs = now;
+        if (dtMs < 0) { dtMs = 0; }
+        if (dtMs > 100) { dtMs = 100; }
+        double dt = (double)dtMs / 1000.0;
+        renderer.time = renderer.time + dt;
+
+        // 失焦自动暂停：只在"有焦点 → 失焦"的边沿触发。自动化脚本会话不跟随桌面焦点。
         bool focused = app.window.IsVisible() && app.window.IsFocused();
-        bool scripted = Gui.Backend.UiDriver.Active();
+        bool scripted = UiDriver.Active();
         if (state == StatePlaying && lastWindowFocused && !focused && !scripted) { Pause(); }
         lastWindowFocused = focused;
         EnsureCardShown();
-        // 焦点丢在非输入区时还给战场（或当前弹层），保证快捷键始终可用
         if (app.focus.focusedId < 0) {
             if (shownCard != null) { shownCard.Focus(app); } else { view.Focus(app); }
         }
 
         if (state == StatePlaying) {
-            battle.TickSimulation((double)TickMs / 1000.0);
-            ticks = ticks + 1;
-            ConsumeBattleEvents();
-            fx.Tick();
-            int outcome = battle.Outcome();
-            if (outcome == 0 && ticks >= TimeLimitTicks) { outcome = 2; }
-            if (outcome != 0) { Finish(outcome == 1); }
-            SyncHud();
+            accMs = accMs + dtMs;
+            int steps = 0;
+            bool ticked = false;
+            while (accMs >= TickMs && steps < 4 && state == StatePlaying) {
+                this.SimStep();
+                accMs = accMs - TickMs;
+                steps = steps + 1;
+                ticked = true;
+            }
+            if (steps >= 4) { accMs = 0; }
+            alpha = (double)accMs / (double)TickMs;
+            fx.Update(dt);
+            this.TickAlerts(dt);
+            this.PanCamera(dt);
+            if (ticked) { SyncHud(); }
         }
         Probe(focused);
         app.RequestRedraw();
     }
 
+    void SimStep() {
+        if (debugAutoplay) { RtsSim.Apply(battle, RtsSim.Coach(battle, battle.ticks)); }
+        battle.TickSimulation((double)TickMs / 1000.0);
+        ConsumeBattleEvents();
+        if (battle.Outcome() != 0) { Finish(battle.Outcome() == 1); }
+    }
+
     // 自动化探针（只在 ZAN_UI_SCRIPT 会话里生效）：脚本据此断言流程状态。
     void Probe(bool focused) {
-        if (!Gui.Backend.UiDriver.Active()) { return; }
-        Gui.Backend.UiDriver.SetProbe("rts.state", Convert.ToString(state));
-        Gui.Backend.UiDriver.SetProbe("rts.ticks", Convert.ToString(ticks));
-        Gui.Backend.UiDriver.SetProbe("rts.focused", focused ? "1" : "0");
-        Gui.Backend.UiDriver.SetProbe("rts.selected", Convert.ToString(battle.SelectedCount()));
-        Gui.Backend.UiDriver.SetProbe("rts.blue", Convert.ToString(battle.Alive(0)));
-        Gui.Backend.UiDriver.SetProbe("rts.red", Convert.ToString(battle.Alive(1)));
-        Gui.Backend.UiDriver.SetProbe("rts.muted", muted ? "1" : "0");
+        if (!UiDriver.Active()) { return; }
+        UiDriver.SetProbe("rts.state", Convert.ToString(state));
+        UiDriver.SetProbe("rts.ticks", Convert.ToString(battle.ticks));
+        UiDriver.SetProbe("rts.focused", focused ? "1" : "0");
+        UiDriver.SetProbe("rts.selected", Convert.ToString(battle.SelectedCount()));
+        UiDriver.SetProbe("rts.blue", Convert.ToString(battle.Alive(0)));
+        UiDriver.SetProbe("rts.red", Convert.ToString(battle.Alive(1)));
+        UiDriver.SetProbe("rts.muted", muted ? "1" : "0");
+        UiDriver.SetProbe("rts.mission", Convert.ToString(missionIndex + 1));
+        UiDriver.SetProbe("rts.difficulty", Convert.ToString(difficulty));
+        UiDriver.SetProbe("rts.minerals", Convert.ToString(battle.teams[0].minerals));
+        UiDriver.SetProbe("rts.queue", Convert.ToString(battle.teams[0].queue.Count));
+        UiDriver.SetProbe("rts.uplink", Convert.ToString(battle.uplinkOwner));
     }
 
     void ConsumeBattleEvents() {
-        for (int i = 0; i < battle.shots.Count; i = i + 1) { fx.AddShot(battle.shots[i]); }
-        for (int i = 0; i < battle.fallen.Count; i = i + 1) { fx.AddBlast(battle.fallen[i]); }
+        bool cannon = false;
+        for (int i = 0; i < battle.shots.Count; i = i + 1) {
+            RtsShot s = battle.shots[i];
+            fx.AddShot(s);
+            if (s.type == RtsUnit.Tank || s.type == RtsUnit.Artillery || s.type == RtsUnit.Hq) { cannon = true; }
+        }
         // 开火声轻且限频：一帧几十发也只响一下
-        if (battle.shots.Count > 0) { sfx.Play("hit", 0.18, 140); }
+        if (battle.shots.Count > 0) { sfx.Play("hit", 0.16, 110); }
+        if (cannon) { sfx.Play("cannon", 0.35, 160); }
+        for (int i = 0; i < battle.fallen.Count; i = i + 1) {
+            RtsUnit u = battle.fallen[i];
+            fx.AddBlast(u);
+            if (u.Team == 0 && battle.ticks - lastUnitAlertTick > 60) {
+                lastUnitAlertTick = battle.ticks;
+                this.AddAlert(u.X, u.Y);
+            }
+        }
         if (battle.fallen.Count > 0) { sfx.Play("explode", 0.45, 90); }
+        for (int i = 0; i < battle.deposits.Count; i = i + 1) {
+            RtsDeposit d = battle.deposits[i];
+            if (d.team != 0) { continue; }
+            fx.AddFloat(d.x, d.y - 14.0, "+" + Convert.ToString(d.amount), 0xFF7FE6FF);
+            sfx.Play("coin", 0.5, 300);
+        }
+        for (int i = 0; i < battle.spawned.Count; i = i + 1) {
+            RtsUnit u = battle.spawned[i];
+            fx.AddWarp(u.X, u.Y, u.Team);
+            if (u.Team == 0) { sfx.Play("ready", 0.5, 120); }
+        }
+        RtsUnit hq = battle.teams[0].hq;
+        if (hq.HitTick == battle.ticks && battle.ticks - lastHqAlertTick > 100) {
+            lastHqAlertTick = battle.ticks;
+            this.AddAlert(hq.X, hq.Y);
+            this.ShowAlert("⚠ 指挥中心遭到攻击！", true);
+            sfx.Play("alarm", 0.6, 1000);
+        }
+        if (battle.captureEvent != -2) {
+            int owner = battle.captureEvent;
+            fx.AddPulse(battle.uplinkX, battle.uplinkY, RtsBattle.UplinkRadius, owner < 0 ? 0xFFCFE4F1 : BattleRenderer.TeamColor(owner));
+            if (owner == 0) {
+                this.ShowAlert("✔ 上行链路已占领：每秒 +" + Convert.ToString(RtsBattle.UplinkIncomePerSec) + " 晶矿", false);
+                sfx.Play("capture", 0.7);
+            } else if (owner == 1) {
+                this.ShowAlert("✖ 上行链路被红军夺取", true);
+                sfx.Play("lost", 0.6);
+            }
+        }
+        if (battle.waveEvent > 0) {
+            this.ShowAlert("⚠ 红军第 " + Convert.ToString(battle.waveEvent) + " 波攻势出动", true);
+            sfx.Play("alarm", 0.7);
+        }
+    }
+
+    void AddAlert(double x, double y) {
+        alerts.Add(x);
+        alerts.Add(y);
+        alerts.Add(1.0);
+    }
+
+    void ShowAlert(string text, bool red) {
+        alertText = text;
+        alertRed = red;
+        alertLeft = 4.0;
+    }
+
+    void TickAlerts(double dt) {
+        for (int i = alerts.Count - 3; i >= 0; i = i - 3) {
+            alerts[i + 2] = alerts[i + 2] - dt / 2.5;
+            if (alerts[i + 2] <= 0.0) {
+                alerts.RemoveAt(i + 2);
+                alerts.RemoveAt(i + 1);
+                alerts.RemoveAt(i);
+            }
+        }
+        if (alertLeft > 0.0) { alertLeft = alertLeft - dt; }
+    }
+
+    // ---- 镜头 ----
+
+    void ClampCamera() {
+        int vw = view != null ? view.ViewW() : 1200;
+        int vh = view != null ? view.ViewH() : 560;
+        double maxX = (double)(battle.worldWidth - vw);
+        double maxY = (double)(battle.worldHeight - vh);
+        camX = maxX <= 0.0 ? maxX / 2.0 : Math.Max(0.0, Math.Min(camX, maxX));
+        camY = maxY <= 0.0 ? maxY / 2.0 : Math.Max(0.0, Math.Min(camY, maxY));
+    }
+
+    void CenterOn(double x, double y) {
+        int vw = view != null && view.ViewW() > 0 ? view.ViewW() : 1262;
+        int vh = view != null && view.ViewH() > 0 ? view.ViewH() : 540;
+        camX = x - (double)vw / 2.0;
+        camY = y - (double)vh / 2.0;
+        ClampCamera();
+    }
+
+    void PanCamera(double dt) {
+        double dx = 0.0;
+        double dy = 0.0;
+        if (panLeft) { dx = dx - 1.0; }
+        if (panRight) { dx = dx + 1.0; }
+        if (panUp) { dy = dy - 1.0; }
+        if (panDown) { dy = dy + 1.0; }
+        dx = dx + (double)view.EdgeX();
+        dy = dy + (double)view.EdgeY();
+        camX = camX + Math.Max(-1.0, Math.Min(1.0, dx)) * 760.0 * dt;
+        camY = camY + Math.Max(-1.0, Math.Min(1.0, dy)) * 760.0 * dt;
+        ClampCamera();
+    }
+
+    public void MinimapJump(int x, int y, int w, int h) {
+        if (w <= 0 || h <= 0) { return; }
+        CenterOn((double)x * (double)battle.worldWidth / (double)w, (double)y * (double)battle.worldHeight / (double)h);
+    }
+
+    public void MinimapOrder(int x, int y, int w, int h, bool attack) {
+        if (w <= 0 || h <= 0) { return; }
+        this.OrderWorld((double)x * (double)battle.worldWidth / (double)w, (double)y * (double)battle.worldHeight / (double)h, attack);
     }
 
     // ---- 流程 ----
 
-    void ShowBriefing() {
-        state = StateBriefing;
-        long plays = profile.Counter("plays");
-        lblBriefBest.Text.Set(BestText());
-        lblBriefTip.SetShown(plays == 0);
-        ShowCard(cardBrief);
+    void ShowMenu() {
+        state = StateMenu;
+        RefreshMenu();
+        ShowCard(cardMenu);
         SyncHud();
     }
 
     void StartBattle() {
-        battle = new RtsBattle();
+        if (!this.Unlocked(missionIndex)) { return; }
+        battle = new RtsBattle(missionIndex, difficulty, 20261125 + (long)missionIndex * 7 + (long)difficulty);
+        renderer.battle = battle;
         fx.Clear();
+        alerts.Clear();
+        alertLeft = 0.0;
+        lastHqAlertTick = -1000;
+        lastUnitAlertTick = -1000;
         view.CancelDrag();
-        ticks = 0;
+        accMs = 0;
+        alpha = 0.0;
         state = StatePlaying;
         profile.Add("plays", 1);
+        profile.Add("difficulty", (long)difficulty - profile.Counter("difficulty"));
         profile.Save();
+        // 调试快进：不出特效、不出声地推进仿真
+        for (int i = 0; i < debugSkipTicks && battle.Outcome() == 0; i = i + 1) {
+            if (debugAutoplay) { RtsSim.Apply(battle, RtsSim.Coach(battle, battle.ticks)); }
+            battle.TickSimulation((double)TickMs / 1000.0);
+        }
+        this.CenterOn(battle.teams[0].hq.X + 300.0, battle.teams[0].hq.Y);
+        this.ShowAlert("🎯 " + battle.mission.goalText, false);
         ShowCard(null);
         view.Focus(app);
         SyncHud();
@@ -187,6 +385,7 @@ public class Program {
         if (state != StatePlaying) { return; }
         state = StatePaused;
         view.CancelDrag();
+        ReleasePan();
         ShowCard(cardPause);
         SyncHud();
     }
@@ -194,45 +393,50 @@ public class Program {
     void Resume() {
         if (state != StatePaused) { return; }
         state = StatePlaying;
+        lastMs = Window.GetTickMs();
         ShowCard(null);
         view.Focus(app);
         SyncHud();
     }
 
+    void ReleasePan() {
+        panLeft = false;
+        panRight = false;
+        panUp = false;
+        panDown = false;
+    }
+
     void Finish(bool won) {
         state = StateResults;
         view.CancelDrag();
-        long ms = (long)ticks * (long)TickMs;
+        ReleasePan();
+        int ticks = battle.ticks;
+        int hqPct = battle.HqPercent(0);
+        int stars = battle.mission.Stars(won, ticks, hqPct);
+        string mk = this.MissionKey(missionIndex, difficulty);
+        int prevStars = (int)profile.Best(mk + "_stars");
         bool newBest = false;
+        bool firstClear = false;
         if (won) {
             profile.Add("wins", 1);
-            newBest = profile.SubmitLowest("fastest_win_ms", ms);
+            firstClear = !profile.Flag("cleared_m" + Convert.ToString(missionIndex), false);
+            profile.SetFlag("cleared_m" + Convert.ToString(missionIndex), true);
+            profile.SubmitBest(mk + "_stars", (long)stars);
+            newBest = profile.SubmitLowest(mk + "_fast", (long)ticks * (long)TickMs);
             profile.Save();
             sfx.Play("success", 0.8);
         } else {
+            profile.Save();
             sfx.Play("fail", 0.8);
         }
-        string reason;
-        if (won) {
-            reason = "右岸守军已全歼，峡口拿下了";
-        } else if (battle.Alive(0) == 0) {
-            reason = "我军全军覆没";
-        } else {
-            reason = "时限已到，守军仍有 " + Convert.ToString(battle.Alive(1)) + " 个单位";
-        }
-        cardResult.Title(won ? "🏆 胜利" : "💀 失败");
-        lblResultHead.Text.Set(reason);
-        lblResultHead.Class = won ? "medium strong green" : "medium strong red";
-        lblResultTime.Text.Set("作战用时  " + Clock(ms));
-        lblResultLost.Text.Set("我军损失  " + Convert.ToString(battle.blueLost) + " / "
-            + Convert.ToString(battle.blueFielded) + " 个单位");
-        lblResultKills.Text.Set("歼灭敌军  " + Convert.ToString(battle.redLost) + " / "
-            + Convert.ToString(battle.redFielded));
-        lblResultBest.Text.Set(BestText() + "    胜场 " + Convert.ToString(profile.Counter("wins"))
-            + " / " + Convert.ToString(profile.Counter("plays")));
-        lblResultNew.SetShown(newBest);
+        FillResult(won, stars, prevStars, newBest, firstClear, hqPct);
         ShowCard(cardResult);
         SyncHud();
+    }
+
+    void NextMission() {
+        if (missionIndex + 1 < RtsMission.Count && this.Unlocked(missionIndex + 1)) { missionIndex = missionIndex + 1; }
+        StartBattle();
     }
 
     void Quit() { form.Close(); }
@@ -245,24 +449,103 @@ public class Program {
         SyncHud();
     }
 
-    // ---- 输入（BattlefieldView / RtsRoot 调） ----
+    // ---- 进度 ----
+
+    string MissionKey(int m, int d) { return "m" + Convert.ToString(m + 1) + "_d" + Convert.ToString(d); }
+
+    public bool Unlocked(int m) {
+        if (m <= 0 || debugUnlock) { return true; }
+        return profile.Flag("cleared_m" + Convert.ToString(m - 1), false);
+    }
+
+    int HighestUnlocked() {
+        int best = 0;
+        for (int m = 0; m < RtsMission.Count; m = m + 1) {
+            if (this.Unlocked(m)) { best = m; }
+        }
+        return best;
+    }
+
+    int StarsOf(int m, int d) { return (int)profile.Best(this.MissionKey(m, d) + "_stars"); }
+
+    int TotalStars() {
+        int n = 0;
+        for (int m = 0; m < RtsMission.Count; m = m + 1) {
+            for (int d = 0; d < 3; d = d + 1) { n = n + this.StarsOf(m, d); }
+        }
+        return n;
+    }
+
+    static string StarText(int n) {
+        string s = "";
+        for (int i = 0; i < 3; i = i + 1) { s = s + (i < n ? "★" : "☆"); }
+        return s;
+    }
+
+    // ---- 输入（BattlefieldView / MinimapView / RtsRoot 调） ----
 
     public bool AcceptsBattleInput() { return state == StatePlaying; }
 
     public void SelectAt(int x, int y, bool additive) {
-        int n = battle.SelectAt((double)x, (double)y, additive);
+        int n = battle.SelectAt((double)x + camX, (double)y + camY, additive);
         if (n > 0) { sfx.Play("select", 0.6); }
+        SyncHud();
     }
 
     public void SelectBox(int x0, int y0, int x1, int y1, bool additive) {
-        int n = battle.SelectInRect((double)x0, (double)y0, (double)x1, (double)y1, additive);
+        int n = battle.SelectInRect((double)x0 + camX, (double)y0 + camY, (double)x1 + camX, (double)y1 + camY, additive);
         if (n > 0) { sfx.Play("select", 0.6); }
+        SyncHud();
     }
 
-    public void OrderMoveAt(int x, int y) {
-        int n = battle.CommandMove(x, y);
-        // 没选中单位就下令：给"无效操作"的反馈，而不是静默无事
-        sfx.Play(n > 0 ? "click" : "error", n > 0 ? 0.7 : 0.4);
+    public void OrderAt(int x, int y, bool attack) { this.OrderWorld((double)x + camX, (double)y + camY, attack); }
+
+    void OrderWorld(double wx, double wy, bool attack) {
+        int r = battle.CommandAt(wx, wy, attack);
+        if (r == 0) {
+            sfx.Play("error", 0.4);
+            return;
+        }
+        fx.AddPing(battle.targetX, battle.targetY, r);
+        sfx.Play(r == 2 ? "cannon" : "click", r == 2 ? 0.4 : 0.7);
+    }
+
+    void Produce(int type) {
+        if (state != StatePlaying) { return; }
+        if (battle.Enqueue(0, type)) {
+            sfx.Play("click");
+        } else {
+            sfx.Play("error", 0.4);
+            RtsTeam t = battle.teams[0];
+            if (t.queue.Count >= RtsBattle.QueueMax) {
+                this.ShowAlert("生产队列已满（最多 " + Convert.ToString(RtsBattle.QueueMax) + " 个）", false);
+            } else if (t.minerals < RtsUnit.CostOf(type)) {
+                this.ShowAlert("晶矿不足：" + RtsUnit.NameOf(type) + "需要 " + Convert.ToString(RtsUnit.CostOf(type)), false);
+            } else {
+                this.ShowAlert("人口已满", false);
+            }
+        }
+        SyncHud();
+    }
+
+    void CancelProduction() {
+        if (state != StatePlaying) { return; }
+        sfx.Play(battle.CancelLast(0) ? "click" : "error", 0.5);
+        SyncHud();
+    }
+
+    void CenterOnSelection() {
+        double sx = 0.0;
+        double sy = 0.0;
+        int n = 0;
+        for (int i = 0; i < battle.units.Count; i = i + 1) {
+            RtsUnit u = battle.units[i];
+            if (!u.Selected) { continue; }
+            sx = sx + u.X;
+            sy = sy + u.Y;
+            n = n + 1;
+        }
+        if (n > 0) { this.CenterOn(sx / (double)n, sy / (double)n); }
     }
 
     // 全局快捷键。返回 true 表示已处理。
@@ -271,228 +554,76 @@ public class Program {
         if (key == 80 || key == 27) {                                        // P / Esc
             if (state == StatePlaying) { Pause(); return true; }
             if (state == StatePaused) { Resume(); return true; }
+            if (state == StateResults && key == 27) { ShowMenu(); return true; }
             return false;
         }
-        if (key == 13 || key == 32) {                                        // Enter / Space
-            if (state == StateBriefing || state == StateResults) { StartBattle(); return true; }
+        if (key == 13 || (key == 32 && state != StatePlaying)) {            // Enter / Space
+            if (state == StateMenu) { StartBattle(); return true; }
+            if (state == StateResults) {
+                if (lastWon && missionIndex + 1 < RtsMission.Count) { NextMission(); } else { StartBattle(); }
+                return true;
+            }
             if (state == StatePaused) { Resume(); return true; }
             return false;
         }
-        if (key == 65 && state == StatePlaying) {                            // A 全选
-            if (battle.SelectAll() > 0) { sfx.Play("select", 0.6); }
+        if (state == StateMenu) {
+            if (key >= 49 && key < 49 + RtsMission.Count) { PickMission(key - 49); return true; }   // 1..3
+            if (key == 37 || key == 39) {                                                          // ← →
+                PickMission(missionIndex + (key == 37 ? -1 : 1));
+                return true;
+            }
+            if (key == 68) { PickDifficulty((difficulty + 1) % 3); return true; }                 // D
+            return false;
+        }
+        if (key == 82 && (state == StatePaused || state == StateResults)) { StartBattle(); return true; }  // R
+        if (state != StatePlaying) { return false; }
+        if (key == 37) { panLeft = true; return true; }
+        if (key == 39) { panRight = true; return true; }
+        if (key == 38) { panUp = true; return true; }
+        if (key == 40) { panDown = true; return true; }
+        if (key == 81) { Produce(RtsUnit.Infantry); return true; }           // Q
+        if (key == 87) { Produce(RtsUnit.Tank); return true; }               // W
+        if (key == 69) { Produce(RtsUnit.Artillery); return true; }          // E
+        if (key == 82) { Produce(RtsUnit.Miner); return true; }              // R
+        if (key == 88) { CancelProduction(); return true; }                  // X
+        if (key == 65) {                                                     // A 全选部队
+            if (battle.SelectArmy() > 0) { sfx.Play("select", 0.6); }
+            SyncHud();
             return true;
         }
-        if (key == 82 && (state == StatePaused || state == StateResults)) { // R 重开
-            StartBattle();
+        if (key == 83) {                                                     // S 全选采矿车
+            if (battle.SelectMiners() > 0) { sfx.Play("select", 0.6); }
+            SyncHud();
             return true;
         }
+        if (key == 72) {                                                     // H 指挥中心
+            battle.SelectHq();
+            this.CenterOn(battle.teams[0].hq.X, battle.teams[0].hq.Y);
+            sfx.Play("select", 0.6);
+            SyncHud();
+            return true;
+        }
+        if (key == 32) { CenterOnSelection(); return true; }                 // Space 镜头跟选中
         return false;
     }
 
-    // ---- 界面 ----
-
-    void BuildUi() {
-        RtsRoot root = new RtsRoot(this);
-        // 铺满窗体内容区（窗体按块流排子控件，不会把纵向容器撑满）
-        root.SetProp("style", "position:absolute; left:0; top:0; right:0; bottom:0;");
-        root.Pad(8);
-        root.Gap(8);
-        form.Add(root);
-
-        // 1. 顶部战况与资源面板
-        Panel topBar = Panel.Row();
-        topBar.Class = "card";
-        topBar.Pad(8);
-        topBar.Gap(16);
-        topBar.Prefer(0, 48);
-        root.With(topBar);
-
-        Label lblTitle = new Label("⚔ 指挥官控制台");
-        lblTitle.Class = "title medium strong yellow";
-        topBar.With(lblTitle);
-
-        lblTime = new Label("");
-        lblTime.Class = "medium strong";
-        topBar.With(lblTime);
-
-        lblForces = new Label("");
-        lblForces.Class = "medium";
-        topBar.With(lblForces);
-
-        lblMin = new Label("");
-        lblMin.Class = "medium cyan";
-        topBar.With(lblMin);
-
-        lblPop = new Label("");
-        lblPop.Class = "medium";
-        topBar.With(lblPop);
-
-        btnReinforce = new Button("");
-        btnReinforce.Class = "primary";
-        btnReinforce.OnClick(() => {
-            if (state != StatePlaying) { return; }
-            if (battle.SpawnReinforcements()) { sfx.Play("click"); } else { sfx.Play("error", 0.4); }
-            SyncHud();
-            view.Focus(app);
-        });
-        topBar.With(btnReinforce);
-
-        btnPause = new Button("⏸ 暂停 (P)");
-        btnPause.Class = "secondary";
-        btnPause.OnClick(() => {
-            sfx.Play("click");
-            if (state == StatePlaying) { Pause(); } else if (state == StatePaused) { Resume(); }
-        });
-        topBar.With(btnPause);
-
-        btnMute = new Button("");
-        btnMute.Class = "secondary";
-        btnMute.OnClick(() => { ToggleMute(); view.Focus(app); });
-        topBar.With(btnMute);
-
-        // 2. 中央战场视口
-        view = new BattlefieldView(this);
-        view.Grow();
-        root.With(view);
-
-        BuildBriefCard();
-        BuildPauseCard();
-        BuildResultCard();
-
-        // 3. 底部操作提示
-        Label hint = new Label("左键点选 · 拖拽框选（Shift 追加）· A 全选 · 右键行军 · P/Esc 暂停 · M 静音 —— 流场寻路 + RVO 避障推挤通过峡谷");
-        hint.Class = "secondary small";
-        root.With(hint);
+    public void HandleKeyUp(int key) {
+        if (key == 37) { panLeft = false; }
+        if (key == 39) { panRight = false; }
+        if (key == 38) { panUp = false; }
+        if (key == 40) { panDown = false; }
     }
 
-    RtsModal NewCard(string title) {
-        RtsModal m = new RtsModal(this, title);
-        m.Width(480);
-        return m;
+    // ---- 绘制入口（控件调） ----
+
+    public void RenderBattlefield(Canvas c, int bx, int by, int bw, int bh) {
+        renderer.Render(c, bx, by, bw, bh, camX, camY, state == StatePlaying ? alpha : 1.0);
+        // 非交战状态压暗战场，让弹层成为视觉焦点
+        if (state != StatePlaying) { c.FillRect(bx, by, bw, bh, 0x99040A12); }
     }
 
-    Label Line(Panel body, string text, string cls) {
-        Label l = new Label(text);
-        l.Class = cls;
-        body.With(l);
-        return l;
-    }
-
-    Button ActionButton(string text, string cls, Action a) {
-        Button b = new Button(text);
-        b.Class = cls;
-        b.OnClick(() => {
-            sfx.Play("click");
-            a();
-        });
-        return b;
-    }
-
-    void BuildBriefCard() {
-        cardBrief = NewCard("⚔ 作战简报：夺取峡口");
-        Panel body = Panel.Column();
-        body.Gap(6);
-        Line(body, "目标：3 分钟内歼灭裂谷右岸的全部红军守备部队。", "medium strong yellow");
-        Line(body, "守军不会过河，但会迎击靠近右岸的部队。兵力不足就别硬冲——", "secondary");
-        Line(body, "先征召装甲营（400 晶矿，击毁敌军有赏金），再集中突破峡口。", "secondary");
-        Line(body, "操作", "strong");
-        Line(body, "左键点选单位 · 左键拖拽框选整队（Shift 追加）· A 全选", "");
-        Line(body, "右键地面：选中单位向该点行军（流场绕开裂谷）", "");
-        Line(body, "P / Esc 暂停 · M 静音 · 窗口失焦自动暂停", "");
-        lblBriefTip = Line(body, "新兵提示：按 A 全选，再右键点峡口右侧集结。", "cyan");
-        lblBriefBest = Line(body, "", "secondary");
-        cardBrief.Content(body);
-        List<Control> acts = new List<Control>();
-        acts.Add(ActionButton("▶ 开始作战 (Enter)", "primary", () => { StartBattle(); }));
-        acts.Add(ActionButton("退出", "secondary", () => { Quit(); }));
-        cardBrief.Actions(acts);
-    }
-
-    void BuildPauseCard() {
-        cardPause = NewCard("⏸ 战斗暂停");
-        cardPause.Height(200);
-        Panel body = Panel.Column();
-        body.Gap(6);
-        Line(body, "战场时间已冻结。", "medium");
-        Line(body, "P / Esc 继续 · R 重新开始", "secondary");
-        cardPause.Content(body);
-        List<Control> acts = new List<Control>();
-        acts.Add(ActionButton("▶ 继续", "primary", () => { Resume(); }));
-        acts.Add(ActionButton("↻ 重新开始", "secondary", () => { StartBattle(); }));
-        acts.Add(ActionButton("退出", "secondary", () => { Quit(); }));
-        cardPause.Actions(acts);
-    }
-
-    void BuildResultCard() {
-        cardResult = NewCard("战报");
-        Panel body = Panel.Column();
-        body.Gap(6);
-        lblResultHead = Line(body, "", "medium strong");
-        lblResultTime = Line(body, "", "medium");
-        lblResultLost = Line(body, "", "medium");
-        lblResultKills = Line(body, "", "medium");
-        lblResultBest = Line(body, "", "secondary");
-        lblResultNew = Line(body, "★ 新纪录！最快胜利", "medium strong yellow");
-        cardResult.Content(body);
-        List<Control> acts = new List<Control>();
-        acts.Add(ActionButton("↻ 再来一局 (Enter)", "primary", () => { StartBattle(); }));
-        acts.Add(ActionButton("退出", "secondary", () => { Quit(); }));
-        cardResult.Actions(acts);
-    }
-
-    // 只显示一张弹层（null = 全部收起，战场重新接收输入）。
-    void ShowCard(RtsModal which) {
-        if (shownCard != null && shownCard != which) {
-            RtsModal old = shownCard;
-            shownCard = null;
-            old.Hide();
-        }
-        shownCard = which;
-        if (which != null) { PushCard(); }
-        app.RequestRedraw();
-    }
-
-    void PushCard() {
-        RtsModal m = shownCard;
-        if (m == null) { return; }
-        m.Show();
-        app.overlayHost.Push(app, null, m, true);
-        m.Focus(app);
-    }
-
-    // 窗口失焦时 overlayHost 会收起全部弹层：流程还停在简报/暂停/战报时补回来。
-    void EnsureCardShown() {
-        if (shownCard == null || app.overlayHost == null) { return; }
-        if (app.overlayHost.ActiveRoot() != shownCard) { PushCard(); }
-    }
-
-    void SyncHud() {
-        int left = TimeLimitTicks - ticks;
-        if (left < 0) { left = 0; }
-        lblTime.Text.Set("⏱ " + Clock((long)left * (long)TickMs));
-        lblTime.Class = (state == StatePlaying && left < 600) ? "medium strong red" : "medium strong";
-        lblForces.Text.Set("我军 " + Convert.ToString(battle.Alive(0)) + " · 敌军 " + Convert.ToString(battle.Alive(1)));
-        lblMin.Text.Set("💎 " + Convert.ToString(battle.minerals));
-        lblPop.Text.Set("👥 " + Convert.ToString(battle.supplyUsed) + "/" + Convert.ToString(battle.supplyMax));
-        btnReinforce.Text.Set("➕ 装甲营 (" + Convert.ToString(battle.reinforceCost) + "💎)");
-        btnReinforce.Disabled.Set(state != StatePlaying || !battle.CanReinforce());
-        btnPause.Text.Set(state == StatePaused ? "▶ 继续 (P)" : "⏸ 暂停 (P)");
-        btnPause.Disabled.Set(state != StatePlaying && state != StatePaused);
-        btnMute.Text.Set(muted ? "🔇 静音 (M)" : "🔊 音效 (M)");
-    }
-
-    string BestText() {
-        if (!profile.HasBest("fastest_win_ms")) { return "最快胜利：暂无"; }
-        return "最快胜利：" + Clock(profile.Best("fastest_win_ms"));
-    }
-
-    static string Clock(long ms) {
-        long sec = ms / 1000;
-        long m = sec / 60;
-        long s = sec % 60;
-        long tenth = (ms % 1000) / 100;
-        return (m < 10 ? "0" : "") + Convert.ToString(m) + ":" + (s < 10 ? "0" : "") + Convert.ToString(s)
-            + "." + Convert.ToString(tenth);
+    public void RenderMinimap(Canvas c, int x, int y, int w, int h) {
+        renderer.RenderMinimap(c, x, y, w, h, camX, camY, view.ViewW(), view.ViewH(), alerts);
     }
 
     // 素材定位：盘上找不到就返回 null（调用方走矢量兜底）。
@@ -500,131 +631,5 @@ public class Program {
         string p = Assets.Find(rel);
         if (p == null || !File.Exists(p)) { return null; }
         return p;
-    }
-
-    // 单位类型 → 精灵图（没有素材返回 null）。
-    string SpriteOf(int type) {
-        if (type == 1) { return this.tankPath; }
-        if (type == 2) { return this.minerPath; }
-        return this.infantryPath;
-    }
-
-    void RenderBattlefield(Canvas c, int bx, int by, int bw, int bh) {
-        // 1. 地面：优先贴美术底图，没有素材才退回纯色
-        if (this.bgPath != null) {
-            CDraw.BlitImage(c, this.bgPath, bx, by, bw, bh);
-        } else {
-            c.FillRect(bx, by, bw, bh, 0xFF141E28);
-        }
-
-        // 2. 绘制网格背景
-        int cols = bw / battle.cellSize;
-        int rows = bh / battle.cellSize;
-        for (int col = 0; col <= cols; col = col + 1) {
-            c.FillRect(bx + col * battle.cellSize, by, 1, bh, 0x11334E68);
-        }
-        for (int row = 0; row <= rows; row = row + 1) {
-            c.FillRect(bx, by + row * battle.cellSize, bw, 1, 0x11334E68);
-        }
-
-        // 3. 绘制中央不可通行悬崖峡谷障碍（与仿真同一张地形：RtsBattle.IsCanyonRow）
-        // 压在美术底图上时用半透明暗色 + 描边，读作"裂谷"而不是灰贴片
-        int simRows = battle.worldHeight / battle.cellSize;
-        int canyonX = bx + (battle.worldWidth / battle.cellSize / 2) * battle.cellSize;
-        for (int r = 0; r < simRows; r = r + 1) {
-            if (battle.IsCanyonRow(r)) {
-                c.FillRect(canyonX, by + r * battle.cellSize, battle.cellSize * 2, battle.cellSize, 0xD90A1220);
-                c.DrawRect(canyonX, by + r * battle.cellSize, battle.cellSize * 2, battle.cellSize, 0xFF4B5563, 1);
-            }
-        }
-        // 红军防线：守军不越过的右岸线
-        c.FillRect(bx + (int)battle.redBankX, by, 2, battle.worldHeight, 0x55F87171);
-
-        // 4. 绘制目标集结点与光标脉冲
-        if (battle.hasTarget) {
-            int tx = bx + (int)battle.targetX;
-            int ty = by + (int)battle.targetY;
-            c.DrawCircle(tx, ty, 20, 0xAA10B981, 2);
-            c.DrawCircle(tx, ty, 8, 0xFF10B981, 2);
-        }
-
-        // 5. 绘制所有作战单位
-        for (int i = 0; i < battle.units.Count; i = i + 1) {
-            RtsUnit u = battle.units[i];
-            int ux = bx + (int)u.X;
-            int uy = by + (int)u.Y;
-            int r = (int)u.Radius;
-
-            // 选中光圈
-            if (u.Selected) {
-                c.DrawCircle(ux, uy, r + 4, 0xFF22C55E, 2);
-            }
-
-            // 阵营环：贴图本身没有配色，敌我用环区分（红军加一层底色更好认）
-            int teamColor = u.Team == 0 ? 0xAA60A5FA : 0xDDF87171;
-            if (u.Team == 1) { c.FillCircle(ux, uy, r + 1, 0x557F1D1D); }
-            c.DrawCircle(ux, uy, r + 1, teamColor, u.Team == 0 ? 1 : 2);
-
-            // 单位本体：优先画精灵图
-            string sprite = this.SpriteOf(u.Type);
-            if (sprite != null) {
-                // 精灵按单位直径画：再放大就会在编队里互相压叠
-                int size = r * 2;
-                CDraw.BlitImage(c, sprite, ux - size / 2, uy - size / 2, size, size);
-            } else if (u.Type == 1) {
-                // 坦克：矩形底盘 + 炮塔
-                int hull = u.Team == 0 ? 0xFF1E3A8A : 0xFF7F1D1D;
-                int edge = u.Team == 0 ? 0xFF3B82F6 : 0xFFEF4444;
-                c.FillRect(ux - r, uy - r, r * 2, r * 2, hull);
-                c.DrawRect(ux - r, uy - r, r * 2, r * 2, edge, 2);
-                c.FillCircle(ux, uy, r / 2, u.Team == 0 ? 0xFF60A5FA : 0xFFFCA5A5);
-            } else {
-                // 步兵：圆形小兵
-                c.FillCircle(ux, uy, r, u.Team == 0 ? 0xFF2563EB : 0xFFDC2626);
-                c.DrawCircle(ux, uy, r, u.Team == 0 ? 0xFF93C5FD : 0xFFFCA5A5, 1);
-            }
-
-            // 血条 (微型)：我军绿、敌军红
-            int barW = r * 2;
-            c.FillRect(ux - r, uy - r - 6, barW, 3, 0xFF450A0A);
-            c.FillRect(ux - r, uy - r - 6, (int)((double)barW * ((double)u.Hp / (double)u.MaxHp)), 3,
-                       u.Team == 0 ? 0xFF22C55E : 0xFFF87171);
-        }
-
-        // 6. 曳光与爆炸
-        fx.Render(c, bx, by);
-
-        // 7. 框选矩形
-        if (view != null && view.Dragging()) {
-            c.FillRect(view.DragLeft(), view.DragTop(), view.DragWidth(), view.DragHeight(), 0x2222C55E);
-            c.DrawRect(view.DragLeft(), view.DragTop(), view.DragWidth(), view.DragHeight(), 0xCC22C55E, 1);
-        }
-
-        // 8. 左下角雷达小地图（Minimap）：右下角是红军阵地，别挡住守军
-        RenderMinimap(c, bx + 10, by + bh - 120, 150, 110);
-
-        // 9. 非交战状态压暗战场，让覆盖层卡片成为视觉焦点
-        if (state != StatePlaying) {
-            c.FillRect(bx, by, bw, bh, 0x88050A12);
-        }
-    }
-
-    void RenderMinimap(Canvas c, int mx, int my, int mw, int mh) {
-        c.FillRect(mx, my, mw, mh, 0xEE0B0F19);
-        c.DrawRect(mx, my, mw, mh, 0xFF374151, 2);
-
-        // 小地图中央峡谷（峡口处留空）
-        int gapTop = my + (int)((double)mh * 7.0 / 18.75);
-        int gapBottom = my + (int)((double)mh * 13.0 / 18.75);
-        c.FillRect(mx + mw / 2 - 2, my, 4, gapTop - my, 0x884B5563);
-        c.FillRect(mx + mw / 2 - 2, gapBottom, 4, my + mh - gapBottom, 0x884B5563);
-
-        // 投影单位光点：敌我分色
-        for (int i = 0; i < battle.units.Count; i = i + 1) {
-            RtsUnit u = battle.units[i];
-            int px = mx + (int)((u.X / (double)battle.worldWidth) * (double)mw);
-            int py = my + (int)((u.Y / (double)battle.worldHeight) * (double)mh);
-            c.FillRect(px, py, 2, 2, u.Team == 0 ? 0xFF3B82F6 : 0xFFEF4444);
-        }
     }
 }

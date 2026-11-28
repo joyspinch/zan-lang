@@ -1,0 +1,144 @@
+using System;
+using System.Collections.Generic;
+using Game.Foundation;
+
+// 红军指挥官（仿真层，确定性：随机只来自 RtsBattle.rng）。每 10 帧决策一次：
+//   1. 生产：先补足采矿车，再按蓝军兵种组合加权挑克制兵种（难度越高越懂克制）；
+//   2. 防守：蓝军摸到指挥中心附近，守家部队全体迎击；
+//   3. 争夺链路：上行链路不归红军时，派 3~4 个守家单位去抢（contestUplink 关卡）；
+//   4. 进攻波次：到点且守家部队够数就整队攻击移动——目标轮流是链路与蓝军指挥中心，
+//      每一波最低规模递增，攻势一波比一波大。
+public class RtsAi {
+    RtsMission mission;
+    public int nextWaveTick;
+    public int waveNo;
+    int pickets;
+
+    public RtsAi(RtsMission m) {
+        this.mission = m;
+        this.nextWaveTick = m.firstWaveTick;
+        this.waveNo = 0;
+        this.pickets = 0;
+    }
+
+    public int WaveSize() { return mission.waveMinSize + mission.waveGrowth * waveNo; }
+
+    public void Tick(RtsBattle b) {
+        if (b.ticks % 10 != 0) { return; }
+        RtsTeam team = b.teams[1];
+        if (team.hq == null || team.hq.Hp <= 0) { return; }
+        Produce(b);
+        if (Defend(b)) { return; }
+        if (mission.contestUplink) { Contest(b); }
+        Waves(b);
+    }
+
+    void Produce(RtsBattle b) {
+        RtsTeam team = b.teams[1];
+        int guard = 0;
+        while (team.queue.Count < 2 && guard < 3) {
+            guard = guard + 1;
+            int miners = b.CountType(1, RtsUnit.Miner) + b.QueuedType(1, RtsUnit.Miner);
+            int want = miners < mission.redMinerTarget ? RtsUnit.Miner : PickCombat(b);
+            if (!b.Enqueue(1, want)) { return; }
+        }
+    }
+
+    // 克制加权：蓝军步兵多 → 多造坦克；坦克多 → 多造炮兵；炮兵多 → 多造步兵。
+    int PickCombat(RtsBattle b) {
+        double smart = mission.difficulty == 0 ? 0.4 : (mission.difficulty == 2 ? 1.6 : 1.0);
+        int inf = b.CountType(0, RtsUnit.Infantry);
+        int tank = b.CountType(0, RtsUnit.Tank);
+        int art = b.CountType(0, RtsUnit.Artillery);
+        double wTank = 2.0 + (double)inf * 0.6 * smart;
+        double wArt = 1.0 + (double)tank * 1.2 * smart;
+        double wInf = 3.0 + (double)art * 1.5 * smart;
+        double sum = wTank + wArt + wInf;
+        double roll = b.rng.NextDouble() * sum;
+        if (roll < wInf) { return RtsUnit.Infantry; }
+        if (roll < wInf + wTank) { return RtsUnit.Tank; }
+        return RtsUnit.Artillery;
+    }
+
+    // 守家部队：没有行军令、不属于任何一波的红军作战单位。
+    List<RtsUnit> HomeArmy(RtsBattle b) {
+        List<RtsUnit> list = new List<RtsUnit>();
+        for (int i = 0; i < b.units.Count; i = i + 1) {
+            RtsUnit u = b.units[i];
+            if (u.Team == 1 && u.IsCombat() && u.Wave == 0 && u.Order == null) { list.Add(u); }
+        }
+        return list;
+    }
+
+    bool Defend(RtsBattle b) {
+        RtsUnit hq = b.teams[1].hq;
+        RtsUnit threat = null;
+        double best = 360.0 * 360.0;
+        for (int i = 0; i < b.units.Count; i = i + 1) {
+            RtsUnit u = b.units[i];
+            if (u.Team != 0 || u.IsBuilding()) { continue; }
+            double dx = u.X - hq.X;
+            double dy = u.Y - hq.Y;
+            double d = dx * dx + dy * dy;
+            if (d < best) {
+                best = d;
+                threat = u;
+            }
+        }
+        if (threat == null) { return false; }
+        List<RtsUnit> home = new List<RtsUnit>();
+        for (int i = 0; i < b.units.Count; i = i + 1) {
+            RtsUnit u = b.units[i];
+            if (u.Team == 1 && u.IsCombat() && u.Wave <= 0
+                && (u.Order == null || !u.Order.attack)) {
+                home.Add(u);
+            }
+        }
+        b.OrderUnits(home, threat.X, threat.Y, true);
+        return true;
+    }
+
+    void Contest(RtsBattle b) {
+        if (b.uplinkOwner == 1) { return; }
+        int near = 0;
+        for (int i = 0; i < b.units.Count; i = i + 1) {
+            RtsUnit u = b.units[i];
+            if (u.Team != 1 || !u.IsCombat()) { continue; }
+            double dx = u.X - b.uplinkX;
+            double dy = u.Y - b.uplinkY;
+            if (dx * dx + dy * dy < 260.0 * 260.0 || (u.Wave == -1 && u.Order != null)) { near = near + 1; }
+        }
+        if (near >= 3) { return; }
+        List<RtsUnit> home = HomeArmy(b);
+        if (home.Count < 4) { return; }
+        List<RtsUnit> squad = new List<RtsUnit>();
+        int want = Math.Min(4, home.Count - 1);
+        for (int i = 0; i < want; i = i + 1) {
+            home[i].Wave = -1;
+            squad.Add(home[i]);
+        }
+        pickets = pickets + 1;
+        b.OrderUnits(squad, b.uplinkX + 30.0, b.uplinkY, true);
+    }
+
+    void Waves(RtsBattle b) {
+        if (b.ticks < nextWaveTick) { return; }
+        List<RtsUnit> home = HomeArmy(b);
+        int need = WaveSize();
+        // 凑不够数就再等，但等太久（20 秒）也带着现有兵力出发
+        bool late = b.ticks >= nextWaveTick + 400 && home.Count >= 3;
+        if (home.Count < need && !late) { return; }
+        waveNo = waveNo + 1;
+        double tx = b.teams[0].hq.X + 40.0;
+        double ty = b.teams[0].hq.Y;
+        bool toUplink = mission.goal == RtsMission.GoalHoldUplink ? (waveNo % 2 == 1) : (waveNo % 3 == 1);
+        if (toUplink && b.uplinkOwner != 1) {
+            tx = b.uplinkX;
+            ty = b.uplinkY;
+        }
+        for (int i = 0; i < home.Count; i = i + 1) { home[i].Wave = waveNo; }
+        b.OrderUnits(home, tx, ty, true);
+        b.waveEvent = waveNo;
+        nextWaveTick = b.ticks + mission.waveIntervalTicks;
+    }
+}

@@ -2,17 +2,19 @@ using System;
 using System.Collections.Generic;
 using Game.Tactics;
 using Game.Core;
+using Game.Foundation;
 
-// 一道行军令：各自一张流场（选中的那一队共用），互不覆盖——先派出的分队不会
-// 因为后一道命令改道。没有单位再引用它时随 ARC 释放。
+// 一道行军令：一张流场（选中的那一队共用；同一目标格的流场有缓存），互不覆盖——
+// 先派出的分队不会因为后一道命令改道。attack = 攻击移动：途中遇敌先交战。
 public class RtsOrder {
     public FlowField field;
     public double x;
     public double y;
     public double arriveRadius;
+    public bool attack;
 }
 
-// 本帧的一发射击（界面画曳光、按需出声；仿真只记录，不碰音频）。
+// 本帧的一发射击（界面画炮口焰、曳光与爆点；仿真只记录，不碰音频）。
 public class RtsShot {
     public double fromX;
     public double fromY;
@@ -20,121 +22,326 @@ public class RtsShot {
     public double toY;
     public int team;
     public int type;
+    public double facing;
+    public bool splash;
 }
 
-// 战场仿真：流场寻路 + RVO 群体避障 + 交火与伤亡，不碰界面。Program 每 50ms 调
-// TickSimulation 并读它画图；RtsSim 用同一份逻辑做无头回放与机器人模糊
-// （docs/ZAN_STANDARD.md S26/S27）。
+// 采矿车交矿（界面飘 +10）。
+public class RtsDeposit {
+    public double x;
+    public double y;
+    public int amount;
+    public int team;
+}
+
+// 一片晶矿：采矿车按“距离 + 已分配车辆”挑矿片，矿采完就枯竭。
+public class RtsPatch {
+    public double x;
+    public double y;
+    public int amount;
+    public int initial;
+    public int team;
+}
+
+// 一方阵营：晶矿、人口（排队中的单位预占人口）、生产队列、伤亡与控制时长。
+public class RtsTeam {
+    public int minerals;
+    public int supplyUsed;
+    public int supplyMax;
+    public List<int> queue;
+    public int progress;
+    public RtsUnit hq;
+    public int fielded;
+    public int lost;
+    public int deposited;
+    public int carryLost;
+    public int holdTicks;
+    public double incomeAcc;
+    public double rallyX;
+    public double rallyY;
+    public int spawnSeq;
+}
+
+// 战场仿真：流场寻路 + RVO 群体避障 + 采矿经济 + 生产队列 + 交火与伤亡 + 上行链路占领
+// + 红军 AI（RtsAi），不碰界面。Program 每 50ms 调 TickSimulation 并读它画图；RtsSim 用
+// 同一份逻辑做无头回放与机器人模糊（docs/ZAN_STANDARD.md S26/S27）。
 //
-// 规则：蓝军（玩家）从左岸出发，经中央裂谷峡口进攻；红军守右岸，发现蓝军就迎击，
-// 但不越过裂谷右沿（RedBankX），脱战后回驻防点。双方单位自动向射程内最近的敌人
-// 开火。一方全灭即分胜负（Outcome）；时限由界面层计。
+// 地形：1600×960 的战场，中央一条南北走向的裂谷（流场代价 255，单位也不能踏入），
+// 留出北、中、南三个峡口；中央峡口里是上行链路。两军指挥中心分居东西两端，
+// 各自背后有一片晶矿。
 public class RtsBattle {
-    // 引擎系统
+    public const int QueueMax = 5;
+    public const int MineTicks = 30;
+    public const int CarryAmount = 10;
+    public const double UplinkRadius = 84.0;
+    public const int UplinkIncomePerSec = 4;
+
     public RvoSimulator rvoSim;
     public List<RtsUnit> units;
+    public List<RtsPatch> patches;
+    public RtsTeam[] teams;
+    public RtsMission mission;
+    public RtsAi ai;
+    public DeterministicRandom rng;
 
-    // 战场参数
-    public int worldWidth = 1024;
-    public int worldHeight = 600;
+    public int worldWidth = 1600;
+    public int worldHeight = 960;
     public int cellSize = 32;
+    public int ticks = 0;
+
+    // 上行链路：capture ∈ [-100, 100]，+ 偏蓝、- 偏红；满格才易主，归零变中立
+    public double uplinkX = 800.0;
+    public double uplinkY = 480.0;
+    public int capture = 0;
+    public int uplinkOwner = -1;
+    public int uplinkBlue = 0;
+    public int uplinkRed = 0;
 
     // 最近一道行军令的集结点（界面画标记）
-    public double targetX = 512.0;
-    public double targetY = 300.0;
+    public double targetX = 0.0;
+    public double targetY = 0.0;
     public bool hasTarget = false;
+    public bool targetAttack = false;
 
-    // 资源统计：征召一个装甲营花晶矿，击毁敌军有赏金
-    public int minerals = 1500;
-    public int power = 100;
-    public int supplyUsed = 0;
-    public int supplyMax = 100;
-    public int reinforceCost = 400;
-    public int killBounty = 20;
-
-    // 战况：本帧射击与阵亡（每帧开头清空），累计伤亡
+    // 本帧事件（每帧开头清空）：射击、阵亡、交矿、出厂、链路易主、红军进攻
     public List<RtsShot> shots;
     public List<RtsUnit> fallen;
-    public int blueLost = 0;
-    public int redLost = 0;
-    public int blueFielded = 0;
-    public int redFielded = 0;
+    public List<RtsDeposit> deposits;
+    public List<RtsUnit> spawned;
+    public int captureEvent = -2;
+    public int waveEvent = 0;
+    public int outcome = 0;
 
-    // 红军行为参数
-    public double redAggroRange = 240.0;
-    public double redBankX = 600.0;
-
+    FlowField terrain;
+    Dictionary<int, FlowField> fieldCache;
     int nextId = 1;
 
-    public RtsBattle() {
+    public RtsBattle(int missionIndex, int difficulty, long seed) {
+        mission = RtsMission.Get(missionIndex, difficulty);
+        rng = new DeterministicRandom(seed);
         rvoSim = RvoSimulator.Create(256, 48);
         units = new List<RtsUnit>();
+        patches = new List<RtsPatch>();
         shots = new List<RtsShot>();
         fallen = new List<RtsUnit>();
+        deposits = new List<RtsDeposit>();
+        spawned = new List<RtsUnit>();
+        fieldCache = new Dictionary<int, FlowField>();
+        terrain = BuildTerrain();
+        teams = new RtsTeam[2];
+        teams[0] = NewTeam(mission.blueMinerals, 360.0, 480.0);
+        teams[1] = NewTeam(mission.redMinerals, 1240.0, 480.0);
+        ai = new RtsAi(mission);
         SpawnInitialArmies();
     }
 
-    // 一张带中央裂谷地形的流场（在第 7~12 行留出峡口，其余是代价 255 的悬崖）。
-    public FlowField NewTerrainField() {
-        int cols = worldWidth / cellSize;
-        int rows = worldHeight / cellSize;
-        FlowField f = FlowField.Create(cols, rows, cellSize);
-        int midCol = cols / 2;
-        for (int r = 0; r < rows; r = r + 1) {
+    RtsTeam NewTeam(int minerals, double rx, double ry) {
+        RtsTeam t = new RtsTeam();
+        t.minerals = minerals;
+        t.supplyUsed = 0;
+        t.supplyMax = mission.supplyCap;
+        t.queue = new List<int>();
+        t.progress = 0;
+        t.rallyX = rx;
+        t.rallyY = ry;
+        return t;
+    }
+
+    // ---- 地形 ----
+
+    public int Cols() { return worldWidth / cellSize; }
+    public int Rows() { return worldHeight / cellSize; }
+    public int CanyonCol() { return Cols() / 2 - 1; }
+
+    // 该行的裂谷格是悬崖（三个峡口以外）。
+    public bool IsCanyonRow(int row) {
+        if (row >= 4 && row <= 6) { return false; }
+        if (row >= 12 && row <= 17) { return false; }
+        if (row >= 23 && row <= 25) { return false; }
+        return true;
+    }
+
+    public bool IsBlockedCell(int col, int row) {
+        if (col < 0 || row < 0 || col >= Cols() || row >= Rows()) { return true; }
+        int cc = CanyonCol();
+        return (col == cc || col == cc + 1) && IsCanyonRow(row);
+    }
+
+    public bool IsBlockedAt(double x, double y) {
+        if (x < 0.0 || y < 0.0) { return true; }
+        return IsBlockedCell((int)(x / (double)cellSize), (int)(y / (double)cellSize));
+    }
+
+    FlowField BuildTerrain() {
+        FlowField f = FlowField.Create(Cols(), Rows(), cellSize);
+        int cc = CanyonCol();
+        for (int r = 0; r < Rows(); r = r + 1) {
             if (IsCanyonRow(r)) {
-                f.SetCost(midCol, r, (byte)255);
-                f.SetCost(midCol + 1, r, (byte)255);
+                f.SetCost(cc, r, (byte)255);
+                f.SetCost(cc + 1, r, (byte)255);
             }
         }
         return f;
     }
 
-    // 该行的裂谷格是悬崖（峡口以外）。
-    public bool IsCanyonRow(int row) { return row < 7 || row > 12; }
+    // 通往 (x, y) 所在格的流场（按目标格缓存；目标格是悬崖就往两侧挪一格）。
+    public FlowField FieldTo(double x, double y) {
+        int col = (int)(x / (double)cellSize);
+        int row = (int)(y / (double)cellSize);
+        if (col < 0) { col = 0; }
+        if (row < 0) { row = 0; }
+        if (col >= Cols()) { col = Cols() - 1; }
+        if (row >= Rows()) { row = Rows() - 1; }
+        if (IsBlockedCell(col, row)) { col = x < (double)(worldWidth / 2) ? CanyonCol() - 1 : CanyonCol() + 2; }
+        int key = row * Cols() + col;
+        if (fieldCache.ContainsKey(key)) { return fieldCache[key]; }
+        if (fieldCache.Count >= 64) { fieldCache.Clear(); }
+        FlowField f = FlowField.Create(Cols(), Rows(), cellSize);
+        int cc = CanyonCol();
+        for (int r = 0; r < Rows(); r = r + 1) {
+            if (IsCanyonRow(r)) {
+                f.SetCost(cc, r, (byte)255);
+                f.SetCost(cc + 1, r, (byte)255);
+            }
+        }
+        f.SetTarget(col, row);
+        f.Rebuild();
+        fieldCache[key] = f;
+        return f;
+    }
+
+    // ---- 开局 ----
 
     RtsUnit AddUnit(int type, int team, double sx, double sy) {
         RtsUnit u = RtsUnit.Create(nextId, type, team, sx, sy);
         nextId = nextId + 1;
-        int slot = rvoSim.AddAgent(sx, sy, u.Radius, u.Speed);
-        u.RvoSlot = slot;
-        units.Add(u);
-        if (team == 0) {
-            blueFielded = blueFielded + 1;
-            supplyUsed = supplyUsed + 1;
-        } else {
-            redFielded = redFielded + 1;
+        if (!u.IsBuilding()) {
+            u.RvoSlot = rvoSim.AddAgent(sx, sy, u.Radius, u.Speed);
         }
+        units.Add(u);
+        teams[team].fielded = teams[team].fielded + 1;
         return u;
     }
 
-    public void SpawnInitialArmies() {
-        // 左侧基地：蓝方兵团。
-        // 间距要大于单位直径（步兵 18、坦克 32），否则编队糊成一块——
-        // 这是贴图版和矢量版的共同要求：矢量圆小，贴图大，占位一样。
-        for (int i = 0; i < 40; i = i + 1) {
-            int uType = (i % 6 == 0) ? 1 : 0;  // 少量坦克，大量步兵
-            AddUnit(uType, 0, 60.0 + (double)((i % 8) * 40), 120.0 + (double)((i / 8) * 44));
+    // 开局直接在场的单位：人口立刻计入（生产出来的单位在入队时就预占了人口）。
+    RtsUnit AddStarting(int type, int team, double sx, double sy) {
+        RtsUnit u = AddUnit(type, team, sx, sy);
+        teams[team].supplyUsed = teams[team].supplyUsed + RtsUnit.SupplyOf(type);
+        return u;
+    }
+
+    void AddPatch(double x, double y, int amount, int team) {
+        RtsPatch p = new RtsPatch();
+        p.x = x;
+        p.y = y;
+        p.amount = amount;
+        p.initial = amount;
+        p.team = team;
+        patches.Add(p);
+    }
+
+    double Mirror(double x, int team) { return team == 0 ? x : (double)worldWidth - x; }
+
+    void SpawnInitialArmies() {
+        for (int team = 0; team < 2; team = team + 1) {
+            teams[team].hq = AddUnit(RtsUnit.Hq, team, Mirror(250.0, team), 480.0);
+            // 晶矿：指挥中心背后一道弧
+            AddPatch(Mirror(92.0, team), 320.0, 1600, team);
+            AddPatch(Mirror(62.0, team), 412.0, 1600, team);
+            AddPatch(Mirror(58.0, team), 506.0, 1600, team);
+            AddPatch(Mirror(70.0, team), 600.0, 1600, team);
+            AddPatch(Mirror(104.0, team), 688.0, 1600, team);
+            for (int i = 0; i < 4; i = i + 1) {
+                AddStarting(RtsUnit.Miner, team, Mirror(160.0, team), 380.0 + (double)(i * 66));
+            }
         }
-        // 右岸：红方守军，坦克压在阵中
-        for (int i = 0; i < 54; i = i + 1) {
-            int uType = (i % 4 == 1) ? 1 : 0;
-            AddUnit(uType, 1, 680.0 + (double)((i % 6) * 50), 70.0 + (double)((i / 6) * 58));
+        // 蓝军：指挥中心前方的编队
+        SpawnBlock(0, RtsUnit.Infantry, mission.blueInfantry, 380.0, 400.0);
+        SpawnBlock(0, RtsUnit.Tank, mission.blueTanks, 430.0, 470.0);
+        SpawnBlock(0, RtsUnit.Artillery, mission.blueArtillery, 340.0, 540.0);
+        // 红军守军
+        double rx = mission.redForward ? 940.0 : 1150.0;
+        SpawnBlock(1, RtsUnit.Infantry, mission.redInfantry, rx, 400.0);
+        SpawnBlock(1, RtsUnit.Tank, mission.redTanks, rx - 30.0, 480.0);
+        SpawnBlock(1, RtsUnit.Artillery, mission.redArtillery, rx + 100.0, 560.0);
+        // 红军开局部队是守备队（Wave = -2）：只守家、不参加进攻波次
+        for (int i = 0; i < units.Count; i = i + 1) {
+            if (units[i].Team == 1 && units[i].IsCombat()) { units[i].Wave = -2; }
         }
     }
 
-    // 征召一个装甲营（10 辆）：花晶矿，并受人口上限约束——不设上限的话连点按钮会让
-    // 单位数冲破 RVO 避障器的 256 个槽位，新单位拿不到槽位、原地不动。
-    public bool CanReinforce() {
-        return supplyUsed + 10 <= supplyMax && minerals >= reinforceCost;
+    void SpawnBlock(int team, int type, int count, double x0, double y0) {
+        double gap = RtsUnit.RadiusOf(type) * 2.0 + 14.0;
+        for (int i = 0; i < count; i = i + 1) {
+            double x = x0 + (double)(i % 4) * gap * (team == 0 ? 1.0 : -1.0);
+            double y = y0 + (double)(i / 4) * gap;
+            AddStarting(type, team, x, y);
+        }
     }
 
-    public bool SpawnReinforcements() {
-        if (!CanReinforce()) { return false; }
-        minerals = minerals - reinforceCost;
-        for (int i = 0; i < 10; i = i + 1) {
-            AddUnit(1, 0, 40.0 + (double)(i * 24), 80.0);
-        }
+    // ---- 生产 ----
+
+    public bool CanQueue(int team, int type) {
+        RtsTeam t = teams[team];
+        if (t.hq == null || t.hq.Hp <= 0 || outcome != 0) { return false; }
+        if (type < 0 || type > RtsUnit.Artillery) { return false; }
+        if (t.queue.Count >= QueueMax) { return false; }
+        if (t.minerals < RtsUnit.CostOf(type)) { return false; }
+        return t.supplyUsed + RtsUnit.SupplyOf(type) <= t.supplyMax;
+    }
+
+    public bool Enqueue(int team, int type) {
+        if (!CanQueue(team, type)) { return false; }
+        RtsTeam t = teams[team];
+        t.minerals = t.minerals - RtsUnit.CostOf(type);
+        t.supplyUsed = t.supplyUsed + RtsUnit.SupplyOf(type);
+        t.queue.Add(type);
         return true;
+    }
+
+    // 取消队尾（全额退款、退人口）；正在生产的那一个进度清零。
+    public bool CancelLast(int team) {
+        RtsTeam t = teams[team];
+        if (t.queue.Count == 0) { return false; }
+        int last = t.queue.Count - 1;
+        int type = t.queue[last];
+        t.queue.RemoveAt(last);
+        t.minerals = t.minerals + RtsUnit.CostOf(type);
+        t.supplyUsed = t.supplyUsed - RtsUnit.SupplyOf(type);
+        if (last == 0) { t.progress = 0; }
+        return true;
+    }
+
+    public int QueuedSupply(int team) {
+        RtsTeam t = teams[team];
+        int n = 0;
+        for (int i = 0; i < t.queue.Count; i = i + 1) { n = n + RtsUnit.SupplyOf(t.queue[i]); }
+        return n;
+    }
+
+    void TickProduction(int team) {
+        RtsTeam t = teams[team];
+        if (t.queue.Count == 0 || t.hq == null || t.hq.Hp <= 0) { return; }
+        int type = t.queue[0];
+        t.progress = t.progress + 1;
+        if (t.progress < RtsUnit.BuildTicksOf(type)) { return; }
+        t.progress = 0;
+        t.queue.RemoveAt(0);
+        // 出厂口：指挥中心朝前线一侧，按序号上下错开
+        double side = team == 0 ? 1.0 : -1.0;
+        int seq = t.spawnSeq % 5;
+        t.spawnSeq = t.spawnSeq + 1;
+        double sx = t.hq.X + side * (t.hq.Radius + 18.0);
+        double sy = t.hq.Y + (double)(seq - 2) * 22.0;
+        if (type == RtsUnit.Miner) { sx = t.hq.X - side * (t.hq.Radius + 16.0); }
+        RtsUnit u = AddUnit(type, team, sx, sy);
+        spawned.Add(u);
+        if (type != RtsUnit.Miner) {
+            double jx = (double)((seq % 3) - 1) * 26.0;
+            double jy = (double)(seq - 2) * 20.0;
+            RtsOrder o = NewOrder(t.rallyX + jx, t.rallyY + jy, 1, false);
+            u.Order = o;
+        }
     }
 
     // ---- 选择 ----
@@ -143,24 +350,31 @@ public class RtsBattle {
         for (int i = 0; i < units.Count; i = i + 1) { units[i].Selected = false; }
     }
 
-    // 框选矩形内的蓝军（additive = 追加到现有选择）。返回选中数。
+    // 框选矩形内的蓝军机动单位（additive = 追加）。框里有作战单位时不选采矿车。
     public int SelectInRect(double x0, double y0, double x1, double y1, bool additive) {
         double lx = Math.Min(x0, x1);
         double hx = Math.Max(x0, x1);
         double ly = Math.Min(y0, y1);
         double hy = Math.Max(y0, y1);
         if (!additive) { ClearSelection(); }
-        for (int i = 0; i < units.Count; i = i + 1) {
-            RtsUnit u = units[i];
-            if (u.Team != 0) { continue; }
-            if (u.X + u.Radius >= lx && u.X - u.Radius <= hx && u.Y + u.Radius >= ly && u.Y - u.Radius <= hy) {
-                u.Selected = true;
+        bool anyCombat = false;
+        for (int pass = 0; pass < 2; pass = pass + 1) {
+            for (int i = 0; i < units.Count; i = i + 1) {
+                RtsUnit u = units[i];
+                if (u.Team != 0 || u.IsBuilding()) { continue; }
+                if (u.X + u.Radius >= lx && u.X - u.Radius <= hx && u.Y + u.Radius >= ly && u.Y - u.Radius <= hy) {
+                    if (pass == 0) {
+                        if (u.IsCombat()) { anyCombat = true; }
+                    } else if (!anyCombat || u.IsCombat()) {
+                        u.Selected = true;
+                    }
+                }
             }
         }
         return SelectedCount();
     }
 
-    // 点选：点中的蓝军单位（没点中就清空选择，除非 additive）。返回选中数。
+    // 点选：点中的蓝军单位或指挥中心（没点中就清空选择，除非 additive）。
     public int SelectAt(double x, double y, bool additive) {
         RtsUnit best = null;
         double bestD = 0.0;
@@ -176,13 +390,41 @@ public class RtsBattle {
                 bestD = d;
             }
         }
-        if (!additive) { ClearSelection(); }
-        if (best != null) { best.Selected = true; }
+        if (!additive || (best != null && best.IsBuilding())) { ClearSelection(); }
+        if (best != null) {
+            if (additive && !best.IsBuilding()) { DeselectBuildings(); }
+            best.Selected = true;
+        }
         return SelectedCount();
     }
 
-    public int SelectAll() {
-        for (int i = 0; i < units.Count; i = i + 1) { units[i].Selected = units[i].Team == 0; }
+    void DeselectBuildings() {
+        for (int i = 0; i < units.Count; i = i + 1) {
+            if (units[i].IsBuilding()) { units[i].Selected = false; }
+        }
+    }
+
+    // 全选作战单位（不含采矿车与建筑）。
+    public int SelectArmy() {
+        for (int i = 0; i < units.Count; i = i + 1) {
+            RtsUnit u = units[i];
+            u.Selected = u.Team == 0 && u.IsCombat();
+        }
+        return SelectedCount();
+    }
+
+    public int SelectMiners() {
+        for (int i = 0; i < units.Count; i = i + 1) {
+            RtsUnit u = units[i];
+            u.Selected = u.Team == 0 && u.Type == RtsUnit.Miner;
+        }
+        return SelectedCount();
+    }
+
+    public int SelectHq() {
+        ClearSelection();
+        RtsUnit hq = teams[0].hq;
+        if (hq != null && hq.Hp > 0) { hq.Selected = true; }
         return SelectedCount();
     }
 
@@ -194,60 +436,34 @@ public class RtsBattle {
         return n;
     }
 
+    public bool HqSelected() {
+        RtsUnit hq = teams[0].hq;
+        return hq != null && hq.Hp > 0 && hq.Selected;
+    }
+
     // ---- 指令 ----
 
-    // 选中的蓝军向 (mouseX, mouseY) 行军。没有选中单位时不下令，返回 0。
-    public int CommandMove(int mouseX, int mouseY) {
-        int n = SelectedCount();
-        if (n == 0) { return 0; }
-        double tx = Math.Max(4.0, Math.Min((double)mouseX, (double)worldWidth - 4.0));
-        double ty = Math.Max(4.0, Math.Min((double)mouseY, (double)worldHeight - 4.0));
-        targetX = tx;
-        targetY = ty;
-        hasTarget = true;
-
-        // 这一队共用一张流场：宏观路径绕开裂谷
+    RtsOrder NewOrder(double x, double y, int n, bool attack) {
         RtsOrder o = new RtsOrder();
-        o.field = NewTerrainField();
-        o.field.SetTarget((int)tx / cellSize, (int)ty / cellSize);
-        o.field.Rebuild();
-        o.x = tx;
-        o.y = ty;
+        o.field = FieldTo(x, y);
+        o.x = x;
+        o.y = y;
         // 大部队挤不进同一个点：到达半径随人数放大
-        o.arriveRadius = 24.0 + 6.0 * Math.Sqrt((double)n);
-        for (int i = 0; i < units.Count; i = i + 1) {
-            if (units[i].Selected) { units[i].Order = o; }
-        }
-        return n;
+        o.arriveRadius = 22.0 + 6.0 * Math.Sqrt((double)n);
+        o.attack = attack;
+        return o;
     }
 
-    // ---- 战况 ----
-
-    public int Alive(int team) {
-        int n = 0;
-        for (int i = 0; i < units.Count; i = i + 1) {
-            if (units[i].Team == team) { n = n + 1; }
-        }
-        return n;
-    }
-
-    // 0 = 交战中，1 = 蓝军胜（红军全灭），2 = 红军胜（蓝军全灭）。
-    public int Outcome() {
-        if (Alive(1) == 0) { return 1; }
-        if (Alive(0) == 0) { return 2; }
-        return 0;
-    }
-
-    // 射程内最近的活着的敌人（没有返回 null）。
-    public RtsUnit NearestEnemy(RtsUnit u, double reach) {
+    // 敌方单位是否在 (x, y) 附近（右键点到敌人 = 攻击移动）。
+    public RtsUnit EnemyNear(int team, double x, double y, double reach) {
         RtsUnit best = null;
         double bestD = reach * reach;
         for (int i = 0; i < units.Count; i = i + 1) {
             RtsUnit e = units[i];
-            if (e.Team == u.Team || e.Hp <= 0) { continue; }
-            double dx = e.X - u.X;
-            double dy = e.Y - u.Y;
-            double d = dx * dx + dy * dy;
+            if (e.Team == team) { continue; }
+            double dx = e.X - x;
+            double dy = e.Y - y;
+            double d = dx * dx + dy * dy - e.Radius * e.Radius;
             if (d <= bestD) {
                 best = e;
                 bestD = d;
@@ -256,106 +472,437 @@ public class RtsBattle {
         return best;
     }
 
-    void SteerBlue(RtsUnit u) {
-        RtsOrder o = u.Order;
-        if (o == null) {
-            rvoSim.SetPrefVelocity(u.RvoSlot, 0.0, 0.0);
-            return;
+    // 右键：选中单位行军（点到敌人 = 攻击移动）；只选了指挥中心 = 设集结点。
+    // 返回 1 行军、2 攻击、3 设集结点、0 无效。forceAttack = Shift+右键：攻击移动。
+    public int CommandAt(double mx, double my) { return CommandAt(mx, my, false); }
+
+    public int CommandAt(double mx, double my, bool forceAttack) {
+        double tx = Math.Max(6.0, Math.Min(mx, (double)worldWidth - 6.0));
+        double ty = Math.Max(6.0, Math.Min(my, (double)worldHeight - 6.0));
+        int n = 0;
+        for (int i = 0; i < units.Count; i = i + 1) {
+            if (units[i].Selected && !units[i].IsBuilding()) { n = n + 1; }
         }
-        double dx = o.x - u.X;
-        double dy = o.y - u.Y;
-        double dist = Math.Sqrt(dx * dx + dy * dy);
-        if (dist < o.arriveRadius) {
-            // 已到达集结点：转为驻守
-            u.Order = null;
-            rvoSim.SetPrefVelocity(u.RvoSlot, 0.0, 0.0);
-            return;
+        if (n == 0) {
+            if (!HqSelected() || IsBlockedAt(tx, ty)) { return 0; }
+            teams[0].rallyX = tx;
+            teams[0].rallyY = ty;
+            targetX = tx;
+            targetY = ty;
+            hasTarget = true;
+            targetAttack = false;
+            return 3;
         }
-        float fx;
-        float fy;
-        o.field.SampleWorldVelocity(u.X, u.Y, out fx, out fy);
-        // 若流场有效，按流场方向全速前进；否则直指目标
-        double vx;
-        double vy;
-        if (Math.Abs(fx) > 0.01 || Math.Abs(fy) > 0.01) {
-            vx = (double)fx * u.Speed;
-            vy = (double)fy * u.Speed;
-        } else {
-            vx = (dx / dist) * u.Speed;
-            vy = (dy / dist) * u.Speed;
+        bool attack = forceAttack || EnemyNear(0, tx, ty, 24.0) != null;
+        RtsOrder o = NewOrder(tx, ty, n, attack);
+        for (int i = 0; i < units.Count; i = i + 1) {
+            RtsUnit u = units[i];
+            if (u.Selected && !u.IsBuilding()) {
+                u.Order = o;
+                if (u.Type == RtsUnit.Miner) { u.MineState = u.Carry > 0 ? 2 : 0; }
+            }
         }
-        rvoSim.SetPrefVelocity(u.RvoSlot, vx, vy);
+        targetX = tx;
+        targetY = ty;
+        hasTarget = true;
+        targetAttack = attack;
+        return attack ? 2 : 1;
     }
 
-    void SteerRed(RtsUnit u) {
-        RtsUnit t = NearestEnemy(u, redAggroRange);
-        double gx = u.HomeX;
-        double gy = u.HomeY;
-        if (t != null) {
-            double tdx = t.X - u.X;
-            double tdy = t.Y - u.Y;
-            if (Math.Sqrt(tdx * tdx + tdy * tdy) <= u.Range * 0.85) {
-                rvoSim.SetPrefVelocity(u.RvoSlot, 0.0, 0.0);
-                return;
-            }
-            gx = t.X;
-            gy = t.Y;
+    // 兼容旧接口：右键像素坐标行军。
+    public int CommandMove(int mouseX, int mouseY) { return CommandAt((double)mouseX, (double)mouseY) > 0 ? SelectedCount() : 0; }
+
+    // 红军 AI 用：给一批单位下同一道攻击移动令。
+    public void OrderUnits(List<RtsUnit> list, double x, double y, bool attack) {
+        if (list.Count == 0) { return; }
+        RtsOrder o = NewOrder(x, y, list.Count, attack);
+        for (int i = 0; i < list.Count; i = i + 1) { list[i].Order = o; }
+    }
+
+    // ---- 战况 ----
+
+    public int Alive(int team) {
+        int n = 0;
+        for (int i = 0; i < units.Count; i = i + 1) {
+            if (units[i].Team == team && !units[i].IsBuilding()) { n = n + 1; }
         }
-        // 守军不过裂谷：目标点钳在右岸
-        if (gx < redBankX) { gx = redBankX; }
+        return n;
+    }
+
+    public int CountType(int team, int type) {
+        int n = 0;
+        for (int i = 0; i < units.Count; i = i + 1) {
+            if (units[i].Team == team && units[i].Type == type) { n = n + 1; }
+        }
+        return n;
+    }
+
+    public int QueuedType(int team, int type) {
+        int n = 0;
+        List<int> q = teams[team].queue;
+        for (int i = 0; i < q.Count; i = i + 1) {
+            if (q[i] == type) { n = n + 1; }
+        }
+        return n;
+    }
+
+    public int HqPercent(int team) {
+        RtsUnit hq = teams[team].hq;
+        if (hq == null || hq.Hp <= 0) { return 0; }
+        return hq.Hp * 100 / hq.MaxHp;
+    }
+
+    public int TimeLeftTicks() {
+        int left = mission.timeLimitTicks - ticks;
+        return left < 0 ? 0 : left;
+    }
+
+    // 0 = 交战中，1 = 蓝军胜，2 = 蓝军败。
+    public int Outcome() { return outcome; }
+
+    int Judge() {
+        if (teams[0].hq.Hp <= 0) { return 2; }
+        if (teams[1].hq.Hp <= 0) { return 1; }
+        if (mission.goal == RtsMission.GoalHoldUplink && teams[0].holdTicks >= mission.holdTicksToWin) { return 1; }
+        if (ticks >= mission.timeLimitTicks) { return 2; }
+        return 0;
+    }
+
+    // 射程内最该打的敌人：距离按克制倍率折算（优先打克制得了的），建筑最后打。
+    public RtsUnit BestTarget(RtsUnit u, double reach, double minReach) {
+        RtsUnit best = null;
+        double bestScore = 0.0;
+        for (int i = 0; i < units.Count; i = i + 1) {
+            RtsUnit e = units[i];
+            if (e.Team == u.Team || e.Hp <= 0) { continue; }
+            double dx = e.X - u.X;
+            double dy = e.Y - u.Y;
+            double d = Math.Sqrt(dx * dx + dy * dy) - e.Radius;
+            if (d > reach || d < minReach) { continue; }
+            double mul = RtsUnit.CounterMul(u.Type, e.Type);
+            double score = (d + 20.0) / mul;
+            if (e.IsBuilding()) { score = score * 3.0 + 200.0; }
+            if (best == null || score < bestScore) {
+                best = e;
+                bestScore = score;
+            }
+        }
+        return best;
+    }
+
+    double Dist(double ax, double ay, double bx, double by) {
+        double dx = bx - ax;
+        double dy = by - ay;
+        return Math.Sqrt(dx * dx + dy * dy);
+    }
+
+    // ---- 意图 ----
+
+    void Stop(RtsUnit u) { rvoSim.SetPrefVelocity(u.RvoSlot, 0.0, 0.0); }
+
+    void SteerDirect(RtsUnit u, double gx, double gy, double stopDist) {
         double dx = gx - u.X;
         double dy = gy - u.Y;
         double dist = Math.Sqrt(dx * dx + dy * dy);
-        if (dist < 8.0) {
-            rvoSim.SetPrefVelocity(u.RvoSlot, 0.0, 0.0);
+        if (dist <= stopDist) {
+            Stop(u);
             return;
         }
-        rvoSim.SetPrefVelocity(u.RvoSlot, (dx / dist) * u.Speed, (dy / dist) * u.Speed);
+        double sp = u.Speed;
+        // 接近目标时减速，免得在终点抖动
+        if (dist < 30.0) { sp = sp * (0.35 + 0.65 * dist / 30.0); }
+        rvoSim.SetPrefVelocity(u.RvoSlot, dx / dist * sp, dy / dist * sp);
     }
+
+    // 隔着裂谷时按流场绕行，同侧直线走。
+    void SteerTo(RtsUnit u, double gx, double gy, FlowField field) {
+        bool across = (u.X < (double)(worldWidth / 2)) != (gx < (double)(worldWidth / 2));
+        if (field == null && across) { field = FieldTo(gx, gy); }
+        if (field != null) {
+            float fx;
+            float fy;
+            field.SampleWorldVelocity(u.X, u.Y, out fx, out fy);
+            if (Math.Abs(fx) > 0.01 || Math.Abs(fy) > 0.01) {
+                rvoSim.SetPrefVelocity(u.RvoSlot, (double)fx * u.Speed, (double)fy * u.Speed);
+                return;
+            }
+        }
+        SteerDirect(u, gx, gy, 0.0);
+    }
+
+    // 交战：进入射程就停火力输出，炮兵被贴脸就后撤。
+    void Engage(RtsUnit u, RtsUnit t) {
+        double d = Dist(u.X, u.Y, t.X, t.Y) - t.Radius;
+        if (u.MinRange > 0.0 && d < u.MinRange + 6.0) {
+            double dx = u.X - t.X;
+            double dy = u.Y - t.Y;
+            double len = Math.Max(1.0, Math.Sqrt(dx * dx + dy * dy));
+            rvoSim.SetPrefVelocity(u.RvoSlot, dx / len * u.Speed, dy / len * u.Speed);
+            return;
+        }
+        if (d <= u.Range * 0.92) {
+            Stop(u);
+            u.Facing = Math.Atan2(t.Y - u.Y, t.X - u.X);
+            return;
+        }
+        SteerTo(u, t.X, t.Y, null);
+    }
+
+    void SteerCombat(RtsUnit u) {
+        double acquire = u.Range + 70.0;
+        RtsOrder o = u.Order;
+        if (o != null) {
+            if (o.attack) {
+                RtsUnit t = BestTarget(u, acquire, 0.0);
+                if (t != null) {
+                    Engage(u, t);
+                    return;
+                }
+            }
+            if (Dist(u.X, u.Y, o.x, o.y) < o.arriveRadius) {
+                u.Order = null;
+                u.HomeX = u.X;
+                u.HomeY = u.Y;
+                Stop(u);
+                return;
+            }
+            SteerTo(u, o.x, o.y, o.field);
+            return;
+        }
+        // 驻守：守卫半径内有敌就迎击，否则回锚点
+        RtsUnit g = BestTarget(u, acquire, 0.0);
+        if (g != null && Dist(u.HomeX, u.HomeY, g.X, g.Y) < 280.0) {
+            Engage(u, g);
+            return;
+        }
+        SteerDirect(u, u.HomeX, u.HomeY, 10.0);
+    }
+
+    // 采矿车：去矿片 → 采 1.5 秒 → 运回指挥中心交矿 → 再去。手动行军令优先。
+    void SteerMiner(RtsUnit u) {
+        RtsOrder o = u.Order;
+        if (o != null) {
+            if (Dist(u.X, u.Y, o.x, o.y) < o.arriveRadius) {
+                u.Order = null;
+                Stop(u);
+                return;
+            }
+            SteerTo(u, o.x, o.y, o.field);
+            return;
+        }
+        RtsUnit hq = teams[u.Team].hq;
+        if (hq == null || hq.Hp <= 0) {
+            Stop(u);
+            return;
+        }
+        if (u.MineState == 2) {
+            if (Dist(u.X, u.Y, hq.X, hq.Y) <= hq.Radius + u.Radius + 8.0) {
+                RtsTeam t = teams[u.Team];
+                t.minerals = t.minerals + u.Carry;
+                t.deposited = t.deposited + u.Carry;
+                RtsDeposit dep = new RtsDeposit();
+                dep.x = u.X;
+                dep.y = u.Y;
+                dep.amount = u.Carry;
+                dep.team = u.Team;
+                deposits.Add(dep);
+                u.Carry = 0;
+                u.MineState = 0;
+                Stop(u);
+                return;
+            }
+            SteerTo(u, hq.X, hq.Y, null);
+            return;
+        }
+        if (u.Carry >= CarryAmount) {
+            u.MineState = 2;
+            return;
+        }
+        if (u.Patch < 0 || patches[u.Patch].amount <= 0) {
+            u.Patch = PickPatch(u);
+            u.MineState = 0;
+            if (u.Patch < 0) {
+                Stop(u);
+                return;
+            }
+        }
+        RtsPatch p = patches[u.Patch];
+        if (u.MineState == 1) {
+            Stop(u);
+            u.Facing = Math.Atan2(p.y - u.Y, p.x - u.X);
+            u.MineTimer = u.MineTimer - 1;
+            if (u.MineTimer <= 0) {
+                int take = Math.Min(CarryAmount - u.Carry, p.amount);
+                if (take < 0) { take = 0; }
+                p.amount = p.amount - take;
+                u.Carry = u.Carry + take;
+                u.MineState = 2;
+            }
+            return;
+        }
+        if (Dist(u.X, u.Y, p.x, p.y) <= u.Radius + 22.0) {
+            u.MineState = 1;
+            u.MineTimer = MineTicks;
+            Stop(u);
+            return;
+        }
+        SteerTo(u, p.x, p.y, null);
+    }
+
+    // 挑矿片：距离 + 每辆已分配采矿车折算 70px，矿车自然分散到各片。
+    int PickPatch(RtsUnit u) {
+        int best = -1;
+        double bestScore = 0.0;
+        for (int i = 0; i < patches.Count; i = i + 1) {
+            RtsPatch p = patches[i];
+            if (p.amount <= 0 || p.team != u.Team) { continue; }
+            int assigned = 0;
+            for (int k = 0; k < units.Count; k = k + 1) {
+                if (units[k] != u && units[k].Patch == i && units[k].Type == RtsUnit.Miner) { assigned = assigned + 1; }
+            }
+            double score = Dist(u.X, u.Y, p.x, p.y) + 70.0 * (double)assigned;
+            if (best < 0 || score < bestScore) {
+                best = i;
+                bestScore = score;
+            }
+        }
+        return best;
+    }
+
+    // ---- 上行链路 ----
+
+    void TickUplink() {
+        int blue = 0;
+        int red = 0;
+        for (int i = 0; i < units.Count; i = i + 1) {
+            RtsUnit u = units[i];
+            if (!u.IsCombat()) { continue; }
+            if (Dist(u.X, u.Y, uplinkX, uplinkY) <= UplinkRadius) {
+                if (u.Team == 0) { blue = blue + 1; } else { red = red + 1; }
+            }
+        }
+        uplinkBlue = blue;
+        uplinkRed = red;
+        int before = uplinkOwner;
+        if (blue > 0 && red == 0) {
+            capture = Math.Min(100, capture + 1 + Math.Min(blue, 4) / 2);
+        } else if (red > 0 && blue == 0) {
+            capture = Math.Max(-100, capture - 1 - Math.Min(red, 4) / 2);
+        }
+        if (capture >= 100) { uplinkOwner = 0; }
+        if (capture <= -100) { uplinkOwner = 1; }
+        if (uplinkOwner == 0 && capture <= 0) { uplinkOwner = -1; }
+        if (uplinkOwner == 1 && capture >= 0) { uplinkOwner = -1; }
+        if (uplinkOwner != before) { captureEvent = uplinkOwner; }
+        if (uplinkOwner >= 0) {
+            RtsTeam t = teams[uplinkOwner];
+            t.holdTicks = t.holdTicks + 1;
+            t.incomeAcc = t.incomeAcc + (double)UplinkIncomePerSec / 20.0;
+        }
+    }
+
+    void TickIncome() {
+        RtsTeam red = teams[1];
+        if (red.hq.Hp > 0) { red.incomeAcc = red.incomeAcc + mission.redIncomePerSec / 20.0; }
+        for (int k = 0; k < 2; k = k + 1) {
+            RtsTeam t = teams[k];
+            if (t.incomeAcc >= 1.0) {
+                int whole = (int)t.incomeAcc;
+                t.minerals = t.minerals + whole;
+                t.incomeAcc = t.incomeAcc - (double)whole;
+            }
+        }
+    }
+
+    // ---- 帧 ----
 
     public void TickSimulation(double dt) {
         shots.Clear();
         fallen.Clear();
+        deposits.Clear();
+        spawned.Clear();
+        captureEvent = -2;
+        waveEvent = 0;
+        if (outcome != 0) { return; }
+        ticks = ticks + 1;
 
-        // 1. 意图：蓝军按流场行军，红军迎击/回防
+        // 0. 红军指挥官：生产、防守、争夺链路、发动进攻波次
+        ai.Tick(this);
+        TickProduction(0);
+        TickProduction(1);
+
+        // 1. 意图
+        for (int i = 0; i < units.Count; i = i + 1) {
+            RtsUnit u = units[i];
+            u.PrevX = u.X;
+            u.PrevY = u.Y;
+            if (u.RvoSlot < 0) { continue; }
+            if (u.Type == RtsUnit.Miner) { SteerMiner(u); } else { SteerCombat(u); }
+        }
+
+        // 2. 微观 RVO 互斥推挤
+        rvoSim.Step(dt);
+
+        // 3. 同步回逻辑单位：战场边缘是墙、裂谷是墙（踏进悬崖格就沿另一轴滑开）、
+        //    建筑是实心圆（被挤进去的推回圆周）
         for (int i = 0; i < units.Count; i = i + 1) {
             RtsUnit u = units[i];
             if (u.RvoSlot < 0) { continue; }
-            if (u.Team == 0) { SteerBlue(u); } else { SteerRed(u); }
-        }
-
-        // 2. 微观 RVO2 互斥推挤物理步进计算
-        rvoSim.Step(dt);
-
-        // 3. 将 RVO 物理位置同步回逻辑单位。战场边缘是墙：避障推挤只在单位之间，
-        //    大部队压向边缘时会把外圈挤出界，这里钳回场内（同步写回避障器）。
-        for (int i = 0; i < units.Count; i = i + 1) {
-            RtsUnit u = units[i];
-            if (u.RvoSlot >= 0) {
-                int slot = u.RvoSlot;
-                double maxX = (double)worldWidth - u.Radius;
-                double maxY = (double)worldHeight - u.Radius;
-                double px = Math.Max(u.Radius, Math.Min(rvoSim.GetX(slot), maxX));
-                double py = Math.Max(u.Radius, Math.Min(rvoSim.GetY(slot), maxY));
-                rvoSim.posX[slot] = px;
-                rvoSim.posY[slot] = py;
-                u.X = px;
-                u.Y = py;
+            int slot = u.RvoSlot;
+            double px = Math.Max(u.Radius, Math.Min(rvoSim.GetX(slot), (double)worldWidth - u.Radius));
+            double py = Math.Max(u.Radius, Math.Min(rvoSim.GetY(slot), (double)worldHeight - u.Radius));
+            if (IsBlockedAt(px, py)) {
+                if (!IsBlockedAt(px, u.PrevY)) {
+                    py = u.PrevY;
+                } else if (!IsBlockedAt(u.PrevX, py)) {
+                    px = u.PrevX;
+                } else {
+                    px = u.PrevX;
+                    py = u.PrevY;
+                }
             }
+            for (int k = 0; k < 2; k = k + 1) {
+                RtsUnit hq = teams[k].hq;
+                if (hq.Hp <= 0) { continue; }
+                double dx = px - hq.X;
+                double dy = py - hq.Y;
+                double min = hq.Radius + u.Radius;
+                double d2 = dx * dx + dy * dy;
+                if (d2 < min * min) {
+                    double d = Math.Max(0.001, Math.Sqrt(d2));
+                    px = hq.X + dx / d * min;
+                    py = hq.Y + dy / d * min;
+                }
+            }
+            rvoSim.posX[slot] = px;
+            rvoSim.posY[slot] = py;
+            double mvx = px - u.PrevX;
+            double mvy = py - u.PrevY;
+            if (mvx * mvx + mvy * mvy > 0.25) { u.Facing = Math.Atan2(mvy, mvx); }
+            u.X = px;
+            u.Y = py;
         }
 
-        // 4. 交火：冷却好的单位打射程内最近的敌人
+        // 4. 交火：冷却好的单位打射程内最该打的敌人（克制倍率 + 炮兵溅射）
         for (int i = 0; i < units.Count; i = i + 1) {
             RtsUnit u = units[i];
-            if (u.Hp <= 0 || u.Range <= 0.0) { continue; }
+            if (u.Hp <= 0 || !u.Armed()) { continue; }
             if (u.Cooldown > 0.0) {
                 u.Cooldown = u.Cooldown - dt;
                 continue;
             }
-            RtsUnit t = NearestEnemy(u, u.Range);
+            RtsUnit t = BestTarget(u, u.Range, u.MinRange);
             if (t == null) { continue; }
-            t.Hp = t.Hp - u.Damage;
+            Hit(u, t, 1.0);
+            if (u.Splash > 0.0) {
+                for (int k = 0; k < units.Count; k = k + 1) {
+                    RtsUnit o = units[k];
+                    if (o == t || o.Team == u.Team || o.Hp <= 0) { continue; }
+                    if (Dist(o.X, o.Y, t.X, t.Y) <= u.Splash + o.Radius) { Hit(u, o, 0.5); }
+                }
+            }
             u.Cooldown = u.Reload;
+            u.Facing = Math.Atan2(t.Y - u.Y, t.X - u.X);
             RtsShot s = new RtsShot();
             s.fromX = u.X;
             s.fromY = u.Y;
@@ -363,25 +910,55 @@ public class RtsBattle {
             s.toY = t.Y;
             s.team = u.Team;
             s.type = u.Type;
+            s.facing = u.Facing;
+            s.splash = u.Splash > 0.0;
             shots.Add(s);
         }
 
-        // 5. 清点阵亡：退还避障槽位，记伤亡与赏金
+        // 5. 清点阵亡：退还避障槽位与人口，记伤亡；采矿车携带的矿随车损失
         for (int i = units.Count - 1; i >= 0; i = i - 1) {
             RtsUnit u = units[i];
             if (u.Hp > 0) { continue; }
             if (u.RvoSlot >= 0) { rvoSim.RemoveAgent(u.RvoSlot); }
             u.RvoSlot = -1;
             u.Order = null;
+            u.Selected = false;
             fallen.Add(u);
-            if (u.Team == 0) {
-                blueLost = blueLost + 1;
-                supplyUsed = supplyUsed - 1;
-            } else {
-                redLost = redLost + 1;
-                minerals = minerals + killBounty;
-            }
+            RtsTeam t = teams[u.Team];
+            t.lost = t.lost + 1;
+            t.supplyUsed = t.supplyUsed - RtsUnit.SupplyOf(u.Type);
+            t.carryLost = t.carryLost + u.Carry;
+            u.Carry = 0;
             units.RemoveAt(i);
         }
+
+        TickUplink();
+        TickIncome();
+        outcome = Judge();
+    }
+
+    void Hit(RtsUnit u, RtsUnit t, double scale) {
+        int dmg = (int)((double)u.Damage * RtsUnit.CounterMul(u.Type, t.Type) * scale + 0.5);
+        if (dmg < 1) { dmg = 1; }
+        t.Hp = t.Hp - dmg;
+        t.HitTick = ticks;
+    }
+
+    // 晶矿守恒：矿区被采走的 = 交到指挥中心的 + 车上拉着的 + 随车损失的。
+    public bool MineralsConserved() {
+        int mined = 0;
+        for (int i = 0; i < patches.Count; i = i + 1) { mined = mined + patches[i].initial - patches[i].amount; }
+        int accounted = teams[0].deposited + teams[1].deposited + teams[0].carryLost + teams[1].carryLost;
+        for (int i = 0; i < units.Count; i = i + 1) { accounted = accounted + units[i].Carry; }
+        return mined == accounted;
+    }
+
+    // 人口账平：已用人口 = 在场单位人口 + 排队中单位人口（两军各自）。
+    public bool SupplyBalanced(int team) {
+        int n = QueuedSupply(team);
+        for (int i = 0; i < units.Count; i = i + 1) {
+            if (units[i].Team == team) { n = n + RtsUnit.SupplyOf(units[i].Type); }
+        }
+        return n == teams[team].supplyUsed;
     }
 }

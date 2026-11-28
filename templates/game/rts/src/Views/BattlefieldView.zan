@@ -1,22 +1,25 @@
-// 战场绘制画布控件：把 Program 的绘制挂进 GUI 树，并把指针手势翻译成指挥动作
-// （左键点选 / 拖拽框选，右键行军）。可取焦点，键盘事件经它冒泡到 RtsRoot。
+// 战场画布控件：把 Program 的战场绘制挂进 GUI 树，并把指针手势翻译成指挥动作
+// （左键点选 / 拖拽框选，右键行军，Shift+右键攻击移动），鼠标贴边滚动镜头。
+// 可取焦点，键盘事件经它冒泡到 RtsRoot。坐标换算：世界 = 控件内像素 + 镜头。
 using System;
 using System.Collections.Generic;
 using Gui;
 using Gui.Backend;
 using Gui.Widget;
-using Game.Tactics;
-using Game.Core;
 
 public class BattlefieldView : Control {
     weak Program host;  // 回指宿主：weak 断开 Program.view ↔ host 的引用环
 
-    // 左键框选手势（控件坐标系内的屏幕像素）
+    // 左键框选手势（屏幕像素）
     bool dragging = false;
     int dragX0 = 0;
     int dragY0 = 0;
     int dragX1 = 0;
     int dragY1 = 0;
+    // 鼠标是否停在视口里、停在哪（贴边滚动用）
+    bool hovering = false;
+    int hoverX = 0;
+    int hoverY = 0;
 
     BattlefieldView(Program host) {
         this.InitControl("battlefield");
@@ -30,6 +33,22 @@ public class BattlefieldView : Control {
     public int DragTop() { return Math.Min(this.dragY0, this.dragY1); }
     public int DragWidth() { return this.dragX1 > this.dragX0 ? this.dragX1 - this.dragX0 : this.dragX0 - this.dragX1; }
     public int DragHeight() { return this.dragY1 > this.dragY0 ? this.dragY1 - this.dragY0 : this.dragY0 - this.dragY1; }
+    public int ViewW() { return this.bw; }
+    public int ViewH() { return this.bh; }
+
+    // 贴边滚动方向（-1/0/1）：鼠标在视口边缘 14px 内
+    public int EdgeX() {
+        if (!this.hovering || this.dragging) { return 0; }
+        if (this.hoverX < this.bx + 14) { return -1; }
+        if (this.hoverX > this.bx + this.bw - 14) { return 1; }
+        return 0;
+    }
+    public int EdgeY() {
+        if (!this.hovering || this.dragging) { return 0; }
+        if (this.hoverY < this.by + 14) { return -1; }
+        if (this.hoverY > this.by + this.bh - 14) { return 1; }
+        return 0;
+    }
 
     public void CancelDrag() {
         this.dragging = false;
@@ -44,8 +63,8 @@ public class BattlefieldView : Control {
         this.Focus(app);
         if (!host.AcceptsBattleInput()) { return; }
         if (e.button == 1) {
-            // 右键：选中单位向该点行军
-            host.OrderMoveAt(e.x - this.bx, e.y - this.by);
+            // 右键：选中单位向该点行军（Shift = 攻击移动）
+            host.OrderAt(e.x - this.bx, e.y - this.by, Modifiers.HasShift(e.modifiers));
             e.Handle();
             return;
         }
@@ -61,12 +80,20 @@ public class BattlefieldView : Control {
     }
 
     public override void OnPointerMove(RoutedEventArgs e) {
+        this.hovering = e.x >= this.bx && e.y >= this.by && e.x < this.bx + this.bw && e.y < this.by + this.bh;
+        this.hoverX = e.x;
+        this.hoverY = e.y;
         if (!this.dragging) { return; }
         this.dragX1 = Math.Max(this.bx, Math.Min(e.x, this.bx + this.bw - 1));
         this.dragY1 = Math.Max(this.by, Math.Min(e.y, this.by + this.bh - 1));
         App app = this.FindApp();
         if (app != null) { app.RequestRedraw(); }
         e.Handle();
+    }
+
+    public override void OnPointerLeave(RoutedEventArgs e) {
+        base.OnPointerLeave(e);
+        this.hovering = false;
     }
 
     public override void OnPointerUp(RoutedEventArgs e) {
@@ -92,9 +119,74 @@ public class BattlefieldView : Control {
         this.CancelDrag();
     }
 
+    public override void OnKeyUp(RoutedEventArgs e) {
+        host.HandleKeyUp(e.keyCode);
+    }
+
     override void OnPaint(App app) {
         base.OnPaint(app);
         Canvas c = app.canvas;
         host.RenderBattlefield(c, this.bx, this.by, this.bw, this.bh);
+        if (this.dragging) {
+            c.FillRect(this.DragLeft(), this.DragTop(), this.DragWidth(), this.DragHeight(), 0x2246F0A0);
+            c.DrawRect(this.DragLeft(), this.DragTop(), this.DragWidth(), this.DragHeight(), 0xDD46F0A0, 1);
+            int l = this.DragLeft();
+            int t = this.DragTop();
+            int r = l + this.DragWidth();
+            int b = t + this.DragHeight();
+            c.FillRect(l - 1, t - 1, 8, 3, 0xFF9FFFD0);
+            c.FillRect(l - 1, t - 1, 3, 8, 0xFF9FFFD0);
+            c.FillRect(r - 6, b - 1, 8, 3, 0xFF9FFFD0);
+            c.FillRect(r - 1, b - 6, 3, 8, 0xFF9FFFD0);
+        }
+    }
+}
+
+// 小地图控件：画缩略战场，左键点击 / 拖动把镜头中心移过去，右键直接下行军令。
+public class MinimapView : Control {
+    weak Program host;
+    bool dragging = false;
+
+    MinimapView(Program host) {
+        this.InitControl("minimap");
+        this.host = host;
+    }
+
+    void Jump(int x, int y) { host.MinimapJump(x - this.bx, y - this.by, this.bw, this.bh); }
+
+    public override void OnPointerDown(RoutedEventArgs e) {
+        base.OnPointerDown(e);
+        App app = this.FindApp();
+        if (e.handled || app == null || !host.AcceptsBattleInput()) { return; }
+        if (e.button == 1) {
+            host.MinimapOrder(e.x - this.bx, e.y - this.by, this.bw, this.bh, Modifiers.HasShift(e.modifiers));
+            e.Handle();
+            return;
+        }
+        if (e.button != 0) { return; }
+        this.dragging = true;
+        this.Jump(e.x, e.y);
+        app.CapturePointer(this, true);
+        e.Handle();
+    }
+
+    public override void OnPointerMove(RoutedEventArgs e) {
+        if (!this.dragging) { return; }
+        this.Jump(e.x, e.y);
+        e.Handle();
+    }
+
+    public override void OnPointerUp(RoutedEventArgs e) {
+        base.OnPointerUp(e);
+        if (!this.dragging) { return; }
+        this.dragging = false;
+        App app = this.FindApp();
+        if (app != null && app.GetCapturedPointer() == this) { app.ReleasePointerCapture(); }
+        e.Handle();
+    }
+
+    override void OnPaint(App app) {
+        base.OnPaint(app);
+        host.RenderMinimap(app.canvas, this.bx, this.by, this.bw, this.bh);
     }
 }

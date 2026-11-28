@@ -1,0 +1,281 @@
+// 单位精灵库（纯表现层）：开局把 assets/ 里的俯视贴图一次性烘焙成
+// 16 个朝向 × 2 个阵营的成品图（按显示尺寸 2×2 超采样旋转，红军把蓝色涂装换成猩红），
+// 注册成 "mem:" 图像键，渲染时 1:1 贴图——不在帧里旋转、不糊。
+// 炮兵没有素材：用坦克车体去饱和 + 程序化加一根长炮管拼出来；晶矿是程序化生成的晶簇。
+// 素材缺失时 Ok() = false，BattleRenderer 退回矢量画法。
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Drawing.Imaging;
+using Gui;
+
+public class SpriteSrc {
+    public int w;
+    public int h;
+    public int[] px;
+}
+
+public class SpriteBank {
+    public const int Dirs = 16;
+    string[] keys = new string[4 * 2 * 16];
+    int[] sizes = new int[4];
+    bool ok = false;
+    public string crystalKey = "";
+    public string crystalDimKey = "";
+    public string portraitArtillery = "";
+
+    public bool Ok() { return this.ok; }
+    public int Size(int type) { return type >= 0 && type < 4 ? this.sizes[type] : 0; }
+
+    // 朝向（弧度，0 = 向右）→ 成品图键。
+    public string Key(int type, int team, double facing) {
+        if (!this.ok || type < 0 || type > 3) { return null; }
+        double turns = facing / (Math.PI * 2.0);
+        int dir = (int)Math.Floor(turns * (double)Dirs + 0.5);
+        dir = ((dir % Dirs) + Dirs) % Dirs;
+        return this.keys[(type * 2 + team) * Dirs + dir];
+    }
+
+    public void Build(string infantry, string tank, string miner) {
+        SpriteSrc inf = SpriteBank.Load(infantry, "mem:rts_src_inf");
+        SpriteSrc tk = SpriteBank.Load(tank, "mem:rts_src_tank");
+        SpriteSrc mn = SpriteBank.Load(miner, "mem:rts_src_miner");
+        this.BuildCrystals();
+        if (inf == null || tk == null || mn == null) { return; }
+        SpriteSrc art = SpriteBank.MakeArtillery(tk);
+        // 显示高度（像素）：步兵 28、坦克 40、采矿车 38、炮兵 40
+        this.BakeType(0, inf, 28.0);
+        this.BakeType(1, tk, 40.0);
+        this.BakeType(2, mn, 38.0);
+        this.BakeType(3, art, 40.0);
+        // 炮兵头像：朝上的那一张放大版（界面 Image 控件用）
+        this.portraitArtillery = "mem:rts_art_portrait";
+        int[] big = SpriteBank.Rotate(art, 0.0, 84.0 / (double)art.h, 92, false);
+        Canvas.ImageRegisterArgb(this.portraitArtillery, big, 92, 92);
+        this.ok = true;
+    }
+
+    void BakeType(int type, SpriteSrc src, double displayH) {
+        double scale = displayH / (double)src.h;
+        double diag = Math.Sqrt((double)(src.w * src.w + src.h * src.h)) * scale;
+        int size = (int)diag + 4;
+        if (size % 2 == 1) { size = size + 1; }
+        this.sizes[type] = size;
+        for (int team = 0; team < 2; team = team + 1) {
+            for (int d = 0; d < Dirs; d = d + 1) {
+                double facing = (double)d * Math.PI * 2.0 / (double)Dirs;
+                int[] px = SpriteBank.Rotate(src, facing, scale, size, team == 1);
+                string key = "mem:rts_u" + Convert.ToString(type) + "_" + Convert.ToString(team) + "_" + Convert.ToString(d);
+                Canvas.ImageRegisterArgb(key, px, size, size);
+                this.keys[(type * 2 + team) * Dirs + d] = key;
+            }
+        }
+    }
+
+    // 读素材像素（盘上或内嵌都行）。失败返回 null。
+    static SpriteSrc Load(string path, string key) {
+        if (path == null || path == "") { return null; }
+        byte[] bytes = File.ReadAllBytes(path);
+        if (bytes == null || bytes.Length == 0) { return null; }
+        int w = Canvas.ImageLoadMem(key, bytes, bytes.Length);
+        if (w <= 0) { return null; }
+        int h = Canvas.ImageHeight(key);
+        if (h <= 0) { return null; }
+        int n = w * h;
+        nint buf = NativeMemory.Alloc(n * 4);
+        if (buf == 0) { return null; }
+        SpriteSrc s = new SpriteSrc();
+        s.w = w;
+        s.h = h;
+        s.px = new int[n];
+        try {
+            int got = ImageCodec.CopyArgb(key, buf, n);
+            if (got < n) { return null; }
+            Span<int> view = new Span<int>(buf, n);
+            for (int i = 0; i < n; i = i + 1) { s.px[i] = view[i]; }
+        } finally {
+            NativeMemory.Free(buf);
+        }
+        return s;
+    }
+
+    // 预乘 alpha 的双线性采样，越界为透明。
+    static void Sample(SpriteSrc s, double x, double y, double[] acc) {
+        double fx = x - 0.5;
+        double fy = y - 0.5;
+        int x0 = (int)Math.Floor(fx);
+        int y0 = (int)Math.Floor(fy);
+        double tx = fx - (double)x0;
+        double ty = fy - (double)y0;
+        for (int k = 0; k < 4; k = k + 1) {
+            int sx = x0 + (k & 1);
+            int sy = y0 + (k >> 1);
+            if (sx < 0 || sy < 0 || sx >= s.w || sy >= s.h) { continue; }
+            double wgt = ((k & 1) == 1 ? tx : 1.0 - tx) * ((k >> 1) == 1 ? ty : 1.0 - ty);
+            int p = s.px[sy * s.w + sx];
+            double a = (double)((p >> 24) & 255) / 255.0;
+            double aw = a * wgt;
+            acc[0] = acc[0] + aw;
+            acc[1] = acc[1] + (double)((p >> 16) & 255) * aw;
+            acc[2] = acc[2] + (double)((p >> 8) & 255) * aw;
+            acc[3] = acc[3] + (double)(p & 255) * aw;
+        }
+    }
+
+    // 把朝上的素材旋到 facing（0 = 向右），缩放到显示尺寸，输出 size×size 直通 ARGB。
+    static int[] Rotate(SpriteSrc s, double facing, double scale, int size, bool red) {
+        int[] o = new int[size * size];
+        double rot = facing + Math.PI / 2.0;
+        double cs = Math.Cos(rot);
+        double sn = Math.Sin(rot);
+        double half = (double)size / 2.0;
+        double[] acc = new double[4];
+        for (int oy = 0; oy < size; oy = oy + 1) {
+            for (int ox = 0; ox < size; ox = ox + 1) {
+                acc[0] = 0.0;
+                acc[1] = 0.0;
+                acc[2] = 0.0;
+                acc[3] = 0.0;
+                for (int ss = 0; ss < 4; ss = ss + 1) {
+                    double px = (double)ox + 0.25 + 0.5 * (double)(ss & 1) - half;
+                    double py = (double)oy + 0.25 + 0.5 * (double)(ss >> 1) - half;
+                    // 逆旋转回素材空间
+                    double ux = px * cs + py * sn;
+                    double uy = -px * sn + py * cs;
+                    SpriteBank.Sample(s, ux / scale + (double)s.w / 2.0, uy / scale + (double)s.h / 2.0, acc);
+                }
+                double a = acc[0] / 4.0;
+                if (a <= 0.004) { continue; }
+                int r = (int)(acc[1] / acc[0]);
+                int g = (int)(acc[2] / acc[0]);
+                int b = (int)(acc[3] / acc[0]);
+                if (red) {
+                    int nr = r;
+                    int ng = g;
+                    int nb = b;
+                    if (b > r + 10) {
+                        nr = Math.Min(255, b + 20);
+                        ng = g * 45 / 100;
+                        nb = r * 60 / 100;
+                    }
+                    r = nr;
+                    g = ng;
+                    b = nb;
+                }
+                int ai = (int)(a * 255.0 + 0.5);
+                if (ai > 255) { ai = 255; }
+                o[oy * size + ox] = (ai << 24) | (SpriteBank.Clamp(r) << 16) | (SpriteBank.Clamp(g) << 8) | SpriteBank.Clamp(b);
+            }
+        }
+        return o;
+    }
+
+    static int Clamp(int v) { return v < 0 ? 0 : (v > 255 ? 255 : v); }
+
+    // 炮兵：坦克车体去饱和成枪灰（保留一点蓝色涂装好换阵营色），顶上加一根长炮管与炮口制退器。
+    static SpriteSrc MakeArtillery(SpriteSrc tank) {
+        int extra = tank.h / 2;
+        SpriteSrc a = new SpriteSrc();
+        a.w = tank.w;
+        a.h = tank.h + extra;
+        a.px = new int[a.w * a.h];
+        for (int y = 0; y < tank.h; y = y + 1) {
+            for (int x = 0; x < tank.w; x = x + 1) {
+                int p = tank.px[y * tank.w + x];
+                int al = (p >> 24) & 255;
+                if (al == 0) { continue; }
+                int r = (p >> 16) & 255;
+                int g = (p >> 8) & 255;
+                int b = p & 255;
+                int gray = (r * 3 + g * 6 + b) / 10;
+                r = (gray * 70 + r * 30) / 100;
+                g = (gray * 70 + g * 30) / 100;
+                b = (gray * 55 + b * 45) / 100;
+                a.px[(y + extra) * a.w + x] = (al << 24) | (r << 16) | (g << 8) | b;
+            }
+        }
+        // 炮管：从车体中心伸出车头一大截
+        int cx = a.w / 2;
+        int top = 1;
+        int bottom = extra + tank.h / 2;
+        for (int y = top; y < bottom; y = y + 1) {
+            for (int dx = -2; dx <= 2; dx = dx + 1) {
+                int shade = dx == -1 ? 0xFF8FA3B8 : (dx == 2 || dx == -2 ? 0xFF1A222C : 0xFF46566A);
+                a.px[y * a.w + cx + dx] = shade;
+            }
+        }
+        // 炮口制退器
+        for (int y = top; y < top + 5; y = y + 1) {
+            for (int dx = -4; dx <= 4; dx = dx + 1) {
+                bool edge = dx == -4 || dx == 4 || y == top;
+                a.px[y * a.w + cx + dx] = edge ? 0xFF1A222C : 0xFF5B6E84;
+            }
+        }
+        // 车体上的蓝色瞄准光学镜（阵营色）
+        for (int y = extra + 6; y < extra + 12; y = y + 1) {
+            for (int dx = -3; dx <= 3; dx = dx + 1) {
+                a.px[y * a.w + cx + dx] = 0xFF3FA8FF;
+            }
+        }
+        return a;
+    }
+
+    // 晶簇：五根带高光侧面与暗面的六棱晶体，冷青发光；枯竭版本是灰的。
+    void BuildCrystals() {
+        int size = 52;
+        this.crystalKey = "mem:rts_crystal";
+        this.crystalDimKey = "mem:rts_crystal_dim";
+        Canvas.ImageRegisterArgb(this.crystalKey, SpriteBank.Crystals(size, false), size, size);
+        Canvas.ImageRegisterArgb(this.crystalDimKey, SpriteBank.Crystals(size, true), size, size);
+    }
+
+    static int[] Crystals(int size, bool dim) {
+        int[] o = new int[size * size];
+        // 每根：中心 x、底 y、半宽、高
+        int[] cx = new int[] { 26, 15, 37, 21, 32 };
+        int[] by = new int[] { 46, 44, 45, 49, 49 };
+        int[] hw = new int[] { 7, 5, 5, 4, 4 };
+        int[] ht = new int[] { 40, 26, 30, 18, 20 };
+        for (int k = 0; k < 5; k = k + 1) {
+            int top = by[k] - ht[k];
+            int shoulder = top + ht[k] / 4;
+            for (int y = top; y < by[k]; y = y + 1) {
+                double halfW;
+                if (y < shoulder) {
+                    halfW = (double)hw[k] * (double)(y - top + 1) / (double)(shoulder - top + 1);
+                } else {
+                    halfW = (double)hw[k] * (1.0 - 0.25 * (double)(y - shoulder) / (double)(by[k] - shoulder));
+                }
+                for (int x = cx[k] - hw[k] - 1; x <= cx[k] + hw[k] + 1; x = x + 1) {
+                    if (x < 0 || x >= size || y < 0 || y >= size) { continue; }
+                    double dx = (double)x + 0.5 - (double)cx[k];
+                    double inside = halfW - Math.Abs(dx);
+                    if (inside < -0.5) { continue; }
+                    double cov = inside >= 0.5 ? 1.0 : inside + 0.5;
+                    double v = (double)(y - top) / (double)ht[k];
+                    int r;
+                    int g;
+                    int b;
+                    if (inside < 1.0) {
+                        r = 200; g = 250; b = 255;  // 亮边
+                    } else if (dx < -0.5) {
+                        r = 110 - (int)(v * 50.0); g = 235 - (int)(v * 70.0); b = 255 - (int)(v * 30.0);  // 受光面
+                    } else {
+                        r = 20; g = 120 - (int)(v * 50.0); b = 170 - (int)(v * 40.0);  // 背光面
+                    }
+                    if (dim) {
+                        int gray = (r + g + b) / 3;
+                        r = gray * 55 / 100;
+                        g = gray * 60 / 100;
+                        b = gray * 68 / 100;
+                    }
+                    int a = (int)(cov * 255.0);
+                    int prev = o[y * size + x];
+                    if (((prev >> 24) & 255) > a) { continue; }
+                    o[y * size + x] = (a << 24) | (SpriteBank.Clamp(r) << 16) | (SpriteBank.Clamp(g) << 8) | SpriteBank.Clamp(b);
+                }
+            }
+        }
+        return o;
+    }
+}

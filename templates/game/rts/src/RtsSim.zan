@@ -1,59 +1,120 @@
 using System;
+using System.Collections.Generic;
 using Game.Foundation;
 
 // 回放与回归（docs/ZAN_STANDARD.md S26/S27）：RtsBattle 以界面同样的 50ms 一帧无头推进。
-// 地形与初始军团固定，种子不参与。replays/ 下的回放由 `zan-check` 重放、逐校验点比对；
-// Bot 是模糊测试用的机器人。改了寻路或避障参数后回放分叉，就重新录制（见 README）。
+// 种子决定关卡、难度与红军 AI 的随机：关卡 = seed % 3，难度 = (seed / 3) % 3。
+// replays/ 下的回放由 `zan-check` 重放、逐校验点比对；Bot 是模糊测试用的机器人。
+// 改了数值、AI 或寻路参数后回放分叉，就重新录制（见 README）。
 //
-// 输入编码：0 无操作；1 + 格子下标（32 列 × 18 行，按行）= 右键该格中心，选中单位行军；
-// 1000 = 征召装甲营；2000 = 全选蓝军；3000 + 格子下标 = 以该格为中心框选 5×5 格。
+// 输入编码（格子下标 = 行 × 50 + 列，战场 50 × 30 格）：
+//   0                  无操作
+//   1 + 格子           右键该格中心（行军 / 点到敌人 = 攻击移动 / 只选指挥中心 = 集结点）
+//   2000 / 2001 / 2002 全选作战单位 / 全选采矿车 / 选中指挥中心
+//   3000 + 格子        以该格为中心框选 5 × 5 格
+//   5000 + 兵种        指挥中心排产（0 步兵 1 坦克 2 采矿车 3 炮兵）
+//   6000               取消队尾
+//   7000 + 格子        左键点选该格中心
+//   8000 + 格子        Shift+右键该格：攻击移动
 public class RtsSim : IReplaySim {
     RtsBattle battle;
 
-    public void Reset(long seed) { battle = new RtsBattle(); }
+    public const int Cells = 1500;
+
+    public void Reset(long seed) {
+        long s = seed < 0 ? -seed : seed;
+        battle = new RtsBattle((int)(s % 3), (int)((s / 3) % 3), seed);
+    }
+
+    public RtsBattle Battle() { return battle; }
+
+    public static double CellX(RtsBattle b, int cell) {
+        return (double)((cell % b.Cols()) * b.cellSize + b.cellSize / 2);
+    }
+    public static double CellY(RtsBattle b, int cell) {
+        return (double)((cell / b.Cols()) * b.cellSize + b.cellSize / 2);
+    }
+    public static int CellAt(RtsBattle b, double x, double y) {
+        int c = (int)(x / (double)b.cellSize);
+        int r = (int)(y / (double)b.cellSize);
+        c = Math.Max(0, Math.Min(c, b.Cols() - 1));
+        r = Math.Max(0, Math.Min(r, b.Rows() - 1));
+        return r * b.Cols() + c;
+    }
+
+    // 把一个输入码作用到战场（界面里的调试自动驾驶也走这里）。
+    public static void Apply(RtsBattle b, int input) {
+        if (input >= 1 && input <= Cells) {
+            b.CommandAt(CellX(b, input - 1), CellY(b, input - 1));
+        } else if (input == 2000) {
+            b.SelectArmy();
+        } else if (input == 2001) {
+            b.SelectMiners();
+        } else if (input == 2002) {
+            b.SelectHq();
+        } else if (input >= 3000 && input < 3000 + Cells) {
+            int cell = input - 3000;
+            double half = (double)(b.cellSize * 5 / 2);
+            b.SelectInRect(CellX(b, cell) - half, CellY(b, cell) - half, CellX(b, cell) + half, CellY(b, cell) + half, false);
+        } else if (input >= 5000 && input <= 5003) {
+            b.Enqueue(0, input - 5000);
+        } else if (input == 6000) {
+            b.CancelLast(0);
+        } else if (input >= 7000 && input < 7000 + Cells) {
+            b.SelectAt(CellX(b, input - 7000), CellY(b, input - 7000), false);
+        } else if (input >= 8000 && input < 8000 + Cells) {
+            b.CommandAt(CellX(b, input - 8000), CellY(b, input - 8000), true);
+        }
+    }
 
     public void Step(int frame, int input) {
-        int cols = battle.worldWidth / battle.cellSize;
-        int rows = battle.worldHeight / battle.cellSize;
-        if (input >= 1 && input <= cols * rows) {
-            int cell = input - 1;
-            battle.CommandMove((cell % cols) * battle.cellSize + battle.cellSize / 2,
-                               (cell / cols) * battle.cellSize + battle.cellSize / 2);
-        } else if (input == 1000) {
-            battle.SpawnReinforcements();
-        } else if (input == 2000) {
-            battle.SelectAll();
-        } else if (input >= 3000 && input < 3000 + cols * rows) {
-            int cell = input - 3000;
-            double cx = (double)((cell % cols) * battle.cellSize + battle.cellSize / 2);
-            double cy = (double)((cell / cols) * battle.cellSize + battle.cellSize / 2);
-            double half = (double)(battle.cellSize * 5 / 2);
-            battle.SelectInRect(cx - half, cy - half, cx + half, cy + half, false);
-        }
+        RtsSim.Apply(battle, input);
         battle.TickSimulation(0.05);
     }
 
     public int StateChecksum() {
         StateHasher h = new StateHasher();
-        h.Int(battle.units.Count).Int(battle.supplyUsed).Bool(battle.hasTarget)
+        h.Int(battle.ticks).Int(battle.units.Count).Bool(battle.hasTarget)
          .Real(battle.targetX).Real(battle.targetY)
-         .Int(battle.minerals).Int(battle.blueLost).Int(battle.redLost);
+         .Int(battle.capture).Int(battle.uplinkOwner).Int(battle.outcome).Int(battle.ai.waveNo);
+        for (int k = 0; k < 2; k = k + 1) {
+            RtsTeam t = battle.teams[k];
+            h.Int(t.minerals).Int(t.supplyUsed).Int(t.lost).Int(t.deposited).Int(t.queue.Count).Int(t.progress).Int(t.holdTicks);
+        }
         for (int i = 0; i < battle.units.Count; i = i + 1) {
             RtsUnit u = battle.units[i];
-            h.Real(u.X).Real(u.Y).Int(u.Hp).Bool(u.Selected);
+            h.Int(u.Type).Real(u.X).Real(u.Y).Int(u.Hp).Bool(u.Selected).Int(u.Carry);
         }
+        for (int i = 0; i < battle.patches.Count; i = i + 1) { h.Int(battle.patches[i].amount); }
         return h.Value();
     }
 
+    // 人口不超上限（两军）
     [Invariant]
-    public bool SupplyWithinCap() { return battle.supplyUsed <= battle.supplyMax; }
+    public bool SupplyWithinCap() {
+        return battle.teams[0].supplyUsed <= battle.teams[0].supplyMax
+            && battle.teams[1].supplyUsed <= battle.teams[1].supplyMax;
+    }
 
-    // 伤亡账平：出场 - 阵亡 = 在场（两军各自）；人口 = 在场蓝军
+    // 人口账平：已用 = 在场 + 排队（两军），排产队列不超长
+    [Invariant]
+    public bool SupplyBalanced() {
+        return battle.SupplyBalanced(0) && battle.SupplyBalanced(1)
+            && battle.teams[0].queue.Count <= RtsBattle.QueueMax
+            && battle.teams[1].queue.Count <= RtsBattle.QueueMax;
+    }
+
+    // 伤亡账平：出场 - 阵亡 = 在场（两军各自，含建筑）
     [Invariant]
     public bool LossesBalance() {
-        return battle.blueFielded - battle.blueLost == battle.Alive(0)
-            && battle.redFielded - battle.redLost == battle.Alive(1)
-            && battle.supplyUsed == battle.Alive(0);
+        for (int k = 0; k < 2; k = k + 1) {
+            int alive = 0;
+            for (int i = 0; i < battle.units.Count; i = i + 1) {
+                if (battle.units[i].Team == k) { alive = alive + 1; }
+            }
+            if (battle.teams[k].fielded - battle.teams[k].lost != alive) { return false; }
+        }
+        return true;
     }
 
     // 帧末不留残血为零的单位（阵亡当帧就清出场）
@@ -65,37 +126,93 @@ public class RtsSim : IReplaySim {
         return true;
     }
 
+    // 晶矿非负，且矿区采走的 = 交矿 + 车上 + 随车损失
     [Invariant]
-    public bool MineralsNonNegative() { return battle.minerals >= 0; }
+    public bool MineralsConserved() {
+        if (battle.teams[0].minerals < 0 || battle.teams[1].minerals < 0) { return false; }
+        for (int i = 0; i < battle.patches.Count; i = i + 1) {
+            if (battle.patches[i].amount < 0) { return false; }
+        }
+        return battle.MineralsConserved();
+    }
 
-    // 每个单位都在避障器里有槽位（拿不到槽位的单位原地不动）
+    // 每个机动单位都在避障器里有槽位（拿不到槽位的单位原地不动）；建筑不占槽位
     [Invariant]
     public bool UnitsHaveRvoSlots() {
         for (int i = 0; i < battle.units.Count; i = i + 1) {
-            if (battle.units[i].RvoSlot < 0) { return false; }
+            RtsUnit u = battle.units[i];
+            if (u.IsBuilding() != (u.RvoSlot < 0)) { return false; }
         }
         return true;
     }
 
-    // 单位不会被推出战场（边缘是墙，RtsBattle 每帧钳回）
+    // 单位不出界、不站在裂谷悬崖格里
     [Invariant]
-    public bool UnitsOnField() {
+    public bool UnitsOnGround() {
         for (int i = 0; i < battle.units.Count; i = i + 1) {
             RtsUnit u = battle.units[i];
             if (u.X < 0.0 || u.Y < 0.0 || u.X > (double)battle.worldWidth || u.Y > (double)battle.worldHeight) {
                 return false;
             }
+            if (battle.IsBlockedAt(u.X, u.Y)) { return false; }
         }
         return true;
     }
 
-    // 机器人：隔一阵全选或框选、在随机格子下达行军令，偶尔征召
+    // 链路占领度在 [-100, 100]，易主只在满格发生
+    [Invariant]
+    public bool UplinkConsistent() {
+        if (battle.capture < -100 || battle.capture > 100) { return false; }
+        if (battle.uplinkOwner == 0 && battle.capture <= 0) { return false; }
+        if (battle.uplinkOwner == 1 && battle.capture >= 0) { return false; }
+        return true;
+    }
+
+    // 只能选中蓝军
+    [Invariant]
+    public bool SelectionIsBlue() {
+        for (int i = 0; i < battle.units.Count; i = i + 1) {
+            if (battle.units[i].Selected && battle.units[i].Team != 0) { return false; }
+        }
+        return true;
+    }
+
+    // 模糊机器人：排产、全选、框选、点选、右键行军 / 攻击链路与敌方基地、偶尔取消
     public static int Bot(DeterministicRandom rng, int frame) {
         int roll = rng.NextBelow(100);
-        if (roll < 4) { return 1 + rng.NextBelow(32 * 18); }
-        if (roll < 6) { return 1000; }
+        if (roll < 6) { return 5000 + rng.NextBelow(4); }
         if (roll < 8) { return 2000; }
-        if (roll < 10) { return 3000 + rng.NextBelow(32 * 18); }
+        if (roll < 9) { return 2001 + rng.NextBelow(2); }
+        if (roll < 10) { return 3000 + rng.NextBelow(Cells); }
+        if (roll < 11) { return 7000 + rng.NextBelow(Cells); }
+        if (roll < 12) { return 6000; }
+        if (roll < 15) { return 1 + rng.NextBelow(Cells); }
+        if (roll < 17) { return 1 + 15 * 50 + 25; }      // 上行链路
+        if (roll < 18) { return 8000 + 15 * 50 + 44; }   // 攻击移动到红军指挥中心
+        if (roll < 19) { return 8000 + rng.NextBelow(Cells); }
+        return 0;
+    }
+
+    // 教练：一个“中等玩家”——维持采矿车与混编生产，兵力够了就先抢链路、再推基地。
+    // 用于平衡测算（_scratch 里的测量程序）与界面的调试自动驾驶（RTS_DEBUG_AUTOPLAY）。
+    public static int Coach(RtsBattle b, int frame) {
+        int slot = frame % 20;
+        RtsTeam me = b.teams[0];
+        if (slot == 0 && me.queue.Count < 2) {
+            int miners = b.CountType(0, RtsUnit.Miner) + b.QueuedType(0, RtsUnit.Miner);
+            if (miners < 6) { return 5000 + RtsUnit.Miner; }
+            int pick = (frame / 20) % 6;
+            if (pick == 0 || pick == 3 || pick == 5) { return 5000 + RtsUnit.Infantry; }
+            if (pick == 1 || pick == 4) { return 5000 + RtsUnit.Tank; }
+            return 5000 + RtsUnit.Artillery;
+        }
+        if (frame % 200 == 7) { return 2000; }
+        if (frame % 200 == 8) {
+            int army = b.CountType(0, RtsUnit.Infantry) + b.CountType(0, RtsUnit.Tank) + b.CountType(0, RtsUnit.Artillery);
+            bool push = army >= 18 || (b.mission.goal == RtsMission.GoalDestroyHq && b.uplinkOwner == 0 && army >= 12);
+            if (push && b.mission.goal == RtsMission.GoalDestroyHq) { return 8000 + CellAt(b, b.teams[1].hq.X - 30.0, b.teams[1].hq.Y); }
+            return 8000 + CellAt(b, b.uplinkX, b.uplinkY);
+        }
         return 0;
     }
 }
