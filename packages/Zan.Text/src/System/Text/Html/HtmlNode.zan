@@ -26,12 +26,20 @@ public class HtmlNode {
     public string text;
     // 属性（名字小写 → 值）。同名属性取第一个（HTML 规则）；按需懒建，消除文本/无属性节点字典分配。
     internal Dictionary<string, string> attrsMap;
+    // 热属性缓存（class / id）；未对外暴露 attrs 字典时零哈希直接命中。
+    internal string cachedClass;
+    internal string cachedId;
+    internal bool attrsExposed;
     public Dictionary<string, string> attrs {
         get {
+            this.attrsExposed = true;
             if (this.attrsMap == null) { this.attrsMap = new Dictionary<string, string>(); }
             return this.attrsMap;
         }
-        set { this.attrsMap = value; }
+        set {
+            this.attrsExposed = true;
+            this.attrsMap = value;
+        }
     }
     // 子节点；按需懒建，消除文本/注释/叶子节点列表分配。
     internal List<HtmlNode> childList;
@@ -52,6 +60,9 @@ public class HtmlNode {
         this.tag = "";
         this.text = "";
         this.attrsMap = null;
+        this.cachedClass = null;
+        this.cachedId = null;
+        this.attrsExposed = false;
         this.childList = null;
         this.parentNode = null;
         this.index = 0;
@@ -146,10 +157,21 @@ public class HtmlNode {
         if (name == null) { return; }
         if (value == null) {
             if (this.attrsMap != null) { this.attrsMap.Remove(name); }
+            if (name == "class") { this.cachedClass = null; }
+            else if (name == "id") { this.cachedId = null; }
             return;
         }
         if (this.attrsMap == null) { this.attrsMap = new Dictionary<string, string>(); }
         this.attrsMap[name] = value;
+        if (name == "class") { this.cachedClass = value; }
+        else if (name == "id") { this.cachedId = value; }
+    }
+
+    internal string GetIdFast() {
+        if (!this.attrsExposed) {
+            return this.cachedId != null ? this.cachedId : "";
+        }
+        return this.Get("id", "");
     }
 
     // class 属性拆成的类名列表。
@@ -167,23 +189,39 @@ public class HtmlNode {
         return out2;
     }
 
-    // 是否带这个类名（原地空白切词比对，零 List/Substring 分配）。
+    // 是否带这个类名（优先走 cachedClass + Span 原地空白切词比对，零字典哈希与零分配）。
     public bool HasClass(string name) {
-        if (name == null || name.Length == 0 || this.attrsMap == null) { return false; }
-        string raw;
-        if (!this.attrsMap.TryGetValue("class", out raw)) { return false; }
+        if (name == null || name.Length == 0) { return false; }
+        string raw = "";
+        if (!this.attrsExposed) {
+            raw = this.cachedClass;
+            if (raw == null) { return false; }
+        } else {
+            if (this.attrsMap == null || !this.attrsMap.TryGetValue("class", out raw)) { return false; }
+        }
         int n = raw.Length;
         int wl = name.Length;
         if (n < wl) { return false; }
+        if (n == wl) { return raw == name; }
+        Span<byte> rb = new Span<byte>((nint)raw, n);
+        Span<byte> nb = new Span<byte>((nint)name, wl);
         int i = 0;
         while (i < n) {
-            while (i < n && HtmlUtil.IsSpace(raw[i] & 255)) { i = i + 1; }
+            while (i < n) {
+                int c = rb[i];
+                if (c != 32 && c != 9 && c != 13 && c != 10) { break; }
+                i = i + 1;
+            }
             int start = i;
-            while (i < n && !HtmlUtil.IsSpace(raw[i] & 255)) { i = i + 1; }
+            while (i < n) {
+                int c = rb[i];
+                if (c == 32 || c == 9 || c == 13 || c == 10) { break; }
+                i = i + 1;
+            }
             if (i - start == wl) {
                 bool eq = true;
                 for (int k = 0; k < wl; k = k + 1) {
-                    if ((raw[start + k] & 255) != (name[k] & 255)) { eq = false; break; }
+                    if (rb[start + k] != nb[k]) { eq = false; break; }
                 }
                 if (eq) { return true; }
             }

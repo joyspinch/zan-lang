@@ -37,45 +37,49 @@ public class CborReader {
     }
 
     public int U8() {
-        if (pos >= len) {
+        int p = pos;
+        if (p >= len) {
             throw new CborException("truncated at byte "
-                + Convert.ToString(pos));
+                + Convert.ToString(p));
         }
-        int b = buf[pos] & 255;
-        pos = pos + 1;
-        return b;
+        Span<byte> b = new Span<byte>((nint)buf, len);
+        pos = p + 1;
+        return b[p];
     }
 
     public int U16BE() {
-        if (len - pos < 2) { throw new CborException("truncated at byte " + Convert.ToString(pos)); }
         int p = pos;
-        int v = ((buf[p] & 255) << 8) | (buf[p + 1] & 255);
+        if (len - p < 2) { throw new CborException("truncated at byte " + Convert.ToString(p)); }
+        Span<byte> b = new Span<byte>((nint)buf, len);
+        int v = ((int)b[p] << 8) | (int)b[p + 1];
         pos = p + 2;
         return v;
     }
 
     public long U32BE() {
-        if (len - pos < 4) { throw new CborException("truncated at byte " + Convert.ToString(pos)); }
         int p = pos;
-        long v = ((long)(buf[p] & 255) << 24)
-            | ((long)(buf[p + 1] & 255) << 16)
-            | ((long)(buf[p + 2] & 255) << 8)
-            | (long)(buf[p + 3] & 255);
+        if (len - p < 4) { throw new CborException("truncated at byte " + Convert.ToString(p)); }
+        Span<byte> b = new Span<byte>((nint)buf, len);
+        long v = ((long)b[p] << 24)
+            | ((long)b[p + 1] << 16)
+            | ((long)b[p + 2] << 8)
+            | (long)b[p + 3];
         pos = p + 4;
         return v;
     }
 
     public long U64BE() {
-        if (len - pos < 8) { throw new CborException("truncated at byte " + Convert.ToString(pos)); }
         int p = pos;
-        long v = ((long)(buf[p] & 255) << 56)
-            | ((long)(buf[p + 1] & 255) << 48)
-            | ((long)(buf[p + 2] & 255) << 40)
-            | ((long)(buf[p + 3] & 255) << 32)
-            | ((long)(buf[p + 4] & 255) << 24)
-            | ((long)(buf[p + 5] & 255) << 16)
-            | ((long)(buf[p + 6] & 255) << 8)
-            | (long)(buf[p + 7] & 255);
+        if (len - p < 8) { throw new CborException("truncated at byte " + Convert.ToString(p)); }
+        Span<byte> b = new Span<byte>((nint)buf, len);
+        long v = ((long)b[p] << 56)
+            | ((long)b[p + 1] << 48)
+            | ((long)b[p + 2] << 40)
+            | ((long)b[p + 3] << 32)
+            | ((long)b[p + 4] << 24)
+            | ((long)b[p + 5] << 16)
+            | ((long)b[p + 6] << 8)
+            | (long)b[p + 7];
         pos = p + 8;
         return v;
     }
@@ -138,30 +142,36 @@ public class CborReader {
         return s;
     }
 
-    // 短 map 键直映缓存（64 槽，FNV-1a 32 + 逐字节精确验证），同构对象数组免重复分配键字符串。
+    // 短 map 键直映缓存（128 槽，FNV-1a 32 + Span 逐字节精确验证），同构对象数组免重复分配键字符串。
     string TakeCachedKey(int n) {
-        if (n < 0 || n > len - pos) {
+        int p = pos;
+        if (n < 0 || n > len - p) {
             throw new CborException("truncated at byte "
-                + Convert.ToString(pos) + " (need " + Convert.ToString(n) + ")");
+                + Convert.ToString(p) + " (need " + Convert.ToString(n) + ")");
         }
         if (n == 0) { return ""; }
         if (n > 32) {
-            string ls = buf.ToStr(pos, n);
-            pos = pos + n;
+            string ls = buf.ToStr(p, n);
+            pos = p + n;
             return ls;
         }
-        if (keyCache == null) { keyCache = new string[64]; }
-        int p = pos;
+        string[] kc = keyCache;
+        if (kc == null) {
+            kc = new string[128];
+            keyCache = kc;
+        }
+        Span<byte> b = new Span<byte>((nint)buf, len);
         uint h = 2166136261U;
         for (int i = 0; i < n; i = i + 1) {
-            h = (h ^ (uint)(buf[p + i] & 255)) * 16777619U;
+            h = (h ^ (uint)b[p + i]) * 16777619U;
         }
-        int slot = (int)(h & 63U);
-        string cached = keyCache[slot];
+        int slot = (int)(h & 127U);
+        string cached = kc[slot];
         if (cached != null && cached.Length == n) {
+            Span<byte> cb = new Span<byte>((nint)cached, n);
             bool eq = true;
             for (int i = 0; i < n; i = i + 1) {
-                if ((buf[p + i] & 255) != (cached[i] & 255)) { eq = false; break; }
+                if (b[p + i] != cb[i]) { eq = false; break; }
             }
             if (eq) {
                 pos = p + n;
@@ -169,7 +179,7 @@ public class CborReader {
             }
         }
         string fresh = buf.ToStr(p, n);
-        keyCache[slot] = fresh;
+        kc[slot] = fresh;
         pos = p + n;
         return fresh;
     }
@@ -180,10 +190,17 @@ public class CborReader {
             throw new CborException("nesting too deep at byte "
                 + Convert.ToString(pos));
         }
-        int ib = U8();
+        int p = pos;
+        if (p >= len) {
+            throw new CborException("truncated at byte " + Convert.ToString(p));
+        }
+        Span<byte> b = new Span<byte>((nint)buf, len);
+        int ib = b[p];
+        pos = p + 1;
         int major = ib >> 5;
         int ai = ib & 31;
         if (major == 0) {  // 无符号整数
+            if (ai < 24) { return JsonValue.NewInt((long)ai); }
             long v = Arg(ai);
             if (v >= 0) { return JsonValue.NewInt(v); }
             // 2^63..2^64-1 → double（精度丢失，文档化）。
@@ -191,35 +208,15 @@ public class CborReader {
             return JsonValue.NewDouble((double)hi * 2.0 + (double)(v & 1));
         }
         if (major == 1) {  // 负整数：RFC 8949 定义值为 -1 - n（n 为无符号 64 位参数）
+            if (ai < 24) { return JsonValue.NewInt(-1L - (long)ai); }
             long n = Arg(ai);
             if (n >= 0) { return JsonValue.NewInt(-1 - n); }
             return JsonValue.NewDouble(0.0 - (1.0 + U64ToDouble(n)));
         }
-        if (major == 2) {  // byte string
-            if (ai == 31) { return JsonValue.NewStr(TakeChunksStr(2)); }
-            return JsonValue.NewStr(TakeUtf8(ArgLen(Arg(ai))));
-        }
         if (major == 3) {  // text string
+            if (ai < 24) { return JsonValue.NewStr(TakeStr(ai)); }
             if (ai == 31) { return JsonValue.NewStr(TakeChunksStr(3)); }
             return JsonValue.NewStr(TakeStr(ArgLen(Arg(ai))));
-        }
-        if (major == 4) {  // array
-            JsonValue arr = JsonValue.NewArray();
-            if (ai == 31) {
-                while (!AtBreak()) { arr.items.Add(ReadValue(depth + 1)); }
-                return arr;
-            }
-            int n = ArgLen(Arg(ai));
-            int rem = len - pos;
-            int cap = n < rem ? n : rem;
-            if (cap > 0) { arr.items.Reserve(cap); }
-            List<JsonValue> items = arr.items;
-            int i = 0;
-            while (i < n) {
-                items.Add(ReadValue(depth + 1));
-                i = i + 1;
-            }
-            return arr;
         }
         if (major == 5) {  // map
             JsonValue obj = JsonValue.NewObject();
@@ -229,19 +226,38 @@ public class CborReader {
                 }
                 return obj;
             }
-            int n = ArgLen(Arg(ai));
+            int n = ai < 24 ? ai : ArgLen(Arg(ai));
             int rem = (len - pos) / 2;
             int cap = n < rem ? n : rem;
             if (cap > 0) {
                 obj.keys.Reserve(cap);
                 obj.vals.Reserve(cap);
             }
-            int i = 0;
-            while (i < n) {
+            for (int i = 0; i < n; i = i + 1) {
                 PutEntry(obj, depth);
-                i = i + 1;
             }
             return obj;
+        }
+        if (major == 4) {  // array
+            JsonValue arr = JsonValue.NewArray();
+            if (ai == 31) {
+                while (!AtBreak()) { arr.items.Add(ReadValue(depth + 1)); }
+                return arr;
+            }
+            int n = ai < 24 ? ai : ArgLen(Arg(ai));
+            int rem = len - pos;
+            int cap = n < rem ? n : rem;
+            if (cap > 0) { arr.items.Reserve(cap); }
+            List<JsonValue> items = arr.items;
+            for (int i = 0; i < n; i = i + 1) {
+                items.Add(ReadValue(depth + 1));
+            }
+            return arr;
+        }
+        if (major == 2) {  // byte string
+            if (ai < 24) { return JsonValue.NewStr(TakeUtf8(ai)); }
+            if (ai == 31) { return JsonValue.NewStr(TakeChunksStr(2)); }
+            return JsonValue.NewStr(TakeUtf8(ArgLen(Arg(ai))));
         }
         if (major == 6) {  // tag
             long tag = Arg(ai);
@@ -299,13 +315,16 @@ public class CborReader {
     // map 条目：key 必须是文本字符串（JsonValue 对象键即字符串）。
     // 定长文本键快路径走短键缓存直接解 string 并去重写入。
     public void PutEntry(JsonValue obj, int depth) {
-        if (depth + 1 <= 512 && pos < len) {
-            int ib = buf[pos] & 255;
+        int p = pos;
+        if (depth + 1 <= 512 && p < len) {
+            Span<byte> b = new Span<byte>((nint)buf, len);
+            int ib = b[p];
             if ((ib >> 5) == 3) {
                 int ai = ib & 31;
                 if (ai != 31) {
-                    pos = pos + 1;
-                    string key = TakeCachedKey(ArgLen(Arg(ai)));
+                    pos = p + 1;
+                    int klen = ai < 24 ? ai : ArgLen(Arg(ai));
+                    string key = TakeCachedKey(klen);
                     JsonValue val = ReadValue(depth + 1);
                     if (!obj.isReadOnly) {
                         CborReader.SetObjField(obj, key, val);

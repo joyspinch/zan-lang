@@ -62,11 +62,14 @@ public class EnvFileConfigurationProvider : ConfigurationProvider {
         Dictionary<string, string> next = new Dictionary<string, string>();
         int n = text.Length;
         nint tp = (nint)text;
+        Span<byte> tb = n > 0 ? new Span<byte>(tp, n) : new Span<byte>((nint)0, 0);
+        byte[] scratch = new byte[512];
+        Span<byte> scratchSpan = new Span<byte>((nint)scratch, 512);
         int pos = 0;
         while (pos < n) {
             int nl = NativeMemory.Find(tp, pos, 10, n - pos);
             int end = nl >= 0 ? nl : n;
-            this.ParseLineSliceInto(next, text, tp, pos, end);
+            this.ParseLineSliceInto(next, text, tp, tb, pos, end, scratch, scratchSpan);
             if (nl < 0) { break; }
             pos = nl + 1;
         }
@@ -76,75 +79,75 @@ public class EnvFileConfigurationProvider : ConfigurationProvider {
     // 解析一行 "KEY=VALUE"。
     protected void ParseLine(string rawLine) {
         if (rawLine == null || rawLine.Length == 0) { return; }
-        this.ParseLineSliceInto(this.data, rawLine, (nint)rawLine, 0, rawLine.Length);
+        nint tp = (nint)rawLine;
+        Span<byte> tb = new Span<byte>(tp, rawLine.Length);
+        this.ParseLineSliceInto(this.data, rawLine, tp, tb, 0, rawLine.Length, null, new Span<byte>((nint)0, 0));
     }
 
-    private void ParseLineSliceInto(Dictionary<string, string> target, string text, nint tp, int start, int end) {
+    private void ParseLineSliceInto(Dictionary<string, string> target, string text, nint tp, Span<byte> tb, int start, int end, byte[] scratch, Span<byte> scratchSpan) {
         int s = start;
         int e = end;
-        while (s < e && EnvFileConfigurationProvider.IsTrimWs(text[s] & 255)) { s = s + 1; }
-        while (e > s && EnvFileConfigurationProvider.IsTrimWs(text[e - 1] & 255)) { e = e - 1; }
+        while (s < e && EnvFileConfigurationProvider.IsTrimWs(tb[s])) { s = s + 1; }
+        while (e > s && EnvFileConfigurationProvider.IsTrimWs(tb[e - 1])) { e = e - 1; }
         if (s >= e) { return; }
-        if ((text[s] & 255) == 35) { return; } // '#'
+        if (tb[s] == 35) { return; } // '#'
         if (e - s >= 7
-            && (text[s] & 255) == 101
-            && (text[s + 1] & 255) == 120
-            && (text[s + 2] & 255) == 112
-            && (text[s + 3] & 255) == 111
-            && (text[s + 4] & 255) == 114
-            && (text[s + 5] & 255) == 116
-            && (text[s + 6] & 255) == 32) {
+            && tb[s] == 101
+            && tb[s + 1] == 120
+            && tb[s + 2] == 112
+            && tb[s + 3] == 111
+            && tb[s + 4] == 114
+            && tb[s + 5] == 116
+            && tb[s + 6] == 32) {
             s = s + 7;
-            while (s < e && EnvFileConfigurationProvider.IsTrimWs(text[s] & 255)) { s = s + 1; }
+            while (s < e && EnvFileConfigurationProvider.IsTrimWs(tb[s])) { s = s + 1; }
         }
         int eq = s < e ? NativeMemory.Find(tp, s, 61, e - s) : -1;
         if (eq < 0) { return; }
         int ks = s;
         int ke = eq;
-        while (ke > ks && EnvFileConfigurationProvider.IsTrimWs(text[ke - 1] & 255)) { ke = ke - 1; }
+        while (ke > ks && EnvFileConfigurationProvider.IsTrimWs(tb[ke - 1])) { ke = ke - 1; }
         if (ks >= ke) { return; }
         int vs = eq + 1;
         int ve = e;
         bool hadLeadingWs = false;
-        while (vs < ve && EnvFileConfigurationProvider.IsTrimWs(text[vs] & 255)) {
+        while (vs < ve && EnvFileConfigurationProvider.IsTrimWs(tb[vs])) {
             vs = vs + 1;
             hadLeadingWs = true;
         }
-        string rawKey = text.Substring(ks, ke - ks);
-        string value = (hadLeadingWs && vs < ve && (text[vs] & 255) == 35)
+        string canonical = ConfigurationKeys.CanonicalSliceFast(text, tb, ks, ke, scratch, scratchSpan);
+        if (canonical.Length == 0 || target == null) { return; }
+        string value = (hadLeadingWs && vs < ve && tb[vs] == 35)
             ? ""
-            : EnvFileConfigurationProvider.ParseValueSlice(text, tp, vs, ve);
-        string canonical = ConfigurationKeys.Canonical(rawKey);
-        if (canonical.Length > 0 && target != null) {
-            target[canonical] = value;
-        }
+            : EnvFileConfigurationProvider.ParseValueSlice(text, tp, tb, vs, ve, scratch, scratchSpan);
+        target[canonical] = value;
     }
 
-    private static bool IsTrailingCommentOrWs(string raw, int pos, int end) {
+    private static bool IsTrailingCommentOrWs(Span<byte> rb, int pos, int end) {
         int p = pos;
-        while (p < end && EnvFileConfigurationProvider.IsTrimWs(raw[p] & 255)) { p = p + 1; }
+        while (p < end && EnvFileConfigurationProvider.IsTrimWs(rb[p])) { p = p + 1; }
         if (p >= end) { return true; }
-        return p > pos && (raw[p] & 255) == 35;
+        return p > pos && rb[p] == 35;
     }
 
-    private static string ParseValueSlice(string raw, nint rp, int start, int end) {
+    private static string ParseValueSlice(string raw, nint rp, Span<byte> rb, int start, int end, byte[] scratch, Span<byte> scratchSpan) {
         int len = end - start;
         if (len < 2) {
             return (start == 0 && end == raw.Length) ? raw : raw.Substring(start, len);
         }
-        int first = raw[start] & 255;
+        int first = rb[start];
         if (first == 34) {
             // 从左向右扫描首个未转义的闭引号，避免行尾注释含 '"' 时把注释吞进值里
             int p = start + 1;
             while (p < end) {
-                int c = raw[p] & 255;
+                int c = rb[p];
                 if (c == 92) {
                     p = p + 2;
                     continue;
                 }
                 if (c == 34) {
-                    if (EnvFileConfigurationProvider.IsTrailingCommentOrWs(raw, p + 1, end)) {
-                        return EnvFileConfigurationProvider.UnescapeSlice(raw, rp, start + 1, p);
+                    if (EnvFileConfigurationProvider.IsTrailingCommentOrWs(rb, p + 1, end)) {
+                        return EnvFileConfigurationProvider.UnescapeSlice(raw, rp, rb, start + 1, p, scratch, scratchSpan);
                     }
                     break;
                 }
@@ -153,26 +156,27 @@ public class EnvFileConfigurationProvider : ConfigurationProvider {
         }
         if (first == 39) {
             int close = NativeMemory.Find(rp, start + 1, 39, end - (start + 1));
-            if (close >= 0 && EnvFileConfigurationProvider.IsTrailingCommentOrWs(raw, close + 1, end)) {
+            if (close >= 0 && EnvFileConfigurationProvider.IsTrailingCommentOrWs(rb, close + 1, end)) {
                 return raw.Substring(start + 1, close - (start + 1));
             }
         }
-        return EnvFileConfigurationProvider.StripInlineCommentSlice(raw, rp, start, end);
+        return EnvFileConfigurationProvider.StripInlineCommentSlice(raw, rp, rb, start, end);
     }
 
     // 取值的字面形式：双引号解转义、单引号取字面量、其余去行尾注释。
     public static string ParseValue(string raw) {
         if (raw == null || raw.Length < 2) { return raw; }
-        return EnvFileConfigurationProvider.ParseValueSlice(raw, (nint)raw, 0, raw.Length);
+        nint rp = (nint)raw;
+        return EnvFileConfigurationProvider.ParseValueSlice(raw, rp, new Span<byte>(rp, raw.Length), 0, raw.Length, null, new Span<byte>((nint)0, 0));
     }
 
-    private static string StripInlineCommentSlice(string raw, nint rp, int start, int end) {
+    private static string StripInlineCommentSlice(string raw, nint rp, Span<byte> rb, int start, int end) {
         int scan = start + 1;
         int hash = -1;
         while (scan < end) {
             int hit = NativeMemory.Find(rp, scan, 35, end - scan);
             if (hit < 0) { break; }
-            int prev = raw[hit - 1] & 255;
+            int prev = rb[hit - 1];
             if (prev == 32 || prev == 9) { hash = hit; break; }
             scan = hit + 1;
         }
@@ -181,31 +185,33 @@ public class EnvFileConfigurationProvider : ConfigurationProvider {
         }
         int ts = start;
         int te = hash;
-        while (ts < te && EnvFileConfigurationProvider.IsTrimWs(raw[ts] & 255)) { ts = ts + 1; }
-        while (te > ts && EnvFileConfigurationProvider.IsTrimWs(raw[te - 1] & 255)) { te = te - 1; }
+        while (ts < te && EnvFileConfigurationProvider.IsTrimWs(rb[ts])) { ts = ts + 1; }
+        while (te > ts && EnvFileConfigurationProvider.IsTrimWs(rb[te - 1])) { te = te - 1; }
         return raw.Substring(ts, te - ts);
     }
 
     // 去掉未加引号值里的行尾注释：'#' 前有空白才算注释起点。
     public static string StripInlineComment(string raw) {
         if (raw == null || raw.Length < 2) { return raw; }
-        return EnvFileConfigurationProvider.StripInlineCommentSlice(raw, (nint)raw, 0, raw.Length);
+        nint rp = (nint)raw;
+        return EnvFileConfigurationProvider.StripInlineCommentSlice(raw, rp, new Span<byte>(rp, raw.Length), 0, raw.Length);
     }
 
-    private static string UnescapeSlice(string text, nint tp, int start, int end) {
+    private static string UnescapeSlice(string text, nint tp, Span<byte> tb, int start, int end, byte[] scratch, Span<byte> scratchSpan) {
         int len = end - start;
         if (len <= 0) { return ""; }
         int firstBs = NativeMemory.Find(tp, start, 92, len);
         if (firstBs < 0) {
             return (start == 0 && end == text.Length) ? text : text.Substring(start, len);
         }
-        byte[] buf = new byte[len];
+        byte[] buf = (scratch != null && len <= scratch.Length) ? scratch : new byte[len];
         nint bp = (nint)buf;
+        Span<byte> dstSpan = (buf == scratch) ? scratchSpan : new Span<byte>(bp, len);
         int cur = start;
         int dst = 0;
         int hit = firstBs;
         while (hit >= 0 && hit + 1 < end) {
-            int nextCh = text[hit + 1] & 255;
+            int nextCh = tb[hit + 1];
             int mapped = 0;
             if (nextCh == 110) { mapped = 10; }
             else if (nextCh == 116) { mapped = 9; }
@@ -218,7 +224,7 @@ public class EnvFileConfigurationProvider : ConfigurationProvider {
                     NativeMemory.Copy(bp + (nint)dst, tp + (nint)cur, run);
                     dst = dst + run;
                 }
-                buf[dst] = (byte)mapped;
+                dstSpan[dst] = (byte)mapped;
                 dst = dst + 1;
                 cur = hit + 2;
                 hit = cur < end ? NativeMemory.Find(tp, cur, 92, end - cur) : -1;
@@ -238,6 +244,7 @@ public class EnvFileConfigurationProvider : ConfigurationProvider {
     // 双引号里的转义展开：\n \t \r \\ \"，其余反斜杠原样保留。
     public static string Unescape(string text) {
         if (text == null) { return ""; }
-        return EnvFileConfigurationProvider.UnescapeSlice(text, (nint)text, 0, text.Length);
+        nint tp = (nint)text;
+        return EnvFileConfigurationProvider.UnescapeSlice(text, tp, new Span<byte>(tp, text.Length), 0, text.Length, null, new Span<byte>((nint)0, 0));
     }
 }

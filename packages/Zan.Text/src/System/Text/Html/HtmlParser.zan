@@ -26,6 +26,7 @@ public class HtmlParser {
     int pos;
     List<HtmlNode> open;
     string[] nameCache;
+    HtmlPolicy sanitizePolicy;
 
     public HtmlParser() {
         this.src = "";
@@ -34,6 +35,7 @@ public class HtmlParser {
         this.pos = 0;
         this.open = new List<HtmlNode>();
         this.nameCache = new string[64];
+        this.sanitizePolicy = null;
     }
 
     private static string[] GetIndentCache() {
@@ -60,6 +62,20 @@ public class HtmlParser {
         p.srcPtr = (nint)p.src;
         p.len = p.src.Length;
         p.pos = 0;
+        HtmlDocument doc = new HtmlDocument();
+        p.open.Add(doc.root);
+        p.Run();
+        return doc;
+    }
+
+    // 消毒专用解析：当策略不保留某标签的任何属性时，跳过其属性字典分配与实体解码（输出逐字节等价）。
+    internal static HtmlDocument ParseForSanitize(string html, HtmlPolicy policy) {
+        HtmlParser p = new HtmlParser();
+        p.src = html == null ? "" : html;
+        p.srcPtr = (nint)p.src;
+        p.len = p.src.Length;
+        p.pos = 0;
+        p.sanitizePolicy = policy;
         HtmlDocument doc = new HtmlDocument();
         p.open.Add(doc.root);
         p.Run();
@@ -293,6 +309,16 @@ public class HtmlParser {
         while (j < this.len && HtmlUtil.IsNameChar(buf[j] & 255)) { j = j + 1; }
         string name = this.InternLower(nameStart, j);
         HtmlNode node = HtmlNode.Element(name);
+        bool keepAttrs = true;
+        HtmlPolicy sp = this.sanitizePolicy;
+        if (sp != null) {
+            if (!sp.TagAllowed(name)) {
+                keepAttrs = !sp.stripDisallowedTags && !sp.dropContentTags.Contains(name);
+            } else if (sp.allowedAttributes.Count() == 0
+                && (sp.tagAttributes.Count == 0 || !sp.tagAttributes.ContainsKey(name))) {
+                keepAttrs = false;
+            }
+        }
 
         while (j < this.len) {
             while (j < this.len && HtmlUtil.IsSpace(buf[j] & 255)) { j = j + 1; }
@@ -307,7 +333,7 @@ public class HtmlParser {
                 j = j + 1;
             }
             if (j == attrStart) { j = j + 1; continue; }
-            string attrName = this.InternLower(attrStart, j);
+            int attrEnd = j;
             int vs = 0;
             int ve = 0;
             int k = j;
@@ -337,8 +363,10 @@ public class HtmlParser {
                 }
                 j = k;
             }
+            if (!keepAttrs) { continue; }
+            string attrName = this.InternLower(attrStart, attrEnd);
             // HTML 规则：同名属性取第一个。
-            // 首个属性免 ContainsKey 二次哈希；无实体短属性值命中 64 槽驻留缓存零分配。
+            // 首个属性免 ContainsKey 二次哈希；同时维护 class/id 热属性缓存。
             Dictionary<string, string> am = node.attrsMap;
             if (am == null) {
                 am = new Dictionary<string, string>();
@@ -350,6 +378,8 @@ public class HtmlParser {
                     decoded = amp < 0 ? this.src.Substring(vs, vlen) : HtmlUtil.DecodeEntitiesSlice(this.src, vs, vlen);
                 }
                 am.Add(attrName, decoded);
+                if (attrName == "class") { node.cachedClass = decoded; }
+                else if (attrName == "id") { node.cachedId = decoded; }
             } else if (!am.ContainsKey(attrName)) {
                 int vlen = ve - vs;
                 string decoded = "";
@@ -358,6 +388,8 @@ public class HtmlParser {
                     decoded = amp < 0 ? this.src.Substring(vs, vlen) : HtmlUtil.DecodeEntitiesSlice(this.src, vs, vlen);
                 }
                 am.Add(attrName, decoded);
+                if (attrName == "class") { node.cachedClass = decoded; }
+                else if (attrName == "id") { node.cachedId = decoded; }
             }
         }
         this.pos = j;

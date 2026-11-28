@@ -63,6 +63,8 @@ public class CssCompound {
     public List<CssPseudo> pseudos;
     // 解析不了 → 永不匹配。
     public bool unsupported;
+    // 预解码：是否需要按标签名过滤（tag 非空且非 "*"）。
+    internal bool hasTagFilter;
 
     public CssCompound() {
         this.tag = "";
@@ -71,6 +73,7 @@ public class CssCompound {
         this.attrs = new List<CssAttr>();
         this.pseudos = new List<CssPseudo>();
         this.unsupported = false;
+        this.hasTagFilter = false;
     }
 }
 
@@ -82,10 +85,18 @@ public class CssCompound {
 public class CssComplex {
     public List<CssCompound> compounds;
     public List<string> combinators;
+    // 预解码组合符枚举：0=首段, 1=child, 2=descendant, 3=adjacent, 4=sibling。
+    internal List<int> combKinds;
+    // 分支组合符（descendant / sibling）计数；≥2 时才可能回溯并启用共享 failMemo。
+    internal int branchCombCount;
+    internal Dict<HtmlNode, long> failMemo;
 
     public CssComplex() {
         this.compounds = new List<CssCompound>();
         this.combinators = new List<string>();
+        this.combKinds = new List<int>();
+        this.branchCombCount = 0;
+        this.failMemo = null;
     }
 }
 
@@ -121,7 +132,11 @@ public class CssSelector {
         List<CssComplex> list = p.ParseList();
         List<HtmlNode> hits = new List<HtmlNode>();
         bool needCount = CssSelector.ListNeedsElemCount(list);
-        p.Collect(scope, list, hits, needCount);
+        if (list.Count == 1) {
+            CssSelector.CollectSingle(scope, list[0], hits, needCount);
+        } else {
+            p.Collect(scope, list, hits, needCount);
+        }
         return hits;
     }
 
@@ -133,7 +148,60 @@ public class CssSelector {
         p.pos = 0;
         List<CssComplex> list = p.ParseList();
         bool needCount = CssSelector.ListNeedsElemCount(list);
+        if (list.Count == 1) {
+            return CssSelector.FindFirstSingle(scope, list[0], needCount);
+        }
         return p.FindFirst(scope, list, needCount);
+    }
+
+    private static void CollectSingle(HtmlNode scope, CssComplex cx, List<HtmlNode> hits, bool needCount) {
+        List<HtmlNode> children = scope.childList;
+        if (children == null) { return; }
+        int cnt = children.Count;
+        int elemTotal = -1;
+        if (needCount) {
+            elemTotal = 0;
+            for (int i = 0; i < cnt; i = i + 1) {
+                if (children[i].type == HtmlNodeType.Element) { elemTotal = elemTotal + 1; }
+            }
+        }
+        int elemIdx = 0;
+        for (int i = 0; i < cnt; i = i + 1) {
+            HtmlNode c = children[i];
+            if (c.type == HtmlNodeType.Element) {
+                if (CssSelector.MatchComplexAt(c, cx, elemIdx, elemTotal)) { hits.Add(c); }
+                elemIdx = elemIdx + 1;
+                if (c.childList != null && c.childList.Count > 0) {
+                    CssSelector.CollectSingle(c, cx, hits, needCount);
+                }
+            }
+        }
+    }
+
+    private static HtmlNode FindFirstSingle(HtmlNode scope, CssComplex cx, bool needCount) {
+        List<HtmlNode> children = scope.childList;
+        if (children == null) { return null; }
+        int cnt = children.Count;
+        int elemTotal = -1;
+        if (needCount) {
+            elemTotal = 0;
+            for (int i = 0; i < cnt; i = i + 1) {
+                if (children[i].type == HtmlNodeType.Element) { elemTotal = elemTotal + 1; }
+            }
+        }
+        int elemIdx = 0;
+        for (int i = 0; i < cnt; i = i + 1) {
+            HtmlNode c = children[i];
+            if (c.type == HtmlNodeType.Element) {
+                if (CssSelector.MatchComplexAt(c, cx, elemIdx, elemTotal)) { return c; }
+                elemIdx = elemIdx + 1;
+                if (c.childList != null && c.childList.Count > 0) {
+                    HtmlNode found = CssSelector.FindFirstSingle(c, cx, needCount);
+                    if (found != null) { return found; }
+                }
+            }
+        }
+        return null;
     }
 
     private static bool ListNeedsElemCount(List<CssComplex> list) {
@@ -162,6 +230,20 @@ public class CssSelector {
         }
         int elemIdx = 0;
         int listCnt = list.Count;
+        if (listCnt == 1) {
+            CssComplex cx0 = list[0];
+            for (int i = 0; i < cnt; i = i + 1) {
+                HtmlNode c = children[i];
+                if (c.IsElement()) {
+                    if (CssSelector.MatchComplexAt(c, cx0, elemIdx, elemTotal)) { hits.Add(c); }
+                    elemIdx = elemIdx + 1;
+                    if (c.childList != null && c.childList.Count > 0) {
+                        this.Collect(c, list, hits, needCount);
+                    }
+                }
+            }
+            return;
+        }
         for (int i = 0; i < cnt; i = i + 1) {
             HtmlNode c = children[i];
             if (c.IsElement()) {
@@ -189,6 +271,21 @@ public class CssSelector {
         }
         int elemIdx = 0;
         int listCnt = list.Count;
+        if (listCnt == 1) {
+            CssComplex cx0 = list[0];
+            for (int i = 0; i < cnt; i = i + 1) {
+                HtmlNode c = children[i];
+                if (c.IsElement()) {
+                    if (CssSelector.MatchComplexAt(c, cx0, elemIdx, elemTotal)) { return c; }
+                    elemIdx = elemIdx + 1;
+                    if (c.childList != null && c.childList.Count > 0) {
+                        HtmlNode found = this.FindFirst(c, list, needCount);
+                        if (found != null) { return found; }
+                    }
+                }
+            }
+            return null;
+        }
         for (int i = 0; i < cnt; i = i + 1) {
             HtmlNode c = children[i];
             if (c.IsElement()) {
@@ -235,15 +332,16 @@ public class CssSelector {
     CssComplex ParseComplex() {
         CssComplex cx = new CssComplex();
         string pending = "";
+        int pendingKind = 0;
         bool first = true;
         while (true) {
             this.SkipSpace();
             if (this.pos >= this.src.Length) { break; }
             int c = this.src[this.pos] & 255;
             if (c == 44) { break; }   // ','
-            if (c == 62) { this.pos = this.pos + 1; pending = "child"; continue; }
-            if (c == 43) { this.pos = this.pos + 1; pending = "adjacent"; continue; }
-            if (c == 126) { this.pos = this.pos + 1; pending = "sibling"; continue; }
+            if (c == 62) { this.pos = this.pos + 1; pending = "child"; pendingKind = 1; continue; }
+            if (c == 43) { this.pos = this.pos + 1; pending = "adjacent"; pendingKind = 3; continue; }
+            if (c == 126) { this.pos = this.pos + 1; pending = "sibling"; pendingKind = 4; continue; }
             CssCompound comp = this.ParseCompound();
             if (comp.tag.Length == 0 && comp.id.Length == 0 && comp.classes.Count == 0
                 && comp.attrs.Count == 0 && comp.pseudos.Count == 0) {
@@ -251,9 +349,18 @@ public class CssSelector {
                 throw new ArgumentException("invalid CSS selector at " + Convert.ToString(this.pos));
             }
             cx.compounds.Add(comp);
-            cx.combinators.Add(first ? "" : (pending.Length > 0 ? pending : "descendant"));
+            if (first) {
+                cx.combinators.Add("");
+                cx.combKinds.Add(0);
+            } else {
+                int ck = pendingKind != 0 ? pendingKind : 2;
+                cx.combinators.Add(pendingKind != 0 ? pending : "descendant");
+                cx.combKinds.Add(ck);
+                if (ck == 2 || ck == 4) { cx.branchCombCount = cx.branchCombCount + 1; }
+            }
             first = false;
             pending = "";
+            pendingKind = 0;
             // 看下一个非空格字符，决定后一个 compound 的关系。
             int save = this.pos;
             this.SkipSpace();
@@ -263,6 +370,7 @@ public class CssSelector {
             if (nc == 62 || nc == 43 || nc == 126) { continue; }
             this.pos = save;
             pending = "descendant";
+            pendingKind = 2;
         }
         if (cx.compounds.Count == 0) {
             throw new ArgumentException("invalid CSS selector at " + Convert.ToString(this.pos));
@@ -273,19 +381,21 @@ public class CssSelector {
     private static string AsciiLower(string s) {
         if (s == null || s.Length == 0) { return ""; }
         int n = s.Length;
+        Span<byte> sb = new Span<byte>((nint)s, n);
         bool hasUpper = false;
         for (int i = 0; i < n; i = i + 1) {
-            int c = s[i] & 255;
+            int c = sb[i];
             if (c >= 65 && c <= 90) { hasUpper = true; break; }
         }
         if (!hasUpper) { return s; }
         byte[] buf = new byte[n];
+        Span<byte> dst = new Span<byte>((nint)buf, n);
         for (int i = 0; i < n; i = i + 1) {
-            int c = s[i] & 255;
+            int c = sb[i];
             if (c >= 65 && c <= 90) { c = c + 32; }
-            buf[i] = (byte)c;
+            dst[i] = (byte)c;
         }
-        return buf.ToStr(0, n);
+        return NativeMemory.GetString((nint)buf, 0, n);
     }
 
     CssCompound ParseCompound() {
@@ -297,6 +407,7 @@ public class CssSelector {
                 comp.tag = "*";
             } else if (HtmlUtil.IsNameStart(c)) {
                 comp.tag = CssSelector.AsciiLower(this.ReadName());
+                comp.hasTagFilter = comp.tag.Length > 0;
             }
         }
         while (this.pos < this.src.Length) {
@@ -417,13 +528,23 @@ public class CssSelector {
     }
 
     string ReadName() {
-        int start = this.pos;
-        while (this.pos < this.src.Length && HtmlUtil.IsNameChar(this.src[this.pos] & 255)) { this.pos = this.pos + 1; }
-        return this.src.Substring(start, this.pos - start);
+        int n = this.src.Length;
+        int p = this.pos;
+        if (p >= n) { return ""; }
+        Span<byte> sb = new Span<byte>((nint)this.src, n);
+        int start = p;
+        while (p < n && HtmlUtil.IsNameChar(sb[p])) { p = p + 1; }
+        this.pos = p;
+        return this.src.Substring(start, p - start);
     }
 
     void SkipSpace() {
-        while (this.pos < this.src.Length && HtmlUtil.IsSpace(this.src[this.pos] & 255)) { this.pos = this.pos + 1; }
+        int n = this.src.Length;
+        int p = this.pos;
+        if (p >= n) { return; }
+        Span<byte> sb = new Span<byte>((nint)this.src, n);
+        while (p < n && HtmlUtil.IsSpace(sb[p])) { p = p + 1; }
+        this.pos = p;
     }
 
     // 解析 an+b（"odd"/"even"/"n"/"-n+3"/"2n + 1"/"3"…，符合 CSS Syntax An+B）。
@@ -498,7 +619,14 @@ public class CssSelector {
         if (n == 0) { return false; }
         if (!CssSelector.MatchCompoundAt(node, cx.compounds[n - 1], elemIdx, elemTotal)) { return false; }
         if (n == 1) { return true; }
-        Dict<HtmlNode, long> failMemo = n >= 3 ? new Dict<HtmlNode, long>() : null;
+        Dict<HtmlNode, long> failMemo = null;
+        if (cx.branchCombCount >= 2) {
+            failMemo = cx.failMemo;
+            if (failMemo == null) {
+                failMemo = new Dict<HtmlNode, long>();
+                cx.failMemo = failMemo;
+            }
+        }
         return CssSelector.MatchChain(node, cx, n - 2, failMemo);
     }
 
@@ -512,11 +640,12 @@ public class CssSelector {
                 return false;
             }
         }
-        string comb = cx.combinators[idx + 1];
-        if (comb == "child") {
+        int comb = cx.combKinds[idx + 1];
+        CssCompound target = cx.compounds[idx];
+        if (comb == 1) {  // child
             HtmlNode p = node.Parent();
             if (p != null && p.IsElement()
-                && CssSelector.MatchCompound(p, cx.compounds[idx])
+                && CssSelector.MatchCompoundAt(p, target, -1, -1)
                 && CssSelector.MatchChain(p, cx, idx - 1, failMemo)) {
                 return true;
             }
@@ -527,10 +656,10 @@ public class CssSelector {
             }
             return false;
         }
-        if (comb == "descendant") {
+        if (comb == 2) {  // descendant
             HtmlNode p = node.ElementParent();
             while (p != null) {
-                if (CssSelector.MatchCompound(p, cx.compounds[idx])
+                if (CssSelector.MatchCompoundAt(p, target, -1, -1)
                     && CssSelector.MatchChain(p, cx, idx - 1, failMemo)) { return true; }
                 p = p.ElementParent();
             }
@@ -541,18 +670,19 @@ public class CssSelector {
             }
             return false;
         }
-        // adjacent（紧邻）/ sibling（任意前序）
+        // adjacent（紧邻, 3）/ sibling（任意前序, 4）
         HtmlNode parent = node.Parent();
         if (parent == null || parent.childList == null) { return false; }
-        int limit = (comb == "adjacent") ? 1 : node.index;
+        int limit = (comb == 3) ? 1 : node.index;
         int seen = 0;
+        List<HtmlNode> sibs = parent.childList;
         for (int i = node.index - 1; i >= 0 && seen < limit; i = i - 1) {
-            HtmlNode sib = parent.childList[i];
+            HtmlNode sib = sibs[i];
             if (!sib.IsElement()) { continue; }
             seen = seen + 1;
-            if (CssSelector.MatchCompound(sib, cx.compounds[idx])
+            if (CssSelector.MatchCompoundAt(sib, target, -1, -1)
                 && CssSelector.MatchChain(sib, cx, idx - 1, failMemo)) { return true; }
-            if (comb == "adjacent") { break; }
+            if (comb == 3) { break; }
         }
         if (failMemo != null && idx < 62) {
             long prev = 0L;
@@ -568,41 +698,40 @@ public class CssSelector {
 
     static bool MatchCompoundAt(HtmlNode node, CssCompound c, int elemIdx, int elemTotal) {
         if (c.unsupported) { return false; }
-        if (c.tag.Length > 0 && c.tag != "*") {
-            if (node.tag != c.tag) { return false; }
-        }
-        if (c.id.Length > 0) {
-            if (node.Get("id", "") != c.id) { return false; }
-        }
+        if (c.hasTagFilter && node.tag != c.tag) { return false; }
+        if (c.id.Length > 0 && node.GetIdFast() != c.id) { return false; }
         int clsCnt = c.classes.Count;
-        for (int i = 0; i < clsCnt; i = i + 1) {
-            if (!node.HasClass(c.classes[i])) { return false; }
+        if (clsCnt > 0) {
+            for (int i = 0; i < clsCnt; i = i + 1) {
+                if (!node.HasClass(c.classes[i])) { return false; }
+            }
         }
         int attrCnt = c.attrs.Count;
-        for (int i = 0; i < attrCnt; i = i + 1) {
-            if (!CssSelector.MatchAttr(node, c.attrs[i])) { return false; }
+        if (attrCnt > 0) {
+            for (int i = 0; i < attrCnt; i = i + 1) {
+                if (!CssSelector.MatchAttr(node, c.attrs[i])) { return false; }
+            }
         }
         int psCnt = c.pseudos.Count;
-        for (int i = 0; i < psCnt; i = i + 1) {
-            if (!CssSelector.MatchPseudoAt(node, c.pseudos[i], elemIdx, elemTotal)) { return false; }
+        if (psCnt > 0) {
+            for (int i = 0; i < psCnt; i = i + 1) {
+                if (!CssSelector.MatchPseudoAt(node, c.pseudos[i], elemIdx, elemTotal)) { return false; }
+            }
         }
         return true;
     }
 
     // ":not(...)" 用：只比类型/id/类/属性，不比伪类。
     static bool MatchSimple(HtmlNode node, CssCompound c) {
-        if (c == null) { return false; }
-        if (c.unsupported) { return false; }
-        if (c.tag.Length > 0 && c.tag != "*") {
-            if (node.tag != c.tag) { return false; }
-        }
-        if (c.id.Length > 0) {
-            if (node.Get("id", "") != c.id) { return false; }
-        }
-        for (int i = 0; i < c.classes.Count; i = i + 1) {
+        if (c == null || c.unsupported) { return false; }
+        if (c.hasTagFilter && node.tag != c.tag) { return false; }
+        if (c.id.Length > 0 && node.GetIdFast() != c.id) { return false; }
+        int clsCnt = c.classes.Count;
+        for (int i = 0; i < clsCnt; i = i + 1) {
             if (!node.HasClass(c.classes[i])) { return false; }
         }
-        for (int i = 0; i < c.attrs.Count; i = i + 1) {
+        int attrCnt = c.attrs.Count;
+        for (int i = 0; i < attrCnt; i = i + 1) {
             if (!CssSelector.MatchAttr(node, c.attrs[i])) { return false; }
         }
         return true;
@@ -710,21 +839,23 @@ public class CssSelector {
         return n;
     }
 
-    // 值里是否含有整个单词（空白分隔，原地字节比对零 Substring 分配）。
+    // 值里是否含有整个单词（空白分隔，Span 原地字节比对零 Substring 分配）。
     static bool ContainsWord(string v, string word) {
         if (word == null || word.Length == 0) { return false; }
         int n = v.Length;
         int wl = word.Length;
         if (n < wl) { return false; }
+        Span<byte> vb = new Span<byte>((nint)v, n);
+        Span<byte> wb = new Span<byte>((nint)word, wl);
         int i = 0;
         while (i < n) {
-            while (i < n && HtmlUtil.IsSpace(v[i] & 255)) { i = i + 1; }
+            while (i < n && HtmlUtil.IsSpace(vb[i])) { i = i + 1; }
             int start = i;
-            while (i < n && !HtmlUtil.IsSpace(v[i] & 255)) { i = i + 1; }
+            while (i < n && !HtmlUtil.IsSpace(vb[i])) { i = i + 1; }
             if (i - start == wl) {
                 bool eq = true;
                 for (int k = 0; k < wl; k = k + 1) {
-                    if ((v[start + k] & 255) != (word[k] & 255)) { eq = false; break; }
+                    if (vb[start + k] != wb[k]) { eq = false; break; }
                 }
                 if (eq) { return true; }
             }
@@ -732,16 +863,18 @@ public class CssSelector {
         return false;
     }
 
-    // 值等于 word 或以 "word-" 开头（零拼接分配）。
+    // 值等于 word 或以 "word-" 开头（Span 零拼接分配）。
     static bool StartsWithDash(string v, string word) {
         if (word == null || word.Length == 0) { return false; }
         int wl = word.Length;
         int vl = v.Length;
         if (vl < wl) { return false; }
         if (vl == wl) { return v == word; }
-        if ((v[wl] & 255) != 45) { return false; }
+        Span<byte> vb = new Span<byte>((nint)v, vl);
+        if (vb[wl] != 45) { return false; }
+        Span<byte> wb = new Span<byte>((nint)word, wl);
         for (int i = 0; i < wl; i = i + 1) {
-            if ((v[i] & 255) != (word[i] & 255)) { return false; }
+            if (vb[i] != wb[i]) { return false; }
         }
         return true;
     }

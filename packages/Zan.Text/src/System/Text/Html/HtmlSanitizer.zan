@@ -167,9 +167,10 @@ public class HtmlPolicy {
 
     internal static string AsciiLowerSlice(string s, int start, int len) {
         if (s == null || len <= 0) { return ""; }
+        Span<byte> sb = new Span<byte>((nint)s, s.Length);
         bool hasUpper = false;
         for (int i = 0; i < len; i = i + 1) {
-            int c = s[start + i] & 255;
+            int c = sb[start + i];
             if (c >= 65 && c <= 90) { hasUpper = true; break; }
         }
         if (!hasUpper) {
@@ -177,12 +178,13 @@ public class HtmlPolicy {
             return s.Substring(start, len);
         }
         byte[] buf = new byte[len];
+        Span<byte> dst = new Span<byte>((nint)buf, len);
         for (int i = 0; i < len; i = i + 1) {
-            int c = s[start + i] & 255;
+            int c = sb[start + i];
             if (c >= 65 && c <= 90) { c = c + 32; }
-            buf[i] = (byte)c;
+            dst[i] = (byte)c;
         }
-        return buf.ToStr(0, len);
+        return NativeMemory.GetString((nint)buf, 0, len);
     }
 
     // 放开一个标签。
@@ -278,7 +280,7 @@ public class HtmlSanitizer {
     // 用给定策略消毒。
     public static string Clean(string html, HtmlPolicy policy) {
         if (policy == null) { policy = HtmlSanitizer.DefaultShared(); }
-        HtmlDocument doc = HtmlParser.Parse(html);
+        HtmlDocument doc = HtmlParser.ParseForSanitize(html, policy);
         int cap = (html != null && html.Length > 256) ? html.Length : 256;
         StringBuilder sb = new StringBuilder(cap);
         HtmlSanitizer.WriteChildren(doc.root, policy, sb);
@@ -292,38 +294,86 @@ public class HtmlSanitizer {
     public static bool IsSafeUrl(string url, HtmlPolicy policy) {
         if (url == null) { return true; }
         if (policy == null) { policy = HtmlSanitizer.DefaultShared(); }
-        string s = HtmlSanitizer.CleanUrl(url);
-        int n = s.Length;
+        int n = url.Length;
+        if (n == 0) { return true; }
+        Span<byte> ub = new Span<byte>((nint)url, n);
+        int start = 0;
+        int end = n;
+        while (start < end && ub[start] <= 32) { start = start + 1; }
+        while (end > start && ub[end - 1] <= 32) { end = end - 1; }
+        if (start >= end) { return true; }
+        // 快路径：在到达 ':' / '/' / '?' / '#' 之前若不含 \t/\n/\r，则免 CleanUrl 分配直接校验协议。
         int cut = -1;
-        for (int i = 0; i < n; i = i + 1) {
-            int c = s[i] & 255;
+        bool hasCtrl = false;
+        for (int i = start; i < end; i = i + 1) {
+            int c = ub[i];
+            if (c == 9 || c == 10 || c == 13) { hasCtrl = true; break; }
             if (c == 58) { cut = i; break; }                    // ':'
+            if (c == 47 || c == 63 || c == 35) { return true; } // 相对地址 '/' '?' '#'
+        }
+        if (!hasCtrl) {
+            if (cut <= start) { return true; }
+            int slen = cut - start;
+            for (int i = 0; i < slen; i = i + 1) {
+                int c = ub[start + i];
+                bool alpha = (c >= 97 && c <= 122) || (c >= 65 && c <= 90);
+                if (i == 0) { if (!alpha) { return false; } continue; }
+                bool digit = c >= 48 && c <= 57;
+                if (!alpha && !digit && c != 43 && c != 45 && c != 46) { return false; }
+            }
+            if (slen == 4 && (ub[start] | 32) == 104 && (ub[start + 1] | 32) == 116
+                && (ub[start + 2] | 32) == 116 && (ub[start + 3] | 32) == 112) {
+                return policy.allowedSchemes.Contains("http");
+            }
+            if (slen == 5 && (ub[start] | 32) == 104 && (ub[start + 1] | 32) == 116
+                && (ub[start + 2] | 32) == 116 && (ub[start + 3] | 32) == 112
+                && (ub[start + 4] | 32) == 115) {
+                return policy.allowedSchemes.Contains("https");
+            }
+            if (slen == 6 && (ub[start] | 32) == 109 && (ub[start + 1] | 32) == 97
+                && (ub[start + 2] | 32) == 105 && (ub[start + 3] | 32) == 108
+                && (ub[start + 4] | 32) == 116 && (ub[start + 5] | 32) == 111) {
+                return policy.allowedSchemes.Contains("mailto");
+            }
+            string scheme = HtmlPolicy.AsciiLowerSlice(url, start, slen);
+            return policy.allowedSchemes.Contains(scheme);
+        }
+        string s = HtmlSanitizer.CleanUrl(url);
+        int sn = s.Length;
+        if (sn == 0) { return true; }
+        Span<byte> sb = new Span<byte>((nint)s, sn);
+        int scut = -1;
+        for (int i = 0; i < sn; i = i + 1) {
+            int c = sb[i];
+            if (c == 58) { scut = i; break; }                   // ':'
             if (c == 47 || c == 63 || c == 35) { break; }       // '/' '?' '#'
         }
-        if (cut <= 0) { return true; }                          // 相对地址
-        for (int i = 0; i < cut; i = i + 1) {
-            int c = s[i] & 255;
+        if (scut <= 0) { return true; }                         // 相对地址
+        for (int i = 0; i < scut; i = i + 1) {
+            int c = sb[i];
             bool alpha = (c >= 97 && c <= 122) || (c >= 65 && c <= 90);
             bool digit = c >= 48 && c <= 57;
             if (i == 0) { if (!alpha) { return false; } continue; }
             if (!alpha && !digit && c != 43 && c != 45 && c != 46) { return false; }
         }
-        string scheme = HtmlPolicy.AsciiLowerSlice(s, 0, cut);
-        return policy.allowedSchemes.Contains(scheme);
+        string scheme2 = HtmlPolicy.AsciiLowerSlice(s, 0, scut);
+        return policy.allowedSchemes.Contains(scheme2);
     }
 
     // 按浏览器的规则清理 URL（去制表/换行、去首尾空白与控制字符；常见无控制字符 URL 零 StringBuilder 分配）。
     public static string CleanUrl(string url) {
         if (url == null) { return ""; }
         int n = url.Length;
+        if (n == 0) { return ""; }
+        Span<byte> ub = new Span<byte>((nint)url, n);
         int start = 0;
         int end = n;
-        while (start < end && (url[start] & 255) <= 32) { start = start + 1; }
-        while (end > start && (url[end - 1] & 255) <= 32) { end = end - 1; }
+        while (start < end && ub[start] <= 32) { start = start + 1; }
+        while (end > start && ub[end - 1] <= 32) { end = end - 1; }
         if (start >= end) { return ""; }
         int firstCtrl = -1;
         for (int i = start; i < end; i = i + 1) {
-            int c = url[i] & 255;
+            int c = ub[i];
             if (c == 9 || c == 10 || c == 13) { firstCtrl = i; break; }
         }
         if (firstCtrl < 0) {
@@ -334,7 +384,7 @@ public class HtmlSanitizer {
         nint up = (nint)url;
         int segStart = start;
         for (int i = firstCtrl; i < end; i = i + 1) {
-            int c = url[i] & 255;
+            int c = ub[i];
             if (c == 9 || c == 10 || c == 13) {
                 if (i > segStart) { sb.Append(new StringView(up + (nint)segStart, i - segStart)); }
                 segStart = i + 1;
@@ -345,9 +395,11 @@ public class HtmlSanitizer {
     }
 
     static void WriteChildren(HtmlNode parent, HtmlPolicy policy, StringBuilder sb) {
-        if (parent.childList == null) { return; }
-        for (int i = 0; i < parent.childList.Count; i = i + 1) {
-            HtmlSanitizer.WriteNode(parent.childList[i], policy, sb);
+        List<HtmlNode> children = parent.childList;
+        if (children == null) { return; }
+        int cnt = children.Count;
+        for (int i = 0; i < cnt; i = i + 1) {
+            HtmlSanitizer.WriteNode(children[i], policy, sb);
         }
     }
 
