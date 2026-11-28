@@ -1,0 +1,225 @@
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Data.Orm;
+using System.Net.Http;
+using System.Web;
+using Cloud.Oss;
+
+class OptWave32Core {
+    static async void DummyHandler(HttpContext ctx) {
+    }
+
+    static void TestView() {
+        Console.WriteLine("=== VIEW ===");
+        ViewData data = new ViewData();
+        data.Set("title", "A&B <C> \"D\" 'E'");
+        data.Set("rawHtml", "<b>raw</b>");
+        data.Set("flagOn", "1");
+        data.Set("flagZero", "0");
+        data.Set("flagFalse", "false");
+        data.Set("flagEmpty", "");
+        List<StrMap> rows = data.AddList("rows");
+        StrMap r1 = new StrMap();
+        r1.Set("name", "Tom & Jerry");
+        r1.Set("ok", "true");
+        rows.Add(r1);
+        StrMap r2 = new StrMap();
+        r2.Set("name", "PlainName");
+        r2.Set("ok", "0");
+        rows.Add(r2);
+
+        string tpl = "<h1>{{title}}</h1>{{{rawHtml}}}"
+            + "{{#if flagOn}}[ON]{{else}}[OFF]{{/if}}"
+            + "{{#if flagZero}}[Z1]{{else}}[Z0]{{/if}}"
+            + "{{#if flagFalse}}[F1]{{else}}[F0]{{/if}}"
+            + "{{#if flagEmpty}}[E1]{{else}}[E0]{{/if}}"
+            + "{{#each rows}}<li data-ok=\"{{ok}}\">{{name}}{{#if ok}}*{{else}}-{{/if}}</li>{{/each}}"
+            + "|{{content}}|";
+        Console.WriteLine("v1=" + View.RenderStr(tpl, data, null));
+
+        data.Set("content", "<em>slot</em>");
+        Console.WriteLine("v2=" + View.RenderStr("X:{{content}}", data, null));
+
+        // Compiled AST path via View.Compile
+        List<VNode> ast = View.Compile("<p>{{title}}</p>{{#if flagZero}}A{{else}}B{{/if}}");
+        Console.WriteLine("v3=" + Convert.ToString(ast.Count));
+
+        // Unclosed tags parity
+        Console.WriteLine("v4=" + View.RenderStr("pre{{#if flagOn}}no-end", data, null));
+        Console.WriteLine("v5=" + View.RenderStr("pre{{#each rows}}no-end", data, null));
+        Console.WriteLine("v6=" + View.HtmlEscape("clean_text_123") + "|" + View.HtmlEscape("<\"'&>"));
+    }
+
+    static void TestApiDocs() {
+        Console.WriteLine("=== APIDOCS ===");
+        WebApp app = new WebApp("127.0.0.1", 0);
+        app.Map("GET", "/", DummyHandler).Named("Home").Title("Root");
+        app.Map("GET", "/health", DummyHandler).Named("Health").Title("Health");
+        Route rGet = app.Map("GET", "/api/v2/users/{id}", DummyHandler).Named("User.Get").Title("Get \"user\"\nline2").Login();
+        rGet.DocParams().Add(new ApiParam("id", "int", true, "", "User ID", "path"));
+        app.Map("DELETE", "/api/v2/users/{id}", DummyHandler).Named("User.Del").Title("Delete user").Auth();
+        Route rPost = app.Map("POST", "/api/v2/users/{id}/roles/{roleId}", DummyHandler).Named("User.Role").Title("Assign role");
+        rPost.DocParams().Add(new ApiParam("roleId", "string", true, "", "Role ID", "path"));
+        rPost.DocParams().Add(new ApiParam("note", "string", false, "", "Note", "form"));
+        string spec = ApiDocs.SpecJson(app);
+        Console.WriteLine("spec_len=" + Convert.ToString(spec.Length));
+        Console.WriteLine("spec=" + spec);
+    }
+
+    static void TestForwarded() {
+        Console.WriteLine("=== FORWARDED ===");
+        Console.WriteLine("c1=" + ForwardedHeaders.Canonical("10.0.0.1"));
+        Console.WriteLine("c2=" + ForwardedHeaders.Canonical("01.2.3.4"));
+        Console.WriteLine("c3=" + ForwardedHeaders.Canonical("2001:db8::1"));
+        Console.WriteLine("c4=" + ForwardedHeaders.Canonical("::1"));
+        Console.WriteLine("c5=" + ForwardedHeaders.Canonical("::"));
+        Console.WriteLine("c6=" + ForwardedHeaders.Canonical("::ffff:192.168.1.2"));
+        Console.WriteLine("c7=" + ForwardedHeaders.Canonical("0:0:0:0:0:ffff:10.0.0.5"));
+        Console.WriteLine("c8=" + ForwardedHeaders.Canonical("2001:db8::192.0.2.1"));
+        Console.WriteLine("c9=" + ForwardedHeaders.Canonical("2001::db8::1"));
+        Console.WriteLine("c10=" + ForwardedHeaders.Canonical("1:2:3:4:5:6::7"));
+
+        ForwardedHeaders fh = new ForwardedHeaders();
+        fh.Enable();
+        fh.AddTrustedProxies("10.0.0.1, 10.0.0.2, 10.0.0.3, 10.0.0.4, 2001:db8::9");
+
+        HttpRequest req1 = HttpRequest.Parse(
+            "GET / HTTP/1.1\r\nHost: demo.local\r\nX-Forwarded-For: 198.51.100.7, 10.0.0.2\r\nUser-Agent: test\r\n\r\n");
+        Console.WriteLine("r1=" + fh.ResolveClientIp(new HttpContext(req1, "10.0.0.1")));
+
+        // >4 hops (exercises extra[] path)
+        HttpRequest req2 = HttpRequest.Parse(
+            "GET / HTTP/1.1\r\nHost: demo.local\r\nx-FoRwArDeD-fOr: 203.0.113.9, 10.0.0.4, 10.0.0.3, 10.0.0.2, 2001:db8::9\r\n\r\n");
+        Console.WriteLine("r2=" + fh.ResolveClientIp(new HttpContext(req2, "10.0.0.1")));
+
+        // duplicate XFF -> fallback to peer
+        HttpRequest reqDup = HttpRequest.Parse(
+            "GET / HTTP/1.1\r\nX-Forwarded-For: 198.51.100.7\r\nX-Forwarded-For: 198.51.100.8\r\n\r\n");
+        Console.WriteLine("r3=" + fh.ResolveClientIp(new HttpContext(reqDup, "10.0.0.1")));
+
+        // folded line -> fallback to peer
+        HttpRequest reqFold = HttpRequest.Parse(
+            "GET / HTTP/1.1\r\nX-Forwarded-For: 198.51.100.7\r\n 10.0.0.2\r\n\r\n");
+        Console.WriteLine("r4=" + fh.ResolveClientIp(new HttpContext(reqFold, "10.0.0.1")));
+
+        // untrusted peer -> peer
+        Console.WriteLine("r5=" + fh.ResolveClientIp(new HttpContext(req1, "192.0.2.55")));
+
+        // IPv4-mapped trusted peer
+        Console.WriteLine("r6=" + fh.ResolveClientIp(new HttpContext(req1, "::ffff:10.0.0.1")));
+    }
+
+    static void TestFormParser() {
+        Console.WriteLine("=== FORMPARSER ===");
+        StrMap m1 = new StrMap();
+        HttpFormParser.ParseUrlEncoded("plain=ok&msg=hello+world%21&bad=%ZZ&tags[]=a&tags[]=b&tags%5B%5D=c&empty=&=nokey", m1);
+        Console.WriteLine("u1=" + m1.Get("plain") + "|" + m1.Get("msg") + "|" + m1.Get("bad") + "|" + m1.Get("tags") + "|" + m1.Get("empty"));
+
+        StrMap m2 = new StrMap();
+        string ct = "multipart/form-data; BOUNDARY=\"----WebKitFormBoundary7MA4\"";
+        string body = "------WebKitFormBoundary7MA4\r\n"
+            + "Content-Disposition: form-data; name=\"user\"\r\n\r\n"
+            + "Alice\r\n"
+            + "------WebKitFormBoundary7MA4\r\n"
+            + "Content-Disposition: form-data; name=\"avatar\"; filename=\"a.png\"\r\n"
+            + "Content-Type: image/png\r\n\r\n"
+            + "PNGDATA\r\n"
+            + "------WebKitFormBoundary7MA4\r\n"
+            + "Content-Disposition: form-data; NAME=role; charset=utf-8\r\n\r\n"
+            + "admin\r\n"
+            + "------WebKitFormBoundary7MA4--\r\n";
+        HttpFormParser.ParseMultipartInto(ct, body, m2);
+        Console.WriteLine("m2=" + m2.Get("user") + "|" + m2.Get("avatar") + "|" + m2.Get("role"));
+        Console.WriteLine("d1=" + HttpFormParser.DispositionName("Content-Disposition: form-data; name=\"k1\""));
+        Console.WriteLine("d2=" + HttpFormParser.DispositionName("Content-Disposition: form-data; name=\"f\"; filename=\"x.txt\""));
+    }
+
+    static void TestOrmUpdate() {
+        Console.WriteLine("=== ORMUPDATE ===");
+        Meta meta = Meta.Of("Order", "orders");
+        meta.Col("id", "Id", DbParams.KindInt, true, true, true, false, 0);
+        meta.Col("status", "Status", DbParams.KindInt, false, false, false, false, 0);
+        meta.Col("title", "Title", DbParams.KindText, false, false, false, false, 64);
+        meta.Col("amount", "Amount", DbParams.KindDouble, false, false, false, false, 0);
+        meta.Col("active", "Active", 2, false, false, false, false, 0);
+        meta.Seal();
+
+        // Empty where -> ""
+        Update uEmpty = Update.Create(null, meta);
+        uEmpty.SetI("status", 1);
+        Console.WriteLine("u0=" + uEmpty.BuildUpdate());
+
+        Update u1 = Update.Create(null, meta);
+        u1.SetS("title", "hello");
+        u1.SetIncrD("amount", 2.5);
+        u1.SetB("active", true);
+        u1.WhereEq("id", 42L);
+        u1.CondBegin(false);
+        u1.WhereEq("status", 99);
+        u1.CondEnd();
+        u1.W("t.status > ?");
+        u1.Pi(0);
+        u1.PredicateCondition("active = 1");
+        Console.WriteLine("u1=" + u1.BuildUpdate());
+
+        // SetDict + Only + WhereIn (0 and 20 elements)
+        DbValues vals = new DbValues();
+        vals.Set("title", "t2");
+        vals.Set("status", "3");
+        vals.Set("amount", "9.0");
+        Update u2 = Update.Create(null, meta);
+        u2.Only("title");
+        u2.Only("status");
+        u2.SetDict(vals);
+        List<int> emptyIds = new List<int>();
+        u2.WhereIn("status", emptyIds);
+        Console.WriteLine("u2=" + u2.BuildUpdate());
+
+        Update u3 = Update.Create(null, meta);
+        u3.Skip("amount");
+        u3.SetDict(vals);
+        List<long> ids20 = new List<long>();
+        for (int k = 1; k <= 20; k = k + 1) { ids20.Add((long)k); }
+        u3.WhereIn("id", ids20);
+        Console.WriteLine("u3=" + u3.BuildUpdate());
+    }
+
+    static void TestOssSigner() {
+        Console.WriteLine("=== OSSSIGNER ===");
+        Console.WriteLine("rfc1=" + OssSigner.Rfc3986("Az09-_.~"));
+        Console.WriteLine("rfc2=" + OssSigner.Rfc3986("a b/c+d%e"));
+        Console.WriteLine("hex1=" + OssSigner.HexByte(0) + "|" + OssSigner.HexByte(171) + "|" + OssSigner.HexByte(255));
+        Console.WriteLine("d_epoch=" + OssSigner.GmtDate(0L) + "|" + OssSigner.AmzDate(0L) + "|" + OssSigner.AmzDateOnly(0L));
+        Console.WriteLine("d_leap=" + OssSigner.GmtDate(1709208000L) + "|" + OssSigner.AmzDate(1709208000L) + "|" + OssSigner.AmzDateOnly(1709208000L));
+        Console.WriteLine("d_2026=" + OssSigner.GmtDate(1792483200L) + "|" + OssSigner.AmzDate(1792483200L) + "|" + OssSigner.AmzDateOnly(1792483200L));
+        Console.WriteLine("d_neg=" + OssSigner.GmtDate(-86400L) + "|" + OssSigner.AmzDate(-86400L) + "|" + OssSigner.AmzDateOnly(-86400L));
+        Console.WriteLine("uri1=" + S3Signer.CanonicalUri(""));
+        Console.WriteLine("uri2=" + S3Signer.CanonicalUri("dir/sub file+1.txt"));
+        List<string> qp = new List<string>();
+        qp.Add("z=1");
+        qp.Add("a=hello world");
+        qp.Add("a=2");
+        qp.Add("empty");
+        string cq = S3Signer.CanonicalQuery(qp);
+        Console.WriteLine("q1=" + cq);
+        string scope = S3Signer.Scope("20261020", "us-east-1", "s3");
+        Console.WriteLine("scope=" + scope);
+        string emptyHash = OssSigner.Sha256Hex("");
+        string creq = S3Signer.CanonicalRequest("GET", S3Signer.CanonicalUri("/bucket/a b.txt"), cq,
+            "host:s3.amazonaws.com\nx-amz-date:20261020T080000Z\n",
+            "host;x-amz-date", emptyHash);
+        string sts = S3Signer.StringToSign("20261020T080000Z", scope, creq);
+        string auth = S3Signer.Authorization("AKIAEXAMPLE", scope, "host;x-amz-date", OssSigner.Sha256Hex(sts));
+        Console.WriteLine("auth=" + auth);
+    }
+
+    static void Main() {
+        OptWave32Core.TestView();
+        OptWave32Core.TestApiDocs();
+        OptWave32Core.TestForwarded();
+        OptWave32Core.TestFormParser();
+        OptWave32Core.TestOrmUpdate();
+        OptWave32Core.TestOssSigner();
+    }
+}
