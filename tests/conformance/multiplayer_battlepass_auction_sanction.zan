@@ -1,0 +1,75 @@
+using System;
+using Game.Net;
+
+namespace Conf;
+
+class MultiplayerBattlePassAuctionSanctionTest {
+    static void Main() {
+        // 1. 双轨赛季通行证：免费领奖幂等 + 中途开通付费轨追溯领奖 + 满级溢出宝箱
+        NetBattlePassEngine bp = new NetBattlePassEngine("S15", 1000, 3);
+        bp.DefineTier(1, "coins_100", "skin_blade");
+        bp.DefineTier(2, "coins_200", "emote_victory");
+        bp.DefineTier(3, "title_hero", "mount_starlight");
+        bp.GrantXp(2500); // 达到 Tier 2
+
+        string rFree1; string rFreeDup; string rPremLocked;
+        bool c1 = bp.ClaimTierReward(1, false, out rFree1);
+        bool cDup = !bp.ClaimTierReward(1, false, out rFreeDup);        // 幂等拦截重领
+        bool premBlocked = !bp.ClaimTierReward(1, true, out rPremLocked); // 未购通行证拦截
+
+        bp.UnlockPremium();
+        string rPrem1; string rPrem2;
+        bool p1 = bp.ClaimTierReward(1, true, out rPrem1); // 追溯领 Tier 1 付费奖励
+        bool p2 = bp.ClaimTierReward(2, true, out rPrem2); // 追溯领 Tier 2 付费奖励
+        bp.GrantXp(2500); // TotalXp=5000 (封顶 3000 + 溢出 2000 -> 4 个 500xp 溢出宝箱)
+        int boxes1 = bp.ClaimOverflowBoxes(500);
+        int boxes2 = bp.ClaimOverflowBoxes(500);
+
+        bool bpOk = c1 && rFree1 == "coins_100" && cDup && premBlocked
+            && p1 && rPrem1 == "skin_blade" && p2 && rPrem2 == "emote_victory"
+            && bp.CurrentTier == 3 && boxes1 == 4 && boxes2 == 0;
+        Console.WriteLine("net-battlepass-dual-overflow: " + Convert.ToString(bpOk ? 1 : 0));
+
+        // 2. 防狙击拍卖行：最小加价、被超价退款、压哨顺延软关闭、一口价扣税结算
+        NetAuctionHouseEngine ah = new NetAuctionHouseEngine(500, 30, 45); // 5% 税, 30s 反狙击窗口顺延 45s
+        AuctionListing lot = ah.CreateListing(10, "relic_axe", 100, 20, 500, 1000, 100); // expire=1100
+        int refId; int refAmt;
+        bool selfBidBlocked = !ah.PlaceBid(lot.ListingId, 10, 120, 1010, out refId, out refAmt);
+        bool bid1Ok = ah.PlaceBid(lot.ListingId, 20, 100, 1010, out refId, out refAmt);
+        bool lowIncBlocked = !ah.PlaceBid(lot.ListingId, 30, 110, 1020, out refId, out refAmt); // < 120
+        // 在 t=1090（距结拍 10s <= 30s 狙击窗口）出价 150 -> 自动退款玩家 20 (100) 且结拍顺延至 1090+45=1135
+        bool snipeBidOk = ah.PlaceBid(lot.ListingId, 30, 150, 1090, out refId, out refAmt);
+        bool extendedOk = lot.ExpireAtSec == 1135 && refId == 20 && refAmt == 100;
+
+        // 玩家 40 在 1110（顺延期内）以 500 一口价秒拍 -> 退玩家 30 (150)，扣 5% 税 (25)，卖家实得 475
+        int buyRefId; int buyRefAmt; int netPay; int fee;
+        bool buyoutOk = ah.Buyout(lot.ListingId, 40, 1110, out buyRefId, out buyRefAmt, out netPay, out fee);
+        int wId; int sPay; int sFee;
+        bool doubleSettleBlocked = !ah.SettleExpired(lot.ListingId, 2000, out wId, out sPay, out sFee);
+
+        bool ahOk = selfBidBlocked && bid1Ok && lowIncBlocked && snipeBidOk && extendedOk
+            && buyoutOk && buyRefId == 30 && buyRefAmt == 150 && fee == 25 && netPay == 475
+            && doubleSettleBlocked;
+        Console.WriteLine("net-auction-antisnipe-escrow: " + Convert.ToString(ahOk ? 1 : 0));
+
+        // 3. 阶梯风控处罚、自然衰减与误判申诉撤销
+        NetSanctionAndTrustEngine trust = new NetSanctionAndTrustEngine(5);
+        SanctionLevel l1 = trust.RecordOffense(77, 15, 1000); // 15 -> Warning (可聊可玩)
+        bool canChatWarn = trust.CanChat(77, 1005);
+        SanctionLevel l2 = trust.RecordOffense(77, 15, 1100); // 30 -> Muted 1h (禁言但仍可匹配)
+        bool mutedNow = !trust.CanChat(77, 1500) && trust.CanJoinMatch(77, 1500);
+        bool unmutedAfter1h = trust.CanChat(77, 5000);
+        // 过 2 天自然衰减 10 分 (30->20)，再严重违规 +40 -> 60 -> TempBanned 24h (禁匹配)
+        SanctionLevel l3 = trust.RecordOffense(77, 40, 1100 + 2 * 86400);
+        bool bannedMatch = !trust.CanJoinMatch(77, 1200 + 2 * 86400);
+        // 申诉撤销 45 分 -> 15 分恢复 Warning 与匹配资格
+        trust.ApplyAppealReversal(77, 45);
+        bool appealRestored = trust.CanJoinMatch(77, 1200 + 2 * 86400)
+            && trust.GetOrCreate(77).TrustScore == 85;
+
+        bool sanctionOk = l1 == SanctionLevel.Warning && canChatWarn
+            && l2 == SanctionLevel.Muted && mutedNow && unmutedAfter1h
+            && l3 == SanctionLevel.TempBanned && bannedMatch && appealRestored;
+        Console.WriteLine("net-sanction-trust-ladder: " + Convert.ToString(sanctionOk ? 1 : 0));
+    }
+}

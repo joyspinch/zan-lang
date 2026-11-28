@@ -1,0 +1,255 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Windows;
+
+// 商业桌面陪伴每日连签日历（Daily Check-In Streak & Freeze Token Calendar）：
+// - 连续登录递增金币奖励（带封顶上限）与同日防重复签到
+// - 支持断签保护卡（StreakFreezeTokens）：漏签 1 天自动消耗保护卡保住连续记录
+public class CompanionDailyCheckInCalendar {
+    public int CurrentStreak;
+    public int LongestStreak;
+    public int TotalCheckIns;
+    public int LastCheckInDay;
+    public int StreakFreezeTokens;
+    public int BaseRewardCoins;
+    public int StreakStepCoins;
+    public int MaxStreakBonusCoins;
+
+    public CompanionDailyCheckInCalendar(int baseRewardCoins, int streakStepCoins, int maxStreakBonusCoins) {
+        this.CurrentStreak = 0;
+        this.LongestStreak = 0;
+        this.TotalCheckIns = 0;
+        this.LastCheckInDay = -1000;
+        this.StreakFreezeTokens = 0;
+        this.BaseRewardCoins = baseRewardCoins > 0 ? baseRewardCoins : 20;
+        this.StreakStepCoins = streakStepCoins >= 0 ? streakStepCoins : 5;
+        this.MaxStreakBonusCoins = maxStreakBonusCoins >= 0 ? maxStreakBonusCoins : 50;
+    }
+
+    public bool CheckIn(int dayIndex, out int grantedCoins, out bool usedFreezeToken) {
+        grantedCoins = 0;
+        usedFreezeToken = false;
+        if (dayIndex <= this.LastCheckInDay) { return false; }
+
+        if (this.TotalCheckIns == 0) {
+            this.CurrentStreak = 1;
+        } else if (dayIndex == this.LastCheckInDay + 1) {
+            this.CurrentStreak = this.CurrentStreak + 1;
+        } else if (dayIndex == this.LastCheckInDay + 2 && this.StreakFreezeTokens > 0) {
+            this.StreakFreezeTokens = this.StreakFreezeTokens - 1;
+            usedFreezeToken = true;
+            this.CurrentStreak = this.CurrentStreak + 1;
+        } else {
+            this.CurrentStreak = 1;
+        }
+
+        this.LastCheckInDay = dayIndex;
+        this.TotalCheckIns = this.TotalCheckIns + 1;
+        if (this.CurrentStreak > this.LongestStreak) {
+            this.LongestStreak = this.CurrentStreak;
+        }
+
+        int bonus = (this.CurrentStreak - 1) * this.StreakStepCoins;
+        if (bonus > this.MaxStreakBonusCoins) { bonus = this.MaxStreakBonusCoins; }
+        grantedCoins = this.BaseRewardCoins + bonus;
+        return true;
+    }
+}
+
+// 桌宠商店货架单品条目。
+public class PetShopItem {
+    public string ItemId;
+    public int PriceCoins;
+    public int MinAffinityLevel;
+    public int StockRemaining; // -1 表示不限量
+    public bool IsPermanentCosmetic;
+    public int DiscountPercent; // 0..90
+
+    public PetShopItem(string itemId, int priceCoins, int minAffinityLevel,
+                       int stockRemaining, bool isPermanentCosmetic, int discountPercent) {
+        this.ItemId = itemId != null ? itemId : "";
+        this.PriceCoins = priceCoins >= 0 ? priceCoins : 0;
+        this.MinAffinityLevel = minAffinityLevel >= 0 ? minAffinityLevel : 0;
+        this.StockRemaining = stockRemaining;
+        this.IsPermanentCosmetic = isPermanentCosmetic;
+        this.DiscountPercent = discountPercent < 0 ? 0 : (discountPercent > 90 ? 90 : discountPercent);
+    }
+}
+
+// 已拥有商品数量账本项。
+public class PetInventoryEntry {
+    public string ItemId;
+    public int Count;
+
+    public PetInventoryEntry(string itemId, int count) {
+        this.ItemId = itemId != null ? itemId : "";
+        this.Count = count;
+    }
+}
+
+// 商业桌面陪伴虚拟商店与库存账本（Pet Shop Catalog & Atomic Purchase）：
+// - 支持好感度门槛、限时折扣、限量库存、永久外观去重与消耗品堆叠原子扣费
+public class CompanionPetShopCatalog {
+    private List<PetShopItem> items;
+    private List<PetInventoryEntry> owned;
+
+    public CompanionPetShopCatalog() {
+        this.items = new List<PetShopItem>();
+        this.owned = new List<PetInventoryEntry>();
+    }
+
+    public void AddItem(string itemId, int priceCoins, int minAffinityLevel,
+                        int stockRemaining, bool isPermanentCosmetic, int discountPercent) {
+        this.items.Add(new PetShopItem(itemId, priceCoins, minAffinityLevel,
+            stockRemaining, isPermanentCosmetic, discountPercent));
+    }
+
+    private PetShopItem FindItem(string itemId) {
+        if (itemId == null) { return null; }
+        for (int i = 0; i < this.items.Count; i = i + 1) {
+            if (this.items[i].ItemId == itemId) { return this.items[i]; }
+        }
+        return null;
+    }
+
+    public int GetOwnedCount(string itemId) {
+        if (itemId == null) { return 0; }
+        for (int i = 0; i < this.owned.Count; i = i + 1) {
+            if (this.owned[i].ItemId == itemId) { return this.owned[i].Count; }
+        }
+        return 0;
+    }
+
+    private void AddOwned(string itemId) {
+        for (int i = 0; i < this.owned.Count; i = i + 1) {
+            if (this.owned[i].ItemId == itemId) {
+                this.owned[i].Count = this.owned[i].Count + 1;
+                return;
+            }
+        }
+        this.owned.Add(new PetInventoryEntry(itemId, 1));
+    }
+
+    public int GetEffectivePrice(string itemId) {
+        PetShopItem it = this.FindItem(itemId);
+        if (it == null) { return -1; }
+        return (it.PriceCoins * (100 - it.DiscountPercent)) / 100;
+    }
+
+    public bool Purchase(string itemId, int playerAffinityLevel,
+                         ref int playerCoins, out int chargedCoins) {
+        chargedCoins = 0;
+        PetShopItem it = this.FindItem(itemId);
+        if (it == null) { return false; }
+        if (playerAffinityLevel < it.MinAffinityLevel) { return false; }
+        if (it.StockRemaining == 0) { return false; }
+        if (it.IsPermanentCosmetic && this.GetOwnedCount(itemId) > 0) { return false; }
+
+        int price = (it.PriceCoins * (100 - it.DiscountPercent)) / 100;
+        if (playerCoins < price) { return false; }
+
+        playerCoins = playerCoins - price;
+        if (it.StockRemaining > 0) {
+            it.StockRemaining = it.StockRemaining - 1;
+        }
+        this.AddOwned(itemId);
+        chargedCoins = price;
+        return true;
+    }
+}
+
+// 拖放文件动作匹配规则。
+public class FileDropRule {
+    public string RuleId;
+    public string ActionName;
+    public string ExtensionsCsv; // 小写逗号分隔，如 ".png,.jpg,.webp"
+    public long MaxBytes;
+    public int Priority;
+
+    public FileDropRule(string ruleId, string actionName, string extensionsCsv,
+                        long maxBytes, int priority) {
+        this.RuleId = ruleId != null ? ruleId : "";
+        this.ActionName = actionName != null ? actionName : "";
+        this.ExtensionsCsv = extensionsCsv != null ? extensionsCsv.ToLower() : "";
+        this.MaxBytes = maxBytes > 0L ? maxBytes : 10485760L;
+        this.Priority = priority;
+    }
+}
+
+// 商业桌面陪伴文件拖放快捷路由器（Desktop Pet Drag-and-Drop Action Router）：
+// - 大小写无关扩展名解析、按规则优先级择优匹配、超大文件安全拦截与批处理统计
+public class CompanionFileDropRouter {
+    public int RoutedCount;
+    public int RejectedCount;
+    private List<FileDropRule> rules;
+
+    public CompanionFileDropRouter() {
+        this.RoutedCount = 0;
+        this.RejectedCount = 0;
+        this.rules = new List<FileDropRule>();
+    }
+
+    public void AddRule(string ruleId, string actionName, string extensionsCsv,
+                        long maxBytes, int priority) {
+        this.rules.Add(new FileDropRule(ruleId, actionName, extensionsCsv, maxBytes, priority));
+    }
+
+    private static string ExtractLowerExtension(string path) {
+        if (path == null || path == "") { return ""; }
+        string low = path.ToLower();
+        int dot = -1;
+        for (int i = low.Length - 1; i >= 0; i = i - 1) {
+            char ch = low[i];
+            if (ch == '/' || ch == '\\') { break; }
+            if (ch == '.') {
+                dot = i;
+                break;
+            }
+        }
+        if (dot < 0 || dot == low.Length - 1) { return ""; }
+        return low.Substring(dot);
+    }
+
+    private static bool CsvContainsExt(string csv, string ext) {
+        if (csv == "" || ext == "") { return false; }
+        string padded = "," + csv + ",";
+        string needle = "," + ext + ",";
+        return padded.IndexOf(needle) >= 0;
+    }
+
+    public bool RouteFile(string filePath, long fileBytes,
+                          out string matchedAction, out string rejectReason) {
+        matchedAction = "";
+        rejectReason = "";
+        string ext = ExtractLowerExtension(filePath);
+        if (ext == "") {
+            this.RejectedCount = this.RejectedCount + 1;
+            rejectReason = "UNSUPPORTED_TYPE";
+            return false;
+        }
+
+        FileDropRule bestRule = null;
+        bool sawOversize = false;
+        for (int i = 0; i < this.rules.Count; i = i + 1) {
+            FileDropRule r = this.rules[i];
+            if (!CsvContainsExt(r.ExtensionsCsv, ext)) { continue; }
+            if (fileBytes > r.MaxBytes) {
+                sawOversize = true;
+                continue;
+            }
+            if (bestRule == null || r.Priority > bestRule.Priority) {
+                bestRule = r;
+            }
+        }
+
+        if (bestRule != null) {
+            matchedAction = bestRule.ActionName;
+            this.RoutedCount = this.RoutedCount + 1;
+            return true;
+        }
+        this.RejectedCount = this.RejectedCount + 1;
+        rejectReason = sawOversize ? "FILE_TOO_LARGE" : "UNSUPPORTED_TYPE";
+        return false;
+    }
+}

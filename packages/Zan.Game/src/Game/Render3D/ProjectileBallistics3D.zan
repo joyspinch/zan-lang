@@ -1,0 +1,175 @@
+using System;
+using System.Numerics;
+
+namespace Game.Render3D;
+
+// 商业 3D 弹道解算与防隧穿连续碰撞检测器（3D Ballistics, Predictive Lead & Swept Collision）：
+// - SolveInterceptTime / SolveLeadAim：双精度解析二次方程求解移动目标精准提前量（炮塔/弓箭/MOBA 预判技能）
+// - SolveBallisticArc：双精度精确解析重力抛物线高/低弹道初速度（手雷/迫击炮/抛物投射物）
+// - SweepSegmentSphere：归一化方向 + 双精度线段-球体连续扫掠碰撞（消除长距离高速子弹单精度相消与隧穿）
+public class ProjectileBallistics3D {
+    // 求解速度为 projectileSpeed 的直线投射物命中匀速移动目标的最短正时间；无解返回 -1。
+    public static float SolveInterceptTime(Vector3 shooterPos, float projectileSpeed,
+                                           Vector3 targetPos, Vector3 targetVel) {
+        if (projectileSpeed <= 1e-4f) { return -1.0f; }
+        double dx = (double)targetPos.X - (double)shooterPos.X;
+        double dy = (double)targetPos.Y - (double)shooterPos.Y;
+        double dz = (double)targetPos.Z - (double)shooterPos.Z;
+        double vx = (double)targetVel.X;
+        double vy = (double)targetVel.Y;
+        double vz = (double)targetVel.Z;
+        double sp = (double)projectileSpeed;
+
+        double a = (vx * vx + vy * vy + vz * vz) - sp * sp;
+        double b = 2.0 * (dx * vx + dy * vy + dz * vz);
+        double c = dx * dx + dy * dy + dz * dz;
+
+        if (c <= 1e-12) { return 0.0f; }
+        double absA = a < 0.0 ? (0.0 - a) : a;
+        if (absA <= 1e-9) {
+            if (b >= -1e-9) { return -1.0f; }
+            double tLin = (0.0 - c) / b;
+            return tLin >= 0.0 ? (float)tLin : -1.0f;
+        }
+        double disc = b * b - 4.0 * a * c;
+        if (disc < 0.0) { return -1.0f; }
+        double sqrtD = Math.Sqrt(disc);
+        double inv2a = 0.5 / a;
+        double t1 = ((0.0 - b) - sqrtD) * inv2a;
+        double t2 = ((0.0 - b) + sqrtD) * inv2a;
+        double best = -1.0;
+        if (t1 >= 0.0) { best = t1; }
+        if (t2 >= 0.0 && (best < 0.0 || t2 < best)) { best = t2; }
+        return (float)best;
+    }
+
+    // 计算预判提前量射击单位方向与命中预测点；不可拦截返回 false。
+    public static bool SolveLeadAim(Vector3 shooterPos, float projectileSpeed,
+                                    Vector3 targetPos, Vector3 targetVel,
+                                    out Vector3 aimDirection, out Vector3 interceptPoint, out float flightTime) {
+        flightTime = SolveInterceptTime(shooterPos, projectileSpeed, targetPos, targetVel);
+        if (flightTime < 0.0f) {
+            aimDirection = Vector3.Zero;
+            interceptPoint = targetPos;
+            return false;
+        }
+        interceptPoint = new Vector3(
+            targetPos.X + targetVel.X * flightTime,
+            targetPos.Y + targetVel.Y * flightTime,
+            targetPos.Z + targetVel.Z * flightTime);
+        Vector3 diff = Vector3.Subtract(interceptPoint, shooterPos);
+        double len = Math.Sqrt((double)diff.X * (double)diff.X + (double)diff.Y * (double)diff.Y + (double)diff.Z * (double)diff.Z);
+        if (len <= 1e-9) {
+            aimDirection = new Vector3(0.0f, 0.0f, 1.0f);
+            return true;
+        }
+        aimDirection = new Vector3((float)((double)diff.X / len), (float)((double)diff.Y / len), (float)((double)diff.Z / len));
+        return true;
+    }
+
+    // 精确解析重力加速度 gravity（正值如 9.81）下以恒定速率 speed 命中目标的初速度（支持低弹道/高弹道）。
+    public static bool SolveBallisticArc(Vector3 start, Vector3 target, float speed,
+                                         float gravity, bool highArc,
+                                         out Vector3 launchVelocity, out float flightTime) {
+        launchVelocity = Vector3.Zero;
+        flightTime = -1.0f;
+        if (speed <= 1e-4f || gravity <= 1e-4f) { return false; }
+
+        double dx = (double)target.X - (double)start.X;
+        double dz = (double)target.Z - (double)start.Z;
+        double dy = (double)target.Y - (double)start.Y;
+        double sp = (double)speed;
+        double g = (double)gravity;
+        double horizDist = Math.Sqrt(dx * dx + dz * dz);
+        if (horizDist <= 1e-6) {
+            double discV = sp * sp - 2.0 * g * dy;
+            if (discV < 0.0) { return false; }
+            launchVelocity = new Vector3(0.0f, dy >= 0.0 ? speed : (0.0f - speed), 0.0f);
+            flightTime = (float)((sp + Math.Sqrt(discV)) / g);
+            return true;
+        }
+
+        double s2 = sp * sp;
+        double s4 = s2 * s2;
+        double disc = s4 - g * (g * horizDist * horizDist + 2.0 * dy * s2);
+        if (disc < 0.0) { return false; } // 超出最大射程
+
+        double root = Math.Sqrt(disc);
+        double tanTheta = highArc
+            ? ((s2 + root) / (g * horizDist))
+            : ((s2 - root) / (g * horizDist));
+        double cosTheta = 1.0 / Math.Sqrt(1.0 + tanTheta * tanTheta);
+        double sinTheta = tanTheta * cosTheta;
+
+        double vHoriz = sp * cosTheta;
+        double vVert = sp * sinTheta;
+        double invH = 1.0 / horizDist;
+        launchVelocity = new Vector3((float)(dx * invH * vHoriz), (float)vVert, (float)(dz * invH * vHoriz));
+        flightTime = (float)(horizDist / (vHoriz > 1e-9 ? vHoriz : 1e-9));
+        return true;
+    }
+
+    // 重力弹道位置采样：p(t) = start + v0 * t - 0.5 * g * t^2 * up。
+    public static Vector3 SampleBallisticPosition(Vector3 start, Vector3 launchVelocity,
+                                                  float gravity, float timeSec) {
+        return new Vector3(
+            start.X + launchVelocity.X * timeSec,
+            start.Y + launchVelocity.Y * timeSec - 0.5f * gravity * timeSec * timeSec,
+            start.Z + launchVelocity.Z * timeSec);
+    }
+
+    // 连续线段-球体扫掠相交检测（归一化方向 + 双精度，彻底消除长距离高速弹丸数值相消与隧穿）：
+    // 返回 [0..1] 的首次命中时间因子 hitT（与命中点 hitPoint），未命中返回 false。
+    public static bool SweepSegmentSphere(Vector3 segStart, Vector3 segEnd,
+                                          Vector3 sphereCenter, float combinedRadius,
+                                          out float hitT, out Vector3 hitPoint) {
+        hitT = 1.0f;
+        hitPoint = segEnd;
+        double r = combinedRadius > 0.0f ? (double)combinedRadius : 0.0;
+        double dx = (double)segEnd.X - (double)segStart.X;
+        double dy = (double)segEnd.Y - (double)segStart.Y;
+        double dz = (double)segEnd.Z - (double)segStart.Z;
+        double mx = (double)segStart.X - (double)sphereCenter.X;
+        double my = (double)segStart.Y - (double)sphereCenter.Y;
+        double mz = (double)segStart.Z - (double)sphereCenter.Z;
+
+        double m2 = mx * mx + my * my + mz * mz;
+        double r2 = r * r;
+        if (m2 <= r2) {
+            hitT = 0.0f;
+            hitPoint = segStart;
+            return true;
+        }
+        double segLen = Math.Sqrt(dx * dx + dy * dy + dz * dz);
+        if (segLen <= 1e-9) { return false; }
+
+        double ux = dx / segLen;
+        double uy = dy / segLen;
+        double uz = dz / segLen;
+        // 最近点沿射线的有向投影距离 proj = dot(sphereCenter - segStart, u)
+        double proj = 0.0 - (mx * ux + my * uy + mz * uz);
+        if (proj < 0.0) { return false; }
+
+        double closestX = (double)segStart.X + ux * proj;
+        double closestY = (double)segStart.Y + uy * proj;
+        double closestZ = (double)segStart.Z + uz * proj;
+        double ex = closestX - (double)sphereCenter.X;
+        double ey = closestY - (double)sphereCenter.Y;
+        double ez = closestZ - (double)sphereCenter.Z;
+        double perpSq = ex * ex + ey * ey + ez * ez;
+        if (perpSq > r2) { return false; }
+
+        double halfChord = Math.Sqrt(r2 - perpSq);
+        double hitDist = proj - halfChord;
+        if (hitDist < 0.0) { hitDist = 0.0; }
+        if (hitDist > segLen) { return false; }
+
+        double t = hitDist / segLen;
+        hitT = (float)t;
+        hitPoint = new Vector3(
+            (float)((double)segStart.X + dx * t),
+            (float)((double)segStart.Y + dy * t),
+            (float)((double)segStart.Z + dz * t));
+        return true;
+    }
+}

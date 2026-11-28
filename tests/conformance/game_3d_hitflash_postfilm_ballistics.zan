@@ -1,0 +1,188 @@
+using System;
+using System.Numerics;
+using Gui;
+using Game.Graphics;
+using Game.Render3D;
+
+namespace Conf;
+
+class Game3DHitFlashPostFilmBallisticsTest {
+    [DllImport("zan_gui")]
+    private static extern int zan_gui_read_pixel(int surfaceId, int x, int y);
+
+    private static Mesh3D MakeQuad(float halfSize) {
+        Mesh3D m = new Mesh3D();
+        m.Vertex(-halfSize, -halfSize, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f);
+        m.Vertex( halfSize, -halfSize, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        m.Vertex( halfSize,  halfSize, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+        m.Vertex(-halfSize,  halfSize, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        m.Triangle(0, 1, 2);
+        m.Triangle(0, 2, 3);
+        return m;
+    }
+
+    private static int ROf(int argb) { return (argb >> 16) & 255; }
+    private static int GOf(int argb) { return (argb >> 8) & 255; }
+    private static int BOf(int argb) { return argb & 255; }
+
+    static void Main() {
+        Canvas.SetBackend(1);
+        Canvas cv = new Canvas(128, 128);
+        int bigQuadH = cv.MeshUpload(MakeQuad(1.8f));
+        int midQuadH = cv.MeshUpload(MakeQuad(0.9f));
+
+        Camera3D cam = new Camera3D();
+        cam.Position = new Vector3(0.0f, 0.0f, 4.0f);
+        cam.Target = new Vector3(0.0f, 0.0f, 0.0f);
+        cam.AspectRatio = 1.0f;
+
+        Renderer3D renderer = new Renderer3D(16);
+        renderer.UseCpuLighting = false;
+
+        // 1. GPU 受击闪白与异常状态覆色（Hit-Flash / Status Overlay）
+        SceneNode root = new SceneNode("root");
+        SceneNode nQuad = new SceneNode("quad");
+        nQuad.MeshKey = bigQuadH;
+        nQuad.BoundsRadius = 4.0f;
+        Material mat = Material.Emissive(0.10f, 0.10f, 0.10f);
+        nQuad.Material = mat;
+        root.AddChild(nQuad);
+
+        RenderPlan plan = new RenderPlan(cam);
+        plan.AmbientRed = 0.0f; plan.AmbientGreen = 0.0f; plan.AmbientBlue = 0.0f;
+
+        mat.HitFlashAmount = 0.0f;
+        plan.Build(root);
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, plan);
+        int basePix = zan_gui_read_pixel(cv.SurfaceId(), 64, 64);
+
+        mat.HitFlashRed = 1.0f; mat.HitFlashGreen = 1.0f; mat.HitFlashBlue = 1.0f;
+        mat.HitFlashAmount = 1.0f;
+        plan.Build(root);
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, plan);
+        int whitePix = zan_gui_read_pixel(cv.SurfaceId(), 64, 64);
+
+        mat.HitFlashRed = 0.0f; mat.HitFlashGreen = 1.0f; mat.HitFlashBlue = 0.1f;
+        mat.HitFlashAmount = 0.7f;
+        plan.Build(root);
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, plan);
+        int poisonPix = zan_gui_read_pixel(cv.SurfaceId(), 64, 64);
+
+        bool flashOk = ROf(basePix) < 40 && GOf(basePix) < 40
+            && ROf(whitePix) > 240 && GOf(whitePix) > 240 && BOf(whitePix) > 240
+            && GOf(poisonPix) > 160 && GOf(poisonPix) > ROf(poisonPix) + 120 && GOf(poisonPix) > BOf(poisonPix) + 100;
+        Console.WriteLine("gpu-hit-flash-overlay: " + Convert.ToString(flashOk ? 1 : 0));
+
+        // 2. GPU 后处理锐化（Unsharp-Mask）与动态胶片颗粒（Temporal Film Grain）
+        // 2a) 锐化：在深灰底上画亮灰小方块，找到左边界像素，开 SharpenStrength=1.0 后亮侧边界像素对比度显著增强
+        nQuad.MeshKey = midQuadH;
+        Material mSharp = Material.Emissive(0.62f, 0.62f, 0.62f);
+        nQuad.Material = mSharp;
+        plan.Build(root);
+
+        renderer.PostProcess = null;
+        cv.Clear(unchecked((int)0xFF383838));
+        renderer.Draw(cv, plan);
+        int edgeX = -1;
+        int baseEdgeR = 0;
+        for (int x = 10; x < 64; x = x + 1) {
+            int pPrev = ROf(zan_gui_read_pixel(cv.SurfaceId(), x - 1, 64));
+            int pCur = ROf(zan_gui_read_pixel(cv.SurfaceId(), x, 64));
+            if (pCur > 135 && pPrev < 90) {
+                edgeX = x;
+                baseEdgeR = pCur;
+                break;
+            }
+        }
+        PostProcess ppSharp = new PostProcess();
+        ppSharp.SharpenStrength = 1.0f;
+        renderer.PostProcess = ppSharp;
+        cv.Clear(unchecked((int)0xFF383838));
+        renderer.Draw(cv, plan);
+        int sharpEdgeR = edgeX > 0 ? ROf(zan_gui_read_pixel(cv.SurfaceId(), edgeX, 64)) : 0;
+
+        // 2b) 胶片颗粒：在纯中灰平面上开启 FilmGrainStrength=0.35，验证空间噪声离散度及跨帧种子变化
+        nQuad.MeshKey = bigQuadH;
+        nQuad.Material = Material.Emissive(0.50f, 0.50f, 0.50f);
+        plan.Build(root);
+
+        PostProcess ppGrain = new PostProcess();
+        ppGrain.FilmGrainStrength = 0.35f;
+        ppGrain.FilmGrainSeed = 1.0f;
+        renderer.PostProcess = ppGrain;
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, plan);
+        int[] sampleA = new int[25];
+        int minG = 255;
+        int maxG = 0;
+        for (int i = 0; i < 25; i = i + 1) {
+            int sx = 32 + (i % 5) * 14;
+            int sy = 32 + (i / 5) * 14;
+            int r = ROf(zan_gui_read_pixel(cv.SurfaceId(), sx, sy));
+            sampleA[i] = r;
+            if (r < minG) { minG = r; }
+            if (r > maxG) { maxG = r; }
+        }
+        ppGrain.FilmGrainSeed = 2.0f;
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, plan);
+        int changed = 0;
+        for (int i = 0; i < 25; i = i + 1) {
+            int sx = 32 + (i % 5) * 14;
+            int sy = 32 + (i / 5) * 14;
+            int r2 = ROf(zan_gui_read_pixel(cv.SurfaceId(), sx, sy));
+            if (r2 != sampleA[i]) { changed = changed + 1; }
+        }
+        renderer.PostProcess = null;
+
+        bool filmOk = edgeX > 0 && sharpEdgeR >= baseEdgeR + 25
+            && (maxG - minG) >= 35 && changed >= 15;
+        Console.WriteLine("gpu-post-sharpen-filmgrain: " + Convert.ToString(filmOk ? 1 : 0));
+
+        // 3. ProjectileBallistics3D：移动目标精准提前量 + 高低重力抛物弹道 + 防隧穿连续扫掠碰撞
+        Vector3 aimDir;
+        Vector3 hitPos;
+        float leadT;
+        bool leadFound = ProjectileBallistics3D.SolveLeadAim(
+            new Vector3(0.0f, 0.0f, 0.0f), 20.0f,
+            new Vector3(30.0f, 0.0f, 0.0f), new Vector3(0.0f, 0.0f, 10.0f),
+            out aimDir, out hitPos, out leadT);
+        Vector3 bulletAtT = new Vector3(aimDir.X * 20.0f * leadT, aimDir.Y * 20.0f * leadT, aimDir.Z * 20.0f * leadT);
+        Vector3 targetAtT = new Vector3(30.0f, 0.0f, 10.0f * leadT);
+        Vector3 leadErr = Vector3.Subtract(bulletAtT, targetAtT);
+        float leadDistErr = (float)Math.Sqrt((double)Vector3.Dot(leadErr, leadErr));
+
+        Vector3 startP = new Vector3(0.0f, 0.0f, 0.0f);
+        Vector3 targetP = new Vector3(20.0f, 2.0f, 0.0f);
+        Vector3 vLow; float tLow;
+        Vector3 vHigh; float tHigh;
+        bool lowOk = ProjectileBallistics3D.SolveBallisticArc(startP, targetP, 18.0f, 9.81f, false, out vLow, out tLow);
+        bool highOk = ProjectileBallistics3D.SolveBallisticArc(startP, targetP, 18.0f, 9.81f, true, out vHigh, out tHigh);
+        Vector3 endLow = ProjectileBallistics3D.SampleBallisticPosition(startP, vLow, 9.81f, tLow);
+        Vector3 endHigh = ProjectileBallistics3D.SampleBallisticPosition(startP, vHigh, 9.81f, tHigh);
+        float errLow = (float)Math.Sqrt((double)Vector3.Dot(Vector3.Subtract(endLow, targetP), Vector3.Subtract(endLow, targetP)));
+        float errHigh = (float)Math.Sqrt((double)Vector3.Dot(Vector3.Subtract(endHigh, targetP), Vector3.Subtract(endHigh, targetP)));
+        Vector3 vFar; float tFar;
+        bool outOfRangeRejected = !ProjectileBallistics3D.SolveBallisticArc(startP, new Vector3(200.0f, 0.0f, 0.0f), 10.0f, 9.81f, false, out vFar, out tFar);
+
+        float sweepT; Vector3 sweepPt;
+        bool sweepHit = ProjectileBallistics3D.SweepSegmentSphere(
+            new Vector3(0.0f, 0.0f, 0.0f), new Vector3(100.0f, 0.0f, 0.0f),
+            new Vector3(50.0f, 0.4f, 0.0f), 0.5f, out sweepT, out sweepPt);
+        float missT; Vector3 missPt;
+        bool sweepMiss = !ProjectileBallistics3D.SweepSegmentSphere(
+            new Vector3(0.0f, 0.0f, 0.0f), new Vector3(100.0f, 0.0f, 0.0f),
+            new Vector3(50.0f, 2.0f, 0.0f), 0.5f, out missT, out missPt);
+
+        bool ballisticsOk = leadFound && leadT > 1.5f && leadDistErr < 0.01f
+            && lowOk && highOk && tHigh > tLow && vHigh.Y > vLow.Y
+            && errLow < 0.02f && errHigh < 0.02f && outOfRangeRejected
+            && sweepHit && sweepT > 0.49f && sweepT < 0.50f && sweepMiss;
+        Console.WriteLine("projectile-ballistics-3d: " + Convert.ToString(ballisticsOk ? 1 : 0));
+
+        renderer.Dispose();
+    }
+}

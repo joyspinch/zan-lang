@@ -206,6 +206,15 @@ ZAN_GAME_API void zan_game_set_triplanar3d(int32_t enabled, float scale,
 ZAN_GAME_API void zan_game_set_height_fog3d(int32_t enabled, float base_y,
     float falloff, float max_density, float r, float g, float b);
 
+/* GPU 受击闪白与异常状态覆色（Hit-Flash / Status Overlay，动作/RPG 战斗反馈）：
+ * amount [0..1] 按 mix(rgb, (r,g,b), amount) 在光照后、雾效前叠色（0 关闭，零开销）。 */
+ZAN_GAME_API void zan_game_set_hit_flash3d(float r, float g, float b, float amount);
+
+/* GPU 后处理锐化与胶片颗粒（Unsharp-Mask Sharpen + Temporal Film Grain，零额外 Pass）：
+ * sharpen_strength [0..2] 增强边缘清晰度；grain_strength [0..0.5] 叠加防色带胶片噪点，grain_seed 驱动逐帧变化。 */
+ZAN_GAME_API void zan_game_set_post_film3d(float sharpen_strength,
+    float grain_strength, float grain_seed);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1,0 +1,356 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Net;
+
+// 赛季通行证单阶双轨奖励定义。
+public class BattlePassTierReward {
+    public int Tier;
+    public string FreeRewardId;
+    public string PremiumRewardId;
+    public bool FreeClaimed;
+    public bool PremiumClaimed;
+
+    public BattlePassTierReward(int tier, string freeRewardId, string premiumRewardId) {
+        this.Tier = tier;
+        this.FreeRewardId = freeRewardId != null ? freeRewardId : "";
+        this.PremiumRewardId = premiumRewardId != null ? premiumRewardId : "";
+        this.FreeClaimed = false;
+        this.PremiumClaimed = false;
+    }
+}
+
+// 商业在线游戏双轨赛季通行证引擎（Free / Premium Battle Pass & Overflow Ledger）：
+// - 经验驱动线性/封顶升阶，免费轨与付费轨独立幂等领奖（中途解锁 Premium 可追溯领取所有已达阶付费奖励）
+// - 满级后支持可重复溢出宝箱（Overflow Bonus）防长尾流失
+public class NetBattlePassEngine {
+    public string SeasonId;
+    public int XpPerTier;
+    public int MaxTiers;
+    public int TotalXp;
+    public int CurrentTier;
+    public bool PremiumUnlocked;
+    public int OverflowBoxesClaimed;
+
+    private List<BattlePassTierReward> tiers;
+
+    public NetBattlePassEngine(string seasonId, int xpPerTier, int maxTiers) {
+        this.SeasonId = seasonId != null ? seasonId : "S1";
+        this.XpPerTier = xpPerTier > 0 ? xpPerTier : 1000;
+        this.MaxTiers = maxTiers > 0 ? maxTiers : 50;
+        this.TotalXp = 0;
+        this.CurrentTier = 0;
+        this.PremiumUnlocked = false;
+        this.OverflowBoxesClaimed = 0;
+        this.tiers = new List<BattlePassTierReward>();
+    }
+
+    public void DefineTier(int tier, string freeRewardId, string premiumRewardId) {
+        if (tier < 1 || tier > this.MaxTiers) { return; }
+        for (int i = 0; i < this.tiers.Count; i = i + 1) {
+            if (this.tiers[i].Tier == tier) {
+                this.tiers[i].FreeRewardId = freeRewardId != null ? freeRewardId : "";
+                this.tiers[i].PremiumRewardId = premiumRewardId != null ? premiumRewardId : "";
+                return;
+            }
+        }
+        this.tiers.Add(new BattlePassTierReward(tier, freeRewardId, premiumRewardId));
+    }
+
+    public int GrantXp(int deltaXp) {
+        if (deltaXp <= 0) { return this.CurrentTier; }
+        this.TotalXp = this.TotalXp + deltaXp;
+        int calcTier = this.TotalXp / this.XpPerTier;
+        if (calcTier > this.MaxTiers) { calcTier = this.MaxTiers; }
+        this.CurrentTier = calcTier;
+        return this.CurrentTier;
+    }
+
+    public void UnlockPremium() {
+        this.PremiumUnlocked = true;
+    }
+
+    public bool ClaimTierReward(int tier, bool premiumTrack, out string rewardId) {
+        rewardId = "";
+        if (tier < 1 || tier > this.CurrentTier) { return false; }
+        if (premiumTrack && !this.PremiumUnlocked) { return false; }
+        for (int i = 0; i < this.tiers.Count; i = i + 1) {
+            BattlePassTierReward r = this.tiers[i];
+            if (r.Tier != tier) { continue; }
+            if (premiumTrack) {
+                if (r.PremiumClaimed || r.PremiumRewardId == "") { return false; }
+                r.PremiumClaimed = true;
+                rewardId = r.PremiumRewardId;
+                return true;
+            }
+            if (r.FreeClaimed || r.FreeRewardId == "") { return false; }
+            r.FreeClaimed = true;
+            rewardId = r.FreeRewardId;
+            return true;
+        }
+        return false;
+    }
+
+    public int ClaimOverflowBoxes(int xpPerOverflowBox) {
+        int step = xpPerOverflowBox > 0 ? xpPerOverflowBox : this.XpPerTier;
+        int capXp = this.MaxTiers * this.XpPerTier;
+        if (this.TotalXp <= capXp) { return 0; }
+        int earnedTotal = (this.TotalXp - capXp) / step;
+        int newlyClaimable = earnedTotal - this.OverflowBoxesClaimed;
+        if (newlyClaimable <= 0) { return 0; }
+        this.OverflowBoxesClaimed = earnedTotal;
+        return newlyClaimable;
+    }
+}
+
+// 拍卖行单条挂单记录。
+public class AuctionListing {
+    public int ListingId;
+    public int SellerId;
+    public string ItemId;
+    public int StartPrice;
+    public int MinIncrement;
+    public int BuyoutPrice;
+    public int CurrentBid;
+    public int HighBidderId;
+    public int ExpireAtSec;
+    public bool Settled;
+
+    public AuctionListing(int id, int sellerId, string itemId, int startPrice,
+                          int minIncrement, int buyoutPrice, int expireAtSec) {
+        this.ListingId = id;
+        this.SellerId = sellerId;
+        this.ItemId = itemId != null ? itemId : "";
+        this.StartPrice = startPrice > 0 ? startPrice : 1;
+        this.MinIncrement = minIncrement > 0 ? minIncrement : 1;
+        this.BuyoutPrice = buyoutPrice >= 0 ? buyoutPrice : 0;
+        this.CurrentBid = 0;
+        this.HighBidderId = 0;
+        this.ExpireAtSec = expireAtSec;
+        this.Settled = false;
+    }
+}
+
+// 商业多人在线防狙击拍卖行引擎（Authoritative Auction House）：
+// - 严格校验最小加价幅度与禁止卖家自拍抬价，竞价成功原子返回被超价者退款额
+// - 反压哨狙击软关闭（Anti-Snipe Soft Close）：临近结拍窗口内出价自动顺延结拍时间
+// - 支持一口价秒拍、结拍幂等结算与万分比交易税（FeeBps）扣除
+public class NetAuctionHouseEngine {
+    public int FeeBps;
+    public int AntiSnipeWindowSec;
+    public int AntiSnipeExtendSec;
+
+    private List<AuctionListing> listings;
+    private int nextListingId;
+
+    public NetAuctionHouseEngine(int feeBps, int antiSnipeWindowSec, int antiSnipeExtendSec) {
+        this.FeeBps = feeBps >= 0 && feeBps <= 5000 ? feeBps : 500;
+        this.AntiSnipeWindowSec = antiSnipeWindowSec >= 0 ? antiSnipeWindowSec : 30;
+        this.AntiSnipeExtendSec = antiSnipeExtendSec >= 0 ? antiSnipeExtendSec : 30;
+        this.listings = new List<AuctionListing>();
+        this.nextListingId = 1;
+    }
+
+    private AuctionListing Find(int listingId) {
+        for (int i = 0; i < this.listings.Count; i = i + 1) {
+            if (this.listings[i].ListingId == listingId) { return this.listings[i]; }
+        }
+        return null;
+    }
+
+    public AuctionListing CreateListing(int sellerId, string itemId, int startPrice,
+                                        int minIncrement, int buyoutPrice,
+                                        int nowSec, int durationSec) {
+        int dur = durationSec > 0 ? durationSec : 3600;
+        AuctionListing l = new AuctionListing(this.nextListingId, sellerId, itemId,
+            startPrice, minIncrement, buyoutPrice, nowSec + dur);
+        this.nextListingId = this.nextListingId + 1;
+        this.listings.Add(l);
+        return l;
+    }
+
+    public bool PlaceBid(int listingId, int bidderId, int bidAmount, int nowSec,
+                         out int refundPrevBidderId, out int refundPrevAmount) {
+        refundPrevBidderId = 0;
+        refundPrevAmount = 0;
+        AuctionListing l = this.Find(listingId);
+        if (l == null || l.Settled || nowSec >= l.ExpireAtSec) { return false; }
+        if (bidderId <= 0 || bidderId == l.SellerId) { return false; }
+
+        int minRequired = l.HighBidderId == 0 ? l.StartPrice : (l.CurrentBid + l.MinIncrement);
+        if (bidAmount < minRequired) { return false; }
+
+        refundPrevBidderId = l.HighBidderId;
+        refundPrevAmount = l.CurrentBid;
+        l.HighBidderId = bidderId;
+        l.CurrentBid = bidAmount;
+
+        // 反压哨狙击：距结拍不足 AntiSnipeWindowSec 时顺延
+        if (this.AntiSnipeWindowSec > 0 && (l.ExpireAtSec - nowSec) <= this.AntiSnipeWindowSec) {
+            int extended = nowSec + this.AntiSnipeExtendSec;
+            if (extended > l.ExpireAtSec) {
+                l.ExpireAtSec = extended;
+            }
+        }
+        return true;
+    }
+
+    public bool Buyout(int listingId, int buyerId, int nowSec,
+                       out int refundPrevBidderId, out int refundPrevAmount,
+                       out int sellerNetPayout, out int taxFee) {
+        refundPrevBidderId = 0;
+        refundPrevAmount = 0;
+        sellerNetPayout = 0;
+        taxFee = 0;
+        AuctionListing l = this.Find(listingId);
+        if (l == null || l.Settled || nowSec >= l.ExpireAtSec) { return false; }
+        if (l.BuyoutPrice <= 0 || buyerId <= 0 || buyerId == l.SellerId) { return false; }
+
+        refundPrevBidderId = l.HighBidderId;
+        refundPrevAmount = l.CurrentBid;
+        l.HighBidderId = buyerId;
+        l.CurrentBid = l.BuyoutPrice;
+        l.Settled = true;
+        taxFee = (l.BuyoutPrice * this.FeeBps) / 10000;
+        sellerNetPayout = l.BuyoutPrice - taxFee;
+        return true;
+    }
+
+    public bool SettleExpired(int listingId, int nowSec,
+                              out int winnerId, out int sellerNetPayout, out int taxFee) {
+        winnerId = 0;
+        sellerNetPayout = 0;
+        taxFee = 0;
+        AuctionListing l = this.Find(listingId);
+        if (l == null || l.Settled || nowSec < l.ExpireAtSec) { return false; }
+        l.Settled = true;
+        if (l.HighBidderId == 0) { return true; } // 流拍
+        winnerId = l.HighBidderId;
+        taxFee = (l.CurrentBid * this.FeeBps) / 10000;
+        sellerNetPayout = l.CurrentBid - taxFee;
+        return true;
+    }
+}
+
+// 账号合规处罚等级。
+public enum SanctionLevel {
+    Clean = 0,
+    Warning = 1,
+    Muted = 2,
+    TempBanned = 3,
+    PermBanned = 4
+}
+
+// 玩家信誉分与违规处罚档案。
+public class PlayerTrustRecord {
+    public int PlayerId;
+    public int TrustScore;
+    public int OffensePoints;
+    public int LastOffenseSec;
+    public SanctionLevel Level;
+    public int SanctionExpireAtSec;
+
+    public PlayerTrustRecord(int playerId) {
+        this.PlayerId = playerId;
+        this.TrustScore = 100;
+        this.OffensePoints = 0;
+        this.LastOffenseSec = 0;
+        this.Level = SanctionLevel.Clean;
+        this.SanctionExpireAtSec = 0;
+    }
+}
+
+// 商业在线游戏阶梯风控处罚与信誉分衰减引擎（Progressive Sanction Ladder & Trust Score）：
+// - 违规扣分按日自然衰减，屡犯沿 Warning -> Muted(1h) -> TempBanned(24h) -> PermBanned 自动升级
+// - 实时聊天/匹配准入闸门（CanChat / CanJoinMatch）自动识别处罚到期
+// - 支持误判申诉撤销（ApplyAppealReversal）恢复信誉分与权限
+public class NetSanctionAndTrustEngine {
+    public int DecayPointsPerDay;
+    private List<PlayerTrustRecord> records;
+
+    public NetSanctionAndTrustEngine(int decayPointsPerDay) {
+        this.DecayPointsPerDay = decayPointsPerDay >= 0 ? decayPointsPerDay : 5;
+        this.records = new List<PlayerTrustRecord>();
+    }
+
+    public PlayerTrustRecord GetOrCreate(int playerId) {
+        for (int i = 0; i < this.records.Count; i = i + 1) {
+            if (this.records[i].PlayerId == playerId) { return this.records[i]; }
+        }
+        PlayerTrustRecord r = new PlayerTrustRecord(playerId);
+        this.records.Add(r);
+        return r;
+    }
+
+    private static SanctionLevel ClassifyPoints(int pts, int nowSec, out int expireAt) {
+        expireAt = 0;
+        if (pts >= 100) {
+            expireAt = 2147483647;
+            return SanctionLevel.PermBanned;
+        }
+        if (pts >= 50) {
+            expireAt = nowSec + 86400;
+            return SanctionLevel.TempBanned;
+        }
+        if (pts >= 25) {
+            expireAt = nowSec + 3600;
+            return SanctionLevel.Muted;
+        }
+        if (pts >= 10) {
+            return SanctionLevel.Warning;
+        }
+        return SanctionLevel.Clean;
+    }
+
+    public SanctionLevel RecordOffense(int playerId, int severityPoints, int nowSec) {
+        PlayerTrustRecord r = this.GetOrCreate(playerId);
+        if (r.LastOffenseSec > 0 && nowSec > r.LastOffenseSec && this.DecayPointsPerDay > 0) {
+            int elapsedDays = (nowSec - r.LastOffenseSec) / 86400;
+            if (elapsedDays > 0) {
+                int decayed = elapsedDays * this.DecayPointsPerDay;
+                r.OffensePoints = r.OffensePoints > decayed ? (r.OffensePoints - decayed) : 0;
+            }
+        }
+        int add = severityPoints > 0 ? severityPoints : 0;
+        r.OffensePoints = r.OffensePoints + add;
+        r.LastOffenseSec = nowSec;
+        int trust = 100 - r.OffensePoints;
+        r.TrustScore = trust < 0 ? 0 : trust;
+
+        int exp;
+        r.Level = ClassifyPoints(r.OffensePoints, nowSec, out exp);
+        r.SanctionExpireAtSec = exp;
+        return r.Level;
+    }
+
+    public bool CanChat(int playerId, int nowSec) {
+        PlayerTrustRecord r = this.GetOrCreate(playerId);
+        if (r.Level == SanctionLevel.PermBanned) { return false; }
+        if ((r.Level == SanctionLevel.Muted || r.Level == SanctionLevel.TempBanned)
+            && nowSec < r.SanctionExpireAtSec) {
+            return false;
+        }
+        return true;
+    }
+
+    public bool CanJoinMatch(int playerId, int nowSec) {
+        PlayerTrustRecord r = this.GetOrCreate(playerId);
+        if (r.Level == SanctionLevel.PermBanned) { return false; }
+        if (r.Level == SanctionLevel.TempBanned && nowSec < r.SanctionExpireAtSec) {
+            return false;
+        }
+        return true;
+    }
+
+    public void ApplyAppealReversal(int playerId, int pointsRemoved) {
+        PlayerTrustRecord r = this.GetOrCreate(playerId);
+        int sub = pointsRemoved > 0 ? pointsRemoved : 0;
+        r.OffensePoints = r.OffensePoints > sub ? (r.OffensePoints - sub) : 0;
+        int trust = 100 - r.OffensePoints;
+        r.TrustScore = trust > 100 ? 100 : trust;
+        if (r.OffensePoints < 25) {
+            r.Level = r.OffensePoints >= 10 ? SanctionLevel.Warning : SanctionLevel.Clean;
+            r.SanctionExpireAtSec = 0;
+        }
+    }
+}

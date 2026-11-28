@@ -106,13 +106,19 @@ binding_lowered:
                     emit_struct_local_capture(g, owner->type, owner->alloca, right,
                                               expr->binary.right, locals);
                 } else {
-                    LLVMValueRef sv = coerce_int_to(g, right,
-                        local_slot_type(g, owner));
+                    LLVMTypeRef slot_ty = local_slot_type(g, owner);
+                    LLVMValueRef rv = (LLVMGetTypeKind(slot_ty) == LLVMStructTypeKind)
+                        ? coerce_struct_value(g, right, owner->type) : right;
+                    LLVMValueRef sv = coerce_int_to(g, rv, slot_ty);
                     zan_store_fit(g, sv, owner->alloca);
                 }
             } else if (local) {
-                LLVMValueRef sv = coerce_int_to(g, right,
-                    local_slot_type(g, local));
+                /* 值结构体赋给 ref/out 参数时 local->alloca 是 LLVMGetParam，
+                 * zan_store_fit 无法反推 target，必须先按值解引用构造临时地址。 */
+                LLVMTypeRef slot_ty = local_slot_type(g, local);
+                LLVMValueRef rv = (LLVMGetTypeKind(slot_ty) == LLVMStructTypeKind)
+                    ? coerce_struct_value(g, right, local->type) : right;
+                LLVMValueRef sv = coerce_int_to(g, rv, slot_ty);
                 zan_store_fit(g, sv, local->alloca);
             } else if (g->current_type_sym &&
                        get_field_sym(g->current_type_sym,

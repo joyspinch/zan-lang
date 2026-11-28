@@ -146,7 +146,7 @@ typedef struct {
     zgl_int u_orm_map, u_orm_on, u_ao_strength, u_alpha_cutoff;
     zgl_int u_emissive_map, u_emissive_on, u_uv_transform, u_rim_light, u_toon;
     zgl_int u_dissolve, u_dissolve_edge, u_clip_plane, u_clip_on;
-    zgl_int u_triplanar, u_height_fog_params, u_height_fog_color;
+    zgl_int u_triplanar, u_height_fog_params, u_height_fog_color, u_hit_flash;
     zgl_int u_light_dir, u_light_color, u_light_count, u_ambient;
     zgl_int u_cam_pos, u_cam_valid, u_material, u_emissive;
     zgl_int u_point_pos, u_point_color, u_point_count;
@@ -219,9 +219,11 @@ static int g_game_clip_on = 0;
 static float g_game_triplanar[3] = { 0.0f, 1.0f, 4.0f }; /* enabled, scale, sharpness */
 static float g_game_height_fog_params[4] = { 0.0f, 1.0f, 0.8f, 0.0f }; /* base_y, falloff, max_density, enabled */
 static float g_game_height_fog_color[3] = { 0.6f, 0.7f, 0.85f };
+static float g_game_hit_flash[4] = { 1.0f, 1.0f, 1.0f, 0.0f }; /* r, g, b, amount */
 static float g_game_color_grade[2] = { 1.0f, 1.0f }; /* saturation, contrast */
 static float g_game_color_tint[3] = { 1.0f, 1.0f, 1.0f };
 static float g_game_post_lens[2] = { 0.0f, 0.0f }; /* fxaa, chromatic */
+static float g_game_post_film[3] = { 0.0f, 0.0f, 0.0f }; /* sharpen, grain, seed */
 static uint32_t g_game_light_version = 1;
 
 static zan_game_mesh *g_game_meshes = NULL;
@@ -481,6 +483,7 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
 "uniform vec3 uTriplanar;\n" \
 "uniform vec4 uHeightFogParams;\n" \
 "uniform vec3 uHeightFogColor;\n" \
+"uniform vec4 uHitFlash;\n" \
 "uniform vec3 uCamPos;\n" \
 "uniform int uCamValid;\n" \
 "uniform vec2 uMaterial;\n" \
@@ -662,6 +665,9 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
     "            rgb += uRimLight.rgb * pow(1.0 - ndv, max(uRimLight.w, 0.25));\n" \
     "        }\n" \
     "    }\n" \
+    "    if (uHitFlash.a > 0.0001) {\n" \
+    "        rgb = mix(rgb, uHitFlash.rgb, clamp(uHitFlash.a, 0.0, 1.0));\n" \
+    "    }\n" \
 "    if (uFogParams.x > 0.5 && uCamValid != 0) {\n" \
 "        float fogDist = length(uCamPos - v_world_pos);\n" \
 "        float fogT = clamp((fogDist - uFogParams.y) * uFogParams.z, 0.0, 1.0);\n" \
@@ -767,6 +773,7 @@ static const char *const ZAN_GAME_POST_FS =
 "uniform vec2 uColorGrade;\n"
 "uniform vec3 uColorTint;\n"
 "uniform vec2 uPostLens;\n"
+"uniform vec3 uPostFilm;\n"
 "in vec2 v_uv;\n"
 "out vec4 frag;\n"
 "vec3 brightPass(vec3 c, float th) {\n"
@@ -799,13 +806,21 @@ static const char *const ZAN_GAME_POST_FS =
 "            col = mix(col, avg, blendF);\n"
 "        }\n"
 "    }\n"
-"    if (uPostLens.y > 0.0002) {\n"
-"        vec2 dir = v_uv - vec2(0.5);\n"
-"        vec2 off = dir * uPostLens.y;\n"
-"        col.r = texture(uScene, clamp(v_uv + off, vec2(0.0), vec2(1.0))).r;\n"
-"        col.b = texture(uScene, clamp(v_uv - off, vec2(0.0), vec2(1.0))).b;\n"
-"    }\n"
-"    if (uBloom.y > 0.001) {\n"
+    "    if (uPostLens.y > 0.0002) {\n"
+    "        vec2 dir = v_uv - vec2(0.5);\n"
+    "        vec2 off = dir * uPostLens.y;\n"
+    "        col.r = texture(uScene, clamp(v_uv + off, vec2(0.0), vec2(1.0))).r;\n"
+    "        col.b = texture(uScene, clamp(v_uv - off, vec2(0.0), vec2(1.0))).b;\n"
+    "    }\n"
+    "    if (uPostFilm.x > 0.001) {\n"
+    "        vec3 sN = texture(uScene, v_uv + vec2(0.0, -uTexelSize.y)).rgb;\n"
+    "        vec3 sS = texture(uScene, v_uv + vec2(0.0,  uTexelSize.y)).rgb;\n"
+    "        vec3 sW = texture(uScene, v_uv + vec2(-uTexelSize.x, 0.0)).rgb;\n"
+    "        vec3 sE = texture(uScene, v_uv + vec2( uTexelSize.x, 0.0)).rgb;\n"
+    "        vec3 lap = 4.0 * col - sN - sS - sW - sE;\n"
+    "        col = max(col + lap * uPostFilm.x, vec3(0.0));\n"
+    "    }\n"
+    "    if (uBloom.y > 0.001) {\n"
 "        float th = uBloom.x;\n"
 "        vec3 glow = brightPass(col, th) * 0.16;\n"
 "        vec2 t2 = uTexelSize * 2.0;\n"
@@ -836,11 +851,15 @@ static const char *const ZAN_GAME_POST_FS =
     "    col = (col - vec3(0.5)) * uColorGrade.y + vec3(0.5);\n"
     "    col *= uColorTint;\n"
     "    if (uVignette > 0.001) {\n"
-"        vec2 d = (v_uv - vec2(0.5)) * 2.0;\n"
-"        float vig = clamp(1.0 - uVignette * dot(d, d) * 0.5, 0.0, 1.0);\n"
-"        col *= vig;\n"
-"    }\n"
-"    frag = vec4(clamp(col, 0.0, 1.0), src.a);\n"
+    "        vec2 d = (v_uv - vec2(0.5)) * 2.0;\n"
+    "        float vig = clamp(1.0 - uVignette * dot(d, d) * 0.5, 0.0, 1.0);\n"
+    "        col *= vig;\n"
+    "    }\n"
+    "    if (uPostFilm.y > 0.0005) {\n"
+    "        float gNoise = fract(sin(dot(v_uv * 1024.0 + vec2(uPostFilm.z * 17.3, uPostFilm.z * 31.7), vec2(12.9898, 78.233))) * 43758.5453);\n"
+    "        col += vec3((gNoise - 0.5) * uPostFilm.y);\n"
+    "    }\n"
+    "    frag = vec4(clamp(col, 0.0, 1.0), src.a);\n"
 "}\n";
 
 typedef struct {
@@ -854,6 +873,7 @@ typedef struct {
     zgl_int u_color_grade;
     zgl_int u_color_tint;
     zgl_int u_post_lens;
+    zgl_int u_post_film;
 } zan_game_post_program;
 
 static const char *const ZAN_GAME_SKYBOX_FS =
@@ -1091,6 +1111,8 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
         : g_game_gl->GetUniformLocation(program, "uHeightFogParams");
     zgl_int height_fog_color = instanced ? -1
         : g_game_gl->GetUniformLocation(program, "uHeightFogColor");
+    zgl_int hit_flash = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uHitFlash");
     zgl_int color = instanced ? 0
         : g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
@@ -1160,6 +1182,7 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
     prog->u_triplanar = triplanar;
     prog->u_height_fog_params = height_fog_params;
     prog->u_height_fog_color = height_fog_color;
+    prog->u_hit_flash = hit_flash;
     prog->u_color = color;
     prog->u_light_dir = light_dir;
     prog->u_light_color = light_color;
@@ -1226,6 +1249,7 @@ static zan_game_program *zan_game_skin_program_get(void) {
     zgl_int triplanar = g_game_gl->GetUniformLocation(program, "uTriplanar");
     zgl_int height_fog_params = g_game_gl->GetUniformLocation(program, "uHeightFogParams");
     zgl_int height_fog_color = g_game_gl->GetUniformLocation(program, "uHeightFogColor");
+    zgl_int hit_flash = g_game_gl->GetUniformLocation(program, "uHitFlash");
     zgl_int color = g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
     zgl_int light_color = g_game_gl->GetUniformLocation(program, "uLightColor[0]");
@@ -1283,6 +1307,7 @@ static zan_game_program *zan_game_skin_program_get(void) {
     g_game_skin_prog.u_triplanar = triplanar;
     g_game_skin_prog.u_height_fog_params = height_fog_params;
     g_game_skin_prog.u_height_fog_color = height_fog_color;
+    g_game_skin_prog.u_hit_flash = hit_flash;
     g_game_skin_prog.u_color = color;
     g_game_skin_prog.u_light_dir = light_dir;
     g_game_skin_prog.u_light_color = light_color;
@@ -1730,6 +1755,11 @@ static void zan_game_bind_shadow_uniforms(const zan_gl_api *gl, zan_game_program
     }
     if (prog->u_height_fog_color >= 0) {
         gl->Uniform3fv(prog->u_height_fog_color, 1, g_game_height_fog_color);
+    }
+    if (prog->u_hit_flash >= 0) {
+        gl->Uniform4f(prog->u_hit_flash,
+            g_game_hit_flash[0], g_game_hit_flash[1],
+            g_game_hit_flash[2], g_game_hit_flash[3]);
     }
 }
 
@@ -2296,6 +2326,7 @@ static zan_game_post_program *zan_game_post_program_get(void) {
     g_game_post_prog.u_color_grade = g_game_gl->GetUniformLocation(prog, "uColorGrade");
     g_game_post_prog.u_color_tint = g_game_gl->GetUniformLocation(prog, "uColorTint");
     g_game_post_prog.u_post_lens = g_game_gl->GetUniformLocation(prog, "uPostLens");
+    g_game_post_prog.u_post_film = g_game_gl->GetUniformLocation(prog, "uPostFilm");
     return &g_game_post_prog;
 }
 
@@ -2398,6 +2429,9 @@ ZAN_GAME_API int32_t zan_game_postprocess3d(int32_t surface_id, float exposure,
     }
     if (prog->u_post_lens >= 0) {
         gl->Uniform2f(prog->u_post_lens, g_game_post_lens[0], g_game_post_lens[1]);
+    }
+    if (prog->u_post_film >= 0) {
+        gl->Uniform3fv(prog->u_post_film, 1, g_game_post_film);
     }
     gl->BindVertexArray(g_game_post_vao);
     gl->DrawArrays(ZGL_TRIANGLES, 0, 3);
@@ -2649,4 +2683,24 @@ ZAN_GAME_API void zan_game_set_height_fog3d(int32_t enabled, float base_y,
     g_game_height_fog_color[0] = r > 0.0f ? r : 0.0f;
     g_game_height_fog_color[1] = g > 0.0f ? g : 0.0f;
     g_game_height_fog_color[2] = b > 0.0f ? b : 0.0f;
+}
+
+ZAN_GAME_API void zan_game_set_hit_flash3d(float r, float g, float b, float amount) {
+    g_game_hit_flash[0] = r > 0.0f ? r : 0.0f;
+    g_game_hit_flash[1] = g > 0.0f ? g : 0.0f;
+    g_game_hit_flash[2] = b > 0.0f ? b : 0.0f;
+    if (amount < 0.0f) amount = 0.0f;
+    if (amount > 1.0f) amount = 1.0f;
+    g_game_hit_flash[3] = amount;
+}
+
+ZAN_GAME_API void zan_game_set_post_film3d(float sharpen_strength,
+    float grain_strength, float grain_seed) {
+    if (sharpen_strength < 0.0f) sharpen_strength = 0.0f;
+    if (sharpen_strength > 2.0f) sharpen_strength = 2.0f;
+    if (grain_strength < 0.0f) grain_strength = 0.0f;
+    if (grain_strength > 0.5f) grain_strength = 0.5f;
+    g_game_post_film[0] = sharpen_strength;
+    g_game_post_film[1] = grain_strength;
+    g_game_post_film[2] = grain_seed;
 }
