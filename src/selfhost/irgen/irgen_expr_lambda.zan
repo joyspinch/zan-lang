@@ -320,8 +320,14 @@ partial class Irgen {
         string owner = DeclOwnerOf(cls, m);
         if (owner == "") { owner = MethodOwner(cls, m.sval); }
         if (owner == "") { owner = cls.sval; }
+        bool isIface = cls != null && HasMod(cls, MOD.Iface());
+        Node effOwner = ownerType != null ? ownerType : recv.ty;
+        if (isIface && recv.ty != null) {
+            Node ifaceOwner = FindInterfaceInstance(recv.ty, MkType(owner), 0);
+            if (ifaceOwner != null) { effOwner = ifaceOwner; }
+        }
         string target = MethodSym(owner, m);
-        if (ownerType != null) {
+        if (!isIface && ownerType != null) {
             string spec = ClassSpecSym(owner, m, ownerType);
             if (spec != "") { target = spec; }
         }
@@ -329,19 +335,44 @@ partial class Irgen {
         int i = 0;
         while (i < m.kids.Count) {
             Node p = m.kids[i];
-            if (p.kind == AK.Param()) { pt.Add(ownerType != null ? binder.SubstOwner(p.type, ownerType) : p.type); }
+            if (p.kind == AK.Param()) { pt.Add(effOwner != null ? binder.SubstOwner(p.type, effOwner) : p.type); }
             i = i + 1;
         }
-        Node retTy = ownerType != null ? binder.SubstOwner(m.type, ownerType) : m.type; if (retTy == null) { retTy = MkType("void"); }
-        string rt = MapType(retTy);
-        string fname = "@__mg_" + target;
-        // the receiver's type: the class that declares the method
-        string rcvTy = MapType(MkType(owner));
-        // one thunk per method (the receiver is not part of it -- it comes
-        // from the closure's env)
-        if (IndexOfStr(mgTargets, target) < 0) {
-            mgTargets.Add(target);
-            EmitMethodGroupThunk(owner, m, target, fname, pt, retTy);
+        Node retTy = effOwner != null ? binder.SubstOwner(m.type, effOwner) : m.type; if (retTy == null) { retTy = MkType("void"); }
+        string rt = IsAsync(m) ? "i8*" : MapType(retTy);
+        string fname;
+        if (isIface) {
+            List<string> llTypes = new List<string>();
+            int pi = 0;
+            while (pi < pt.Count) {
+                string pll = MapType(pt[pi]);
+                if (IsRefParam(m, pi)) { pll = pll + "*"; }
+                llTypes.Add(pll);
+                pi = pi + 1;
+            }
+            Node dispatchRecv = recv.ty != null ? recv.ty : MkType(owner);
+            int at = EnsureClosedInterfaceDispatch(dispatchRecv, m, llTypes, rt);
+            string key = "iface_" + at;
+            fname = "@zmg_if_" + at;
+            if (IndexOfStr(mgTargets, key) < 0) {
+                mgTargets.Add(key);
+                EmitInterfaceMethodGroupThunk(at, fname, llTypes, rt);
+            }
+        } else {
+            string key = target;
+            bool genericOwner = effOwner != null && effOwner.kids.Count > 0 && MentionsTPDeep(m);
+            if (genericOwner) {
+                key = target + "$" + FormatTypeNode(effOwner);
+            }
+            int existing = IndexOfStr(mgTargets, key);
+            int slotIdx = existing >= 0 ? existing : mgTargets.Count;
+            fname = genericOwner ? ("@zmg_" + target + "_" + slotIdx) : ("@__mg_" + target);
+            // one thunk per method (the receiver is not part of it -- it comes
+            // from the closure's env)
+            if (existing < 0) {
+                mgTargets.Add(key);
+                EmitMethodGroupThunk(owner, m, target, fname, pt, retTy);
+            }
         }
         // the env: one slot holding the receiver
         List<Node> captureTypes = new List<Node>(); captureTypes.Add(recv.ty);
@@ -358,13 +389,39 @@ partial class Irgen {
         return OwnedClosure(fname, env, retTy, pt);
     }
 
+    void EmitInterfaceMethodGroupThunk(int dispatchAt, string fname, List<string> llTypes, string rt) {
+        StringBuilder saved = body; int savedTmp = tmp; bool savedEntry = eaActive;
+        body = new StringBuilder(); tmp = 0; eaActive = false;
+        string sig = "define " + rt + " " + fname + "(i8* %env";
+        int i = 0;
+        while (i < llTypes.Count) { sig = sig + ", " + llTypes[i] + " %p" + i; i = i + 1; }
+        L(sig + ") {"); L("entry:");
+        L("  %envi = bitcast i8* %env to i64*");
+        L("  %rcvi = load i64, i64* %envi");
+        L("  %rcv = inttoptr i64 %rcvi to i8*");
+        string args = "i8* %rcv";
+        i = 0;
+        while (i < llTypes.Count) { args = args + ", " + llTypes[i] + " %p" + i; i = i + 1; }
+        string call = "call " + rt + " @zinterface_dispatch_" + dispatchAt + "(" + args + ")";
+        if (rt == "void") {
+            L("  " + call);
+            L("  ret void");
+        } else {
+            string value = NT();
+            L("  " + value + " = " + call);
+            L("  ret " + rt + " " + value);
+        }
+        L("}"); deferred.Append(body.ToString());
+        body = saved; tmp = savedTmp; eaActive = savedEntry;
+    }
+
     // Reuse ordinary argument/slot coercion for the vtable's declared ABI.
     // The thunk exposes the concrete delegate signature, but dispatch remains
     // virtual even when a generic class needs a specialized direct body.
     void EmitMethodGroupThunk(string owner, Node m, string target, string fname, List<Node> pt, Node retTy) {
         StringBuilder saved = body; int savedTmp = tmp; bool savedEntry = eaActive;
         body = new StringBuilder(); tmp = 0; eaActive = false;
-        string rt = MapType(retTy);
+        string rt = IsAsync(m) ? "i8*" : MapType(retTy);
         string sig = "define " + rt + " " + fname + "(i8* %env";
         int i = 0;
         while (i < pt.Count) { sig = sig + ", " + MapType(pt[i]) + " %p" + i; i = i + 1; }
@@ -404,7 +461,7 @@ partial class Irgen {
                 L("vtcall:");
             }
             L("  %vfn = bitcast i8* %vraw to " + MethodFnTypeThis(m, owner));
-            fn = "%vfn"; callRt = MapTypeDecl(m.type, owner);
+            fn = "%vfn"; callRt = IsAsync(m) ? "i8*" : MapTypeDecl(m.type, owner);
         }
         string args = recvTy + " %rcv";
         i = 0;
@@ -419,8 +476,8 @@ partial class Irgen {
         else {
             string value = NT(); L("  " + value + " = call " + callRt + " " + fn + "(" + args + ")");
             ExprVal result = new ExprVal(value, retTy);
-            if (slot >= 0 && IsErasedTypeDecl(m.type, owner)) { result = FromSlot(value, retTy); }
-            L("  ret " + rt + " " + Coerce(result, rt));
+            if (!IsAsync(m) && slot >= 0 && IsErasedTypeDecl(m.type, owner)) { result = FromSlot(value, retTy); }
+            L("  ret " + rt + " " + (IsAsync(m) ? value : Coerce(result, rt)));
         }
         L("}"); deferred.Append(body.ToString());
         body = saved; tmp = savedTmp; eaActive = savedEntry;

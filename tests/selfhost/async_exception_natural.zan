@@ -24,6 +24,38 @@ class NaturalPropHolder {
     }
 }
 record NaturalRec(string A, string B);
+interface INatDummy { void Ping(); }
+interface INatAdder { int Add(int x); }
+interface INatSubAdder : INatAdder { int Mul(int x); }
+interface INatGet<T> { T Get(int x); }
+interface INatDefCalc { int Calc(int x) { return x + 10; } }
+interface INatAsyncBox { Task<NaturalBox> GetAsync(bool boom); }
+async delegate Task<NaturalBox> NatAsyncBoxDel(bool boom);
+struct NatStructAdder : INatAdder {
+    public int Base;
+    public NatStructAdder(int b) { this.Base = b; }
+    public int Add(int x) { return this.Base + x; }
+}
+class NatMultiImpl : INatDummy, INatSubAdder, INatGet<NaturalBox>, INatDefCalc, INatAsyncBox {
+    public NaturalBox Tag;
+    public NatMultiImpl(int v) { this.Tag = new NaturalBox(v); }
+    public void Ping() { }
+    public int Add(int x) { return this.Tag.Val + x; }
+    public int Mul(int x) { return this.Tag.Val * x; }
+    public NaturalBox Get(int x) { return new NaturalBox(this.Tag.Val + x); }
+    public async Task<NaturalBox> GetAsync(bool boom) {
+        NaturalBox local = new NaturalBox(this.Tag.Val + 1);
+        await Task.Yield();
+        if (boom) { throw new Exception("nmi_" + local.Name); }
+        return local;
+    }
+}
+class NatStrGetImpl : INatDummy, INatGet<string> {
+    public string Prefix;
+    public NatStrGetImpl(string p) { this.Prefix = p; }
+    public void Ping() { }
+    public string Get(int x) { return this.Prefix + "_" + x.ToString(); }
+}
 class Program {
     static NaturalOriginal original;
     static NaturalReplacement replacement;
@@ -217,6 +249,74 @@ class Program {
         acc = acc + oldProp.Val + ph.Current.Val;
         return acc;
     }
+    static async Task<(NaturalBox, NaturalBox)> MakeTupleAsync(int v) {
+        await Task.Yield();
+        return (MakeBox(v), MakeBox(v + 1));
+    }
+    static async Task<NaturalBox> MakeBoxAsync(int v) {
+        await Task.Yield();
+        return MakeBox(v);
+    }
+    static async Task<int> MakeIntAsync(int v) {
+        await Task.Yield();
+        return v;
+    }
+    static async Task<Exception> MakeExAsync(string tag) {
+        await Task.Yield();
+        return new Exception("ex_" + tag);
+    }
+    static async Task<int> AsyncDeconThrowLock() {
+        int acc = 0;
+        var (a, b) = await MakeTupleAsync(10);
+        var tp = await MakeTupleAsync(20);
+        var (c, d) = tp;
+        var solo = await MakeBoxAsync(30);
+        await Task.Yield();
+        acc = acc + a.Val + b.Val + c.Val + d.Val + solo.Val; // 92
+        try {
+            throw await MakeExAsync("boom");
+        } catch (Exception e) {
+            await Task.Yield();
+            acc = acc + e.Message.Length; // 7
+        }
+        lock (await MakeBoxAsync(5)) {
+            int x = 10 + await MakeIntAsync(6);
+            acc = acc + x; // 16
+        }
+        NatMultiImpl mi = new NatMultiImpl(10);
+        INatAdder ia = mi;
+        Func<int, int> fa = ia.Add;
+        acc = acc + fa(5); // 15
+        INatSubAdder isa = mi;
+        Func<int, int> fm = isa.Mul;
+        acc = acc + fm(3); // 30
+        Func<int, int> baseFn = isa.Add;
+        acc = acc + baseFn(6); // 16
+        INatGet<NaturalBox> igb = mi;
+        Func<int, NaturalBox> fgb = igb.Get;
+        acc = acc + fgb(7).Val; // 17
+        INatGet<string> igs = new NatStrGetImpl("hi");
+        Func<int, string> fgs = igs.Get;
+        acc = acc + fgs(99).Length; // 5
+        INatDefCalc idc = mi;
+        Func<int, int> fc = idc.Calc;
+        acc = acc + fc(4); // 14
+        INatAdder sa = new NatStructAdder(20);
+        Func<int, int> fsa = sa.Add;
+        acc = acc + fsa(4); // 24
+        INatAsyncBox iab = mi;
+        NatAsyncBoxDel fad = iab.GetAsync;
+        NaturalBox okb = await fad(false);
+        acc = acc + okb.Val; // 11
+        try {
+            NaturalBox badb = await fad(true);
+            acc = acc + badb.Val;
+        } catch (Exception e) {
+            await Task.Yield();
+            acc = acc + e.Message.Length; // "nmi_nb_11" = 9
+        }
+        return acc; // 115+15+30+16+17+5+14+24+11+9 = 256
+    }
     static async void Pending() {
         try { throw original; }
         finally {
@@ -253,5 +353,6 @@ class Program {
         Console.WriteLine(SyncDeconAndSwitchCapture());
         Console.WriteLine(await AsyncWithDeconSwitch());
         Console.WriteLine(await AsyncCtorAndCollectionInit());
+        Console.WriteLine(await AsyncDeconThrowLock());
     }
 }
