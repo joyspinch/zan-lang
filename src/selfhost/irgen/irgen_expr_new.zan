@@ -38,6 +38,14 @@ partial class Irgen {
 
     // ---- indexing (string char / list element / array) ----
     ExprVal GenIndex(Node e, bool asPlace = false, bool hold = false) {
+        bool arm = eaActive;
+        if (arm) { EnterCallArm(); }
+        ExprVal res = GenIndexCore(e, asPlace, hold);
+        if (arm) { LeaveCallArm(); }
+        return res;
+    }
+
+    ExprVal GenIndexCore(Node e, bool asPlace = false, bool hold = false) {
         ExprVal obj = GenExpr(e.a);
         if (hold && obj.ty != null && obj.ty.ival >= 1) { HoldArrayPlace(obj); }
         ExprVal idx = GenExpr(e.b);
@@ -246,6 +254,8 @@ partial class Irgen {
             return new ExprVal("null", MkType("object"));
         }
         if (e.ival != 1 && IsSpanType(ty)) {
+            bool spanArm = eaActive && e.kids.Count > 1;
+            if (spanArm) { EnterCallArm(); }
             string baseOp = "null";
             string lenOp = "0";
             if (e.kids.Count > 0) {
@@ -267,6 +277,7 @@ partial class Irgen {
                 ExprVal l = GenExpr(e.kids[1]);
                 lenOp = l.op;
             }
+            if (spanArm) { LeaveCallArm(); }
             string iv0 = NT();
             L("  " + iv0 + " = insertvalue { i8*, i64 } undef, i8* " + baseOp + ", 0");
             string iv1 = NT();
@@ -332,11 +343,15 @@ partial class Irgen {
             string arr = ArrayAllocate(at, nsz.op);
             string storage = ArrayStorage(elemTy);
             if (init) {
+                string arrGuard = ArmGuardSlot(arr, at, "i64*");
+                if (eaActive) { EnterCallArm(); }
                 int jn = 0;
                 while (jn < e.kids.Count) {
                     InitArrayElement(arr, "" + jn, elemTy, storage, GenExpr(e.kids[jn]));
                     jn = jn + 1;
                 }
+                if (eaActive) { LeaveCallArm(); }
+                RetireGuardSlot(arrGuard, "i64*");
             } else if (storage == "i64" && IsStructTy(elemTy)) {
                 L("  call void @" + elemTy.sval + "_initarr(i64* " + arr + ", i64 " + nsz.op + ")");
             }
@@ -349,6 +364,12 @@ partial class Irgen {
             int ownership = ListSlotOwnership(ListElem(ty));
             string meta = ListTypeMetadata(ty);
             L("  " + t + " = call i8* @zlist_new_typed(i64 " + ownership + ", i8* " + meta + ")");
+            bool listHasInit = (e.ival == 2 && e.kids.Count > 0) || e.kids.Count > 0;
+            string listGuard = "";
+            if (listHasInit) {
+                listGuard = ArmGuardSlot(t, ty, "i8*");
+                if (eaActive) { EnterCallArm(); }
+            }
             if (e.ival == 2) {
                 // collection initializer: append each item
                 int j = 0;
@@ -423,6 +444,10 @@ partial class Irgen {
                     j = j + 1;
                 }
             }
+            if (listHasInit) {
+                if (eaActive) { LeaveCallArm(); }
+                RetireGuardSlot(listGuard, "i8*");
+            }
             AddTemp(t, ty);
             return new ExprVal(t, ty);
         }
@@ -432,6 +457,8 @@ partial class Irgen {
             string meta = DictTypeMetadata(ty);
             L("  " + t + " = call i8* @zdict_new_typed(i64 " + ow + ", i8* " + meta + ")");
             if (e.ival == 2) {
+                string dictGuard = ArmGuardSlot(t, ty, "i8*");
+                if (eaActive) { EnterCallArm(); }
                 // collection initializer: each item is a key/value pair.
                 int j = 0;
                 while (j < e.kids.Count) {
@@ -444,6 +471,8 @@ partial class Irgen {
                     }
                     j = j + 1;
                 }
+                if (eaActive) { LeaveCallArm(); }
+                RetireGuardSlot(dictGuard, "i8*");
             }
             AddTemp(t, ty);
             return new ExprVal(t, ty);
@@ -508,15 +537,8 @@ partial class Irgen {
         // would treat a stmtTemps receiver as stealable via TakeOwnedTemp and
         // drop it mid-construction) and bracket ctor/init calls with
         // EnterCallArm so throwing arguments or constructors unwind cleanly.
-        string objGuard = "";
         string objLt = "%" + cn + "*";
-        if (eaActive) {
-            objGuard = NTS();
-            entryAllocas.Append("  " + objGuard + " = alloca " + objLt + "\n");
-            entryAllocas.Append("  store " + objLt + " null, " + objLt + "* " + objGuard + "\n");
-            L("  store " + objLt + " " + obj + ", " + objLt + "* " + objGuard);
-            ArmLocalSlot(objGuard, ty, false);
-        }
+        string objGuard = ArmGuardSlot(obj, ty, objLt);
         EnterCallArm();
         // The constructor: with an object initializer (ival == 2) the kids are
         // `Field = value` pairs, not ctor args, so only a parameterless ctor
@@ -661,10 +683,7 @@ partial class Irgen {
         // object initializer: store each `Field = value` into the instance
         if (e.ival == 2) { ApplyObjInit(e, obj, ty, cls, cn); }
         LeaveCallArm();
-        if (objGuard != "") {
-            RetireLocalSlot(objGuard, objLt);
-            L("  store " + objLt + " null, " + objLt + "* " + objGuard);
-        }
+        RetireGuardSlot(objGuard, objLt);
         AddTemp(obj, ty);
         // preserve generic type arguments (ty may carry <...>) for the result
         return new ExprVal(obj, ty);
@@ -750,10 +769,13 @@ partial class Irgen {
     // the initializer (the host's construct_new factory path) -- every item
     // acts on the ONE evaluated object.
     ExprVal GenCallInit(Node e) {
+        bool arm = eaActive;
+        if (arm) { EnterCallArm(); }
         ExprVal r = GenExpr(e.a);
         Node cls = ClassOf(r.ty);
         if (cls == null || r.ty == null) {
             diags.Error("[E3022] object initializer can only continue a call that returns a class instance", e.line, e.col);
+            if (arm) { LeaveCallArm(); }
             return r;
         }
         string cn = cls.sval;
@@ -764,6 +786,7 @@ partial class Irgen {
         string obj = NT();
         L("  " + obj + " = bitcast " + MapType(r.ty) + " " + r.op + " to %" + cn + "*");
         ApplyObjInit(e, obj, r.ty, cls, cn);
+        if (arm) { LeaveCallArm(); }
         return r;
     }
 

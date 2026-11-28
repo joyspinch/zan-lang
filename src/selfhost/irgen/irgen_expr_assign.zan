@@ -1176,24 +1176,111 @@ partial class Irgen {
         return new ExprVal(res, MkType("bool"));
     }
 
-    // tuple literal (a, b, ...) -> heap i64[N], each element packed into a slot.
+    string TupleSlotKind(Node et) {
+        if (et == null || IsErasedType(et)) { return "v"; }
+        if (et.ival >= 1) { return "a" + ArrRankOf(et); }
+        if (DynamicReferenceType(et)) { return "r"; }
+        if (IsDelegate(et)) { return "d"; }
+        if (IsStr(et)) { return "s"; }
+        if (ArcManaged(et) || IsDecimal(et)) { return "o"; }
+        return "v";
+    }
+
+    string TupleDtor(List<Node> elemTypes) {
+        StringBuilder keySb = new StringBuilder();
+        bool anyManaged = false;
+        int i = 0;
+        while (i < elemTypes.Count) {
+            if (i > 0) { keySb.Append("_"); }
+            string k = TupleSlotKind(elemTypes[i]);
+            if (k != "v") { anyManaged = true; }
+            keySb.Append(k);
+            i = i + 1;
+        }
+        if (!anyManaged) { return "null"; }
+        string key = keySb.ToString();
+        if (tupleDtorCache.ContainsKey(key)) { return tupleDtorCache[key]; }
+        string sym = "@ztuple_dtor_" + key;
+        string dtorPtr = "bitcast (void (i8*)* " + sym + " to i8*)";
+        tupleDtorCache[key] = dtorPtr;
+        StringBuilder saved = body;
+        int st = tmp; int sl = lbl; string sc = curLbl; bool se = eaActive;
+        body = new StringBuilder(); tmp = 0; lbl = 0; curLbl = "entry"; eaActive = false;
+        L("define internal void " + sym + "(i8* %raw) {");
+        L("entry:");
+        L("  %p = bitcast i8* %raw to i64*");
+        i = 0;
+        while (i < elemTypes.Count) {
+            string k = TupleSlotKind(elemTypes[i]);
+            if (k != "v") {
+                string sp = NT();
+                L("  " + sp + " = getelementptr i64, i64* %p, i64 " + i);
+                string sv = NT();
+                L("  " + sv + " = load i64, i64* " + sp);
+                if (k.StartsWith("a")) {
+                    string ap = NT();
+                    L("  " + ap + " = inttoptr i64 " + sv + " to i64*");
+                    EmitArrayRelease(ap, "i64*", elemTypes[i]);
+                } else {
+                    string op = NT();
+                    L("  " + op + " = inttoptr i64 " + sv + " to i8*");
+                    if (k == "s") { L("  call void @zstr_slot_release(i8* " + op + ")"); }
+                    else if (k == "d") { L("  call void @zdelegate_release(i8* " + op + ")"); }
+                    else if (k == "r") { L("  call void @zref_release(i8* " + op + ")"); }
+                    else { L("  call void @zrelease(i8* " + op + ")"); }
+                }
+            }
+            i = i + 1;
+        }
+        L("  ret void");
+        L("}");
+        deferred.Append(body.ToString());
+        body = saved; tmp = st; lbl = sl; curLbl = sc; eaActive = se;
+        return dtorPtr;
+    }
+
+    // tuple literal (a, b, ...) -> ARC-managed zalloc i64[N], each element packed into a slot.
     ExprVal GenTuple(Node e) {
         int n = e.kids.Count;
         Node tty = new Node(AK.TypeRef()); tty.sval = "Tuple";
-        string buf = NT();
-        L("  " + buf + " = call i8* @malloc(i64 " + (n * 8) + ")");
-        string p = NT();
-        L("  " + p + " = bitcast i8* " + buf + " to i64*");
+        // Evaluate all element expressions before allocating or retaining slots so a
+        // mid-tuple throw unwinds earlier temporaries without leaking a partial tuple.
+        bool arm = eaActive;
+        if (arm) { EnterCallArm(); }
+        List<ExprVal> vals = new List<ExprVal>();
         int i = 0;
         while (i < n) {
             ExprVal ev = GenExpr(e.kids[i]);
+            vals.Add(ev);
             tty.Add(ev.ty);
-            if (ArcManaged(ev.ty)) { EmitArcRetain(ev.op, ev.ty); }
-            string slot = NT();
-            L("  " + slot + " = getelementptr i64, i64* " + p + ", i64 " + i);
-            L("  store i64 " + ToSlot(ev, ev.ty) + ", i64* " + slot);
             i = i + 1;
         }
+        if (arm) { LeaveCallArm(); }
+        string dtor = TupleDtor(tty.kids);
+        string buf = NT();
+        L("  " + buf + " = call i8* @zalloc(i64 " + (n * 8) + ", i8* " + dtor + ", i8* null)");
+        string p = NT();
+        L("  " + p + " = bitcast i8* " + buf + " to i64*");
+        i = 0;
+        while (i < n) {
+            ExprVal ev = vals[i];
+            if (IsStructTy(ev.ty)) {
+                ev = CopyStructValue(ev);
+            } else if (!IsDecimal(ev.ty) && (ArcManaged(ev.ty) || (ev.ty != null && ev.ty.ival >= 1))) {
+                EmitArcRetain(ev.op, ev.ty);
+            }
+            string slotVal = ToSlot(ev, ev.ty);
+            if (IsDecimal(ev.ty)) {
+                string dp = NT();
+                L("  " + dp + " = inttoptr i64 " + slotVal + " to i8*");
+                L("  call void @zretain(i8* " + dp + ")");
+            }
+            string slot = NT();
+            L("  " + slot + " = getelementptr i64, i64* " + p + ", i64 " + i);
+            L("  store i64 " + slotVal + ", i64* " + slot);
+            i = i + 1;
+        }
+        AddTemp(buf, tty);
         return new ExprVal(buf, tty);
     }
 
@@ -1221,6 +1308,11 @@ partial class Irgen {
             string lt = MapType(ety);
             string reg = AddLocal(tgt.sval, ety);
             EA(reg, lt);
+            if (IsStructTy(ety)) {
+                ev = CopyStructValue(ev);
+            } else if (ArcManaged(ety) || ety.ival >= 1) {
+                EmitArcRetain(ev.op, ety);
+            }
             L("  store " + lt + " " + Coerce(ev, lt) + ", " + lt + "* " + reg);
             i = i + 1;
         }
