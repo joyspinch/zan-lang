@@ -47,9 +47,12 @@ public class Csrf {
     // 路径前缀段边界匹配："/api/webhook" 仅命中 "/api/webhook" 或 "/api/webhook/..."，
     // 不会误匹配 "/api/webhook-evil"；以 "/" 结尾的前缀保持目录前缀语义。
     public static bool MatchesPrefix(string path, string prefix) {
-        if (path == null || prefix == null || prefix.Length == 0) { return false; }
-        if (!HttpContext.StartsWith(path, prefix)) { return false; }
+        if (path == null || prefix == null) { return false; }
         int plen = prefix.Length;
+        if (plen == 0 || path.Length < plen) { return false; }
+        for (int i = 0; i < plen; i = i + 1) {
+            if ((path[i] & 255) != (prefix[i] & 255)) { return false; }
+        }
         if ((prefix[plen - 1] & 255) == 47) { return true; }
         return path.Length == plen || (path[plen] & 255) == 47;
     }
@@ -104,14 +107,21 @@ public class Csrf {
     public static bool ConstantTimeEquals(string a, string b) {
         int la = a.Length;
         int lb = b.Length;
-        int n = la > lb ? la : lb;
-        int diff = la == lb ? 0 : 1;
-        for (int i = 0; i < n; i = i + 1) {
-            int x = i < la ? a[i] & 255 : 0;
-            int y = i < lb ? b[i] & 255 : 0;
-            diff = diff | (x ^ y);
+        if (la == lb) {
+            int diff = 0;
+            for (int i = 0; i < la; i = i + 1) {
+                diff = diff | ((a[i] & 255) ^ (b[i] & 255));
+            }
+            return diff == 0;
         }
-        return diff == 0;
+        int n = la > lb ? la : lb;
+        int diff2 = 1;
+        for (int i = 0; i < n; i = i + 1) {
+            int x = i < la ? (a[i] & 255) : 0;
+            int y = i < lb ? (b[i] & 255) : 0;
+            diff2 = diff2 | (x ^ y);
+        }
+        return diff2 == 0;
     }
 
     // 站点校验前哨（Before 钩子形态）：不安全方法上依据
@@ -146,35 +156,91 @@ public class Csrf {
         return Csrf.SameAuthorityForScheme(origin, host, false);
     }
 
+    private static int LowerAscii(int c) {
+        return (c >= 65 && c <= 90) ? (c + 32) : c;
+    }
+
+    private static int TrimDefaultPortEnd(string s, int start, int end, bool isHttps) {
+        int len = end - start;
+        if (isHttps) {
+            if (len >= 4
+                && (s[end - 4] & 255) == 58
+                && (s[end - 3] & 255) == 52
+                && (s[end - 2] & 255) == 52
+                && (s[end - 1] & 255) == 51) {
+                return end - 4;
+            }
+        } else {
+            if (len >= 3
+                && (s[end - 3] & 255) == 58
+                && (s[end - 2] & 255) == 56
+                && (s[end - 1] & 255) == 48) {
+                return end - 3;
+            }
+        }
+        return end;
+    }
+
     // 含协议降级防护的同源校验：HTTPS 请求拒绝明文 http:// Origin。
     public static bool SameAuthorityForScheme(string origin, string host, bool requireHttps) {
         if (origin == null || host == null || host.Length == 0) { return false; }
-        string originLow = origin.ToLower();
-        int scheme = originLow.IndexOf("://");
+        int olen = origin.Length;
         bool isHttps = false;
-        string auth = originLow;
-        if (scheme >= 0) {
-            string sch = originLow.Substring(0, scheme);
-            if (sch == "https") { isHttps = true; }
-            else if (sch != "http") { return false; }
-            auth = originLow.Substring(scheme + 3);
-        } else if (requireHttps) {
-            return false;
+        int authStart = 0;
+
+        // 快路径：99%+ Origin 以 "https://"（冒号在索引 5）或 "http://"（冒号在索引 4）开头，免扫描与 FFI。
+        if (olen >= 8
+            && (origin[5] & 255) == 58
+            && (origin[6] & 255) == 47
+            && (origin[7] & 255) == 47
+            && ((origin[0] & 255) | 32) == 104
+            && ((origin[1] & 255) | 32) == 116
+            && ((origin[2] & 255) | 32) == 116
+            && ((origin[3] & 255) | 32) == 112
+            && ((origin[4] & 255) | 32) == 115) {
+            isHttps = true;
+            authStart = 8;
+        } else if (olen >= 7
+            && (origin[4] & 255) == 58
+            && (origin[5] & 255) == 47
+            && (origin[6] & 255) == 47
+            && ((origin[0] & 255) | 32) == 104
+            && ((origin[1] & 255) | 32) == 116
+            && ((origin[2] & 255) | 32) == 116
+            && ((origin[3] & 255) | 32) == 112) {
+            if (requireHttps) { return false; }
+            authStart = 7;
+        } else {
+            if (requireHttps) { return false; }
+            int lim = olen - 2;
+            for (int i = 0; i < lim; i = i + 1) {
+                if ((origin[i] & 255) == 58 && (origin[i + 1] & 255) == 47 && (origin[i + 2] & 255) == 47) {
+                    return false; // 含其他协议（非 http/https）
+                }
+            }
         }
-        if (requireHttps && !isHttps) { return false; }
-        auth = Csrf.TrimDefaultPort(auth, isHttps);
-        string hostLow = Csrf.TrimDefaultPort(host.ToLower(), isHttps);
-        return auth == hostLow;
+
+        int authEnd = Csrf.TrimDefaultPortEnd(origin, authStart, olen, isHttps);
+        int hostEnd = Csrf.TrimDefaultPortEnd(host, 0, host.Length, isHttps);
+        int alen = authEnd - authStart;
+        if (alen != hostEnd) { return false; }
+        for (int i = 0; i < alen; i = i + 1) {
+            int ca = origin[authStart + i] & 255;
+            int cb = host[i] & 255;
+            if (ca != cb && Csrf.LowerAscii(ca) != Csrf.LowerAscii(cb)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     // 去掉明确的默认端口后缀（https 的 :443 / 明文的 :80）；
     // 其余端口保留参与比较。
     public static string TrimDefaultPort(string auth, bool isHttps) {
-        if (isHttps && auth.EndsWith(":443")) {
-            return auth.Substring(0, auth.Length - 4);
-        }
-        if (!isHttps && auth.EndsWith(":80")) {
-            return auth.Substring(0, auth.Length - 3);
+        int n = auth.Length;
+        int end = Csrf.TrimDefaultPortEnd(auth, 0, n, isHttps);
+        if (end < n) {
+            return auth.Substring(0, end);
         }
         return auth;
     }

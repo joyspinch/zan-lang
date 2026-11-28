@@ -5,27 +5,157 @@ using System.Security.Cryptography;
 namespace Sdk.Jushuitan;
 
 public static class JushuitanSign {
+    private static void SiftDownPair(string[] keys, string[] vals, int root, int end) {
+        while (true) {
+            int child = root * 2 + 1;
+            if (child >= end) { break; }
+            int swap = root;
+            if (String.CompareOrdinal(keys[swap], keys[child]) < 0) {
+                swap = child;
+            }
+            if (child + 1 < end
+                && String.CompareOrdinal(keys[swap], keys[child + 1]) < 0) {
+                swap = child + 1;
+            }
+            if (swap == root) { break; }
+            string tk = keys[root]; keys[root] = keys[swap]; keys[swap] = tk;
+            string tv = vals[root]; vals[root] = vals[swap]; vals[swap] = tv;
+            root = swap;
+        }
+    }
+
+    private static string ToHexLower(byte[] digest) {
+        int n = digest.Length;
+        byte[] hex = new byte[n * 2];
+        for (int i = 0; i < n; i = i + 1) {
+            int b = digest[i] & 255;
+            int hi = (b >> 4) & 15;
+            int lo = b & 15;
+            hex[i * 2] = (byte)(hi < 10 ? hi + 48 : hi + 87);
+            hex[i * 2 + 1] = (byte)(lo < 10 ? lo + 48 : lo + 87);
+        }
+        return NativeMemory.GetString((nint)hex, 0, n * 2);
+    }
+
+    private static bool IsUrlUnreserved(int c) {
+        return (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+            || (c >= 48 && c <= 57) || c == 45 || c == 95 || c == 46 || c == 126;
+    }
+
+    private static int UrlEncodedLen(string s) {
+        if (s == null) { return 0; }
+        int n = s.Length;
+        int outLen = n;
+        for (int i = 0; i < n; i = i + 1) {
+            int c = s[i] & 255;
+            if (!JushuitanSign.IsUrlUnreserved(c) && c != 32) {
+                outLen = outLen + 2;
+            }
+        }
+        return outLen;
+    }
+
+    private static int WriteUrlEncoded(byte[] buf, nint bp, int di, string s) {
+        if (s == null || s.Length == 0) { return di; }
+        int n = s.Length;
+        int i = 0;
+        while (i < n && JushuitanSign.IsUrlUnreserved(s[i] & 255)) { i = i + 1; }
+        if (i == n) {
+            NativeMemory.Copy(bp + (nint)di, (nint)s, n);
+            return di + n;
+        }
+        if (i > 0) {
+            NativeMemory.Copy(bp + (nint)di, (nint)s, i);
+            di = di + i;
+        }
+        while (i < n) {
+            int c = s[i] & 255;
+            if (JushuitanSign.IsUrlUnreserved(c)) {
+                buf[di] = (byte)c;
+                di = di + 1;
+            } else if (c == 32) {
+                buf[di] = 43;
+                di = di + 1;
+            } else {
+                int hi = (c >> 4) & 15;
+                int lo = c & 15;
+                buf[di] = 37;
+                buf[di + 1] = (byte)(hi < 10 ? hi + 48 : hi + 87);
+                buf[di + 2] = (byte)(lo < 10 ? lo + 48 : lo + 87);
+                di = di + 3;
+            }
+            i = i + 1;
+        }
+        return di;
+    }
+
+    // 原地排序并计算 MD5 十六进制签名（keys/vals 数组会被就地重排）。
+    internal static string ComputeFromArrays(string[] keys, string[] vals, int cnt, int payloadLen, string secret) {
+        if (cnt > 1) {
+            if (cnt <= 32) {
+                for (int i = 1; i < cnt; i = i + 1) {
+                    string curKey = keys[i];
+                    string curVal = vals[i];
+                    int j = i - 1;
+                    while (j >= 0 && String.CompareOrdinal(keys[j], curKey) > 0) {
+                        keys[j + 1] = keys[j];
+                        vals[j + 1] = vals[j];
+                        j = j - 1;
+                    }
+                    keys[j + 1] = curKey;
+                    vals[j + 1] = curVal;
+                }
+            } else {
+                for (int start = (cnt - 2) / 2; start >= 0; start = start - 1) {
+                    JushuitanSign.SiftDownPair(keys, vals, start, cnt);
+                }
+                for (int end = cnt - 1; end > 0; end = end - 1) {
+                    string tk = keys[end]; keys[end] = keys[0]; keys[0] = tk;
+                    string tv = vals[end]; vals[end] = vals[0]; vals[0] = tv;
+                    JushuitanSign.SiftDownPair(keys, vals, 0, end);
+                }
+            }
+        }
+
+        int slen = secret.Length;
+        int totalLen = slen + payloadLen;
+        byte[] buf = new byte[totalLen];
+        nint bp = (nint)buf;
+        NativeMemory.Copy(bp, (nint)secret, slen);
+        int di = slen;
+        for (int i = 0; i < cnt; i = i + 1) {
+            string k = keys[i];
+            string v = vals[i];
+            int kl = k.Length;
+            int vl = v.Length;
+            if (kl > 0) { NativeMemory.Copy(bp + (nint)di, (nint)k, kl); di = di + kl; }
+            if (vl > 0) { NativeMemory.Copy(bp + (nint)di, (nint)v, vl); di = di + vl; }
+        }
+        return JushuitanSign.ToHexLower(Md5.Hash(buf, totalLen));
+    }
+
     public static string Compute(Dictionary<string, string> fields, string secret) {
         if (fields == null || secret == null || secret.Length == 0) {
             throw new JushuitanException("client.invalidArguments", "签名需要参数和应用密钥", 0, "");
         }
-        // Dictionary.Keys 返回内部 List，必须复制后再排序以免打乱键值映射。
         List<string> rawKeys = fields.Keys;
-        List<string> sorted = new List<string>();
-        for (int i = 0; i < rawKeys.Count; i = i + 1) {
+        int rawCount = rawKeys.Count;
+        string[] keys = new string[rawCount];
+        string[] vals = new string[rawCount];
+        int cnt = 0;
+        int payloadLen = 0;
+        for (int i = 0; i < rawCount; i = i + 1) {
             string key = rawKeys[i];
-            if (key != "sign") { sorted.Add(key); }
+            if (key != "sign") {
+                string val = fields[key];
+                if (val == null) { val = ""; }
+                keys[cnt] = key;
+                vals[cnt] = val;
+                cnt = cnt + 1;
+                payloadLen = payloadLen + key.Length + val.Length;
+            }
         }
-        sorted.Sort();
-
-        StringBuilder source = new StringBuilder();
-        source.Append(secret);
-        for (int i = 0; i < sorted.Count; i = i + 1) {
-            string key = sorted[i];
-            source.Append(key);
-            source.Append(fields[key]);
-        }
-        return Convert.ToHexString(Md5.Hash(source.ToString())).ToLowerAscii();
+        return JushuitanSign.ComputeFromArrays(keys, vals, cnt, payloadLen, secret);
     }
 
     public static bool Verify(Dictionary<string, string> fields, string secret) {
@@ -34,23 +164,34 @@ public static class JushuitanSign {
         if (!fields.TryGetValue("sign", out actual) || actual == null || actual.Length != 32) { return false; }
         string expected = JushuitanSign.Compute(fields, secret);
         int difference = 0;
-        for (int i = 0; i < expected.Length; i = i + 1) {
-            difference = difference | (expected[i] ^ actual[i]);
+        for (int i = 0; i < 32; i = i + 1) {
+            difference = difference | ((expected[i] & 255) ^ (actual[i] & 255));
         }
         return difference == 0;
     }
 
     public static string FormEncode(Dictionary<string, string> fields) {
         if (fields == null || fields.Count == 0) { return ""; }
-        StringBuilder body = new StringBuilder();
-        List<string> keys = fields.Keys;
-        for (int i = 0; i < keys.Count; i = i + 1) {
-            if (i > 0) { body.Append("&"); }
-            string key = keys[i];
-            body.Append(Encoding.UrlEncode(key));
-            body.Append("=");
-            body.Append(Encoding.UrlEncode(fields[key]));
+        List<string> rawKeys = fields.Keys;
+        int n = rawKeys.Count;
+        string[] vals = new string[n];
+        long totalL = (long)(n - 1);
+        for (int i = 0; i < n; i = i + 1) {
+            string key = rawKeys[i];
+            string val = fields[key];
+            vals[i] = val;
+            totalL = totalL + (long)JushuitanSign.UrlEncodedLen(key) + 1L + (long)JushuitanSign.UrlEncodedLen(val);
         }
-        return body.ToString();
+        int total = (int)totalL;
+        byte[] buf = new byte[total];
+        nint bp = (nint)buf;
+        int di = 0;
+        for (int i = 0; i < n; i = i + 1) {
+            if (i > 0) { buf[di] = 38; di = di + 1; }
+            di = JushuitanSign.WriteUrlEncoded(buf, bp, di, rawKeys[i]);
+            buf[di] = 61; di = di + 1;
+            di = JushuitanSign.WriteUrlEncoded(buf, bp, di, vals[i]);
+        }
+        return NativeMemory.GetString(bp, 0, total);
     }
 }

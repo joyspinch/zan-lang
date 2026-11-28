@@ -1,10 +1,54 @@
 using System;
 using System.Json;
+using System.Text;
 
 namespace Sdk.Taobao;
 
 // 强类型模型解析助手（保持 int64 完整精度，不经由 double 转换）。
 public static class TaobaoJson {
+    private static bool IsTrimWs(int c) {
+        return c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12;
+    }
+
+    private static int LowerAscii(int c) {
+        return (c >= 65 && c <= 90) ? (c + 32) : c;
+    }
+
+    // 返回：1 = 成功解析，0 = 非带符号纯数字，-1 = 带符号纯数字但超出 int64 范围。
+    private static int ParseLongSlice(string s, int start, int end, out long result) {
+        result = 0L;
+        if (start >= end) { return 0; }
+        int i = start;
+        bool neg = false;
+        if ((s[i] & 255) == 45) {
+            neg = true;
+            i = i + 1;
+            if (i >= end) { return 0; }
+        }
+        // 使用负向累加器，精确覆盖 [-9223372036854775808, 9223372036854775807]
+        long limit = neg ? (-9223372036854775807L - 1L) : -9223372036854775807L;
+        long multMin = limit / 10L;
+        long acc = 0L;
+        bool overflow = false;
+        while (i < end) {
+            int d = (s[i] & 255) - 48;
+            if (d < 0 || d > 9) { return 0; }
+            if (!overflow) {
+                if (acc < multMin) {
+                    overflow = true;
+                } else {
+                    acc = acc * 10L;
+                    if (acc < limit + (long)d) { overflow = true; }
+                    else { acc = acc - (long)d; }
+                }
+            }
+            i = i + 1;
+        }
+        if (overflow) { return -1; }
+        result = neg ? acc : -acc;
+        return 1;
+    }
+
     public static string GetString(JsonValue? obj, string key, string dflt = "") {
         if (obj == null || !obj.IsObject()) { return dflt; }
         JsonValue? v = obj.Get(key);
@@ -21,12 +65,22 @@ public static class TaobaoJson {
         if (v == null || v.IsNull()) { return dflt; }
         if (v.IsInt()) { return v.AsInt(dflt); }
         if (v.IsString()) {
-            string s = v.AsString("").Trim();
-            if (s.Length > 0 && TaobaoJson.IsSignedDigits(s)) {
-                try { return Convert.ToInt32(s); } catch (Exception _ex) { return dflt; }
+            string s = v.AsString("");
+            int a = 0;
+            int b = s.Length;
+            while (a < b && TaobaoJson.IsTrimWs(s[a] & 255)) { a = a + 1; }
+            while (b > a && TaobaoJson.IsTrimWs(s[b - 1] & 255)) { b = b - 1; }
+            long parsed = 0L;
+            int st = TaobaoJson.ParseLongSlice(s, a, b, out parsed);
+            if (st < 0) { return dflt; }
+            if (st > 0) {
+                if (parsed >= -2147483648L && parsed <= 2147483647L) {
+                    return (int)parsed;
+                }
+                return dflt;
             }
         }
-        return obj.Int(key, dflt);
+        return v.AsInt(dflt);
     }
 
     public static long GetLong(JsonValue? obj, string key, long dflt = 0L) {
@@ -35,12 +89,17 @@ public static class TaobaoJson {
         if (v == null || v.IsNull()) { return dflt; }
         if (v.IsInt()) { return v.AsLong(dflt); }
         if (v.IsString()) {
-            string s = v.AsString("").Trim();
-            if (s.Length > 0 && TaobaoJson.IsSignedDigits(s)) {
-                try { return Convert.ToInt64(s); } catch (Exception _ex) { return dflt; }
-            }
+            string s = v.AsString("");
+            int a = 0;
+            int b = s.Length;
+            while (a < b && TaobaoJson.IsTrimWs(s[a] & 255)) { a = a + 1; }
+            while (b > a && TaobaoJson.IsTrimWs(s[b - 1] & 255)) { b = b - 1; }
+            long parsed = 0L;
+            int st = TaobaoJson.ParseLongSlice(s, a, b, out parsed);
+            if (st < 0) { return dflt; }
+            if (st > 0) { return parsed; }
         }
-        return obj.Long(key, dflt);
+        return v.AsLong(dflt);
     }
 
     public static double GetDouble(JsonValue? obj, string key, double dflt = 0.0) {
@@ -53,7 +112,7 @@ public static class TaobaoJson {
                 try { return Convert.ToDouble(s); } catch (Exception e) { return dflt; }
             }
         }
-        return obj.Double(key, dflt);
+        return v.AsDouble(dflt);
     }
 
     public static bool GetBool(JsonValue? obj, string key, bool dflt = false) {
@@ -62,11 +121,34 @@ public static class TaobaoJson {
         if (v == null || v.IsNull()) { return dflt; }
         if (v.IsBool()) { return v.AsBool(dflt); }
         if (v.IsString()) {
-            string s = v.AsString("").Trim().ToLower();
-            if (s == "true" || s == "1") { return true; }
-            if (s == "false" || s == "0") { return false; }
+            string s = v.AsString("");
+            int a = 0;
+            int b = s.Length;
+            while (a < b && TaobaoJson.IsTrimWs(s[a] & 255)) { a = a + 1; }
+            while (b > a && TaobaoJson.IsTrimWs(s[b - 1] & 255)) { b = b - 1; }
+            int len = b - a;
+            if (len == 1) {
+                int c = s[a] & 255;
+                if (c == 49) { return true; }
+                if (c == 48) { return false; }
+            } else if (len == 4) {
+                if (TaobaoJson.LowerAscii(s[a] & 255) == 116
+                    && TaobaoJson.LowerAscii(s[a + 1] & 255) == 114
+                    && TaobaoJson.LowerAscii(s[a + 2] & 255) == 117
+                    && TaobaoJson.LowerAscii(s[a + 3] & 255) == 101) {
+                    return true;
+                }
+            } else if (len == 5) {
+                if (TaobaoJson.LowerAscii(s[a] & 255) == 102
+                    && TaobaoJson.LowerAscii(s[a + 1] & 255) == 97
+                    && TaobaoJson.LowerAscii(s[a + 2] & 255) == 108
+                    && TaobaoJson.LowerAscii(s[a + 3] & 255) == 115
+                    && TaobaoJson.LowerAscii(s[a + 4] & 255) == 101) {
+                    return false;
+                }
+            }
         }
-        return obj.Bool(key, dflt);
+        return v.AsBool(dflt);
     }
 
     public static JsonValue? GetValue(JsonValue? obj, string key) {
@@ -90,7 +172,8 @@ public static class TaobaoJson {
         List<string> result = new List<string>();
         JsonValue? arr = TaobaoJson.GetArray(obj, key, itemKey);
         if (arr == null || !arr.IsArray()) { return result; }
-        for (int i = 0; i < arr.Count(); i = i + 1) {
+        int cnt = arr.Count();
+        for (int i = 0; i < cnt; i = i + 1) {
             JsonValue? item = arr.At(i);
             if (item != null && !item.IsNull()) {
                 result.Add(item.IsString() ? item.AsString("") : item.ToJson());
@@ -103,7 +186,8 @@ public static class TaobaoJson {
         List<int> result = new List<int>();
         JsonValue? arr = TaobaoJson.GetArray(obj, key, itemKey);
         if (arr == null || !arr.IsArray()) { return result; }
-        for (int i = 0; i < arr.Count(); i = i + 1) {
+        int cnt = arr.Count();
+        for (int i = 0; i < cnt; i = i + 1) {
             JsonValue? item = arr.At(i);
             if (item != null && !item.IsNull()) { result.Add(item.AsInt(0)); }
         }
@@ -114,7 +198,8 @@ public static class TaobaoJson {
         List<long> result = new List<long>();
         JsonValue? arr = TaobaoJson.GetArray(obj, key, itemKey);
         if (arr == null || !arr.IsArray()) { return result; }
-        for (int i = 0; i < arr.Count(); i = i + 1) {
+        int cnt = arr.Count();
+        for (int i = 0; i < cnt; i = i + 1) {
             JsonValue? item = arr.At(i);
             if (item != null && !item.IsNull()) { result.Add(item.AsLong(0L)); }
         }
@@ -125,7 +210,8 @@ public static class TaobaoJson {
         List<double> result = new List<double>();
         JsonValue? arr = TaobaoJson.GetArray(obj, key, itemKey);
         if (arr == null || !arr.IsArray()) { return result; }
-        for (int i = 0; i < arr.Count(); i = i + 1) {
+        int cnt = arr.Count();
+        for (int i = 0; i < cnt; i = i + 1) {
             JsonValue? item = arr.At(i);
             if (item != null && !item.IsNull()) { result.Add(item.AsDouble(0.0)); }
         }
@@ -136,7 +222,8 @@ public static class TaobaoJson {
         List<bool> result = new List<bool>();
         JsonValue? arr = TaobaoJson.GetArray(obj, key, itemKey);
         if (arr == null || !arr.IsArray()) { return result; }
-        for (int i = 0; i < arr.Count(); i = i + 1) {
+        int cnt = arr.Count();
+        for (int i = 0; i < cnt; i = i + 1) {
             JsonValue? item = arr.At(i);
             if (item != null && !item.IsNull()) { result.Add(item.AsBool(false)); }
         }
@@ -147,7 +234,8 @@ public static class TaobaoJson {
         List<JsonValue> result = new List<JsonValue>();
         JsonValue? arr = TaobaoJson.GetArray(obj, key, itemKey);
         if (arr == null || !arr.IsArray()) { return result; }
-        for (int i = 0; i < arr.Count(); i = i + 1) {
+        int cnt = arr.Count();
+        for (int i = 0; i < cnt; i = i + 1) {
             JsonValue? item = arr.At(i);
             if (item != null && !item.IsNull()) { result.Add((JsonValue)item); }
         }
@@ -160,41 +248,74 @@ public static class TaobaoJson {
     }
 
     public static string JoinLongList(List<long>? values) {
-        if (values == null || values.Count == 0) { return ""; }
-        List<string> parts = new List<string>();
-        for (int i = 0; i < values.Count; i = i + 1) {
-            parts.Add(Convert.ToString(values[i]));
+        if (values == null) { return ""; }
+        int n = values.Count;
+        if (n == 0) { return ""; }
+        // 单块缓冲逆向直写：零 StringBuilder、零每元素 StringView/Append 调用。
+        int cap = n * 21;
+        byte[] buf = new byte[cap];
+        int pos = cap;
+        for (int i = n - 1; i >= 0; i = i - 1) {
+            long v = values[i];
+            if (v == 0L) {
+                pos = pos - 1;
+                buf[pos] = 48;
+            } else {
+                bool neg = v < 0L;
+                long cur = neg ? v : -v;
+                while (cur < 0L) {
+                    long q = cur / 10L;
+                    int rem = (int)(q * 10L - cur);
+                    pos = pos - 1;
+                    buf[pos] = (byte)(48 + rem);
+                    cur = q;
+                }
+                if (neg) {
+                    pos = pos - 1;
+                    buf[pos] = 45;
+                }
+            }
+            if (i > 0) {
+                pos = pos - 1;
+                buf[pos] = 44;
+            }
         }
-        return string.Join(",", parts);
+        return NativeMemory.GetString((nint)buf, pos, cap - pos);
     }
 
     public static string JoinDoubleList(List<double>? values) {
-        if (values == null || values.Count == 0) { return ""; }
-        List<string> parts = new List<string>();
-        for (int i = 0; i < values.Count; i = i + 1) {
-            parts.Add(Convert.ToString(values[i]));
+        if (values == null) { return ""; }
+        int n = values.Count;
+        if (n == 0) { return ""; }
+        StringBuilder sb = new StringBuilder(n * 12);
+        for (int i = 0; i < n; i = i + 1) {
+            if (i > 0) { sb.Append(","); }
+            sb.Append(Convert.ToString(values[i]));
         }
-        return string.Join(",", parts);
+        return sb.ToString();
     }
 
     public static string JoinBoolList(List<bool>? values) {
-        if (values == null || values.Count == 0) { return ""; }
-        List<string> parts = new List<string>();
-        for (int i = 0; i < values.Count; i = i + 1) {
-            parts.Add(values[i] ? "true" : "false");
+        if (values == null) { return ""; }
+        int n = values.Count;
+        if (n == 0) { return ""; }
+        int total = n - 1;
+        for (int i = 0; i < n; i = i + 1) {
+            total = total + (values[i] ? 4 : 5);
         }
-        return string.Join(",", parts);
-    }
-
-    private static bool IsSignedDigits(string s) {
-        int start = 0;
-        if (s[0] == '-') {
-            if (s.Length == 1) { return false; }
-            start = 1;
+        byte[] buf = new byte[total];
+        nint bp = (nint)buf;
+        int di = 0;
+        for (int i = 0; i < n; i = i + 1) {
+            if (i > 0) { buf[di] = 44; di = di + 1; }
+            if (values[i]) {
+                buf[di] = 116; buf[di + 1] = 114; buf[di + 2] = 117; buf[di + 3] = 101;
+                di = di + 4;
+            } else {
+                buf[di] = 102; buf[di + 1] = 97; buf[di + 2] = 108; buf[di + 3] = 115; buf[di + 4] = 101;
+                di = di + 5;
+            }
         }
-        for (int i = start; i < s.Length; i = i + 1) {
-            if (s[i] < '0' || s[i] > '9') { return false; }
-        }
-        return true;
+        return NativeMemory.GetString(bp, 0, total);
     }
 }

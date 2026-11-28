@@ -11,6 +11,7 @@ public class StaticFiles {
     public static const int MaxFileBytes = HttpLimits.MaxStaticFileBytes;
     private static List<StaticMount> mounts = new List<StaticMount>();
     private static Dict<string, string> mimeTypes = null;
+    private static bool customMimeRegistered = false;
 
     private static Dict<string, string> EnsureMimes() {
         lock (StaticFiles.mounts) {
@@ -56,6 +57,7 @@ public class StaticFiles {
             } else {
                 m.Add(key, contentType);
             }
+            StaticFiles.customMimeRegistered = true;
         }
     }
 
@@ -203,14 +205,15 @@ public class StaticFiles {
 
     public static string RelativeTo(string path, string urlPrefix) {
         if (path == null || urlPrefix == null) { return null; }
-        if (urlPrefix == "/") {
+        int pn = urlPrefix.Length;
+        if (pn == 1 && (urlPrefix[0] & 255) == 47) {
             if (path.Length <= 1 || (path[0] & 255) != 47) { return null; }
             return path.Substring(1);
         }
-        int pn = urlPrefix.Length;
-        if (path.Length <= pn) { return null; }
-        if (path.Substring(0, pn) != urlPrefix) { return null; }
-        if ((path[pn] & 255) != 47) { return null; }  // '/'
+        if (path.Length <= pn || (path[pn] & 255) != 47) { return null; }
+        for (int i = 0; i < pn; i = i + 1) {
+            if ((path[i] & 255) != (urlPrefix[i] & 255)) { return null; }
+        }
         return path.Substring(pn + 1);
     }
 
@@ -235,9 +238,84 @@ public class StaticFiles {
         return !segStart;
     }
 
+    private static int LowerAscii(int c) {
+        return (c >= 65 && c <= 90) ? (c + 32) : c;
+    }
+
+    private static string BuiltinMime(string rel, int start, int len) {
+        if (len == 2) {
+            if (StaticFiles.LowerAscii(rel[start] & 255) == 106
+                && StaticFiles.LowerAscii(rel[start + 1] & 255) == 115) {
+                return "application/javascript; charset=utf-8";
+            }
+            return "application/octet-stream";
+        }
+        if (len == 3) {
+            int c0 = StaticFiles.LowerAscii(rel[start] & 255);
+            int c1 = StaticFiles.LowerAscii(rel[start + 1] & 255);
+            int c2 = StaticFiles.LowerAscii(rel[start + 2] & 255);
+            if (c0 == 99 && c1 == 115 && c2 == 115) { return "text/css; charset=utf-8"; }
+            if (c0 == 109) {
+                if (c1 == 106 && c2 == 115) { return "application/javascript; charset=utf-8"; }
+                if (c1 == 97 && c2 == 112) { return "application/json; charset=utf-8"; }
+                return "application/octet-stream";
+            }
+            if (c0 == 116) {
+                if (c1 == 120 && c2 == 116) { return "text/plain; charset=utf-8"; }
+                if (c1 == 116 && c2 == 102) { return "font/ttf"; }
+                return "application/octet-stream";
+            }
+            if (c0 == 115 && c1 == 118 && c2 == 103) { return "image/svg+xml"; }
+            if (c0 == 112 && c1 == 110 && c2 == 103) { return "image/png"; }
+            if (c0 == 106 && c1 == 112 && c2 == 103) { return "image/jpeg"; }
+            if (c0 == 103 && c1 == 105 && c2 == 102) { return "image/gif"; }
+            if (c0 == 105 && c1 == 99 && c2 == 111) { return "image/x-icon"; }
+            return "application/octet-stream";
+        }
+        if (len == 4) {
+            int c0 = StaticFiles.LowerAscii(rel[start] & 255);
+            int c1 = StaticFiles.LowerAscii(rel[start + 1] & 255);
+            int c2 = StaticFiles.LowerAscii(rel[start + 2] & 255);
+            int c3 = StaticFiles.LowerAscii(rel[start + 3] & 255);
+            if (c0 == 106) {
+                if (c1 == 115 && c2 == 111 && c3 == 110) { return "application/json; charset=utf-8"; }
+                if (c1 == 112 && c2 == 101 && c3 == 103) { return "image/jpeg"; }
+                return "application/octet-stream";
+            }
+            if (c0 == 104 && c1 == 116 && c2 == 109 && c3 == 108) { return "text/html; charset=utf-8"; }
+            if (c0 == 119) {
+                if (c1 == 101 && c2 == 98 && c3 == 112) { return "image/webp"; }
+                if (c1 == 111 && c2 == 102 && c3 == 102) { return "font/woff"; }
+                return "application/octet-stream";
+            }
+            return "application/octet-stream";
+        }
+        if (len == 5) {
+            if (StaticFiles.LowerAscii(rel[start] & 255) == 119
+                && StaticFiles.LowerAscii(rel[start + 1] & 255) == 111
+                && StaticFiles.LowerAscii(rel[start + 2] & 255) == 102
+                && StaticFiles.LowerAscii(rel[start + 3] & 255) == 102
+                && (rel[start + 4] & 255) == 50) {
+                return "font/woff2";
+            }
+        }
+        return "application/octet-stream";
+    }
+
     // 按扩展名（小写化后）查询可扩展 MIME 表；未知类型为
     // application/octet-stream。
     public static string ContentType(string rel) {
+        if (!StaticFiles.customMimeRegistered) {
+            int n = rel.Length;
+            int dot = -1;
+            for (int i = n - 1; i >= 0; i = i - 1) {
+                int c = rel[i] & 255;
+                if (c == 47) { break; }
+                if (c == 46) { dot = i; break; }
+            }
+            if (dot < 0 || dot == n - 1) { return "application/octet-stream"; }
+            return StaticFiles.BuiltinMime(rel, dot + 1, n - dot - 1);
+        }
         string ext = StaticFiles.Extension(rel);
         if (ext.Length == 0) { return "application/octet-stream"; }
         string mime = "";
@@ -249,12 +327,24 @@ public class StaticFiles {
     public static string Extension(string rel) {
         int n = rel.Length;
         int dot = -1;
+        bool hasUpper = false;
         for (int i = n - 1; i >= 0; i = i - 1) {
             int c = rel[i] & 255;
             if (c == 47) { break; }  // '/'
             if (c == 46) { dot = i; break; }  // '.'
+            if (c >= 65 && c <= 90) { hasUpper = true; }
         }
         if (dot < 0 || dot == n - 1) { return ""; }
-        return rel.Substring(dot + 1, n - dot - 1).ToLower();
+        int extStart = dot + 1;
+        int extLen = n - extStart;
+        if (!hasUpper) {
+            return rel.Substring(extStart, extLen);
+        }
+        byte[] buf = new byte[extLen];
+        for (int i = 0; i < extLen; i = i + 1) {
+            int c = rel[extStart + i] & 255;
+            buf[i] = (byte)((c >= 65 && c <= 90) ? (c + 32) : c);
+        }
+        return NativeMemory.GetString((nint)buf, 0, extLen);
     }
 }
