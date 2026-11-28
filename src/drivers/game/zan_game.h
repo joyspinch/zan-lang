@@ -195,6 +195,17 @@ ZAN_GAME_API void zan_game_set_dissolve3d(float threshold, float edge_width,
 ZAN_GAME_API void zan_game_set_clip_plane3d(int32_t enabled,
     float nx, float ny, float nz, float d);
 
+/* GPU 世界空间三平面纹理投影（Triplanar Mapping，消除陡坡/悬崖/体素/程序化地形的 UV 拉伸）：
+ * enabled != 0 时按世界空间坐标与法线权重三轴采样 uTex 并以 fract 无缝平铺；
+ * scale 为世界每米平铺频率，sharpness 为轴向混合锐度（推荐 2.0..8.0）。 */
+ZAN_GAME_API void zan_game_set_triplanar3d(int32_t enabled, float scale,
+    float sharpness);
+
+/* GPU 指数高度大气雾（Exponential Height Fog，山谷薄雾/地底毒雾/云海分层氛围）：
+ * enabled != 0 时按 exp(-max(worldY - base_y, 0) * falloff) * max_density 混入雾色。 */
+ZAN_GAME_API void zan_game_set_height_fog3d(int32_t enabled, float base_y,
+    float falloff, float max_density, float r, float g, float b);
+
 #ifdef __cplusplus
 }
 #endif

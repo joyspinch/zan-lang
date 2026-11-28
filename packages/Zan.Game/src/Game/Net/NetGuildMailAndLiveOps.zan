@@ -1,0 +1,326 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Net;
+
+// 公会职位枚举（数值越高权限越大）。
+public enum GuildRole {
+    Member = 0,
+    Officer = 1,
+    Leader = 2
+}
+
+// 公会成员记录与当日金库提款额度账本。
+public class GuildMemberRecord {
+    public int PlayerId;
+    public GuildRole Role;
+    public int DailyWithdrawnGold;
+    public int LastWithdrawDay;
+
+    public GuildMemberRecord(int playerId, GuildRole role) {
+        this.PlayerId = playerId;
+        this.Role = role;
+        this.DailyWithdrawnGold = 0;
+        this.LastWithdrawDay = -1;
+    }
+}
+
+// 商业多人在线公会权限与共享金库（Authoritative Guild RBAC & Treasury）：
+// - 严格角色层级（仅 Leader 可任免/移交会长；踢人仅允许高职踢低职，禁止越级或自踢）
+// - 共享金库按职位限额防盗刷（Member 禁提、Officer 受单日限额约束、Leader 在余额内放行）
+public class NetGuildRegistry {
+    public int GuildId;
+    public string GuildName;
+    public int MaxMembers;
+    public int TreasuryGold;
+    public int OfficerDailyWithdrawLimit;
+
+    private List<GuildMemberRecord> members;
+
+    public NetGuildRegistry(int guildId, string guildName, int maxMembers, int officerDailyLimit) {
+        this.GuildId = guildId;
+        this.GuildName = guildName != null ? guildName : "";
+        this.MaxMembers = maxMembers >= 2 ? maxMembers : 50;
+        this.TreasuryGold = 0;
+        this.OfficerDailyWithdrawLimit = officerDailyLimit >= 0 ? officerDailyLimit : 500;
+        this.members = new List<GuildMemberRecord>();
+    }
+
+    public int MemberCount { get { return this.members.Count; } }
+
+    private int FindIndex(int playerId) {
+        for (int i = 0; i < this.members.Count; i = i + 1) {
+            if (this.members[i].PlayerId == playerId) { return i; }
+        }
+        return -1;
+    }
+
+    public bool HasMember(int playerId) {
+        return this.FindIndex(playerId) >= 0;
+    }
+
+    public GuildRole GetRole(int playerId) {
+        int idx = this.FindIndex(playerId);
+        if (idx < 0) { return GuildRole.Member; }
+        return this.members[idx].Role;
+    }
+
+    public bool AddMember(int playerId, GuildRole role) {
+        if (playerId <= 0 || this.members.Count >= this.MaxMembers) { return false; }
+        if (this.FindIndex(playerId) >= 0) { return false; }
+        if (role == GuildRole.Leader) {
+            for (int i = 0; i < this.members.Count; i = i + 1) {
+                if (this.members[i].Role == GuildRole.Leader) { return false; }
+            }
+        }
+        this.members.Add(new GuildMemberRecord(playerId, role));
+        return true;
+    }
+
+    public bool SetRole(int actorId, int targetId, GuildRole newRole) {
+        int aIdx = this.FindIndex(actorId);
+        int tIdx = this.FindIndex(targetId);
+        if (aIdx < 0 || tIdx < 0 || aIdx == tIdx) { return false; }
+        if (this.members[aIdx].Role != GuildRole.Leader) { return false; }
+        if (newRole == GuildRole.Leader) {
+            // 原子移交会长，原会长自动降为 Officer
+            this.members[aIdx].Role = GuildRole.Officer;
+            this.members[tIdx].Role = GuildRole.Leader;
+            return true;
+        }
+        this.members[tIdx].Role = newRole;
+        return true;
+    }
+
+    public bool KickMember(int actorId, int targetId) {
+        int aIdx = this.FindIndex(actorId);
+        int tIdx = this.FindIndex(targetId);
+        if (aIdx < 0 || tIdx < 0 || aIdx == tIdx) { return false; }
+        if ((int)this.members[aIdx].Role <= (int)this.members[tIdx].Role) { return false; }
+        this.members.RemoveAt(tIdx);
+        return true;
+    }
+
+    public bool DepositGold(int playerId, int amount) {
+        if (amount <= 0 || this.FindIndex(playerId) < 0) { return false; }
+        this.TreasuryGold = this.TreasuryGold + amount;
+        return true;
+    }
+
+    public bool WithdrawGold(int playerId, int amount, int dayIndex) {
+        if (amount <= 0 || amount > this.TreasuryGold) { return false; }
+        int idx = this.FindIndex(playerId);
+        if (idx < 0) { return false; }
+        GuildMemberRecord m = this.members[idx];
+        if (m.Role == GuildRole.Member) { return false; }
+        if (m.Role == GuildRole.Officer) {
+            if (m.LastWithdrawDay != dayIndex) {
+                m.LastWithdrawDay = dayIndex;
+                m.DailyWithdrawnGold = 0;
+            }
+            if (m.DailyWithdrawnGold + amount > this.OfficerDailyWithdrawLimit) { return false; }
+            m.DailyWithdrawnGold = m.DailyWithdrawnGold + amount;
+        }
+        this.TreasuryGold = this.TreasuryGold - amount;
+        return true;
+    }
+}
+
+// 权威服务器邮件条目（含附件与 TTL 过期时间）。
+public class NetMailMessage {
+    public int MailId;
+    public int RecipientPlayerId;
+    public string SenderName;
+    public string Subject;
+    public int GoldAmount;
+    public string AttachmentItemId;
+    public int AttachmentCount;
+    public int CreatedAtSec;
+    public int ExpireAtSec;
+    public bool IsRead;
+    public bool AttachmentsClaimed;
+
+    public NetMailMessage(int mailId, int recipientId, string sender, string subject,
+                          int gold, string itemId, int itemCount, int nowSec, int ttlSec) {
+        this.MailId = mailId;
+        this.RecipientPlayerId = recipientId;
+        this.SenderName = sender != null ? sender : "";
+        this.Subject = subject != null ? subject : "";
+        this.GoldAmount = gold > 0 ? gold : 0;
+        this.AttachmentItemId = itemId != null ? itemId : "";
+        this.AttachmentCount = itemCount > 0 ? itemCount : 0;
+        this.CreatedAtSec = nowSec;
+        this.ExpireAtSec = nowSec + (ttlSec > 0 ? ttlSec : 86400);
+        this.IsRead = false;
+        this.AttachmentsClaimed = false;
+    }
+}
+
+// 商业多人在线幂等邮箱与奖励附件服务（Idempotent Mailbox & Attachment Claim Service）：
+// - 网络重传/客户端连点领取同一封邮件附件严格幂等，杜绝双倍刷钻/刷装备
+// - 支持 TTL 自动过期拦截与定时清理
+public class NetMailboxService {
+    private List<NetMailMessage> mails;
+    private int nextMailId;
+
+    public NetMailboxService() {
+        this.mails = new List<NetMailMessage>();
+        this.nextMailId = 1;
+    }
+
+    public int TotalMailCount { get { return this.mails.Count; } }
+
+    public NetMailMessage SendMail(int recipientPlayerId, string sender, string subject,
+                                   int gold, string itemId, int itemCount, int nowSec, int ttlSec) {
+        NetMailMessage m = new NetMailMessage(this.nextMailId, recipientPlayerId, sender,
+            subject, gold, itemId, itemCount, nowSec, ttlSec);
+        this.nextMailId = this.nextMailId + 1;
+        this.mails.Add(m);
+        return m;
+    }
+
+    public bool ClaimAttachments(int playerId, int mailId, int nowSec,
+                                 out int grantedGold, out string grantedItemId, out int grantedItemCount) {
+        grantedGold = 0;
+        grantedItemId = "";
+        grantedItemCount = 0;
+        for (int i = 0; i < this.mails.Count; i = i + 1) {
+            NetMailMessage m = this.mails[i];
+            if (m.MailId != mailId) { continue; }
+            if (m.RecipientPlayerId != playerId) { return false; }
+            if (nowSec >= m.ExpireAtSec) { return false; }
+            if (m.AttachmentsClaimed) { return false; }
+            if (m.GoldAmount <= 0 && m.AttachmentCount <= 0) { return false; }
+            m.AttachmentsClaimed = true;
+            m.IsRead = true;
+            grantedGold = m.GoldAmount;
+            grantedItemId = m.AttachmentItemId;
+            grantedItemCount = m.AttachmentCount;
+            return true;
+        }
+        return false;
+    }
+
+    public int PurgeExpired(int nowSec) {
+        int removed = 0;
+        for (int i = this.mails.Count - 1; i >= 0; i = i - 1) {
+            if (nowSec >= this.mails[i].ExpireAtSec) {
+                this.mails.RemoveAt(i);
+                removed = removed + 1;
+            }
+        }
+        return removed;
+    }
+
+    public int UnreadCount(int playerId, int nowSec) {
+        int count = 0;
+        for (int i = 0; i < this.mails.Count; i = i + 1) {
+            NetMailMessage m = this.mails[i];
+            if (m.RecipientPlayerId == playerId && !m.IsRead && nowSec < m.ExpireAtSec) {
+                count = count + 1;
+            }
+        }
+        return count;
+    }
+}
+
+// Live-Ops 功能开关与灰度配置。
+public class LiveOpsFlagConfig {
+    public string Key;
+    public bool Enabled;
+    public bool KillSwitch;
+    public int RolloutBps; // 0..10000（万分比，5000=50.00%）
+    public string Salt;
+    public List<int> Allowlist;
+
+    public LiveOpsFlagConfig(string key, bool enabled, int rolloutBps, string salt) {
+        this.Key = key != null ? key : "";
+        this.Enabled = enabled;
+        this.KillSwitch = false;
+        this.RolloutBps = rolloutBps < 0 ? 0 : (rolloutBps > 10000 ? 10000 : rolloutBps);
+        this.Salt = salt != null ? salt : "v1";
+        this.Allowlist = new List<int>();
+    }
+}
+
+// 商业在线游戏 Live-Ops 灰度发布、A/B 确定性分桶与一键熔断器（Kill-Switch）：
+// - FNV-1a 32-bit 加盐确定性哈希分桶（0..9999 万分比），跨服跨重启同一玩家分桶完全一致
+// - 支持 QA/VIP 白名单放行与最高优先级紧急熔断（KillSwitch 覆盖白名单与灰度比例）
+public class NetLiveOpsRollout {
+    private List<LiveOpsFlagConfig> flags;
+
+    public NetLiveOpsRollout() {
+        this.flags = new List<LiveOpsFlagConfig>();
+    }
+
+    private LiveOpsFlagConfig FindFlag(string key) {
+        if (key == null) { return null; }
+        for (int i = 0; i < this.flags.Count; i = i + 1) {
+            if (this.flags[i].Key == key) { return this.flags[i]; }
+        }
+        return null;
+    }
+
+    public void UpsertFlag(string key, bool enabled, int rolloutBps, string salt) {
+        if (key == null || key == "") { return; }
+        LiveOpsFlagConfig f = this.FindFlag(key);
+        int clamped = rolloutBps < 0 ? 0 : (rolloutBps > 10000 ? 10000 : rolloutBps);
+        if (f != null) {
+            f.Enabled = enabled;
+            f.RolloutBps = clamped;
+            if (salt != null) { f.Salt = salt; }
+            return;
+        }
+        this.flags.Add(new LiveOpsFlagConfig(key, enabled, clamped, salt));
+    }
+
+    public bool AddAllowlist(string key, int playerId) {
+        LiveOpsFlagConfig f = this.FindFlag(key);
+        if (f == null) { return false; }
+        for (int i = 0; i < f.Allowlist.Count; i = i + 1) {
+            if (f.Allowlist[i] == playerId) { return true; }
+        }
+        f.Allowlist.Add(playerId);
+        return true;
+    }
+
+    public bool SetKillSwitch(string key, bool active) {
+        LiveOpsFlagConfig f = this.FindFlag(key);
+        if (f == null) { return false; }
+        f.KillSwitch = active;
+        return true;
+    }
+
+    public static int ComputeBucketBps(string key, string salt, int playerId) {
+        uint h = 2166136261U;
+        string k = key != null ? key : "";
+        string s = salt != null ? salt : "";
+        for (int i = 0; i < k.Length; i = i + 1) {
+            h = h ^ (uint)k[i];
+            h = unchecked(h * 16777619U);
+        }
+        h = h ^ 58U;
+        h = unchecked(h * 16777619U);
+        for (int i = 0; i < s.Length; i = i + 1) {
+            h = h ^ (uint)s[i];
+            h = unchecked(h * 16777619U);
+        }
+        uint pid = unchecked((uint)playerId);
+        for (int b = 0; b < 4; b = b + 1) {
+            h = h ^ ((pid >> (b * 8)) & 255U);
+            h = unchecked(h * 16777619U);
+        }
+        return (int)(h % 10000U);
+    }
+
+    public bool IsEnabledForPlayer(string key, int playerId) {
+        LiveOpsFlagConfig f = this.FindFlag(key);
+        if (f == null || f.KillSwitch || !f.Enabled) { return false; }
+        for (int i = 0; i < f.Allowlist.Count; i = i + 1) {
+            if (f.Allowlist[i] == playerId) { return true; }
+        }
+        if (f.RolloutBps <= 0) { return false; }
+        if (f.RolloutBps >= 10000) { return true; }
+        return ComputeBucketBps(f.Key, f.Salt, playerId) < f.RolloutBps;
+    }
+}

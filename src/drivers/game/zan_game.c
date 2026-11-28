@@ -146,6 +146,7 @@ typedef struct {
     zgl_int u_orm_map, u_orm_on, u_ao_strength, u_alpha_cutoff;
     zgl_int u_emissive_map, u_emissive_on, u_uv_transform, u_rim_light, u_toon;
     zgl_int u_dissolve, u_dissolve_edge, u_clip_plane, u_clip_on;
+    zgl_int u_triplanar, u_height_fog_params, u_height_fog_color;
     zgl_int u_light_dir, u_light_color, u_light_count, u_ambient;
     zgl_int u_cam_pos, u_cam_valid, u_material, u_emissive;
     zgl_int u_point_pos, u_point_color, u_point_count;
@@ -215,6 +216,9 @@ static float g_game_dissolve[2] = { 0.0f, 0.08f }; /* threshold, edge_width */
 static float g_game_dissolve_edge[3] = { 1.0f, 0.4f, 0.05f };
 static float g_game_clip_plane[4] = { 0.0f, 1.0f, 0.0f, 0.0f };
 static int g_game_clip_on = 0;
+static float g_game_triplanar[3] = { 0.0f, 1.0f, 4.0f }; /* enabled, scale, sharpness */
+static float g_game_height_fog_params[4] = { 0.0f, 1.0f, 0.8f, 0.0f }; /* base_y, falloff, max_density, enabled */
+static float g_game_height_fog_color[3] = { 0.6f, 0.7f, 0.85f };
 static float g_game_color_grade[2] = { 1.0f, 1.0f }; /* saturation, contrast */
 static float g_game_color_tint[3] = { 1.0f, 1.0f, 1.0f };
 static float g_game_post_lens[2] = { 0.0f, 0.0f }; /* fxaa, chromatic */
@@ -471,6 +475,9 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
 "uniform vec3 uDissolveEdge;\n" \
 "uniform vec4 uClipPlane;\n" \
 "uniform int uClipOn;\n" \
+"uniform vec3 uTriplanar;\n" \
+"uniform vec4 uHeightFogParams;\n" \
+"uniform vec3 uHeightFogColor;\n" \
 "uniform vec3 uCamPos;\n" \
 "uniform int uCamValid;\n" \
 "uniform vec2 uMaterial;\n" \
@@ -657,7 +664,27 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
 "        float fogT = clamp((fogDist - uFogParams.y) * uFogParams.z, 0.0, 1.0);\n" \
 "        rgb = mix(rgb, uFogColor, fogT);\n" \
 "    }\n" \
+"    if (uHeightFogParams.w > 0.5) {\n" \
+"        float hAbove = max(v_world_pos.y - uHeightFogParams.x, 0.0);\n" \
+"        float hf = clamp(exp(-hAbove * max(uHeightFogParams.y, 0.001)) * clamp(uHeightFogParams.z, 0.0, 1.0), 0.0, 1.0);\n" \
+"        rgb = mix(rgb, uHeightFogColor, hf);\n" \
+"    }\n" \
 "    frag = vec4(rgb, outAlpha);\n"
+
+#define ZAN_GAME_3D_SAMPLE_ALBEDO \
+"    vec4 tex;\n" \
+"    if (uTriplanar.x > 0.5) {\n" \
+"        float tSc = max(uTriplanar.y, 0.0001);\n" \
+"        float tSh = max(uTriplanar.z, 1.0);\n" \
+"        vec3 bw = pow(abs(normalize(v_normal)) + vec3(0.0001), vec3(tSh));\n" \
+"        bw /= max(bw.x + bw.y + bw.z, 0.0001);\n" \
+"        vec4 tx = texture(uTex, fract(v_world_pos.zy * tSc));\n" \
+"        vec4 ty = texture(uTex, fract(v_world_pos.xz * tSc));\n" \
+"        vec4 tz = texture(uTex, fract(v_world_pos.xy * tSc));\n" \
+"        tex = tx * bw.x + ty * bw.y + tz * bw.z;\n" \
+"    } else {\n" \
+"        tex = texture(uTex, v_uv);\n" \
+"    }\n"
 
 static const char *const ZAN_GAME_3D_FS_PLAIN =
 ZAN_GAME_3D_LIGHT_UNIFORMS
@@ -670,7 +697,7 @@ ZAN_GAME_3D_SHADOW_UNIFORMS
 "void main() {\n"
 ZAN_GAME_3D_SHADOW_FACTOR
 ZAN_GAME_3D_LIGHT_SHADOW_BODY
-"    vec4 tex = texture(uTex, v_uv);\n"
+ZAN_GAME_3D_SAMPLE_ALBEDO
 ZAN_GAME_3D_FINAL_COMPOSE("tex.rgb * uColor.rgb", "tex.a * uColor.a")
 "}\n";
 
@@ -686,7 +713,7 @@ ZAN_GAME_3D_SHADOW_UNIFORMS
 "void main() {\n"
 ZAN_GAME_3D_SHADOW_FACTOR
 ZAN_GAME_3D_LIGHT_SHADOW_BODY
-"    vec4 tex = texture(uTex, v_uv);\n"
+ZAN_GAME_3D_SAMPLE_ALBEDO
 ZAN_GAME_3D_FINAL_COMPOSE("tex.rgb * uColor.rgb * v_color.rgb", "tex.a * uColor.a * v_color.a")
 "}\n";
 
@@ -1055,6 +1082,12 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
         : g_game_gl->GetUniformLocation(program, "uClipPlane");
     zgl_int clip_on = instanced ? -1
         : g_game_gl->GetUniformLocation(program, "uClipOn");
+    zgl_int triplanar = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uTriplanar");
+    zgl_int height_fog_params = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uHeightFogParams");
+    zgl_int height_fog_color = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uHeightFogColor");
     zgl_int color = instanced ? 0
         : g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
@@ -1121,6 +1154,9 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
     prog->u_dissolve_edge = dissolve_edge;
     prog->u_clip_plane = clip_plane;
     prog->u_clip_on = clip_on;
+    prog->u_triplanar = triplanar;
+    prog->u_height_fog_params = height_fog_params;
+    prog->u_height_fog_color = height_fog_color;
     prog->u_color = color;
     prog->u_light_dir = light_dir;
     prog->u_light_color = light_color;
@@ -1184,6 +1220,9 @@ static zan_game_program *zan_game_skin_program_get(void) {
     zgl_int dissolve_edge = g_game_gl->GetUniformLocation(program, "uDissolveEdge");
     zgl_int clip_plane = g_game_gl->GetUniformLocation(program, "uClipPlane");
     zgl_int clip_on = g_game_gl->GetUniformLocation(program, "uClipOn");
+    zgl_int triplanar = g_game_gl->GetUniformLocation(program, "uTriplanar");
+    zgl_int height_fog_params = g_game_gl->GetUniformLocation(program, "uHeightFogParams");
+    zgl_int height_fog_color = g_game_gl->GetUniformLocation(program, "uHeightFogColor");
     zgl_int color = g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
     zgl_int light_color = g_game_gl->GetUniformLocation(program, "uLightColor[0]");
@@ -1238,6 +1277,9 @@ static zan_game_program *zan_game_skin_program_get(void) {
     g_game_skin_prog.u_dissolve_edge = dissolve_edge;
     g_game_skin_prog.u_clip_plane = clip_plane;
     g_game_skin_prog.u_clip_on = clip_on;
+    g_game_skin_prog.u_triplanar = triplanar;
+    g_game_skin_prog.u_height_fog_params = height_fog_params;
+    g_game_skin_prog.u_height_fog_color = height_fog_color;
     g_game_skin_prog.u_color = color;
     g_game_skin_prog.u_light_dir = light_dir;
     g_game_skin_prog.u_light_color = light_color;
@@ -1675,6 +1717,17 @@ static void zan_game_bind_shadow_uniforms(const zan_gl_api *gl, zan_game_program
     }
     if (prog->u_clip_on >= 0) {
         gl->Uniform1i(prog->u_clip_on, g_game_clip_on);
+    }
+    if (prog->u_triplanar >= 0) {
+        gl->Uniform3fv(prog->u_triplanar, 1, g_game_triplanar);
+    }
+    if (prog->u_height_fog_params >= 0) {
+        gl->Uniform4f(prog->u_height_fog_params,
+            g_game_height_fog_params[0], g_game_height_fog_params[1],
+            g_game_height_fog_params[2], g_game_height_fog_params[3]);
+    }
+    if (prog->u_height_fog_color >= 0) {
+        gl->Uniform3fv(prog->u_height_fog_color, 1, g_game_height_fog_color);
     }
 }
 
@@ -2574,4 +2627,24 @@ ZAN_GAME_API void zan_game_set_clip_plane3d(int32_t enabled,
     g_game_clip_plane[1] = ny;
     g_game_clip_plane[2] = nz;
     g_game_clip_plane[3] = d;
+}
+
+ZAN_GAME_API void zan_game_set_triplanar3d(int32_t enabled, float scale,
+    float sharpness) {
+    g_game_triplanar[0] = enabled ? 1.0f : 0.0f;
+    g_game_triplanar[1] = scale > 0.0001f ? scale : 1.0f;
+    g_game_triplanar[2] = sharpness >= 1.0f ? sharpness : 4.0f;
+}
+
+ZAN_GAME_API void zan_game_set_height_fog3d(int32_t enabled, float base_y,
+    float falloff, float max_density, float r, float g, float b) {
+    g_game_height_fog_params[0] = base_y;
+    g_game_height_fog_params[1] = falloff > 0.001f ? falloff : 0.001f;
+    if (max_density < 0.0f) max_density = 0.0f;
+    if (max_density > 1.0f) max_density = 1.0f;
+    g_game_height_fog_params[2] = max_density;
+    g_game_height_fog_params[3] = enabled ? 1.0f : 0.0f;
+    g_game_height_fog_color[0] = r > 0.0f ? r : 0.0f;
+    g_game_height_fog_color[1] = g > 0.0f ? g : 0.0f;
+    g_game_height_fog_color[2] = b > 0.0f ? b : 0.0f;
 }

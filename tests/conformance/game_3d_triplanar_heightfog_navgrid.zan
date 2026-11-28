@@ -1,0 +1,149 @@
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+using Gui;
+using Game.Graphics;
+using Game.Render3D;
+
+namespace Conf;
+
+class Game3DTriplanarHeightFogNavGridTest {
+    [DllImport("zan_gui")]
+    private static extern int zan_gui_read_pixel(int surfaceId, int x, int y);
+
+    private static Mesh3D MakeCollapsedUvQuad(float halfSize) {
+        Mesh3D m = new Mesh3D();
+        // 所有顶点 UV 坍缩为 (0,0)，模拟无 UV 悬崖/体素网格，用于验证三平面世界空间投影
+        m.Vertex(-halfSize, -halfSize, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        m.Vertex( halfSize, -halfSize, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        m.Vertex( halfSize,  halfSize, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        m.Vertex(-halfSize,  halfSize, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        m.Triangle(0, 1, 2);
+        m.Triangle(0, 2, 3);
+        return m;
+    }
+
+    private static int ROf(int argb) { return (argb >> 16) & 255; }
+    private static int GOf(int argb) { return (argb >> 8) & 255; }
+    private static int BOf(int argb) { return argb & 255; }
+
+    static void Main() {
+        // 先用软件画布烘焙一张左红右蓝的 32x32 程序化测试纹理注册到内存图库
+        Canvas.SetBackend(0);
+        Canvas texCv = new Canvas(32, 32);
+        texCv.FillRect(0, 0, 16, 32, unchecked((int)0xFFFF1010));
+        texCv.FillRect(16, 0, 16, 32, unchecked((int)0xFF1010FF));
+        int spriteHandle = texCv.BakeSprite("mem:triplanar_split");
+
+        // 切回 GPU 后端进行真机 OpenGL 渲染回读验证
+        Canvas.SetBackend(1);
+        Canvas cv = new Canvas(128, 128);
+        int quadH = cv.MeshUpload(MakeCollapsedUvQuad(1.8f));
+
+        Camera3D cam = new Camera3D();
+        cam.Position = new Vector3(0.0f, 0.0f, 4.0f);
+        cam.Target = new Vector3(0.0f, 0.0f, 0.0f);
+        cam.AspectRatio = 1.0f;
+
+        Renderer3D renderer = new Renderer3D(16);
+        renderer.UseCpuLighting = false;
+
+        SceneNode root = new SceneNode("root");
+        SceneNode nQuad = new SceneNode("quad");
+        nQuad.MeshKey = quadH;
+        nQuad.BoundsRadius = 4.0f;
+        Material mTri = Material.Solid(1.0f, 1.0f, 1.0f);
+        mTri.TextureKey = "mem:triplanar_split";
+        nQuad.Material = mTri;
+        root.AddChild(nQuad);
+
+        RenderPlan plan = new RenderPlan(cam);
+        plan.AmbientRed = 1.0f; plan.AmbientGreen = 1.0f; plan.AmbientBlue = 1.0f;
+
+        // 1. GPU 世界空间三平面纹理投影（Triplanar Mapping）
+        // 关闭时 UV=(0,0) 全采样红色；开启 Triplanar (scale=0.5) 后负 X 落入 [0.5,1) 蓝色区，正 X 落入 [0,0.5) 红色区
+        mTri.TriplanarEnabled = false;
+        plan.Build(root);
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, plan);
+        int offLeft = zan_gui_read_pixel(cv.SurfaceId(), 40, 64);
+        int offRight = zan_gui_read_pixel(cv.SurfaceId(), 88, 64);
+
+        mTri.TriplanarEnabled = true;
+        mTri.TriplanarScale = 0.5f;
+        mTri.TriplanarSharpness = 4.0f;
+        plan.Build(root);
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, plan);
+        int onLeft = zan_gui_read_pixel(cv.SurfaceId(), 40, 64);   // world x ~ -0.6 -> fract(-0.3)=0.7 -> 蓝
+        int onRight = zan_gui_read_pixel(cv.SurfaceId(), 88, 64);  // world x ~ +0.6 -> fract(+0.3)=0.3 -> 红
+
+        bool triOk = spriteHandle > 0
+            && ROf(offLeft) > BOf(offLeft) + 120
+            && ROf(offRight) > BOf(offRight) + 120
+            && BOf(onLeft) > ROf(onLeft) + 120
+            && ROf(onRight) > BOf(onRight) + 120;
+        Console.WriteLine("gpu-triplanar-world-mapping: " + Convert.ToString(triOk ? 1 : 0));
+
+        // 2. GPU 指数高度大气雾（Exponential Height Fog）
+        // 暗灰平面：开启青色山谷高度雾（baseY=-1.0, falloff=1.8, maxDensity=0.90）后，低海拔底部浓郁青雾、高海拔顶部清澈
+        Material mFog = Material.Emissive(0.12f, 0.12f, 0.12f);
+        nQuad.Material = mFog;
+        plan.AmbientRed = 0.0f; plan.AmbientGreen = 0.0f; plan.AmbientBlue = 0.0f;
+        plan.Build(root);
+
+        renderer.EnableHeightFog = true;
+        renderer.HeightFogBaseY = -1.0f;
+        renderer.HeightFogFalloff = 1.8f;
+        renderer.HeightFogMaxDensity = 0.90f;
+        renderer.HeightFogRed = 0.0f;
+        renderer.HeightFogGreen = 0.95f;
+        renderer.HeightFogBlue = 0.95f;
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, plan);
+        // OpenGL FBO 读回坐标系 y=16 对应低海拔 (-Y 山谷)、y=64 对应中海拔 (Y=0)、y=112 对应高海拔 (+Y 山顶)
+        int lowPix = zan_gui_read_pixel(cv.SurfaceId(), 64, 16);
+        int midPix = zan_gui_read_pixel(cv.SurfaceId(), 64, 64);
+        int highPix = zan_gui_read_pixel(cv.SurfaceId(), 64, 112);
+
+        renderer.EnableHeightFog = false;
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, plan);
+        int clearLow = zan_gui_read_pixel(cv.SurfaceId(), 64, 16);
+
+        bool fogOk = GOf(lowPix) > 180 && BOf(lowPix) > 180
+            && GOf(midPix) > GOf(highPix) + 15
+            && GOf(highPix) < 50 && BOf(highPix) < 50
+            && GOf(clearLow) < 50 && BOf(clearLow) < 50;
+        Console.WriteLine("gpu-exponential-height-fog: " + Convert.ToString(fogOk ? 1 : 0));
+
+        // 3. NavGrid3D 高度感知 A* 寻路 + 防切角 + 视线拉直平滑
+        NavGrid3D nav = new NavGrid3D(10, 10, 1.0f, 0.0f, 0.0f);
+        nav.MaxStepHeight = 0.6f;
+        // 在 x=4, z=0..7 设墙体障碍；在 x=6, z=8 设 3.0m 陡峭悬崖（不可攀爬）；x=6, z=9 为 0.3m 缓坡（可通行）
+        nav.SetRectWalkable(4, 0, 1, 8, false);
+        nav.SetCell(6, 8, true, 3.0f);
+        nav.SetCell(6, 9, true, 0.3f);
+
+        Vector3 startW = nav.GridToWorld(1, 2);
+        Vector3 goalW = nav.GridToWorld(8, 2);
+        List<Vector3> rawPath = nav.FindPath(startW, goalW);
+        List<Vector3> smoothPath = nav.SmoothPath(rawPath);
+
+        bool pathValid = rawPath.Count >= 10 && smoothPath.Count >= 3 && smoothPath.Count < rawPath.Count;
+        for (int i = 0; i < rawPath.Count; i = i + 1) {
+            int gx;
+            int gz;
+            nav.WorldToGrid(rawPath[i], out gx, out gz);
+            if (!nav.IsWalkable(gx, gz)) { pathValid = false; }
+            if (gx == 6 && gz == 8) { pathValid = false; } // 绝不能踏上 3m 悬崖
+        }
+        // 封死唯一通道后应返回空路径
+        nav.SetRectWalkable(4, 8, 1, 2, false);
+        List<Vector3> blocked = nav.FindPath(startW, goalW);
+        bool navOk = pathValid && blocked.Count == 0;
+        Console.WriteLine("navgrid3d-astar-elevation-smooth: " + Convert.ToString(navOk ? 1 : 0));
+
+        renderer.Dispose();
+    }
+}

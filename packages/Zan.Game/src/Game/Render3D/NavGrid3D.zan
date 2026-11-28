@@ -1,0 +1,317 @@
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+
+namespace Game.Render3D;
+
+// 商业 3D 高度感知网格导航与 A* 寻路器（Elevation-Aware 3D Navigation Grid）：
+// - 紧凑定长数组存储每格可行走标记与地形高程（零每格对象分配）
+// - 8 方向 Octile 启发 + 二叉最小堆 A* 搜索，带最大攀爬步高（MaxStepHeight）与防切角守卫（Anti-Corner-Cutting）
+// - 视线拉直平滑（String-Pulling SmoothPath），把锯齿格点路径化简为自然直线路点
+public class NavGrid3D {
+    public int Width;
+    public int Depth;
+    public float CellSize;
+    public float OriginX;
+    public float OriginZ;
+    public float MaxStepHeight;
+
+    private bool[] walkable;
+    private float[] heights;
+
+    public NavGrid3D(int width, int depth, float cellSize, float originX, float originZ) {
+        this.Width = width > 0 ? width : 1;
+        this.Depth = depth > 0 ? depth : 1;
+        this.CellSize = cellSize > 0.01f ? cellSize : 1.0f;
+        this.OriginX = originX;
+        this.OriginZ = originZ;
+        this.MaxStepHeight = 0.6f;
+
+        int total = this.Width * this.Depth;
+        this.walkable = new bool[total];
+        this.heights = new float[total];
+        for (int i = 0; i < total; i = i + 1) {
+            this.walkable[i] = true;
+            this.heights[i] = 0.0f;
+        }
+    }
+
+    public bool InBounds(int gx, int gz) {
+        return gx >= 0 && gx < this.Width && gz >= 0 && gz < this.Depth;
+    }
+
+    private int CellIndex(int gx, int gz) {
+        return gz * this.Width + gx;
+    }
+
+    public void SetCell(int gx, int gz, bool isWalkable, float heightY) {
+        if (!this.InBounds(gx, gz)) { return; }
+        int idx = this.CellIndex(gx, gz);
+        this.walkable[idx] = isWalkable;
+        this.heights[idx] = heightY;
+    }
+
+    public void SetRectWalkable(int x0, int z0, int w, int d, bool isWalkable) {
+        for (int z = z0; z < z0 + d; z = z + 1) {
+            for (int x = x0; x < x0 + w; x = x + 1) {
+                if (this.InBounds(x, z)) {
+                    this.walkable[this.CellIndex(x, z)] = isWalkable;
+                }
+            }
+        }
+    }
+
+    public bool IsWalkable(int gx, int gz) {
+        if (!this.InBounds(gx, gz)) { return false; }
+        return this.walkable[this.CellIndex(gx, gz)];
+    }
+
+    public float GetHeight(int gx, int gz) {
+        if (!this.InBounds(gx, gz)) { return 0.0f; }
+        return this.heights[this.CellIndex(gx, gz)];
+    }
+
+    public void WorldToGrid(Vector3 worldPos, out int gx, out int gz) {
+        float fx = (worldPos.X - this.OriginX) / this.CellSize;
+        float fz = (worldPos.Z - this.OriginZ) / this.CellSize;
+        int ix = (int)Math.Floor((double)fx);
+        int iz = (int)Math.Floor((double)fz);
+        if (ix < 0) { ix = 0; }
+        if (ix >= this.Width) { ix = this.Width - 1; }
+        if (iz < 0) { iz = 0; }
+        if (iz >= this.Depth) { iz = this.Depth - 1; }
+        gx = ix;
+        gz = iz;
+    }
+
+    public Vector3 GridToWorld(int gx, int gz) {
+        float wx = this.OriginX + ((float)gx + 0.5f) * this.CellSize;
+        float wz = this.OriginZ + ((float)gz + 0.5f) * this.CellSize;
+        float wy = this.GetHeight(gx, gz);
+        return new Vector3(wx, wy, wz);
+    }
+
+    public bool CanTraverse(int fromX, int fromZ, int toX, int toZ) {
+        if (!this.InBounds(fromX, fromZ) || !this.InBounds(toX, toZ)) { return false; }
+        int fromIdx = this.CellIndex(fromX, fromZ);
+        int toIdx = this.CellIndex(toX, toZ);
+        if (!this.walkable[fromIdx] || !this.walkable[toIdx]) { return false; }
+
+        float hFrom = this.heights[fromIdx];
+        float hTo = this.heights[toIdx];
+        float dh = hTo - hFrom;
+        if (dh < 0.0f) { dh = 0.0f - dh; }
+        if (dh > this.MaxStepHeight) { return false; }
+
+        int dx = toX - fromX;
+        int dz = toZ - fromZ;
+        if (dx != 0 && dz != 0) {
+            // 防切角：斜向移动必须保证两侧正交邻格均可行走且无悬崖断层
+            if (!this.CanTraverse(fromX, fromZ, fromX + dx, fromZ)) { return false; }
+            if (!this.CanTraverse(fromX, fromZ, fromX, fromZ + dz)) { return false; }
+        }
+        return true;
+    }
+
+    private static float OctileHeuristic(int x0, int z0, int x1, int z1) {
+        int dx = x1 - x0;
+        if (dx < 0) { dx = 0 - dx; }
+        int dz = z1 - z0;
+        if (dz < 0) { dz = 0 - dz; }
+        int mn = dx < dz ? dx : dz;
+        int mx = dx > dz ? dx : dz;
+        return (float)mn * 1.4142135f + (float)(mx - mn);
+    }
+
+    private static void HeapPush(int[] heap, ref int size, int node, float[] fScore) {
+        int i = size;
+        heap[i] = node;
+        size = size + 1;
+        while (i > 0) {
+            int p = (i - 1) / 2;
+            if (fScore[heap[i]] < fScore[heap[p]]) {
+                int tmp = heap[p];
+                heap[p] = heap[i];
+                heap[i] = tmp;
+                i = p;
+            } else {
+                break;
+            }
+        }
+    }
+
+    private static int HeapPop(int[] heap, ref int size, float[] fScore) {
+        int top = heap[0];
+        size = size - 1;
+        if (size > 0) {
+            heap[0] = heap[size];
+            int i = 0;
+            while (true) {
+                int l = i * 2 + 1;
+                int r = l + 1;
+                int best = i;
+                if (l < size && fScore[heap[l]] < fScore[heap[best]]) { best = l; }
+                if (r < size && fScore[heap[r]] < fScore[heap[best]]) { best = r; }
+                if (best == i) { break; }
+                int tmp = heap[i];
+                heap[i] = heap[best];
+                heap[best] = tmp;
+                i = best;
+            }
+        }
+        return top;
+    }
+
+    public List<Vector3> FindPath(Vector3 startWorld, Vector3 goalWorld) {
+        List<Vector3> path = new List<Vector3>();
+        int sx;
+        int sz;
+        int gx;
+        int gz;
+        this.WorldToGrid(startWorld, out sx, out sz);
+        this.WorldToGrid(goalWorld, out gx, out gz);
+        if (!this.IsWalkable(sx, sz) || !this.IsWalkable(gx, gz)) { return path; }
+        if (sx == gx && sz == gz) {
+            path.Add(this.GridToWorld(sx, sz));
+            return path;
+        }
+
+        int total = this.Width * this.Depth;
+        float[] gScore = new float[total];
+        float[] fScore = new float[total];
+        int[] parent = new int[total];
+        int[] state = new int[total]; // 0=unvisited, 1=open, 2=closed
+        int[] heap = new int[total * 2 + 8];
+        int heapSize = 0;
+
+        for (int i = 0; i < total; i = i + 1) {
+            gScore[i] = 1e30f;
+            fScore[i] = 1e30f;
+            parent[i] = -1;
+            state[i] = 0;
+        }
+
+        int startIdx = this.CellIndex(sx, sz);
+        int goalIdx = this.CellIndex(gx, gz);
+        gScore[startIdx] = 0.0f;
+        fScore[startIdx] = OctileHeuristic(sx, sz, gx, gz);
+        state[startIdx] = 1;
+        HeapPush(heap, ref heapSize, startIdx, fScore);
+
+        int[] dxArr = new int[8];
+        int[] dzArr = new int[8];
+        dxArr[0] = 1;  dzArr[0] = 0;
+        dxArr[1] = -1; dzArr[1] = 0;
+        dxArr[2] = 0;  dzArr[2] = 1;
+        dxArr[3] = 0;  dzArr[3] = -1;
+        dxArr[4] = 1;  dzArr[4] = 1;
+        dxArr[5] = 1;  dzArr[5] = -1;
+        dxArr[6] = -1; dzArr[6] = 1;
+        dxArr[7] = -1; dzArr[7] = -1;
+
+        bool found = false;
+        while (heapSize > 0) {
+            int cur = HeapPop(heap, ref heapSize, fScore);
+            if (state[cur] == 2) { continue; }
+            state[cur] = 2;
+            if (cur == goalIdx) {
+                found = true;
+                break;
+            }
+            int cx = cur % this.Width;
+            int cz = cur / this.Width;
+
+            for (int d = 0; d < 8; d = d + 1) {
+                int nx = cx + dxArr[d];
+                int nz = cz + dzArr[d];
+                if (!this.CanTraverse(cx, cz, nx, nz)) { continue; }
+                int nIdx = this.CellIndex(nx, nz);
+                if (state[nIdx] == 2) { continue; }
+
+                float stepCost = (dxArr[d] != 0 && dzArr[d] != 0) ? 1.4142135f : 1.0f;
+                float dh = this.heights[nIdx] - this.heights[cur];
+                if (dh < 0.0f) { dh = 0.0f - dh; }
+                float candG = gScore[cur] + stepCost + dh * 0.25f;
+                if (candG < gScore[nIdx]) {
+                    gScore[nIdx] = candG;
+                    fScore[nIdx] = candG + OctileHeuristic(nx, nz, gx, gz);
+                    parent[nIdx] = cur;
+                    state[nIdx] = 1;
+                    if (heapSize < heap.Length) {
+                        HeapPush(heap, ref heapSize, nIdx, fScore);
+                    }
+                }
+            }
+        }
+
+        if (!found) { return path; }
+
+        List<int> rev = new List<int>();
+        int walk = goalIdx;
+        while (walk >= 0) {
+            rev.Add(walk);
+            if (walk == startIdx) { break; }
+            walk = parent[walk];
+        }
+        for (int i = rev.Count - 1; i >= 0; i = i - 1) {
+            int idx = rev[i];
+            path.Add(this.GridToWorld(idx % this.Width, idx / this.Width));
+        }
+        return path;
+    }
+
+    // 网格视线检查：沿超覆盖步进检查两格之间是否可无阻碍直连。
+    public bool HasLineOfSight(int x0, int z0, int x1, int z1) {
+        if (!this.IsWalkable(x0, z0) || !this.IsWalkable(x1, z1)) { return false; }
+        int curX = x0;
+        int curZ = z0;
+        int dx = x1 - x0;
+        int dz = z1 - z0;
+        int stepX = dx >= 0 ? 1 : -1;
+        int stepZ = dz >= 0 ? 1 : -1;
+        int adx = dx >= 0 ? dx : (0 - dx);
+        int adz = dz >= 0 ? dz : (0 - dz);
+        int steps = adx > adz ? adx : adz;
+        if (steps == 0) { return true; }
+
+        for (int s = 1; s <= steps; s = s + 1) {
+            int nextX = x0 + (dx * s) / steps;
+            int nextZ = z0 + (dz * s) / steps;
+            if (nextX == curX && nextZ == curZ) { continue; }
+            if (!this.CanTraverse(curX, curZ, nextX, nextZ)) { return false; }
+            curX = nextX;
+            curZ = nextZ;
+        }
+        return true;
+    }
+
+    // 路径字符串拉直平滑（String-Pulling），在保持无碰撞的前提下移除冗余中间拐点。
+    public List<Vector3> SmoothPath(List<Vector3> rawPath) {
+        List<Vector3> result = new List<Vector3>();
+        if (rawPath == null || rawPath.Count == 0) { return result; }
+        if (rawPath.Count <= 2) {
+            for (int i = 0; i < rawPath.Count; i = i + 1) { result.Add(rawPath[i]); }
+            return result;
+        }
+        int anchor = 0;
+        result.Add(rawPath[0]);
+        while (anchor < rawPath.Count - 1) {
+            int ax;
+            int az;
+            this.WorldToGrid(rawPath[anchor], out ax, out az);
+            int furthest = anchor + 1;
+            for (int probe = rawPath.Count - 1; probe > anchor + 1; probe = probe - 1) {
+                int px;
+                int pz;
+                this.WorldToGrid(rawPath[probe], out px, out pz);
+                if (this.HasLineOfSight(ax, az, px, pz)) {
+                    furthest = probe;
+                    break;
+                }
+            }
+            result.Add(rawPath[furthest]);
+            anchor = furthest;
+        }
+        return result;
+    }
+}

@@ -1,0 +1,73 @@
+using System;
+using Game.Net;
+
+namespace Conf;
+
+class MultiplayerGuildMailLiveOpsTest {
+    static void Main() {
+        // 1. 公会 RBAC 权限层级 + 共享金库每日提款限额 + 会长原子移交
+        NetGuildRegistry guild = new NetGuildRegistry(100, "Starlight", 3, 200);
+        guild.AddMember(1, GuildRole.Leader);
+        guild.AddMember(2, GuildRole.Officer);
+        guild.AddMember(3, GuildRole.Member);
+        bool capBlocked = !guild.AddMember(4, GuildRole.Member); // 满员 3 人拦截
+
+        guild.DepositGold(3, 1000);
+        bool memberDenied = !guild.WithdrawGold(3, 50, 1);        // 普通成员禁止提款
+        bool offOk1 = guild.WithdrawGold(2, 150, 1);              // 官员首笔 150 <= 200 放行
+        bool offCapBlocked = !guild.WithdrawGold(2, 100, 1);      // 当日累计 250 > 200 拦截
+        bool offNextDayOk = guild.WithdrawGold(2, 200, 2);        // 次日额度刷新 200 放行
+        bool officerCannotKickLeader = !guild.KickMember(2, 1);   // 禁止以下犯上
+        bool officerKicksMember = guild.KickMember(2, 3);         // 官员可踢普通成员
+        bool transferOk = guild.SetRole(1, 2, GuildRole.Leader);  // 原子移交会长
+
+        bool guildOk = capBlocked && memberDenied && offOk1 && offCapBlocked
+            && offNextDayOk && officerCannotKickLeader && officerKicksMember
+            && transferOk && guild.GetRole(2) == GuildRole.Leader
+            && guild.GetRole(1) == GuildRole.Officer
+            && guild.TreasuryGold == 650 && guild.MemberCount == 2;
+        Console.WriteLine("net-guild-rbac-treasury: " + Convert.ToString(guildOk ? 1 : 0));
+
+        // 2. 权威幂等邮箱：首次领取成功、重复重放拦截、过期拦截与清理
+        NetMailboxService mail = new NetMailboxService();
+        NetMailMessage m1 = mail.SendMail(10, "System", "Season Reward", 500, "mount_phoenix", 1, 1000, 3600);
+        NetMailMessage m2 = mail.SendMail(10, "Event", "Flash Gift", 100, "gem", 5, 1000, 60);
+
+        int g1 = 0; string it1 = ""; int c1 = 0;
+        bool wrongPlayer = !mail.ClaimAttachments(99, m1.MailId, 1010, out g1, out it1, out c1);
+        bool claimOk = mail.ClaimAttachments(10, m1.MailId, 1010, out g1, out it1, out c1);
+        int gDup = 0; string itDup = ""; int cDup = 0;
+        bool replayBlocked = !mail.ClaimAttachments(10, m1.MailId, 1015, out gDup, out itDup, out cDup);
+        int gExp = 0; string itExp = ""; int cExp = 0;
+        bool expiredBlocked = !mail.ClaimAttachments(10, m2.MailId, 1100, out gExp, out itExp, out cExp);
+        int purged = mail.PurgeExpired(1100);
+
+        bool mailOk = wrongPlayer && claimOk && replayBlocked && expiredBlocked
+            && g1 == 500 && it1 == "mount_phoenix" && c1 == 1
+            && gDup == 0 && purged == 1 && mail.TotalMailCount == 1;
+        Console.WriteLine("net-idempotent-mailbox: " + Convert.ToString(mailOk ? 1 : 0));
+
+        // 3. Live-Ops 灰度分桶与一键熔断（KillSwitch 覆盖白名单）
+        NetLiveOpsRollout rollout = new NetLiveOpsRollout();
+        rollout.UpsertFlag("new_boss_raid", true, 5000, "s14"); // 50% 灰度
+        rollout.AddAllowlist("new_boss_raid", 99999);
+
+        // 验证 200 名玩家分桶均匀落入 30%..70% 区间且完全确定性
+        int hits = 0;
+        bool sticky = true;
+        for (int pid = 1; pid <= 200; pid = pid + 1) {
+            bool a = rollout.IsEnabledForPlayer("new_boss_raid", pid);
+            bool b = rollout.IsEnabledForPlayer("new_boss_raid", pid);
+            if (a != b) { sticky = false; }
+            if (a) { hits = hits + 1; }
+        }
+        bool allowHit = rollout.IsEnabledForPlayer("new_boss_raid", 99999);
+        rollout.SetKillSwitch("new_boss_raid", true);
+        bool killBlocksAllow = !rollout.IsEnabledForPlayer("new_boss_raid", 99999);
+        bool killBlocksRegular = !rollout.IsEnabledForPlayer("new_boss_raid", 1);
+
+        bool rolloutOk = sticky && hits >= 60 && hits <= 140
+            && allowHit && killBlocksAllow && killBlocksRegular;
+        Console.WriteLine("net-liveops-rollout-killswitch: " + Convert.ToString(rolloutOk ? 1 : 0));
+    }
+}
