@@ -1,0 +1,304 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Extraction;
+
+// 一件（一组）物品实例：定义 + 数量 + 耐久/弹匣/使用次数 + 在格子里的位置与朝向。
+public class ItemStack {
+    public int Uid;
+    public ItemDef Def;
+    public int Count;
+    public float Dur;
+    public int Loaded;           // 武器：已装弹
+    public int AmmoTier;         // 武器：弹匣里的弹种
+    public int UsesLeft;
+    public int X;
+    public int Y;
+    public bool Rot;
+    public GridInventory Inner;  // 胸挂/背包 的内部格子
+    public bool Found;           // 容器中：是否已被搜出
+
+    public ItemStack(ItemDef d, int uid) {
+        this.Uid = uid;
+        this.Def = d;
+        this.Count = 1;
+        this.Dur = d.Durability;
+        this.UsesLeft = d.Uses;
+        this.Found = true;
+        this.Loaded = d.Category == ItemCategory.Weapon ? d.MagSize : 0;
+        if (d.GridW > 0 && d.GridH > 0) { this.Inner = new GridInventory(d.GridW, d.GridH); }
+    }
+
+    public int W() { return this.Rot ? this.Def.H : this.Def.W; }
+    public int H() { return this.Rot ? this.Def.W : this.Def.H; }
+
+    // 自身价值（耐久折算，不含内部格子）。
+    public int SelfValue() {
+        int c = this.Count < 1 ? 1 : this.Count;
+        int v = this.Def.Value * c;
+        if (this.Def.Durability > 0) { v = (int)(v * (0.3f + 0.7f * this.Dur / this.Def.Durability)); }
+        return v;
+    }
+    // 总价值（含内部格子）。
+    public int TotalValue() {
+        int v = this.SelfValue();
+        if (this.Inner != null) { v = v + this.Inner.Value(); }
+        return v;
+    }
+}
+
+// 网格背包：物品占 W×H 格，可 90° 旋转，同类可堆叠。
+public class GridInventory {
+    public int W;
+    public int H;
+    public List<ItemStack> Items;
+    public int LastTakenTier;    // TakeAmmo 取到的弹种（-1 没取到）
+
+    public GridInventory(int w, int h) { this.W = w; this.H = h; this.Items = new List<ItemStack>(); this.LastTakenTier = -1; }
+
+    public ItemStack At(int x, int y) {
+        for (int i = 0; i < this.Items.Count; i = i + 1) {
+            ItemStack it = this.Items[i];
+            if (x >= it.X && x < it.X + it.W() && y >= it.Y && y < it.Y + it.H()) { return it; }
+        }
+        return null;
+    }
+
+    public bool Fits(int iw, int ih, int x, int y, ItemStack ignore) {
+        if (x < 0 || y < 0 || x + iw > this.W || y + ih > this.H) { return false; }
+        for (int i = 0; i < this.Items.Count; i = i + 1) {
+            ItemStack it = this.Items[i];
+            if (it == ignore) { continue; }
+            if (x < it.X + it.W() && x + iw > it.X && y < it.Y + it.H() && y + ih > it.Y) { return false; }
+        }
+        return true;
+    }
+
+    // 自动放入：先堆叠，再按行扫描找空位（先不转后转）。全部放下返回 true。
+    public bool Insert(ItemStack it) {
+        if (it.Def.Stack > 1) {
+            for (int i = 0; i < this.Items.Count && it.Count > 0; i = i + 1) {
+                ItemStack o = this.Items[i];
+                if (o.Def == it.Def && o.Count < o.Def.Stack) {
+                    int room = o.Def.Stack - o.Count;
+                    int mv = it.Count < room ? it.Count : room;
+                    o.Count = o.Count + mv; it.Count = it.Count - mv;
+                }
+            }
+            if (it.Count <= 0) { return true; }
+        }
+        for (int pass = 0; pass < 2; pass = pass + 1) {
+            if (pass == 1 && it.Def.W == it.Def.H) { break; }
+            it.Rot = pass == 1;
+            for (int y = 0; y < this.H; y = y + 1) {
+                for (int x = 0; x < this.W; x = x + 1) {
+                    if (this.Fits(it.W(), it.H(), x, y, null)) { it.X = x; it.Y = y; this.Items.Add(it); return true; }
+                }
+            }
+        }
+        it.Rot = false;
+        return false;
+    }
+
+    public bool PlaceAt(ItemStack it, int x, int y, bool rot) {
+        bool old = it.Rot;
+        it.Rot = rot;
+        if (!this.Fits(it.W(), it.H(), x, y, it)) { it.Rot = old; return false; }
+        it.X = x; it.Y = y;
+        if (!this.Items.Contains(it)) { this.Items.Add(it); }
+        return true;
+    }
+
+    public bool Contains(ItemStack it) { return this.Items.Contains(it); }
+    public void Remove(ItemStack it) { this.Items.Remove(it); }
+
+    public ItemStack Find(int uid) {
+        for (int i = 0; i < this.Items.Count; i = i + 1) {
+            ItemStack it = this.Items[i];
+            if (it.Uid == uid) { return it; }
+            if (it.Inner != null) { ItemStack r = it.Inner.Find(uid); if (r != null) { return r; } }
+        }
+        return null;
+    }
+
+    public int Value() {
+        int v = 0;
+        for (int i = 0; i < this.Items.Count; i = i + 1) { v = v + this.Items[i].TotalValue(); }
+        return v;
+    }
+
+    public int UsedCells() {
+        int n = 0;
+        for (int i = 0; i < this.Items.Count; i = i + 1) { n = n + this.Items[i].W() * this.Items[i].H(); }
+        return n;
+    }
+
+    public int CountAmmo(int caliber) {
+        int n = 0;
+        for (int i = 0; i < this.Items.Count; i = i + 1) {
+            ItemStack it = this.Items[i];
+            if (it.Def.Category == ItemCategory.Ammo && it.Def.Caliber == caliber) { n = n + it.Count; }
+        }
+        return n;
+    }
+
+    // 取 need 发该口径弹药：优先 prefTier；一次只取同一弹种。返回取到数量，弹种写入 LastTakenTier。
+    public int TakeAmmo(int caliber, int need, int prefTier, int lockTier) {
+        this.LastTakenTier = lockTier;
+        int got = 0;
+        for (int pass = 0; pass < 2 && got < need; pass = pass + 1) {
+            for (int i = this.Items.Count - 1; i >= 0 && got < need; i = i - 1) {
+                ItemStack it = this.Items[i];
+                if (it.Def.Category != ItemCategory.Ammo || it.Def.Caliber != caliber) { continue; }
+                if (pass == 0 && it.Def.Tier != prefTier) { continue; }
+                if (this.LastTakenTier >= 0 && it.Def.Tier != this.LastTakenTier) { continue; }
+                int mv = need - got < it.Count ? need - got : it.Count;
+                it.Count = it.Count - mv; got = got + mv; this.LastTakenTier = it.Def.Tier;
+                if (it.Count <= 0) { this.Items.RemoveAt(i); }
+            }
+        }
+        return got;
+    }
+}
+
+// 角色身上的全部物品：6 个装备槽 + 口袋 + 安全箱（死亡保留）+ 胸挂/背包内部格子。
+public class Loadout {
+    public ItemStack[] Equip;
+    public GridInventory Pockets;
+    public GridInventory Pouch;
+    public int LastTakenTier;
+
+    public Loadout(int pocketW, int pocketH, int pouchW, int pouchH) {
+        this.Equip = new ItemStack[EquipSlot.Count];
+        this.Pockets = new GridInventory(pocketW, pocketH);
+        this.Pouch = new GridInventory(pouchW, pouchH);
+        this.LastTakenTier = -1;
+    }
+
+    public GridInventory Rig() { ItemStack e = this.Equip[EquipSlot.Rig]; return e != null ? e.Inner : null; }
+    public GridInventory Bag() { ItemStack e = this.Equip[EquipSlot.Bag]; return e != null ? e.Inner : null; }
+
+    // 普通存放区（胸挂 → 口袋 → 背包），不含安全箱。
+    public List<GridInventory> Grids() {
+        List<GridInventory> g = new List<GridInventory>();
+        GridInventory r = this.Rig(); if (r != null) { g.Add(r); }
+        g.Add(this.Pockets);
+        GridInventory b = this.Bag(); if (b != null) { g.Add(b); }
+        return g;
+    }
+
+    // 该物品默认装备槽（-1 不可装备）。
+    public static int SlotFor(ItemDef d) {
+        if (d.Category == ItemCategory.Weapon) { return d.Sidearm ? EquipSlot.Secondary : EquipSlot.Primary; }
+        if (d.Category == ItemCategory.Armor) { return EquipSlot.Armor; }
+        if (d.Category == ItemCategory.Helmet) { return EquipSlot.Helmet; }
+        if (d.Category == ItemCategory.Rig) { return EquipSlot.Rig; }
+        if (d.Category == ItemCategory.Bag) { return EquipSlot.Bag; }
+        return -1;
+    }
+    // 槽位是否接受该物品：主武器槽接受任意武器，副武器槽只接受 sidearm。
+    public static bool Accepts(int slot, ItemDef d) {
+        if (slot == EquipSlot.Primary) { return d.Category == ItemCategory.Weapon; }
+        if (slot == EquipSlot.Secondary) { return d.Category == ItemCategory.Weapon && d.Sidearm; }
+        return Loadout.SlotFor(d) == slot;
+    }
+
+    // 拾取：空着的匹配槽直接穿上，否则放进存放区。
+    public bool Add(ItemStack it) {
+        int s = Loadout.SlotFor(it.Def);
+        if (s >= 0 && this.Equip[s] == null) { this.Equip[s] = it; return true; }
+        if (s == EquipSlot.Secondary && this.Equip[EquipSlot.Primary] == null) { this.Equip[EquipSlot.Primary] = it; return true; }
+        List<GridInventory> gs = this.Grids();
+        for (int i = 0; i < gs.Count; i = i + 1) { if (gs[i].Insert(it)) { return true; } }
+        return false;
+    }
+
+    public bool IsEquipped(ItemStack it) {
+        for (int s = 0; s < EquipSlot.Count; s = s + 1) { if (this.Equip[s] == it) { return true; } }
+        return false;
+    }
+
+    public ItemStack Find(int uid) {
+        for (int s = 0; s < EquipSlot.Count; s = s + 1) {
+            ItemStack e = this.Equip[s];
+            if (e == null) { continue; }
+            if (e.Uid == uid) { return e; }
+            if (e.Inner != null) { ItemStack r = e.Inner.Find(uid); if (r != null) { return r; } }
+        }
+        ItemStack a = this.Pockets.Find(uid);
+        if (a != null) { return a; }
+        return this.Pouch.Find(uid);
+    }
+
+    public bool Remove(ItemStack it) {
+        for (int s = 0; s < EquipSlot.Count; s = s + 1) {
+            ItemStack e = this.Equip[s];
+            if (e == it) { this.Equip[s] = null; return true; }
+            if (e != null && e.Inner != null && e.Inner.Contains(it)) { e.Inner.Remove(it); return true; }
+        }
+        if (this.Pockets.Contains(it)) { this.Pockets.Remove(it); return true; }
+        if (this.Pouch.Contains(it)) { this.Pouch.Remove(it); return true; }
+        return false;
+    }
+
+    public int Value() {
+        int v = this.Pockets.Value() + this.Pouch.Value();
+        for (int s = 0; s < EquipSlot.Count; s = s + 1) { if (this.Equip[s] != null) { v = v + this.Equip[s].TotalValue(); } }
+        return v;
+    }
+
+    public int CountAmmo(int caliber) {
+        int n = this.Pouch.CountAmmo(caliber);
+        List<GridInventory> gs = this.Grids();
+        for (int i = 0; i < gs.Count; i = i + 1) { n = n + gs[i].CountAmmo(caliber); }
+        return n;
+    }
+
+    public int TakeAmmo(int caliber, int need, int prefTier) {
+        this.LastTakenTier = -1;
+        int got = 0;
+        List<GridInventory> gs = this.Grids();
+        gs.Add(this.Pouch);
+        for (int i = 0; i < gs.Count && got < need; i = i + 1) {
+            int g = gs[i].TakeAmmo(caliber, need - got, this.LastTakenTier >= 0 ? this.LastTakenTier : prefTier, this.LastTakenTier);
+            if (g > 0) { got = got + g; this.LastTakenTier = gs[i].LastTakenTier; }
+        }
+        return got;
+    }
+
+    // 第一件能用的医疗品：needBleed 时只找能止血的（用时最短），否则找回血最多的。
+    public ItemStack FirstMed(bool needBleed) {
+        List<GridInventory> gs = this.Grids();
+        gs.Add(this.Pouch);
+        ItemStack best = null;
+        for (int i = 0; i < gs.Count; i = i + 1) {
+            for (int k = 0; k < gs[i].Items.Count; k = k + 1) {
+                ItemStack it = gs[i].Items[k];
+                if (it.Def.Category != ItemCategory.Med) { continue; }
+                if (needBleed && !it.Def.StopBleed) { continue; }
+                if (best == null || (needBleed ? it.Def.UseTime < best.Def.UseTime : it.Def.Heal > best.Def.Heal)) { best = it; }
+            }
+        }
+        return best;
+    }
+
+    // 所有物品平铺（装备、胸挂/背包内物品、口袋、安全箱）。
+    public void All(List<ItemStack> output) {
+        for (int s = 0; s < EquipSlot.Count; s = s + 1) {
+            ItemStack e = this.Equip[s];
+            if (e == null) { continue; }
+            output.Add(e);
+            if (e.Inner != null) { for (int k = 0; k < e.Inner.Items.Count; k = k + 1) { output.Add(e.Inner.Items[k]); } }
+        }
+        for (int k = 0; k < this.Pockets.Items.Count; k = k + 1) { output.Add(this.Pockets.Items[k]); }
+        for (int k = 0; k < this.Pouch.Items.Count; k = k + 1) { output.Add(this.Pouch.Items[k]); }
+    }
+
+    // 负重：普通存放区占用比例（0..1）。
+    public float Fullness() {
+        int cells = 0; int used = 0;
+        List<GridInventory> gs = this.Grids();
+        for (int i = 0; i < gs.Count; i = i + 1) { cells = cells + gs[i].W * gs[i].H; used = used + gs[i].UsedCells(); }
+        return cells == 0 ? 0.0f : (float)used / cells;
+    }
+}

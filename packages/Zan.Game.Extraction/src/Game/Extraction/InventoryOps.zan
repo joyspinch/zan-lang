@@ -1,0 +1,175 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Extraction;
+
+// 经过校验的背包操作：权威侧（主机/单机）执行，客户端只发操作。
+// 目标编码：0 胸挂 1 口袋 2 背包 3 安全箱；10+槽位 装备槽；20 当前打开的容器。
+public static class InvTarget {
+    public const int Rig = 0;
+    public const int Pockets = 1;
+    public const int Bag = 2;
+    public const int Pouch = 3;
+    public const int SlotBase = 10;
+    public const int Container = 20;
+}
+
+public static class InventoryOps {
+    public static GridInventory TargetGrid(Loadout lo, GridInventory container, int target) {
+        if (target == InvTarget.Rig) { return lo.Rig(); }
+        if (target == InvTarget.Pockets) { return lo.Pockets; }
+        if (target == InvTarget.Bag) { return lo.Bag(); }
+        if (target == InvTarget.Pouch) { return lo.Pouch; }
+        if (target == InvTarget.Container) { return container; }
+        return null;
+    }
+
+    // 在身上或打开的容器里找物品（只返回已搜出的）。
+    public static ItemStack Locate(Loadout lo, GridInventory container, int uid) {
+        ItemStack it = lo.Find(uid);
+        if (it == null && container != null) { it = container.Find(uid); }
+        if (it != null && !it.Found) { return null; }
+        return it;
+    }
+
+    // 从当前位置取下（未搜出的不能取）。
+    public static bool Detach(Loadout lo, GridInventory container, ItemStack it) {
+        if (lo.Remove(it)) { return true; }
+        if (container != null && container.Contains(it)) {
+            if (!it.Found) { return false; }
+            container.Remove(it);
+            return true;
+        }
+        return false;
+    }
+
+    // 放到指定格子/槽位。被替换下的旧装备通过 displaced 返回（放不下的由调用方丢地上）。
+    public static bool Move(Loadout lo, GridInventory container, ItemStack it, int target, int x, int y, bool rot, List<ItemStack> displaced) {
+        if (target >= InvTarget.SlotBase && target < InvTarget.SlotBase + EquipSlot.Count) {
+            int s = target - InvTarget.SlotBase;
+            if (!Loadout.Accepts(s, it.Def)) { return false; }
+            ItemStack old = lo.Equip[s];
+            if (old == it) { return true; }
+            if (!InventoryOps.Detach(lo, container, it)) { return false; }
+            lo.Equip[s] = it;
+            it.Rot = false;
+            if (old != null && !lo.Add(old)) {
+                if (container == null || !container.Insert(old)) { displaced.Add(old); }
+            }
+            return true;
+        }
+        GridInventory g = InventoryOps.TargetGrid(lo, container, target);
+        if (g == null || g == it.Inner) { return false; }
+        // 堆叠合并
+        ItemStack under = g.At(x, y);
+        if (under != null && under != it && under.Def == it.Def && it.Def.Stack > 1) {
+            int room = under.Def.Stack - under.Count;
+            if (room <= 0) { return false; }
+            int mv = it.Count < room ? it.Count : room;
+            under.Count = under.Count + mv; it.Count = it.Count - mv;
+            if (it.Count <= 0) { InventoryOps.Detach(lo, container, it); }
+            return true;
+        }
+        int iw = rot ? it.Def.H : it.Def.W; int ih = rot ? it.Def.W : it.Def.H;
+        if (!g.Fits(iw, ih, x, y, it)) { return false; }
+        if (!g.Contains(it) && !InventoryOps.Detach(lo, container, it)) { return false; }
+        return g.PlaceAt(it, x, y, rot);
+    }
+
+    // 快速转移：容器 → 身上；身上 → 容器（有打开的容器时）；否则穿上装备。
+    public static bool Quick(Loadout lo, GridInventory container, ItemStack it, List<ItemStack> displaced) {
+        if (container != null && container.Contains(it)) {
+            if (!it.Found) { return false; }
+            container.Remove(it);
+            if (lo.Add(it)) { return true; }
+            container.Insert(it);
+            return false;
+        }
+        if (container != null) {
+            lo.Remove(it);
+            if (container.Insert(it)) { return true; }
+            lo.Add(it);
+            return false;
+        }
+        int s = Loadout.SlotFor(it.Def);
+        if (s < 0 || lo.IsEquipped(it)) { return false; }
+        ItemStack old = lo.Equip[s];
+        lo.Remove(it);
+        lo.Equip[s] = it;
+        if (old != null && !lo.Add(old)) { displaced.Add(old); }
+        return true;
+    }
+}
+
+// 护甲结算：防护等级 × 耐久 vs 弹药穿透。
+public class ArmorHit {
+    public int Taken;          // 实际伤害
+    public float DurLoss;      // 耐久损失
+    public bool Blocked;       // 被挡住（钝伤）
+}
+
+public static class ArmorModel {
+    public static float ThresholdPerTier = 13.0f;
+
+    // tier 防护等级；dur/maxDur 当前耐久；pen 穿透；head 是否头部（头盔钝伤更小）。
+    public static ArmorHit Resolve(int tier, float dur, int maxDur, int pen, int dmg, bool head) {
+        ArmorHit h = new ArmorHit();
+        h.Taken = dmg;
+        if (tier <= 0 || dur <= 0.0f || maxDur <= 0) { return h; }
+        float frac = dur / maxDur;
+        float thr = tier * ArmorModel.ThresholdPerTier * (0.45f + 0.55f * frac);
+        if (pen >= thr) {
+            h.Taken = (int)(dmg * 0.88f);
+            h.DurLoss = dmg * 0.06f + 1.0f;
+        } else {
+            h.Taken = (int)(dmg * (head ? 0.12f : 0.22f));
+            h.DurLoss = dmg * 0.12f + 1.0f;
+            h.Blocked = true;
+        }
+        return h;
+    }
+}
+
+// 撤离点（3D 平面圆）：常开 / 随机开放 / 需要条件（拉闸等）。
+public static class ExtractKind {
+    public const int Always = 0;
+    public const int Random = 1;
+    public const int Conditional = 2;
+}
+
+public class ExtractPoint {
+    public string Name;
+    public float X;
+    public float Z;
+    public float Radius;
+    public int Kind;
+    public bool Open;
+    public string Hint;
+    public ExtractPoint(string name, float x, float z, float radius, int kind) {
+        this.Name = name; this.X = x; this.Z = z; this.Radius = radius; this.Kind = kind;
+        this.Open = kind == ExtractKind.Always; this.Hint = "";
+    }
+    public bool Contains(float x, float z) {
+        float dx = x - this.X; float dz = z - this.Z;
+        return dx * dx + dz * dz < this.Radius * this.Radius;
+    }
+}
+
+// 单个玩家的撤离读条：离开或换点即清零。
+public class ExtractProgress {
+    public int Index;
+    public float Time;
+    public ExtractProgress() { this.Index = -1; }
+
+    // 返回 true 表示本次推进后撤离完成。
+    public bool Step(List<ExtractPoint> points, float x, float z, float dt, float need) {
+        int idx = -1;
+        for (int i = 0; i < points.Count; i = i + 1) {
+            if (points[i].Open && points[i].Contains(x, z)) { idx = i; break; }
+        }
+        if (idx < 0) { this.Index = -1; this.Time = 0.0f; return false; }
+        if (idx != this.Index) { this.Index = idx; this.Time = 0.0f; }
+        this.Time = this.Time + dt;
+        return this.Time >= need;
+    }
+}

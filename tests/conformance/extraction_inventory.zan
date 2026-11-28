@@ -1,0 +1,101 @@
+using System;
+using System.Collections.Generic;
+using Game.Extraction;
+
+namespace T;
+
+// Zan.Game.Extraction：数据驱动物品目录、网格背包、装备规则、背包操作、掉落、护甲、撤离读条。
+class Program {
+    static string Data() {
+        return "{\"calibers\":[\"9mm\",\"5.8mm\"],"
+            + "\"items\":["
+            + "{\"id\":1,\"name\":\"手枪\",\"short\":\"P\",\"w\":2,\"h\":1,\"cat\":\"weapon\",\"value\":400,\"weapon\":1,\"sidearm\":true,\"mag\":13,\"caliber\":0},"
+            + "{\"id\":2,\"name\":\"步枪\",\"short\":\"R\",\"w\":4,\"h\":2,\"cat\":\"weapon\",\"value\":5000,\"rarity\":2,\"weapon\":3,\"mag\":30,\"caliber\":1},"
+            + "{\"id\":10,\"name\":\"9mm\",\"cat\":\"ammo\",\"value\":4,\"stack\":60,\"caliber\":0,\"tier\":0,\"pen\":14},"
+            + "{\"id\":11,\"name\":\"9mmAP\",\"cat\":\"ammo\",\"value\":12,\"stack\":60,\"caliber\":0,\"tier\":1,\"pen\":30},"
+            + "{\"id\":20,\"name\":\"甲\",\"w\":3,\"h\":3,\"cat\":\"armor\",\"value\":2400,\"tier\":2,\"durability\":45},"
+            + "{\"id\":30,\"name\":\"胸挂\",\"w\":2,\"h\":2,\"cat\":\"rig\",\"value\":400,\"gridW\":2,\"gridH\":2},"
+            + "{\"id\":33,\"name\":\"背包\",\"w\":2,\"h\":2,\"cat\":\"bag\",\"value\":600,\"gridW\":3,\"gridH\":3},"
+            + "{\"id\":40,\"name\":\"绷带\",\"cat\":\"med\",\"value\":120,\"stopBleed\":true,\"useTime\":2.0},"
+            + "{\"id\":41,\"name\":\"急救包\",\"h\":2,\"cat\":\"med\",\"value\":600,\"heal\":45,\"stopBleed\":true,\"useTime\":3.5},"
+            + "{\"id\":56,\"name\":\"显卡\",\"w\":2,\"cat\":\"loot\",\"value\":7600,\"rarity\":3}"
+            + "],"
+            + "\"lootTables\":{\"tool\":[[10,10],[40,5],[56,1]]},"
+            + "\"containers\":[{\"key\":\"tool\",\"name\":\"工具箱\",\"w\":4,\"h\":2,\"min\":2,\"max\":3}]}";
+    }
+
+    static void Main() {
+        ItemCatalog cat = new ItemCatalog();
+        int n = cat.LoadJson(Data());
+        Console.WriteLine("loaded=" + n.ToString() + " cal=" + cat.CaliberName(1) + " ammo=" + cat.AmmoFor(0, 1).ToString() + " missing=" + cat.Get(999).Name.Length.ToString());
+
+        // 网格：放置、旋转、堆叠
+        GridInventory g = new GridInventory(4, 2);
+        ItemStack rifle = cat.Make(2, 1);
+        Console.WriteLine("rifle fits=" + g.Insert(rifle).ToString() + " at=" + rifle.X.ToString() + "," + rifle.Y.ToString());
+        Console.WriteLine("full insert=" + g.Insert(cat.Make(40, 1)).ToString());
+        GridInventory g2 = new GridInventory(1, 4);
+        ItemStack r2 = cat.Make(2, 1);
+        ItemStack card = cat.Make(56, 1);
+        Console.WriteLine("rot card=" + g2.Insert(card).ToString() + " rot=" + card.Rot.ToString() + " w=" + card.W().ToString() + " rifle=" + g2.Insert(r2).ToString());
+        GridInventory g3 = new GridInventory(2, 1);
+        g3.Insert(cat.Make(10, 50));
+        g3.Insert(cat.Make(10, 30));
+        Console.WriteLine("stack items=" + g3.Items.Count.ToString() + " first=" + g3.Items[0].Count.ToString() + " ammo=" + g3.CountAmmo(0).ToString());
+
+        // 装备规则
+        Loadout lo = new Loadout(4, 1, 2, 2);
+        lo.Add(cat.Make(1, 1));
+        lo.Add(cat.Make(2, 1));
+        lo.Add(cat.Make(30, 1));
+        lo.Add(cat.Make(33, 1));
+        Console.WriteLine("slots primary=" + lo.Equip[EquipSlot.Primary].Def.ShortName + " secondary=" + lo.Equip[EquipSlot.Secondary].Def.ShortName
+            + " acceptsRifleInSecondary=" + Loadout.Accepts(EquipSlot.Secondary, cat.Get(2)).ToString());
+        lo.Add(cat.Make(10, 60));
+        lo.Add(cat.Make(11, 20));
+        lo.Add(cat.Make(41, 1));
+        lo.Add(cat.Make(40, 1));
+        int got = lo.TakeAmmo(0, 25, 1);
+        Console.WriteLine("ammo total=" + lo.CountAmmo(0).ToString() + " took=" + got.ToString() + " tier=" + lo.LastTakenTier.ToString());
+        Console.WriteLine("med bleed=" + lo.FirstMed(true).Def.Name + " heal=" + lo.FirstMed(false).Def.Name);
+
+        // 背包操作：移动到口袋、换装备、快速转移进容器
+        List<ItemStack> displaced = new List<ItemStack>();
+        ItemStack band = lo.FirstMed(true);
+        bool mv = InventoryOps.Move(lo, null, band, InvTarget.Pockets, 3, 0, false, displaced);
+        Console.WriteLine("move pocket=" + mv.ToString() + " at=" + band.X.ToString());
+        GridInventory box = new GridInventory(4, 3);
+        bool q = InventoryOps.Quick(lo, box, band, displaced);
+        Console.WriteLine("quick to box=" + q.ToString() + " boxItems=" + box.Items.Count.ToString());
+        ItemStack armor = cat.Make(20, 1);
+        box.Insert(armor);
+        bool eq = InventoryOps.Move(lo, box, armor, InvTarget.SlotBase + EquipSlot.Armor, 0, 0, false, displaced);
+        bool bad = InventoryOps.Move(lo, box, cat.Make(56, 1), InvTarget.SlotBase + EquipSlot.Helmet, 0, 0, false, displaced);
+        Console.WriteLine("equip armor=" + eq.ToString() + " wrongSlot=" + bad.ToString() + " value=" + lo.Value().ToString());
+
+        // 掉落：固定种子可复现，新物品需搜索
+        GridInventory crate = new GridInventory(4, 2);
+        cat.Fill(crate, "tool", new Random(7), 0.5f);
+        int hidden = 0;
+        for (int i = 0; i < crate.Items.Count; i = i + 1) { if (!crate.Items[i].Found) { hidden = hidden + 1; } }
+        GridInventory crate2 = new GridInventory(4, 2);
+        cat.Fill(crate2, "tool", new Random(7), 0.5f);
+        Console.WriteLine("loot n=" + crate.Items.Count.ToString() + " hidden=" + hidden.ToString() + " same=" + (crate.Items.Count == crate2.Items.Count && crate.Value() == crate2.Value()).ToString());
+
+        // 护甲
+        ArmorHit pen = ArmorModel.Resolve(2, 45.0f, 45, 30, 40, false);
+        ArmorHit blk = ArmorModel.Resolve(2, 45.0f, 45, 14, 40, false);
+        ArmorHit worn = ArmorModel.Resolve(2, 5.0f, 45, 14, 40, false);
+        Console.WriteLine("armor pen=" + pen.Taken.ToString() + "/" + pen.Blocked.ToString() + " blk=" + blk.Taken.ToString() + "/" + blk.Blocked.ToString() + " worn=" + worn.Taken.ToString());
+
+        // 撤离读条
+        List<ExtractPoint> pts = new List<ExtractPoint>();
+        pts.Add(new ExtractPoint("北门", 0.0f, 0.0f, 3.0f, ExtractKind.Always));
+        pts.Add(new ExtractPoint("码头", 50.0f, 0.0f, 3.0f, ExtractKind.Conditional));
+        ExtractProgress ep = new ExtractProgress();
+        bool done = false; int steps = 0;
+        while (!done && steps < 100) { done = ep.Step(pts, 1.0f, 1.0f, 0.5f, 8.0f); steps = steps + 1; }
+        bool closed = new ExtractProgress().Step(pts, 50.0f, 0.0f, 9.0f, 8.0f);
+        Console.WriteLine("extract steps=" + steps.ToString() + " closedPoint=" + closed.ToString());
+    }
+}

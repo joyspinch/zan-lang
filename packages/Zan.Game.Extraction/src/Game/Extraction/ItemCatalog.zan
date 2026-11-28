@@ -1,0 +1,275 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+
+namespace Game.Extraction;
+
+// 搜打撤物品体系（数据驱动）：物品定义、口径、容器类型与掉落表全部来自 JSON，
+// 游戏只携带数据文件。格式见 README「数据格式」一节。
+
+// 物品大类。
+public static class ItemCategory {
+    public const int Weapon = 0;
+    public const int Ammo = 1;
+    public const int Armor = 2;
+    public const int Helmet = 3;
+    public const int Rig = 4;
+    public const int Bag = 5;
+    public const int Med = 6;
+    public const int Loot = 7;
+    public const int Key = 8;
+    public const int Count = 9;
+
+    private static string[] keys = new string[] { "weapon", "ammo", "armor", "helmet", "rig", "bag", "med", "loot", "key" };
+    private static string[] names = new string[] { "武器", "弹药", "护甲", "头盔", "胸挂", "背包", "医疗", "物资", "钥匙" };
+
+    public static int Parse(string key) {
+        for (int i = 0; i < keys.Length; i = i + 1) { if (keys[i] == key) { return i; } }
+        return Loot;
+    }
+    public static string Name(int cat) { return cat >= 0 && cat < names.Length ? names[cat] : "物资"; }
+}
+
+// 装备槽。
+public static class EquipSlot {
+    public const int Primary = 0;
+    public const int Secondary = 1;
+    public const int Helmet = 2;
+    public const int Armor = 3;
+    public const int Rig = 4;
+    public const int Bag = 5;
+    public const int Count = 6;
+
+    private static string[] names = new string[] { "主武器", "副武器", "头盔", "护甲", "胸挂", "背包" };
+    public static string Name(int slot) { return slot >= 0 && slot < names.Length ? names[slot] : ""; }
+}
+
+// 物品定义（只读数据）。
+public class ItemDef {
+    public int Id;
+    public string Name;
+    public string ShortName;
+    public int W;
+    public int H;
+    public int Category;
+    public int Value;
+    public int Stack;
+    public int Rarity;          // 0 普通 1 优良 2 稀有 3 史诗 4 传说
+    public int WeaponId;        // 武器：游戏侧武器表索引（-1 非武器）
+    public bool Sidearm;        // 武器：可放副武器槽
+    public int MagSize;         // 武器：弹匣容量
+    public int Caliber;         // 武器/弹药：口径索引（-1 无）
+    public int Tier;            // 弹药档 / 防护等级
+    public int Pen;             // 弹药穿透值
+    public int Durability;      // 护甲/头盔耐久上限
+    public int Heal;
+    public bool StopBleed;
+    public float UseTime;
+    public int Uses;
+    public int GridW;           // 胸挂/背包自带格子
+    public int GridH;
+    public string Desc;
+
+    public ItemDef() {
+        this.Name = ""; this.ShortName = ""; this.Desc = "";
+        this.W = 1; this.H = 1; this.Stack = 1; this.Uses = 1;
+        this.WeaponId = -1; this.Caliber = -1;
+        this.Category = ItemCategory.Loot;
+    }
+}
+
+// 容器类型（工具箱、武器箱……）：格子尺寸 + 掉落规则。
+public class ContainerDef {
+    public string Key;
+    public string Name;
+    public int W;
+    public int H;
+    public string Table;
+    public int MinItems;
+    public int MaxItems;
+    public float EmptyChance;
+    public ContainerDef() { this.Key = ""; this.Name = ""; this.Table = ""; this.W = 3; this.H = 3; this.MinItems = 1; this.MaxItems = 3; }
+}
+
+// 掉落表：物品 id + 权重。
+public class LootTable {
+    public string Key;
+    public List<int> Ids;
+    public List<int> Weights;
+    public LootTable(string key) { this.Key = key; this.Ids = new List<int>(); this.Weights = new List<int>(); }
+    public void Add(int id, int weight) { this.Ids.Add(id); this.Weights.Add(weight); }
+}
+
+public class ItemCatalog {
+    private Dictionary<int, ItemDef> defs;
+    private Dictionary<string, LootTable> tables;
+    private Dictionary<string, ContainerDef> containers;
+    public List<string> CaliberNames;
+    public List<string> RarityNames;
+    public List<int> RarityColors;
+    public List<int> Order;          // 物品 id 按定义顺序
+    public ItemDef Fallback;
+    public int ItemUidSeed;
+
+    public ItemCatalog() {
+        this.defs = new Dictionary<int, ItemDef>();
+        this.tables = new Dictionary<string, LootTable>();
+        this.containers = new Dictionary<string, ContainerDef>();
+        this.CaliberNames = new List<string>();
+        this.RarityNames = new List<string>();
+        this.RarityColors = new List<int>();
+        this.Order = new List<int>();
+        this.Fallback = new ItemDef();
+        this.ItemUidSeed = 1;
+        string[] rn = new string[] { "普通", "优良", "稀有", "史诗", "传说" };
+        int[] rc = new int[] { unchecked((int)0xFF8C949A), unchecked((int)0xFF5DBB63), unchecked((int)0xFF4A90E2), unchecked((int)0xFFA65BE0), unchecked((int)0xFFF0B030) };
+        for (int i = 0; i < rn.Length; i = i + 1) { this.RarityNames.Add(rn[i]); this.RarityColors.Add(rc[i]); }
+    }
+
+    public void Add(ItemDef d) {
+        if (!this.defs.ContainsKey(d.Id)) { this.Order.Add(d.Id); }
+        this.defs[d.Id] = d;
+    }
+    public bool Has(int id) { return this.defs.ContainsKey(id); }
+    // 总是返回非空定义（未知 id 返回空白的 Fallback）。
+    public ItemDef Get(int id) {
+        if (this.defs.ContainsKey(id)) { return this.defs[id]; }
+        return this.Fallback;
+    }
+    public LootTable Table(string key) { return this.tables.ContainsKey(key) ? this.tables[key] : null; }
+    public ContainerDef Container(string key) { return this.containers.ContainsKey(key) ? this.containers[key] : null; }
+    public void AddTable(LootTable t) { this.tables[t.Key] = t; }
+    public void AddContainer(ContainerDef c) { this.containers[c.Key] = c; }
+
+    public string RarityName(int r) { return r >= 0 && r < this.RarityNames.Count ? this.RarityNames[r] : ""; }
+    public int RarityColor(int r) { return r >= 0 && r < this.RarityColors.Count ? this.RarityColors[r] : unchecked((int)0xFF8C949A); }
+    public string CaliberName(int c) { return c >= 0 && c < this.CaliberNames.Count ? this.CaliberNames[c] : ""; }
+
+    // 按口径与弹药档查弹药物品 id（找不到返回 -1）。
+    public int AmmoFor(int caliber, int tier) {
+        for (int i = 0; i < this.Order.Count; i = i + 1) {
+            ItemDef d = this.defs[this.Order[i]];
+            if (d.Category == ItemCategory.Ammo && d.Caliber == caliber && d.Tier == tier) { return d.Id; }
+        }
+        return -1;
+    }
+
+    public ItemStack Make(int id, int count) {
+        ItemDef d = this.Get(id);
+        ItemStack it = new ItemStack(d, this.ItemUidSeed);
+        this.ItemUidSeed = this.ItemUidSeed + 1;
+        int c = count < 1 ? 1 : count;
+        it.Count = c > d.Stack ? d.Stack : c;
+        return it;
+    }
+
+    // ---------------- JSON ----------------
+    // 返回加载的物品数；格式错误返回 -1。
+    public int LoadJson(string text) {
+        JsonValue root = JsonValue.Parse(text);
+        if (root == null || !root.IsObject()) { return -1; }
+        int n = 0;
+        JsonValue cal = root.Get("calibers");
+        if (cal != null && cal.IsArray()) {
+            this.CaliberNames.Clear();
+            for (int i = 0; i < cal.Count(); i = i + 1) { this.CaliberNames.Add(cal.At(i).AsString("")); }
+        }
+        JsonValue items = root.Get("items");
+        if (items != null && items.IsArray()) {
+            for (int i = 0; i < items.Count(); i = i + 1) {
+                JsonValue o = items.At(i);
+                ItemDef d = new ItemDef();
+                d.Id = o.Int("id", 0);
+                d.Name = o.Str("name", "");
+                d.ShortName = o.Str("short", d.Name);
+                d.W = o.Int("w", 1); d.H = o.Int("h", 1);
+                d.Category = ItemCategory.Parse(o.Str("cat", "loot"));
+                d.Value = o.Int("value", 0);
+                d.Stack = o.Int("stack", 1);
+                d.Rarity = o.Int("rarity", 0);
+                d.WeaponId = o.Int("weapon", -1);
+                d.Sidearm = o.Bool("sidearm", false);
+                d.MagSize = o.Int("mag", 0);
+                d.Caliber = o.Int("caliber", -1);
+                d.Tier = o.Int("tier", 0);
+                d.Pen = o.Int("pen", 0);
+                d.Durability = o.Int("durability", 0);
+                d.Heal = o.Int("heal", 0);
+                d.StopBleed = o.Bool("stopBleed", false);
+                d.UseTime = (float)o.Double("useTime", 0.0);
+                d.Uses = o.Int("uses", 1);
+                d.GridW = o.Int("gridW", 0); d.GridH = o.Int("gridH", 0);
+                d.Desc = o.Str("desc", "");
+                if (d.Id <= 0) { continue; }
+                this.Add(d);
+                n = n + 1;
+            }
+        }
+        JsonValue tabs = root.Get("lootTables");
+        if (tabs != null && tabs.IsObject()) {
+            for (int i = 0; i < tabs.Count(); i = i + 1) {
+                LootTable t = new LootTable(tabs.KeyAt(i));
+                JsonValue arr = tabs.ValAt(i);
+                for (int k = 0; k + 0 < arr.Count(); k = k + 1) {
+                    JsonValue pair = arr.At(k);
+                    if (pair.IsArray() && pair.Count() >= 2) { t.Add(pair.At(0).AsInt(0), pair.At(1).AsInt(1)); }
+                }
+                this.AddTable(t);
+            }
+        }
+        JsonValue cons = root.Get("containers");
+        if (cons != null && cons.IsArray()) {
+            for (int i = 0; i < cons.Count(); i = i + 1) {
+                JsonValue o = cons.At(i);
+                ContainerDef c = new ContainerDef();
+                c.Key = o.Str("key", "");
+                c.Name = o.Str("name", c.Key);
+                c.W = o.Int("w", 3); c.H = o.Int("h", 3);
+                c.Table = o.Str("table", c.Key);
+                c.MinItems = o.Int("min", 1); c.MaxItems = o.Int("max", 3);
+                c.EmptyChance = (float)o.Double("empty", 0.0);
+                if (c.Key != "") { this.AddContainer(c); }
+            }
+        }
+        return n;
+    }
+
+    // ---------------- 掉落 ----------------
+    // 按容器类型往格子里随机塞物品；tierBoost（0..1）提高稀有物权重。新物品 Found = false（需搜索）。
+    public void Fill(GridInventory g, string containerKey, Random rng, float tierBoost) {
+        ContainerDef c = this.Container(containerKey);
+        if (c == null) { return; }
+        LootTable t = this.Table(c.Table);
+        if (t == null || t.Ids.Count == 0) { return; }
+        if (rng.NextDouble() < c.EmptyChance) { return; }
+        int span = c.MaxItems - c.MinItems + 1;
+        int n = c.MinItems + (int)(rng.NextDouble() * span);
+        if (n > c.MaxItems) { n = c.MaxItems; }
+        for (int k = 0; k < n; k = k + 1) {
+            int pick = this.Roll(t, rng, tierBoost);
+            ItemDef d = this.Get(pick);
+            int cnt = 1;
+            if (d.Category == ItemCategory.Ammo) { cnt = d.Stack / 3 + (int)(rng.NextDouble() * d.Stack * 0.5); }
+            ItemStack it = this.Make(pick, cnt);
+            if (d.Category == ItemCategory.Weapon) { it.Loaded = (int)(rng.NextDouble() * d.MagSize); }
+            if (d.Durability > 0) { it.Dur = d.Durability * (0.45f + (float)rng.NextDouble() * 0.55f); }
+            it.Found = false;
+            g.Insert(it);
+        }
+    }
+
+    public int Roll(LootTable t, Random rng, float tierBoost) {
+        float total = 0.0f;
+        for (int i = 0; i < t.Ids.Count; i = i + 1) { total = total + this.Weight(t, i, tierBoost); }
+        float r = (float)rng.NextDouble() * total;
+        for (int i = 0; i < t.Ids.Count; i = i + 1) {
+            r = r - this.Weight(t, i, tierBoost);
+            if (r <= 0.0f) { return t.Ids[i]; }
+        }
+        return t.Ids[t.Ids.Count - 1];
+    }
+    private float Weight(LootTable t, int i, float boost) {
+        ItemDef d = this.Get(t.Ids[i]);
+        return t.Weights[i] * (1.0f + boost * d.Rarity * 1.5f);
+    }
+}
