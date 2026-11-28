@@ -754,8 +754,19 @@ partial class Irgen {
     }
 
     void GenSwitchStmt(Node s) {
-        stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
+        int swScope = locName.Count;
+        syncFlow.localScopes.Add(s); syncFlow.localScopeStarts.Add(swScope);
+        BranchTempScope swSubjBts = EnterBranchTempScope();
         ExprVal subj = GenExpr(s.a);
+        bool keepAsyncSubj = curAsync && (ArcManaged(subj.ty) || (subj.ty != null && subj.ty.ival >= 1));
+        if (!curAsync && (ArcManaged(subj.ty) || (subj.ty != null && subj.ty.ival >= 1))) {
+            string subjLL = MapType(subj.ty);
+            string subjReg = AddLocal(".sw.subj", subj.ty);
+            EA(subjReg, subjLL);
+            L("  store " + subjLL + " " + subj.op + ", " + subjLL + "* " + subjReg);
+            if (!TransferTempOwner(subj)) { EmitArcRetain(subj.op, subj.ty); }
+        }
+        if (!keepAsyncSubj) { LeaveBranchTempScope(swSubjBts); }
         int lend = NL();
         Node savedBreakScope = syncFlow.breakScope;
         syncFlow.breakScope = s;
@@ -815,6 +826,7 @@ partial class Irgen {
                     c = EmitTypeTestVal(subj, cse.type, s.a);
                 }
             } else {
+                BranchTempScope patBts = EnterBranchTempScope();
                 ExprVal pv = GenExpr(cse.a);
                 if (IsStr(subj.ty) && IsStr(pv.ty)) {
                     string r = NT();
@@ -823,6 +835,7 @@ partial class Irgen {
                 } else {
                     L("  " + c + " = icmp eq i64 " + subj.op + ", " + pv.op);
                 }
+                LeaveBranchTempScope(patBts);
             }
             if (cse.c != null) {
                 // a `when` guard: the pattern must match and the guard must hold
@@ -831,9 +844,11 @@ partial class Irgen {
                 EmitPatternBind(cse, subj);
                 L("  br label %L" + guardL[i]);
                 Label(guardL[i]);
+                BranchTempScope guardBts = EnterBranchTempScope();
                 ExprVal gv = GenExpr(cse.c);
                 string gi = NT();
                 L("  " + gi + " = icmp ne i64 " + gv.op + ", 0");
+                LeaveBranchTempScope(guardBts);
                 int rejected = NL();
                 L("  br i1 " + gi + ", label %L" + bodyL[i] + ", label %L" + rejected);
                 Label(rejected);
@@ -877,13 +892,17 @@ partial class Irgen {
             L("  br label %L" + lend);
         }
         Label(lend);
+        if (keepAsyncSubj) { LeaveBranchTempScope(swSubjBts); }
+        ReleaseLocalsFrom(swScope);
+        TrimLocals(swScope);
+        syncFlow.localScopes.RemoveAt(syncFlow.localScopes.Count - 1);
+        syncFlow.localScopeStarts.RemoveAt(syncFlow.localScopeStarts.Count - 1);
         syncFlow.breakScope = savedBreakScope;
         brkTarget = sBrk; loopScopeBase = sLoop;
     }
 
     ExprVal GenSwitchExpr(Node e) {
-        List<string> svT = stmtTemps; List<Node> svTT = stmtTempTypes;
-        stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
+        BranchTempScope outerBts = EnterBranchTempScope();
         ExprVal subj = GenExpr(e.a);
         int nend = NL();
         List<string> vals = new List<string>();
@@ -921,9 +940,11 @@ partial class Irgen {
                 if (arm.c != null) {
                     L("  br label %L" + pGuard);
                     Label(pGuard);
+                    BranchTempScope guardBts = EnterBranchTempScope();
                     ExprVal gv = GenExpr(arm.c);
                     string gi = NT();
                     L("  " + gi + " = icmp ne i64 " + gv.op + ", 0");
+                    LeaveBranchTempScope(guardBts);
                     int rejected = NL();
                     L("  br i1 " + gi + ", label %L" + bodyL + ", label %L" + rejected);
                     Label(rejected);
@@ -934,14 +955,17 @@ partial class Irgen {
                 }
             } else if (arm.a == null) {
                 if (arm.c != null) {
+                    BranchTempScope guardBts = EnterBranchTempScope();
                     ExprVal gv = GenExpr(arm.c);
                     string gi = NT();
                     L("  " + gi + " = icmp ne i64 " + gv.op + ", 0");
+                    LeaveBranchTempScope(guardBts);
                     L("  br i1 " + gi + ", label %L" + bodyL + ", label %L" + nextL);
                 } else {
                     L("  br label %L" + bodyL);
                 }
             } else {
+                BranchTempScope patBts = EnterBranchTempScope();
                 ExprVal pv = GenExpr(arm.a);
                 string c = NT();
                 if (arm.op != 0) {
@@ -961,24 +985,29 @@ partial class Irgen {
                 } else {
                     L("  " + c + " = icmp eq i64 " + subj.op + ", " + pv.op);
                 }
+                LeaveBranchTempScope(patBts);
                 if (arm.c != null) {
                     int guardL = NL();
                     L("  br i1 " + c + ", label %L" + guardL + ", label %L" + nextL);
                     Label(guardL);
+                    BranchTempScope guardBts = EnterBranchTempScope();
                     ExprVal gv = GenExpr(arm.c);
                     string gi = NT();
                     L("  " + gi + " = icmp ne i64 " + gv.op + ", 0");
+                    LeaveBranchTempScope(guardBts);
                     L("  br i1 " + gi + ", label %L" + bodyL + ", label %L" + nextL);
                 } else {
                     L("  br i1 " + c + ", label %L" + bodyL + ", label %L" + nextL);
                 }
             }
             Label(bodyL);
+            BranchTempScope armBts = EnterBranchTempScope();
             ExprVal rv = GenExpr(arm.b);
             resLL = MapType(rv.ty);
             resTy = rv.ty;
             string result = Coerce(rv, resLL);
             EmitArcRetain(result, resTy);
+            LeaveBranchTempScope(armBts);
             vals.Add(result);
             labs.Add(curLbl);
             ReleaseLocalsFrom(armScope);
@@ -1002,8 +1031,7 @@ partial class Irgen {
         if (vals.Count > 0) { phi = phi + ", [ " + zero + ", %" + fbLbl + " ]"; }
         else { phi = phi + " [ " + zero + ", %" + fbLbl + " ]"; }
         L("  " + phi);
-        EmitTempReleases();
-        stmtTemps = svT; stmtTempTypes = svTT;
+        LeaveBranchTempScope(outerBts);
         AddTemp(t, resTy);
         return new ExprVal(t, resTy);
     }

@@ -1,0 +1,132 @@
+using System;
+
+namespace SelfhostLiftedSwitchLockOwnership;
+
+class Box {
+    public int Val;
+    public Box(int v) { this.Val = v; }
+}
+
+class Holder {
+    public Box SyncRoot;
+    public Holder(int v) { this.SyncRoot = new Box(v); }
+}
+
+class Program {
+    static Box MakeBox(int v) { return new Box(v); }
+    static Holder MakeHolder(int v) { return new Holder(v); }
+    static string MakeStr(int v) { return "str_" + v.ToString(); }
+    static int? MakeOpt(int v) { return v; }
+    static int? MakeNull() { return null; }
+    static double? MakeDbl(double v) { return v; }
+    static int? BoomOpt() { throw new Exception("boom_opt"); }
+    static bool BoomGuard(Box b) { throw new Exception("boom_guard_" + b.Val.ToString()); }
+    static Box BoomBox(Box b) { throw new Exception("boom_box_" + b.Val.ToString()); }
+
+    static int TestSwitchStmtOwnership() {
+        int acc = 0;
+        switch (MakeStr(42)) {
+            case "nope": acc = acc + 1; break;
+        }
+        switch (MakeStr(2)) {
+            case "str_1":
+            case "str_2":
+                acc = acc + 20;
+                break;
+            default:
+                acc = acc + 99;
+                break;
+        }
+        switch (MakeBox(7)) {
+            case Box b when MakeBox(b.Val).Val == 99: acc = acc + 1; break;
+            case Box b when MakeBox(b.Val).Val == 7: acc = acc + b.Val; break;
+        }
+        try {
+            switch (MakeBox(11)) {
+                case Box b when BoomGuard(MakeBox(b.Val)): acc = acc + 1; break;
+            }
+        } catch (Exception e) {
+            acc = acc + e.Message.Length;
+        }
+        return acc;
+    }
+
+    static int TestSwitchExprOwnership() {
+        int acc = 0;
+        Box r = MakeBox(5) switch {
+            Box b when MakeBox(b.Val).Val == 99 => MakeBox(100),
+            Box b => MakeBox(b.Val + 1)
+        };
+        acc = acc + r.Val;
+        try {
+            Box r2 = MakeBox(10) switch {
+                Box b when MakeBox(100).Val == 99 => MakeBox(1),
+                Box b when MakeBox(200).Val == 99 => MakeBox(2),
+                Box b when BoomGuard(MakeBox(b.Val)) => MakeBox(3),
+                _ => MakeBox(4)
+            };
+            acc = acc + r2.Val;
+        } catch (Exception e) {
+            acc = acc + e.Message.Length;
+        }
+        try {
+            Box r3 = MakeBox(13) switch {
+                Box b => BoomBox(MakeBox(b.Val))
+            };
+            acc = acc + r3.Val;
+        } catch (Exception e) {
+            acc = acc + e.Message.Length;
+        }
+        return acc;
+    }
+
+    static int TestLiftedNullableArith() {
+        int? a = MakeOpt(10) + MakeOpt(20);
+        int? b = MakeOpt(10) + MakeNull();
+        int? c = MakeNull() + MakeOpt(20);
+        int? d = MakeOpt(7) + 3;
+        int? d2 = 4 + MakeOpt(6);
+        double? f = MakeDbl(2.5) * MakeDbl(4.0);
+        int? e1 = null;
+        try { e1 = MakeNull() + BoomOpt(); } catch (Exception ex) { e1 = -99; }
+        int e2 = 0;
+        try { int? z = MakeOpt(10) + BoomOpt(); e2 = z ?? -1; } catch (Exception ex) { e2 = ex.Message.Length; }
+        return (a ?? -1) + (b ?? 0) + (c ?? 0) + (d ?? -1) + (d2 ?? -1) + (int)(f ?? 0.0) + (e1 ?? 0) + e2;
+    }
+
+    static int TestLockOwnership() {
+        int acc = 0;
+        lock (MakeBox(1)) {
+        }
+        lock (MakeHolder(2).SyncRoot) {
+            acc = acc + MakeBox(10).Val;
+        }
+        try {
+            lock (MakeBox(3)) {
+                Box tmp = MakeBox(4);
+                throw new Exception("lock_" + tmp.Val.ToString());
+            }
+        } catch (Exception e) {
+            acc = acc + e.Message.Length;
+        }
+        lock (MakeBox(5)) {
+            return acc + 5;
+        }
+    }
+
+    static int ApplyLam(Box b, Func<int, int> f) {
+        return b.Val + f(b.Val);
+    }
+
+    static int TestLambdaTemps() {
+        return ApplyLam(MakeBox(7), x => MakeBox(x * 2).Val + 1);
+    }
+
+    static void Main() {
+        Console.WriteLine("sw_stmt=" + TestSwitchStmtOwnership().ToString());
+        Console.WriteLine("sw_expr=" + TestSwitchExprOwnership().ToString());
+        Console.WriteLine("lifted=" + TestLiftedNullableArith().ToString());
+        Console.WriteLine("lock=" + TestLockOwnership().ToString());
+        Console.WriteLine("lam=" + TestLambdaTemps().ToString());
+    }
+}

@@ -204,7 +204,19 @@ partial class Irgen {
 
     void GenLock(Node s) {
         if (s.a == null) { return; }
+        int lockScope = locName.Count;
+        syncFlow.localScopes.Add(s); syncFlow.localScopeStarts.Add(lockScope);
+        BranchTempScope lockBts = EnterBranchTempScope();
         ExprVal v = GenExpr(s.a);
+        bool keepAsyncLock = curAsync && (ArcManaged(v.ty) || (v.ty != null && v.ty.ival >= 1));
+        if (!curAsync && (ArcManaged(v.ty) || (v.ty != null && v.ty.ival >= 1))) {
+            string vll = MapType(v.ty);
+            string lockReg = AddLocal(".lock.obj", v.ty);
+            EA(lockReg, vll);
+            L("  store " + vll + " " + v.op + ", " + vll + "* " + lockReg);
+            if (!TransferTempOwner(v)) { EmitArcRetain(v.op, v.ty); }
+        }
+        if (!keepAsyncLock) { LeaveBranchTempScope(lockBts); }
         string vt = MapType(v.ty);
         string obj = v.op;
         if (vt != "i8*") {
@@ -271,6 +283,11 @@ partial class Irgen {
         finBodies.RemoveAt(finBodies.Count - 1);
         finLive.RemoveAt(finLive.Count - 1);
         finMonSlot.RemoveAt(finMonSlot.Count - 1);
+        if (keepAsyncLock) { LeaveBranchTempScope(lockBts); }
+        if (!term) { ReleaseLocalsFrom(lockScope); }
+        TrimLocals(lockScope);
+        syncFlow.localScopes.RemoveAt(syncFlow.localScopes.Count - 1);
+        syncFlow.localScopeStarts.RemoveAt(syncFlow.localScopeStarts.Count - 1);
     }
 
     bool IsClassPtr(string s) {
