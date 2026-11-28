@@ -21,7 +21,8 @@ public class ValidationText {
     // null、空串或全是空白字符视为空。
     public static bool IsBlank(string value) {
         if (value == null) { return true; }
-        for (int i = 0; i < value.Length; i = i + 1) {
+        int n = value.Length;
+        for (int i = 0; i < n; i = i + 1) {
             int c = value[i] & 255;
             if (c != 32 && (c < 9 || c > 13)) { return false; }
         }
@@ -29,22 +30,78 @@ public class ValidationText {
     }
 
     // 通配匹配：pattern 里的 `*` 匹配任意长度，`?` 匹配一个字节。
-    // 贪心 + 回溯（记录最近一个 `*` 的位置），线性于常见输入。
+    // 字面/前缀/后缀/包含快路径 + 贪心回溯，缓存长度并按字节直比。
     public static bool Matches(string value, string pattern) {
         if (value == null || pattern == null) { return false; }
-        int v = 0;
-        int p = 0;
-        int star = 0 - 1;
-        int mark = 0;
-        while (v < value.Length) {
-            if (p < pattern.Length && (pattern[p] == '?' || pattern[p] == value[v])) {
-                v = v + 1;
-                p = p + 1;
-            } else if (p < pattern.Length && pattern[p] == '*') {
-                star = p;
-                mark = v;
-                p = p + 1;
-            } else if (star >= 0) {
+        int vLen = value.Length;
+        int pLen = pattern.Length;
+        if (pLen == 0) { return vLen == 0; }
+        nint pp = (nint)pattern;
+        int wPos = NativeMemory.IndexOfAny(pp, pLen, 42, 63);  // '*' or '?'
+        if (wPos < 0) {
+            return vLen == pLen && value == pattern;
+        }
+        if (wPos > 0) {
+            if (vLen < wPos) { return false; }
+            for (int k = 0; k < wPos; k = k + 1) {
+                if ((value[k] & 255) != (pattern[k] & 255)) { return false; }
+            }
+            if (wPos == pLen - 1 && (pattern[wPos] & 255) == 42) { return true; }
+        } else if ((pattern[0] & 255) == 42) {
+            if (pLen == 1) { return true; }
+            int tailLen = pLen - 1;
+            int w2 = NativeMemory.IndexOfAny(pp + (nint)1, tailLen, 42, 63);
+            if (w2 < 0) {
+                // 纯后缀模式 "*bar"
+                if (vLen < tailLen) { return false; }
+                int off = vLen - tailLen;
+                for (int k = 0; k < tailLen; k = k + 1) {
+                    if ((value[off + k] & 255) != (pattern[1 + k] & 255)) { return false; }
+                }
+                return true;
+            }
+            if (w2 == tailLen - 1 && (pattern[pLen - 1] & 255) == 42) {
+                // 纯包含模式 "*mid*"
+                int midLen = pLen - 2;
+                if (midLen == 0) { return true; }
+                if (vLen < midLen) { return false; }
+                int first = pattern[1] & 255;
+                int limit = vLen - midLen;
+                nint vp = (nint)value;
+                int pos = 0;
+                while (pos <= limit) {
+                    int hit = NativeMemory.Find(vp, pos, first, limit - pos + 1);
+                    if (hit < 0) { return false; }
+                    bool ok = true;
+                    for (int k = 1; k < midLen; k = k + 1) {
+                        if ((value[hit + k] & 255) != (pattern[1 + k] & 255)) { ok = false; break; }
+                    }
+                    if (ok) { return true; }
+                    pos = hit + 1;
+                }
+                return false;
+            }
+        }
+        int v = wPos;
+        int p = wPos;
+        int star = -1;
+        int mark = wPos;
+        while (v < vLen) {
+            if (p < pLen) {
+                int pc = pattern[p] & 255;
+                if (pc == 63 || pc == (value[v] & 255)) {
+                    v = v + 1;
+                    p = p + 1;
+                    continue;
+                }
+                if (pc == 42) {
+                    star = p;
+                    mark = v;
+                    p = p + 1;
+                    continue;
+                }
+            }
+            if (star >= 0) {
                 p = star + 1;
                 mark = mark + 1;
                 v = mark;
@@ -52,29 +109,35 @@ public class ValidationText {
                 return false;
             }
         }
-        while (p < pattern.Length && pattern[p] == '*') {
+        while (p < pLen && (pattern[p] & 255) == 42) {
             p = p + 1;
         }
-        return p == pattern.Length;
+        return p == pLen;
     }
 
-    // 基础邮箱格式校验：不含空白/控制字符，含有唯一 @ 且前后合法，域名含合法分段与 .
+    // 基础邮箱格式校验：单遍字节扫描融合控制符、唯一 @、起止点、连续点与域名点检查。
     public static bool IsValidEmail(string value) {
-        if (value == null || value.Length < 5) { return false; }
-        for (int i = 0; i < value.Length; i = i + 1) {
+        if (value == null) { return false; }
+        int n = value.Length;
+        if (n < 5) { return false; }
+        int first = value[0] & 255;
+        int last = value[n - 1] & 255;
+        if (first == 46 || last == 46 || first == 64 || last == 64) { return false; }
+        int at = -1;
+        bool hasDotAfterAt = false;
+        int prev = 0;
+        for (int i = 0; i < n; i = i + 1) {
             int c = value[i] & 255;
             if (c <= 32 || c == 127) { return false; }
+            if (c == 64) {
+                if (at >= 0 || prev == 46) { return false; }
+                at = i;
+            } else if (c == 46) {
+                if (prev == 46 || prev == 64) { return false; }
+                if (at >= 0) { hasDotAfterAt = true; }
+            }
+            prev = c;
         }
-        int at = value.IndexOf("@");
-        if (at <= 0 || at == value.Length - 1) { return false; }
-        // 只能有一个 @
-        if (value.IndexOf("@", at + 1) >= 0) { return false; }
-        // 本地部分与域名不得以点起止或包含连续点
-        if ((value[0] & 255) == 46 || (value[at - 1] & 255) == 46) { return false; }
-        if ((value[at + 1] & 255) == 46 || (value[value.Length - 1] & 255) == 46) { return false; }
-        if (value.IndexOf("..") >= 0) { return false; }
-        int dot = value.IndexOf(".", at + 1);
-        if (dot <= at + 1 || dot == value.Length - 1) { return false; }
-        return true;
+        return at > 0 && hasDotAfterAt;
     }
 }
