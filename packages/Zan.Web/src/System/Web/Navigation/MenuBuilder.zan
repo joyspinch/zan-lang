@@ -90,39 +90,47 @@ public class MenuBuilder {
             if ((r.NeedsLogin() || r.NeedsAuth()) && uid.Length == 0) { continue; }
             if (r.NeedsAuth() && !await app.Allow(uid, r.Action(), scope)) { continue; }
 
+            string pt = r.Pattern();
             MenuNode n = new MenuNode();
             string title = r.GetTitle();
             if (title.Length == 0) { title = r.Action(); }
             n.SetTitle(title);
-            n.SetPath(r.Pattern());
+            n.SetPath(pt);
+
+            string explicitGroup = r.MetaGet("Group");
+            string explicitGroupOrder = r.MetaGet("GroupOrder");
+            int segStart = 0;
+            int segLen = 0;
+            bool hasSecond = false;
+            if (explicitGroup.Length == 0 || explicitGroupOrder.Length == 0) {
+                MenuBuilder.FirstBodySegment(pt, out segStart, out segLen, out hasSecond);
+            }
 
             /* 优先采用特性显式声明的分组（[Custom(Group = "...")]），未声明时按 URL 前缀约定回退 */
-            string explicitGroup = r.MetaGet("Group");
             if (explicitGroup.Length > 0) {
                 n.SetGroup(explicitGroup);
             } else {
-                n.SetGroup(MenuBuilder.GroupOf(r.Pattern()));
+                n.SetGroup(MenuBuilder.GroupFromSeg(pt, segStart, segLen, hasSecond));
             }
 
             /* 优先采用特性显式声明的排序（[Custom(GroupOrder = ...)] / [Custom(Order = ...)]） */
-            string explicitGroupOrder = r.MetaGet("GroupOrder");
             if (explicitGroupOrder.Length > 0) {
                 n.SetGroupOrder(Convert.ToInt32(explicitGroupOrder));
             } else {
-                n.SetGroupOrder(MenuBuilder.OrderOfGroup(n.Group(), r.Pattern()));
+                n.SetGroupOrder(MenuBuilder.OrderFromSeg(n.Group(), pt, segStart, segLen));
             }
 
             string explicitOrder = r.MetaGet("Order");
             if (explicitOrder.Length > 0) {
                 n.SetOrder(explicitOrder);
             } else {
-                n.SetOrder(r.Pattern());
+                n.SetOrder(pt);
             }
 
             string icon = r.MetaGet("Icon");
             if (icon.Length == 0) { icon = MenuBuilder.defaultIcon; }
             n.SetIcon(icon);
-            n.SetActive(MenuBuilder.Matches(r.Pattern(), activePath));
+            n.SetActive(MenuBuilder.Matches(pt, activePath));
             outp.Add(n);
         }
         MenuBuilder.Sort(outp);
@@ -170,69 +178,144 @@ public class MenuBuilder {
         }
     }
 
-    // pages do.
-    public static string GroupOf(string path) {
-        List<string> segs = MenuBuilder.Body(path);
-        if (segs.Count == 0) { return ""; }
-        if (segs.Count == 1 && !MenuBuilder.labels.Has(segs[0])) { return ""; }
-        return MenuBuilder.Label(segs[0]);
+    private static bool SliceEqualsStr(string s, int start, int len, string target) {
+        if (len != target.Length) { return false; }
+        for (int i = 0; i < len; i = i + 1) {
+            if ((s[start + i] & 255) != (target[i] & 255)) { return false; }
+        }
+        return true;
     }
 
-    public static int OrderOf(string path) {
-        return MenuBuilder.OrderOfGroup(MenuBuilder.GroupOf(path), path);
+    private static void FirstBodySegment(string pattern, out int segStart, out int segLen, out bool hasSecond) {
+        segStart = 0;
+        segLen = 0;
+        hasSecond = false;
+        if (pattern == null || pattern.Length == 0) { return; }
+        List<string> stripped = MenuBuilder.EnsureStripPrefixes();
+        int strippedCount = stripped.Count;
+        int n = pattern.Length;
+        int i = 0;
+        bool foundFirst = false;
+        while (i < n) {
+            while (i < n && (pattern[i] & 255) == 47) { i = i + 1; }
+            int e = i;
+            while (e < n && (pattern[e] & 255) != 47) { e = e + 1; }
+            int len = e - i;
+            if (len > 0 && (pattern[i] & 255) != 123) {
+                if (!foundFirst) {
+                    bool skip = false;
+                    for (int j = 0; j < strippedCount; j = j + 1) {
+                        if (MenuBuilder.SliceEqualsStr(pattern, i, len, stripped[j])) {
+                            skip = true;
+                            break;
+                        }
+                    }
+                    if (!skip) {
+                        segStart = i;
+                        segLen = len;
+                        foundFirst = true;
+                    }
+                } else {
+                    hasSecond = true;
+                    return;
+                }
+            }
+            i = e;
+        }
     }
 
-    public static int OrderOfGroup(string group, string path) {
+    private static string GroupFromSeg(string path, int segStart, int segLen, bool hasSecond) {
+        if (segLen == 0) { return ""; }
+        string seg = path.Substring(segStart, segLen);
+        string named = MenuBuilder.labels.Get(seg);
+        if (named.Length > 0) { return named; }
+        if (!hasSecond && !MenuBuilder.labels.Has(seg)) { return ""; }
+        return MenuBuilder.CapitalizeFirst(seg);
+    }
+
+    private static int OrderFromSeg(string group, string path, int segStart, int segLen) {
         if (group.Length == 0) { return -1; }
-        List<string> segs = MenuBuilder.Body(path);
-        string seg = segs.Count > 0 ? segs[0] : "";
-        for (int i = 0; i < MenuBuilder.sections.Count; i = i + 1) {
+        int cnt = MenuBuilder.sections.Count;
+        for (int i = 0; i < cnt; i = i + 1) {
             string s = MenuBuilder.sections[i];
-            if (s == seg || MenuBuilder.labels.Get(s) == group) {
+            if ((segLen > 0 && MenuBuilder.SliceEqualsStr(path, segStart, segLen, s))
+                || (segLen == 0 && s.Length == 0)
+                || MenuBuilder.labels.Get(s) == group) {
                 return (i + 1) * 10;
             }
         }
         return 1;
     }
 
-    private static List<string> Body(string pattern) {
-        List<string> raw = Router.SplitPath(pattern);
-        List<string> outp = new List<string>();
-        List<string> stripped = MenuBuilder.EnsureStripPrefixes();
-        for (int i = 0; i < raw.Count; i = i + 1) {
-            string s = raw[i];
-            if (s.Length == 0 || s.StartsWith("{")) { continue; }
-            if (outp.Count == 0) {
-                bool skip = false;
-                for (int j = 0; j < stripped.Count; j = j + 1) {
-                    if (s == stripped[j]) { skip = true; break; }
-                }
-                if (skip) { continue; }
-            }
-            outp.Add(s);
-        }
-        return outp;
+    // pages do.
+    public static string GroupOf(string path) {
+        int segStart = 0;
+        int segLen = 0;
+        bool hasSecond = false;
+        MenuBuilder.FirstBodySegment(path, out segStart, out segLen, out hasSecond);
+        return MenuBuilder.GroupFromSeg(path, segStart, segLen, hasSecond);
     }
 
-    private static string Label(string s) {
-        if (s.Length == 0) { return s; }
-        string named = MenuBuilder.labels.Get(s);
-        if (named.Length > 0) { return named; }
-        return s.Substring(0, 1).ToUpper() + s.Substring(1);
+    public static int OrderOf(string path) {
+        int segStart = 0;
+        int segLen = 0;
+        bool hasSecond = false;
+        MenuBuilder.FirstBodySegment(path, out segStart, out segLen, out hasSecond);
+        string g = MenuBuilder.GroupFromSeg(path, segStart, segLen, hasSecond);
+        return MenuBuilder.OrderFromSeg(g, path, segStart, segLen);
+    }
+
+    public static int OrderOfGroup(string group, string path) {
+        if (group.Length == 0) { return -1; }
+        int segStart = 0;
+        int segLen = 0;
+        bool hasSecond = false;
+        MenuBuilder.FirstBodySegment(path, out segStart, out segLen, out hasSecond);
+        return MenuBuilder.OrderFromSeg(group, path, segStart, segLen);
+    }
+
+    private static string CapitalizeFirst(string s) {
+        int n = s.Length;
+        if (n == 0) { return s; }
+        int c0 = s[0] & 255;
+        if (c0 < 97 || c0 > 122) { return s; }
+        byte[] buf = new byte[n];
+        NativeMemory.Copy((nint)buf, (nint)s, n);
+        buf[0] = (byte)(c0 - 32);
+        return NativeMemory.GetString((nint)buf, 0, n);
     }
 
     public static bool Matches(string pattern, string path) {
-        if (path.Length == 0) { return false; }
+        int qn = path.Length;
+        if (qn == 0) { return false; }
         if (pattern == path) { return true; }
-        List<string> want = Router.SplitPath(pattern);
-        List<string> have = Router.SplitPath(path);
-        if (want.Count == 0 || have.Count < want.Count) { return false; }
-        for (int i = 0; i < want.Count; i = i + 1) {
-            string w = want[i];
-            if (w.Length > 0 && w.Substring(0, 1) == "{") { continue; }
-            if (w != have[i]) { return false; }
+        int pn = pattern.Length;
+        int pi = 0;
+        int qi = 0;
+        int wantCount = 0;
+        while (pi < pn) {
+            while (pi < pn && (pattern[pi] & 255) == 47) { pi = pi + 1; }
+            if (pi >= pn) { break; }
+            int pe = pi;
+            while (pe < pn && (pattern[pe] & 255) != 47) { pe = pe + 1; }
+            wantCount = wantCount + 1;
+
+            while (qi < qn && (path[qi] & 255) == 47) { qi = qi + 1; }
+            if (qi >= qn) { return false; }
+            int qe = qi;
+            while (qe < qn && (path[qe] & 255) != 47) { qe = qe + 1; }
+
+            if ((pattern[pi] & 255) != 123) {
+                int wlen = pe - pi;
+                if (wlen != qe - qi) { return false; }
+                for (int k = 0; k < wlen; k = k + 1) {
+                    if ((pattern[pi + k] & 255) != (path[qi + k] & 255)) { return false; }
+                }
+            }
+            pi = pe;
+            qi = qe;
         }
-        return true;
+        return wantCount > 0;
     }
 
     public static void Sort(List<MenuNode> list) {

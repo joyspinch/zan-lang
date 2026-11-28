@@ -11,43 +11,154 @@ namespace Tools.Bench;
 // **中位数**（主指标）而不是均值——均值会被偶发尖峰带偏，基线比的是
 // 中位数才稳。
 public class BenchReport {
-    // 文本报告：每个用例一行，列按最长值右对齐补空格。
+    private static const string SPACES64 = "                                                                ";
+    private static const string HEX_LOWER = "0123456789abcdef";
+
+    private static void AppendSpaces(StringBuilder sb, int count) {
+        nint sp = (nint)BenchReport.SPACES64;
+        while (count >= 64) {
+            sb.Append(BenchReport.SPACES64);
+            count = count - 64;
+        }
+        if (count > 0) {
+            sb.Append(new StringView(sp, count));
+        }
+    }
+
+    private static int LongDigits(long v) {
+        if (v == 0L) { return 1; }
+        int len = 0;
+        long n = v;
+        if (n < 0L) {
+            len = 1;
+        } else {
+            n = -n;
+        }
+        while (n < 0L) {
+            n = n / 10L;
+            len = len + 1;
+        }
+        return len;
+    }
+
+    private static int AppendLong(StringBuilder sb, long v, byte[] numBuf) {
+        if (v == 0L) {
+            sb.Append("0");
+            return 1;
+        }
+        bool neg = v < 0L;
+        long n = neg ? v : -v;
+        int pos = 24;
+        while (n < 0L) {
+            long q = n / 10L;
+            int rem = (int)(q * 10L - n);
+            pos = pos - 1;
+            numBuf[pos] = (byte)(48 + rem);
+            n = q;
+        }
+        if (neg) {
+            pos = pos - 1;
+            numBuf[pos] = 45;
+        }
+        int len = 24 - pos;
+        sb.Append(new StringView((nint)numBuf + (nint)pos, len));
+        return len;
+    }
+
+    private static void AppendPaddedStr(StringBuilder sb, string s, int width) {
+        sb.Append(s);
+        int pad = width - s.Length;
+        if (pad > 0) { BenchReport.AppendSpaces(sb, pad); }
+    }
+
+    private static void AppendPaddedLong(StringBuilder sb, long v, int width, byte[] numBuf) {
+        int len = BenchReport.AppendLong(sb, v, numBuf);
+        int pad = width - len;
+        if (pad > 0) { BenchReport.AppendSpaces(sb, pad); }
+    }
+
+    // 文本报告：每个用例一行，列按最长值左对齐补空格。
     public static string Text(List<BenchResult> results) {
         if (results == null || results.Count == 0) {
             return "(no benchmark cases)\n";
         }
-        string[] headers = new string[] {
-            "case", "iterations", "median(ns)", "mean(ns)", "min(ns)", "max(ns)", "sd(ns)", "ops/s", "allocated(B)"
-        };
-        int cols = headers.Length;
-        // 每列的最宽值（表头与所有行一起算）。
-        int[] widths = new int[cols];
-        for (int c = 0; c < cols; c++) { widths[c] = headers[c].Length; }
-        List<string[]> rows = new List<string[]>();
-        for (int i = 0; i < results.Count; i++) {
+        int n = results.Count;
+        int w0 = 4;   // "case"
+        int w1 = 10;  // "iterations"
+        int w2 = 10;  // "median(ns)"
+        int w3 = 8;   // "mean(ns)"
+        int w4 = 7;   // "min(ns)"
+        int w5 = 7;   // "max(ns)"
+        int w6 = 6;   // "sd(ns)"
+        int w7 = 5;   // "ops/s"
+        int w8 = 12;  // "allocated(B)"
+        string[] sdStrs = new string[n];
+        string[] opsStrs = new string[n];
+        for (int i = 0; i < n; i = i + 1) {
             BenchResult r = results[i];
-            string[] row = new string[] {
-                r.name,
-                Convert.ToString(r.iterations),
-                Convert.ToString(r.medianNs),
-                Convert.ToString(r.meanNs),
-                Convert.ToString(r.minNs),
-                Convert.ToString(r.maxNs),
-                Convert.ToString(r.stdDevNs),
-                Convert.ToString(r.opsPerSecond),
-                Convert.ToString(r.allocatedBytes)
-            };
-            for (int c = 0; c < cols; c++) {
-                if (row[c].Length > widths[c]) { widths[c] = row[c].Length; }
-            }
-            rows.Add(row);
+            int l0 = r.name.Length;
+            if (l0 > w0) { w0 = l0; }
+            int l1 = BenchReport.LongDigits((long)r.iterations);
+            if (l1 > w1) { w1 = l1; }
+            int l2 = BenchReport.LongDigits(r.medianNs);
+            if (l2 > w2) { w2 = l2; }
+            int l3 = BenchReport.LongDigits(r.meanNs);
+            if (l3 > w3) { w3 = l3; }
+            int l4 = BenchReport.LongDigits(r.minNs);
+            if (l4 > w4) { w4 = l4; }
+            int l5 = BenchReport.LongDigits(r.maxNs);
+            if (l5 > w5) { w5 = l5; }
+            string s6 = Convert.ToString(r.stdDevNs);
+            sdStrs[i] = s6;
+            if (s6.Length > w6) { w6 = s6.Length; }
+            string s7 = Convert.ToString(r.opsPerSecond);
+            opsStrs[i] = s7;
+            if (s7.Length > w7) { w7 = s7.Length; }
+            int l8 = BenchReport.LongDigits(r.allocatedBytes);
+            if (l8 > w8) { w8 = l8; }
         }
 
-        StringBuilder sb = new StringBuilder();
-        sb.Append(BenchReport.Row(headers, widths));
+        int lineLen = w0 + w1 + w2 + w3 + w4 + w5 + w6 + w7 + w8 + 17;
+        StringBuilder sb = new StringBuilder((n + 1) * lineLen);
+        BenchReport.AppendPaddedStr(sb, "case", w0);
+        sb.Append("  ");
+        BenchReport.AppendPaddedStr(sb, "iterations", w1);
+        sb.Append("  ");
+        BenchReport.AppendPaddedStr(sb, "median(ns)", w2);
+        sb.Append("  ");
+        BenchReport.AppendPaddedStr(sb, "mean(ns)", w3);
+        sb.Append("  ");
+        BenchReport.AppendPaddedStr(sb, "min(ns)", w4);
+        sb.Append("  ");
+        BenchReport.AppendPaddedStr(sb, "max(ns)", w5);
+        sb.Append("  ");
+        BenchReport.AppendPaddedStr(sb, "sd(ns)", w6);
+        sb.Append("  ");
+        BenchReport.AppendPaddedStr(sb, "ops/s", w7);
+        sb.Append("  ");
+        BenchReport.AppendPaddedStr(sb, "allocated(B)", w8);
         sb.Append("\n");
-        for (int i = 0; i < rows.Count; i++) {
-            sb.Append(BenchReport.Row(rows[i], widths));
+
+        byte[] numBuf = new byte[24];
+        for (int i = 0; i < n; i = i + 1) {
+            BenchResult r = results[i];
+            BenchReport.AppendPaddedStr(sb, r.name, w0);
+            sb.Append("  ");
+            BenchReport.AppendPaddedLong(sb, (long)r.iterations, w1, numBuf);
+            sb.Append("  ");
+            BenchReport.AppendPaddedLong(sb, r.medianNs, w2, numBuf);
+            sb.Append("  ");
+            BenchReport.AppendPaddedLong(sb, r.meanNs, w3, numBuf);
+            sb.Append("  ");
+            BenchReport.AppendPaddedLong(sb, r.minNs, w4, numBuf);
+            sb.Append("  ");
+            BenchReport.AppendPaddedLong(sb, r.maxNs, w5, numBuf);
+            sb.Append("  ");
+            BenchReport.AppendPaddedStr(sb, sdStrs[i], w6);
+            sb.Append("  ");
+            BenchReport.AppendPaddedStr(sb, opsStrs[i], w7);
+            sb.Append("  ");
+            BenchReport.AppendPaddedLong(sb, r.allocatedBytes, w8, numBuf);
             sb.Append("\n");
         }
         return sb.ToString();
@@ -56,42 +167,79 @@ public class BenchReport {
     // 一行：按列宽左对齐补空格（第一列左对齐，数字列右对齐更好读，
     // 这里统一左对齐——列宽已按内容算好，读起来一样齐）。
     static string Row(string[] cells, int[] widths) {
-        StringBuilder sb = new StringBuilder();
-        for (int c = 0; c < cells.Length; c++) {
+        int est = 0;
+        for (int c = 0; c < cells.Length; c = c + 1) {
+            est = est + widths[c] + 2;
+        }
+        StringBuilder sb = new StringBuilder(est);
+        for (int c = 0; c < cells.Length; c = c + 1) {
             if (c > 0) { sb.Append("  "); }
-            sb.Append(cells[c]);
-            int pad = widths[c] - cells[c].Length;
-            for (int k = 0; k < pad; k++) { sb.Append(" "); }
+            BenchReport.AppendPaddedStr(sb, cells[c], widths[c]);
         }
         return sb.ToString();
     }
 
+    private static void QuoteInto(StringBuilder sb, string s) {
+        if (s == null || s.Length == 0) {
+            sb.Append("\"\"");
+            return;
+        }
+        sb.Append("\"");
+        int n = s.Length;
+        nint sp = (nint)s;
+        nint hp = (nint)BenchReport.HEX_LOWER;
+        int start = 0;
+        for (int i = 0; i < n; i = i + 1) {
+            int c = s[i] & 255;
+            if (c == 34 || c == 92 || c < 32) {
+                if (i > start) { sb.Append(new StringView(sp + (nint)start, i - start)); }
+                if (c == 34) { sb.Append("\\\""); }
+                else if (c == 92) { sb.Append("\\\\"); }
+                else if (c == 8) { sb.Append("\\b"); }
+                else if (c == 12) { sb.Append("\\f"); }
+                else if (c == 10) { sb.Append("\\n"); }
+                else if (c == 13) { sb.Append("\\r"); }
+                else if (c == 9) { sb.Append("\\t"); }
+                else {
+                    sb.Append("\\u00");
+                    sb.Append(new StringView(hp + (nint)((c >> 4) & 15), 1));
+                    sb.Append(new StringView(hp + (nint)(c & 15), 1));
+                }
+                start = i + 1;
+            }
+        }
+        if (n > start) { sb.Append(new StringView(sp + (nint)start, n - start)); }
+        sb.Append("\"");
+    }
+
     // JSON 报告（可存成基线文件）。
     public static string Json(List<BenchResult> results) {
-        StringBuilder sb = new StringBuilder();
+        int n = results == null ? 0 : results.Count;
+        StringBuilder sb = new StringBuilder(32 + n * 192);
         sb.Append("{\"benchmarks\":[");
-        if (results != null) {
-            for (int i = 0; i < results.Count; i++) {
+        if (n > 0) {
+            byte[] numBuf = new byte[24];
+            for (int i = 0; i < n; i = i + 1) {
                 BenchResult r = results[i];
                 if (i > 0) { sb.Append(","); }
                 sb.Append("{\"name\":");
-                sb.Append(BenchReport.Quote(r.name));
+                BenchReport.QuoteInto(sb, r.name);
                 sb.Append(",\"iterations\":");
-                sb.Append(Convert.ToString(r.iterations));
+                BenchReport.AppendLong(sb, (long)r.iterations, numBuf);
                 sb.Append(",\"medianNs\":");
-                sb.Append(Convert.ToString(r.medianNs));
+                BenchReport.AppendLong(sb, r.medianNs, numBuf);
                 sb.Append(",\"meanNs\":");
-                sb.Append(Convert.ToString(r.meanNs));
+                BenchReport.AppendLong(sb, r.meanNs, numBuf);
                 sb.Append(",\"minNs\":");
-                sb.Append(Convert.ToString(r.minNs));
+                BenchReport.AppendLong(sb, r.minNs, numBuf);
                 sb.Append(",\"maxNs\":");
-                sb.Append(Convert.ToString(r.maxNs));
+                BenchReport.AppendLong(sb, r.maxNs, numBuf);
                 sb.Append(",\"stdDevNs\":");
                 sb.Append(Convert.ToString(r.stdDevNs));
                 sb.Append(",\"opsPerSecond\":");
                 sb.Append(Convert.ToString(r.opsPerSecond));
                 sb.Append(",\"allocatedBytes\":");
-                sb.Append(Convert.ToString(r.allocatedBytes));
+                BenchReport.AppendLong(sb, r.allocatedBytes, numBuf);
                 sb.Append("}");
             }
         }
@@ -101,33 +249,25 @@ public class BenchReport {
 
     // JSON 字符串转义（RFC 8259：引号、反斜杠及全部 0x00..0x1F 控制字符）。
     public static string Quote(string s) {
-        if (s == null) { return "\"\""; }
-        StringBuilder sb = new StringBuilder();
-        sb.Append("\"");
-        int start = 0;
+        if (s == null || s.Length == 0) { return "\"\""; }
         int n = s.Length;
-        for (int i = 0; i < n; i++) {
+        bool needEsc = false;
+        for (int i = 0; i < n; i = i + 1) {
             int c = s[i] & 255;
             if (c == 34 || c == 92 || c < 32) {
-                if (i > start) { sb.Append(s.Substring(start, i - start)); }
-                if (c == 34) { sb.Append("\\\""); }
-                else if (c == 92) { sb.Append("\\\\"); }
-                else if (c == 8) { sb.Append("\\b"); }
-                else if (c == 12) { sb.Append("\\f"); }
-                else if (c == 10) { sb.Append("\\n"); }
-                else if (c == 13) { sb.Append("\\r"); }
-                else if (c == 9) { sb.Append("\\t"); }
-                else {
-                    string hex = "0123456789abcdef";
-                    sb.Append("\\u00");
-                    sb.Append(hex.Substring((c >> 4) & 15, 1));
-                    sb.Append(hex.Substring(c & 15, 1));
-                }
-                start = i + 1;
+                needEsc = true;
+                break;
             }
         }
-        if (n > start) { sb.Append(s.Substring(start, n - start)); }
-        sb.Append("\"");
+        if (!needEsc) {
+            byte[] buf = new byte[n + 2];
+            buf[0] = 34;
+            NativeMemory.Copy((nint)buf + (nint)1, (nint)s, n);
+            buf[n + 1] = 34;
+            return NativeMemory.GetString((nint)buf, 0, n + 2);
+        }
+        StringBuilder sb = new StringBuilder(n + 16);
+        BenchReport.QuoteInto(sb, s);
         return sb.ToString();
     }
 

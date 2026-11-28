@@ -1,0 +1,191 @@
+using System;
+using System.Collections.Generic;
+using System.Configuration;
+using System.Json;
+using System.Web;
+using Tools.Bench;
+using Sdk.Wechat;
+using Sdk.Wechat.TenPay;
+using Data.Mapping;
+
+class OptWave34Core {
+    static void TestConfigKeys() {
+        Console.WriteLine("=== CONFIG_KEYS ===");
+        Console.WriteLine("can=" + ConfigurationKeys.Canonical(null)
+            + "|" + ConfigurationKeys.Canonical("")
+            + "|" + ConfigurationKeys.Canonical("Database:Port")
+            + "|" + ConfigurationKeys.Canonical("DATABASE__PORT")
+            + "|" + ConfigurationKeys.Canonical("a___b::c__d:")
+            + "|" + ConfigurationKeys.Canonical("__lead__tail__"));
+        List<string> segs = ConfigurationKeys.SplitSegments("a___b::c");
+        Console.WriteLine("seg=" + Convert.ToString(segs.Count) + ":" + string.Join("/", segs));
+        Console.WriteLine("ns=" + ConfigurationKeys.NormalizeSegment("Abc")
+            + "|" + ConfigurationKeys.NormalizeSegment("myKEY")
+            + "|" + ConfigurationKeys.NormalizePrefix("  APP___ "));
+        Console.WriteLine("env=" + ConfigurationKeys.ToEnvironmentName("Database:Port", "APP_")
+            + "|" + ConfigurationKeys.ToEnvironmentName("a__b", "")
+            + "|" + ConfigurationKeys.ToEnvironmentName("", "APP"));
+        Console.WriteLine("from=" + ConfigurationKeys.FromEnvironmentName("APP__DATABASE__PORT", "APP__")
+            + "|" + ConfigurationKeys.FromEnvironmentName("OTHER__PORT", "APP")
+            + "|" + ConfigurationKeys.FromEnvironmentName("APP__A___B", "APP"));
+    }
+
+    static void TestFilter() {
+        Console.WriteLine("=== FILTER ===");
+        Console.WriteLine("cl=" + Filter.Clean("")
+            + "|" + Filter.Clean("clean")
+            + "|" + Filter.Clean("  trim  ")
+            + "|" + Filter.Clean("\t a\r\nb\tc \n"));
+        Console.WriteLine("ht=" + Filter.Html("clean")
+            + "|" + Filter.Html("  a & <b>\"c\" 'd'\r\n\te  "));
+        Console.WriteLine("ln=" + Convert.ToString(Filter.ToLong(" 42 ", -1L))
+            + "," + Convert.ToString(Filter.ToLong("-9223372036854775808", -1L))
+            + "," + Convert.ToString(Filter.ToLong("9223372036854775807", -1L))
+            + "," + Convert.ToString(Filter.ToLong("9223372036854775808", -1L))
+            + "," + Convert.ToString(Filter.ToLong("12\r\n34", -1L))
+            + "," + Convert.ToString(Filter.ToLong("12\t34", -1L))
+            + "," + Convert.ToString(Filter.ToLong("-", -1L)));
+        Console.WriteLine("db=" + Convert.ToString(Filter.ToDouble(" -3.25 ", 0.0))
+            + "," + Convert.ToString(Filter.ToDouble("1\r2.5", 0.0))
+            + "," + Convert.ToString(Filter.ToDouble(".", -9.0)));
+        Console.WriteLine("bl=" + (Filter.ToBool(" TRUE ", false) ? "1" : "0")
+            + (Filter.ToBool("\tYes\r\n", false) ? "1" : "0")
+            + (Filter.ToBool("o\rn", false) ? "1" : "0")
+            + (Filter.ToBool("1", false) ? "1" : "0")
+            + (Filter.ToBool("FALSE", true) ? "1" : "0")
+            + (Filter.ToBool("off", true) ? "1" : "0")
+            + (Filter.ToBool("NO", true) ? "1" : "0")
+            + (Filter.ToBool("0", true) ? "1" : "0")
+            + (Filter.ToBool("bad", true) ? "1" : "0"));
+    }
+
+    static void TestBenchReport() {
+        Console.WriteLine("=== BENCH_REPORT ===");
+        Console.WriteLine("q=" + BenchReport.Quote(null)
+            + "|" + BenchReport.Quote("plain")
+            + "|" + BenchReport.Quote("a\"b\\c\x08\x0c\n\r\t\x01\x1f"));
+        List<BenchResult> list = new List<BenchResult>();
+        BenchResult r1 = new BenchResult();
+        r1.name = "case_a";
+        r1.iterations = 100;
+        r1.medianNs = 0L;
+        r1.meanNs = 42L;
+        r1.minNs = -10L;
+        r1.maxNs = 999999L;
+        r1.stdDevNs = 1.5;
+        r1.opsPerSecond = 2500.0;
+        r1.allocatedBytes = 64L;
+        list.Add(r1);
+        BenchResult r2 = new BenchResult();
+        r2.name = "case_\"b\"";
+        r2.iterations = 5;
+        r2.medianNs = 12345L;
+        r2.meanNs = 12345L;
+        r2.minNs = 12000L;
+        r2.maxNs = 13000L;
+        r2.stdDevNs = 0.0;
+        r2.opsPerSecond = 81000.0;
+        r2.allocatedBytes = 0L;
+        list.Add(r2);
+        Console.Write(BenchReport.Text(list));
+        Console.Write(BenchReport.Json(list));
+    }
+
+    static void TestWechatXml() {
+        Console.WriteLine("=== WECHAT_XML ===");
+        WechatPayV2Request req = new WechatPayV2Request();
+        req.Set("z_key", "v_z");
+        req.Set("a_key", "a]]>b]]>c");
+        req.Set("m_key", "v_m");
+        req.Set("empty", "");
+        req.Set("sign", "SKIP");
+        Console.WriteLine("canon=" + req.Canonical("MK123"));
+        string xml = req.ToXml();
+        Console.WriteLine("xml=" + xml);
+        string sample = "<xml><a attr=\"1\">hello</a><b><![CDATA[val_b]]></b><c/><!-- ign --><?pi x?></xml>";
+        WechatPayV2Request p = WechatPayV2Request.ParseXml(sample);
+        Console.WriteLine("parse=" + p.Get("a", "") + "|" + p.Get("b", "") + "|" + p.Get("c", "X") + "|" + p.Get("d", "NONE"));
+        Console.WriteLine("gt=" + XmlUtil.GetTag(sample, "a") + "|" + XmlUtil.GetTag(sample, "b") + "|" + XmlUtil.GetTag(sample, "none"));
+        Console.WriteLine("ct=" + XmlUtil.CdataTag("T", "x]]>y") + "|" + XmlUtil.CdataTag("T", "ok") + "|" + XmlUtil.TextTag("T", "a&b<c"));
+    }
+
+    static void TestMenuBuilder() {
+        Console.WriteLine("=== MENU_BUILDER ===");
+        MenuBuilder.Section("system", "SysGrp");
+        MenuBuilder.Section("orders", "OrdGrp");
+        Console.WriteLine("grp=" + MenuBuilder.GroupOf("/admin/system/users")
+            + "|" + MenuBuilder.GroupOf("/admin/orders/list")
+            + "|" + MenuBuilder.GroupOf("/admin/analytics/overview")
+            + "|" + MenuBuilder.GroupOf("/dashboard")
+            + "|" + MenuBuilder.GroupOf("/admin/system"));
+        Console.WriteLine("ord=" + Convert.ToString(MenuBuilder.OrderOf("/admin/system/users"))
+            + "," + Convert.ToString(MenuBuilder.OrderOf("/admin/orders/list"))
+            + "," + Convert.ToString(MenuBuilder.OrderOf("/admin/analytics/overview"))
+            + "," + Convert.ToString(MenuBuilder.OrderOf("/dashboard")));
+        string ms = ""
+            + (MenuBuilder.Matches("/admin/users", "/admin/users") ? "1" : "0")
+            + (MenuBuilder.Matches("/admin/users/{id}", "/admin/users/42") ? "1" : "0")
+            + (MenuBuilder.Matches("/admin/users/{id}", "/admin/users/42/edit") ? "1" : "0")
+            + (MenuBuilder.Matches("/admin/users/{id}", "/admin/users") ? "1" : "0")
+            + (MenuBuilder.Matches("/admin/users", "/admin/roles") ? "1" : "0")
+            + (MenuBuilder.Matches("/", "/admin") ? "1" : "0")
+            + (MenuBuilder.Matches("/a", "") ? "1" : "0");
+        Console.WriteLine("mat=" + ms);
+    }
+
+    static void TestGenMapping() {
+        Console.WriteLine("=== GEN_MAPPING ===");
+        string metaJson = @"{
+          ""version"": 1,
+          ""classes"": [
+            { ""name"": ""Order"", ""ns"": ""Shop.Domain"", ""kind"": ""class"",
+              ""fields"": [
+                { ""name"": ""code"", ""type"": ""string"", ""static"": false, ""private"": false },
+                { ""name"": ""amount"", ""type"": ""int"", ""static"": false, ""private"": false },
+                { ""name"": ""customer"", ""type"": ""Customer"", ""static"": false, ""private"": false },
+                { ""name"": ""hidden"", ""type"": ""string"", ""static"": false, ""private"": true }
+              ],
+              ""ctors"": [ { ""params"": [] } ] },
+            { ""name"": ""Customer"", ""ns"": ""Shop.Domain"", ""kind"": ""class"",
+              ""fields"": [
+                { ""name"": ""name"", ""type"": ""string"", ""static"": false, ""private"": false },
+                { ""name"": ""email"", ""type"": ""string"", ""static"": false, ""private"": false }
+              ],
+              ""ctors"": [ { ""params"": [] } ] },
+            { ""name"": ""OrderDto"", ""ns"": ""Shop.Api"", ""kind"": ""class"",
+              ""fields"": [
+                { ""name"": ""code"", ""type"": ""STRING"", ""static"": false, ""private"": false },
+                { ""name"": ""amount"", ""type"": ""int"", ""static"": false, ""private"": false },
+                { ""name"": ""customerName"", ""type"": ""string"", ""static"": false, ""private"": false },
+                { ""name"": ""customerEmail"", ""type"": ""string"", ""static"": false, ""private"": false },
+                { ""name"": ""extra"", ""type"": ""string"", ""static"": false, ""private"": false }
+              ],
+              ""ctors"": [ { ""params"": [] } ] }
+          ]
+        }";
+        JsonValue entities = JsonSerializer.Deserialize(metaJson);
+        string code = "";
+        string err = "";
+        bool ok = GenMapping.TryEmitFromEntities(entities, "Order", "OrderDto", "", "Shop.Map", true, out code, out err);
+        List<string> unm = GenMapping.UnmatchedByConvention(entities, "Order", "OrderDto");
+        Console.WriteLine("ok=" + (ok ? "1" : "0") + " unm=" + string.Join(",", unm));
+        Console.Write(code);
+
+        MappingSpec bad = new MappingSpec();
+        bad.SourceType = "A";
+        bad.TargetType = "B";
+        bad.NamespaceName = "Bad..Ns";
+        string c2 = ""; string e2 = "";
+        bool ok2 = GenMapping.TryEmit(bad, out c2, out e2);
+        Console.WriteLine("bad_ns=" + (ok2 ? "1" : "0") + ":" + e2);
+    }
+
+    static void Main() {
+        OptWave34Core.TestConfigKeys();
+        OptWave34Core.TestFilter();
+        OptWave34Core.TestBenchReport();
+        OptWave34Core.TestWechatXml();
+        OptWave34Core.TestMenuBuilder();
+        OptWave34Core.TestGenMapping();
+    }
+}

@@ -127,8 +127,8 @@ public class GenMapping {
         for (int i = 0; i < m.Members.Count; i = i + 1) {
             spec.Members.Add(m.Members[i]);
         }
-        string srcNs = ClassNamespace(entities, sourceType);
-        string dstNs = ClassNamespace(entities, targetType);
+        string srcNs = m.SrcNs;
+        string dstNs = m.DstNs;
         if (srcNs != "" && srcNs != spec.NamespaceName) { spec.Usings.Add(srcNs); }
         if (dstNs != "" && dstNs != spec.NamespaceName && dstNs != srcNs) {
             spec.Usings.Add(dstNs);
@@ -157,13 +157,99 @@ public class GenMapping {
         public List<MappingMember> Members = new List<MappingMember>();
         public List<string> Unmatched = new List<string>();
         public string Error = "";
+        public string SrcNs = "";
+        public string DstNs = "";
+    }
+
+    private static string ConcatLowerAscii(string a, string b) {
+        int al = a.Length;
+        int bl = b.Length;
+        int total = al + bl;
+        byte[] buf = new byte[total];
+        for (int i = 0; i < al; i = i + 1) {
+            int c = a[i] & 255;
+            buf[i] = (byte)((c >= 65 && c <= 90) ? c + 32 : c);
+        }
+        for (int i = 0; i < bl; i = i + 1) {
+            int c = b[i] & 255;
+            buf[al + i] = (byte)((c >= 65 && c <= 90) ? c + 32 : c);
+        }
+        return NativeMemory.GetString((nint)buf, 0, total);
+    }
+
+    private static string LowerAscii(string s) {
+        int n = s.Length;
+        bool need = false;
+        for (int i = 0; i < n; i = i + 1) {
+            int c = s[i] & 255;
+            if (c >= 65 && c <= 90) { need = true; break; }
+        }
+        if (!need) { return s; }
+        byte[] buf = new byte[n];
+        for (int i = 0; i < n; i = i + 1) {
+            int c = s[i] & 255;
+            buf[i] = (byte)((c >= 65 && c <= 90) ? c + 32 : c);
+        }
+        return NativeMemory.GetString((nint)buf, 0, n);
+    }
+
+    private static bool EqConcatIgnoreCase(string a, string b, string target) {
+        int al = a.Length;
+        int bl = b.Length;
+        if (al + bl != target.Length) { return false; }
+        for (int i = 0; i < al; i = i + 1) {
+            int c1 = a[i] & 255;
+            int c2 = target[i] & 255;
+            if (c1 >= 65 && c1 <= 90) { c1 = c1 + 32; }
+            if (c2 >= 65 && c2 <= 90) { c2 = c2 + 32; }
+            if (c1 != c2) { return false; }
+        }
+        for (int i = 0; i < bl; i = i + 1) {
+            int c1 = b[i] & 255;
+            int c2 = target[al + i] & 255;
+            if (c1 >= 65 && c1 <= 90) { c1 = c1 + 32; }
+            if (c2 >= 65 && c2 <= 90) { c2 = c2 + 32; }
+            if (c1 != c2) { return false; }
+        }
+        return true;
+    }
+
+    private static void ExtractWritableFields(JsonValue cls, List<string> names, List<string> types) {
+        if (cls == null) { return; }
+        JsonValue fields = cls.Get("fields");
+        if (fields == null || !fields.IsArray()) { return; }
+        int cnt = fields.Count();
+        for (int i = 0; i < cnt; i = i + 1) {
+            JsonValue f = fields.At(i);
+            if (f == null) { continue; }
+            if (JsonBool(f.Get("static"), false)) { continue; }
+            if (JsonBool(f.Get("private"), false)) { continue; }
+            if (JsonBool(f.Get("protected"), false)) { continue; }
+            names.Add(JsonStr(f.Get("name"), ""));
+            types.Add(JsonStr(f.Get("type"), ""));
+        }
     }
 
     private static ConventionMatch Match(JsonValue entities, string sourceType,
                                          string targetType) {
         ConventionMatch m = new ConventionMatch();
-        JsonValue sc = FindClass(entities, sourceType);
-        JsonValue tc = FindClass(entities, targetType);
+        JsonValue sc = null;
+        JsonValue tc = null;
+        JsonValue classes = entities == null ? null : entities.Get("classes");
+        int classCount = (classes != null && classes.IsArray()) ? classes.Count() : 0;
+        if (sourceType != "" && targetType != "" && classCount > 0) {
+            for (int i = 0; i < classCount; i = i + 1) {
+                JsonValue c = classes.At(i);
+                if (c == null) { continue; }
+                string cname = JsonStr(c.Get("name"), "");
+                if (sc == null && cname == sourceType) { sc = c; }
+                if (tc == null && cname == targetType) { tc = c; }
+                if (sc != null && tc != null) { break; }
+            }
+        } else {
+            sc = FindClass(entities, sourceType);
+            tc = FindClass(entities, targetType);
+        }
         if (sc == null) {
             m.Error = "source type '" + sourceType + "' is not in the entity metadata";
             return m;
@@ -178,39 +264,122 @@ public class GenMapping {
                       targetType + "())";
             return m;
         }
-        List<JsonValue> sfields = WritableFields(sc);
-        List<JsonValue> tfields = WritableFields(tc);
-        for (int i = 0; i < tfields.Count; i = i + 1) {
-            JsonValue tf = tfields[i];
-            string tname = JsonStr(tf.Get("name"), "");
-            string ttype = JsonStr(tf.Get("type"), "");
+        m.SrcNs = JsonStr(sc.Get("ns"), "");
+        m.DstNs = JsonStr(tc.Get("ns"), "");
+
+        List<string> sNames = new List<string>();
+        List<string> sTypes = new List<string>();
+        ExtractWritableFields(sc, sNames, sTypes);
+        int sCount = sNames.Count;
+        Dict<string, int> sByName = new Dict<string, int>();
+        bool sHasDup = false;
+        for (int j = 0; j < sCount; j = j + 1) {
+            string sn = sNames[j];
+            if (sn == "") { continue; }
+            if (sByName.ContainsKey(sn)) { sHasDup = true; }
+            else { sByName.Add(sn, j); }
+        }
+
+        List<string> tNames = new List<string>();
+        List<string> tTypes = new List<string>();
+        ExtractWritableFields(tc, tNames, tTypes);
+        int tCount = tNames.Count;
+
+        bool flatBuilt = false;
+        List<string> flatSName = null;
+        List<string> flatBName = null;
+        List<string> flatBType = null;
+        Dict<string, int> flatByLower = null;
+        bool flatHasDup = false;
+
+        for (int i = 0; i < tCount; i = i + 1) {
+            string tname = tNames[i];
             if (tname == "") { continue; }
+            string ttype = tTypes[i];
             string from = "";
             // 约定一：同名同类型
-            for (int j = 0; j < sfields.Count; j = j + 1) {
-                JsonValue sf = sfields[j];
-                string sname = JsonStr(sf.Get("name"), "");
-                string stype = JsonStr(sf.Get("type"), "");
-                if (sname == tname && TypeEq(stype, ttype)) { from = sname; break; }
+            int sIdx = -1;
+            if (sByName.TryGetValue(tname, out sIdx)) {
+                if (TypeEq(sTypes[sIdx], ttype)) {
+                    from = tname;
+                } else if (sHasDup) {
+                    for (int j = sIdx + 1; j < sCount; j = j + 1) {
+                        if (sNames[j] == tname && TypeEq(sTypes[j], ttype)) {
+                            from = tname;
+                            break;
+                        }
+                    }
+                }
             }
             // 约定二：扁平化（一级字段 + 它的字段 == 目标名）
             if (from == "") {
-                for (int j = 0; j < sfields.Count && from == ""; j = j + 1) {
-                    JsonValue sf = sfields[j];
-                    string sname = JsonStr(sf.Get("name"), "");
-                    string stype = JsonStr(sf.Get("type"), "");
-                    if (sname == "") { continue; }
-                    JsonValue sub = FindClass(entities, stype);
-                    if (sub == null) { continue; }
-                    List<JsonValue> subfields = WritableFields(sub);
-                    for (int k = 0; k < subfields.Count; k = k + 1) {
-                        JsonValue bf = subfields[k];
-                        string bname = JsonStr(bf.Get("name"), "");
-                        string btype = JsonStr(bf.Get("type"), "");
-                        if (bname == "") { continue; }
-                        if (EqIgnoreCase(sname + bname, tname) && TypeEq(btype, ttype)) {
-                            from = sname + "." + bname;
-                            break;
+                if (!flatBuilt) {
+                    flatBuilt = true;
+                    flatSName = new List<string>();
+                    flatBName = new List<string>();
+                    flatBType = new List<string>();
+                    Dict<string, JsonValue> classMap = new Dict<string, JsonValue>();
+                    for (int ci = 0; ci < classCount; ci = ci + 1) {
+                        JsonValue c = classes.At(ci);
+                        if (c == null) { continue; }
+                        string cname = JsonStr(c.Get("name"), "");
+                        if (cname != "" && !classMap.ContainsKey(cname)) {
+                            classMap.Add(cname, c);
+                        }
+                    }
+                    List<string> subNames = new List<string>();
+                    List<string> subTypes = new List<string>();
+                    for (int j = 0; j < sCount; j = j + 1) {
+                        string sn = sNames[j];
+                        string st = sTypes[j];
+                        if (sn == "" || st == "") { continue; }
+                        JsonValue sub = null;
+                        if (!classMap.TryGetValue(st, out sub) || sub == null) { continue; }
+                        subNames.Clear();
+                        subTypes.Clear();
+                        ExtractWritableFields(sub, subNames, subTypes);
+                        for (int k = 0; k < subNames.Count; k = k + 1) {
+                            string bn = subNames[k];
+                            if (bn == "") { continue; }
+                            flatSName.Add(sn);
+                            flatBName.Add(bn);
+                            flatBType.Add(subTypes[k]);
+                        }
+                    }
+                    if (flatSName.Count > 8) {
+                        flatByLower = new Dict<string, int>();
+                        for (int k = 0; k < flatSName.Count; k = k + 1) {
+                            string lk = ConcatLowerAscii(flatSName[k], flatBName[k]);
+                            if (flatByLower.ContainsKey(lk)) { flatHasDup = true; }
+                            else { flatByLower.Add(lk, k); }
+                        }
+                    }
+                }
+                int fCount = flatSName.Count;
+                if (fCount > 0) {
+                    if (flatByLower != null) {
+                        string tl = LowerAscii(tname);
+                        int fIdx = -1;
+                        if (flatByLower.TryGetValue(tl, out fIdx)) {
+                            if (TypeEq(flatBType[fIdx], ttype)) {
+                                from = flatSName[fIdx] + "." + flatBName[fIdx];
+                            } else if (flatHasDup) {
+                                for (int k = fIdx + 1; k < fCount; k = k + 1) {
+                                    if (EqConcatIgnoreCase(flatSName[k], flatBName[k], tname)
+                                        && TypeEq(flatBType[k], ttype)) {
+                                        from = flatSName[k] + "." + flatBName[k];
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        for (int k = 0; k < fCount; k = k + 1) {
+                            if (EqConcatIgnoreCase(flatSName[k], flatBName[k], tname)
+                                && TypeEq(flatBType[k], ttype)) {
+                                from = flatSName[k] + "." + flatBName[k];
+                                break;
+                            }
                         }
                     }
                 }
@@ -226,7 +395,8 @@ public class GenMapping {
                                       string srcType, string dstType,
                                       List<MappingMember> members,
                                       bool withListMap, List<string> usings) {
-        StringBuilder sb = new StringBuilder();
+        int est = 512 + members.Count * 48 + usings.Count * 24 + (withListMap ? 320 : 0);
+        StringBuilder sb = new StringBuilder(est);
         sb.Append("// <auto-generated>\n");
         sb.Append("// 由 System.Mapping.GenMapping 生成——重新生成会覆盖，勿手改。\n");
         sb.Append("// 源类型："); sb.Append(srcType); sb.Append("    目标类型："); sb.Append(dstType); sb.Append("\n");
@@ -280,30 +450,6 @@ public class GenMapping {
         return null;
     }
 
-    // 类所在命名空间（找不到返回空串）。
-    private static string ClassNamespace(JsonValue entities, string typeName) {
-        JsonValue c = FindClass(entities, typeName);
-        if (c == null) { return ""; }
-        return JsonStr(c.Get("ns"), "");
-    }
-
-    // 可写的字段（跳过 static / private / protected）。
-    private static List<JsonValue> WritableFields(JsonValue cls) {
-        List<JsonValue> outv = new List<JsonValue>();
-        if (cls == null) { return outv; }
-        JsonValue fields = cls.Get("fields");
-        if (fields == null || !fields.IsArray()) { return outv; }
-        for (int i = 0; i < fields.Count(); i = i + 1) {
-            JsonValue f = fields.At(i);
-            if (f == null) { continue; }
-            if (JsonBool(f.Get("static"), false)) { continue; }
-            if (JsonBool(f.Get("private"), false)) { continue; }
-            if (JsonBool(f.Get("protected"), false)) { continue; }
-            outv.Add(f);
-        }
-        return outv;
-    }
-
     // 目标类型有没有无参构造器（没有显式构造器 = 有隐式无参构造器）。
     private static bool HasParameterlessCtor(JsonValue cls) {
         if (cls == null) { return false; }
@@ -320,13 +466,22 @@ public class GenMapping {
 
     // 类型名比较（大小写无关——Zan 的内建类型名都是小写，类名首字母大写）。
     private static bool TypeEq(string a, string b) {
-        if (a == null || b == null) { return false; }
-        return a.ToLower() == b.ToLower();
+        return EqIgnoreCase(a, b);
     }
 
     private static bool EqIgnoreCase(string a, string b) {
         if (a == null || b == null) { return false; }
-        return a.ToLower() == b.ToLower();
+        int n = a.Length;
+        if (n != b.Length) { return false; }
+        for (int i = 0; i < n; i = i + 1) {
+            int c1 = a[i] & 255;
+            int c2 = b[i] & 255;
+            if (c1 == c2) { continue; }
+            if (c1 >= 65 && c1 <= 90) { c1 = c1 + 32; }
+            if (c2 >= 65 && c2 <= 90) { c2 = c2 + 32; }
+            if (c1 != c2) { return false; }
+        }
+        return true;
     }
 
     private static string JsonStr(JsonValue v, string dflt) {
@@ -345,49 +500,42 @@ public class GenMapping {
     // （Zan 没有 char 类型，字符串下标取的是**字节**，所以按字节值判。）
     private static bool IsIdentifier(string s) {
         if (s == null || s.Length == 0) { return false; }
-        int b0 = s[0];
+        int b0 = s[0] & 255;
         if (!IsIdentStart(b0)) { return false; }
         for (int i = 1; i < s.Length; i = i + 1) {
-            int b = s[i];
+            int b = s[i] & 255;
             if (!IsIdentStart(b) && !IsDigit(b)) { return false; }
         }
         return true;
     }
 
+    private static bool IsDotSeparatedIdentifiers(string s) {
+        if (s == null || s.Length == 0) { return false; }
+        int n = s.Length;
+        bool atStart = true;
+        for (int i = 0; i < n; i = i + 1) {
+            int b = s[i] & 255;
+            if (b == 46) {
+                if (atStart) { return false; }
+                atStart = true;
+            } else if (atStart) {
+                if (!IsIdentStart(b)) { return false; }
+                atStart = false;
+            } else {
+                if (!IsIdentStart(b) && !IsDigit(b)) { return false; }
+            }
+        }
+        return !atStart;
+    }
+
     // 成员路径：点分的标识符（`customer.name`）。
     private static bool IsMemberPath(string s) {
-        if (s == null || s.Length == 0) { return false; }
-        List<string> parts = SplitPath(s);
-        if (parts.Count == 0) { return false; }
-        for (int i = 0; i < parts.Count; i = i + 1) {
-            if (!IsIdentifier(parts[i])) { return false; }
-        }
-        return true;
+        return IsDotSeparatedIdentifiers(s);
     }
 
     // 命名空间：点分的标识符。
     private static bool IsNamespace(string s) {
-        if (s == null || s.Length == 0) { return false; }
-        List<string> parts = SplitPath(s);
-        if (parts.Count == 0) { return false; }
-        for (int i = 0; i < parts.Count; i = i + 1) {
-            if (!IsIdentifier(parts[i])) { return false; }
-        }
-        return true;
-    }
-
-    private static List<string> SplitPath(string s) {
-        List<string> parts = new List<string>();
-        int start = 0;
-        int n = s.Length;
-        for (int i = 0; i < n; i = i + 1) {
-            if ((s[i] & 255) == 46) {
-                parts.Add(s.Substring(start, i - start));
-                start = i + 1;
-            }
-        }
-        parts.Add(s.Substring(start, n - start));
-        return parts;
+        return IsDotSeparatedIdentifiers(s);
     }
 
     private static bool IsIdentStart(int b) {
