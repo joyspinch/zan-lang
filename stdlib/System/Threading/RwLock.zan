@@ -10,88 +10,84 @@ public class RwLock : IDisposable {
     public int readers;
     public bool writer;
     public int writersWaiting;
+    private bool disposed;
 
     public RwLock() {
-        this.mtx = Mutex.Create();
+        this.mtx = 0;
         this.readers = 0;
         this.writer = false;
         this.writersWaiting = 0;
+        this.disposed = false;
     }
 
     // 获取共享读访问；有写者持锁或等待时排队让行。
     public void EnterRead() {
         while (true) {
-            nint m = this.mtx;
-            if (m == 0) {
-                throw new ObjectDisposedException("RwLock");
+            lock (this) {
+                if (this.disposed) {
+                    throw new ObjectDisposedException("RwLock");
+                }
+                if (!this.writer && this.writersWaiting == 0) {
+                    this.readers = this.readers + 1;
+                    return;
+                }
             }
-            Mutex.Lock(m);
-            if (!this.writer && this.writersWaiting == 0) {
-                this.readers = this.readers + 1;
-                Mutex.Unlock(m);
-                return;
-            }
-            Mutex.Unlock(m);
             Thread.Sleep(1);
         }
     }
 
     // 释放共享读访问。
     public void ExitRead() {
-        nint m = this.mtx;
-        if (m == 0) {
-            return;
+        lock (this) {
+            if (this.disposed) {
+                return;
+            }
+            if (this.readers > 0) {
+                this.readers = this.readers - 1;
+            }
         }
-        Mutex.Lock(m);
-        if (this.readers > 0) {
-            this.readers = this.readers - 1;
-        }
-        Mutex.Unlock(m);
     }
 
     // 获取排他写访问；等待期间登记写者意愿（写优先）。
     public void EnterWrite() {
-        nint m = this.mtx;
-        if (m == 0) {
-            throw new ObjectDisposedException("RwLock");
-        }
-        Mutex.Lock(m);
-        this.writersWaiting = this.writersWaiting + 1;
-        Mutex.Unlock(m);
-        while (true) {
-            m = this.mtx;
-            if (m == 0) {
+        lock (this) {
+            if (this.disposed) {
                 throw new ObjectDisposedException("RwLock");
             }
-            Mutex.Lock(m);
-            if (!this.writer && this.readers == 0) {
-                this.writersWaiting = this.writersWaiting - 1;
-                this.writer = true;
-                Mutex.Unlock(m);
-                return;
+            this.writersWaiting = this.writersWaiting + 1;
+        }
+        while (true) {
+            lock (this) {
+                if (this.disposed) {
+                    if (this.writersWaiting > 0) {
+                        this.writersWaiting = this.writersWaiting - 1;
+                    }
+                    throw new ObjectDisposedException("RwLock");
+                }
+                if (!this.writer && this.readers == 0) {
+                    this.writersWaiting = this.writersWaiting - 1;
+                    this.writer = true;
+                    return;
+                }
             }
-            Mutex.Unlock(m);
             Thread.Sleep(1);
         }
     }
 
     // 释放排他写访问。
     public void ExitWrite() {
-        nint m = this.mtx;
-        if (m == 0) {
-            return;
+        lock (this) {
+            if (this.disposed) {
+                return;
+            }
+            this.writer = false;
         }
-        Mutex.Lock(m);
-        this.writer = false;
-        Mutex.Unlock(m);
     }
 
     // 释放底层互斥句柄（锁废弃时调用；加锁后调用未定义）。
     public void Close() {
-        if (this.mtx != 0) {
-            nint m = this.mtx;
-            this.mtx = 0;
-            Mutex.Destroy(m);
+        lock (this) {
+            this.disposed = true;
         }
     }
 

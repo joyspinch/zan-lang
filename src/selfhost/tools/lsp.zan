@@ -54,6 +54,8 @@ public class LspSymbol {
     public string TypeName;
     public string ContainerName;
     public List<string> BaseTypes;
+    public List<string> RawBaseTypes;
+    public List<string> TypeParams;
 
     public LspSymbol(string uri, string name, int kind, int line, int col) {
         Uri = uri;
@@ -66,6 +68,8 @@ public class LspSymbol {
         TypeName = "";
         ContainerName = "";
         BaseTypes = new List<string>();
+        RawBaseTypes = new List<string>();
+        TypeParams = new List<string>();
     }
 
     public static int KindClass() { return 0; }
@@ -521,9 +525,9 @@ public partial class LspServer {
             if (d.kind == AK.NamespaceDecl()) {
                 CollectMemberSymbolsInto(dst, uri, d, lineOffset);
             } else if (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) {
-                CollectTypeMembersInto(dst, uri, d, lineOffset);
+                CollectTypeMembersInto(dst, uri, d, "", lineOffset);
             } else if (d.kind == AK.EnumDecl()) {
-                CollectEnumMembersInto(dst, uri, d, lineOffset);
+                CollectEnumMembersInto(dst, uri, d, "", lineOffset);
             } else if (d.kind == AK.DelegateDecl()) {
                 CollectDelegateSymbolInto(dst, uri, d, "", lineOffset);
             }
@@ -532,9 +536,9 @@ public partial class LspServer {
     }
 
     static void CollectTypeMembersInto(List<LspSymbol> dst, string uri,
-            Node d, int lineOffset) {
+            Node d, string parentType, int lineOffset) {
         string owner = d.sval != null ? d.sval : "";
-        AttachBaseTypesInto(dst, uri, d, owner);
+        AttachTypeMetaInto(dst, uri, d, owner, parentType, lineOffset);
         int j = 0;
         while (j < d.kids.Count) {
             Node m = d.kids[j];
@@ -575,9 +579,9 @@ public partial class LspServer {
                 }
                 dst.Add(csym);
             } else if (m.kind == AK.EnumDecl()) {
-                CollectEnumMembersInto(dst, uri, m, lineOffset);
+                CollectEnumMembersInto(dst, uri, m, owner, lineOffset);
             } else if (m.kind == AK.ClassDecl() || m.kind == AK.StructDecl()) {
-                CollectTypeMembersInto(dst, uri, m, lineOffset);
+                CollectTypeMembersInto(dst, uri, m, owner, lineOffset);
             } else if (m.kind == AK.DelegateDecl()) {
                 CollectDelegateSymbolInto(dst, uri, m, owner, lineOffset);
             }
@@ -586,8 +590,9 @@ public partial class LspServer {
     }
 
     static void CollectEnumMembersInto(List<LspSymbol> dst, string uri,
-            Node e, int lineOffset) {
+            Node e, string parentType, int lineOffset) {
         string owner = e.sval != null ? e.sval : "";
+        AttachTypeMetaInto(dst, uri, e, owner, parentType, lineOffset);
         int k = 0;
         while (k < e.kids.Count) {
             Node em = e.kids[k];
@@ -954,6 +959,8 @@ public partial class LspServer {
             PublishDiagnostics(uri, lastVer, "[]");
             if (doc != null && doc.ProjectRoot != "") {
                 RefreshWorkspaceDiagnostics(doc.ProjectRoot, doc);
+            } else {
+                ClearStandaloneExternal(uri);
             }
             return;
         }
@@ -1091,7 +1098,8 @@ public partial class LspServer {
                 int mi = 0;
                 while (mi < pool.Count) {
                     LspSymbol sym = pool[mi];
-                    if (sym.ContainerName == ownerName && IsMemberKind(sym.Kind)
+                    if (sym.ContainerName == ownerName
+                            && (IsMemberKind(sym.Kind) || IsTypeSymbolKind(sym.Kind))
                             && sym.Kind != LspSymbol.KindCtor()
                             && (prefix == "" || sym.Name.StartsWith(prefix))
                             && !seen.ContainsKey(sym.Name)) {
@@ -1103,7 +1111,7 @@ public partial class LspServer {
                         sb.Append(",\"kind\":");
                         sb.Append(sym.CompletionKind());
                         sb.Append(",\"detail\":");
-                        sb.Append(EncodeJsonString(SymbolDetail(sym)));
+                        sb.Append(EncodeJsonString(SymbolDetailForReceiver(pool, sym, recvType)));
                         sb.Append("}");
                     }
                     mi = mi + 1;

@@ -7,35 +7,82 @@ namespace System.Threading;
 public class Mutex : IDisposable {
     nint handle;
     bool isDisposed;
+    int activeOps;
 
     // 创建一个新的互斥锁实例。
     public Mutex() {
         this.handle = Mutex.Create();
         this.isDisposed = false;
+        this.activeOps = 0;
     }
 
     // 阻塞等待并获取互斥锁（对齐工业级标准 API）。
     public void WaitOne() {
-        if (!this.isDisposed && this.handle != 0) {
-            Mutex.Lock(this.handle);
+        nint h = 0;
+        lock (this) {
+            if (this.isDisposed || this.handle == 0) {
+                throw new ObjectDisposedException("Mutex");
+            }
+            h = this.handle;
+            this.activeOps = this.activeOps + 1;
+        }
+        try {
+            Mutex.Lock(h);
+        } finally {
+            this.FinishOp();
         }
     }
 
     // 释放已持有的互斥锁（对齐工业级标准 API）。
     public void ReleaseMutex() {
-        if (!this.isDisposed && this.handle != 0) {
-            Mutex.Unlock(this.handle);
+        nint h = 0;
+        lock (this) {
+            if (this.handle == 0) {
+                if (this.isDisposed) {
+                    throw new ObjectDisposedException("Mutex");
+                }
+                return;
+            }
+            h = this.handle;
+            this.activeOps = this.activeOps + 1;
+        }
+        try {
+            Mutex.Unlock(h);
+        } finally {
+            this.FinishOp();
+        }
+    }
+
+    private void FinishOp() {
+        nint toDestroy = 0;
+        lock (this) {
+            if (this.activeOps > 0) {
+                this.activeOps = this.activeOps - 1;
+            }
+            if (this.isDisposed && this.activeOps == 0 && this.handle != 0) {
+                toDestroy = this.handle;
+                this.handle = 0;
+            }
+        }
+        if (toDestroy != 0) {
+            Mutex.Destroy(toDestroy);
         }
     }
 
     // 关闭并销毁底层互斥锁资源。
     public void Close() {
-        if (!this.isDisposed) {
-            this.isDisposed = true;
-            if (this.handle != 0) {
-                Mutex.Destroy(this.handle);
-                this.handle = 0;
+        nint toDestroy = 0;
+        lock (this) {
+            if (!this.isDisposed) {
+                this.isDisposed = true;
+                if (this.activeOps == 0 && this.handle != 0) {
+                    toDestroy = this.handle;
+                    this.handle = 0;
+                }
             }
+        }
+        if (toDestroy != 0) {
+            Mutex.Destroy(toDestroy);
         }
     }
 

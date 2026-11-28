@@ -1,0 +1,73 @@
+using System;
+using System.Collections.Generic;
+using Game.Net;
+
+namespace Conf;
+
+class MultiplayerSpectatorRegionTelemetryTest {
+    static void Main() {
+        // 1. 竞技防窥屏延迟观战缓冲器（10 帧防窥屏延迟 + 2x 倍速追赶 + Seek 钳位防提前剧透）
+        NetSpectatorDelayBuffer spec = new NetSpectatorDelayBuffer(10, 100);
+        for (int t = 1; t <= 8; t = t + 1) {
+            spec.PushLiveFrame(t, (long)(t * 16), "snap_" + Convert.ToString(t));
+        }
+        bool blockedBeforeDelay = !spec.IsDelayReady && spec.StepPlayback(1.0f) == null;
+
+        for (int t = 9; t <= 25; t = t + 1) {
+            spec.PushLiveFrame(t, (long)(t * 16), "snap_" + Convert.ToString(t));
+        }
+        // SafeWatchableTick = 25 - 10 = 15；试图 Seek 到 25 必须被防窥屏钳位到 15
+        spec.SetPlaybackSpeed(2.0f);
+        SpectatorFrameRecord f1 = spec.StepPlayback(1.0f); // 从 1 推进 +2 -> 3
+        bool seekOk = spec.SeekToTick(25);
+        SpectatorFrameRecord fClamped = spec.StepPlayback(0.0f);
+        bool specOk = blockedBeforeDelay && f1 != null && f1.Tick == 3
+            && seekOk && fClamped != null && fClamped.Tick == 15 && fClamped.SnapshotPayload == "snap_15";
+        Console.WriteLine("net-spectator-delay-buffer: " + Convert.ToString(specOk ? 1 : 0));
+
+        // 2. 全球多机房智能选区与故障切换（中位数去毛刺 + 丢包惩罚淘汰假低 Ping 劣化节点）
+        NetPingRegionSelector sel = new NetPingRegionSelector();
+        // ap-bad 平均 RTT 很低 (20ms) 但 50% 丢包 -> 惩罚 +750ms -> 淘汰！
+        sel.RecordProbe("ap-bad", true, 20.0f);
+        sel.RecordProbe("ap-bad", false, -1.0f);
+        sel.RecordProbe("ap-bad", true, 22.0f);
+        sel.RecordProbe("ap-bad", false, -1.0f);
+        // ap-good 稳定 38ms（含一次偶发 200ms 毛刺，中位数过滤为 38ms）
+        sel.RecordProbe("ap-good", true, 36.0f);
+        sel.RecordProbe("ap-good", true, 38.0f);
+        sel.RecordProbe("ap-good", true, 200.0f);
+        // us-west 稳定 140ms
+        sel.RecordProbe("us-west", true, 140.0f);
+        sel.RecordProbe("us-west", true, 142.0f);
+
+        string best = sel.SelectBestRegion();
+        string fallback = "";
+        bool shouldFail = sel.ShouldFailover("ap-bad", out fallback);
+        bool regionOk = best == "ap-good" && shouldFail && fallback == "ap-good";
+        Console.WriteLine("net-ping-region-failover: " + Convert.ToString(regionOk ? 1 : 0));
+
+        // 3. 专用服 SLA 帧耗时分位（p50/p95/p99）与 KDA / 事件审计汇集
+        NetMatchTelemetrySink sink = new NetMatchTelemetrySink("match-99", 16.67f);
+        for (int i = 1; i <= 20; i = i + 1) {
+            float dur = i == 20 ? 24.5f : (float)i * 0.5f; // 仅第 20 帧超时 >16.67ms
+            sink.RecordTickDuration(dur);
+        }
+        sink.RecordDamage(101, 250);
+        sink.RecordKill(500, 101, 202, 103);
+        sink.RecordObjective(620, 101, "ControlPointA");
+
+        float p50 = sink.QueryTickPercentile(0.50f);
+        float p95 = sink.QueryTickPercentile(0.95f);
+        PlayerMatchStats p101 = sink.GetOrCreatePlayer(101);
+        PlayerMatchStats p202 = sink.GetOrCreatePlayer(202);
+        PlayerMatchStats p103 = sink.GetOrCreatePlayer(103);
+
+        bool telOk = sink.OverBudgetTickCount == 1
+            && p50 > 4.9f && p50 < 5.6f
+            && p95 > 9.0f
+            && p101.Kills == 1 && p101.DamageDealt == 250 && p101.ObjectivesCaptured == 1
+            && p202.Deaths == 1 && p103.Assists == 1
+            && sink.AuditEventCount == 2;
+        Console.WriteLine("net-match-telemetry-sla-kda: " + Convert.ToString(telOk ? 1 : 0));
+    }
+}

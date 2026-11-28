@@ -34,7 +34,9 @@ public class ServiceProvider : IServiceProvider, IServiceScopeFactory, IDisposab
             if (descriptors != null) {
                 for (int i = 0; i < descriptors.Count; i = i + 1) {
                     ServiceDescriptor d = descriptors[i];
-                    this.descriptorMap[d.serviceType] = d;
+                    if (d != null && d.serviceType != null) {
+                        this.descriptorMap[d.serviceType] = d;
+                    }
                 }
             }
         }
@@ -48,7 +50,7 @@ public class ServiceProvider : IServiceProvider, IServiceScopeFactory, IDisposab
 
     public object GetService(string serviceType) {
         if (serviceType == null) { return null; }
-        if (this.isDisposed) {
+        if (this.isDisposed || (this.rootProvider != null && this.rootProvider.isDisposed)) {
             throw new Exception("Cannot resolve service from a disposed ServiceProvider.");
         }
 
@@ -159,6 +161,13 @@ public class ServiceProvider : IServiceProvider, IServiceScopeFactory, IDisposab
                 bool mustWait = false;
                 bool cycleDetected = false;
                 lock (owner.gate) {
+                    if (owner.isDisposed) {
+                        if (waiting && owner.waitingOn != null) {
+                            owner.waitingOn.Remove(tid);
+                            waiting = false;
+                        }
+                        throw new Exception("Cannot resolve service from a disposed ServiceProvider.");
+                    }
                     object existing = null;
                     if (cache.TryGetValue(serviceType, out existing)) {
                         if (waiting && owner.waitingOn != null) {
@@ -217,9 +226,10 @@ public class ServiceProvider : IServiceProvider, IServiceScopeFactory, IDisposab
         }
 
         object created = null;
+        bool disposedWhileBuilding = false;
         try {
             if (d.factory != null) {
-                created = d.factory(this);
+                created = d.factory(owner);
             }
         } finally {
             lock (owner.gate) {
@@ -227,21 +237,39 @@ public class ServiceProvider : IServiceProvider, IServiceScopeFactory, IDisposab
                     owner.buildingThreads.Remove(serviceType);
                 }
                 if (created != null) {
-                    cache[serviceType] = created;
+                    if (!owner.isDisposed) {
+                        cache[serviceType] = created;
+                    } else {
+                        disposedWhileBuilding = true;
+                    }
                 }
             }
+        }
+        if (disposedWhileBuilding) {
+            if (created is IDisposable) {
+                try {
+                    IDisposable disp = (IDisposable)created;
+                    disp.Dispose();
+                } catch (Exception ex) {
+                    // ignore secondary dispose error during aborted creation
+                }
+            }
+            throw new Exception("Cannot resolve service from a disposed ServiceProvider.");
         }
         return created;
     }
 
     public IServiceScope CreateScope() {
         ServiceProvider root = this.rootProvider != null ? this.rootProvider : this;
+        if (this.isDisposed || root.isDisposed) {
+            throw new Exception("Cannot create scope from a disposed ServiceProvider.");
+        }
         ServiceProvider scopedSp = new ServiceProvider(null, root);
         return new ServiceScope(scopedSp);
     }
 
-    private void DisposeInstanceMap(Dictionary<string, object> map) {
-        if (map == null) { return; }
+    private Exception DisposeInstanceMap(Dictionary<string, object> map, Exception firstError) {
+        if (map == null) { return firstError; }
         List<object> snapshot = null;
         lock (this.gate) {
             if (map.Count > 0) {
@@ -253,11 +281,18 @@ public class ServiceProvider : IServiceProvider, IServiceScopeFactory, IDisposab
             for (int i = 0; i < snapshot.Count; i = i + 1) {
                 object obj = snapshot[i];
                 if (obj is IDisposable) {
-                    IDisposable disp = (IDisposable)obj;
-                    disp.Dispose();
+                    try {
+                        IDisposable disp = (IDisposable)obj;
+                        disp.Dispose();
+                    } catch (Exception ex) {
+                        if (firstError == null) {
+                            firstError = ex;
+                        }
+                    }
                 }
             }
         }
+        return firstError;
     }
 
     public void Dispose() {
@@ -266,7 +301,11 @@ public class ServiceProvider : IServiceProvider, IServiceScopeFactory, IDisposab
             this.isDisposed = true;
         }
 
-        this.DisposeInstanceMap(this.scopedInstances);
-        this.DisposeInstanceMap(this.singletons);
+        Exception firstError = null;
+        firstError = this.DisposeInstanceMap(this.scopedInstances, firstError);
+        firstError = this.DisposeInstanceMap(this.singletons, firstError);
+        if (firstError != null) {
+            throw firstError;
+        }
     }
 }

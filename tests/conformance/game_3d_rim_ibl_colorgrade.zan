@@ -1,0 +1,146 @@
+using System;
+using System.Numerics;
+using Gui;
+using Game.Graphics;
+using Game.Render3D;
+
+namespace Conf;
+
+class Game3DRimIblColorGradeTest {
+    [DllImport("zan_gui")]
+    private static extern int zan_gui_read_pixel(int surfaceId, int x, int y);
+
+    private static Mesh3D MakeQuadWithNormal(float halfSize, float nx, float ny, float nz) {
+        Mesh3D m = new Mesh3D();
+        m.Vertex(-halfSize, -halfSize, 0.0f, nx, ny, nz, 0.0f, 1.0f);
+        m.Vertex( halfSize, -halfSize, 0.0f, nx, ny, nz, 1.0f, 1.0f);
+        m.Vertex( halfSize,  halfSize, 0.0f, nx, ny, nz, 1.0f, 0.0f);
+        m.Vertex(-halfSize,  halfSize, 0.0f, nx, ny, nz, 0.0f, 0.0f);
+        m.Triangle(0, 1, 2);
+        m.Triangle(0, 2, 3);
+        return m;
+    }
+
+    private static int ROf(int argb) { return (argb >> 16) & 255; }
+    private static int GOf(int argb) { return (argb >> 8) & 255; }
+    private static int BOf(int argb) { return argb & 255; }
+
+    static void Main() {
+        Canvas.SetBackend(1);
+        Canvas cv = new Canvas(128, 128);
+        // 掠射角法线（朝 +X 偏 +Z，NdotV 很小）与正面法线（朝 +Z，NdotV ≈ 1）
+        int grazingH = cv.MeshUpload(MakeQuadWithNormal(1.8f, 0.96f, 0.0f, 0.28f));
+        int facingH = cv.MeshUpload(MakeQuadWithNormal(1.8f, 0.0f, 0.0f, 1.0f));
+        // 朝上偏前法线（反射向量 R = reflect(-V, N) 指向 +Y 天空半球！）
+        int skyReflH = cv.MeshUpload(MakeQuadWithNormal(1.8f, 0.0f, 0.707f, 0.707f));
+
+        Camera3D cam = new Camera3D();
+        cam.Position = new Vector3(0.0f, 0.0f, 4.0f);
+        cam.Target = new Vector3(0.0f, 0.0f, 0.0f);
+        cam.AspectRatio = 1.0f;
+
+        Renderer3D renderer = new Renderer3D(16);
+        renderer.UseCpuLighting = false;
+
+        // 1. GPU 菲涅尔轮廓边缘光（全黑无灯场景：掠射角法线亮起高强度红色边缘光，正面法线几乎保持全黑）
+        SceneNode rRimG = new SceneNode("rim_g");
+        SceneNode nRimG = new SceneNode("g");
+        nRimG.MeshKey = grazingH;
+        nRimG.BoundsRadius = 4.0f;
+        Material mRim = Material.Solid(0.0f, 0.0f, 0.0f);
+        mRim.RimRed = 1.0f;
+        mRim.RimGreen = 0.0f;
+        mRim.RimBlue = 0.0f;
+        mRim.RimPower = 2.0f;
+        nRimG.Material = mRim;
+        rRimG.AddChild(nRimG);
+
+        RenderPlan pRimG = new RenderPlan(cam);
+        pRimG.AmbientRed = 0.0f; pRimG.AmbientGreen = 0.0f; pRimG.AmbientBlue = 0.0f;
+        pRimG.Build(rRimG);
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, pRimG);
+        int pixGrazing = zan_gui_read_pixel(cv.SurfaceId(), 64, 64);
+
+        nRimG.MeshKey = facingH;
+        pRimG.Build(rRimG);
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, pRimG);
+        int pixFacing = zan_gui_read_pixel(cv.SurfaceId(), 64, 64);
+
+        bool rimOk = ROf(pixGrazing) > 100 && ROf(pixGrazing) > ROf(pixFacing) + 80 && ROf(pixFacing) < 25;
+        Console.WriteLine("gpu-fresnel-rim-light: " + Convert.ToString(rimOk ? 1 : 0));
+
+        // 2. GPU 解析式高光环境反射 IBL（开启天空蓝/地面黑半球 IBL 且 0 盏方向光）：
+        // 光滑金属（Metallic=1, Roughness=0.05）在反射方向指向天空时显著比粗糙金属（Roughness=0.95）更亮更蓝！
+        renderer.EnableHemisphereAmbient = true;
+        renderer.HemiSkyRed = 0.05f; renderer.HemiSkyGreen = 0.20f; renderer.HemiSkyBlue = 1.0f;
+        renderer.HemiGroundRed = 0.0f; renderer.HemiGroundGreen = 0.0f; renderer.HemiGroundBlue = 0.0f;
+
+        SceneNode rIbl = new SceneNode("ibl");
+        SceneNode nIbl = new SceneNode("metal");
+        nIbl.MeshKey = skyReflH;
+        nIbl.BoundsRadius = 4.0f;
+        Material mSmooth = Material.Solid(1.0f, 1.0f, 1.0f);
+        mSmooth.Metallic = 1.0f;
+        mSmooth.Roughness = 0.05f;
+        nIbl.Material = mSmooth;
+        rIbl.AddChild(nIbl);
+
+        RenderPlan pIbl = new RenderPlan(cam);
+        pIbl.Build(rIbl);
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, pIbl);
+        int pixSmooth = zan_gui_read_pixel(cv.SurfaceId(), 64, 64);
+
+        mSmooth.Roughness = 0.95f;
+        pIbl.Build(rIbl);
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, pIbl);
+        int pixRough = zan_gui_read_pixel(cv.SurfaceId(), 64, 64);
+
+        renderer.EnableHemisphereAmbient = false;
+        bool iblOk = BOf(pixSmooth) > 160 && BOf(pixSmooth) > BOf(pixRough) + 40;
+        Console.WriteLine("gpu-specular-ibl-metal: " + Convert.ToString(iblOk ? 1 : 0));
+
+        // 3. GPU 后处理调色（Saturation=0 去饱和变灰度 + ColorTint 色偏）+ CameraJuice3D 震屏/顿帧/FOV 脉冲
+        SceneNode rGrade = new SceneNode("grade");
+        SceneNode nRed = new SceneNode("red");
+        nRed.MeshKey = facingH;
+        nRed.BoundsRadius = 4.0f;
+        nRed.Material = Material.Emissive(0.95f, 0.05f, 0.05f);
+        rGrade.AddChild(nRed);
+
+        PostProcess noir = new PostProcess();
+        noir.Saturation = 0.0f;
+        noir.Contrast = 1.0f;
+        renderer.PostProcess = noir;
+
+        RenderPlan pGrade = new RenderPlan(cam);
+        pGrade.AmbientRed = 0.0f; pGrade.AmbientGreen = 0.0f; pGrade.AmbientBlue = 0.0f;
+        pGrade.Build(rGrade);
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, pGrade);
+        int pixNoir = zan_gui_read_pixel(cv.SurfaceId(), 64, 64);
+        int rgDiff = ROf(pixNoir) - GOf(pixNoir);
+        if (rgDiff < 0) { rgDiff = -rgDiff; }
+        int gbDiff = GOf(pixNoir) - BOf(pixNoir);
+        if (gbDiff < 0) { gbDiff = -gbDiff; }
+        bool gradeOk = ROf(pixNoir) > 35 && rgDiff <= 3 && gbDiff <= 3;
+
+        CameraJuice3D juice = new CameraJuice3D(1.0472f);
+        juice.AddTrauma(0.8f);
+        juice.TriggerHitStop(0.08f);
+        juice.SetFovKick(0.25f);
+        float dtFrozen = juice.StepRawDelta(0.05f); // 仍在 0.08s 顿帧内 -> 0
+        Vector3 shake1 = juice.SampleShakeOffset();
+        float dtAfter = juice.StepRawDelta(0.05f);  // 顿帧耗尽 -> 0 (边界)
+        float dtLive = juice.StepRawDelta(0.05f);   // 恢复正常玩法 dt=0.05
+        bool juiceOk = dtFrozen == 0.0f && dtAfter == 0.0f && dtLive > 0.049f
+            && (shake1.X != 0.0f || shake1.Y != 0.0f)
+            && juice.EffectiveFovRad > 1.15f;
+
+        Console.WriteLine("gpu-color-grade-and-camera-juice: " + Convert.ToString((gradeOk && juiceOk) ? 1 : 0));
+        renderer.Dispose();
+    }
+}

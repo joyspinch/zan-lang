@@ -666,6 +666,336 @@ def check_project_navigation(s, workspace, open_doc, change_doc, close_doc, expe
     derived_path.unlink()
     unrelated_path.unlink()
 
+    # 10. External packages & stdlib member checking, internal visibility, and nested type (Outer.Inner) navigation
+    pkg_dir = workspace / "packages/Acme.Tools/src/Acme/Tools"
+    pkg_dir.mkdir(parents=True, exist_ok=True)
+    pkg_file = pkg_dir / "PkgHelper.zan"
+    pkg_uri = pkg_file.as_uri()
+    pkg_file.write_text(
+        "namespace Acme.Tools;\n"
+        "public class PkgHelper {\n"
+        "    public int Limit;\n"
+        "    public static int Scale(int factor, int offset) { return factor + offset; }\n"
+        "    internal static int Secret() { return 42; }\n"
+        "    public class Config {\n"
+        "        public int Timeout;\n"
+        "    }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    pkg_use_uri = (workspace / "app/src/PkgUse.zan").as_uri()
+    pkg_ok_text = (
+        "using Acme.Tools;\n"
+        "namespace App.Client;\n"
+        "class PkgUse {\n"
+        "    static int Run(PkgHelper helper, PkgHelper.Config cfg) {\n"
+        "        return PkgHelper.Scale(2, 3) + helper.Limit + cfg.Timeout;\n"
+        "    }\n"
+        "}\n"
+    )
+    open_doc(pkg_use_uri, pkg_ok_text)
+    expect_diag(caller, 5, set())
+    expect_diag(pkg_use_uri, 1, set())
+    plines = pkg_ok_text.splitlines()
+
+    # 10a. External package navigation + nested qualified type (PkgHelper.Config) completion/def/hover/sig/inlay
+    pkg_dot = s.request("textDocument/completion", {
+        "textDocument": {"uri": pkg_use_uri},
+        "position": {"line": 4, "character": plines[4].index("PkgHelper.Scale") + len("PkgHelper.")},
+    }).get("result") or []
+    pkg_dot_labels = [c["label"] for c in pkg_dot]
+    for want_item in ("Scale", "Limit", "Config"):
+        if want_item not in pkg_dot_labels:
+            fail("external package dot completion", "missing %s in %r" % (want_item, pkg_dot_labels))
+
+    cfg_dot = s.request("textDocument/completion", {
+        "textDocument": {"uri": pkg_use_uri},
+        "position": {"line": 4, "character": plines[4].index("cfg.Timeout") + len("cfg.")},
+    }).get("result") or []
+    if "Timeout" not in [c["label"] for c in cfg_dot]:
+        fail("nested type instance completion", "missing Timeout in %r" % (cfg_dot,))
+
+    def_nested = s.request("textDocument/definition", {
+        "textDocument": {"uri": pkg_use_uri},
+        "position": {"line": 3, "character": plines[3].index("PkgHelper.Config") + len("PkgHelper.") + 2},
+    }).get("result")
+    if not def_nested or def_nested["uri"] != pkg_uri or def_nested["range"]["start"]["line"] != 5:
+        fail("external nested type definition", "expected %s:5, got %r" % (pkg_uri, def_nested))
+
+    hv_pkg = s.request("textDocument/hover", {
+        "textDocument": {"uri": pkg_use_uri},
+        "position": {"line": 4, "character": plines[4].index("Scale") + 1},
+    }).get("result")
+    hv_pkg_val = (hv_pkg or {}).get("contents", {}).get("value", "")
+    if "int Scale(int factor, int offset)" not in hv_pkg_val or "PkgHelper" not in hv_pkg_val:
+        fail("external package hover", "unexpected hover: %r" % (hv_pkg,))
+
+    sig_pkg = s.request("textDocument/signatureHelp", {
+        "textDocument": {"uri": pkg_use_uri},
+        "position": {"line": 4, "character": plines[4].index("3)")},
+    }).get("result")
+    if not sig_pkg or sig_pkg.get("activeParameter") != 1 \
+            or "int Scale(int factor, int offset)" not in [x.get("label") for x in sig_pkg.get("signatures") or []]:
+        fail("external package signatureHelp", "unexpected signatureHelp: %r" % (sig_pkg,))
+
+    pkg_hints = s.request("textDocument/inlayHint", {
+        "textDocument": {"uri": pkg_use_uri},
+        "range": {"start": {"line": 4, "character": 0}, "end": {"line": 5, "character": 0}},
+    }).get("result") or []
+    pkg_hint_labels = [h.get("label") for h in pkg_hints]
+    if "factor:" not in pkg_hint_labels or "offset:" not in pkg_hint_labels:
+        fail("external package inlayHint", "expected factor:/offset:, got %r" % (pkg_hints,))
+
+    # 10b. External package member checking + cross-module internal visibility diagnostics
+    pkg_bad_text = (
+        "using Acme.Tools;\n"
+        "namespace App.Client;\n"
+        "class PkgUse {\n"
+        "    static int Run(PkgHelper helper) {\n"
+        "        return PkgHelper.BadCall() + helper.BadField + PkgHelper.Secret();\n"
+        "    }\n"
+        "}\n"
+    )
+    change_doc(pkg_use_uri, 2, pkg_bad_text)
+    expect_diag(caller, 5, set())
+    expect_diag(pkg_use_uri, 2, {
+        "type 'Acme.Tools.PkgHelper' has no method 'BadCall'",
+        "type 'Acme.Tools.PkgHelper' has no member 'BadField'",
+        "'Acme.Tools.PkgHelper.Secret' is internal to 'Acme.Tools' and cannot be accessed from 'App.Client'",
+    })
+
+    # 10c. Real stdlib member checking & navigation (`using System.IO;` -> `Path.Combine`)
+    std_use_uri = (workspace / "app/src/StdUse.zan").as_uri()
+    std_ok_text = (
+        "using System.IO;\n"
+        "class StdUse {\n"
+        "    static string Join() { return Path.Combine(\"a\", \"b\"); }\n"
+        "}\n"
+    )
+    open_doc(std_use_uri, std_ok_text)
+    expect_diag(caller, 5, set())
+    expect_diag(pkg_use_uri, 2, {
+        "type 'Acme.Tools.PkgHelper' has no method 'BadCall'",
+        "type 'Acme.Tools.PkgHelper' has no member 'BadField'",
+        "'Acme.Tools.PkgHelper.Secret' is internal to 'Acme.Tools' and cannot be accessed from 'App.Client'",
+    })
+    expect_diag(std_use_uri, 1, set())
+    std_lines = std_ok_text.splitlines()
+
+    std_dot = s.request("textDocument/completion", {
+        "textDocument": {"uri": std_use_uri},
+        "position": {"line": 2, "character": std_lines[2].index("Path.Combine") + len("Path.")},
+    }).get("result") or []
+    if "Combine" not in [c["label"] for c in std_dot]:
+        fail("stdlib dot completion", "missing Path.Combine in %r" % ([c["label"] for c in std_dot],))
+
+    def_path = s.request("textDocument/definition", {
+        "textDocument": {"uri": std_use_uri},
+        "position": {"line": 2, "character": std_lines[2].index("Combine") + 1},
+    }).get("result")
+    if not def_path or not def_path.get("uri", "").endswith("/System/IO/Path.zan"):
+        fail("stdlib definition", "expected .../System/IO/Path.zan, got %r" % (def_path,))
+
+    std_bad_text = (
+        "using System.IO;\n"
+        "class StdUse {\n"
+        "    static string Join() { return Path.NotARealMethod(); }\n"
+        "}\n"
+    )
+    change_doc(std_use_uri, 2, std_bad_text)
+    expect_diag(caller, 5, set())
+    expect_diag(pkg_use_uri, 2, {
+        "type 'Acme.Tools.PkgHelper' has no method 'BadCall'",
+        "type 'Acme.Tools.PkgHelper' has no member 'BadField'",
+        "'Acme.Tools.PkgHelper.Secret' is internal to 'Acme.Tools' and cannot be accessed from 'App.Client'",
+    })
+    expect_diag(std_use_uri, 2, {"type 'System.IO.Path' has no method 'NotARealMethod'"})
+
+    close_doc(std_use_uri)
+    expect_diag(std_use_uri, 2, set())
+    expect_diag(caller, 5, set())
+    expect_diag(pkg_use_uri, 2, {
+        "type 'Acme.Tools.PkgHelper' has no method 'BadCall'",
+        "type 'Acme.Tools.PkgHelper' has no member 'BadField'",
+        "'Acme.Tools.PkgHelper.Secret' is internal to 'Acme.Tools' and cannot be accessed from 'App.Client'",
+    })
+    close_doc(pkg_use_uri)
+    expect_diag(pkg_use_uri, 2, set())
+    expect_diag(caller, 5, set())
+    pkg_file.unlink()
+
+    # 11. Fine-grained private/protected visibility diagnostics (E2002/E2003 parity with C host)
+    vis_uri = (workspace / "app/src/VisibilityCheck.zan").as_uri()
+    vis_ok_text = (
+        "namespace App;\n"
+        "class Vault {\n"
+        "    private int secret;\n"
+        "    protected int guardVal;\n"
+        "    public int OpenVal;\n"
+        "    private int PeekSecret() { return secret; }\n"
+        "    protected int ReadGuard() { return guardVal; }\n"
+        "    public int SelfCheck() { return secret + PeekSecret() + guardVal + ReadGuard(); }\n"
+        "}\n"
+        "class SubVault : Vault {\n"
+        "    public int OkSub() { return guardVal + ReadGuard() + base.ReadGuard() + OpenVal; }\n"
+        "}\n"
+        "class Outsider {\n"
+        "    public int OkOut(Vault v) { return v.OpenVal; }\n"
+        "}\n"
+    )
+    open_doc(vis_uri, vis_ok_text)
+    expect_diag(caller, 5, set())
+    expect_diag(vis_uri, 1, set())
+
+    vis_bad_text = (
+        "namespace App;\n"
+        "class Vault {\n"
+        "    private int secret;\n"
+        "    protected int guardVal;\n"
+        "    protected int subGuard;\n"
+        "    public int OpenVal;\n"
+        "    private int PeekSecret() { return secret; }\n"
+        "    private int PeekBase() { return secret; }\n"
+        "    protected int ReadGuard() { return guardVal; }\n"
+        "}\n"
+        "class SubVault : Vault {\n"
+        "    public int BadSub() { return secret + PeekSecret() + base.PeekBase(); }\n"
+        "}\n"
+        "class Outsider {\n"
+        "    public int BadOut(Vault v, SubVault sub) {\n"
+        "        return v.secret + v.PeekSecret() + v.guardVal + v.ReadGuard() + sub.subGuard;\n"
+        "    }\n"
+        "}\n"
+    )
+    change_doc(vis_uri, 2, vis_bad_text)
+    expect_diag(caller, 5, set())
+    expect_diag(vis_uri, 2, {
+        "'App.Vault.secret' is private and cannot be accessed from 'App.SubVault'",
+        "'App.Vault.PeekSecret' is private and cannot be accessed from 'App.SubVault'",
+        "'App.Vault.PeekBase' is private and cannot be accessed from 'App.SubVault'",
+        "'App.Vault.secret' is private and cannot be accessed from 'App.Outsider'",
+        "'App.Vault.PeekSecret' is private and cannot be accessed from 'App.Outsider'",
+        "'App.Vault.guardVal' is protected and cannot be accessed from 'App.Outsider'",
+        "'App.Vault.ReadGuard' is protected and cannot be accessed from 'App.Outsider'",
+        "'App.Vault.subGuard' is protected and cannot be accessed from 'App.Outsider'",
+    })
+    close_doc(vis_uri)
+    expect_diag(vis_uri, 2, set())
+    expect_diag(caller, 5, set())
+
+    # 12. Generic type-argument substitution & chained member/call navigation
+    gen_box_path = workspace / "app/src/GenBox.zan"
+    gen_box_uri = gen_box_path.as_uri()
+    gen_box_path.write_text(
+        "namespace App;\n"
+        "class GenService {\n"
+        "    public int Count;\n"
+        "    public int Read(int step) { return Count + step; }\n"
+        "}\n"
+        "class GenBox<T> {\n"
+        "    public T Value;\n"
+        "    public T Get() { return Value; }\n"
+        "}\n"
+        "class GenServiceBox : GenBox<GenService> {\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    gen_use_uri = (workspace / "app/src/GenUse.zan").as_uri()
+    gen_use_text = (
+        "namespace App;\n"
+        "class GenRunner {\n"
+        "    GenService GetService() { return new GenService(); }\n"
+        "    int Run(GenBox<GenService> box, GenServiceBox sbox) {\n"
+        "        var inferred = box.Get();\n"
+        "        int a = box.Value.Count;\n"
+        "        int b = box.Get().Read(7);\n"
+        "        int c = sbox.Value.Count;\n"
+        "        int d = GetService().Read(3);\n"
+        "        return a + b + c + d + inferred.Count;\n"
+        "    }\n"
+        "}\n"
+    )
+    open_doc(gen_use_uri, gen_use_text)
+    expect_diag(caller, 5, set())
+    expect_diag(gen_use_uri, 1, set())
+    glines = gen_use_text.splitlines()
+
+    # 12a. Completion on `box.` substitutes T -> GenService in detail
+    box_dot = s.request("textDocument/completion", {
+        "textDocument": {"uri": gen_use_uri},
+        "position": {"line": 5, "character": glines[5].index("box.Value") + len("box.")},
+    }).get("result") or []
+    box_detail_map = {c["label"]: c.get("detail", "") for c in box_dot}
+    if "GenService" not in box_detail_map.get("Value", "") or "GenService Get()" not in box_detail_map.get("Get", ""):
+        fail("generic box dot completion detail", "expected substituted GenService details, got %r" % (box_detail_map,))
+
+    # 12b. Chained completions: box.Value., box.Get()., sbox.Value., GetService()., inferred.
+    chain_checks = [
+        ("box.Value.", 5, glines[5].index("box.Value.Count") + len("box.Value.")),
+        ("box.Get().", 6, glines[6].index("box.Get().Read") + len("box.Get().")),
+        ("sbox.Value.", 7, glines[7].index("sbox.Value.Count") + len("sbox.Value.")),
+        ("GetService().", 8, glines[8].index("GetService().Read") + len("GetService().")),
+        ("inferred.", 9, glines[9].index("inferred.Count") + len("inferred.")),
+    ]
+    for label, ln, ch in chain_checks:
+        comp = s.request("textDocument/completion", {
+            "textDocument": {"uri": gen_use_uri},
+            "position": {"line": ln, "character": ch},
+        }).get("result") or []
+        clabels = [c["label"] for c in comp]
+        if "Count" not in clabels or "Read" not in clabels:
+            fail("chained completion " + label, "expected Count/Read in %r" % (clabels,))
+
+    # 12c. Chained definitions jump to GenService.Count (line 2) and GenService.Read (line 3)
+    for label, ln, needle, want_line in [
+        ("box.Value.Count", 5, "box.Value.Count", 2),
+        ("box.Get().Read", 6, "box.Get().Read", 3),
+        ("sbox.Value.Count", 7, "sbox.Value.Count", 2),
+        ("GetService().Read", 8, "GetService().Read", 3),
+        ("inferred.Count", 9, "inferred.Count", 2),
+    ]:
+        col = glines[ln].index(needle) + len(needle) - 2
+        dres = s.request("textDocument/definition", {
+            "textDocument": {"uri": gen_use_uri},
+            "position": {"line": ln, "character": col},
+        }).get("result")
+        if not dres or dres["uri"] != gen_box_uri or dres["range"]["start"]["line"] != want_line:
+            fail("chained definition " + label, "expected %s:%d, got %r" % (gen_box_uri, want_line, dres))
+
+    # 12d. Chained signatureHelp + inlayHint on `box.Get().Read(7)`
+    sig_gen = s.request("textDocument/signatureHelp", {
+        "textDocument": {"uri": gen_use_uri},
+        "position": {"line": 6, "character": glines[6].index("7)")},
+    }).get("result")
+    if not sig_gen or sig_gen.get("activeParameter") != 0 \
+            or "int Read(int step)" not in [x.get("label") for x in sig_gen.get("signatures") or []]:
+        fail("chained generic signatureHelp", "unexpected signatureHelp: %r" % (sig_gen,))
+
+    gen_hints = s.request("textDocument/inlayHint", {
+        "textDocument": {"uri": gen_use_uri},
+        "range": {"start": {"line": 6, "character": 0}, "end": {"line": 9, "character": 0}},
+    }).get("result") or []
+    gen_hint_labels = [h.get("label") for h in gen_hints]
+    if gen_hint_labels.count("step:") < 2:
+        fail("chained generic inlayHint", "expected >=2 step: hints, got %r" % (gen_hints,))
+
+    # 12e. Semantic references on `GenService.Read` includes chained calls `box.Get().Read(7)` & `GetService().Read(3)`
+    read_refs = s.request("textDocument/references", {
+        "textDocument": {"uri": gen_use_uri},
+        "position": {"line": 6, "character": glines[6].index("box.Get().Read") + len("box.Get().") + 1},
+        "context": {"includeDeclaration": True},
+    }).get("result") or []
+    gen_use_ref_lines = sorted(r["range"]["start"]["line"] for r in read_refs if r["uri"] == gen_use_uri)
+    gen_box_ref_lines = sorted(r["range"]["start"]["line"] for r in read_refs if r["uri"] == gen_box_uri)
+    if gen_box_ref_lines != [3] or gen_use_ref_lines != [6, 8]:
+        fail("chained generic references", "expected GenBox:[3] + GenUse:[6,8], got box=%r use=%r" % (
+            gen_box_ref_lines, gen_use_ref_lines))
+
+    close_doc(gen_use_uri)
+    expect_diag(gen_use_uri, 1, set())
+    expect_diag(caller, 5, set())
+    gen_box_path.unlink()
+
     # Restore caller version/text expected by downstream manifest assertions
     helper_path.unlink()
     s.notify("workspace/didChangeWatchedFiles", {"changes": [{"uri": helper_uri, "type": 3}]})

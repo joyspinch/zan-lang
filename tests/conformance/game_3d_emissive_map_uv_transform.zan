@@ -1,0 +1,142 @@
+using System;
+using System.Numerics;
+using System.Text;
+using Gui;
+using Game.Assets;
+using Game.Graphics;
+using Game.Render3D;
+
+namespace Conf;
+
+class Game3DEmissiveMapUvTransformTest {
+    [DllImport("zan_gui")]
+    private static extern int zan_gui_read_pixel(int surfaceId, int x, int y);
+
+    private static Mesh3D MakeFrontQuad(float halfSize) {
+        Mesh3D m = new Mesh3D();
+        m.Vertex(-halfSize, -halfSize, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f);
+        m.Vertex( halfSize, -halfSize, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        m.Vertex( halfSize,  halfSize, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+        m.Vertex(-halfSize,  halfSize, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        m.Triangle(0, 1, 2);
+        m.Triangle(0, 2, 3);
+        return m;
+    }
+
+    private static int ROf(int argb) { return (argb >> 16) & 255; }
+    private static int GOf(int argb) { return (argb >> 8) & 255; }
+    private static int BOf(int argb) { return argb & 255; }
+
+    static void Main() {
+        Canvas.SetBackend(1);
+        Canvas canvas = new Canvas(128, 128);
+        int quadHandle = canvas.MeshUpload(MakeFrontQuad(1.8f));
+
+        // 烘焙左青右黑自发光贴图
+        Canvas emCv = new Canvas(64, 64);
+        emCv.Clear(unchecked((int)0xFF000000));
+        emCv.FillRect(0, 0, 32, 64, unchecked((int)0xFF00FFFF));
+        emCv.FillRect(32, 0, 32, 64, unchecked((int)0xFF000000));
+        string emKey = "mem:r10_emissive_split";
+        int emBaked = emCv.BakeSprite(emKey, 0, 0, 64, 64);
+
+        // 烘焙左红右绿纹理（验证 GPU UV 变换精确截取右半绿区）
+        Canvas uvCv = new Canvas(64, 64);
+        uvCv.Clear(unchecked((int)0xFF000000));
+        uvCv.FillRect(0, 0, 32, 64, unchecked((int)0xFFFF0000));
+        uvCv.FillRect(32, 0, 32, 64, unchecked((int)0xFF00FF00));
+        string splitKey = "mem:r10_uv_red_green";
+        int uvBaked = uvCv.BakeSprite(splitKey, 0, 0, 64, 64);
+
+        Camera3D cam = new Camera3D();
+        cam.Position = new Vector3(0.0f, 0.0f, 4.0f);
+        cam.Target = new Vector3(0.0f, 0.0f, 0.0f);
+        cam.AspectRatio = 1.0f;
+
+        Renderer3D renderer = new Renderer3D(16);
+        renderer.UseCpuLighting = false;
+
+        // 1. GPU 自发光贴图（纹理单元 4）：全暗无光场景，左半青色发光、右半纯黑
+        SceneNode rootEm = new SceneNode("root_em");
+        SceneNode nEm = new SceneNode("em_quad");
+        nEm.MeshKey = quadHandle;
+        nEm.BoundsRadius = 4.0f;
+        Material mEm = Material.Solid(1.0f, 1.0f, 1.0f);
+        mEm.EmissiveRed = 1.0f;
+        mEm.EmissiveGreen = 1.0f;
+        mEm.EmissiveBlue = 1.0f;
+        mEm.EmissiveMapKey = emKey;
+        nEm.Material = mEm;
+        rootEm.AddChild(nEm);
+
+        RenderPlan planEm = new RenderPlan(cam);
+        planEm.AmbientRed = 0.0f;
+        planEm.AmbientGreen = 0.0f;
+        planEm.AmbientBlue = 0.0f;
+        planEm.Build(rootEm);
+
+        canvas.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(canvas, planEm);
+        int emLeft = zan_gui_read_pixel(canvas.SurfaceId(), 40, 64);
+        int emRight = zan_gui_read_pixel(canvas.SurfaceId(), 88, 64);
+        bool emissiveOk = emBaked > 0
+            && ROf(emLeft) < 30 && GOf(emLeft) > 200 && BOf(emLeft) > 200
+            && ROf(emRight) < 15 && GOf(emRight) < 15 && BOf(emRight) < 15;
+        Console.WriteLine("gpu-emissive-map-unit4: " + Convert.ToString(emissiveOk ? 1 : 0));
+
+        // 2. GPU UV 变换（scale/offset）：左红右绿纹理，UvScaleU=0.5, UvOffsetU=0.5 仅采右半绿区铺满整张面片
+        SceneNode rootUv = new SceneNode("root_uv");
+        SceneNode nUv = new SceneNode("uv_quad");
+        nUv.MeshKey = quadHandle;
+        nUv.BoundsRadius = 4.0f;
+        Material mUv = Material.Solid(1.0f, 1.0f, 1.0f);
+        mUv.TextureKey = splitKey;
+        mUv.UvScaleU = 0.5f;
+        mUv.UvScaleV = 1.0f;
+        mUv.UvOffsetU = 0.5f;
+        mUv.UvOffsetV = 0.0f;
+        nUv.Material = mUv;
+        rootUv.AddChild(nUv);
+
+        RenderPlan planUv = new RenderPlan(cam);
+        planUv.AmbientRed = 1.0f;
+        planUv.AmbientGreen = 1.0f;
+        planUv.AmbientBlue = 1.0f;
+        planUv.Build(rootUv);
+
+        canvas.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(canvas, planUv);
+        int uvLeft = zan_gui_read_pixel(canvas.SurfaceId(), 40, 64);
+        int uvRight = zan_gui_read_pixel(canvas.SurfaceId(), 88, 64);
+        bool uvOk = uvBaked > 0
+            && GOf(uvLeft) > 200 && ROf(uvLeft) < 30
+            && GOf(uvRight) > 200 && ROf(uvRight) < 30;
+        Console.WriteLine("gpu-uv-transform-scale-offset: " + Convert.ToString(uvOk ? 1 : 0));
+
+        // 3. glTF 2.0 emissiveTexture 解析 + FlipbookUv3D 序列帧/滚动辅助验证
+        string gltfJson = "{\"asset\":{\"version\":\"2.0\"},"
+            + "\"images\":[{\"name\":\"glow_img\"}],"
+            + "\"textures\":[{\"source\":0}],"
+            + "\"materials\":[{\"name\":\"neon\",\"emissiveFactor\":[1.0,0.5,0.25],\"emissiveTexture\":{\"index\":0}}]}";
+        GltfModel model = GltfLoader.LoadGltfBytes(Encoding.UTF8.GetBytes(gltfJson), null, "");
+        bool gltfOk = model != null && model.MaterialCount == 1
+            && model.Materials[0].EmissiveTextureIndex == 0
+            && model.Materials[0].EmissiveR > 0.99f
+            && model.Materials[0].EmissiveG > 0.49f && model.Materials[0].EmissiveG < 0.51f;
+
+        Material fbMat = new Material();
+        FlipbookUv3D.ApplyFrame(fbMat, 4, 2, 5);
+        bool flipOk = fbMat.UvScaleU > 0.24f && fbMat.UvScaleU < 0.26f
+            && fbMat.UvScaleV > 0.49f && fbMat.UvScaleV < 0.51f
+            && fbMat.UvOffsetU > 0.24f && fbMat.UvOffsetU < 0.26f
+            && fbMat.UvOffsetV > 0.49f && fbMat.UvOffsetV < 0.51f;
+
+        FlipbookUv3D.ApplyScroll(fbMat, 2.0f, 3.0f, 1.25f, -0.25f);
+        bool scrollOk = fbMat.UvScaleU > 1.99f && fbMat.UvScaleV > 2.99f
+            && fbMat.UvOffsetU > 0.24f && fbMat.UvOffsetU < 0.26f
+            && fbMat.UvOffsetV > 0.74f && fbMat.UvOffsetV < 0.76f;
+
+        Console.WriteLine("gltf-emissive-flipbook-uv: " + Convert.ToString((gltfOk && flipOk && scrollOk) ? 1 : 0));
+        renderer.Dispose();
+    }
+}

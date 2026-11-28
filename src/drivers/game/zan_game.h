@@ -38,9 +38,17 @@ ZAN_GAME_API int32_t zan_game_draw3d(int32_t surface_id, int32_t mesh,
 ZAN_GAME_API int32_t zan_game_draw3d_ex(int32_t surface_id, int32_t mesh,
     const float *mvp, const float *model, int32_t color, const char *texture);
 
-/* Alpha 透明混合与深度写入状态控制（应用于后续 draw3d / draw3d_ex /
- * draw3d_skinned / draw3d_batch）。默认 enabled=0, depth_write=1。 */
+/* Alpha/Additive 混合与深度写入状态控制（应用于后续 draw3d / draw3d_ex /
+ * draw3d_skinned / draw3d_batch）。
+ * enabled: 0 = 关闭混合（不透明），1 = 标准 Alpha 混合（SRC_ALPHA, ONE_MINUS_SRC_ALPHA），
+ *          2 = 加法辉光混合（SRC_ALPHA, ONE，用于火焰/剑光/能量拖尾 VFX）。
+ * 默认 enabled=0, depth_write=1。 */
 ZAN_GAME_API int32_t zan_game_set_blend3d(int32_t enabled, int32_t depth_write);
+
+/* 硬件面剔除状态控制（已自动适配 Canvas FBO 顶下 Y 翻转绕序，标准 CCW 正面保持为正面）：
+ * mode: 0 = 关闭剔除（双面 DoubleSided），1 = 剔除背面（Back，闭合实体 ~2x 像素填充提速），
+ *       2 = 剔除正面（Front）。默认 mode=0。 */
+ZAN_GAME_API int32_t zan_game_set_cull3d(int32_t mode);
 
 /* 多 Pass 3D 帧深度缓冲复用边界：begin_frame3d 清一次深度缓冲并开启跨调用
  * 深度保留（不透明静态 + 蒙皮角色 + 透明层共享同一 24-bit 深度缓冲）；
@@ -147,6 +155,34 @@ ZAN_GAME_API void zan_game_set_pbr_maps3d(const char *orm_texture,
  * alpha < cutoff 时执行 discard（跳过颜色与深度写入，用于树叶/栅栏/毛发卡片）；
  * cutoff <= 0 关闭裁切。 */
 ZAN_GAME_API void zan_game_set_alpha_cutoff3d(float cutoff);
+
+/* glTF 2.0 自发光贴图（纹理单元 4）：片元自发光 = uEmissive * texture(uEmissiveMap, v_uv).rgb，
+ * 用于局部发光纹理（霓虹/符文/角色眼部/仪表盘）并可直接驱动 Bloom 泛光；texture 为空关闭采样。 */
+ZAN_GAME_API void zan_game_set_emissive_map3d(const char *texture);
+
+/* GPU UV 平铺与滚动变换（KHR_texture_transform / 纹理序列帧 Flipbook / 流水特效）：
+ * 顶点着色器输出 v_uv = a_uv * vec2(scale_u, scale_v) + vec2(offset_u, offset_v)。
+ * 缺省 (1, 1, 0, 0) 为恒等变换。 */
+ZAN_GAME_API void zan_game_set_uv_transform3d(float scale_u, float scale_v,
+    float offset_u, float offset_v);
+
+/* GPU 菲涅尔轮廓边缘光（Rim Light，用于 3D 动作/二次元角色轮廓高光与受击闪白）：
+ * rgb 为边缘光线性颜色（全 0 关闭，零开销），power 为锐度指数（推荐 2.0..5.0）。 */
+ZAN_GAME_API void zan_game_set_rim_light3d(float r, float g, float b, float power);
+
+/* GPU 后处理调色参数（在 zan_game_postprocess3d 色调映射后、暗角前生效，零额外 Pass）：
+ * saturation（0=黑白, 1=原色, >1 增饱和）、contrast（1=原对比度）、tint RGB（1,1,1=无偏色）。 */
+ZAN_GAME_API void zan_game_set_color_grade3d(float saturation, float contrast,
+    float tint_r, float tint_g, float tint_b);
+
+/* GPU 风格化卡通/二次元色阶量化（Toon / Cel Shading）：
+ * bands >= 2.0 开启漫反射色阶量化（推荐 3..5 阶），< 2.0 关闭还原 PBR 连续着色；
+ * specular_step 控制高光硬边阈值（推荐 0.25..0.55）。 */
+ZAN_GAME_API void zan_game_set_toon_shading3d(float bands, float specular_step);
+
+/* GPU 后处理 FXAA 抗锯齿与径向色差镜头特效（零额外 Pass，在 zan_game_postprocess3d 中生效）：
+ * fxaa_strength [0..1] 控制边缘亮度抗锯齿强度；chromatic_strength [0..0.1] 控制径向红蓝分离强度。 */
+ZAN_GAME_API void zan_game_set_post_lens3d(float fxaa_strength, float chromatic_strength);
 
 #ifdef __cplusplus
 }

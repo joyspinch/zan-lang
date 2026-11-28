@@ -31,110 +31,226 @@ public class ExternalTarget {
 
     // 严格解析绝对 HTTP(S) URL。失败返回 null；不会把输入
     // 猜测修正为另一个 URL。拒绝项：空串、空格/控制字符、片段 "#"、
-    // 反斜杠 "\"、userinfo "@"、百分号编码 "%"；端口限 1-65535；主机须为
+    // 反斜杠 "\"、userinfo "@"、非法百分号编码 "%"；端口限 1-65535；主机须为
     // 严格 IPv4/IPv6 字面量或合法 DNS 名（拒绝 localhost、.local/.localhost
     // 结尾、空标签、连字符位置非法）。path 恒以 "/" 开头；query 保留 "?"
     // 前缀原样返回，不做解码。
     public static ExternalTarget Parse(string url) {
-        if (!ExternalTarget.ValidText(url)) { return null; }
-        int sep = url.IndexOf("://");
-        if (sep <= 0) { return null; }
-        string scheme = ExternalTarget.AsciiLowerSlice(url, 0, sep);
-        if (scheme != "http" && scheme != "https") { return null; }
-        string rest = url.Substring(sep + 3, url.Length - sep - 3);
-        if (rest.Length == 0 || rest.Contains("#") || rest.Contains("\\")
-            || rest.Contains("@")) { return null; }
+        if (url == null) { return null; }
+        int n = url.Length;
+        if (n < 8) { return null; }
 
-        int slash = rest.IndexOf("/");
-        int question = rest.IndexOf("?");
-        int cut = slash;
-        if (cut < 0 || (question >= 0 && question < cut)) { cut = question; }
-        string authority = cut < 0 ? rest : rest.Substring(0, cut);
-        string tail = cut < 0 ? "" : rest.Substring(cut, rest.Length - cut);
-        if (authority.Length == 0) { return null; }
-
-        ExternalTarget t = new ExternalTarget();
-        t.scheme = scheme;
-        t.port = scheme == "https" ? NetConstants.PortHttps : NetConstants.PortHttp;
-        string h = "";
-        int explicitPort = 0;
-        if (authority.StartsWith("[")) {
-            int close = authority.IndexOf("]");
-            if (close < 0) { return null; }
-            h = ExternalTarget.AsciiLowerSlice(authority, 1, close - 1);
-            if (!ExternalTarget.ValidIPv6(h)) { return null; }
-            t.literal = true;
-            if (close + 1 < authority.Length) {
-                explicitPort = ExternalTarget.PortOf(authority, close + 1);
-                if (explicitPort < 0) { return null; }
-            }
-            if (explicitPort > 0) { t.port = explicitPort; }
-        } else {
-            if (authority.IndexOf("[") >= 0 || authority.IndexOf("]") >= 0) {
+        int c0 = url[0] & 255;
+        int c1 = url[1] & 255;
+        int c2 = url[2] & 255;
+        int c3 = url[3] & 255;
+        if ((c0 | 32) != 104 || (c1 | 32) != 116 || (c2 | 32) != 116 || (c3 | 32) != 112) {
+            return null;
+        }
+        bool isHttps = false;
+        int authStart = 0;
+        bool schemeLower = (c0 == 104 && c1 == 116 && c2 == 116 && c3 == 112);
+        int c4 = url[4] & 255;
+        if (c4 == 58) {
+            if ((url[5] & 255) != 47 || (url[6] & 255) != 47) { return null; }
+            authStart = 7;
+        } else if ((c4 | 32) == 115) {
+            if (n < 9 || (url[5] & 255) != 58 || (url[6] & 255) != 47 || (url[7] & 255) != 47) {
                 return null;
             }
-            int colon = authority.IndexOf(":");
-            if (colon >= 0) {
-                if (authority.IndexOf(":", colon + 1) >= 0 ||
-                    colon == authority.Length - 1) { return null; }
-                h = ExternalTarget.AsciiLowerSlice(authority, 0, colon);
-                explicitPort = ExternalTarget.PortOf(authority, colon);
-                if (explicitPort < 0) { return null; }
-                if (explicitPort > 0) { t.port = explicitPort; }
-            } else {
-                h = ExternalTarget.AsciiLowerSlice(authority, 0, authority.Length);
-            }
-            if (ExternalTarget.ValidIPv4(h)) {
-                t.literal = true;
-            } else if (!ExternalTarget.ValidDnsName(h)) {
-                return null;
-            }
-        }
-        if (h.Length == 0) { return null; }
-        if (tail == "") {
-            t.path = "/";
-            t.query = "";
-        } else if (tail.StartsWith("?")) {
-            t.path = "/";
-            t.query = tail;
+            isHttps = true;
+            authStart = 8;
+            if (c4 != 115) { schemeLower = false; }
         } else {
-            int q = tail.IndexOf("?");
-            if (q < 0) {
-                t.path = tail;
-                t.query = "";
-            } else {
-                t.path = tail.Substring(0, q);
-                t.query = tail.Substring(q, tail.Length - q);
-            }
-            if (t.path == "") { t.path = "/"; }
+            return null;
         }
-        if (!t.path.StartsWith("/")) { return null; }
-        // % 只能以合法的百分号编码三元组出现（%XX，XX 为十六进制），
-        // 且不得出现在 authority 里——否则视为畸形目标拒收。官方发行
-        // 文件名带空格（"Firefox Setup 158.0.1.exe"）必须以 %20 过境。
-        if (rest.IndexOf("%") >= 0) {
-            for (int i = 0; i < rest.Length; i = i + 1) {
-                if (rest[i] != '%') { continue; }
-                if (i + 2 >= rest.Length || rest[i + 1] == '/'
-                    || !ExternalTarget.IsHex(rest[i + 1])
-                    || !ExternalTarget.IsHex(rest[i + 2])) {
-                    return null;
+        if (authStart >= n) { return null; }
+
+        // 单遍扫描 [authStart..n)：拒绝控制/空格/#/\ /@，记录首个 / 与 ? 并校验 %XX。
+        int slash = -1;
+        int question = -1;
+        int cut = -1;
+        for (int i = authStart; i < n; i = i + 1) {
+            int c = url[i] & 255;
+            if (c <= 32 || c == 127 || c == 35 || c == 92 || c == 64) { return null; }
+            if (c == 47) {
+                if (slash < 0) {
+                    slash = i;
+                    if (cut < 0) { cut = i; }
                 }
-                if (i < cut) { return null; }  // authority 里不允许 %。
+            } else if (c == 63) {
+                if (question < 0) {
+                    question = i;
+                    if (cut < 0) { cut = i; }
+                }
+            } else if (c == 37) {
+                // authority 内不允许 %；tail 内必须为合法 %XX（且次字节不为 '/'）。
+                if (cut < 0) { return null; }
+                if (i + 2 >= n) { return null; }
+                int h1 = url[i + 1] & 255;
+                int h2 = url[i + 2] & 255;
+                if (!ExternalTarget.IsHex(h1) || !ExternalTarget.IsHex(h2)) { return null; }
                 i = i + 2;
             }
         }
-        t.host = h;
-        t.loopback = ExternalTarget.IsLoopbackHost(h);
-        t.safeLiteral = !t.literal || ExternalTarget.SafeLiteral(h);
-        string authorityOut = t.host;
-        if (t.literal && h.IndexOf(":") >= 0) {
-            authorityOut = "[" + h + "]";
+
+        int authEnd = cut < 0 ? n : cut;
+        if (authEnd <= authStart) { return null; }
+
+        int defaultPort = isHttps ? NetConstants.PortHttps : NetConstants.PortHttp;
+        int port = defaultPort;
+        int explicitPort = 0;
+        bool portLeadingZero = false;
+        bool isLiteral = false;
+        bool isV6 = false;
+        bool isLoopback = false;
+        bool isSafe = true;
+        bool hostHasUpper = false;
+        int hostStart = authStart;
+        int hostEnd = authEnd;
+
+        if ((url[authStart] & 255) == 91) {
+            int close = -1;
+            for (int i = authStart + 1; i < authEnd; i = i + 1) {
+                if ((url[i] & 255) == 93) { close = i; break; }
+            }
+            if (close < 0) { return null; }
+            hostStart = authStart + 1;
+            hostEnd = close;
+            if (hostEnd <= hostStart) { return null; }
+            long v6Hi = 0L;
+            long v6Lo = 0L;
+            if (!ExternalTarget.TryParseIPv6Slice(url, hostStart, hostEnd, out v6Hi, out v6Lo, out hostHasUpper)) {
+                return null;
+            }
+            isLiteral = true;
+            isV6 = true;
+            if (close + 1 < authEnd) {
+                explicitPort = ExternalTarget.PortOfSlice(url, close + 1, authEnd);
+                if (explicitPort < 0) { return null; }
+                if (explicitPort > 0) {
+                    port = explicitPort;
+                    portLeadingZero = (url[close + 2] & 255) == 48;
+                }
+            }
+            isLoopback = (v6Hi == 0L && v6Lo == 1L);
+            isSafe = ExternalTarget.IsSafeIPv6(v6Hi, v6Lo);
+        } else {
+            int colon = -1;
+            for (int i = authStart; i < authEnd; i = i + 1) {
+                int c = url[i] & 255;
+                if (c == 91 || c == 93) { return null; }
+                if (c == 58) {
+                    if (colon >= 0) { return null; }
+                    colon = i;
+                }
+            }
+            if (colon >= 0) {
+                if (colon == authEnd - 1) { return null; }
+                hostEnd = colon;
+                explicitPort = ExternalTarget.PortOfSlice(url, colon, authEnd);
+                if (explicitPort < 0) { return null; }
+                if (explicitPort > 0) {
+                    port = explicitPort;
+                    portLeadingZero = (url[colon + 1] & 255) == 48;
+                }
+            }
+            if (hostEnd <= hostStart) { return null; }
+
+            int v4Packed = 0;
+            if (ExternalTarget.TryParseIPv4Slice(url, hostStart, hostEnd, out v4Packed)) {
+                isLiteral = true;
+                isLoopback = ((v4Packed >> 24) & 255) == 127;
+                isSafe = ExternalTarget.IsSafeIPv4(v4Packed);
+            } else {
+                if (!ExternalTarget.ValidDnsNameSlice(url, hostStart, hostEnd, out hostHasUpper)) {
+                    return null;
+                }
+            }
         }
-        if (t.port != (scheme == "https" ? NetConstants.PortHttps : NetConstants.PortHttp)) {
-            authorityOut = authorityOut + ":" + Convert.ToString(t.port);
+
+        string hostStr = hostHasUpper
+            ? ExternalTarget.AsciiLowerSlice(url, hostStart, hostEnd - hostStart)
+            : url.Substring(hostStart, hostEnd - hostStart);
+
+        string pathStr = "/";
+        string queryStr = "";
+        bool hasRealSlashPath = false;
+        if (cut >= 0) {
+            if ((url[cut] & 255) == 63) {
+                queryStr = url.Substring(cut, n - cut);
+            } else {
+                hasRealSlashPath = true;
+                if (question < 0) {
+                    pathStr = url.Substring(cut, n - cut);
+                } else {
+                    pathStr = url.Substring(cut, question - cut);
+                    queryStr = url.Substring(question, n - question);
+                }
+            }
         }
-        t.canonical = scheme + "://" + authorityOut + t.path + t.query;
+
+        string schemeStr = isHttps ? "https" : "http";
+        string canonicalStr = "";
+        bool portOmittedOrCanonical = (explicitPort == 0)
+            || (explicitPort != defaultPort && !portLeadingZero);
+        if (schemeLower && !hostHasUpper && portOmittedOrCanonical && hasRealSlashPath) {
+            canonicalStr = url;
+        } else {
+            int pLen = 0;
+            byte[] pBuf = null;
+            if (port != defaultPort) {
+                pBuf = new byte[8];
+                int tmp = port;
+                int idx = 8;
+                while (tmp > 0) {
+                    int q = tmp / 10;
+                    idx = idx - 1;
+                    pBuf[idx] = (byte)(48 + (tmp - q * 10));
+                    tmp = q;
+                }
+                pLen = 8 - idx;
+            }
+            int sLen = schemeStr.Length;
+            int hLen = hostStr.Length;
+            int pathLen = pathStr.Length;
+            int qLen = queryStr.Length;
+            int total = sLen + 3 + (isV6 ? hLen + 2 : hLen) + (pLen > 0 ? pLen + 1 : 0) + pathLen + qLen;
+            byte[] outBuf = new byte[total];
+            nint obp = (nint)outBuf;
+            int dst = 0;
+            NativeMemory.Copy(obp, (nint)schemeStr, sLen);
+            dst = sLen;
+            outBuf[dst] = 58; outBuf[dst + 1] = 47; outBuf[dst + 2] = 47;
+            dst = dst + 3;
+            if (isV6) { outBuf[dst] = 91; dst = dst + 1; }
+            NativeMemory.Copy(obp + (nint)dst, (nint)hostStr, hLen);
+            dst = dst + hLen;
+            if (isV6) { outBuf[dst] = 93; dst = dst + 1; }
+            if (pLen > 0) {
+                outBuf[dst] = 58;
+                dst = dst + 1;
+                NativeMemory.Copy(obp + (nint)dst, (nint)pBuf + (nint)(8 - pLen), pLen);
+                dst = dst + pLen;
+            }
+            NativeMemory.Copy(obp + (nint)dst, (nint)pathStr, pathLen);
+            dst = dst + pathLen;
+            if (qLen > 0) {
+                NativeMemory.Copy(obp + (nint)dst, (nint)queryStr, qLen);
+            }
+            canonicalStr = NativeMemory.GetString(obp, 0, total);
+        }
+
+        ExternalTarget t = new ExternalTarget();
+        t.scheme = schemeStr;
+        t.host = hostStr;
+        t.path = pathStr;
+        t.query = queryStr;
+        t.canonical = canonicalStr;
+        t.port = port;
+        t.literal = isLiteral;
+        t.safeLiteral = isSafe;
+        t.loopback = isLoopback;
         return t;
     }
 
@@ -162,106 +278,119 @@ public class ExternalTarget {
     // 是否回环目标：127/8 IPv4 或 "::1"。
     public bool IsLoopback() { return this.loopback; }
 
-    // URL 文本预检：非空且不含控制字符与空格。
     private static bool IsHex(int c) {
-        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')
-            || (c >= 'A' && c <= 'F');
-    }
-
-    private static bool ValidText(string s) {
-        if (s == null || s.Length == 0) { return false; }
-        for (int i = 0; i < s.Length; i = i + 1) {
-            int c = s[i] & 255;
-            if (c < 32 || c == 127 || c == 32) { return false; }
-        }
-        return true;
+        return (c >= 48 && c <= 57) || (c >= 97 && c <= 102)
+            || (c >= 65 && c <= 70);
     }
 
     private static string AsciiLowerSlice(string s, int start, int len) {
         if (len <= 0) { return ""; }
-        bool hasUpper = false;
-        for (int i = 0; i < len; i = i + 1) {
-            int c = s[start + i] & 255;
-            if (c >= 65 && c <= 90) { hasUpper = true; break; }
-        }
-        if (!hasUpper) {
-            if (start == 0 && len == s.Length) { return s; }
-            return s.Substring(start, len);
-        }
         byte[] buf = new byte[len];
         for (int i = 0; i < len; i = i + 1) {
             int c = s[start + i] & 255;
             if (c >= 65 && c <= 90) { c = c + 32; }
             buf[i] = (byte)c;
         }
-        return buf.ToStr(0, len);
+        return NativeMemory.GetString((nint)buf, 0, len);
     }
 
-    // 解析 authority 从 at 起的 ":端口"：1-65535 返回端口，未写端口
-    // 返回 0，畸形返回 -1。
-    private static int PortOf(string authority, int at) {
-        if (at >= authority.Length) { return 0; }
-        if ((authority[at] & 255) != 58) { return -1; }
+    // 解析切片 [at..end) 起的 ":端口"：1-65535 返回端口，空返回 0，畸形返回 -1。
+    private static int PortOfSlice(string s, int at, int end) {
+        if (at >= end) { return 0; }
+        if ((s[at] & 255) != 58) { return -1; }
         int start = at + 1;
-        int len = authority.Length - start;
+        int len = end - start;
         if (len <= 0 || len > 5) { return -1; }
         int n = 0;
-        for (int i = start; i < authority.Length; i = i + 1) {
-            int c = authority[i] & 255;
+        for (int i = start; i < end; i = i + 1) {
+            int c = s[i] & 255;
             if (c < 48 || c > 57) { return -1; }
-            n = n * 10 + c - 48;
+            n = n * 10 + (c - 48);
         }
         if (n < 1 || n > 65535) { return -1; }
         return n;
     }
 
-    // 严格 DNS 名校验：小写字母/数字/连字符，标签 1-63 字符且不以
-    // 连字符开头/结尾，总长 ≤253；拒绝 localhost、"." 结尾和
-    // .localhost/.local 结尾。
-    private static bool ValidDnsName(string h) {
-        if (h.Length == 0 || h.Length > 253 || h == "localhost") { return false; }
-        if (h.EndsWith(".")) { return false; }
-        if (h.EndsWith(".localhost") || h.EndsWith(".local")) { return false; }
+    private static bool SliceEndsWithLower(string s, int start, int end, string suffix) {
+        int sLen = suffix.Length;
+        if (end - start < sLen) { return false; }
+        int baseIdx = end - sLen;
+        for (int i = 0; i < sLen; i = i + 1) {
+            int c = s[baseIdx + i] & 255;
+            if (c >= 65 && c <= 90) { c = c + 32; }
+            if (c != (suffix[i] & 255)) { return false; }
+        }
+        return true;
+    }
+
+    // 严格 DNS 名校验（直接切片零分配，同时记录是否存在大写字母）。
+    private static bool ValidDnsNameSlice(string s, int start, int end, out bool hasUpper) {
+        hasUpper = false;
+        int len = end - start;
+        if (len == 0 || len > 253) { return false; }
+        if ((s[end - 1] & 255) == 46) { return false; }
+        if (len == 9 && ExternalTarget.SliceEndsWithLower(s, start, end, "localhost")) { return false; }
+        if (ExternalTarget.SliceEndsWithLower(s, start, end, ".local")) { return false; }
+        if (ExternalTarget.SliceEndsWithLower(s, start, end, ".localhost")) { return false; }
         int label = 0;
-        for (int i = 0; i < h.Length; i = i + 1) {
-            int c = h[i] & 255;
+        int prev = 0;
+        for (int i = start; i < end; i = i + 1) {
+            int c = s[i] & 255;
             if (c == 46) {
-                if (label == 0 || h[i - 1] == '-') { return false; }
+                if (label == 0 || prev == 45) { return false; }
                 label = 0;
             } else {
-                if (!((c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == '-')) {
+                if (c >= 65 && c <= 90) {
+                    hasUpper = true;
+                } else if (!((c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 45)) {
                     return false;
                 }
-                if (label == 0 && c == '-') { return false; }
+                if (label == 0 && c == 45) { return false; }
                 label = label + 1;
                 if (label > 63) { return false; }
             }
+            prev = c;
         }
-        return label > 0 && h[h.Length - 1] != '-';
+        return label > 0 && prev != 45;
     }
 
-    // 严格 IPv4 校验：恰好 4 段、每段 0-255、拒绝前导零。
-    public static bool ValidIPv4(string h) {
+    // 严格 IPv4 切片解析：恰好 4 段、每段 0-255、拒绝前导零；成功返回 true 并输出打包 32 位大端值。
+    private static bool TryParseIPv4Slice(string h, int start, int end, out int packed) {
+        packed = 0;
+        int len = end - start;
+        if (len < 7 || len > 15) { return false; }
         int parts = 0;
         int value = 0;
         int digits = 0;
-        for (int i = 0; i <= h.Length; i = i + 1) {
-            if (i == h.Length || h[i] == '.') {
-                if (digits == 0 || value > 255 || (digits > 1 && h[i - digits] == '0')) {
+        int acc = 0;
+        for (int i = start; i <= end; i = i + 1) {
+            if (i == end || (h[i] & 255) == 46) {
+                if (digits == 0 || value > 255 || (digits > 1 && (h[i - digits] & 255) == 48)) {
                     return false;
                 }
+                if (parts >= 4) { return false; }
+                acc = (acc << 8) | value;
                 parts = parts + 1;
                 value = 0;
                 digits = 0;
             } else {
                 int c = h[i] & 255;
                 if (c < 48 || c > 57) { return false; }
-                value = value * 10 + c - 48;
+                value = value * 10 + (c - 48);
                 digits = digits + 1;
                 if (digits > 3) { return false; }
             }
         }
-        return parts == 4;
+        if (parts != 4) { return false; }
+        packed = acc;
+        return true;
+    }
+
+    // 严格 IPv4 校验：恰好 4 段、每段 0-255、拒绝前导零。
+    public static bool ValidIPv4(string h) {
+        if (h == null) { return false; }
+        int packed = 0;
+        return ExternalTarget.TryParseIPv4Slice(h, 0, h.Length, out packed);
     }
 
     // 单个十六进制字符 → 0..15；非法返回 -1。
@@ -274,6 +403,7 @@ public class ExternalTarget {
 
     // 解析 1-4 位十六进制组；越界/非法返回 -1。
     public static int ParseHex(string s) {
+        if (s == null) { return -1; }
         return ExternalTarget.ParseHexSlice(s, 0, s.Length);
     }
 
@@ -283,183 +413,170 @@ public class ExternalTarget {
         for (int i = 0; i < len; i = i + 1) {
             int v = ExternalTarget.HexValue(s[start + i] & 255);
             if (v < 0) { return -1; }
-            n = n * 16 + v;
+            n = (n << 4) | v;
         }
         return n;
     }
 
-    // 严格 IPv6 校验（纯十六进制组形式，含一个 "::" 压缩或恰好 8 组）；
-    // 拒绝内嵌 IPv4 尾段。空组只在属于唯一的 "::" 压缩时合法：
-    // "::1"（前导压缩）、"2001:db8::"（尾随压缩）此前被
-    // i==0 / i==len 分支整体错杀，而它们正是回环与常见形态。
-    public static bool ValidIPv6(string h) {
-        if (h.Length < 2 || h.Contains(".")) { return false; }
-        int first = h.IndexOf("::");
-        if (first >= 0 && h.IndexOf("::", first + 2) >= 0) { return false; }
-        if (h.IndexOf(":::") >= 0) { return false; }
-        int groups = 0;
-        int start = 0;
-        int len = h.Length;
-        for (int i = 0; i <= len; i = i + 1) {
-            if (i == len || (h[i] & 255) == 58) {  // ':'
-                if (i > start) {
-                    if (ExternalTarget.ParseHexSlice(h, start, i - start) < 0) { return false; }
-                    groups = groups + 1;
-                } else if (i == 0) {
-                    if (first != 0) { return false; }
-                } else if (i == len) {
-                    if (first != len - 2) { return false; }
-                } else if ((h[i - 1] & 255) != 58) {
-                    return false;
-                }
-                start = i + 1;
-            }
-        }
-        if (first >= 0) { return groups < 8; }
-        return groups == 8;
-    }
+    // 单遍零分配解析严格纯十六进制 IPv6 切片为两个大端 64 位整数 (hi, lo)。
+    private static bool TryParseIPv6Slice(string h, int start, int end,
+                                          out long hi, out long lo, out bool hasUpper) {
+        hi = 0L;
+        lo = 0L;
+        hasUpper = false;
+        int len = end - start;
+        if (len < 2 || len > 39) { return false; }
 
-    // 将严格纯十六进制 IPv6 字面量规范解析为 16 字节大端数组；非法返回 null。
-    private static byte[] ParseIPv6Bytes(string h) {
-        if (h == null || h.Length < 2 || h.Contains(".")) { return null; }
-        int first = h.IndexOf("::");
-        if (first >= 0 && h.IndexOf("::", first + 2) >= 0) { return null; }
-        if (h.IndexOf(":::") >= 0) { return null; }
-        int[] left = new int[8];
+        int dcolon = -1;
+        int g0 = 0; int g1 = 0; int g2 = 0; int g3 = 0;
+        int g4 = 0; int g5 = 0; int g6 = 0; int g7 = 0;
+        int r0 = 0; int r1 = 0; int r2 = 0; int r3 = 0;
+        int r4 = 0; int r5 = 0; int r6 = 0;
         int leftCount = 0;
-        int[] right = new int[8];
         int rightCount = 0;
         bool inRight = false;
-        int start = 0;
-        int len = h.Length;
-        for (int i = 0; i <= len; i = i + 1) {
-            if (i == len || (h[i] & 255) == 58) { // ':'
-                if (i > start) {
-                    int val = ExternalTarget.ParseHexSlice(h, start, i - start);
-                    if (val < 0) { return null; }
+
+        int segStart = start;
+        for (int i = start; i <= end; i = i + 1) {
+            int c = i < end ? (h[i] & 255) : 58;
+            if (c == 46) { return false; }
+            if (c >= 65 && c <= 90) { hasUpper = true; }
+            if (c == 58) {
+                int segLen = i - segStart;
+                if (segLen > 0) {
+                    if (segLen > 4) { return false; }
+                    int val = 0;
+                    for (int k = segStart; k < i; k = k + 1) {
+                        int v = ExternalTarget.HexValue(h[k] & 255);
+                        if (v < 0) { return false; }
+                        val = (val << 4) | v;
+                    }
                     if (!inRight) {
-                        if (leftCount >= 8) { return null; }
-                        left[leftCount] = val;
+                        if (leftCount >= 8) { return false; }
+                        if (leftCount == 0) { g0 = val; }
+                        else if (leftCount == 1) { g1 = val; }
+                        else if (leftCount == 2) { g2 = val; }
+                        else if (leftCount == 3) { g3 = val; }
+                        else if (leftCount == 4) { g4 = val; }
+                        else if (leftCount == 5) { g5 = val; }
+                        else if (leftCount == 6) { g6 = val; }
+                        else { g7 = val; }
                         leftCount = leftCount + 1;
                     } else {
-                        if (rightCount >= 8) { return null; }
-                        right[rightCount] = val;
+                        if (rightCount >= 7) { return false; }
+                        if (rightCount == 0) { r0 = val; }
+                        else if (rightCount == 1) { r1 = val; }
+                        else if (rightCount == 2) { r2 = val; }
+                        else if (rightCount == 3) { r3 = val; }
+                        else if (rightCount == 4) { r4 = val; }
+                        else if (rightCount == 5) { r5 = val; }
+                        else { r6 = val; }
                         rightCount = rightCount + 1;
                     }
-                } else if (i == 0) {
-                    if (first != 0) { return null; }
+                } else if (i == start) {
+                    if (start + 1 >= end || (h[start + 1] & 255) != 58) { return false; }
+                    if (start + 2 < end && (h[start + 2] & 255) == 58) { return false; }
+                    dcolon = start;
                     inRight = true;
-                } else if (i == len) {
-                    if (first != len - 2) { return null; }
-                } else if ((h[i - 1] & 255) == 58) {
-                    inRight = true;
+                } else if (i == end) {
+                    if (dcolon != end - 2) { return false; }
                 } else {
-                    return null;
+                    if ((h[i - 1] & 255) != 58) { return false; }
+                    if (dcolon >= 0) {
+                        if (dcolon == start && i == start + 1) {
+                            // Leading "::" second colon: already handled.
+                        } else {
+                            return false;
+                        }
+                    } else {
+                        if (i + 1 < end && (h[i + 1] & 255) == 58) { return false; }
+                        dcolon = i - 1;
+                        inRight = true;
+                    }
                 }
-                start = i + 1;
+                segStart = i + 1;
             }
         }
-        int totalGroups = leftCount + rightCount;
-        if (first >= 0) {
-            if (totalGroups >= 8) { return null; }
+
+        int total = leftCount + rightCount;
+        if (dcolon >= 0) {
+            if (total >= 8) { return false; }
         } else {
-            if (totalGroups != 8) { return null; }
+            if (total != 8) { return false; }
         }
-        int[] groups = new int[8];
-        for (int i = 0; i < leftCount; i = i + 1) { groups[i] = left[i]; }
-        int zeroFill = 8 - totalGroups;
-        for (int i = 0; i < rightCount; i = i + 1) { groups[leftCount + zeroFill + i] = right[i]; }
-        byte[] bytes = new byte[16];
-        for (int i = 0; i < 8; i = i + 1) {
-            bytes[i * 2] = (byte)((groups[i] >> 8) & 255);
-            bytes[i * 2 + 1] = (byte)(groups[i] & 255);
-        }
-        return bytes;
-    }
 
-    // 主机是否为回环地址：IPv4 第一段为 127，或规范解析后等于 ::1（覆盖 0:0:0:0:0:0:0:1 / 0::1 等写法）。
-    private static bool IsLoopbackHost(string h) {
-        if (ValidIPv4(h)) {
-            return h.StartsWith("127.");
-        }
-        byte[] b = ExternalTarget.ParseIPv6Bytes(h);
-        if (b == null) { return false; }
-        for (int i = 0; i < 15; i = i + 1) {
-            if ((b[i] & 255) != 0) { return false; }
-        }
-        return (b[15] & 255) == 1;
-    }
-
-    // 判定字面量地址是否安全公网。IPv4 排除：0/8、10/8、127/8、
-    // 224/4 及以上（组播+保留）、169.254/16、172.16/12、192.0.0/24、
-    // 192.168/16、100.64/10、198.18/15、198.51.100/24、203.0.113/24、
-    // 255.255.255.255。IPv6 规范化为 16 字节后排除：::/96（含 ::、::1、IPv4 兼容）、
-    // ::ffff:0:0/96（IPv4 映射）、64:ff9b::/96（NAT64）、100::/64、fe80::/10、fec0::/10、
-    // fc00::/7、ff00::/8、2001:db8::/32。
-    private static bool SafeLiteral(string h) {
-        if (ValidIPv4(h)) {
-            int a = 0;
-            int b = 0;
-            int c = 0;
-            int d = 0;
-            int part = 0;
-            int val = 0;
-            for (int i = 0; i <= h.Length; i = i + 1) {
-                if (i == h.Length || (h[i] & 255) == 46) {
-                    if (part == 0) { a = val; }
-                    else if (part == 1) { b = val; }
-                    else if (part == 2) { c = val; }
-                    else if (part == 3) { d = val; }
-                    part = part + 1;
-                    val = 0;
-                } else {
-                    val = val * 10 + (h[i] & 255) - 48;
-                }
+        if (rightCount > 0) {
+            int baseIdx = 8 - rightCount;
+            for (int ri = 0; ri < rightCount; ri = ri + 1) {
+                int rv = ri == 0 ? r0 : (ri == 1 ? r1 : (ri == 2 ? r2
+                    : (ri == 3 ? r3 : (ri == 4 ? r4 : (ri == 5 ? r5 : r6)))));
+                int idx = baseIdx + ri;
+                if (idx == 1) { g1 = rv; }
+                else if (idx == 2) { g2 = rv; }
+                else if (idx == 3) { g3 = rv; }
+                else if (idx == 4) { g4 = rv; }
+                else if (idx == 5) { g5 = rv; }
+                else if (idx == 6) { g6 = rv; }
+                else if (idx == 7) { g7 = rv; }
             }
-            if (a == 0 || a == 10 || a == 127 || a >= 224) { return false; }
-            if (a == 169 && b == 254) { return false; }
-            if (a == 172 && b >= 16 && b <= 31) { return false; }
-            if (a == 192 && (b == 168 || (b == 0 && c == 0))) { return false; }
-            if (a == 100 && b >= 64 && b <= 127) { return false; }
-            if (a == 198 && (b == 18 || b == 19 || b == 51)) { return false; }
-            if (a == 203 && b == 0 && c == 113) { return false; }
-            if (a == 255 && b == 255 && c == 255 && d == 255) { return false; }
-            return true;
         }
-        byte[] ip = ExternalTarget.ParseIPv6Bytes(h);
-        if (ip == null) { return false; }
-        int b0 = ip[0] & 255;
-        int b1 = ip[1] & 255;
-        int b2 = ip[2] & 255;
-        int b3 = ip[3] & 255;
-        // 检查前 10 字节是否全 0（覆盖 ::、::1、::/96、::ffff:0:0/96）
-        bool zero10 = true;
-        for (int i = 0; i < 10; i = i + 1) {
-            if ((ip[i] & 255) != 0) { zero10 = false; break; }
-        }
-        if (zero10) {
-            int b10 = ip[10] & 255;
-            int b11 = ip[11] & 255;
-            if ((b10 == 0 && b11 == 0) || (b10 == 255 && b11 == 255)) { return false; }
+
+        hi = (((long)g0 & 65535L) << 48)
+            | (((long)g1 & 65535L) << 32)
+            | (((long)g2 & 65535L) << 16)
+            | ((long)g3 & 65535L);
+        lo = (((long)g4 & 65535L) << 48)
+            | (((long)g5 & 65535L) << 32)
+            | (((long)g6 & 65535L) << 16)
+            | ((long)g7 & 65535L);
+        return true;
+    }
+
+    // 严格 IPv6 校验（纯十六进制组形式，含一个 "::" 压缩或恰好 8 组）；拒绝内嵌 IPv4 尾段。
+    public static bool ValidIPv6(string h) {
+        if (h == null) { return false; }
+        long hi = 0L;
+        long lo = 0L;
+        bool up = false;
+        return ExternalTarget.TryParseIPv6Slice(h, 0, h.Length, out hi, out lo, out up);
+    }
+
+    private static bool IsSafeIPv4(int packed) {
+        int a = (packed >> 24) & 255;
+        int b = (packed >> 16) & 255;
+        int c = (packed >> 8) & 255;
+        int d = packed & 255;
+        if (a == 0 || a == 10 || a == 127 || a >= 224) { return false; }
+        if (a == 169 && b == 254) { return false; }
+        if (a == 172 && b >= 16 && b <= 31) { return false; }
+        if (a == 192 && (b == 168 || (b == 0 && c == 0))) { return false; }
+        if (a == 100 && b >= 64 && b <= 127) { return false; }
+        if (a == 198 && (b == 18 || b == 19 || b == 51)) { return false; }
+        if (a == 203 && b == 0 && c == 113) { return false; }
+        if (a == 255 && b == 255 && c == 255 && d == 255) { return false; }
+        return true;
+    }
+
+    private static bool IsSafeIPv6(long hi, long lo) {
+        // ::/96（含 ::、::1、IPv4 兼容）与 ::ffff:0:0/96（IPv4 映射）
+        if (hi == 0L && ((lo >> 48) & 0xFFFFL) == 0L) {
+            long g5 = (lo >> 32) & 0xFFFFL;
+            if (g5 == 0L || g5 == 0xFFFFL) { return false; }
         }
         // NAT64 well-known prefix 64:ff9b::/96
-        if (b0 == 0 && b1 == 100 && b2 == 255 && b3 == 155) {
-            bool natZero = true;
-            for (int i = 4; i < 12; i = i + 1) {
-                if ((ip[i] & 255) != 0) { natZero = false; break; }
-            }
-            if (natZero) { return false; }
+        if (hi == 0x0064FF9B00000000L && ((lo >> 32) & 0xFFFFFFFFL) == 0L) {
+            return false;
         }
         // Discard-only 100::/64
-        if (b0 == 1 && b1 == 0 && b2 == 0 && b3 == 0
-            && (ip[4] & 255) == 0 && (ip[5] & 255) == 0
-            && (ip[6] & 255) == 0 && (ip[7] & 255) == 0) { return false; }
+        if (hi == 0x0100000000000000L) { return false; }
+        int b0 = (int)((hi >> 56) & 255L);
+        int b1 = (int)((hi >> 48) & 255L);
         // Link-local fe80::/10 & deprecated site-local fec0::/10
-        if (b0 == 254 && ((b1 & 192) == 128 || (b1 & 192) == 192)) { return false; }
+        if (b0 == 0xFE && (b1 & 0x80) != 0) { return false; }
         // Unique local fc00::/7 & multicast ff00::/8
-        if ((b0 & 254) == 252 || b0 == 255) { return false; }
+        if ((b0 & 0xFE) == 0xFC || b0 == 0xFF) { return false; }
         // Documentation 2001:db8::/32
-        if (b0 == 32 && b1 == 1 && b2 == 13 && b3 == 184) { return false; }
+        if (((hi >> 32) & 0xFFFFFFFFL) == 0x20010DB8L) { return false; }
         return true;
     }
 }

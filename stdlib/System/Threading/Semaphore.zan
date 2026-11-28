@@ -9,45 +9,93 @@ namespace System.Threading;
 public class Semaphore : IDisposable {
     private nint handle;
     private bool disposed;
+    private int activeOps;
 
     // 实例构造：创建具有指定初始许可和上限的信号量。
     public Semaphore(int initialCount, int maxCount) {
+        if (initialCount < 0 || maxCount <= 0 || initialCount > maxCount) {
+            throw new ArgumentOutOfRangeException("initialCount", "initialCount must be in [0, maxCount] and maxCount > 0");
+        }
         this.handle = Pal.Threading.CreateSemaphore(initialCount, maxCount);
+        if (this.handle == 0) {
+            throw new InvalidOperationException("Failed to create Semaphore");
+        }
         this.disposed = false;
+        this.activeOps = 0;
+    }
+
+    private nint AcquireHandle() {
+        lock (this) {
+            if (this.disposed || this.handle == 0) {
+                throw new ObjectDisposedException("Semaphore");
+            }
+            this.activeOps = this.activeOps + 1;
+            return this.handle;
+        }
+    }
+
+    private void ReleaseHandleRef() {
+        nint toDestroy = 0;
+        lock (this) {
+            if (this.activeOps > 0) {
+                this.activeOps = this.activeOps - 1;
+            }
+            if (this.disposed && this.activeOps == 0 && this.handle != 0) {
+                toDestroy = this.handle;
+                this.handle = 0;
+            }
+        }
+        if (toDestroy != 0) {
+            Pal.Threading.DestroySemaphore(toDestroy);
+        }
     }
 
     // 无限阻塞获取一个许可。
     public void WaitOne() {
-        if (this.disposed || this.handle == 0) {
-            throw new ObjectDisposedException("Semaphore");
+        nint h = this.AcquireHandle();
+        try {
+            Pal.Threading.WaitSemaphore(h);
+        } finally {
+            this.ReleaseHandleRef();
         }
-        Pal.Threading.WaitSemaphore(this.handle);
     }
 
     // 最多等待 `timeoutMs` 毫秒获取一个许可。
     // 获取到返回 true；超时返回 false（此时不消耗许可）。
     // 负超时无限等待，0 则轮询。
     public bool WaitOne(int timeoutMs) {
-        if (this.disposed || this.handle == 0) {
-            throw new ObjectDisposedException("Semaphore");
+        nint h = this.AcquireHandle();
+        try {
+            return Pal.Threading.WaitForSemaphore(h, timeoutMs);
+        } finally {
+            this.ReleaseHandleRef();
         }
-        return Pal.Threading.WaitForSemaphore(this.handle, timeoutMs);
     }
 
     // 归还一个许可。
     public void Release() {
-        if (this.disposed || this.handle == 0) {
-            throw new ObjectDisposedException("Semaphore");
+        nint h = this.AcquireHandle();
+        try {
+            Pal.Threading.ReleaseSemaphore(h);
+        } finally {
+            this.ReleaseHandleRef();
         }
-        Pal.Threading.ReleaseSemaphore(this.handle);
     }
 
     // 释放信号量底层原生句柄与资源。
     public void Dispose() {
-        if (!this.disposed && this.handle != 0) {
-            Pal.Threading.DestroySemaphore(this.handle);
-            this.handle = 0;
-            this.disposed = true;
+        nint toDestroy = 0;
+        lock (this) {
+            if (!this.disposed) {
+                this.disposed = true;
+                if (this.activeOps == 0 && this.handle != 0) {
+                    toDestroy = this.handle;
+                    this.handle = 0;
+                }
+            }
+        }
+        if (toDestroy != 0) {
+            Pal.Threading.DestroySemaphore(toDestroy);
         }
     }
 

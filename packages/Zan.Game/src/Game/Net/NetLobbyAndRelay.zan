@@ -1,0 +1,478 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Net;
+
+// 房间成员角色常量。
+public static class LobbyMemberRole {
+    public const int Player = 0;
+    public const int Spectator = 1;
+}
+
+// 联机房间成员条目。
+public class LobbyMember {
+    public int PeerId;
+    public string DisplayName;
+    public int Role;
+    public int TeamId;
+    public bool Ready;
+    public int JoinedSeq;
+
+    public LobbyMember(int peerId, string displayName, int role, int joinedSeq) {
+        this.PeerId = peerId;
+        this.DisplayName = displayName != null ? displayName : "";
+        this.Role = role;
+        this.TeamId = 0;
+        this.Ready = false;
+        this.JoinedSeq = joinedSeq;
+    }
+}
+
+// 商业联机房间/大厅状态机（支持加入码鉴权、玩家/观战双槽位、阵营分配、房主踢人与断线自动继承、全员就绪开局门控）。
+public class NetLobbyRoom {
+    public string RoomId;
+    public string JoinCode;
+    public int HostPeerId;
+    public int MaxPlayers;
+    public int MaxSpectators;
+    public int MinPlayersToStart;
+    public string MapName;
+    public string ModeName;
+    public bool Locked;
+
+    private List<LobbyMember> members;
+    private int nextJoinSeq;
+
+    public NetLobbyRoom(string roomId, string joinCode, int maxPlayers, int maxSpectators) {
+        this.RoomId = roomId != null ? roomId : "";
+        this.JoinCode = joinCode != null ? joinCode : "";
+        this.HostPeerId = 0;
+        this.MaxPlayers = maxPlayers > 0 ? maxPlayers : 4;
+        this.MaxSpectators = maxSpectators >= 0 ? maxSpectators : 2;
+        this.MinPlayersToStart = 2;
+        this.MapName = "default";
+        this.ModeName = "standard";
+        this.Locked = false;
+        this.members = new List<LobbyMember>();
+        this.nextJoinSeq = 0;
+    }
+
+    public int MemberCount { get { return this.members.Count; } }
+
+    public LobbyMember FindMember(int peerId) {
+        for (int i = 0; i < this.members.Count; i = i + 1) {
+            if (this.members[i].PeerId == peerId) { return this.members[i]; }
+        }
+        return null;
+    }
+
+    public int CountPlayers() {
+        int c = 0;
+        for (int i = 0; i < this.members.Count; i = i + 1) {
+            if (this.members[i].Role == LobbyMemberRole.Player) { c = c + 1; }
+        }
+        return c;
+    }
+
+    public int CountSpectators() {
+        int c = 0;
+        for (int i = 0; i < this.members.Count; i = i + 1) {
+            if (this.members[i].Role == LobbyMemberRole.Spectator) { c = c + 1; }
+        }
+        return c;
+    }
+
+    public int CountTeam(int teamId) {
+        int c = 0;
+        for (int i = 0; i < this.members.Count; i = i + 1) {
+            if (this.members[i].Role == LobbyMemberRole.Player && this.members[i].TeamId == teamId) {
+                c = c + 1;
+            }
+        }
+        return c;
+    }
+
+    // 加入房间（校验锁定状态、加入码、重入与容量；首位入房者自动成为房主）。
+    public bool TryJoin(int peerId, string displayName, string code, bool asSpectator) {
+        if (this.Locked || peerId <= 0) { return false; }
+        if (this.JoinCode != "" && code != this.JoinCode) { return false; }
+        if (this.FindMember(peerId) != null) { return false; }
+        if (asSpectator) {
+            if (this.CountSpectators() >= this.MaxSpectators) { return false; }
+        } else {
+            if (this.CountPlayers() >= this.MaxPlayers) { return false; }
+        }
+        this.nextJoinSeq = this.nextJoinSeq + 1;
+        int role = asSpectator ? LobbyMemberRole.Spectator : LobbyMemberRole.Player;
+        LobbyMember m = new LobbyMember(peerId, displayName, role, this.nextJoinSeq);
+        this.members.Add(m);
+        if (this.HostPeerId == 0) {
+            this.HostPeerId = peerId;
+        }
+        return true;
+    }
+
+    // 成员离房；若房主离开则按入房先后自动提拔下一位玩家（若无玩家则提拔最老观战者）。
+    public bool Leave(int peerId) {
+        int idx = -1;
+        for (int i = 0; i < this.members.Count; i = i + 1) {
+            if (this.members[i].PeerId == peerId) {
+                idx = i;
+                break;
+            }
+        }
+        if (idx < 0) { return false; }
+        this.members.RemoveAt(idx);
+        if (this.HostPeerId == peerId) {
+            this.ElectNewHost();
+        }
+        return true;
+    }
+
+    private void ElectNewHost() {
+        LobbyMember bestPlayer = null;
+        LobbyMember bestAny = null;
+        for (int i = 0; i < this.members.Count; i = i + 1) {
+            LobbyMember m = this.members[i];
+            if (bestAny == null || m.JoinedSeq < bestAny.JoinedSeq) {
+                bestAny = m;
+            }
+            if (m.Role == LobbyMemberRole.Player) {
+                if (bestPlayer == null || m.JoinedSeq < bestPlayer.JoinedSeq) {
+                    bestPlayer = m;
+                }
+            }
+        }
+        if (bestPlayer != null) {
+            this.HostPeerId = bestPlayer.PeerId;
+        } else if (bestAny != null) {
+            this.HostPeerId = bestAny.PeerId;
+        } else {
+            this.HostPeerId = 0;
+        }
+    }
+
+    public bool TryKick(int callerPeerId, int targetPeerId) {
+        if (callerPeerId != this.HostPeerId || targetPeerId == callerPeerId) { return false; }
+        return this.Leave(targetPeerId);
+    }
+
+    public bool TryTransferHost(int callerPeerId, int targetPeerId) {
+        if (callerPeerId != this.HostPeerId) { return false; }
+        if (this.FindMember(targetPeerId) == null) { return false; }
+        this.HostPeerId = targetPeerId;
+        return true;
+    }
+
+    public bool SetTeam(int peerId, int teamId) {
+        LobbyMember m = this.FindMember(peerId);
+        if (m == null || m.Role != LobbyMemberRole.Player) { return false; }
+        m.TeamId = teamId;
+        return true;
+    }
+
+    public bool SetReady(int peerId, bool ready) {
+        LobbyMember m = this.FindMember(peerId);
+        if (m == null) { return false; }
+        m.Ready = ready;
+        return true;
+    }
+
+    // 检查是否满足开局条件（未锁定、正式玩家数 >= MinPlayersToStart、所有正式玩家均已 Ready）。
+    public bool CanStartMatch() {
+        if (this.Locked) { return false; }
+        int players = 0;
+        for (int i = 0; i < this.members.Count; i = i + 1) {
+            LobbyMember m = this.members[i];
+            if (m.Role == LobbyMemberRole.Player) {
+                players = players + 1;
+                if (!m.Ready) { return false; }
+            }
+        }
+        return players >= this.MinPlayersToStart;
+    }
+}
+
+// 可靠有序 RPC/事件消息信封（UDP 之上承载技能释放、道具拾取、聊天、对局结算等不可丢事件）。
+public class ReliableEventPacket {
+    public int Seq;
+    public int Opcode;
+    public string Payload;
+    public long LastSentMs;
+    public int RetryCount;
+    public bool Acked;
+
+    public ReliableEventPacket(int seq, int opcode, string payload) {
+        this.Seq = seq;
+        this.Opcode = opcode;
+        this.Payload = payload != null ? payload : "";
+        this.LastSentMs = 0;
+        this.RetryCount = 0;
+        this.Acked = false;
+    }
+}
+
+// UDP 之上的商业级可靠有序事件通道（32-bit Selective Ack 位图 + 指数退避 RTO 重传 + 接收端去重保序投递）。
+public class NetReliableEventChannel {
+    public long BaseRtoMs;
+    public int MaxRetries;
+    public int TimedOutCount;
+
+    private int nextSendSeq;
+    private List<ReliableEventPacket> sendWindow;
+
+    private int nextExpectedRecvSeq;
+    private int remoteLatestSeq;
+    private uint recvAckBitfield;
+    private List<ReliableEventPacket> recvReorderBuffer;
+    private List<ReliableEventPacket> deliveredQueue;
+
+    public NetReliableEventChannel(long baseRtoMs, int maxRetries) {
+        this.BaseRtoMs = baseRtoMs > 10 ? baseRtoMs : 120;
+        this.MaxRetries = maxRetries > 0 ? maxRetries : 6;
+        this.TimedOutCount = 0;
+        this.nextSendSeq = 1;
+        this.sendWindow = new List<ReliableEventPacket>();
+        this.nextExpectedRecvSeq = 1;
+        this.remoteLatestSeq = 0;
+        this.recvAckBitfield = 0U;
+        this.recvReorderBuffer = new List<ReliableEventPacket>();
+        this.deliveredQueue = new List<ReliableEventPacket>();
+    }
+
+    public int PendingSendCount { get { return this.sendWindow.Count; } }
+
+    // 入队一条待可靠发送的 RPC/事件，返回分配的单调递增序列号 Seq。
+    public int EnqueueSend(int opcode, string payload) {
+        int seq = this.nextSendSeq;
+        this.nextSendSeq = this.nextSendSeq + 1;
+        this.sendWindow.Add(new ReliableEventPacket(seq, opcode, payload));
+        return seq;
+    }
+
+    // 收集本帧需要首次发送或 RTO 退避重传的包；超过 MaxRetries 的包自动淘汰并计入 TimedOutCount。
+    public List<ReliableEventPacket> CollectDueTransmissions(long nowMs) {
+        List<ReliableEventPacket> due = new List<ReliableEventPacket>();
+        int i = 0;
+        while (i < this.sendWindow.Count) {
+            ReliableEventPacket p = this.sendWindow[i];
+            if (p.Acked) {
+                this.sendWindow.RemoveAt(i);
+                continue;
+            }
+            if (p.RetryCount == 0) {
+                p.RetryCount = 1;
+                p.LastSentMs = nowMs;
+                due.Add(p);
+                i = i + 1;
+                continue;
+            }
+            int shift = p.RetryCount - 1;
+            if (shift > 4) { shift = 4; }
+            long rto = this.BaseRtoMs << shift;
+            if (nowMs - p.LastSentMs >= rto) {
+                if (p.RetryCount >= this.MaxRetries) {
+                    this.TimedOutCount = this.TimedOutCount + 1;
+                    this.sendWindow.RemoveAt(i);
+                    continue;
+                }
+                p.RetryCount = p.RetryCount + 1;
+                p.LastSentMs = nowMs;
+                due.Add(p);
+            }
+            i = i + 1;
+        }
+        return due;
+    }
+
+    // 处理对端回传的 Ack + 32-bit Selective Ack 位图（bit k 表示 ackSeq - 1 - k 已收到），确认并清理已达包。
+    public int ProcessAck(int ackSeq, uint ackBitfield) {
+        if (ackSeq <= 0) { return 0; }
+        int newlyAcked = 0;
+        int i = 0;
+        while (i < this.sendWindow.Count) {
+            ReliableEventPacket p = this.sendWindow[i];
+            bool hit = false;
+            if (p.Seq == ackSeq) {
+                hit = true;
+            } else if (p.Seq < ackSeq) {
+                int diff = ackSeq - p.Seq;
+                if (diff >= 1 && diff <= 32) {
+                    uint mask = 1U << (diff - 1);
+                    if ((ackBitfield & mask) != 0U) { hit = true; }
+                }
+            }
+            if (hit) {
+                p.Acked = true;
+                newlyAcked = newlyAcked + 1;
+                this.sendWindow.RemoveAt(i);
+            } else {
+                i = i + 1;
+            }
+        }
+        return newlyAcked;
+    }
+
+    // 接收一条来自对端的可靠包：更新 Selective Ack 位图、丢弃重复包、乱序缓存在保序窗口并在缺口补齐后严格按序交付。
+    public void ReceivePacket(int seq, int opcode, string payload) {
+        if (seq <= 0) { return; }
+        // 更新接收端 SACK 状态
+        if (this.remoteLatestSeq == 0) {
+            this.remoteLatestSeq = seq;
+            this.recvAckBitfield = 0U;
+        } else if (seq > this.remoteLatestSeq) {
+            int shift = seq - this.remoteLatestSeq;
+            if (shift >= 32) {
+                this.recvAckBitfield = 0U;
+            } else {
+                this.recvAckBitfield = (this.recvAckBitfield << shift) | (1U << (shift - 1));
+            }
+            this.remoteLatestSeq = seq;
+        } else if (seq < this.remoteLatestSeq) {
+            int diff = this.remoteLatestSeq - seq;
+            if (diff >= 1 && diff <= 32) {
+                this.recvAckBitfield = this.recvAckBitfield | (1U << (diff - 1));
+            }
+        }
+
+        // 丢弃已交付的老包或缓冲区内重复包
+        if (seq < this.nextExpectedRecvSeq) { return; }
+        for (int i = 0; i < this.recvReorderBuffer.Count; i = i + 1) {
+            if (this.recvReorderBuffer[i].Seq == seq) { return; }
+        }
+        this.recvReorderBuffer.Add(new ReliableEventPacket(seq, opcode, payload));
+
+        // 连续交付所有已就绪的期望序列号
+        bool advanced = true;
+        while (advanced) {
+            advanced = false;
+            for (int i = 0; i < this.recvReorderBuffer.Count; i = i + 1) {
+                if (this.recvReorderBuffer[i].Seq == this.nextExpectedRecvSeq) {
+                    this.deliveredQueue.Add(this.recvReorderBuffer[i]);
+                    this.recvReorderBuffer.RemoveAt(i);
+                    this.nextExpectedRecvSeq = this.nextExpectedRecvSeq + 1;
+                    advanced = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    // 获取当前应随心跳/下行包捎带回传的 (AckSeq, AckBitfield)。
+    public void BuildAckHeader(out int ackSeq, out uint ackBitfield) {
+        ackSeq = this.remoteLatestSeq;
+        ackBitfield = this.recvAckBitfield;
+    }
+
+    // 取出本帧已严格按序就绪的全部事件并清空交付队列。
+    public List<ReliableEventPacket> DrainDelivered() {
+        List<ReliableEventPacket> res = new List<ReliableEventPacket>();
+        for (int i = 0; i < this.deliveredQueue.Count; i = i + 1) {
+            res.Add(this.deliveredQueue[i]);
+        }
+        this.deliveredQueue.Clear();
+        return res;
+    }
+}
+
+// NAT 穿透连接状态常量。
+public static class NatPathState {
+    public const int Idle = 0;
+    public const int Punching = 1;
+    public const int DirectP2P = 2;
+    public const int Relayed = 3;
+    public const int Failed = 4;
+}
+
+// 商业联机 ICE-Lite 风格 UDP 打洞与 TURN/Relay 无缝降级协调器：
+// 并发向对端公网映射地址周期发探针，一旦双向握手成功立即升级直连 P2P；
+// 若遇到对称型 NAT 在超时窗口内无法直连，自动无感知回退至中继 Relay 节点保障 100% 连通率。
+public class NetNatTraversalSession {
+    public string LocalEndpoint;
+    public string RemoteReflexiveEndpoint;
+    public string RelayEndpoint;
+    public string ActiveEndpoint;
+    public int State;
+    public long PunchTimeoutMs;
+    public long PunchIntervalMs;
+    public int ProbesSent;
+    public bool ReceivedRemoteProbe;
+    public bool ReceivedRemotePong;
+
+    private long punchStartMs;
+    private long lastProbeMs;
+
+    public NetNatTraversalSession(string localEndpoint, long punchTimeoutMs, long punchIntervalMs) {
+        this.LocalEndpoint = localEndpoint != null ? localEndpoint : "";
+        this.RemoteReflexiveEndpoint = "";
+        this.RelayEndpoint = "";
+        this.ActiveEndpoint = "";
+        this.State = NatPathState.Idle;
+        this.PunchTimeoutMs = punchTimeoutMs > 100 ? punchTimeoutMs : 2500;
+        this.PunchIntervalMs = punchIntervalMs > 20 ? punchIntervalMs : 200;
+        this.ProbesSent = 0;
+        this.ReceivedRemoteProbe = false;
+        this.ReceivedRemotePong = false;
+        this.punchStartMs = 0;
+        this.lastProbeMs = -1000000;
+    }
+
+    public void StartPunch(string remoteReflexive, string relayEndpoint, long nowMs) {
+        this.RemoteReflexiveEndpoint = remoteReflexive != null ? remoteReflexive : "";
+        this.RelayEndpoint = relayEndpoint != null ? relayEndpoint : "";
+        this.ActiveEndpoint = "";
+        this.ProbesSent = 0;
+        this.ReceivedRemoteProbe = false;
+        this.ReceivedRemotePong = false;
+        this.punchStartMs = nowMs;
+        this.lastProbeMs = nowMs - this.PunchIntervalMs;
+        if (this.RemoteReflexiveEndpoint != "") {
+            this.State = NatPathState.Punching;
+        } else if (this.RelayEndpoint != "") {
+            this.State = NatPathState.Relayed;
+            this.ActiveEndpoint = this.RelayEndpoint;
+        } else {
+            this.State = NatPathState.Failed;
+        }
+    }
+
+    // 驱动打洞状态机：若本帧应向 RemoteReflexiveEndpoint 发送一次 UDP 打洞探针则返回 true；超时自动降级 Relay。
+    public bool Step(long nowMs) {
+        if (this.State != NatPathState.Punching) { return false; }
+        if (nowMs - this.punchStartMs >= this.PunchTimeoutMs) {
+            if (this.RelayEndpoint != "") {
+                this.State = NatPathState.Relayed;
+                this.ActiveEndpoint = this.RelayEndpoint;
+            } else {
+                this.State = NatPathState.Failed;
+                this.ActiveEndpoint = "";
+            }
+            return false;
+        }
+        if (nowMs - this.lastProbeMs >= this.PunchIntervalMs) {
+            this.lastProbeMs = nowMs;
+            this.ProbesSent = this.ProbesSent + 1;
+            return true;
+        }
+        return false;
+    }
+
+    // 收到对端发来的直连打洞探针（刷新目标端口并指示调用方回复 Pong）。
+    public bool OnRemoteProbeReceived(string fromEndpoint) {
+        if (this.State != NatPathState.Punching && this.State != NatPathState.DirectP2P) { return false; }
+        if (fromEndpoint != null && fromEndpoint != "") {
+            this.RemoteReflexiveEndpoint = fromEndpoint;
+        }
+        this.ReceivedRemoteProbe = true;
+        return true;
+    }
+
+    // 收到对端直连 Pong 确认：双向映射打通，立即晋升为低延迟 DirectP2P 路径。
+    public void OnRemotePongReceived() {
+        if (this.State == NatPathState.Punching || this.State == NatPathState.Relayed) {
+            this.ReceivedRemotePong = true;
+            this.State = NatPathState.DirectP2P;
+            this.ActiveEndpoint = this.RemoteReflexiveEndpoint;
+        }
+    }
+}

@@ -1,0 +1,180 @@
+using System;
+using System.Numerics;
+using System.Text;
+using Gui;
+using Game.Graphics;
+using Game.Render3D;
+using Game.Assets;
+
+namespace Conf;
+
+class Game3DCullAdditiveVfxTest {
+    [DllImport("zan_gui")]
+    private static extern int zan_gui_read_pixel(int surfaceId, int x, int y);
+
+    // 标准 CCW 正面四边形（面向 +Z 相机）
+    private static Mesh3D MakeFrontQuad(float halfW, float halfH) {
+        Mesh3D m = new Mesh3D();
+        m.Vertex(-halfW, -halfH, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f);
+        m.Vertex( halfW, -halfH, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        m.Vertex( halfW,  halfH, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+        m.Vertex(-halfW,  halfH, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        m.Triangle(0, 1, 2);
+        m.Triangle(0, 2, 3);
+        return m;
+    }
+
+    // 反向 CW 背面四边形（索引反绕）
+    private static Mesh3D MakeBackQuad(float halfW, float halfH) {
+        Mesh3D m = new Mesh3D();
+        m.Vertex(-halfW, -halfH, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f);
+        m.Vertex( halfW, -halfH, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        m.Vertex( halfW,  halfH, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+        m.Vertex(-halfW,  halfH, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        m.Triangle(0, 2, 1);
+        m.Triangle(0, 3, 2);
+        return m;
+    }
+
+    private static int R(int argb) { return (argb >> 16) & 255; }
+    private static int G(int argb) { return (argb >> 8) & 255; }
+    private static int B(int argb) { return argb & 255; }
+
+    static void Main() {
+        Canvas.SetBackend(1);
+        Canvas cv = new Canvas(128, 128);
+        int frontH = cv.MeshUpload(MakeFrontQuad(1.8f, 1.8f));
+        int backH = cv.MeshUpload(MakeBackQuad(1.8f, 1.8f));
+
+        Camera3D cam = new Camera3D();
+        cam.Position = new Vector3(0.0f, 0.0f, 4.0f);
+        cam.Target = new Vector3(0.0f, 0.0f, 0.0f);
+        cam.AspectRatio = 1.0f;
+
+        Renderer3D renderer = new Renderer3D(16);
+
+        // 1. 硬件背面剔除实测（已校正 Canvas FBO 顶下 Y 翻转绕序）：
+        // CullMode3D.Back 下：正面 CCW 蓝片可见，背面 CW 绿片被硬件剔除（透出纯黑清屏底色）；
+        // CullMode3D.None（DoubleSided）下：背面 CW 绿片可见！
+        SceneNode rootFront = new SceneNode("rf");
+        SceneNode nf = new SceneNode("front");
+        nf.MeshKey = frontH;
+        nf.BoundsRadius = 4.0f;
+        nf.Material = Material.Emissive(0.1f, 0.2f, 0.95f);
+        nf.Material.CullMode = CullMode3D.Back;
+        rootFront.AddChild(nf);
+
+        RenderPlan pf = new RenderPlan(cam);
+        pf.Build(rootFront);
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, pf);
+        int pixFront = zan_gui_read_pixel(cv.SurfaceId(), 64, 64);
+
+        SceneNode rootBackCulled = new SceneNode("rbc");
+        SceneNode nbc = new SceneNode("back_culled");
+        nbc.MeshKey = backH;
+        nbc.BoundsRadius = 4.0f;
+        nbc.Material = Material.Emissive(0.1f, 0.95f, 0.1f);
+        nbc.Material.CullMode = CullMode3D.Back;
+        rootBackCulled.AddChild(nbc);
+
+        RenderPlan pbc = new RenderPlan(cam);
+        pbc.Build(rootBackCulled);
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, pbc);
+        int pixBackCulled = zan_gui_read_pixel(cv.SurfaceId(), 64, 64);
+
+        nbc.Material.CullMode = CullMode3D.None;
+        pbc.Build(rootBackCulled);
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, pbc);
+        int pixBackDouble = zan_gui_read_pixel(cv.SurfaceId(), 64, 64);
+
+        bool cullOk = B(pixFront) > 200
+            && R(pixBackCulled) < 5 && G(pixBackCulled) < 5 && B(pixBackCulled) < 5
+            && G(pixBackDouble) > 200;
+        Console.WriteLine("gpu-hardware-backface-cull: " + Convert.ToString(cullOk ? 1 : 0));
+
+        // 2. 加法辉光混合实测（红光层 + 绿光层叠加 -> 亮黄 R>120 且 G>120）
+        SceneNode rootAdd = new SceneNode("radd");
+        SceneNode nRed = new SceneNode("add_red");
+        nRed.MeshKey = frontH;
+        nRed.BoundsRadius = 4.0f;
+        nRed.Layer = 1;
+        nRed.Local.Position = new Vector3(0.0f, 0.0f, -0.2f);
+        nRed.Material = Material.Emissive(0.65f, 0.0f, 0.0f);
+        nRed.Material.Red = 0.0f; nRed.Material.Green = 0.0f; nRed.Material.Blue = 0.0f;
+        nRed.Material.AdditiveBlend = true;
+        rootAdd.AddChild(nRed);
+
+        SceneNode nGrn = new SceneNode("add_grn");
+        nGrn.MeshKey = frontH;
+        nGrn.BoundsRadius = 4.0f;
+        nGrn.Layer = 1;
+        nGrn.Local.Position = new Vector3(0.0f, 0.0f, 0.0f);
+        nGrn.Material = Material.Emissive(0.0f, 0.65f, 0.0f);
+        nGrn.Material.Red = 0.0f; nGrn.Material.Green = 0.0f; nGrn.Material.Blue = 0.0f;
+        nGrn.Material.AdditiveBlend = true;
+        rootAdd.AddChild(nGrn);
+
+        RenderPlan padd = new RenderPlan(cam);
+        padd.Build(rootAdd);
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, padd);
+        int pixAdd = zan_gui_read_pixel(cv.SurfaceId(), 64, 64);
+        bool additiveOk = R(pixAdd) > 130 && G(pixAdd) > 130 && B(pixAdd) < 20;
+        Console.WriteLine("gpu-additive-vfx-blend: " + Convert.ToString(additiveOk ? 1 : 0));
+
+        // 3. Billboard3D 面向相机公告牌 + RibbonTrail3D 3D 动态丝带拖尾实测 + glTF doubleSided 解析
+        Mesh3D bbMesh = Billboard3D.BuildSphericalQuad(new Vector3(0.0f, 0.0f, 0.0f), 2.0f, 2.0f, cam);
+        int bbHandle = cv.MeshUpload(bbMesh);
+        SceneNode rootBb = new SceneNode("rbb");
+        SceneNode nBb = new SceneNode("bb");
+        nBb.MeshKey = bbHandle;
+        nBb.BoundsRadius = 4.0f;
+        nBb.Material = Material.Emissive(0.9f, 0.5f, 0.1f);
+        nBb.Material.CullMode = CullMode3D.Back;
+        rootBb.AddChild(nBb);
+        RenderPlan pbb = new RenderPlan(cam);
+        pbb.Build(rootBb);
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, pbb);
+        int pixBb = zan_gui_read_pixel(cv.SurfaceId(), 64, 64);
+
+        RibbonTrail3D trail = new RibbonTrail3D(0.5f, 0.8f, 0.1f, 16);
+        trail.AddPoint(new Vector3(-1.5f, 0.0f, 0.0f));
+        trail.Update(0.1f);
+        trail.AddPoint(new Vector3(0.0f, 0.0f, 0.0f));
+        trail.Update(0.1f);
+        trail.AddPoint(new Vector3(1.5f, 0.0f, 0.0f));
+        Mesh3D trailMesh = trail.BuildMesh(cam.Position, 0.2f, 0.9f, 1.0f);
+        int trailHandle = cv.MeshUpload(trailMesh);
+        SceneNode rootTr = new SceneNode("rtr");
+        SceneNode nTr = new SceneNode("trail");
+        nTr.MeshKey = trailHandle;
+        nTr.BoundsRadius = 5.0f;
+        nTr.Layer = 1;
+        nTr.Material = Material.Solid(1.0f, 1.0f, 1.0f);
+        nTr.Material.AdditiveBlend = true;
+        rootTr.AddChild(nTr);
+        RenderPlan ptr = new RenderPlan(cam);
+        ptr.AmbientRed = 1.0f; ptr.AmbientGreen = 1.0f; ptr.AmbientBlue = 1.0f;
+        ptr.Build(rootTr);
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, ptr);
+        int pixTrail = zan_gui_read_pixel(cv.SurfaceId(), 64, 64);
+
+        string gltfJson = "{\"asset\":{\"version\":\"2.0\"},"
+            + "\"materials\":[{\"name\":\"cloth\",\"doubleSided\":true},{\"name\":\"stone\",\"doubleSided\":false}]}";
+        GltfModel gm = GltfLoader.LoadGltfBytes(Encoding.UTF8.GetBytes(gltfJson), null, "");
+
+        bool vfxGltfOk = bbHandle > 0 && R(pixBb) > 180
+            && trailHandle > 0 && trailMesh.VertexCount() == 6 && trailMesh.IndexCount() == 12
+            && B(pixTrail) > 80
+            && gm != null && gm.MaterialCount == 2
+            && gm.Materials[0].DoubleSided && !gm.Materials[1].DoubleSided;
+        Console.WriteLine("billboard-ribbon-trail-gltf-doublesided: " + Convert.ToString(vfxGltfOk ? 1 : 0));
+
+        renderer.Dispose();
+    }
+}

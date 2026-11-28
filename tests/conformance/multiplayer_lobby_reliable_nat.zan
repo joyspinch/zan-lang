@@ -1,0 +1,90 @@
+using System;
+using System.Collections.Generic;
+using Game.Net;
+
+namespace Conf;
+
+class MultiplayerLobbyReliableNatTest {
+    static void Main() {
+        // 1. 商业联机大厅：加入码鉴权 + 玩家/观战槽位 + 房主离房自动继承 + 踢人权限 + 全员 Ready 门控
+        NetLobbyRoom room = new NetLobbyRoom("room-alpha", "ZAN888", 2, 1);
+        bool badCodeBlocked = !room.TryJoin(10, "Alice", "WRONG", false);
+        bool j1 = room.TryJoin(10, "Alice", "ZAN888", false);
+        bool j2 = room.TryJoin(20, "Bob", "ZAN888", false);
+        bool fullBlocked = !room.TryJoin(30, "Carol", "ZAN888", false);
+        bool specOk = room.TryJoin(40, "Watcher", "ZAN888", true);
+        room.SetTeam(10, 1);
+        room.SetTeam(20, 2);
+        room.SetReady(10, true);
+        bool notReadyYet = !room.CanStartMatch();
+        room.SetReady(20, true);
+        bool readyNow = room.CanStartMatch();
+
+        // 非房主踢人被拒；房主 10 离开 -> 20（最老玩家）自动继承房主并能踢出观战者 40
+        bool nonHostKickDenied = !room.TryKick(20, 40);
+        room.Leave(10);
+        bool migratedHost = room.HostPeerId == 20;
+        bool newHostKickOk = room.TryKick(20, 40) && room.CountSpectators() == 0;
+
+        bool lobbyOk = badCodeBlocked && j1 && j2 && fullBlocked && specOk
+            && notReadyYet && readyNow && nonHostKickDenied && migratedHost && newHostKickOk;
+        Console.WriteLine("net-lobby-room-host-migration: " + Convert.ToString(lobbyOk ? 1 : 0));
+
+        // 2. UDP 可靠有序事件通道（乱序到达 + SACK 精准选择重传丢包 + 去重 + 严格按序交付）
+        NetReliableEventChannel sender = new NetReliableEventChannel(100, 5);
+        NetReliableEventChannel receiver = new NetReliableEventChannel(100, 5);
+
+        int s1 = sender.EnqueueSend(101, "cast_fireball");
+        int s2 = sender.EnqueueSend(102, "spawn_loot");
+        int s3 = sender.EnqueueSend(103, "victory_banner");
+        List<ReliableEventPacket> tx0 = sender.CollectDueTransmissions(1000);
+
+        // 模拟包 #2 丢失：仅 #1 与 #3 到达接收端（#3 乱序先到，不能提前交付！）
+        receiver.ReceivePacket(tx0[0].Seq, tx0[0].Opcode, tx0[0].Payload);
+        receiver.ReceivePacket(tx0[2].Seq, tx0[2].Opcode, tx0[2].Payload);
+        receiver.ReceivePacket(tx0[0].Seq, tx0[0].Opcode, tx0[0].Payload); // 重复包应被忽略
+        List<ReliableEventPacket> deliv1 = receiver.DrainDelivered();
+
+        // 接收端构造 SACK 回传给发送端（ackSeq=3, bitfield 标记 seq=1 已达而 seq=2 缺失）
+        int ackSeq;
+        uint ackBits;
+        receiver.BuildAckHeader(out ackSeq, out ackBits);
+        int ackedCount = sender.ProcessAck(ackSeq, ackBits);
+
+        // 经过 100ms RTO 后，发送端只应精准重传丢失的 #2！
+        List<ReliableEventPacket> rtx = sender.CollectDueTransmissions(1150);
+        if (rtx.Count == 1) {
+            receiver.ReceivePacket(rtx[0].Seq, rtx[0].Opcode, rtx[0].Payload);
+        }
+        List<ReliableEventPacket> deliv2 = receiver.DrainDelivered();
+
+        bool reliableOk = s1 == 1 && s2 == 2 && s3 == 3
+            && deliv1.Count == 1 && deliv1[0].Seq == 1 && deliv1[0].Payload == "cast_fireball"
+            && ackedCount == 2 && sender.PendingSendCount == 1
+            && rtx.Count == 1 && rtx[0].Seq == 2
+            && deliv2.Count == 2 && deliv2[0].Seq == 2 && deliv2[1].Seq == 3;
+        Console.WriteLine("net-reliable-sack-ordered-rpc: " + Convert.ToString(reliableOk ? 1 : 0));
+
+        // 3. ICE-Lite UDP 打洞直连晋升 + 对称 NAT 超时无缝降级 TURN/Relay
+        NetNatTraversalSession direct = new NetNatTraversalSession("192.168.1.5:5000", 1000, 200);
+        direct.StartPunch("203.0.113.8:61234", "relay.zan.gg:3478", 1000);
+        bool probe1 = direct.Step(1000);
+        bool probeBlockedByInterval = !direct.Step(1100);
+        bool gotProbe = direct.OnRemoteProbeReceived("203.0.113.8:61234");
+        direct.OnRemotePongReceived();
+        bool directOk = probe1 && probeBlockedByInterval && gotProbe
+            && direct.State == NatPathState.DirectP2P
+            && direct.ActiveEndpoint == "203.0.113.8:61234";
+
+        NetNatTraversalSession symNat = new NetNatTraversalSession("10.0.0.2:5000", 500, 200);
+        symNat.StartPunch("198.51.100.9:40000", "relay.zan.gg:3478", 2000);
+        symNat.Step(2000);
+        symNat.Step(2200);
+        symNat.Step(2600); // 超过 500ms 打洞窗口 -> 自动回退 Relay
+        bool relayOk = symNat.State == NatPathState.Relayed
+            && symNat.ActiveEndpoint == "relay.zan.gg:3478"
+            && symNat.ProbesSent == 2;
+
+        Console.WriteLine("net-nat-punch-relay-fallback: " + Convert.ToString((directOk && relayOk) ? 1 : 0));
+    }
+}

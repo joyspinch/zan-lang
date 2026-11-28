@@ -1,0 +1,157 @@
+using System;
+using System.Numerics;
+using Gui;
+using Game.Graphics;
+using Game.Render3D;
+
+namespace Conf;
+
+class Game3DFxaaChromaticToonTest {
+    [DllImport("zan_gui")]
+    private static extern int zan_gui_read_pixel(int surfaceId, int x, int y);
+
+    private static Mesh3D MakeQuadAt(float cx, float halfW, float halfH, float nx, float ny, float nz) {
+        Mesh3D m = new Mesh3D();
+        m.Vertex(cx - halfW, -halfH, 0.0f, nx, ny, nz, 0.0f, 1.0f);
+        m.Vertex(cx + halfW, -halfH, 0.0f, nx, ny, nz, 1.0f, 1.0f);
+        m.Vertex(cx + halfW,  halfH, 0.0f, nx, ny, nz, 1.0f, 0.0f);
+        m.Vertex(cx - halfW,  halfH, 0.0f, nx, ny, nz, 0.0f, 0.0f);
+        m.Triangle(0, 1, 2);
+        m.Triangle(0, 2, 3);
+        return m;
+    }
+
+    private static int ROf(int argb) { return (argb >> 16) & 255; }
+    private static int GOf(int argb) { return (argb >> 8) & 255; }
+    private static int BOf(int argb) { return argb & 255; }
+
+    static void Main() {
+        Canvas.SetBackend(1);
+        Canvas cv = new Canvas(128, 128);
+
+        // 右侧竖直白色亮条（x 在画面右半区偏离中心，便于检测边缘 FXAA 柔化与径向色差红蓝分离）
+        int barH = cv.MeshUpload(MakeQuadAt(0.9f, 0.25f, 1.5f, 0.0f, 0.0f, 1.0f));
+        // 两个法线略微不同的面（测试连续 PBR vs Toon 3 阶色阶量化）
+        int tiltA = cv.MeshUpload(MakeQuadAt(0.0f, 1.8f, 1.8f, 0.45f, 0.0f, 0.893f));
+        int tiltB = cv.MeshUpload(MakeQuadAt(0.0f, 1.8f, 1.8f, 0.62f, 0.0f, 0.785f));
+
+        Camera3D cam = new Camera3D();
+        cam.Position = new Vector3(0.0f, 0.0f, 4.0f);
+        cam.Target = new Vector3(0.0f, 0.0f, 0.0f);
+        cam.AspectRatio = 1.0f;
+
+        Renderer3D renderer = new Renderer3D(16);
+        renderer.UseCpuLighting = false;
+
+        // 1. GPU 径向色差（Chromatic Aberration）：白条边界出现明显 R/B 通道分离
+        SceneNode rBar = new SceneNode("bar_root");
+        SceneNode nBar = new SceneNode("bar");
+        nBar.MeshKey = barH;
+        nBar.BoundsRadius = 4.0f;
+        nBar.Material = Material.Emissive(1.0f, 1.0f, 1.0f);
+        rBar.AddChild(nBar);
+
+        RenderPlan pBar = new RenderPlan(cam);
+        pBar.AmbientRed = 0.0f; pBar.AmbientGreen = 0.0f; pBar.AmbientBlue = 0.0f;
+        pBar.Build(rBar);
+
+        PostProcess ppCa = new PostProcess();
+        ppCa.ChromaticAberration = 0.08f;
+        renderer.PostProcess = ppCa;
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, pBar);
+
+        int maxRbDiff = 0;
+        for (int x = 64; x < 126; x = x + 1) {
+            int px = zan_gui_read_pixel(cv.SurfaceId(), x, 64);
+            int d = ROf(px) - BOf(px);
+            if (d < 0) { d = -d; }
+            if (d > maxRbDiff) { maxRbDiff = d; }
+        }
+        bool caOk = maxRbDiff >= 120;
+        Console.WriteLine("gpu-chromatic-aberration: " + Convert.ToString(caOk ? 1 : 0));
+
+        // 2. GPU FXAA 抗锯齿：白条锐利边缘被柔和过渡出中间灰阶，而平坦背景与白条内部保持纯净
+        renderer.PostProcess = null;
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, pBar);
+        int rawMidCount = 0;
+        for (int x = 64; x < 126; x = x + 1) {
+            int r = ROf(zan_gui_read_pixel(cv.SurfaceId(), x, 64));
+            if (r > 20 && r < 235) { rawMidCount = rawMidCount + 1; }
+        }
+
+        PostProcess ppFxaa = new PostProcess();
+        ppFxaa.FxaaStrength = 1.0f;
+        renderer.PostProcess = ppFxaa;
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, pBar);
+        int fxaaMidCount = 0;
+        for (int x = 64; x < 126; x = x + 1) {
+            int r = ROf(zan_gui_read_pixel(cv.SurfaceId(), x, 64));
+            if (r > 20 && r < 235) { fxaaMidCount = fxaaMidCount + 1; }
+        }
+        int flatBg = ROf(zan_gui_read_pixel(cv.SurfaceId(), 10, 64));
+        bool fxaaOk = fxaaMidCount > rawMidCount && flatBg < 5;
+        Console.WriteLine("gpu-fxaa-edge-smoothing: " + Convert.ToString(fxaaOk ? 1 : 0));
+
+        // 3. GPU 风格化 Toon/Cel 色阶量化（3 阶量化把相邻两个法线倾角折叠到同一色阶）+ SplineTrack3D 匀速轨道
+        renderer.PostProcess = null;
+        SceneNode rToon = new SceneNode("toon_root");
+        SceneNode nToon = new SceneNode("toon");
+        nToon.BoundsRadius = 4.0f;
+        Material mToon = Material.Solid(1.0f, 1.0f, 1.0f);
+        mToon.Metallic = 0.0f;
+        mToon.Roughness = 1.0f;
+        nToon.Material = mToon;
+        rToon.AddChild(nToon);
+
+        RenderPlan pToon = new RenderPlan(cam);
+        pToon.AmbientRed = 0.0f; pToon.AmbientGreen = 0.0f; pToon.AmbientBlue = 0.0f;
+        Light keyLight = new Light();
+        keyLight.Kind = LightKind.Directional;
+        keyLight.Direction = new Vector3(0.0f, 0.0f, -1.0f);
+        keyLight.Red = 1.0f; keyLight.Green = 1.0f; keyLight.Blue = 1.0f;
+        keyLight.Intensity = 1.0f;
+        pToon.Lights.Add(keyLight);
+
+        // 先连续 PBR：两个不同倾角得到不同亮度
+        mToon.ToonBands = 0.0f;
+        nToon.MeshKey = tiltA; pToon.Build(rToon);
+        cv.Clear(unchecked((int)0xFF000000)); renderer.Draw(cv, pToon);
+        int pbrA = ROf(zan_gui_read_pixel(cv.SurfaceId(), 64, 64));
+
+        nToon.MeshKey = tiltB; pToon.Build(rToon);
+        cv.Clear(unchecked((int)0xFF000000)); renderer.Draw(cv, pToon);
+        int pbrB = ROf(zan_gui_read_pixel(cv.SurfaceId(), 64, 64));
+
+        // 再 Toon 3 阶量化：两个都在 [0.75..0.92] 区间，量化到同一高阶（~1.0 -> 255 或 ~0.67 -> 170）
+        mToon.ToonBands = 3.0f;
+        nToon.MeshKey = tiltA; pToon.Build(rToon);
+        cv.Clear(unchecked((int)0xFF000000)); renderer.Draw(cv, pToon);
+        int toonA = ROf(zan_gui_read_pixel(cv.SurfaceId(), 64, 64));
+
+        nToon.MeshKey = tiltB; pToon.Build(rToon);
+        cv.Clear(unchecked((int)0xFF000000)); renderer.Draw(cv, pToon);
+        int toonB = ROf(zan_gui_read_pixel(cv.SurfaceId(), 64, 64));
+
+        int pbrDiff = pbrA - pbrB; if (pbrDiff < 0) { pbrDiff = -pbrDiff; }
+        int toonDiff = toonA - toonB; if (toonDiff < 0) { toonDiff = -toonDiff; }
+
+        SplineTrack3D track = new SplineTrack3D(false);
+        track.AddPoint(new Vector3(0.0f, 0.0f, 0.0f));
+        track.AddPoint(new Vector3(5.0f, 0.0f, 0.0f));
+        track.AddPoint(new Vector3(10.0f, 0.0f, 0.0f));
+        float len = track.EstimateLength(32);
+        Vector3 mid = track.SampleAtDistance(5.0f, 32);
+        Vector3 tan = track.EvaluateTangent(0.5f);
+
+        bool toonSplineOk = pbrDiff >= 10 && toonDiff <= 3
+            && len > 9.9f && len < 10.1f
+            && mid.X > 4.9f && mid.X < 5.1f
+            && tan.X > 0.99f;
+        Console.WriteLine("gpu-toon-cel-and-spline3d: " + Convert.ToString(toonSplineOk ? 1 : 0));
+
+        renderer.Dispose();
+    }
+}

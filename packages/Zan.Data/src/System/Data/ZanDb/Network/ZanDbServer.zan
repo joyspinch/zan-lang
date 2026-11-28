@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Json;
 using System.Net.Sockets;
 using System.Text;
@@ -7,12 +8,15 @@ using System.Data.Search;
 namespace System.Data.ZanDb;
 
 public class ZanDbServer {
+    private const int MAX_IDEMPOTENCY_KEYS = 10000;
+
     private ZanDatabase db;
     private object ownerGate;
     private object lifecycleGate;
     private TcpListener listener;
     private List<ZanDbServiceConnection> connections;
     private List<long> tasks;
+    private Queue<string> idempKeys;
     private string token;
     private string tokenScope;
     private string host;
@@ -37,6 +41,7 @@ public class ZanDbServer {
         this.lifecycleGate = new object();
         this.connections = new List<ZanDbServiceConnection>();
         this.tasks = new List<long>();
+        this.idempKeys = new Queue<string>();
         this.token = options.token;
         this.tokenScope = ZanDbProtocol.Hash(this.token);
         this.host = options.host;
@@ -427,23 +432,10 @@ public class ZanDbServer {
         return hits;
     }
 
-    private JsonValue ExecuteOwned(JsonValue original) {
-        string id = "";
+    private JsonValue ExecuteOwned(JsonValue request, string id) {
         try {
             if (this.closed) { return ZanDbProtocol.Error(id, 0, "service_stopped", "Service is closed."); }
-            if (!original.IsObject()) { throw new ZanDbRequestException("invalid_request", "Request must be an object."); }
-            JsonValue request = ZanDbProtocol.Canonical(original, 0);
-            id = ZanDbProtocol.RequireString(request, "id");
-            if (!ZanDbProtocol.SafeId(id, ZanDbProtocol.MAX_ID)) { throw new ZanDbRequestException("invalid_request", "Invalid request id."); }
-            string suppliedToken = ZanDbProtocol.RequireString(request, "token");
-            if (!this.Authenticated(suppliedToken)) { return ZanDbProtocol.Error(id, 0, "unauthorized", "Invalid token."); }
-            JsonValue version = ZanDbProtocol.Member(request, "v");
-            if (!version.IsInt() || version.AsLong(0) != ZanDbProtocol.VERSION) {
-                throw new ZanDbRequestException("unsupported_version", "Only protocol version 1 is supported.");
-            }
             string client = ZanDbProtocol.RequireString(request, "client");
-            if (!ZanDbProtocol.SafeId(client, ZanDbProtocol.MAX_CLIENT)) { throw new ZanDbRequestException("invalid_request", "Invalid client id."); }
-            this.Validate(request, false);
             string action = ZanDbProtocol.RequireString(request, "action");
             if (!ZanDbProtocol.IsWrite(action)) {
                 JsonValue result = this.Dispatch(request);
@@ -478,7 +470,16 @@ public class ZanDbServer {
             record.PutStr("fingerprint", fingerprint);
             record.Put("response", response);
             this.db.Kv().Put(key, record.ToJson());
+            // 限制本次服务生命周期内的幂等键表规模，防止 _service:req:* 无界增长。
+            string evicted = null;
+            if (this.idempKeys.Count() >= MAX_IDEMPOTENCY_KEYS) {
+                evicted = this.idempKeys.Dequeue();
+                if (evicted != null && evicted != key) {
+                    this.db.Kv().Delete(evicted);
+                }
+            }
             if (!this.db.Commit()) { throw new IOException("ZanDB durable commit failed."); }
+            this.idempKeys.Enqueue(key);
             if (this.db.GetRevision() != revision) { throw new IOException("ZanDB commit revision contract violated."); }
             return response;
         } catch (ZanDbRequestException e) {
@@ -502,7 +503,40 @@ public class ZanDbServer {
         }
     }
 
-    public JsonValue Execute(JsonValue request) {
-        lock (this.ownerGate) { return this.ExecuteOwned(request); }
+    public JsonValue Execute(JsonValue original) {
+        string id = "";
+        JsonValue request;
+        try {
+            if (original == null || !original.IsObject()) {
+                throw new ZanDbRequestException("invalid_request", "Request must be an object.");
+            }
+            // 未持全局 ownerGate 前完成鉴权、规范化与参数校验，避免恶意/未认证请求阻塞已认证流量。
+            string rawId = ZanDbProtocol.RequireString(original, "id");
+            if (!ZanDbProtocol.SafeId(rawId, ZanDbProtocol.MAX_ID)) {
+                throw new ZanDbRequestException("invalid_request", "Invalid request id.");
+            }
+            id = rawId;
+            string suppliedToken = ZanDbProtocol.RequireString(original, "token");
+            if (!this.Authenticated(suppliedToken)) {
+                return ZanDbProtocol.Error(id, 0, "unauthorized", "Invalid token.");
+            }
+            request = ZanDbProtocol.Canonical(original, 0);
+            JsonValue version = ZanDbProtocol.Member(request, "v");
+            if (!version.IsInt() || version.AsLong(0) != ZanDbProtocol.VERSION) {
+                throw new ZanDbRequestException("unsupported_version", "Only protocol version 1 is supported.");
+            }
+            string client = ZanDbProtocol.RequireString(request, "client");
+            if (!ZanDbProtocol.SafeId(client, ZanDbProtocol.MAX_CLIENT)) {
+                throw new ZanDbRequestException("invalid_request", "Invalid client id.");
+            }
+            this.Validate(request, false);
+        } catch (ZanDbRequestException e) {
+            return ZanDbProtocol.Error(id, this.CurrentRevision(), e.code, e.Message);
+        } catch (ArgumentException e) {
+            return ZanDbProtocol.Error(id, this.CurrentRevision(), "invalid_request", e.Message);
+        } catch (Exception _e) {
+            return ZanDbProtocol.Error(id, 0, "internal_error", "Request failed.");
+        }
+        lock (this.ownerGate) { return this.ExecuteOwned(request, id); }
     }
 }

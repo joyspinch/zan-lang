@@ -31,6 +31,9 @@ namespace System.Data.TDengine;
 // "root", "taosdata", "demo");
 // db.Close();
 public class TDengineConnection : IDbConnection {
+    private const int MAX_RESPONSE_BYTES = 67108864;
+    private const int IO_TIMEOUT_MS = 30000;
+
     string host;
     int port;
     string auth;  // 完整的 Authorization 请求头值
@@ -91,15 +94,49 @@ public class TDengineConnection : IDbConnection {
         return TDengineConnection.Open(host, port, user, password, "");
     }
 
+    private static bool IsSafeHost(string s) {
+        if (s == null || s.Length == 0 || s.Length > 255) { return false; }
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i] & 255;
+            if (c <= 32 || c == 127 || c == 47 || c == 63 || c == 35 || c == 64) { return false; }
+        }
+        return true;
+    }
+
+    private static bool IsSafeDatabase(string s) {
+        if (s == null || s.Length == 0) { return true; }
+        if (s.Length > 128) { return false; }
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i] & 255;
+            bool ok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90)
+                || (c >= 97 && c <= 122) || c == 95 || c == 45 || c == 46;
+            if (!ok) { return false; }
+        }
+        return true;
+    }
+
+    private static bool IsSafeToken(string s) {
+        if (s == null || s.Length == 0) { return false; }
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i] & 255;
+            if (c <= 32 || c == 127) { return false; }
+        }
+        return true;
+    }
+
     // 使用 HTTP Basic 凭据打开连接，并指定默认
     // 数据库（语句随后可直接使用不带库名的表名）。
     // 连接时会先与服务器通信一次以校验凭据，可检查 IsConnected()。
     public static TDengineConnection Open(string host, int port, string user, string password,
                                    string database) {
         TDengineConnection conn = new TDengineConnection();
+        if (!TDengineConnection.IsSafeHost(host) || !TDengineConnection.IsSafeDatabase(database)) {
+            conn.lastError = "invalid TDengine host or database name";
+            return conn;
+        }
         conn.host = host;
         conn.port = port;
-        conn.database = database;
+        conn.database = database != null ? database : "";
         string cred = user + ":" + password;
         conn.auth = "Basic " + Base64.Encode(cred, cred.Length);
         conn.connected = conn.Ping();
@@ -111,9 +148,14 @@ public class TDengineConnection : IDbConnection {
     // `GET /rest/login/&lt;user&gt;/&lt;password&gt;` 返回。
     public static TDengineConnection OpenToken(string host, int port, string token, string database) {
         TDengineConnection conn = new TDengineConnection();
+        if (!TDengineConnection.IsSafeHost(host) || !TDengineConnection.IsSafeDatabase(database)
+                || !TDengineConnection.IsSafeToken(token)) {
+            conn.lastError = "invalid TDengine host, database, or token";
+            return conn;
+        }
         conn.host = host;
         conn.port = port;
-        conn.database = database;
+        conn.database = database != null ? database : "";
         conn.auth = "Taosd " + token;
         conn.connected = conn.Ping();
         return conn;
@@ -124,9 +166,13 @@ public class TDengineConnection : IDbConnection {
     public static async TDengineConnection OpenAsync(string host, int port, string user,
                                               string password, string database) {
         TDengineConnection conn = new TDengineConnection();
+        if (!TDengineConnection.IsSafeHost(host) || !TDengineConnection.IsSafeDatabase(database)) {
+            conn.lastError = "invalid TDengine host or database name";
+            return conn;
+        }
         conn.host = host;
         conn.port = port;
-        conn.database = database;
+        conn.database = database != null ? database : "";
         string cred = user + ":" + password;
         conn.auth = "Basic " + Base64.Encode(cred, cred.Length);
         conn.connected = await conn.PingAsync();
@@ -137,9 +183,14 @@ public class TDengineConnection : IDbConnection {
     public static async TDengineConnection OpenTokenAsync(string host, int port, string token,
                                                    string database) {
         TDengineConnection conn = new TDengineConnection();
+        if (!TDengineConnection.IsSafeHost(host) || !TDengineConnection.IsSafeDatabase(database)
+                || !TDengineConnection.IsSafeToken(token)) {
+            conn.lastError = "invalid TDengine host, database, or token";
+            return conn;
+        }
         conn.host = host;
         conn.port = port;
-        conn.database = database;
+        conn.database = database != null ? database : "";
         conn.auth = "Taosd " + token;
         conn.connected = await conn.PingAsync();
         return conn;
@@ -171,7 +222,10 @@ public class TDengineConnection : IDbConnection {
 
     // 选择后续语句使用的默认数据库。
     public void Use(string database) {
-        this.database = database;
+        if (!TDengineConnection.IsSafeDatabase(database)) {
+            throw new ArgumentException("invalid TDengine database name");
+        }
+        this.database = database != null ? database : "";
     }
 
     // ===== SQL 文本渲染 =====
@@ -229,13 +283,28 @@ public class TDengineConnection : IDbConnection {
         while (i < len) {
             int c = sql[i] & 255;
             if (quote != 0) {
-                if (c == 92 && i + 1 < len) {
+                if (c == 92 && quote != 96 && i + 1 < len) {
                     i = i + 2;
                     continue;
                 }
-                if (c == quote) { quote = 0; }
+                if (c == quote) {
+                    if (quote == 39 && i + 1 < len && (sql[i + 1] & 255) == 39) {
+                        i = i + 2;
+                        continue;
+                    }
+                    quote = 0;
+                }
                 i = i + 1;
-            } else if (c == 39 || c == 34) {  // '\'' or '"'
+            } else if (c == 45 && i + 1 < len && (sql[i + 1] & 255) == 45) {
+                // 单行注释 -- ... \n
+                i = i + 2;
+                while (i < len && (sql[i] & 255) != 10) { i = i + 1; }
+            } else if (c == 47 && i + 1 < len && (sql[i + 1] & 255) == 42) {
+                // 块注释 /* ... */
+                i = i + 2;
+                while (i + 1 < len && !((sql[i] & 255) == 42 && (sql[i + 1] & 255) == 47)) { i = i + 1; }
+                i = i + 1 < len ? i + 2 : len;
+            } else if (c == 39 || c == 34 || c == 96) {  // '\'', '"', '`'
                 quote = c;
                 i = i + 1;
             } else if (c == 63) {  // '?'
@@ -274,10 +343,13 @@ public class TDengineConnection : IDbConnection {
             int size = TDengineConnection.HexOf(body.Substring(pos, lineEnd - pos));
             if (size <= 0) { return sb.ToString(); }
             int start = lineEnd + 1;
-            if (start + size > body.Length) { size = body.Length - start; }
+            if (start >= body.Length) { return sb.ToString(); }
+            int rem = body.Length - start;
+            if (size > rem) { size = rem; }
             if (size <= 0) { return sb.ToString(); }
             sb.Append(body.Substring(start, size));
-            pos = start + size + 2;  // 跳过 chunk 末尾的 CRLF
+            if (size > rem - 2) { pos = body.Length; }
+            else { pos = start + size + 2; }  // 跳过 chunk 末尾的 CRLF
         }
         return sb.ToString();
     }
@@ -387,10 +459,20 @@ public class TDengineConnection : IDbConnection {
         string rawStr = "";
         try {
             StringBuilder raw = new StringBuilder();
+            int totalBytes = 0;
             bool reading = true;
             while (reading) {
                 string chunk = Socket.Receive(sock, 65536);
-                if (chunk.Length == 0) { reading = false; } else { raw.Append(chunk); }
+                if (chunk.Length == 0) {
+                    reading = false;
+                } else {
+                    if (chunk.Length > MAX_RESPONSE_BYTES - totalBytes) {
+                        this.lastError = "response exceeds 64 MiB limit";
+                        return "";
+                    }
+                    totalBytes = totalBytes + chunk.Length;
+                    raw.Append(chunk);
+                }
             }
             rawStr = raw.ToString();
         } finally {
@@ -412,7 +494,7 @@ public class TDengineConnection : IDbConnection {
             return "";
         }
         Socket.SetNonBlocking(sock);
-        int rc = await AsyncSocket.Connect(sock, this.host, this.port);
+        int rc = await Socket.ConnectAsync(sock, this.host, this.port, IO_TIMEOUT_MS);
         if (rc != 0) {
             Socket.Close(sock);
             this.lastError = Unreachable();
@@ -429,10 +511,24 @@ public class TDengineConnection : IDbConnection {
         string rawStr = "";
         try {
             StringBuilder raw = new StringBuilder();
+            int totalBytes = 0;
             bool reading = true;
             while (reading) {
-                string chunk = await AsyncSocket.Receive(sock, 65536);
-                if (chunk.Length == 0) { reading = false; } else { raw.Append(chunk); }
+                string chunk = await Socket.RecvAsync(sock, 65536, IO_TIMEOUT_MS);
+                if (chunk.Length == 0) {
+                    if (Socket.LastRecvTimedOut()) {
+                        this.lastError = "receive from taosAdapter timed out";
+                        return "";
+                    }
+                    reading = false;
+                } else {
+                    if (chunk.Length > MAX_RESPONSE_BYTES - totalBytes) {
+                        this.lastError = "response exceeds 64 MiB limit";
+                        return "";
+                    }
+                    totalBytes = totalBytes + chunk.Length;
+                    raw.Append(chunk);
+                }
             }
             rawStr = raw.ToString();
         } finally {
@@ -760,6 +856,8 @@ public class TDengineConnection : IDbConnection {
     public void Close() {
         List<AsyncGate> toWake = null;
         lock (this) {
+            this.connected = false;
+            this.auth = "";
             if (this.waiters != null && this.waiters.Count() > 0) {
                 toWake = new List<AsyncGate>();
                 while (this.waiters.Count() > 0) {
@@ -771,8 +869,6 @@ public class TDengineConnection : IDbConnection {
         if (toWake != null) {
             for (int i = 0; i < toWake.Count; i = i + 1) { toWake[i].Signal(); }
         }
-        this.connected = false;
-        this.auth = "";
     }
 
     // 返回 provider id（DbProvider.TDengine）。

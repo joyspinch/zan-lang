@@ -1,0 +1,375 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+
+namespace System.Windows;
+
+// 屏幕全局光标坐标快照。
+public class CursorPoint {
+    public int X;
+    public int Y;
+
+    public CursorPoint(int x, int y) {
+        this.X = x;
+        this.Y = y;
+    }
+}
+
+// 屏幕四角热区常量。
+public static class HotCornerKind {
+    public const int None = 0;
+    public const int TopLeft = 1;
+    public const int TopRight = 2;
+    public const int BottomLeft = 3;
+    public const int BottomRight = 4;
+}
+
+// 桌宠全局光标追踪与“摸头手势（Headpat）”识别器：
+// Windows 下通过只读 Win32 user32!GetCursorPos 跨多屏采集真实鼠标位置（即使桌宠窗口处于 WS_EX_TRANSPARENT 鼠标穿透状态也能实时眼神跟随与检测抚摸！），
+// 并提供水平往返抚摸（左右反转计次）手势触发与屏幕四角热区识别。
+public class GlobalCursorTracker {
+    #if WINDOWS
+    [DllImport("user32", EntryPoint = "GetCursorPos")]
+    private static extern int WinGetCursorPos(nint lpPoint);
+    #endif
+
+    public int MinStrokePx;
+    public int RequiredReversals;
+    public long GestureWindowMs;
+    public long TriggerCooldownMs;
+
+    private bool hasPrev;
+    private int prevX;
+    private int lastDir; // -1=left, 0=none, 1=right
+    private int reversalCount;
+    private long windowStartMs;
+    private long cooldownUntilMs;
+
+    public GlobalCursorTracker() {
+        this.MinStrokePx = 10;
+        this.RequiredReversals = 3;
+        this.GestureWindowMs = 1000;
+        this.TriggerCooldownMs = 1500;
+        this.hasPrev = false;
+        this.prevX = 0;
+        this.lastDir = 0;
+        this.reversalCount = 0;
+        this.windowStartMs = 0;
+        this.cooldownUntilMs = 0;
+    }
+
+    // 采集当前 OS 全局桌面光标位置（Windows 走 user32!GetCursorPos）。
+    public static CursorPoint QueryCursorPos() {
+        #if WINDOWS
+        nint buf = NativeMemory.Alloc(8);
+        if (buf == 0) { return new CursorPoint(0, 0); }
+        try {
+            int ok = WinGetCursorPos(buf);
+            if (ok != 0) {
+                Span<int> pt = new Span<int>(buf, 2);
+                return new CursorPoint(pt[0], pt[1]);
+            }
+        } finally {
+            NativeMemory.Free(buf);
+        }
+        #endif
+        return new CursorPoint(0, 0);
+    }
+
+    public void ResetGesture() {
+        this.hasPrev = false;
+        this.lastDir = 0;
+        this.reversalCount = 0;
+        this.windowStartMs = 0;
+    }
+
+    // 喂入一次光标采样并检测宠物头顶区域内的往返“摸头/揉搓”手势；触发瞬间返回 true 并进入冷却。
+    public bool FeedHeadpatSample(int cursorX, int cursorY, long nowMs,
+                                  int zoneLeft, int zoneTop, int zoneRight, int zoneBottom) {
+        if (nowMs < this.cooldownUntilMs) { return false; }
+        bool inside = cursorX >= zoneLeft && cursorX <= zoneRight
+            && cursorY >= zoneTop && cursorY <= zoneBottom;
+        if (!inside) {
+            this.ResetGesture();
+            return false;
+        }
+        if (!this.hasPrev) {
+            this.hasPrev = true;
+            this.prevX = cursorX;
+            this.lastDir = 0;
+            this.reversalCount = 0;
+            this.windowStartMs = nowMs;
+            return false;
+        }
+        if (nowMs - this.windowStartMs > this.GestureWindowMs) {
+            this.reversalCount = 0;
+            this.lastDir = 0;
+            this.windowStartMs = nowMs;
+        }
+
+        int dx = cursorX - this.prevX;
+        int absDx = dx < 0 ? -dx : dx;
+        if (absDx < this.MinStrokePx) { return false; }
+
+        int dir = dx > 0 ? 1 : -1;
+        this.prevX = cursorX;
+        if (this.lastDir != 0 && dir != this.lastDir) {
+            this.reversalCount = this.reversalCount + 1;
+        }
+        this.lastDir = dir;
+
+        if (this.reversalCount >= this.RequiredReversals) {
+            this.ResetGesture();
+            this.cooldownUntilMs = nowMs + this.TriggerCooldownMs;
+            return true;
+        }
+        return false;
+    }
+
+    // 检测光标是否落入显示器四角热区（用于角落呼出/一键隐藏等快捷交互）。
+    public static int DetectHotCorner(int cursorX, int cursorY,
+                                      int screenLeft, int screenTop, int screenRight, int screenBottom,
+                                      int cornerSizePx) {
+        int cs = cornerSizePx > 0 ? cornerSizePx : 16;
+        bool nearL = cursorX >= screenLeft && cursorX < screenLeft + cs;
+        bool nearR = cursorX <= screenRight && cursorX > screenRight - cs;
+        bool nearT = cursorY >= screenTop && cursorY < screenTop + cs;
+        bool nearB = cursorY <= screenBottom && cursorY > screenBottom - cs;
+        if (nearL && nearT) { return HotCornerKind.TopLeft; }
+        if (nearR && nearT) { return HotCornerKind.TopRight; }
+        if (nearL && nearB) { return HotCornerKind.BottomLeft; }
+        if (nearR && nearB) { return HotCornerKind.BottomRight; }
+        return HotCornerKind.None;
+    }
+}
+
+// 跨实例单进程 IPC 命令消息信封（副实例唤起主实例 / URL 协议回调 / 外部脚本触发桌宠动作）。
+public class IpcCommandMessage {
+    public string Command;
+    public string Payload;
+    public long TimestampMs;
+
+    public IpcCommandMessage(string command, string payload, long timestampMs) {
+        this.Command = command != null ? command : "";
+        this.Payload = payload != null ? payload : "";
+        this.TimestampMs = timestampMs;
+    }
+}
+
+// 无防火墙弹窗、跨平台原子文件信箱 IPC：
+// 副实例以“写 .tmp 临时文件 → 原子 File.Move 改名 .msg”投递命令，主实例轮询消费并自动剔除超过 TTL 的过期信封。
+public class CompanionIpcMailbox {
+    private string mailboxDir;
+    public long MessageTtlMs;
+    private int sendSeq;
+
+    public CompanionIpcMailbox(string directoryPath, long messageTtlMs) {
+        this.mailboxDir = directoryPath != null ? directoryPath : "";
+        this.MessageTtlMs = messageTtlMs > 0 ? messageTtlMs : 10000;
+        this.sendSeq = 0;
+    }
+
+    public string DirectoryPath { get { return this.mailboxDir; } }
+
+    // 投递一条原子 IPC 命令到目标信箱目录；返回是否投递成功。
+    public bool SendCommand(string command, string payload, long nowMs) {
+        if (this.mailboxDir == "" || command == null || command == "") { return false; }
+        Directory.CreateDirectory(this.mailboxDir);
+        this.sendSeq = this.sendSeq + 1;
+        string cleanCmd = command.Replace("\r", " ").Replace("\n", " ");
+        string cleanPay = (payload != null ? payload : "").Replace("\r", " ").Replace("\n", " ");
+        string body = Convert.ToString(nowMs) + "\n" + cleanCmd + "\n" + cleanPay;
+
+        string stem = "ipc_" + Convert.ToString(nowMs) + "_" + Convert.ToString(this.sendSeq);
+        string tmpPath = Path.Combine(this.mailboxDir, stem + ".tmp");
+        string msgPath = Path.Combine(this.mailboxDir, stem + ".msg");
+        File.WriteAllText(tmpPath, body);
+        if (File.Exists(msgPath)) { File.Delete(msgPath); }
+        File.Move(tmpPath, msgPath);
+        return true;
+    }
+
+    // 轮询并消费全部未过期的 .msg 命令信封（消费后立刻删除文件，超时信封静默清理）。
+    public List<IpcCommandMessage> PollCommands(long nowMs) {
+        List<IpcCommandMessage> result = new List<IpcCommandMessage>();
+        if (this.mailboxDir == "" || !Directory.Exists(this.mailboxDir)) { return result; }
+        List<string> files = Directory.GetFiles(this.mailboxDir);
+        // 按文件名字典序简单排序，保证同毫秒序列顺序一致
+        for (int i = 0; i < files.Count; i = i + 1) {
+            for (int j = i + 1; j < files.Count; j = j + 1) {
+                if (string.CompareOrdinal(files[i], files[j]) > 0) {
+                    string t = files[i];
+                    files[i] = files[j];
+                    files[j] = t;
+                }
+            }
+        }
+        for (int i = 0; i < files.Count; i = i + 1) {
+            string path = files[i];
+            if (!path.EndsWith(".msg")) { continue; }
+            string raw = "";
+            if (File.Exists(path)) {
+                raw = File.ReadAllText(path);
+                File.Delete(path);
+            }
+            if (raw == "") { continue; }
+            int nl1 = raw.IndexOf("\n");
+            if (nl1 <= 0) { continue; }
+            string tsStr = raw.Substring(0, nl1).Trim();
+            long ts = 0;
+            if (!long.TryParse(tsStr, out ts)) { continue; }
+            if (nowMs - ts > this.MessageTtlMs) { continue; }
+            string rest = raw.Substring(nl1 + 1);
+            int nl2 = rest.IndexOf("\n");
+            string cmd = nl2 >= 0 ? rest.Substring(0, nl2).Trim() : rest.Trim();
+            string pay = nl2 >= 0 ? rest.Substring(nl2 + 1).Trim() : "";
+            if (cmd != "") {
+                result.Add(new IpcCommandMessage(cmd, pay, ts));
+            }
+        }
+        return result;
+    }
+}
+
+// 每日任务条目。
+public class DailyQuestEntry {
+    public string Id;
+    public string Title;
+    public int Progress;
+    public int Target;
+    public int RewardCoins;
+    public bool Completed;
+
+    public DailyQuestEntry(string id, string title, int target, int rewardCoins) {
+        this.Id = id != null ? id : "";
+        this.Title = title != null ? title : "";
+        this.Progress = 0;
+        this.Target = target > 0 ? target : 1;
+        this.RewardCoins = rewardCoins > 0 ? rewardCoins : 0;
+        this.Completed = false;
+    }
+}
+
+internal class OwnedCosmeticEntry {
+    public string ItemId;
+    public string Slot;
+
+    public OwnedCosmeticEntry(string itemId, string slot) {
+        this.ItemId = itemId;
+        this.Slot = slot;
+    }
+}
+
+// 桌宠每日任务、连续签到、安全金币账本与装扮解锁/穿戴系统（商业挂机陪伴长留存核心）：
+// - 按日历日键（dayKey，如 20261128）精确轮换每日任务并维护连续活跃天数（Streak）
+// - 任务达成自动单次发奖（防重复领奖），金币账本杜绝负余额与整数溢出
+// - 装扮按槽位（Hat / Scarf / Background / DeskProp）解锁购买并互斥穿戴
+public class CompanionProgressionLedger {
+    public int LastActiveDayKey;
+    public int LoginStreakDays;
+    public int Coins;
+    public int TotalQuestsCompleted;
+
+    private List<DailyQuestEntry> dailyQuests;
+    private List<OwnedCosmeticEntry> ownedCosmetics;
+    private Dictionary<string, string> equippedBySlot;
+
+    public CompanionProgressionLedger() {
+        this.LastActiveDayKey = 0;
+        this.LoginStreakDays = 0;
+        this.Coins = 0;
+        this.TotalQuestsCompleted = 0;
+        this.dailyQuests = new List<DailyQuestEntry>();
+        this.ownedCosmetics = new List<OwnedCosmeticEntry>();
+        this.equippedBySlot = new Dictionary<string, string>();
+    }
+
+    public int DailyQuestCount { get { return this.dailyQuests.Count; } }
+
+    // 切换到新一天（如 20261128）：连续登录则 Streak+1，断签重置为 1，同日调用幂等返回 false。
+    public bool BeginDay(int dayKey) {
+        if (dayKey <= 0 || dayKey == this.LastActiveDayKey) { return false; }
+        if (this.LastActiveDayKey > 0 && dayKey == this.LastActiveDayKey + 1) {
+            this.LoginStreakDays = this.LoginStreakDays + 1;
+        } else {
+            this.LoginStreakDays = 1;
+        }
+        this.LastActiveDayKey = dayKey;
+        this.dailyQuests.Clear();
+        return true;
+    }
+
+    public void AddDailyQuest(string id, string title, int target, int rewardCoins) {
+        if (id == null || id == "") { return; }
+        this.dailyQuests.Add(new DailyQuestEntry(id, title, target, rewardCoins));
+    }
+
+    // 推进指定每日任务进度；首次达成目标瞬间自动发奖并返回 true（已完成任务不重复发奖）。
+    public bool AdvanceQuest(string questId, int delta) {
+        if (questId == null || delta <= 0) { return false; }
+        for (int i = 0; i < this.dailyQuests.Count; i = i + 1) {
+            DailyQuestEntry q = this.dailyQuests[i];
+            if (q.Id != questId) { continue; }
+            if (q.Completed) { return false; }
+            q.Progress = q.Progress + delta;
+            if (q.Progress >= q.Target) {
+                q.Progress = q.Target;
+                q.Completed = true;
+                this.TotalQuestsCompleted = this.TotalQuestsCompleted + 1;
+                this.EarnCoins(q.RewardCoins);
+                return true;
+            }
+            return false;
+        }
+        return false;
+    }
+
+    public void EarnCoins(int amount) {
+        if (amount <= 0) { return; }
+        long next = (long)this.Coins + (long)amount;
+        this.Coins = next > 2000000000L ? 2000000000 : (int)next;
+    }
+
+    public bool TrySpendCoins(int cost) {
+        if (cost < 0 || this.Coins < cost) { return false; }
+        this.Coins = this.Coins - cost;
+        return true;
+    }
+
+    public bool OwnsCosmetic(string itemId) {
+        if (itemId == null) { return false; }
+        for (int i = 0; i < this.ownedCosmetics.Count; i = i + 1) {
+            if (this.ownedCosmetics[i].ItemId == itemId) { return true; }
+        }
+        return false;
+    }
+
+    // 购买解锁一件装扮（已拥有或余额不足返回 false）。
+    public bool TryUnlockCosmetic(string itemId, string slot, int costCoins) {
+        if (itemId == null || itemId == "" || slot == null || slot == "") { return false; }
+        if (this.OwnsCosmetic(itemId)) { return false; }
+        if (!this.TrySpendCoins(costCoins)) { return false; }
+        this.ownedCosmetics.Add(new OwnedCosmeticEntry(itemId, slot));
+        return true;
+    }
+
+    // 穿戴已解锁装扮到其对应槽位（同槽位自动替换）。
+    public bool TryEquipCosmetic(string itemId) {
+        if (itemId == null) { return false; }
+        for (int i = 0; i < this.ownedCosmetics.Count; i = i + 1) {
+            OwnedCosmeticEntry e = this.ownedCosmetics[i];
+            if (e.ItemId == itemId) {
+                this.equippedBySlot[e.Slot] = e.ItemId;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public string GetEquippedCosmetic(string slot) {
+        if (slot == null) { return ""; }
+        string val;
+        if (this.equippedBySlot.TryGetValue(slot, out val)) { return val; }
+        return "";
+    }
+}

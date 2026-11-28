@@ -68,22 +68,42 @@ public class PosixEnvironment : IPlatformEnvironment {
 
     public string ExecutablePath() {
         #if LINUX
-        byte[] buf = new byte[4097];
-        int n = readlink("/proc/self/exe", buf, 4096);
-        if (n <= 0 || n > 4096) { return ""; }
-        return buf.ToStr(0, n);
+        int cap = 4096;
+        while (cap <= 65536) {
+            byte[] buf = new byte[cap + 1];
+            int n = readlink("/proc/self/exe", buf, cap);
+            if (n <= 0) { return ""; }
+            if (n < cap) { return buf.ToStr(0, n); }
+            cap = cap * 2;
+        }
+        return "";
         #elif MACOS || IOS
         nint sizeBuf = NativeMemory.Alloc(4);
+        if (sizeBuf == 0) { return ""; }
         nint pathBuf = 0;
         string exe = "";
         try {
-            new Span<int>(sizeBuf, 1)[0] = 4096;
-            pathBuf = NativeMemory.Alloc(4096);
-            NativeMemory.Fill(pathBuf, 0, 4096);
+            int cap = 4096;
+            new Span<int>(sizeBuf, 1)[0] = cap;
+            pathBuf = NativeMemory.Alloc(cap);
+            if (pathBuf == 0) { return ""; }
+            NativeMemory.Fill(pathBuf, 0, cap);
             int ok = NSGetExecutablePath(pathBuf, sizeBuf);
+            if (ok != 0) {
+                int needed = new Span<int>(sizeBuf, 1)[0];
+                if (needed > cap && needed <= 65536) {
+                    NativeMemory.Free(pathBuf);
+                    pathBuf = 0;
+                    cap = needed;
+                    pathBuf = NativeMemory.Alloc(cap);
+                    if (pathBuf == 0) { return ""; }
+                    NativeMemory.Fill(pathBuf, 0, cap);
+                    ok = NSGetExecutablePath(pathBuf, sizeBuf);
+                }
+            }
             if (ok == 0) {
-                int len = NativeMemory.Find(pathBuf, 0, 0, 4096);
-                if (len >= 0 && len < 4096) {
+                int len = NativeMemory.Find(pathBuf, 0, 0, cap);
+                if (len >= 0 && len < cap) {
                     exe = NativeMemory.GetString(pathBuf, 0, len);
                 }
             }

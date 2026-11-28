@@ -32,19 +32,61 @@ public class ExprSql {
         return n != null && n.Kind == 1 && n.TVal == 4;
     }
 
+    // 融合版 LIKE 模式转义与前后 % 包装：wrap 0=纯转义、1=StartsWith、2=EndsWith、3=Contains。
+    private static string EscapeLikeWrapped(string s, int wrap) {
+        if (s == null) {
+            if (wrap == 0) { return null; }
+            if (wrap == 3) { return "%%"; }
+            return "%";
+        }
+        int len = s.Length;
+        int esc = 0;
+        for (int i = 0; i < len; i = i + 1) {
+            int c = s[i] & 255;
+            if (c == 92 || c == 37 || c == 95) { esc = esc + 1; }
+        }
+        if (esc == 0 && wrap == 0) { return s; }
+        int lead = (wrap == 2 || wrap == 3) ? 1 : 0;
+        int trail = (wrap == 1 || wrap == 3) ? 1 : 0;
+        int total = lead + len + esc + trail;
+        byte[] buf = new byte[total];
+        nint bp = (nint)buf;
+        nint sp = (nint)s;
+        int dst = 0;
+        if (lead == 1) { buf[dst] = 37; dst = 1; }
+        if (esc == 0) {
+            if (len > 0) {
+                NativeMemory.Copy(bp + (nint)dst, sp, len);
+                dst = dst + len;
+            }
+        } else {
+            int seg = 0;
+            for (int i = 0; i < len; i = i + 1) {
+                int c = s[i] & 255;
+                if (c == 92 || c == 37 || c == 95) {
+                    if (i > seg) {
+                        NativeMemory.Copy(bp + (nint)dst, sp + (nint)seg, i - seg);
+                        dst = dst + (i - seg);
+                    }
+                    buf[dst] = 92;
+                    buf[dst + 1] = (byte)c;
+                    dst = dst + 2;
+                    seg = i + 1;
+                }
+            }
+            if (seg < len) {
+                NativeMemory.Copy(bp + (nint)dst, sp + (nint)seg, len - seg);
+                dst = dst + (len - seg);
+            }
+        }
+        if (trail == 1) { buf[dst] = 37; }
+        return NativeMemory.GetString(bp, 0, total);
+    }
+
     // LIKE 模式转义：用户文本里的 \ % _ 原义化（前置 \），
     // 通配语义只留给调用形态补的 %；拼 ESCAPE '\' 子句使用。
     public static string EscapeLike(string s) {
-        if (s == null) { return s; }
-        if (s.IndexOf("\\") < 0 && s.IndexOf("%") < 0 &&
-            s.IndexOf("_") < 0) { return s; }
-        StringBuilder e = new StringBuilder();
-        for (int i = 0; i < s.Length; i++) {
-            char c = s[i];
-            if (c == '\\' || c == '%' || c == '_') { e.Append("\\"); }
-            e.Append(c);
-        }
-        return e.ToString();
+        return ExprSql.EscapeLikeWrapped(s, 0);
     }
 
     // Zan 比较运算符对应的 SQL 写法。SQLite 恰好
@@ -59,154 +101,343 @@ public class ExprSql {
 
     public static bool IsSafeIdent(string s) {
         if (s == null || s.Length == 0 || s.Length > 128) { return false; }
-        for (int i = 0; i < s.Length; i = i + 1) {
-            char c = s[i];
-            bool ok = (c >= 'a' && c <= 'z') ||
-                      (c >= 'A' && c <= 'Z') ||
-                      (c >= '0' && c <= '9') ||
-                      c == '_';
+        int len = s.Length;
+        for (int i = 0; i < len; i = i + 1) {
+            int c = s[i] & 255;
+            bool ok = (c >= 97 && c <= 122) ||
+                      (c >= 65 && c <= 90) ||
+                      (c >= 48 && c <= 57) ||
+                      c == 95;
             if (!ok) { return false; }
         }
         return true;
     }
 
-    // Validate before binding: rejected subtrees must not leave stray parameters.
-    public static void Validate(ExprNode n) {
+    // 单遍校验并测量精确字节数（供 Validate 与超大表达式回退路径共用）。
+    private static int ValidateAndMeasure(ExprNode n) {
         if (n == null) { throw new NotSupportedException("SQL expression is missing a node"); }
-        if (n.Kind == 0) {
-            if (n.Name == null || n.Name.Length == 0 || n.Name.Length > 128) {
-                throw new NotSupportedException("Invalid SQL member name");
-            }
-            for (int i = 0; i < n.Name.Length; i = i + 1) {
-                if (n.Name[i] < 32) { throw new NotSupportedException("Invalid SQL member name"); }
-            }
-            return;
-        }
-        if (n.Kind == 1) {
-            if (n.TVal < 0 || n.TVal > 5) { throw new NotSupportedException("Unsupported SQL constant type"); }
-            return;
-        }
-        if (n.Kind == 4 || n.Kind == 5) { Validate(n.A); return; }
-        if (n.Kind == 2) {
+        int kind = n.Kind;
+        if (kind == 2) {
             string op = n.Name;
-            if (op != "==" && op != "!=" && op != "<" && op != ">" &&
-                op != "<=" && op != ">=" && op != "+" && op != "-" &&
-                op != "*" && op != "/" && op != "%" && op != "&&" && op != "||") {
+            if (op == null) { throw new NotSupportedException("Unsupported SQL operator: "); }
+            int opLen = op.Length;
+            if (opLen == 2) {
+                int c0 = op[0] & 255;
+                int c1 = op[1] & 255;
+                if (c0 == 38 && c1 == 38) { return 7 + ValidateAndMeasure(n.A) + ValidateAndMeasure(n.B); }
+                if (c0 == 124 && c1 == 124) { return 6 + ValidateAndMeasure(n.A) + ValidateAndMeasure(n.B); }
+                if (c1 == 61 && (c0 == 61 || c0 == 33)) {
+                    int laLen = ValidateAndMeasure(n.A);
+                    int lbLen = ValidateAndMeasure(n.B);
+                    bool la = n.A.Kind == 1 && n.A.TVal == 4;
+                    bool lb = n.B.Kind == 1 && n.B.TVal == 4;
+                    if (la && lb) { return 3; }
+                    if (la) { return (c0 == 61 ? 10 : 14) + lbLen; }
+                    if (lb) { return (c0 == 61 ? 10 : 14) + laLen; }
+                    return (c0 == 61 ? 5 : 6) + laLen + lbLen;
+                }
+                if (c1 == 61 && (c0 == 60 || c0 == 62)) {
+                    return 6 + ValidateAndMeasure(n.A) + ValidateAndMeasure(n.B);
+                }
                 throw new NotSupportedException("Unsupported SQL operator: " + op);
             }
-            Validate(n.A); Validate(n.B); return;
+            if (opLen == 1) {
+                int c0 = op[0] & 255;
+                if (c0 == 60 || c0 == 62 || c0 == 43 || c0 == 45 || c0 == 42 || c0 == 47 || c0 == 37) {
+                    return 5 + ValidateAndMeasure(n.A) + ValidateAndMeasure(n.B);
+                }
+            }
+            throw new NotSupportedException("Unsupported SQL operator: " + op);
         }
-        if (n.Kind == 3 && (n.Name == "StartsWith" || n.Name == "EndsWith" || n.Name == "Contains")) {
-            Validate(n.A);
-            string text = EvalText(n.B);
-            return;
+        if (kind == 0) {
+            string nm = n.Name;
+            if (nm == null || nm.Length == 0 || nm.Length > 128) {
+                throw new NotSupportedException("Invalid SQL member name");
+            }
+            int len = nm.Length;
+            bool safe = true;
+            int quotes = 0;
+            for (int i = 0; i < len; i = i + 1) {
+                int c = nm[i] & 255;
+                if (c < 32) { throw new NotSupportedException("Invalid SQL member name"); }
+                if (!((c >= 97 && c <= 122) || (c >= 65 && c <= 90)
+                    || (c >= 48 && c <= 57) || c == 95)) {
+                    safe = false;
+                    if (c == 34) { quotes = quotes + 1; }
+                }
+            }
+            return safe ? (2 + len) : (4 + len + quotes);
+        }
+        if (kind == 1) {
+            if (n.TVal < 0 || n.TVal > 5) { throw new NotSupportedException("Unsupported SQL constant type"); }
+            return 1;
+        }
+        if (kind == 4) { return ValidateAndMeasure(n.A); }
+        if (kind == 5) { return 6 + ValidateAndMeasure(n.A); }
+        if (kind == 3) {
+            string fn = n.Name;
+            if (fn == "StartsWith" || fn == "EndsWith" || fn == "Contains") {
+                int recvLen = ValidateAndMeasure(n.A);
+                ExprNode arg = n.B;
+                if (arg == null) { throw new NotSupportedException("SQL expression requires a constant value"); }
+                if (!(arg.Kind == 1 && (arg.TVal == 2 || arg.TVal == 0 || arg.TVal == 5))) {
+                    throw new NotSupportedException("SQL LIKE requires a text or integer constant");
+                }
+                return recvLen + 18;
+            }
         }
         throw new NotSupportedException("Unsupported SQL expression: " + n.Name);
     }
 
-    // 为以 n 为根的树构建 WHERE 片段。
-    public static void Build(ExprNode n, StringBuilder sb, DbParams ps) {
-        Validate(n);
-        Render(n, sb, ps);
+    // Validate before binding: rejected subtrees must not leave stray parameters.
+    public static void Validate(ExprNode n) {
+        ExprSql.ValidateAndMeasure(n);
     }
 
-    static void Render(ExprNode n, StringBuilder sb, DbParams ps) {
-        if (n.Kind == 4) {
-            Render(n.A, sb, ps);
-        } else if (n.Kind == 0) {
-            sb.Append("t.");
-            if (IsSafeIdent(n.Name)) {
-                sb.Append(n.Name);
-            } else {
-                // A member is one column, never a prequoted fragment or qualified path.
-                sb.Append("\"");
-                sb.Append(n.Name.Replace("\"", "\"\""));
-                sb.Append("\"");
-            }
-        } else if (n.Kind == 1) {
-            if (n.TVal == 2) {
-                ps.Add(n.SVal);
-            } else if (n.TVal == 3) {
-                ps.AddInt(n.BVal ? 1 : 0);
-            } else if (n.TVal == 1) {
-                ps.AddDouble(n.DVal);
-            } else if (n.TVal == 4) {
-                ps.AddNull();
-            } else if (n.TVal == 5) {
-                ps.AddLong(n.LVal);
-            } else {
-                ps.AddInt(n.IVal);
-            }
-            sb.Append("?");
-        } else if (n.Kind == 2) {
-            if (n.Name == "==" || n.Name == "!=") {
-                // 等值撞 null 常量（B-ID65）：`= NULL` 在三值逻辑下永不
-                // 命中，必须译 IS [NOT] NULL；两边全 null 是常量谓词。
-                bool la = IsNullConst(n.A);
-                bool lb = IsNullConst(n.B);
-                if (la && lb) {
-                    sb.Append(n.Name == "==" ? "1=1" : "1=0");
-                } else if (la || lb) {
-                    sb.Append("(");
-                    Render(la ? n.B : n.A, sb, ps);
-                    sb.Append(" IS ");
-                    if (n.Name == "!=") { sb.Append("NOT "); }
-                    sb.Append("NULL)");
-                } else {
-                    sb.Append("(");
-                    Render(n.A, sb, ps);
-                    sb.Append(" ");
-                    sb.Append(SqlOp(n.Name));
-                    sb.Append(" ");
-                    Render(n.B, sb, ps);
-                    sb.Append(")");
+    // 零 ref/out 单遍快路径：-1 表示非法节点（交 Validate 抛原异常），-2 表示超出当前缓冲需精确测量重跑。
+    private static int RenderFast(ExprNode n, byte[] buf, int cap, int pos, List<DbParam> items) {
+        if (n == null) { return -1; }
+        int kind = n.Kind;
+        if (kind == 2) {
+            string op = n.Name;
+            if (op == null) { return -1; }
+            int opLen = op.Length;
+            if (opLen == 2) {
+                int c0 = op[0] & 255;
+                int c1 = op[1] & 255;
+                if (c0 == 38 && c1 == 38) {
+                    if (pos + 7 > cap) { return -2; }
+                    buf[pos] = 40; pos = pos + 1;
+                    pos = ExprSql.RenderFast(n.A, buf, cap, pos, items);
+                    if (pos < 0) { return pos; }
+                    if (pos + 6 > cap) { return -2; }
+                    buf[pos] = 32; buf[pos + 1] = 65; buf[pos + 2] = 78; buf[pos + 3] = 68; buf[pos + 4] = 32;
+                    pos = pos + 5;
+                    pos = ExprSql.RenderFast(n.B, buf, cap, pos, items);
+                    if (pos < 0) { return pos; }
+                    if (pos + 1 > cap) { return -2; }
+                    buf[pos] = 41;
+                    return pos + 1;
                 }
-            } else if (n.Name == "&&") {
-                sb.Append("(");
-                Render(n.A, sb, ps);
-                sb.Append(" AND ");
-                Render(n.B, sb, ps);
-                sb.Append(")");
-            } else if (n.Name == "||") {
-                sb.Append("(");
-                Render(n.A, sb, ps);
-                sb.Append(" OR ");
-                Render(n.B, sb, ps);
-                sb.Append(")");
-            } else {
-                sb.Append("(");
-                Render(n.A, sb, ps);
-                sb.Append(" ");
-                sb.Append(SqlOp(n.Name));
-                sb.Append(" ");
-                Render(n.B, sb, ps);
-                sb.Append(")");
-            }
-        } else if (n.Kind == 5) {
-            sb.Append("NOT (");
-            Render(n.A, sb, ps);
-            sb.Append(")");
-        } else if (n.Kind == 3) {
-            if (n.Name == "StartsWith" || n.Name == "EndsWith" ||
-                n.Name == "Contains") {
-                Render(n.A, sb, ps);
-                // ESCAPE '\'（B-ID65）：用户文本经 EscapeLike 原义化，
-                // 通配语义只留给这里补的 %。
-                sb.Append(" LIKE ? ESCAPE '\\'");
-                string pat = EscapeLike(EvalText(n.B));
-                if (n.Name == "StartsWith") {
-                    pat = pat + "%";
-                } else if (n.Name == "EndsWith") {
-                    pat = "%" + pat;
-                } else {
-                    pat = "%" + pat + "%";
+                if (c0 == 124 && c1 == 124) {
+                    if (pos + 6 > cap) { return -2; }
+                    buf[pos] = 40; pos = pos + 1;
+                    pos = ExprSql.RenderFast(n.A, buf, cap, pos, items);
+                    if (pos < 0) { return pos; }
+                    if (pos + 5 > cap) { return -2; }
+                    buf[pos] = 32; buf[pos + 1] = 79; buf[pos + 2] = 82; buf[pos + 3] = 32;
+                    pos = pos + 4;
+                    pos = ExprSql.RenderFast(n.B, buf, cap, pos, items);
+                    if (pos < 0) { return pos; }
+                    if (pos + 1 > cap) { return -2; }
+                    buf[pos] = 41;
+                    return pos + 1;
                 }
-                ps.Add(pat);
-            } else {
-                throw new NotSupportedException("Unsupported SQL expression: " + n.Name);
+                if (c1 == 61 && (c0 == 61 || c0 == 33)) {
+                    ExprNode na = n.A;
+                    ExprNode nb = n.B;
+                    if (na == null || nb == null) { return -1; }
+                    bool la = na.Kind == 1 && na.TVal == 4;
+                    bool lb = nb.Kind == 1 && nb.TVal == 4;
+                    if (la && lb) {
+                        if (pos + 3 > cap) { return -2; }
+                        buf[pos] = 49; buf[pos + 1] = 61; buf[pos + 2] = c0 == 61 ? (byte)49 : (byte)48;
+                        return pos + 3;
+                    }
+                    if (la || lb) {
+                        if (pos + 14 > cap) { return -2; }
+                        buf[pos] = 40; pos = pos + 1;
+                        pos = ExprSql.RenderFast(la ? nb : na, buf, cap, pos, items);
+                        if (pos < 0) { return pos; }
+                        if (c0 == 61) {
+                            if (pos + 9 > cap) { return -2; }
+                            buf[pos] = 32; buf[pos + 1] = 73; buf[pos + 2] = 83; buf[pos + 3] = 32;
+                            buf[pos + 4] = 78; buf[pos + 5] = 85; buf[pos + 6] = 76; buf[pos + 7] = 76; buf[pos + 8] = 41;
+                            return pos + 9;
+                        }
+                        if (pos + 13 > cap) { return -2; }
+                        buf[pos] = 32; buf[pos + 1] = 73; buf[pos + 2] = 83; buf[pos + 3] = 32;
+                        buf[pos + 4] = 78; buf[pos + 5] = 79; buf[pos + 6] = 84; buf[pos + 7] = 32;
+                        buf[pos + 8] = 78; buf[pos + 9] = 85; buf[pos + 10] = 76; buf[pos + 11] = 76; buf[pos + 12] = 41;
+                        return pos + 13;
+                    }
+                    if (pos + 6 > cap) { return -2; }
+                    buf[pos] = 40; pos = pos + 1;
+                    pos = ExprSql.RenderFast(na, buf, cap, pos, items);
+                    if (pos < 0) { return pos; }
+                    if (c0 == 61) {
+                        if (pos + 4 > cap) { return -2; }
+                        buf[pos] = 32; buf[pos + 1] = 61; buf[pos + 2] = 32;
+                        pos = pos + 3;
+                    } else {
+                        if (pos + 5 > cap) { return -2; }
+                        buf[pos] = 32; buf[pos + 1] = 60; buf[pos + 2] = 62; buf[pos + 3] = 32;
+                        pos = pos + 4;
+                    }
+                    pos = ExprSql.RenderFast(nb, buf, cap, pos, items);
+                    if (pos < 0) { return pos; }
+                    if (pos + 1 > cap) { return -2; }
+                    buf[pos] = 41;
+                    return pos + 1;
+                }
+                if (c1 == 61 && (c0 == 60 || c0 == 62)) {
+                    if (pos + 6 > cap) { return -2; }
+                    buf[pos] = 40; pos = pos + 1;
+                    pos = ExprSql.RenderFast(n.A, buf, cap, pos, items);
+                    if (pos < 0) { return pos; }
+                    if (pos + 5 > cap) { return -2; }
+                    buf[pos] = 32; buf[pos + 1] = (byte)c0; buf[pos + 2] = 61; buf[pos + 3] = 32;
+                    pos = pos + 4;
+                    pos = ExprSql.RenderFast(n.B, buf, cap, pos, items);
+                    if (pos < 0) { return pos; }
+                    if (pos + 1 > cap) { return -2; }
+                    buf[pos] = 41;
+                    return pos + 1;
+                }
+                return -1;
             }
-        } else {
-            throw new NotSupportedException("Unsupported SQL expression: " + n.Name);
+            if (opLen == 1) {
+                int c0 = op[0] & 255;
+                if (c0 == 60 || c0 == 62 || c0 == 43 || c0 == 45 || c0 == 42 || c0 == 47 || c0 == 37) {
+                    if (pos + 5 > cap) { return -2; }
+                    buf[pos] = 40; pos = pos + 1;
+                    pos = ExprSql.RenderFast(n.A, buf, cap, pos, items);
+                    if (pos < 0) { return pos; }
+                    if (pos + 4 > cap) { return -2; }
+                    buf[pos] = 32; buf[pos + 1] = (byte)c0; buf[pos + 2] = 32;
+                    pos = pos + 3;
+                    pos = ExprSql.RenderFast(n.B, buf, cap, pos, items);
+                    if (pos < 0) { return pos; }
+                    if (pos + 1 > cap) { return -2; }
+                    buf[pos] = 41;
+                    return pos + 1;
+                }
+            }
+            return -1;
+        }
+        if (kind == 0) {
+            string nm = n.Name;
+            if (nm == null || nm.Length == 0 || nm.Length > 128) { return -1; }
+            int nLen = nm.Length;
+            if (pos + nLen + 2 > cap) { return -2; }
+            buf[pos] = 116; buf[pos + 1] = 46;
+            int dst = pos + 2;
+            bool safe = true;
+            for (int i = 0; i < nLen; i = i + 1) {
+                int c = nm[i] & 255;
+                if ((c >= 97 && c <= 122) || (c >= 65 && c <= 90)
+                    || (c >= 48 && c <= 57) || c == 95) {
+                    buf[dst + i] = (byte)c;
+                } else {
+                    if (c < 32) { return -1; }
+                    safe = false;
+                    break;
+                }
+            }
+            if (safe) { return dst + nLen; }
+            if (pos + nLen * 2 + 4 > cap) { return -2; }
+            buf[dst] = 34;
+            dst = dst + 1;
+            for (int i = 0; i < nLen; i = i + 1) {
+                int c = nm[i] & 255;
+                if (c < 32) { return -1; }
+                if (c == 34) {
+                    buf[dst] = 34; buf[dst + 1] = 34;
+                    dst = dst + 2;
+                } else {
+                    buf[dst] = (byte)c;
+                    dst = dst + 1;
+                }
+            }
+            buf[dst] = 34;
+            return dst + 1;
+        }
+        if (kind == 1) {
+            int tv = n.TVal;
+            if (tv < 0 || tv > 5) { return -1; }
+            if (pos + 1 > cap) { return -2; }
+            if (tv == 2) {
+                string sv = n.SVal;
+                if (sv == null) { items.Add(new DbParam(DbParams.KindNull, "", 0L, 0.0)); }
+                else { items.Add(new DbParam(DbParams.KindText, sv, 0L, 0.0)); }
+            } else if (tv == 3) {
+                items.Add(new DbParam(DbParams.KindInt, "", n.BVal ? 1L : 0L, 0.0));
+            } else if (tv == 1) {
+                items.Add(new DbParam(DbParams.KindDouble, "", 0L, n.DVal));
+            } else if (tv == 4) {
+                items.Add(new DbParam(DbParams.KindNull, "", 0L, 0.0));
+            } else if (tv == 5) {
+                items.Add(new DbParam(DbParams.KindInt, "", n.LVal, 0.0));
+            } else {
+                items.Add(new DbParam(DbParams.KindInt, "", (long)n.IVal, 0.0));
+            }
+            buf[pos] = 63;
+            return pos + 1;
+        }
+        if (kind == 3) {
+            string fn = n.Name;
+            int wrap = 0;
+            if (fn == "StartsWith") { wrap = 1; }
+            else if (fn == "EndsWith") { wrap = 2; }
+            else if (fn == "Contains") { wrap = 3; }
+            else { return -1; }
+            pos = ExprSql.RenderFast(n.A, buf, cap, pos, items);
+            if (pos < 0) { return pos; }
+            ExprNode arg = n.B;
+            if (arg == null) { return -1; }
+            string raw;
+            if (arg.Kind == 1 && arg.TVal == 2) { raw = arg.SVal; }
+            else if (arg.Kind == 1 && arg.TVal == 0) { raw = Convert.ToString(arg.IVal); }
+            else if (arg.Kind == 1 && arg.TVal == 5) { raw = Convert.ToString(arg.LVal); }
+            else { return -1; }
+            if (pos + 18 > cap) { return -2; }
+            buf[pos] = 32; buf[pos + 1] = 76; buf[pos + 2] = 73; buf[pos + 3] = 75; buf[pos + 4] = 69;
+            buf[pos + 5] = 32; buf[pos + 6] = 63; buf[pos + 7] = 32;
+            buf[pos + 8] = 69; buf[pos + 9] = 83; buf[pos + 10] = 67; buf[pos + 11] = 65; buf[pos + 12] = 80; buf[pos + 13] = 69;
+            buf[pos + 14] = 32; buf[pos + 15] = 39; buf[pos + 16] = 92; buf[pos + 17] = 39;
+            pos = pos + 18;
+            string pat = ExprSql.EscapeLikeWrapped(raw, wrap);
+            if (pat == null) { items.Add(new DbParam(DbParams.KindNull, "", 0L, 0.0)); }
+            else { items.Add(new DbParam(DbParams.KindText, pat, 0L, 0.0)); }
+            return pos;
+        }
+        if (kind == 5) {
+            if (pos + 6 > cap) { return -2; }
+            buf[pos] = 78; buf[pos + 1] = 79; buf[pos + 2] = 84; buf[pos + 3] = 32; buf[pos + 4] = 40;
+            pos = pos + 5;
+            pos = ExprSql.RenderFast(n.A, buf, cap, pos, items);
+            if (pos < 0) { return pos; }
+            if (pos + 1 > cap) { return -2; }
+            buf[pos] = 41;
+            return pos + 1;
+        }
+        if (kind == 4) { return ExprSql.RenderFast(n.A, buf, cap, pos, items); }
+        return -1;
+    }
+
+    // 为以 n 为根的树构建 WHERE 片段。
+    public static void Build(ExprNode n, StringBuilder sb, DbParams ps) {
+        List<DbParam> items = ps.items;
+        int savedParams = items.Count;
+        byte[] buf = new byte[512];
+        int len = ExprSql.RenderFast(n, buf, 512, 0, items);
+        if (len >= 0) {
+            if (len > 0) { sb.Append(NativeMemory.GetString((nint)buf, 0, len)); }
+            return;
+        }
+        while (items.Count > savedParams) {
+            items.RemoveAt(items.Count - 1);
+        }
+        if (len == -1) {
+            ExprSql.ValidateAndMeasure(n);
+            return;
+        }
+        int exact = ExprSql.ValidateAndMeasure(n);
+        if (exact <= 0) { return; }
+        byte[] big = new byte[exact + 16];
+        int bigLen = ExprSql.RenderFast(n, big, exact + 16, 0, items);
+        if (bigLen > 0) {
+            sb.Append(NativeMemory.GetString((nint)big, 0, bigLen));
         }
     }
 }

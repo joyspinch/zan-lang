@@ -400,7 +400,9 @@ public class Path {
         int len = path.Length;
         byte sepByte = NativeMemory.Find((nint)path, 0, 92, len) >= 0 ? (byte)92 : (byte)47;
         int c0 = path[0] & 255;
-        bool rooted = (c0 == 47 || c0 == 92 || (len > 1 && (path[1] & 255) == 58));
+        bool hasDrive = (len > 1 && (path[1] & 255) == 58);
+        bool rooted = (c0 == 47 || c0 == 92 || hasDrive);
+        int minPopCnt = hasDrive ? 1 : 0;
 
         int[] starts = new int[32];
         int[] lens = new int[32];
@@ -414,7 +416,7 @@ public class Path {
             if (segLen == 0 || (segLen == 1 && (path[segStart] & 255) == 46)) {
                 // 跳过 "" 与 "."
             } else if (segLen == 2 && (path[segStart] & 255) == 46 && (path[segStart + 1] & 255) == 46) {
-                if (outCnt > 0) {
+                if (outCnt > minPopCnt) {
                     int topStart = starts[outCnt - 1];
                     int topLen = lens[outCnt - 1];
                     bool topIsDotDot = topLen == 2 && (path[topStart] & 255) == 46 && (path[topStart + 1] & 255) == 46;
@@ -538,12 +540,24 @@ public class Path {
     }
 
     // 当 path 是 dir 的目录前缀（或等于 dir）时为真，
-    // 在 Windows 上按段不区分大小写比较（零分配游标扫描）。
+    // 先按 Clean 规范化消除 "." / ".." 穿越段，再按段前缀比较（Windows 不区分大小写）。
     public static bool IsUnder(string dir, string path) {
-        if (dir == null) { return true; }
-        if (path == null) { return false; }
-        int aLen = dir.Length;
-        int bLen = path.Length;
+        if (dir == null || path == null || dir.Length == 0 || path.Length == 0) { return false; }
+        int d0 = dir[0] & 255;
+        int p0 = path[0] & 255;
+        bool dSlashRoot = (d0 == 47 || d0 == 92);
+        bool pSlashRoot = (p0 == 47 || p0 == 92);
+        if (dSlashRoot != pSlashRoot) { return false; }
+
+        string cDir = Path.Clean(dir);
+        string cPath = Path.Clean(path);
+        if (cDir.Length == 0) {
+            return dSlashRoot && pSlashRoot;
+        }
+        if (cPath.Length == 0) { return false; }
+
+        int aLen = cDir.Length;
+        int bLen = cPath.Length;
         int aPos = 0;
         int bPos = 0;
         bool aDone = false;
@@ -552,9 +566,9 @@ public class Path {
             if (bDone) { return false; }
             int aOff; int aSLen;
             int bOff; int bSLen;
-            Path.NextSeg(dir, aLen, ref aPos, ref aDone, out aOff, out aSLen);
-            Path.NextSeg(path, bLen, ref bPos, ref bDone, out bOff, out bSLen);
-            if (!Path.SameSlice(dir, aOff, aSLen, path, bOff, bSLen)) { return false; }
+            Path.NextSeg(cDir, aLen, ref aPos, ref aDone, out aOff, out aSLen);
+            Path.NextSeg(cPath, bLen, ref bPos, ref bDone, out bOff, out bSLen);
+            if (!Path.SameSlice(cDir, aOff, aSLen, cPath, bOff, bSLen)) { return false; }
         }
         return true;
     }

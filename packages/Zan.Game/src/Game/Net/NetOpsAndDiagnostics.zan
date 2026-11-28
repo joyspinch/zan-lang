@@ -1,0 +1,409 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Net;
+
+// 实时网络质量等级常量（驱动商业游戏 HUD 信号格/告警图标与降级策略）。
+public static class NetQualityGrade {
+    public const int Excellent = 0; // RTT <= 50ms, Loss <= 1%, Jitter <= 10ms
+    public const int Good = 1;      // RTT <= 100ms, Loss <= 3%, Jitter <= 25ms
+    public const int Fair = 2;      // RTT <= 160ms, Loss <= 7%, Jitter <= 50ms
+    public const int Poor = 3;      // RTT <= 260ms, Loss <= 15%
+    public const int Critical = 4;  // 严重高延迟或丢包
+}
+
+// 商业级实时网络遥测与质量监测器：
+// - EWMA 平滑往返时延（RTT）与 RFC 3550 到达间隔抖动（J += (|D| - J) / 16）
+// - 64 包环形滑窗丢包率统计（避免开局历史累计稀释近期突发丢包）
+// - 收发带宽速率（Bytes/sec）采样与 5 级连接健康评估
+public class NetQualityMonitor {
+    private const int LossWindowSize = 64;
+
+    public float SmoothedRttMs;
+    public float JitterMs;
+    public float TxBytesPerSec;
+    public float RxBytesPerSec;
+    public int TotalSamples;
+
+    private bool hasRtt;
+    private float lastRttMs;
+    private int[] lossRing; // 0 = delivered, 1 = lost
+    private int lossCursor;
+    private int lossCount;
+    private int lostInWindow;
+
+    private long bwWindowStartMs;
+    private long bwTxAcc;
+    private long bwRxAcc;
+
+    public NetQualityMonitor() {
+        this.SmoothedRttMs = 0.0f;
+        this.JitterMs = 0.0f;
+        this.TxBytesPerSec = 0.0f;
+        this.RxBytesPerSec = 0.0f;
+        this.TotalSamples = 0;
+        this.hasRtt = false;
+        this.lastRttMs = 0.0f;
+        this.lossRing = new int[LossWindowSize];
+        this.lossCursor = 0;
+        this.lossCount = 0;
+        this.lostInWindow = 0;
+        this.bwWindowStartMs = -1;
+        this.bwTxAcc = 0;
+        this.bwRxAcc = 0;
+    }
+
+    // 记录一次 RTT 采样（毫秒），同步更新 EWMA RTT 与 RFC 3550 抖动。
+    public void RecordRtt(float rttMs) {
+        if (rttMs < 0.0f) { rttMs = 0.0f; }
+        this.TotalSamples = this.TotalSamples + 1;
+        if (!this.hasRtt) {
+            this.hasRtt = true;
+            this.SmoothedRttMs = rttMs;
+            this.lastRttMs = rttMs;
+            this.JitterMs = 0.0f;
+            return;
+        }
+        float diff = rttMs - this.lastRttMs;
+        if (diff < 0.0f) { diff = -diff; }
+        this.JitterMs = this.JitterMs + (diff - this.JitterMs) / 16.0f;
+        this.SmoothedRttMs = this.SmoothedRttMs * 0.875f + rttMs * 0.125f;
+        this.lastRttMs = rttMs;
+    }
+
+    // 记录单个序号包的送达/丢失结果，写入 64 包环形滑窗。
+    public void RecordPacketOutcome(bool delivered) {
+        int val = delivered ? 0 : 1;
+        if (this.lossCount < LossWindowSize) {
+            this.lossRing[this.lossCursor] = val;
+            this.lostInWindow = this.lostInWindow + val;
+            this.lossCount = this.lossCount + 1;
+        } else {
+            this.lostInWindow = this.lostInWindow - this.lossRing[this.lossCursor] + val;
+            this.lossRing[this.lossCursor] = val;
+        }
+        this.lossCursor = (this.lossCursor + 1) % LossWindowSize;
+    }
+
+    public float PacketLossRate {
+        get {
+            if (this.lossCount <= 0) { return 0.0f; }
+            return (float)this.lostInWindow / (float)this.lossCount;
+        }
+    }
+
+    // 记录收发字节并按 1 秒窗口刷新实时吞吐率（Bytes/sec）。
+    public void RecordTraffic(int txBytes, int rxBytes, long nowMs) {
+        if (txBytes > 0) { this.bwTxAcc = this.bwTxAcc + (long)txBytes; }
+        if (rxBytes > 0) { this.bwRxAcc = this.bwRxAcc + (long)rxBytes; }
+        if (this.bwWindowStartMs < 0) {
+            this.bwWindowStartMs = nowMs;
+            return;
+        }
+        long elapsed = nowMs - this.bwWindowStartMs;
+        if (elapsed >= 1000) {
+            float sec = (float)elapsed / 1000.0f;
+            this.TxBytesPerSec = (float)this.bwTxAcc / sec;
+            this.RxBytesPerSec = (float)this.bwRxAcc / sec;
+            this.bwTxAcc = 0;
+            this.bwRxAcc = 0;
+            this.bwWindowStartMs = nowMs;
+        }
+    }
+
+    // 综合 RTT、抖动与滑窗丢包率评估当前网络健康档位。
+    public int EvaluateGrade() {
+        float rtt = this.SmoothedRttMs;
+        float jit = this.JitterMs;
+        float loss = this.PacketLossRate;
+        if (rtt > 260.0f || loss > 0.15f) { return NetQualityGrade.Critical; }
+        if (rtt > 160.0f || loss > 0.07f || jit > 50.0f) { return NetQualityGrade.Poor; }
+        if (rtt > 100.0f || loss > 0.03f || jit > 25.0f) { return NetQualityGrade.Fair; }
+        if (rtt > 50.0f || loss > 0.01f || jit > 10.0f) { return NetQualityGrade.Good; }
+        return NetQualityGrade.Excellent;
+    }
+}
+
+// 增量 FNV-1a 64 位帧状态哈希器（用于帧同步 / 权威回放逐帧确定性一致性校验）。
+public class TickStateHasher {
+    private const ulong OffsetBasis = 14695981039346656037ul;
+    private const ulong Prime = 1099511628211ul;
+
+    private ulong hash;
+
+    public TickStateHasher() {
+        this.hash = OffsetBasis;
+    }
+
+    public void Reset() {
+        this.hash = OffsetBasis;
+    }
+
+    public void MixUInt(uint v) {
+        this.hash = (this.hash ^ (ulong)(v & 0xFFu)) * Prime;
+        this.hash = (this.hash ^ (ulong)((v >> 8) & 0xFFu)) * Prime;
+        this.hash = (this.hash ^ (ulong)((v >> 16) & 0xFFu)) * Prime;
+        this.hash = (this.hash ^ (ulong)((v >> 24) & 0xFFu)) * Prime;
+    }
+
+    public void MixInt(int v) {
+        this.MixUInt((uint)v);
+    }
+
+    // 按固定小数精度量化浮点后混入哈希（规避 -0.0 与跨平台微小尾数噪声）。
+    public void MixFloatQuantized(float value, float scale) {
+        float sc = scale > 0.0f ? scale : 1000.0f;
+        int q = (int)Math.Round((double)value * (double)sc);
+        this.MixInt(q);
+    }
+
+    public void MixEntity(int entityId, float x, float y, float z, int hp) {
+        this.MixInt(entityId);
+        this.MixFloatQuantized(x, 1000.0f);
+        this.MixFloatQuantized(y, 1000.0f);
+        this.MixFloatQuantized(z, 1000.0f);
+        this.MixInt(hp);
+    }
+
+    public ulong Digest { get { return this.hash; } }
+}
+
+// 帧不同步（Desync）诊断报告：精确记录首次分叉帧号、多数派哈希与偏离共识的嫌疑节点列表。
+public class DesyncReport {
+    public int Tick;
+    public bool HasDesync;
+    public ulong MajorityHash;
+    public List<int> DivergedPeers;
+
+    public DesyncReport(int tick) {
+        this.Tick = tick;
+        this.HasDesync = false;
+        this.MajorityHash = 0ul;
+        this.DivergedPeers = new List<int>();
+    }
+}
+
+internal class TickHashSlot {
+    public int Tick;
+    public List<int> PeerIds;
+    public List<ulong> Hashes;
+
+    public TickHashSlot(int tick) {
+        this.Tick = tick;
+        this.PeerIds = new List<int>();
+        this.Hashes = new List<ulong>();
+    }
+}
+
+// 商业帧同步 / 权威回放 Desync 探测器：
+// 收集多端每帧提交的 64 位状态哈希，自动检测首个分叉 Tick 并基于多数派共识定位分叉客户端（防静默脱轨与篡改）。
+public class NetDesyncDetector {
+    public int MaxRetainedTicks;
+    public int FirstDesyncTick;
+
+    private List<TickHashSlot> slots;
+
+    public NetDesyncDetector(int maxRetainedTicks) {
+        this.MaxRetainedTicks = maxRetainedTicks > 8 ? maxRetainedTicks : 128;
+        this.FirstDesyncTick = -1;
+        this.slots = new List<TickHashSlot>();
+    }
+
+    private TickHashSlot FindOrCreateSlot(int tick) {
+        for (int i = 0; i < this.slots.Count; i = i + 1) {
+            if (this.slots[i].Tick == tick) { return this.slots[i]; }
+        }
+        TickHashSlot s = new TickHashSlot(tick);
+        this.slots.Add(s);
+        while (this.slots.Count > this.MaxRetainedTicks) {
+            this.slots.RemoveAt(0);
+        }
+        return s;
+    }
+
+    // 提交某客户端在指定 tick 计算出的世界状态哈希。
+    public void SubmitHash(int tick, int peerId, ulong stateHash) {
+        TickHashSlot s = this.FindOrCreateSlot(tick);
+        for (int i = 0; i < s.PeerIds.Count; i = i + 1) {
+            if (s.PeerIds[i] == peerId) {
+                s.Hashes[i] = stateHash;
+                return;
+            }
+        }
+        s.PeerIds.Add(peerId);
+        s.Hashes.Add(stateHash);
+    }
+
+    // 评估指定 tick 是否一致（需要至少 minPeers 份哈希提交）；存在分歧时定位偏离多数派的嫌疑 peer。
+    public DesyncReport EvaluateTick(int tick, int minPeers) {
+        DesyncReport report = new DesyncReport(tick);
+        TickHashSlot s = null;
+        for (int i = 0; i < this.slots.Count; i = i + 1) {
+            if (this.slots[i].Tick == tick) { s = this.slots[i]; break; }
+        }
+        if (s == null || s.PeerIds.Count < minPeers || s.PeerIds.Count == 0) {
+            return report;
+        }
+
+        // 统计出现次数最多的多数派哈希
+        ulong bestHash = s.Hashes[0];
+        int bestCount = 0;
+        for (int i = 0; i < s.Hashes.Count; i = i + 1) {
+            ulong h = s.Hashes[i];
+            int cnt = 0;
+            for (int j = 0; j < s.Hashes.Count; j = j + 1) {
+                if (s.Hashes[j] == h) { cnt = cnt + 1; }
+            }
+            if (cnt > bestCount) {
+                bestCount = cnt;
+                bestHash = h;
+            }
+        }
+
+        report.MajorityHash = bestHash;
+        for (int i = 0; i < s.PeerIds.Count; i = i + 1) {
+            if (s.Hashes[i] != bestHash) {
+                report.HasDesync = true;
+                report.DivergedPeers.Add(s.PeerIds[i]);
+            }
+        }
+        if (report.HasDesync && (this.FirstDesyncTick < 0 || tick < this.FirstDesyncTick)) {
+            this.FirstDesyncTick = tick;
+        }
+        return report;
+    }
+}
+
+// 专用对局服节点状态快照。
+public class DedicatedServerNode {
+    public string ServerId;
+    public string Region;
+    public string Address;
+    public int ActiveMatches;
+    public int MaxMatches;
+    public float CpuLoad; // 0..1
+    public bool Draining;
+    public long LastHeartbeatMs;
+
+    public DedicatedServerNode(string serverId, string region, string address, int maxMatches) {
+        this.ServerId = serverId != null ? serverId : "";
+        this.Region = region != null ? region : "";
+        this.Address = address != null ? address : "";
+        this.ActiveMatches = 0;
+        this.MaxMatches = maxMatches > 0 ? maxMatches : 1;
+        this.CpuLoad = 0.0f;
+        this.Draining = false;
+        this.LastHeartbeatMs = 0;
+    }
+}
+
+// 专用游戏服集群调度与零停机摘流管理器（对标 Agones / GameLift 商业后端调度）：
+// 按区域隔离选服、支持心跳超时自动摘除、支持装箱优先（Bin-Packing，便于云弹性缩容空闲节点）
+// 或最轻负载策略，并支持零中断优雅排空（BeginDrain 停接新局、放行在跑对局直至清零）。
+public class NetServerFleetBalancer {
+    public long HeartbeatTimeoutMs;
+    public float MaxAllocCpuLoad;
+    public bool PreferBinPacking; // true = 装箱紧凑分配，false = 最低负载分散
+
+    private List<DedicatedServerNode> nodes;
+
+    public NetServerFleetBalancer(long heartbeatTimeoutMs) {
+        this.HeartbeatTimeoutMs = heartbeatTimeoutMs > 0 ? heartbeatTimeoutMs : 15000;
+        this.MaxAllocCpuLoad = 0.85f;
+        this.PreferBinPacking = true;
+        this.nodes = new List<DedicatedServerNode>();
+    }
+
+    public int NodeCount { get { return this.nodes.Count; } }
+
+    public void RegisterOrHeartbeat(string serverId, string region, string address,
+                                    int activeMatches, int maxMatches, float cpuLoad, long nowMs) {
+        if (serverId == null || serverId == "") { return; }
+        DedicatedServerNode found = this.FindNode(serverId);
+        if (found == null) {
+            found = new DedicatedServerNode(serverId, region, address, maxMatches);
+            this.nodes.Add(found);
+        }
+        found.Region = region != null ? region : "";
+        found.Address = address != null ? address : "";
+        found.ActiveMatches = activeMatches >= 0 ? activeMatches : 0;
+        found.MaxMatches = maxMatches > 0 ? maxMatches : 1;
+        found.CpuLoad = cpuLoad;
+        found.LastHeartbeatMs = nowMs;
+    }
+
+    public DedicatedServerNode FindNode(string serverId) {
+        if (serverId == null) { return null; }
+        for (int i = 0; i < this.nodes.Count; i = i + 1) {
+            if (this.nodes[i].ServerId == serverId) { return this.nodes[i]; }
+        }
+        return null;
+    }
+
+    // 优雅摘流：停止向该节点分配新对局，允许已开局玩家自然完赛。
+    public bool BeginDrain(string serverId) {
+        DedicatedServerNode n = this.FindNode(serverId);
+        if (n == null) { return false; }
+        n.Draining = true;
+        return true;
+    }
+
+    public bool IsSafeToShutdown(string serverId) {
+        DedicatedServerNode n = this.FindNode(serverId);
+        if (n == null) { return true; }
+        return n.Draining && n.ActiveMatches <= 0;
+    }
+
+    // 清理超时失联节点，返回移除数量。
+    public int PurgeStaleNodes(long nowMs) {
+        int removed = 0;
+        for (int i = this.nodes.Count - 1; i >= 0; i = i - 1) {
+            if (nowMs - this.nodes[i].LastHeartbeatMs > this.HeartbeatTimeoutMs) {
+                this.nodes.RemoveAt(i);
+                removed = removed + 1;
+            }
+        }
+        return removed;
+    }
+
+    // 为目标区域分配一台健康且未摘流的专用服务器并原子占位（ActiveMatches + 1）；无可用节点返回 null。
+    public DedicatedServerNode AllocateMatch(string region, long nowMs) {
+        DedicatedServerNode best = null;
+        for (int i = 0; i < this.nodes.Count; i = i + 1) {
+            DedicatedServerNode n = this.nodes[i];
+            if (n.Region != region) { continue; }
+            if (n.Draining) { continue; }
+            if (nowMs - n.LastHeartbeatMs > this.HeartbeatTimeoutMs) { continue; }
+            if (n.ActiveMatches >= n.MaxMatches) { continue; }
+            if (n.CpuLoad > this.MaxAllocCpuLoad) { continue; }
+
+            if (best == null) {
+                best = n;
+            } else if (this.PreferBinPacking) {
+                // 装箱优先：选剩余空位更少（更满）的机器，腾空其余机器以便弹性缩容
+                int remN = n.MaxMatches - n.ActiveMatches;
+                int remBest = best.MaxMatches - best.ActiveMatches;
+                if (remN < remBest || (remN == remBest && n.CpuLoad < best.CpuLoad)) {
+                    best = n;
+                }
+            } else {
+                // 均衡优先：选负载最低的机器
+                if (n.ActiveMatches < best.ActiveMatches ||
+                    (n.ActiveMatches == best.ActiveMatches && n.CpuLoad < best.CpuLoad)) {
+                    best = n;
+                }
+            }
+        }
+        if (best != null) {
+            best.ActiveMatches = best.ActiveMatches + 1;
+        }
+        return best;
+    }
+
+    public void ReleaseMatch(string serverId) {
+        DedicatedServerNode n = this.FindNode(serverId);
+        if (n != null && n.ActiveMatches > 0) {
+            n.ActiveMatches = n.ActiveMatches - 1;
+        }
+    }
+}

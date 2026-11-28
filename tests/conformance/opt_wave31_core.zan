@@ -1,0 +1,314 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+using System.Data;
+using System.Data.Orm;
+using System.Data.Excel;
+using System.Linq;
+using System.Net.External;
+using System.Cli;
+using Tasks.Jobs;
+
+public class MockDb : IDbExecutor {
+    private int prov;
+    public string lastSql;
+    public int lastParams;
+    public MockDb(int prov) { this.prov = prov; this.lastSql = ""; this.lastParams = 0; }
+    public int GetProvider() { return this.prov; }
+    public DbResult Query(string sql, DbParams prms) { return null; }
+    public int Execute(string sql, DbParams prms) {
+        this.lastSql = sql;
+        this.lastParams = prms == null ? 0 : prms.Count();
+        return 1;
+    }
+    public DbResult Query(string sql) { return null; }
+    public int Execute(string sql) { this.lastSql = sql; this.lastParams = 0; return 1; }
+    public string ExecuteScalar(string sql) { return ""; }
+    public string ExecuteScalar(string sql, DbParams prms) { return ""; }
+    public async DbResult QueryAsync(string sql, DbParams prms) { return null; }
+    public async int ExecuteAsync(string sql, DbParams prms) { return 0; }
+    public async DbResult QueryAsync(string sql) { return null; }
+    public async int ExecuteAsync(string sql) { return 0; }
+    public async string ExecuteScalarAsync(string sql) { return ""; }
+    public async string ExecuteScalarAsync(string sql, DbParams prms) { return ""; }
+}
+
+public class Program {
+    static void Check(string name, bool ok) {
+        if (!ok) {
+            Console.WriteLine("FAIL:" + name);
+            Environment.Exit(1);
+        }
+    }
+
+    static void TestCron() {
+        DateTime t0 = DateTime.FromParts(2026, 3, 14, 10, 27, 35);
+        CronExpression c1 = CronExpression.Parse("*/15 9-17 * * 1-5");
+        Check("cron_bits_min", c1.minutes[0] && c1.minutes[15] && !c1.minutes[16]);
+        Check("cron_bits_dow", !c1.weekdays[0] && c1.weekdays[1] && c1.weekdays[5] && !c1.weekdays[6]);
+        DateTime n1 = c1.GetNext(t0);
+        // 2026-03-14 is Saturday -> Monday 2026-03-16 09:00
+        Check("cron_next1", n1 != null && n1.year == 2026 && n1.month == 3 && n1.day == 16 && n1.hour == 9 && n1.minute == 0);
+        Check("cron_match1", c1.IsMatching(n1) && !c1.IsMatching(t0));
+
+        // Leap day
+        CronExpression leap = CronExpression.Parse("45 6 29 2 *");
+        DateTime nLeap = leap.GetNext(t0);
+        Check("cron_leap", nLeap != null && nLeap.year == 2028 && nLeap.month == 2 && nLeap.day == 29 && nLeap.hour == 6 && nLeap.minute == 45);
+
+        // Impossible Feb 31
+        CronExpression imp = CronExpression.Parse("0 0 31 2 *");
+        Check("cron_imp", imp.GetNext(t0) == null);
+
+        // Jobs intersection vs Hosting union on "0 9 15 * 1" from 2026-06-01 00:00 (Monday)
+        DateTime jun1 = DateTime.FromParts(2026, 6, 1, 0, 0, 0);
+        CronExpression cj = CronExpression.Parse("0 9 15 * 1");
+        CronExpression ch = CronExpression.ParseHosting("0 9 15 * 1");
+        DateTime nj = cj.GetNext(jun1);
+        DateTime nh = ch.GetNext(jun1);
+        // 2026-06-15 is Monday! Hosting hits 2026-06-01 09:00 (Monday), Jobs hits 2026-06-15 09:00 (15th AND Monday)
+        Check("cron_jobs_inter", nj != null && nj.year == 2026 && nj.month == 6 && nj.day == 15 && nj.hour == 9);
+        Check("cron_host_union", nh != null && nh.year == 2026 && nh.month == 6 && nh.day == 1 && nh.hour == 9);
+
+        // Sunday=7 in Hosting range 5-7
+        CronExpression cSun = CronExpression.ParseHosting("0 0 * * 5-7");
+        Check("cron_host_sun7", cSun != null && cSun.weekdays[0] && cSun.weekdays[5] && cSun.weekdays[6]);
+
+        // Hosting invalid returns null
+        Check("cron_host_bad1", CronExpression.ParseHosting("1,,2 * * * *") == null);
+        Check("cron_host_bad2", CronExpression.ParseHosting("*/0 * * * *") == null);
+        Check("cron_host_bad3", CronExpression.ParseHosting("60 * * * *") == null);
+        Console.WriteLine("cron:ok");
+    }
+
+    static void TestXlsx() {
+        XlsxBook b = XlsxBook.New();
+        XlsxSheet s1 = b.AddSheet("'Sales:2026/Q1*?[Final]'");
+        XlsxSheet s2 = b.AddSheet("'Sales:2026/Q1*?[Final]'");
+        XlsxSheet sEmpty = b.AddSheet("''");
+        Check("xlsx_name1", s1.name == "Sales_2026_Q1___Final_");
+        Check("xlsx_name2", s2.name == "Sales_2026_Q1___Final_2");
+        Check("xlsx_empty", sEmpty.name == "Sheet");
+
+        s1.freezeRows = 1;
+        s1.freezeCols = 1;
+        s1.mergeCells.Add("A1:C1");
+
+        List<XlsxCell> r1 = new List<XlsxCell>();
+        r1.Add(XlsxCell.Str(" A & <B> > C "));
+        r1.Add(XlsxCell.Num(42.5));
+        r1.Add(XlsxCell.Bool(true));
+        r1.Add(XlsxCell.Bool(false));
+        r1.Add(XlsxCell.Date(0));      // 1970-01-01 -> 25569
+        r1.Add(XlsxCell.Date(-30000)); // negative excel serial
+        s1.AddRow(r1);
+
+        // Wide row with 30 columns to cover col >= 26 (AA..AD)
+        List<XlsxCell> r2 = new List<XlsxCell>();
+        for (int c = 0; c < 30; c = c + 1) {
+            r2.Add(XlsxCell.Str("c" + Convert.ToString(c)));
+        }
+        s1.AddRow(r2);
+
+        byte[] d1 = b.SaveToBytes();
+        byte[] d2 = b.SaveToBytes();
+        Check("xlsx_nonempty", d1.Length > 200);
+        Check("xlsx_repro_len", d1.Length == d2.Length);
+        bool same = true;
+        for (int i = 0; i < d1.Length; i = i + 1) {
+            if (d1[i] != d2[i]) { same = false; break; }
+        }
+        Check("xlsx_repro_bytes", same);
+        Console.WriteLine("xlsx:ok");
+    }
+
+    static void TestExternalTarget() {
+        ExternalTarget t1 = ExternalTarget.Parse("https://api.example.com/v2/items?q=a%20b");
+        Check("ext_t1", t1 != null && t1.Canonical() == "https://api.example.com/v2/items?q=a%20b"
+            && t1.Port() == 443 && !t1.IsLiteral() && t1.IsSafeLiteral() && !t1.IsLoopback());
+
+        ExternalTarget t2 = ExternalTarget.Parse("HTTPS://API.Example.COM:443?x=1");
+        Check("ext_t2", t2 != null && t2.Canonical() == "https://api.example.com/?x=1"
+            && t2.Path() == "/" && t2.Query() == "?x=1" && t2.Host() == "api.example.com");
+
+        ExternalTarget t3 = ExternalTarget.Parse("http://example.com:08080");
+        Check("ext_t3", t3 != null && t3.Canonical() == "http://example.com:8080/" && t3.Port() == 8080);
+
+        ExternalTarget t4 = ExternalTarget.Parse("http://93.184.216.34/ok");
+        Check("ext_v4_pub", t4 != null && t4.IsLiteral() && t4.IsSafeLiteral() && !t4.IsLoopback());
+
+        ExternalTarget t5 = ExternalTarget.Parse("http://127.0.0.1:8080/a");
+        Check("ext_v4_loop", t5 != null && t5.IsLiteral() && !t5.IsSafeLiteral() && t5.IsLoopback());
+
+        ExternalTarget t6 = ExternalTarget.Parse("http://192.168.1.1/a");
+        Check("ext_v4_priv", t6 != null && t6.IsLiteral() && !t6.IsSafeLiteral() && !t6.IsLoopback());
+
+        ExternalTarget t7 = ExternalTarget.Parse("https://[2606:2800:220:1:248:1893:25c8:1946]/p");
+        Check("ext_v6_pub", t7 != null && t7.IsLiteral() && t7.IsSafeLiteral() && !t7.IsLoopback());
+
+        ExternalTarget t8 = ExternalTarget.Parse("http://[::1]:9000/p");
+        Check("ext_v6_loop", t8 != null && t8.IsLiteral() && !t8.IsSafeLiteral() && t8.IsLoopback()
+            && t8.Canonical() == "http://[::1]:9000/p");
+
+        ExternalTarget t9 = ExternalTarget.Parse("http://[0:0:0:0:0:0:0:1]/p");
+        Check("ext_v6_loop_full", t9 != null && t9.IsLoopback() && !t9.IsSafeLiteral());
+
+        ExternalTarget t10 = ExternalTarget.Parse("https://[2001:DB8::]/p");
+        Check("ext_v6_doc", t10 != null && !t10.IsSafeLiteral() && t10.Host() == "2001:db8::");
+
+        ExternalTarget t11 = ExternalTarget.Parse("https://[64:ff9b::1]/p");
+        Check("ext_v6_nat64", t11 != null && !t11.IsSafeLiteral());
+
+        ExternalTarget t12 = ExternalTarget.Parse("https://[fe80::1]/p");
+        Check("ext_v6_ll", t12 != null && !t12.IsSafeLiteral());
+
+        // Rejections
+        Check("ext_rej_local", ExternalTarget.Parse("http://localhost/a") == null);
+        Check("ext_rej_dotlocal", ExternalTarget.Parse("http://foo.LOCAL/a") == null);
+        Check("ext_rej_frag", ExternalTarget.Parse("https://example.com/a#b") == null);
+        Check("ext_rej_at", ExternalTarget.Parse("https://u@example.com/a") == null);
+        Check("ext_rej_pct_auth", ExternalTarget.Parse("https://ex%20ample.com/a") == null);
+        Check("ext_rej_pct_bad", ExternalTarget.Parse("https://example.com/%2G") == null);
+        ExternalTarget tLeadZero = ExternalTarget.Parse("http://01.2.3.4/a");
+        Check("ext_rej_v4_zero", !ExternalTarget.ValidIPv4("01.2.3.4")
+            && tLeadZero != null && !tLeadZero.IsLiteral());
+        Check("ext_rej_v6_triple", ExternalTarget.Parse("http://[2001:::1]/a") == null);
+        Check("ext_rej_v6_double", ExternalTarget.Parse("http://[2001::1::2]/a") == null);
+        Console.WriteLine("exturl:ok");
+    }
+
+    static void TestExprSql() {
+        ExprNode e = ExprNode.Lambda("u",
+            ExprNode.Binary("&&",
+                ExprNode.Binary("==", ExprNode.Member("id"), ExprNode.Const(7L)),
+                ExprNode.Binary("||",
+                    ExprNode.Binary("!=", ExprNode.Member("deleted_at"), ExprNode.NullConst()),
+                    ExprNode.Call("Contains", ExprNode.Member("tag"), ExprNode.Const("a_b%c\\d")))));
+        StringBuilder sb = new StringBuilder();
+        DbParams ps = new DbParams();
+        ExprSql.Build(e, sb, ps);
+        Check("expr_sql", sb.ToString() == "((t.id = ?) AND ((t.deleted_at IS NOT NULL) OR t.tag LIKE ? ESCAPE '\\'))");
+        Check("expr_params", ps.Count() == 2 && ps.IntAt(0) == 7L && ps.TextAt(1) == "%a\\_b\\%c\\\\d%");
+
+        // Unsafe ident + both-null + Not
+        ExprNode e2 = ExprNode.Not(ExprNode.Binary("==", ExprNode.Member("a\"b"), ExprNode.Const(true)));
+        StringBuilder sb2 = new StringBuilder();
+        DbParams ps2 = new DbParams();
+        ExprSql.Build(e2, sb2, ps2);
+        Check("expr_unsafe", sb2.ToString() == "NOT ((t.\"a\"\"b\" = ?))" && ps2.Count() == 1);
+
+        // Validation failure leaves 0 stray params
+        ExprNode bad = ExprNode.Binary("&&",
+            ExprNode.Binary("==", ExprNode.Member("x"), ExprNode.Const(1)),
+            ExprNode.Binary("??", ExprNode.Member("y"), ExprNode.Const(2)));
+        StringBuilder sb3 = new StringBuilder();
+        DbParams ps3 = new DbParams();
+        bool threw = false;
+        try { ExprSql.Build(bad, sb3, ps3); } catch (Exception ex) { threw = true; }
+        Check("expr_atomic", threw && ps3.Count() == 0 && sb3.Length == 0);
+        Console.WriteLine("exprsql:ok");
+    }
+
+    static void TestOrmInsert() {
+        Meta meta = Meta.Of("Item", "items")
+            .Col("id", "Id", 0, true, true, false, true, 0)
+            .Col("code", "Code", 3, false, false, false, true, 64)
+            .Col("cnt", "Cnt", 0, false, false, false, true, 0)
+            .Col("hi", "Hi", 1, false, false, false, true, 0)
+            .Col("lo", "Lo", 1, false, false, false, true, 0)
+            .Seal();
+
+        MockDb sq = new MockDb(DbProvider.SQLite);
+        Insert ins = Insert.Create(sq, meta);
+        for (int i = 0; i < 5; i = i + 1) {
+            DbValues dv = new DbValues();
+            if (i == 3) {
+                // Different column order + missing 'lo' -> NULL + text-to-int coercion
+                dv.Set("cnt", "10");
+                dv.Set("code", "c3");
+                dv.Set("id", 3L);
+                dv.Set("hi", 9.5);
+            } else {
+                dv.Set("id", (long)i);
+                dv.Set("code", "c" + Convert.ToString(i));
+                dv.Set("cnt", i + 1);
+                dv.Set("hi", (double)i);
+                dv.Set("lo", (double)i);
+            }
+            ins.AddDict(dv);
+        }
+        ins.OC("id");
+        ins.ACC("cnt");
+        ins.GMX("hi");
+        ins.GMN("lo");
+        ins.ExecuteDicts();
+        string wantSq = "INSERT INTO \"items\" (\"id\", \"code\", \"cnt\", \"hi\", \"lo\") VALUES (?, ?, ?, ?, ?), (?, ?, ?, ?, ?), (?, ?, ?, ?, ?), (?, ?, ?, ?, ?), (?, ?, ?, ?, ?) ON CONFLICT (\"id\") DO UPDATE SET \"code\" = excluded.\"code\", \"cnt\" = \"cnt\" + excluded.\"cnt\", \"hi\" = max(\"hi\", excluded.\"hi\"), \"lo\" = min(\"lo\", excluded.\"lo\")";
+        Check("ins_sqlite_sql", sq.lastSql == wantSq && sq.lastParams == 25);
+
+        MockDb my = new MockDb(DbProvider.MySQL);
+        Insert insMy = Insert.Create(my, meta);
+        DbValues d0 = new DbValues().Set("id", 1L).Set("code", "a").Set("cnt", 1).Set("hi", 1.0).Set("lo", 1.0);
+        insMy.AddDict(d0);
+        insMy.OC("id");
+        insMy.ACC("cnt");
+        insMy.GMX("hi");
+        insMy.ExecuteDicts();
+        string wantMy = "INSERT INTO `items` (`id`, `code`, `cnt`, `hi`, `lo`) VALUES (?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE `code` = VALUES(`code`), `cnt` = `cnt` + VALUES(`cnt`), `hi` = GREATEST(`hi`, VALUES(`hi`)), `lo` = VALUES(`lo`)";
+        Check("ins_mysql_sql", my.lastSql == wantMy && my.lastParams == 5);
+
+        // Unknown column in 2nd row must still throw
+        bool threw = false;
+        try {
+            insMy.AddDict(new DbValues().Set("id", 2L).Set("no_such_col", "x"));
+        } catch (Exception ex) { threw = true; }
+        Check("ins_bad_col", threw);
+        Console.WriteLine("ormins:ok");
+    }
+
+    static void TestCliApp() {
+        CliApp app = new CliApp("tool").Describe("Demo tool").Version("1.2.3");
+        app.Option(new CliOption("verbose", CliType.Bool).Short("v").Help("Verbose"));
+        CliCommand db = new CliCommand("db").Describe("DB ops");
+        CliCommand mig = new CliCommand("migrate").Alias("mig").Describe("Migrate");
+        mig.AddOption(new CliOption("steps", CliType.Int).Short("n").Default("1").Help("Steps"));
+        mig.AddOption(new CliOption("dry", CliType.Bool).Short("d").Help("Dry"));
+        mig.AddOption(new CliOption("tag", CliType.String).Short("g").Help("Tag"));
+        mig.AddOption(new CliOption("env", CliType.String).Short("e").Required().Help("Env"));
+        mig.AddOption(new CliOption("target", CliType.String).AsPositional().Required());
+        mig.AddOption(new CliOption("files", CliType.String).AsPositional().Variadic());
+        db.AddCommand(mig);
+        app.Add(db);
+
+        CliResult r1 = app.Parse(new string[] {
+            "-v", "db", "mig", "-d", "--steps=5", "-eprod", "-g", "a", "-g", "b", "main", "1.sql", "2.sql"
+        });
+        Check("cli_r1_ok", r1.error.Length == 0 && r1.GetBool("verbose") && r1.GetBool("dry")
+            && r1.GetInt("steps", 0) == 5 && r1.Get("env", "") == "prod"
+            && r1.Get("target", "") == "main" && r1.GetAll("tag").Count == 2
+            && r1.GetAll("files").Count == 2);
+
+        CliResult r2 = app.Parse(new string[] { "db", "mig", "-e", "dev", "--steps", "abc", "main" });
+        Check("cli_bad_int", r2.error == "option --steps expects an integer, got 'abc'");
+
+        CliResult r3 = app.Parse(new string[] { "db", "nope" });
+        Check("cli_bad_cmd", r3.error == "unknown command 'nope'");
+
+        CliResult r4 = app.Parse(new string[] { "db", "mig", "--help" });
+        Check("cli_help_flag", r4.help && r4.command == mig);
+        string help = app.HelpFor(mig);
+        Check("cli_help_text", help.Contains("Usage: tool db migrate [options] <target> [files]...")
+            && help.Contains("-e, --env <string>") && help.Contains("(required)")
+            && help.Contains("(default: 1)") && help.Contains("-h, --help"));
+        Console.WriteLine("cliapp:ok");
+    }
+
+    public static void Main(string[] args) {
+        TestCron();
+        TestXlsx();
+        TestExternalTarget();
+        TestExprSql();
+        TestOrmInsert();
+        TestCliApp();
+        Console.WriteLine("ALL_WAVE31_OK");
+    }
+}

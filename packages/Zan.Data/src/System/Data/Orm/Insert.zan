@@ -57,8 +57,21 @@ public class Insert {
 
     // 追加一行动态列（列名经元数据校验，未知列抛异常）。
     public void AddDict(DbValues v) {
-        int i = 0;
-        while (i < v.Count()) { this.meta.Require(v.NameAt(i)); i = i + 1; }
+        List<DbValue> vItems = v.items;
+        int vc = vItems.Count;
+        if (this.dicts.Count > 0) {
+            List<DbValue> hItems = this.dicts[0].items;
+            int hc = hItems.Count;
+            for (int i = 0; i < vc; i = i + 1) {
+                string nm = vItems[i].name;
+                if (i < hc && hItems[i].name == nm) { continue; }
+                this.meta.Require(nm);
+            }
+        } else {
+            for (int i = 0; i < vc; i = i + 1) {
+                this.meta.Require(vItems[i].name);
+            }
+        }
         this.dicts.Add(v);
     }
 
@@ -97,15 +110,295 @@ public class Insert {
         return l;
     }
 
-    // 把列集合拼成逗号分隔的列名清单。
-    private string ColList(List<Col> cols) {
-        int p = this.db.GetProvider();
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < cols.Count; i = i + 1) {
-            if (i > 0) { sb.Append(", "); }
-            sb.Append(Dialect.QuoteIdentifier(p, cols[i].Col));
+    // 返回标识符按方言引用后的精确字节长度（零分配）。
+    private static int QuotedLen(int p, string ident, out bool isSimple) {
+        isSimple = false;
+        if (ident == null || ident.Length == 0) { return 0; }
+        int len = ident.Length;
+        if (len == 1 && (ident[0] & 255) == 42) { return 1; }
+        int openCh = 34;
+        int closeCh = 34;
+        if (p == DbProvider.MySQL || p == DbProvider.MariaDB) {
+            openCh = 96; closeCh = 96;
+        } else if (p == DbProvider.SqlServer) {
+            openCh = 91; closeCh = 93;
         }
-        return sb.ToString();
+        if (!(len >= 2 && (ident[0] & 255) == openCh && (ident[len - 1] & 255) == closeCh)) {
+            bool ok = true;
+            for (int i = 0; i < len; i = i + 1) {
+                int c = ident[i] & 255;
+                if (c == 46 || c == closeCh) { ok = false; break; }
+            }
+            if (ok) {
+                isSimple = true;
+                return len + 2;
+            }
+        }
+        return Dialect.QuoteIdentifier(p, ident).Length;
+    }
+
+    private static int WriteQuoted(byte[] buf, nint bp, int pos, int p, string ident) {
+        if (ident == null || ident.Length == 0) { return pos; }
+        int len = ident.Length;
+        if (len == 1 && (ident[0] & 255) == 42) {
+            buf[pos] = 42;
+            return pos + 1;
+        }
+        int openCh = 34;
+        int closeCh = 34;
+        if (p == DbProvider.MySQL || p == DbProvider.MariaDB) {
+            openCh = 96; closeCh = 96;
+        } else if (p == DbProvider.SqlServer) {
+            openCh = 91; closeCh = 93;
+        }
+        bool simple = true;
+        if (len >= 2 && (ident[0] & 255) == openCh && (ident[len - 1] & 255) == closeCh) {
+            simple = false;
+        } else {
+            for (int i = 0; i < len; i = i + 1) {
+                int c = ident[i] & 255;
+                if (c == 46 || c == closeCh) { simple = false; break; }
+            }
+        }
+        if (simple) {
+            buf[pos] = (byte)openCh;
+            NativeMemory.Copy(bp + (nint)(pos + 1), (nint)ident, len);
+            buf[pos + 1 + len] = (byte)closeCh;
+            return pos + len + 2;
+        }
+        string q = Dialect.QuoteIdentifier(p, ident);
+        NativeMemory.Copy(bp + (nint)pos, (nint)q, q.Length);
+        return pos + q.Length;
+    }
+
+    // 预检冲突子句并计算精确字节长度（零中间对象）。
+    private int MeasureConflict(int p, out List<string> keysOut, out int[] modesOut, out int updateCount) {
+        keysOut = null;
+        modesOut = null;
+        updateCount = 0;
+        if (!this.upsert) { return 0; }
+        List<string> keys = this.conf;
+        if (keys.Count == 0) { keys = this.meta.PkCols(); }
+        if (keys.Count == 0) {
+            throw new Exception(this.meta.Entity
+                + ": OnConflict needs key columns");
+        }
+        bool my = p == DbProvider.MySQL || p == DbProvider.MariaDB;
+        bool pg = p == DbProvider.PostgreSQL || p == DbProvider.OpenGauss
+                  || p == DbProvider.Kingbase;
+        if (!my && !pg && p != DbProvider.SQLite) {
+            throw new Exception(
+                "Upsert (OnConflict) is not supported on this provider");
+        }
+        keysOut = keys;
+        bool tmpSimple = false;
+        int keysLen = 0;
+        if (my) {
+            keysLen = Insert.QuotedLen(p, keys[0], out tmpSimple);
+        } else {
+            for (int i = 0; i < keys.Count; i = i + 1) {
+                if (i > 0) { keysLen = keysLen + 2; }
+                keysLen = keysLen + Insert.QuotedLen(p, keys[i], out tmpSimple);
+            }
+        }
+        if (this.nop) {
+            return my ? (25 + keysLen + 3 + keysLen) : (14 + keysLen + 12);
+        }
+
+        int metaCount = this.meta.Cols.Count;
+        int[] modes = new int[metaCount];
+        bool isSqlite = p == DbProvider.SQLite;
+        bool hasAcc = this.acc.Count > 0;
+        bool hasGmx = this.gmx.Count > 0;
+        bool hasGmn = this.gmn.Count > 0;
+        int bodyLen = 0;
+        int n = 0;
+        for (int i = 0; i < metaCount; i = i + 1) {
+            Col c = this.meta.Cols[i];
+            if (!this.Use(c.Col, c.IsIdent) || Dialect.Has(keys, c.Col)) {
+                modes[i] = -1;
+                continue;
+            }
+            int md = 0;
+            if (hasAcc && Dialect.Has(this.acc, c.Col)) { md = 1; }
+            else if (hasGmx && Dialect.Has(this.gmx, c.Col)) { md = 2; }
+            else if (hasGmn && Dialect.Has(this.gmn, c.Col)) { md = 3; }
+            modes[i] = md;
+            int ql = Insert.QuotedLen(p, c.Col, out tmpSimple);
+            if (n > 0) { bodyLen = bodyLen + 2; }
+            if (md == 0) {
+                // my: qc + " = VALUES(" + qc + ")" -> 2*ql + 11; pg/sq: qc + " = excluded." + qc -> 2*ql + 12
+                bodyLen = bodyLen + ql + ql + (my ? 11 : 12);
+            } else if (md == 1) {
+                // my: qc + " = " + qc + " + VALUES(" + qc + ")" -> 3*ql + 14; pg/sq: 3*ql + 15
+                bodyLen = bodyLen + ql * 3 + (my ? 14 : 15);
+            } else {
+                int fnLen = md == 2 ? (isSqlite ? 3 : 8) : (isSqlite ? 3 : 5);
+                // qc + " = " + fn + "(" + qc + ", " + src + ")"
+                // my: 3*ql + fnLen + 15; pg/sq: 3*ql + fnLen + 16
+                bodyLen = bodyLen + ql * 3 + fnLen + (my ? 15 : 16);
+            }
+            n = n + 1;
+        }
+        modesOut = modes;
+        updateCount = n;
+        if (n == 0) {
+            return my ? (25 + keysLen + 3 + keysLen) : (14 + keysLen + 12);
+        }
+        return (my ? 25 : (14 + keysLen + 16)) + bodyLen;
+    }
+
+    private int WriteConflict(byte[] buf, nint bp, int pos, int p,
+                              List<string> keys, int[] modes, int updateCount) {
+        if (!this.upsert) { return pos; }
+        bool my = p == DbProvider.MySQL || p == DbProvider.MariaDB;
+        if (this.nop || updateCount == 0) {
+            if (my) {
+                NativeMemory.Copy(bp + (nint)pos, (nint)" ON DUPLICATE KEY UPDATE ", 25);
+                pos = pos + 25;
+                pos = Insert.WriteQuoted(buf, bp, pos, p, keys[0]);
+                NativeMemory.Copy(bp + (nint)pos, (nint)" = ", 3);
+                pos = pos + 3;
+                pos = Insert.WriteQuoted(buf, bp, pos, p, keys[0]);
+            } else {
+                NativeMemory.Copy(bp + (nint)pos, (nint)" ON CONFLICT (", 14);
+                pos = pos + 14;
+                for (int i = 0; i < keys.Count; i = i + 1) {
+                    if (i > 0) { buf[pos] = 44; buf[pos + 1] = 32; pos = pos + 2; }
+                    pos = Insert.WriteQuoted(buf, bp, pos, p, keys[i]);
+                }
+                NativeMemory.Copy(bp + (nint)pos, (nint)") DO NOTHING", 12);
+                pos = pos + 12;
+            }
+            return pos;
+        }
+
+        if (my) {
+            NativeMemory.Copy(bp + (nint)pos, (nint)" ON DUPLICATE KEY UPDATE ", 25);
+            pos = pos + 25;
+        } else {
+            NativeMemory.Copy(bp + (nint)pos, (nint)" ON CONFLICT (", 14);
+            pos = pos + 14;
+            for (int i = 0; i < keys.Count; i = i + 1) {
+                if (i > 0) { buf[pos] = 44; buf[pos + 1] = 32; pos = pos + 2; }
+                pos = Insert.WriteQuoted(buf, bp, pos, p, keys[i]);
+            }
+            NativeMemory.Copy(bp + (nint)pos, (nint)") DO UPDATE SET ", 16);
+            pos = pos + 16;
+        }
+
+        bool isSqlite = p == DbProvider.SQLite;
+        int metaCount = this.meta.Cols.Count;
+        int n = 0;
+        for (int i = 0; i < metaCount; i = i + 1) {
+            int md = modes[i];
+            if (md < 0) { continue; }
+            string col = this.meta.Cols[i].Col;
+            if (n > 0) { buf[pos] = 44; buf[pos + 1] = 32; pos = pos + 2; }
+            int qStart = pos;
+            pos = Insert.WriteQuoted(buf, bp, pos, p, col);
+            int qLen = pos - qStart;
+            buf[pos] = 32; buf[pos + 1] = 61; buf[pos + 2] = 32;
+            pos = pos + 3;
+            if (md == 0) {
+                if (my) {
+                    NativeMemory.Copy(bp + (nint)pos, (nint)"VALUES(", 7);
+                    pos = pos + 7;
+                    NativeMemory.Copy(bp + (nint)pos, bp + (nint)qStart, qLen);
+                    pos = pos + qLen;
+                    buf[pos] = 41; pos = pos + 1;
+                } else {
+                    NativeMemory.Copy(bp + (nint)pos, (nint)"excluded.", 9);
+                    pos = pos + 9;
+                    NativeMemory.Copy(bp + (nint)pos, bp + (nint)qStart, qLen);
+                    pos = pos + qLen;
+                }
+            } else if (md == 1) {
+                NativeMemory.Copy(bp + (nint)pos, bp + (nint)qStart, qLen);
+                pos = pos + qLen;
+                if (my) {
+                    NativeMemory.Copy(bp + (nint)pos, (nint)" + VALUES(", 10);
+                    pos = pos + 10;
+                    NativeMemory.Copy(bp + (nint)pos, bp + (nint)qStart, qLen);
+                    pos = pos + qLen;
+                    buf[pos] = 41; pos = pos + 1;
+                } else {
+                    NativeMemory.Copy(bp + (nint)pos, (nint)" + excluded.", 12);
+                    pos = pos + 12;
+                    NativeMemory.Copy(bp + (nint)pos, bp + (nint)qStart, qLen);
+                    pos = pos + qLen;
+                }
+            } else {
+                if (md == 2) {
+                    if (isSqlite) {
+                        NativeMemory.Copy(bp + (nint)pos, (nint)"max(", 4); pos = pos + 4;
+                    } else {
+                        NativeMemory.Copy(bp + (nint)pos, (nint)"GREATEST(", 9); pos = pos + 9;
+                    }
+                } else {
+                    if (isSqlite) {
+                        NativeMemory.Copy(bp + (nint)pos, (nint)"min(", 4); pos = pos + 4;
+                    } else {
+                        NativeMemory.Copy(bp + (nint)pos, (nint)"LEAST(", 6); pos = pos + 6;
+                    }
+                }
+                NativeMemory.Copy(bp + (nint)pos, bp + (nint)qStart, qLen);
+                pos = pos + qLen;
+                if (my) {
+                    NativeMemory.Copy(bp + (nint)pos, (nint)", VALUES(", 9);
+                    pos = pos + 9;
+                    NativeMemory.Copy(bp + (nint)pos, bp + (nint)qStart, qLen);
+                    pos = pos + qLen;
+                    buf[pos] = 41; buf[pos + 1] = 41; pos = pos + 2;
+                } else {
+                    NativeMemory.Copy(bp + (nint)pos, (nint)", excluded.", 11);
+                    pos = pos + 11;
+                    NativeMemory.Copy(bp + (nint)pos, bp + (nint)qStart, qLen);
+                    pos = pos + qLen;
+                    buf[pos] = 41; pos = pos + 1;
+                }
+            }
+            n = n + 1;
+        }
+        return pos;
+    }
+
+    private static int WriteValueTuples(byte[] buf, nint bp, int pos, int colCount, int rowCount) {
+        if (rowCount <= 0) { return pos; }
+        int tupleLen = colCount <= 0 ? 6 : (colCount * 3);
+        int startPos = pos;
+        buf[pos] = 40; pos = pos + 1;
+        if (colCount <= 0) {
+            NativeMemory.Copy(bp + (nint)pos, (nint)"NULL", 4);
+            pos = pos + 4;
+        } else {
+            buf[pos] = 63; pos = pos + 1;
+            for (int k = 1; k < colCount; k = k + 1) {
+                buf[pos] = 44; buf[pos + 1] = 32; buf[pos + 2] = 63;
+                pos = pos + 3;
+            }
+        }
+        buf[pos] = 41; pos = pos + 1;
+
+        if (rowCount > 1) {
+            int unitStart = pos;
+            int unitLen = tupleLen + 2;
+            buf[pos] = 44; buf[pos + 1] = 32;
+            NativeMemory.Copy(bp + (nint)(pos + 2), bp + (nint)startPos, tupleLen);
+            pos = pos + unitLen;
+
+            int built = 1;
+            int rem = rowCount - 2;
+            while (rem > 0) {
+                int take = built < rem ? built : rem;
+                int bytes = take * unitLen;
+                NativeMemory.Copy(bp + (nint)pos, bp + (nint)unitStart, bytes);
+                pos = pos + bytes;
+                built = built + take;
+                rem = rem - take;
+            }
+        }
+        return pos;
     }
 
     // 冲突子句。键列缺省取实体主键；方言差异
@@ -113,70 +406,101 @@ public class Insert {
     public string Conflict() {
         if (!this.upsert) { return ""; }
         int p = this.db.GetProvider();
-        List<string> keys = this.conf;
-        if (keys.Count == 0) { keys = this.meta.PkCols(); }
-        if (keys.Count == 0) {
-            throw new Exception(this.meta.Entity
-                + ": OnConflict needs key columns");
-        }
-        StringBuilder sb = new StringBuilder();
-        sb.Append(Dialect.ConflictHead(p, keys, this.nop));
-        if (this.nop) { return sb.ToString(); }
-        int n = 0;
-        for (int i = 0; i < this.meta.Cols.Count; i = i + 1) {
-            Col c = this.meta.Cols[i];
-            if (!this.Use(c.Col, c.IsIdent)) { continue; }
-            if (Dialect.Has(keys, c.Col)) { continue; }
-            if (n > 0) { sb.Append(", "); }
-            sb.Append(Dialect.Excl(p, c.Col,
-                Dialect.Mode(this.acc, this.gmx, this.gmn, c.Col)));
-            n = n + 1;
-        }
-        if (n == 0) { return Dialect.ConflictHead(p, keys, true); }
-        return sb.ToString();
+        List<string> keys = null;
+        int[] modes = null;
+        int updateCount = 0;
+        int len = this.MeasureConflict(p, out keys, out modes, out updateCount);
+        if (len <= 0) { return ""; }
+        byte[] buf = new byte[len];
+        nint bp = (nint)buf;
+        this.WriteConflict(buf, bp, 0, p, keys, modes, updateCount);
+        return NativeMemory.GetString(bp, 0, len);
     }
 
     // 动态列写入（指定行范围）：所有行按第一行的列形状对齐，缺的列写
     // NULL，值按列声明类型绑定。
     public int BuildDictsRange(int start, int count) {
         if (count <= 0) { return 0; }
-        DbParams ps = new DbParams();
-        DbValues head = this.dicts[0];
-        List<string> cols = new List<string>();
-        int c = 0;
-        while (c < head.Count()) {
-            string cn = head.NameAt(c);
-            if (this.Use(cn, false)) { cols.Add(cn); }
-            c = c + 1;
-        }
-        if (cols.Count == 0) { return 0; }
+        List<DbValue> headItems = this.dicts[0].items;
+        int hc = headItems.Count;
+        if (hc == 0) { return 0; }
+
+        bool noFilter = this.only.Count == 0 && this.skip.Count == 0;
+        string[] colNames = new string[hc];
+        int[] headIdx = new int[hc];
+        int[] kinds = new int[hc];
+        int colCount = 0;
         int p = this.db.GetProvider();
-        StringBuilder sb = new StringBuilder();
-        sb.Append("INSERT INTO ");
-        sb.Append(Dialect.QuoteIdentifier(p, this.tbl));
-        sb.Append(" (");
-        for (c = 0; c < cols.Count; c = c + 1) {
-            if (c > 0) { sb.Append(", "); }
-            sb.Append(Dialect.QuoteIdentifier(p, cols[c]));
-        }
-        sb.Append(") VALUES ");
-        string marks = Dialect.Marks(cols.Count);
-        int i = 0;
-        while (i < count) {
-            DbValues v = this.dicts[start + i];
-            if (i > 0) { sb.Append(", "); }
-            sb.Append("(");
-            sb.Append(marks);
-            sb.Append(")");
-            for (int k = 0; k < cols.Count; k = k + 1) {
-                int at = v.IndexOf(cols[k]);
-                if (at < 0) { ps.AddNull(); }
-                else { v.BindAs(ps, at, this.meta.KindOf(cols[k])); }
+        bool tmpSimple = false;
+        int colsSqlLen = 0;
+        for (int c = 0; c < hc; c = c + 1) {
+            string cn = headItems[c].name;
+            if (noFilter || this.Use(cn, false)) {
+                colNames[colCount] = cn;
+                headIdx[colCount] = c;
+                kinds[colCount] = this.meta.KindOf(cn);
+                if (colCount > 0) { colsSqlLen = colsSqlLen + 2; }
+                colsSqlLen = colsSqlLen + Insert.QuotedLen(p, cn, out tmpSimple);
+                colCount = colCount + 1;
             }
-            i = i + 1;
         }
-        sb.Append(this.Conflict());
-        this.sql = sb.ToString();
+        if (colCount == 0) { return 0; }
+
+        List<string> confKeys = null;
+        int[] confModes = null;
+        int confUpdates = 0;
+        int confLen = this.MeasureConflict(p, out confKeys, out confModes, out confUpdates);
+
+        int tblLen = Insert.QuotedLen(p, this.tbl, out tmpSimple);
+        int tupleLen = colCount * 3;
+        int tuplesLen = tupleLen + (count - 1) * (tupleLen + 2);
+        // "INSERT INTO " (12) + tbl + " (" (2) + cols + ") VALUES " (9) + tuples + conflict
+        int totalLen = 23 + tblLen + colsSqlLen + tuplesLen + confLen;
+        byte[] buf = new byte[totalLen];
+        nint bp = (nint)buf;
+        int pos = 0;
+        NativeMemory.Copy(bp, (nint)"INSERT INTO ", 12);
+        pos = 12;
+        pos = Insert.WriteQuoted(buf, bp, pos, p, this.tbl);
+        buf[pos] = 32; buf[pos + 1] = 40; pos = pos + 2;
+        for (int c = 0; c < colCount; c = c + 1) {
+            if (c > 0) { buf[pos] = 44; buf[pos + 1] = 32; pos = pos + 2; }
+            pos = Insert.WriteQuoted(buf, bp, pos, p, colNames[c]);
+        }
+        NativeMemory.Copy(bp + (nint)pos, (nint)") VALUES ", 9);
+        pos = pos + 9;
+        pos = Insert.WriteValueTuples(buf, bp, pos, colCount, count);
+        if (confLen > 0) {
+            pos = this.WriteConflict(buf, bp, pos, p, confKeys, confModes, confUpdates);
+        }
+
+        DbParams ps = new DbParams();
+        for (int i = 0; i < count; i = i + 1) {
+            DbValues v = this.dicts[start + i];
+            List<DbValue> vItems = v.items;
+            int vc = vItems.Count;
+            for (int k = 0; k < colCount; k = k + 1) {
+                int hp = headIdx[k];
+                string col = colNames[k];
+                int at = (hp < vc && vItems[hp].name == col) ? hp : v.IndexOf(col);
+                if (at < 0) {
+                    ps.AddNull();
+                } else {
+                    DbValue dv = vItems[at];
+                    int want = kinds[k];
+                    int vk = dv.kind;
+                    if (vk == want || vk == DbParams.KindNull || want == DbParams.KindNull) {
+                        if (vk == DbParams.KindInt) { ps.AddLong(dv.ival); }
+                        else if (vk == DbParams.KindText) { ps.Add(dv.text); }
+                        else if (vk == DbParams.KindDouble) { ps.AddDouble(dv.dval); }
+                        else { ps.AddNull(); }
+                    } else {
+                        v.BindAs(ps, at, want);
+                    }
+                }
+            }
+        }
+        this.sql = NativeMemory.GetString(bp, 0, pos);
         this.bound = ps;
         return 1;
     }
@@ -190,29 +514,50 @@ public class Insert {
     public int BuildRowsRange(int start, int count) {
         if (count <= 0) { return 0; }
         List<Col> cols = this.Used();
-        if (cols.Count == 0) { return 0; }
+        int colCount = cols.Count;
+        if (colCount == 0) { return 0; }
+        int p = this.db.GetProvider();
+        bool tmpSimple = false;
+        int colsSqlLen = 0;
+        for (int c = 0; c < colCount; c = c + 1) {
+            if (c > 0) { colsSqlLen = colsSqlLen + 2; }
+            colsSqlLen = colsSqlLen + Insert.QuotedLen(p, cols[c].Col, out tmpSimple);
+        }
+        List<string> confKeys = null;
+        int[] confModes = null;
+        int confUpdates = 0;
+        int confLen = this.MeasureConflict(p, out confKeys, out confModes, out confUpdates);
+
+        int tblLen = Insert.QuotedLen(p, this.tbl, out tmpSimple);
+        int tupleLen = colCount * 3;
+        int tuplesLen = tupleLen + (count - 1) * (tupleLen + 2);
+        int totalLen = 23 + tblLen + colsSqlLen + tuplesLen + confLen;
+        byte[] buf = new byte[totalLen];
+        nint bp = (nint)buf;
+        int pos = 0;
+        NativeMemory.Copy(bp, (nint)"INSERT INTO ", 12);
+        pos = 12;
+        pos = Insert.WriteQuoted(buf, bp, pos, p, this.tbl);
+        buf[pos] = 32; buf[pos + 1] = 40; pos = pos + 2;
+        for (int c = 0; c < colCount; c = c + 1) {
+            if (c > 0) { buf[pos] = 44; buf[pos + 1] = 32; pos = pos + 2; }
+            pos = Insert.WriteQuoted(buf, bp, pos, p, cols[c].Col);
+        }
+        NativeMemory.Copy(bp + (nint)pos, (nint)") VALUES ", 9);
+        pos = pos + 9;
+        pos = Insert.WriteValueTuples(buf, bp, pos, colCount, count);
+        if (confLen > 0) {
+            pos = this.WriteConflict(buf, bp, pos, p, confKeys, confModes, confUpdates);
+        }
+
         DbParams ps = new DbParams();
-        StringBuilder sb = new StringBuilder();
-        sb.Append("INSERT INTO ");
-        sb.Append(Dialect.QuoteIdentifier(this.db.GetProvider(), this.tbl));
-        sb.Append(" (");
-        sb.Append(this.ColList(cols));
-        sb.Append(") VALUES ");
-        string marks = Dialect.Marks(cols.Count);
-        int i = 0;
-        while (i < count) {
+        for (int i = 0; i < count; i = i + 1) {
             int rowIdx = start + i;
-            if (i > 0) { sb.Append(", "); }
-            sb.Append("(");
-            sb.Append(marks);
-            sb.Append(")");
-            for (int k = 0; k < cols.Count; k = k + 1) {
+            for (int k = 0; k < colCount; k = k + 1) {
                 this.rows.BindCol(rowIdx, cols[k], ps);
             }
-            i = i + 1;
         }
-        sb.Append(this.Conflict());
-        this.sql = sb.ToString();
+        this.sql = NativeMemory.GetString(bp, 0, pos);
         this.bound = ps;
         return 1;
     }

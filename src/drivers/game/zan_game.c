@@ -144,6 +144,7 @@ typedef struct {
     zgl_int u_mvp, u_model, u_light_vp, u_tex, u_shadow_map, u_shadow_on, u_color;
     zgl_int u_normal_map, u_normal_on, u_normal_scale;
     zgl_int u_orm_map, u_orm_on, u_ao_strength, u_alpha_cutoff;
+    zgl_int u_emissive_map, u_emissive_on, u_uv_transform, u_rim_light, u_toon;
     zgl_int u_light_dir, u_light_color, u_light_count, u_ambient;
     zgl_int u_cam_pos, u_cam_valid, u_material, u_emissive;
     zgl_int u_point_pos, u_point_color, u_point_count;
@@ -205,6 +206,13 @@ static float g_game_normal_scale = 0.0f;
 static char g_game_orm_key[256] = { 0 };
 static float g_game_ao_strength = 1.0f;
 static float g_game_alpha_cutoff = 0.0f;
+static char g_game_emissive_key[256] = { 0 };
+static float g_game_uv_transform[4] = { 1.0f, 1.0f, 0.0f, 0.0f };
+static float g_game_rim_light[4] = { 0.0f, 0.0f, 0.0f, 3.0f };
+static float g_game_toon[2] = { 0.0f, 0.35f }; /* bands, specular_step */
+static float g_game_color_grade[2] = { 1.0f, 1.0f }; /* saturation, contrast */
+static float g_game_color_tint[3] = { 1.0f, 1.0f, 1.0f };
+static float g_game_post_lens[2] = { 0.0f, 0.0f }; /* fxaa, chromatic */
 static uint32_t g_game_light_version = 1;
 
 static zan_game_mesh *g_game_meshes = NULL;
@@ -225,9 +233,10 @@ static zgl_uint g_game_batch_tex = 0;
 static int g_game_cleanup_registered;
 static uint32_t g_game_next_mesh_id = 1;
 
-/* Alpha 混合、深度保留、阴影贴图与 GPU 骨骼矩阵全局状态 */
-static int g_game_blend_enabled = 0;
+/* Alpha/Additive 混合、硬件面剔除、深度保留、阴影贴图与 GPU 骨骼矩阵全局状态 */
+static int g_game_blend_enabled = 0; /* 0=off, 1=alpha, 2=additive */
 static int g_game_depth_write = 1;
+static int g_game_cull_mode = 0;     /* 0=off, 1=back, 2=front */
 static int g_game_preserve_depth = 0;
 static zgl_uint g_game_shadow_fbo = 0;
 static zgl_uint g_game_shadow_tex = 0;
@@ -278,13 +287,14 @@ static const char *const ZAN_GAME_3D_VS_PLAIN =
 "uniform mat4 uMVP;\n"
 "uniform mat4 uModel;\n"
 "uniform mat4 uLightVP;\n"
+"uniform vec4 uUvTransform;\n"
 "out vec2 v_uv;\n"
 "out vec3 v_normal;\n"
 "out vec3 v_world_pos;\n"
 "out vec4 v_light_pos;\n"
 "void main() {\n"
 "    vec4 wp = uModel * vec4(a_pos, 1.0);\n"
-"    v_uv = a_uv;\n"
+"    v_uv = a_uv * uUvTransform.xy + uUvTransform.zw;\n"
 "    v_normal = normalize(mat3(uModel) * a_normal);\n"
 "    v_world_pos = wp.xyz;\n"
 "    v_light_pos = uLightVP * wp;\n"
@@ -300,6 +310,7 @@ static const char *const ZAN_GAME_3D_VS_COLOR =
 "uniform mat4 uMVP;\n"
 "uniform mat4 uModel;\n"
 "uniform mat4 uLightVP;\n"
+"uniform vec4 uUvTransform;\n"
 "out vec2 v_uv;\n"
 "out vec3 v_normal;\n"
 "out vec3 v_world_pos;\n"
@@ -307,7 +318,7 @@ static const char *const ZAN_GAME_3D_VS_COLOR =
 "out vec4 v_light_pos;\n"
 "void main() {\n"
 "    vec4 wp = uModel * vec4(a_pos, 1.0);\n"
-"    v_uv = a_uv;\n"
+"    v_uv = a_uv * uUvTransform.xy + uUvTransform.zw;\n"
 "    v_normal = normalize(mat3(uModel) * a_normal);\n"
 "    v_world_pos = wp.xyz;\n"
 "    v_color = a_color;\n"
@@ -325,6 +336,7 @@ static const char *const ZAN_GAME_3D_VS_SKINNED =
 "uniform mat4 uMVP;\n"
 "uniform mat4 uModel;\n"
 "uniform mat4 uLightVP;\n"
+"uniform vec4 uUvTransform;\n"
 "uniform mat4 uBones[64];\n"
 "out vec2 v_uv;\n"
 "out vec3 v_normal;\n"
@@ -340,7 +352,7 @@ static const char *const ZAN_GAME_3D_VS_SKINNED =
 "    vec4 sp = skin * vec4(a_pos, 1.0);\n"
 "    vec3 sn = normalize(mat3(skin) * a_normal);\n"
 "    vec4 wp = uModel * sp;\n"
-"    v_uv = a_uv;\n"
+"    v_uv = a_uv * uUvTransform.xy + uUvTransform.zw;\n"
 "    v_normal = normalize(mat3(uModel) * sn);\n"
 "    v_world_pos = wp.xyz;\n"
 "    v_light_pos = uLightVP * wp;\n"
@@ -446,6 +458,10 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
 "uniform int uOrmOn;\n" \
 "uniform float uAoStrength;\n" \
 "uniform float uAlphaCutoff;\n" \
+"uniform sampler2D uEmissiveMap;\n" \
+"uniform int uEmissiveOn;\n" \
+"uniform vec4 uRimLight;\n" \
+"uniform vec2 uToon;\n" \
 "uniform vec3 uCamPos;\n" \
 "uniform int uCamValid;\n" \
 "uniform vec2 uMaterial;\n" \
@@ -579,9 +595,38 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
 #define ZAN_GAME_3D_FINAL_COMPOSE(BASE_EXPR, ALPHA_EXPR) \
 "    float outAlpha = " ALPHA_EXPR ";\n" \
 "    if (uAlphaCutoff > 0.0001 && outAlpha < uAlphaCutoff) discard;\n" \
-"    vec3 baseRgb = " BASE_EXPR ";\n" \
-"    vec3 specTint = mix(vec3(1.0), baseRgb, metal);\n" \
-"    vec3 rgb = baseRgb * mix(light, light * (0.35 + 0.65 * rough), metal) + specTint * specAcc + uEmissive;\n" \
+    "    vec3 baseRgb = " BASE_EXPR ";\n" \
+    "    vec3 specTint = mix(vec3(1.0), baseRgb, metal);\n" \
+    "    vec3 emitRgb = (uEmissiveOn != 0) ? (uEmissive * texture(uEmissiveMap, v_uv).rgb) : uEmissive;\n" \
+    "    vec3 litDiff = light;\n" \
+    "    vec3 litSpec = specAcc;\n" \
+    "    if (uToon.x >= 2.0) {\n" \
+    "        float dl = max(litDiff.r, max(litDiff.g, litDiff.b));\n" \
+    "        if (dl > 0.0001) {\n" \
+    "            float q = floor(clamp(dl, 0.0, 1.0) * uToon.x + 0.5) / uToon.x;\n" \
+    "            litDiff *= (q / dl);\n" \
+    "        }\n" \
+    "        float sl = max(litSpec.r, max(litSpec.g, litSpec.b));\n" \
+    "        float spStep = (uToon.y > 0.001) ? uToon.y : 0.35;\n" \
+    "        float sq = smoothstep(spStep - 0.03, spStep + 0.03, sl);\n" \
+    "        litSpec = (sl > 0.0001) ? (litSpec * (sq / sl)) : vec3(0.0);\n" \
+    "    }\n" \
+    "    vec3 rgb = baseRgb * mix(litDiff, litDiff * (0.35 + 0.65 * rough), metal) + specTint * litSpec + emitRgb;\n" \
+    "    if (uCamValid != 0) {\n" \
+    "        float ndv = clamp(dot(N, V), 0.0, 1.0);\n" \
+    "        if (uHemiOn != 0) {\n" \
+    "            vec3 R = reflect(-V, N);\n" \
+    "            vec3 envSpec = mix(uHemiGround, uHemiSky, clamp(R.y * 0.5 + 0.5, 0.0, 1.0));\n" \
+    "            vec3 f0 = mix(vec3(0.04), baseRgb, metal);\n" \
+    "            float fTerm = pow(1.0 - ndv, 5.0);\n" \
+    "            vec3 fresnel = f0 + (vec3(1.0) - f0) * fTerm;\n" \
+    "            float smoothness = 1.0 - rough;\n" \
+    "            rgb += envSpec * fresnel * (smoothness * smoothness) * ao * 0.75;\n" \
+    "        }\n" \
+    "        if ((uRimLight.r + uRimLight.g + uRimLight.b) > 0.0001) {\n" \
+    "            rgb += uRimLight.rgb * pow(1.0 - ndv, max(uRimLight.w, 0.25));\n" \
+    "        }\n" \
+    "    }\n" \
 "    if (uFogParams.x > 0.5 && uCamValid != 0) {\n" \
 "        float fogDist = length(uCamPos - v_world_pos);\n" \
 "        float fogT = clamp((fogDist - uFogParams.y) * uFogParams.z, 0.0, 1.0);\n" \
@@ -664,6 +709,9 @@ static const char *const ZAN_GAME_POST_FS =
 "uniform int uTonemap;\n"
 "uniform float uVignette;\n"
 "uniform vec2 uBloom;\n"
+"uniform vec2 uColorGrade;\n"
+"uniform vec3 uColorTint;\n"
+"uniform vec2 uPostLens;\n"
 "in vec2 v_uv;\n"
 "out vec4 frag;\n"
 "vec3 brightPass(vec3 c, float th) {\n"
@@ -674,6 +722,34 @@ static const char *const ZAN_GAME_POST_FS =
 "void main() {\n"
 "    vec4 src = texture(uScene, v_uv);\n"
 "    vec3 col = src.rgb;\n"
+"    if (uPostLens.x > 0.001) {\n"
+"        vec3 rgbN = texture(uScene, v_uv + vec2(0.0, -uTexelSize.y)).rgb;\n"
+"        vec3 rgbS = texture(uScene, v_uv + vec2(0.0,  uTexelSize.y)).rgb;\n"
+"        vec3 rgbW = texture(uScene, v_uv + vec2(-uTexelSize.x, 0.0)).rgb;\n"
+"        vec3 rgbE = texture(uScene, v_uv + vec2( uTexelSize.x, 0.0)).rgb;\n"
+"        vec3 lw = vec3(0.299, 0.587, 0.114);\n"
+"        float lC = dot(col, lw);\n"
+"        float lN = dot(rgbN, lw);\n"
+"        float lS = dot(rgbS, lw);\n"
+"        float lW = dot(rgbW, lw);\n"
+"        float lE = dot(rgbE, lw);\n"
+"        float lMin = min(lC, min(min(lN, lS), min(lW, lE)));\n"
+"        float lMax = max(lC, max(max(lN, lS), max(lW, lE)));\n"
+"        float contrast = lMax - lMin;\n"
+"        if (contrast > max(0.06, lMax * 0.125)) {\n"
+"            float edgeH = abs(lN + lS - 2.0 * lC);\n"
+"            float edgeV = abs(lW + lE - 2.0 * lC);\n"
+"            vec3 avg = (edgeH >= edgeV) ? 0.5 * (rgbN + rgbS) : 0.5 * (rgbW + rgbE);\n"
+"            float blendF = clamp(contrast * 1.5, 0.0, 0.75) * clamp(uPostLens.x, 0.0, 1.0);\n"
+"            col = mix(col, avg, blendF);\n"
+"        }\n"
+"    }\n"
+"    if (uPostLens.y > 0.0002) {\n"
+"        vec2 dir = v_uv - vec2(0.5);\n"
+"        vec2 off = dir * uPostLens.y;\n"
+"        col.r = texture(uScene, clamp(v_uv + off, vec2(0.0), vec2(1.0))).r;\n"
+"        col.b = texture(uScene, clamp(v_uv - off, vec2(0.0), vec2(1.0))).b;\n"
+"    }\n"
 "    if (uBloom.y > 0.001) {\n"
 "        float th = uBloom.x;\n"
 "        vec3 glow = brightPass(col, th) * 0.16;\n"
@@ -695,12 +771,16 @@ static const char *const ZAN_GAME_POST_FS =
 "        col += glow * uBloom.y;\n"
 "    }\n"
 "    col *= max(uExposure, 0.0);\n"
-"    if (uTonemap == 1) {\n"
-"        col = col / (vec3(1.0) + col);\n"
-"    } else if (uTonemap == 2) {\n"
-"        col = (col * (2.51 * col + 0.03)) / (col * (2.43 * col + 0.59) + 0.14);\n"
-"    }\n"
-"    if (uVignette > 0.001) {\n"
+    "    if (uTonemap == 1) {\n"
+    "        col = col / (vec3(1.0) + col);\n"
+    "    } else if (uTonemap == 2) {\n"
+    "        col = (col * (2.51 * col + 0.03)) / (col * (2.43 * col + 0.59) + 0.14);\n"
+    "    }\n"
+    "    float luma = dot(col, vec3(0.2126, 0.7152, 0.0722));\n"
+    "    col = mix(vec3(luma), col, uColorGrade.x);\n"
+    "    col = (col - vec3(0.5)) * uColorGrade.y + vec3(0.5);\n"
+    "    col *= uColorTint;\n"
+    "    if (uVignette > 0.001) {\n"
 "        vec2 d = (v_uv - vec2(0.5)) * 2.0;\n"
 "        float vig = clamp(1.0 - uVignette * dot(d, d) * 0.5, 0.0, 1.0);\n"
 "        col *= vig;\n"
@@ -716,6 +796,9 @@ typedef struct {
     zgl_int u_tonemap;
     zgl_int u_vignette;
     zgl_int u_bloom;
+    zgl_int u_color_grade;
+    zgl_int u_color_tint;
+    zgl_int u_post_lens;
 } zan_game_post_program;
 
 static const char *const ZAN_GAME_SKYBOX_FS =
@@ -895,7 +978,7 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
         ? (colored ? ZAN_GAME_3D_FS_INST_COLOR : ZAN_GAME_3D_FS_INST)
         : (colored ? ZAN_GAME_3D_FS_COLOR : ZAN_GAME_3D_FS_PLAIN);
     char vs_src[4096];
-    char fs_src[8192];
+    char fs_src[16384];
     const char *head = zan_game_glsl_head();
     snprintf(vs_src, sizeof(vs_src), "%s%s", head, vs);
     snprintf(fs_src, sizeof(fs_src), "%s%s", head, fs);
@@ -929,6 +1012,16 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
         : g_game_gl->GetUniformLocation(program, "uAoStrength");
     zgl_int alpha_cutoff = instanced ? -1
         : g_game_gl->GetUniformLocation(program, "uAlphaCutoff");
+    zgl_int emissive_map = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uEmissiveMap");
+    zgl_int emissive_on = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uEmissiveOn");
+    zgl_int uv_transform = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uUvTransform");
+    zgl_int rim_light = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uRimLight");
+    zgl_int toon = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uToon");
     zgl_int color = instanced ? 0
         : g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
@@ -986,6 +1079,11 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
     prog->u_orm_on = orm_on;
     prog->u_ao_strength = ao_strength;
     prog->u_alpha_cutoff = alpha_cutoff;
+    prog->u_emissive_map = emissive_map;
+    prog->u_emissive_on = emissive_on;
+    prog->u_uv_transform = uv_transform;
+    prog->u_rim_light = rim_light;
+    prog->u_toon = toon;
     prog->u_color = color;
     prog->u_light_dir = light_dir;
     prog->u_light_color = light_color;
@@ -1015,7 +1113,7 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
 static zan_game_program *zan_game_skin_program_get(void) {
     if (g_game_skin_prog.program) return &g_game_skin_prog;
     char vs_src[4096];
-    char fs_src[8192];
+    char fs_src[16384];
     const char *head = zan_game_glsl_head();
     snprintf(vs_src, sizeof(vs_src), "%s%s", head, ZAN_GAME_3D_VS_SKINNED);
     snprintf(fs_src, sizeof(fs_src), "%s%s", head, ZAN_GAME_3D_FS_PLAIN);
@@ -1040,6 +1138,11 @@ static zan_game_program *zan_game_skin_program_get(void) {
     zgl_int orm_on = g_game_gl->GetUniformLocation(program, "uOrmOn");
     zgl_int ao_strength = g_game_gl->GetUniformLocation(program, "uAoStrength");
     zgl_int alpha_cutoff = g_game_gl->GetUniformLocation(program, "uAlphaCutoff");
+    zgl_int emissive_map = g_game_gl->GetUniformLocation(program, "uEmissiveMap");
+    zgl_int emissive_on = g_game_gl->GetUniformLocation(program, "uEmissiveOn");
+    zgl_int uv_transform = g_game_gl->GetUniformLocation(program, "uUvTransform");
+    zgl_int rim_light = g_game_gl->GetUniformLocation(program, "uRimLight");
+    zgl_int toon = g_game_gl->GetUniformLocation(program, "uToon");
     zgl_int color = g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
     zgl_int light_color = g_game_gl->GetUniformLocation(program, "uLightColor[0]");
@@ -1085,6 +1188,11 @@ static zan_game_program *zan_game_skin_program_get(void) {
     g_game_skin_prog.u_orm_on = orm_on;
     g_game_skin_prog.u_ao_strength = ao_strength;
     g_game_skin_prog.u_alpha_cutoff = alpha_cutoff;
+    g_game_skin_prog.u_emissive_map = emissive_map;
+    g_game_skin_prog.u_emissive_on = emissive_on;
+    g_game_skin_prog.u_uv_transform = uv_transform;
+    g_game_skin_prog.u_rim_light = rim_light;
+    g_game_skin_prog.u_toon = toon;
     g_game_skin_prog.u_color = color;
     g_game_skin_prog.u_light_dir = light_dir;
     g_game_skin_prog.u_light_color = light_color;
@@ -1382,8 +1490,19 @@ static void zan_game_clip(const zan_gpu_frame *frame, int *x, int *y,
     *height = (int)(y1 - y0);
 }
 
+#define ZAN_GAME_GL_FRONT 0x0404
+#define ZAN_GAME_GL_CW    0x0900
+
 static void zan_game_apply_blend_state(const zan_gl_api *gl) {
-    if (g_game_blend_enabled) {
+    if (g_game_blend_enabled == 2) {
+        gl->Enable(ZGL_BLEND);
+        if (gl->BlendFuncSeparate) {
+            gl->BlendFuncSeparate(ZGL_SRC_ALPHA, ZGL_ONE,
+                                  ZGL_ONE, ZGL_ONE_MINUS_SRC_ALPHA);
+        } else {
+            gl->BlendFunc(ZGL_SRC_ALPHA, ZGL_ONE);
+        }
+    } else if (g_game_blend_enabled == 1) {
         gl->Enable(ZGL_BLEND);
         if (gl->BlendFuncSeparate) {
             gl->BlendFuncSeparate(ZGL_SRC_ALPHA, ZGL_ONE_MINUS_SRC_ALPHA,
@@ -1397,6 +1516,20 @@ static void zan_game_apply_blend_state(const zan_gl_api *gl) {
     if (gl->DepthMask) {
         gl->DepthMask(g_game_depth_write ? ZGL_TRUE : ZGL_FALSE);
     }
+    if (g_game_cull_mode != 0 && gl->CullFace) {
+        gl->Enable(ZGL_CULL_FACE);
+        /* Canvas FBO 顶点着色器对 clip.y 取反，标准 CCW 正面在 FBO 空间变为 CW */
+        if (gl->FrontFace) gl->FrontFace(ZAN_GAME_GL_CW);
+        gl->CullFace(g_game_cull_mode == 2 ? ZAN_GAME_GL_FRONT : ZGL_BACK);
+    } else {
+        gl->Disable(ZGL_CULL_FACE);
+        if (gl->FrontFace) gl->FrontFace(ZGL_CCW);
+    }
+}
+
+static void zan_game_restore_cull_state(const zan_gl_api *gl) {
+    gl->Disable(ZGL_CULL_FACE);
+    if (gl->FrontFace) gl->FrontFace(ZGL_CCW);
 }
 
 static void zan_game_bind_shadow_uniforms(const zan_gl_api *gl, zan_game_program *prog,
@@ -1456,6 +1589,34 @@ static void zan_game_bind_shadow_uniforms(const zan_gl_api *gl, zan_game_program
     if (prog->u_alpha_cutoff >= 0 && gl->Uniform1f) {
         gl->Uniform1f(prog->u_alpha_cutoff, g_game_alpha_cutoff);
     }
+    zgl_uint em_tex = 0;
+    if (g_game_emissive_key[0]) {
+        const zan_bitmap *ebmp = zan_image_get(g_game_emissive_key);
+        if (zan_game_bitmap_valid(ebmp)) {
+            em_tex = zan_gui_gpu_texture(ebmp);
+        }
+    }
+    if (prog->u_emissive_on >= 0) {
+        gl->Uniform1i(prog->u_emissive_on, em_tex ? 1 : 0);
+    }
+    if (prog->u_emissive_map >= 0) {
+        gl->ActiveTexture(ZGL_TEXTURE0 + 4);
+        gl->BindTexture(ZGL_TEXTURE_2D, em_tex);
+        gl->Uniform1i(prog->u_emissive_map, 4);
+    }
+    if (prog->u_uv_transform >= 0) {
+        gl->Uniform4f(prog->u_uv_transform,
+            g_game_uv_transform[0], g_game_uv_transform[1],
+            g_game_uv_transform[2], g_game_uv_transform[3]);
+    }
+    if (prog->u_rim_light >= 0) {
+        gl->Uniform4f(prog->u_rim_light,
+            g_game_rim_light[0], g_game_rim_light[1],
+            g_game_rim_light[2], g_game_rim_light[3]);
+    }
+    if (prog->u_toon >= 0) {
+        gl->Uniform2f(prog->u_toon, g_game_toon[0], g_game_toon[1]);
+    }
 }
 
 ZAN_GAME_API int32_t zan_game_draw3d_ex(int32_t surface_id, int32_t mesh_id,
@@ -1510,6 +1671,7 @@ ZAN_GAME_API int32_t zan_game_draw3d_ex(int32_t surface_id, int32_t mesh_id,
     gl->BindVertexArray(mesh->vao);
     gl->DrawElements(ZGL_TRIANGLES, mesh->index_count, ZGL_UNSIGNED_SHORT, NULL);
     gl->BindVertexArray(0);
+    zan_game_restore_cull_state(gl);
     if (gl->DepthMask) gl->DepthMask(ZGL_TRUE);
     gl->Finish();
     result = gl->GetError() == ZGL_NO_ERROR;
@@ -1660,6 +1822,7 @@ ZAN_GAME_API int32_t zan_game_draw3d_batch(int32_t surface_id, int32_t mesh_id,
 ZAN_GAME_API int32_t zan_game_draw3d_batch_end(int32_t surface_id) {
     if (surface_id < 0 || surface_id != g_game_batch_surface) return 0;
     if (g_game_gl) {
+        zan_game_restore_cull_state(g_game_gl);
         if (g_game_gl->DepthMask) g_game_gl->DepthMask(ZGL_TRUE);
         g_game_gl->Finish();
     }
@@ -1688,8 +1851,17 @@ ZAN_GAME_API int32_t zan_game_set_lights3d(int32_t count, const float *dirs,
 }
 
 ZAN_GAME_API int32_t zan_game_set_blend3d(int32_t enabled, int32_t depth_write) {
-    g_game_blend_enabled = enabled != 0 ? 1 : 0;
+    g_game_blend_enabled = (enabled == 2) ? 2 : (enabled != 0 ? 1 : 0);
     g_game_depth_write = depth_write != 0 ? 1 : 0;
+    if (g_game_batch_surface >= 0 && g_game_gl) {
+        zan_game_apply_blend_state(g_game_gl);
+    }
+    return 1;
+}
+
+ZAN_GAME_API int32_t zan_game_set_cull3d(int32_t mode) {
+    if (mode < 0 || mode > 2) return 0;
+    g_game_cull_mode = mode;
     if (g_game_batch_surface >= 0 && g_game_gl) {
         zan_game_apply_blend_state(g_game_gl);
     }
@@ -1981,6 +2153,7 @@ ZAN_GAME_API int32_t zan_game_draw3d_skinned(int32_t surface_id, int32_t mesh_id
     gl->BindVertexArray(mesh->vao);
     gl->DrawElements(ZGL_TRIANGLES, mesh->index_count, ZGL_UNSIGNED_SHORT, NULL);
     gl->BindVertexArray(0);
+    zan_game_restore_cull_state(gl);
     if (gl->DepthMask) gl->DepthMask(ZGL_TRUE);
     gl->Finish();
     result = gl->GetError() == ZGL_NO_ERROR;
@@ -1993,7 +2166,7 @@ done:
 static zan_game_post_program *zan_game_post_program_get(void) {
     if (g_game_post_prog.program) return &g_game_post_prog;
     char vs_src[1024];
-    char fs_src[3072];
+    char fs_src[8192];
     const char *head = zan_game_glsl_head();
     snprintf(vs_src, sizeof(vs_src), "%s%s", head, ZAN_GAME_POST_VS);
     snprintf(fs_src, sizeof(fs_src), "%s%s", head, ZAN_GAME_POST_FS);
@@ -2006,6 +2179,9 @@ static zan_game_post_program *zan_game_post_program_get(void) {
     g_game_post_prog.u_tonemap = g_game_gl->GetUniformLocation(prog, "uTonemap");
     g_game_post_prog.u_vignette = g_game_gl->GetUniformLocation(prog, "uVignette");
     g_game_post_prog.u_bloom = g_game_gl->GetUniformLocation(prog, "uBloom");
+    g_game_post_prog.u_color_grade = g_game_gl->GetUniformLocation(prog, "uColorGrade");
+    g_game_post_prog.u_color_tint = g_game_gl->GetUniformLocation(prog, "uColorTint");
+    g_game_post_prog.u_post_lens = g_game_gl->GetUniformLocation(prog, "uPostLens");
     return &g_game_post_prog;
 }
 
@@ -2100,6 +2276,15 @@ ZAN_GAME_API int32_t zan_game_postprocess3d(int32_t surface_id, float exposure,
     if (prog->u_tonemap >= 0) gl->Uniform1i(prog->u_tonemap, tonemap_mode);
     if (prog->u_vignette >= 0 && gl->Uniform1f) gl->Uniform1f(prog->u_vignette, vignette);
     if (prog->u_bloom >= 0) gl->Uniform2f(prog->u_bloom, bloom_threshold, bloom_intensity);
+    if (prog->u_color_grade >= 0) {
+        gl->Uniform2f(prog->u_color_grade, g_game_color_grade[0], g_game_color_grade[1]);
+    }
+    if (prog->u_color_tint >= 0) {
+        gl->Uniform3fv(prog->u_color_tint, 1, g_game_color_tint);
+    }
+    if (prog->u_post_lens >= 0) {
+        gl->Uniform2f(prog->u_post_lens, g_game_post_lens[0], g_game_post_lens[1]);
+    }
     gl->BindVertexArray(g_game_post_vao);
     gl->DrawArrays(ZGL_TRIANGLES, 0, 3);
     gl->BindVertexArray(0);
@@ -2260,4 +2445,52 @@ ZAN_GAME_API void zan_game_set_alpha_cutoff3d(float cutoff) {
     }
     if (cutoff > 1.0f) cutoff = 1.0f;
     g_game_alpha_cutoff = cutoff;
+}
+
+ZAN_GAME_API void zan_game_set_emissive_map3d(const char *texture) {
+    if (!texture || !texture[0]) {
+        g_game_emissive_key[0] = '\0';
+        return;
+    }
+    snprintf(g_game_emissive_key, sizeof(g_game_emissive_key), "%s", texture);
+}
+
+ZAN_GAME_API void zan_game_set_uv_transform3d(float scale_u, float scale_v,
+    float offset_u, float offset_v) {
+    g_game_uv_transform[0] = scale_u;
+    g_game_uv_transform[1] = scale_v;
+    g_game_uv_transform[2] = offset_u;
+    g_game_uv_transform[3] = offset_v;
+}
+
+ZAN_GAME_API void zan_game_set_rim_light3d(float r, float g, float b, float power) {
+    g_game_rim_light[0] = r > 0.0f ? r : 0.0f;
+    g_game_rim_light[1] = g > 0.0f ? g : 0.0f;
+    g_game_rim_light[2] = b > 0.0f ? b : 0.0f;
+    g_game_rim_light[3] = power >= 0.25f ? power : 0.25f;
+}
+
+ZAN_GAME_API void zan_game_set_color_grade3d(float saturation, float contrast,
+    float tint_r, float tint_g, float tint_b) {
+    g_game_color_grade[0] = saturation >= 0.0f ? saturation : 0.0f;
+    g_game_color_grade[1] = contrast >= 0.0f ? contrast : 0.0f;
+    g_game_color_tint[0] = tint_r >= 0.0f ? tint_r : 0.0f;
+    g_game_color_tint[1] = tint_g >= 0.0f ? tint_g : 0.0f;
+    g_game_color_tint[2] = tint_b >= 0.0f ? tint_b : 0.0f;
+}
+
+ZAN_GAME_API void zan_game_set_toon_shading3d(float bands, float specular_step) {
+    g_game_toon[0] = bands >= 2.0f ? bands : 0.0f;
+    if (specular_step < 0.05f) specular_step = 0.05f;
+    if (specular_step > 0.98f) specular_step = 0.98f;
+    g_game_toon[1] = specular_step;
+}
+
+ZAN_GAME_API void zan_game_set_post_lens3d(float fxaa_strength, float chromatic_strength) {
+    if (fxaa_strength < 0.0f) fxaa_strength = 0.0f;
+    if (fxaa_strength > 1.0f) fxaa_strength = 1.0f;
+    if (chromatic_strength < 0.0f) chromatic_strength = 0.0f;
+    if (chromatic_strength > 0.1f) chromatic_strength = 0.1f;
+    g_game_post_lens[0] = fxaa_strength;
+    g_game_post_lens[1] = chromatic_strength;
 }

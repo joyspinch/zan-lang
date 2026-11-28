@@ -1,0 +1,81 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Windows;
+
+namespace Conf;
+
+class DesktopCompanionEngagementIpcTest {
+    static void Main() {
+        // 1. Win32 全局光标实机采样 + 摸头往返手势识别 + 四角热区检测
+        CursorPoint liveCursor = GlobalCursorTracker.QueryCursorPos();
+        bool liveCursorOk = liveCursor != null && liveCursor.X > -32768 && liveCursor.X < 32768;
+
+        GlobalCursorTracker tracker = new GlobalCursorTracker();
+        tracker.MinStrokePx = 10;
+        tracker.RequiredReversals = 3;
+        // 在宠头区域 [100..260, 100..200] 内来回揉搓：右 -> 左(rev1) -> 右(rev2) -> 左(rev3 触发!)
+        bool h0 = tracker.FeedHeadpatSample(150, 140, 1000, 100, 100, 260, 200);
+        bool h1 = tracker.FeedHeadpatSample(190, 140, 1100, 100, 100, 260, 200);
+        bool h2 = tracker.FeedHeadpatSample(140, 140, 1200, 100, 100, 260, 200);
+        bool h3 = tracker.FeedHeadpatSample(200, 140, 1300, 100, 100, 260, 200);
+        bool h4 = tracker.FeedHeadpatSample(145, 140, 1400, 100, 100, 260, 200);
+        // 触发后冷却期内不重复触发
+        bool hCool = tracker.FeedHeadpatSample(210, 140, 1500, 100, 100, 260, 200);
+        int cornerTR = GlobalCursorTracker.DetectHotCorner(1915, 4, 0, 0, 1920, 1080, 16);
+        int cornerMid = GlobalCursorTracker.DetectHotCorner(500, 500, 0, 0, 1920, 1080, 16);
+
+        bool cursorOk = liveCursorOk && !h0 && !h1 && !h2 && !h3 && h4 && !hCool
+            && cornerTR == HotCornerKind.TopRight && cornerMid == HotCornerKind.None;
+        Console.WriteLine("global-cursor-headpat-hotcorner: " + Convert.ToString(cursorOk ? 1 : 0));
+
+        // 2. 跨实例原子文件信箱 IPC（顺序保序 + TTL 过期剔除 + 消费即删）
+        string dir = Path.Combine(Path.GetTempPath(), "zan_r9_ipc_mailbox_test");
+        if (Directory.Exists(dir)) {
+            List<string> leftover = Directory.GetFiles(dir);
+            for (int i = 0; i < leftover.Count; i = i + 1) { File.Delete(leftover[i]); }
+        }
+        bool ipcOk = false;
+        try {
+            CompanionIpcMailbox box = new CompanionIpcMailbox(dir, 5000);
+            box.SendCommand("StaleOld", "ignored", 1000);       // 过期信封（now=20000 时超时 >5000ms）
+            box.SendCommand("Show", "front", 19000);
+            box.SendCommand("StartPomodoro", "25m", 19500);
+
+            List<IpcCommandMessage> cmds = box.PollCommands(20000);
+            List<IpcCommandMessage> secondPoll = box.PollCommands(20100);
+            ipcOk = cmds.Count == 2
+                && cmds[0].Command == "Show" && cmds[0].Payload == "front"
+                && cmds[1].Command == "StartPomodoro" && cmds[1].Payload == "25m"
+                && secondPoll.Count == 0;
+        } finally {
+            if (Directory.Exists(dir)) {
+                List<string> rem = Directory.GetFiles(dir);
+                for (int i = 0; i < rem.Count; i = i + 1) { File.Delete(rem[i]); }
+                Directory.Delete(dir);
+            }
+        }
+        Console.WriteLine("companion-ipc-mailbox-atomic: " + Convert.ToString(ipcOk ? 1 : 0));
+
+        // 3. 每日任务轮换 + 连续签到 Streak + 防重领奖金币账本 + 装扮解锁与槽位互斥穿戴
+        CompanionProgressionLedger ledger = new CompanionProgressionLedger();
+        bool day1 = ledger.BeginDay(20261127);
+        bool day1Dup = !ledger.BeginDay(20261127);
+        ledger.AddDailyQuest("q_focus", "Complete 2 Pomodoros", 2, 100);
+        bool step1 = !ledger.AdvanceQuest("q_focus", 1);
+        bool step2Done = ledger.AdvanceQuest("q_focus", 1);
+        bool doubleClaimBlocked = !ledger.AdvanceQuest("q_focus", 1);
+
+        bool day2 = ledger.BeginDay(20261128);
+        bool streak2 = ledger.LoginStreakDays == 2 && ledger.DailyQuestCount == 0;
+
+        bool buyHat1 = ledger.TryUnlockCosmetic("hat_wizard", "Hat", 60);
+        bool buyTooExpensive = !ledger.TryUnlockCosmetic("hat_crown", "Hat", 80); // 仅剩 40 金币
+        bool equip1 = ledger.TryEquipCosmetic("hat_wizard");
+        bool eqOk = ledger.GetEquippedCosmetic("Hat") == "hat_wizard" && ledger.Coins == 40;
+
+        bool progOk = day1 && day1Dup && step1 && step2Done && doubleClaimBlocked
+            && day2 && streak2 && buyHat1 && buyTooExpensive && equip1 && eqOk;
+        Console.WriteLine("companion-progression-quests-cosmetics: " + Convert.ToString(progOk ? 1 : 0));
+    }
+}

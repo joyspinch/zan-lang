@@ -13,7 +13,6 @@ public class TaskGroup : IDisposable {
     int timeoutMs;
     bool isCancelled;
     bool isDisposed;
-    nint syncLock;
     CancellationTokenRegistration parentReg;
 
     public TaskGroup() {
@@ -21,7 +20,6 @@ public class TaskGroup : IDisposable {
         this.timeoutMs = 0;
         this.isCancelled = false;
         this.isDisposed = false;
-        this.syncLock = Mutex.Create();
         this.parentReg = null;
     }
 
@@ -30,7 +28,6 @@ public class TaskGroup : IDisposable {
         this.timeoutMs = timeoutMs;
         this.isCancelled = false;
         this.isDisposed = false;
-        this.syncLock = Mutex.Create();
         this.parentReg = null;
     }
 
@@ -39,7 +36,6 @@ public class TaskGroup : IDisposable {
         this.timeoutMs = 0;
         this.isCancelled = false;
         this.isDisposed = false;
-        this.syncLock = Mutex.Create();
         this.parentReg = null;
         this.AttachToken(token);
     }
@@ -49,7 +45,6 @@ public class TaskGroup : IDisposable {
         this.timeoutMs = timeoutMs;
         this.isCancelled = false;
         this.isDisposed = false;
-        this.syncLock = Mutex.Create();
         this.parentReg = null;
         this.AttachToken(token);
     }
@@ -57,27 +52,45 @@ public class TaskGroup : IDisposable {
     // 绑定外部取消令牌：当 token 触发取消时，向当前任务组广播取消。
     public void AttachToken(CancellationToken token) {
         if (token == null) { return; }
-        if (this.parentReg != null) {
-            this.parentReg.Dispose();
+        CancellationTokenRegistration oldReg = null;
+        lock (this) {
+            if (this.isDisposed) { return; }
+            oldReg = this.parentReg;
+            this.parentReg = null;
+        }
+        if (oldReg != null) {
+            oldReg.Dispose();
         }
         TaskGroup self = this;
-        this.parentReg = token.Register(() => {
+        CancellationTokenRegistration newReg = token.Register(() => {
             self.CancelAll();
         });
+        CancellationTokenRegistration toDispose = null;
+        lock (this) {
+            if (this.isDisposed) {
+                toDispose = newReg;
+            } else {
+                toDispose = this.parentReg;
+                this.parentReg = newReg;
+            }
+        }
+        if (toDispose != null) {
+            toDispose.Dispose();
+        }
     }
 
     // 登记一个子任务句柄至当前任务树。
     public long Add(long handle) {
         if (handle == 0) { return 0; }
-        nint lk = this.syncLock;
-        if (this.isDisposed || lk == 0) {
-            Task.Cancel(handle);
-            return handle;
+        bool shouldCancel = false;
+        lock (this) {
+            if (this.isDisposed) {
+                shouldCancel = true;
+            } else {
+                this.children.Add(handle);
+                shouldCancel = this.isCancelled;
+            }
         }
-        Mutex.Lock(lk);
-        this.children.Add(handle);
-        bool shouldCancel = this.isCancelled;
-        Mutex.Unlock(lk);
         if (shouldCancel) {
             Task.Cancel(handle);
         }
@@ -87,84 +100,84 @@ public class TaskGroup : IDisposable {
     // 当前任务组总纳管子任务数。
     public int TotalCount {
         get {
-            nint lk = this.syncLock;
-            if (this.isDisposed || lk == 0) { return 0; }
-            Mutex.Lock(lk);
-            int c = this.children.Count;
-            Mutex.Unlock(lk);
-            return c;
+            lock (this) {
+                if (this.isDisposed) { return 0; }
+                return this.children.Count;
+            }
         }
     }
 
     // 当前处于活跃运行态的子任务数。
     public int ActiveCount {
         get {
-            nint lk = this.syncLock;
-            if (this.isDisposed || lk == 0) { return 0; }
-            Mutex.Lock(lk);
-            int active = 0;
-            for (int i = 0; i < this.children.Count; i = i + 1) {
-                if (Task.IsDone(this.children[i]) == 0) {
-                    active = active + 1;
+            lock (this) {
+                if (this.isDisposed) { return 0; }
+                int active = 0;
+                for (int i = 0; i < this.children.Count; i = i + 1) {
+                    if (Task.IsDone(this.children[i]) == 0) {
+                        active = active + 1;
+                    }
                 }
+                return active;
             }
-            Mutex.Unlock(lk);
-            return active;
         }
     }
 
     // 已完成的子任务数。
     public int CompletedCount {
         get {
-            nint lk = this.syncLock;
-            if (this.isDisposed || lk == 0) { return 0; }
-            Mutex.Lock(lk);
-            int done = 0;
-            for (int i = 0; i < this.children.Count; i = i + 1) {
-                if (Task.IsDone(this.children[i]) != 0) {
-                    done = done + 1;
+            lock (this) {
+                if (this.isDisposed) { return 0; }
+                int done = 0;
+                for (int i = 0; i < this.children.Count; i = i + 1) {
+                    if (Task.IsDone(this.children[i]) != 0) {
+                        done = done + 1;
+                    }
                 }
+                return done;
             }
-            Mutex.Unlock(lk);
-            return done;
         }
     }
 
     // 是否已被请求取消。
     public bool IsCancelled {
-        get { return this.isCancelled; }
+        get {
+            lock (this) {
+                return this.isCancelled;
+            }
+        }
     }
 
     // 获取所有子任务句柄列表副本。
     public List<long> GetChildren() {
         List<long> list = new List<long>();
-        nint lk = this.syncLock;
-        if (this.isDisposed || lk == 0) { return list; }
-        Mutex.Lock(lk);
-        for (int i = 0; i < this.children.Count; i = i + 1) {
-            list.Add(this.children[i]);
+        lock (this) {
+            if (this.isDisposed) { return list; }
+            for (int i = 0; i < this.children.Count; i = i + 1) {
+                list.Add(this.children[i]);
+            }
         }
-        Mutex.Unlock(lk);
         return list;
     }
 
     // 广播取消组内所有子任务。
     public void CancelAll() {
-        nint lk = this.syncLock;
-        if (this.isDisposed || lk == 0) {
+        List<long> targets = null;
+        lock (this) {
             this.isCancelled = true;
-            return;
+            if (this.isDisposed) { return; }
+            if (this.children.Count > 0) {
+                targets = new List<long>();
+                for (int i = 0; i < this.children.Count; i = i + 1) {
+                    targets.Add(this.children[i]);
+                }
+            }
         }
-        Mutex.Lock(lk);
-        this.isCancelled = true;
-        List<long> targets = new List<long>();
-        for (int i = 0; i < this.children.Count; i = i + 1) {
-            targets.Add(this.children[i]);
-        }
-        Mutex.Unlock(lk);
 
-        for (int i = 0; i < targets.Count; i = i + 1) {
-            Task.Cancel(targets[i]);
+        if (targets != null) {
+            for (int i = 0; i < targets.Count; i = i + 1) {
+                Task.Cancel(targets[i]);
+            }
         }
     }
 
@@ -189,15 +202,27 @@ public class TaskGroup : IDisposable {
     }
 
     public void Dispose() {
-        if (!this.isDisposed) {
+        CancellationTokenRegistration reg = null;
+        List<long> targets = null;
+        lock (this) {
+            if (this.isDisposed) { return; }
             this.isDisposed = true;
-            if (this.parentReg != null) {
-                this.parentReg.Dispose();
-                this.parentReg = null;
+            this.isCancelled = true;
+            reg = this.parentReg;
+            this.parentReg = null;
+            if (this.children != null && this.children.Count > 0) {
+                targets = this.children;
+                this.children = new List<long>();
             }
-            if (this.syncLock != 0) {
-                Mutex.Destroy(this.syncLock);
-                this.syncLock = 0;
+        }
+        if (reg != null) {
+            reg.Dispose();
+        }
+        if (targets != null) {
+            for (int i = 0; i < targets.Count; i = i + 1) {
+                if (Task.IsDone(targets[i]) == 0) {
+                    Task.Cancel(targets[i]);
+                }
             }
         }
     }

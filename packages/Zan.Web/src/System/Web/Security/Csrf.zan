@@ -68,11 +68,6 @@ public class Csrf {
     // 管线短路。前哨先做 Origin/Sec-Fetch-Site 站点校验（浏览器自动
     // 附带、免客户端配合），double-submit token 是第二道闸。
     public static bool Guard(HttpContext ctx) {
-        if (!Csrf.OriginCheck(ctx)) {
-            ctx.Status(403, "Forbidden");
-            ctx.Text("cross-site request rejected");
-            return false;
-        }
         bool safe = ctx.Method() == "GET" || ctx.Method() == "HEAD"
             || ctx.Method() == "OPTIONS";
         if (safe) {
@@ -82,6 +77,11 @@ public class Csrf {
             return true;
         }
         if (Csrf.Skipped(ctx, ctx.Path())) { return true; }
+        if (!Csrf.OriginCheck(ctx)) {
+            ctx.Status(403, "Forbidden");
+            ctx.Text("cross-site request rejected");
+            return false;
+        }
         string cookie = ctx.Cookie(Csrf.CookieName);
         string sent = ctx.Header(Csrf.HeaderName);
         if (sent.Length == 0) { sent = ctx.Form(Csrf.FormName); }
@@ -135,21 +135,36 @@ public class Csrf {
         string site = ctx.Header("Sec-Fetch-Site");
         if (site == "cross-site") { return false; }
         string origin = ctx.Header("Origin");
-        if (origin.Length > 0 && !Csrf.SameAuthority(origin,
-            ctx.Header("Host"))) { return false; }
+        if (origin.Length > 0 && !Csrf.SameAuthorityForScheme(origin,
+            ctx.Header("Host"), ctx.Tls() != null)) { return false; }
         return true;
     }
 
     // Origin 的 authority（冒号后段，去默认端口、小写）是否与 Host
     // 一致。大小写不敏感按 RFC 3986；Host 缺失视为不一致（保守）。
     public static bool SameAuthority(string origin, string host) {
-        if (host.Length == 0) { return false; }
-        int scheme = origin.IndexOf("://");
-        string auth = scheme >= 0 ? origin.Substring(scheme + 3) : origin;
-        bool isHttps = origin.StartsWith("https://");
+        return Csrf.SameAuthorityForScheme(origin, host, false);
+    }
+
+    // 含协议降级防护的同源校验：HTTPS 请求拒绝明文 http:// Origin。
+    public static bool SameAuthorityForScheme(string origin, string host, bool requireHttps) {
+        if (origin == null || host == null || host.Length == 0) { return false; }
+        string originLow = origin.ToLower();
+        int scheme = originLow.IndexOf("://");
+        bool isHttps = false;
+        string auth = originLow;
+        if (scheme >= 0) {
+            string sch = originLow.Substring(0, scheme);
+            if (sch == "https") { isHttps = true; }
+            else if (sch != "http") { return false; }
+            auth = originLow.Substring(scheme + 3);
+        } else if (requireHttps) {
+            return false;
+        }
+        if (requireHttps && !isHttps) { return false; }
         auth = Csrf.TrimDefaultPort(auth, isHttps);
-        host = Csrf.TrimDefaultPort(host, isHttps);
-        return auth.ToLower() == host.ToLower();
+        string hostLow = Csrf.TrimDefaultPort(host.ToLower(), isHttps);
+        return auth == hostLow;
     }
 
     // 去掉明确的默认端口后缀（https 的 :443 / 明文的 :80）；

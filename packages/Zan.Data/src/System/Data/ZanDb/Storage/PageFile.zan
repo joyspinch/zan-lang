@@ -144,58 +144,91 @@ public class PageFile {
     }
 
     // 定位读取到原始块中；读取错误与 EOF（0）分开报告。
+    // Windows 上 _lseeki64 + _read 共享 fd 偏移指针，必须持实例锁串行化防止多线程踩偏移。
     public int ReadRaw(long offset, nint raw, int count) {
-        if (this.fp == 0) { this.lastError = "file is closed"; return -1; }
-        if (offset < 0 || count < 0) { this.lastError = "invalid read range"; return -1; }
-        int n = 0;
-        #if WINDOWS
-        if (SeekFd(this.fd, offset, 0) < 0) {
-            this.lastError = "read seek failed";
+        if (offset < 0 || count < 0) {
+            lock (this) { this.lastError = "invalid read range"; }
             return -1;
         }
-        n = ReadFd(this.fd, raw, count);
+        #if WINDOWS
+        lock (this) {
+            if (this.fp == 0) { this.lastError = "file is closed"; return -1; }
+            if (SeekFd(this.fd, offset, 0) < 0) {
+                this.lastError = "read seek failed";
+                return -1;
+            }
+            int n = ReadFd(this.fd, raw, count);
+            if (n < 0) { this.lastError = "file read failed"; }
+            return n;
+        }
         #else
-        n = PReadFd(this.fd, raw, count, offset);
-        #endif
-        if (n < 0) { this.lastError = "file read failed"; }
+        int curFd = -1;
+        lock (this) {
+            if (this.fp == 0) { this.lastError = "file is closed"; return -1; }
+            curFd = this.fd;
+        }
+        int n = PReadFd(curFd, raw, count, offset);
+        if (n < 0) { lock (this) { this.lastError = "file read failed"; } }
         return n;
+        #endif
     }
 
     // 从原始块向 offset 处写入 count 字节。
     // 返回写入的字节数，短写同样留下错误。
     public int WriteAt(long offset, nint raw, int count) {
-        if (this.fp == 0) { this.lastError = "file is closed"; return -1; }
-        if (offset < 0 || count < 0) { this.lastError = "invalid write range"; return -1; }
-        int n = 0;
-        #if WINDOWS
-        if (SeekFd(this.fd, offset, 0) < 0) {
-            this.lastError = "write seek failed";
+        if (offset < 0 || count < 0) {
+            lock (this) { this.lastError = "invalid write range"; }
             return -1;
         }
-        n = WriteFd(this.fd, raw, count);
+        #if WINDOWS
+        lock (this) {
+            if (this.fp == 0) { this.lastError = "file is closed"; return -1; }
+            if (SeekFd(this.fd, offset, 0) < 0) {
+                this.lastError = "write seek failed";
+                return -1;
+            }
+            int n = WriteFd(this.fd, raw, count);
+            if (n != count) { this.lastError = "file write failed"; }
+            return n;
+        }
         #else
-        n = PWriteFd(this.fd, raw, count, offset);
-        #endif
-        if (n != count) { this.lastError = "file write failed"; }
+        int curFd = -1;
+        lock (this) {
+            if (this.fp == 0) { this.lastError = "file is closed"; return -1; }
+            curFd = this.fd;
+        }
+        int n = PWriteFd(curFd, raw, count, offset);
+        if (n != count) { lock (this) { this.lastError = "file write failed"; } }
         return n;
+        #endif
     }
 
     // 在文件末尾追加 count 字节；返回数据落盘的偏移量，
     // 出错时返回 -1。
     public long Append(nint raw, int count) {
-        if (this.fp == 0) { return -1; }
-        long end = Size();
-        if (end < 0) { return -1; }
-        if (WriteAt(end, raw, count) != count) { return -1; }
-        return end;
+        lock (this) {
+            if (this.fp == 0) { return -1; }
+            long end = SeekFd(this.fd, 0, 2);
+            if (end < 0) { this.lastError = "file size failed"; return -1; }
+            #if WINDOWS
+            if (SeekFd(this.fd, end, 0) < 0) { this.lastError = "write seek failed"; return -1; }
+            int n = WriteFd(this.fd, raw, count);
+            #else
+            int n = PWriteFd(this.fd, raw, count, end);
+            #endif
+            if (n != count) { this.lastError = "file write failed"; return -1; }
+            return end;
+        }
     }
 
     // 当前文件大小（字节）。
     public long Size() {
-        if (this.fp == 0) { this.lastError = "file is closed"; return -1; }
-        long n = SeekFd(this.fd, 0, 2);
-        if (n < 0) { this.lastError = "file size failed"; }
-        return n;
+        lock (this) {
+            if (this.fp == 0) { this.lastError = "file is closed"; return -1; }
+            long n = SeekFd(this.fd, 0, 2);
+            if (n < 0) { this.lastError = "file size failed"; }
+            return n;
+        }
     }
 
     // 缓冲写入的 flush；定位 IO 无缓冲，因此该方法
@@ -205,61 +238,77 @@ public class PageFile {
     // 将写入的数据强制落盘到稳定存储。成功时返回 true
     // 成功。
     public bool Sync() {
-        if (this.fp == 0) { this.lastError = "file is closed"; return false; }
-        if (SyncFd(this.fd) != 0) { this.lastError = "file sync failed"; return false; }
-        return true;
+        lock (this) {
+            if (this.fp == 0) { this.lastError = "file is closed"; return false; }
+            if (SyncFd(this.fd) != 0) { this.lastError = "file sync failed"; return false; }
+            return true;
+        }
     }
 
     // 把文件截断/扩展到 size 字节。日志重放后用
     // 它清掉撕裂尾部。
     public bool Truncate(long size) {
-        if (this.fp == 0) { this.lastError = "file is closed"; return false; }
-        if (size < 0) { this.lastError = "invalid truncate size"; return false; }
-        if (TruncFd(this.fd, size) != 0) { this.lastError = "file truncate failed"; return false; }
-        return true;
+        lock (this) {
+            if (this.fp == 0) { this.lastError = "file is closed"; return false; }
+            if (size < 0) { this.lastError = "invalid truncate size"; return false; }
+            if (TruncFd(this.fd, size) != 0) { this.lastError = "file truncate failed"; return false; }
+            return true;
+        }
     }
 
     // 获取整个文件的独占锁，等待当前
     // 持有者释放。若进程
     // 退出，锁由操作系统释放，因此崩溃的写入者不会卡死数据库。
     public bool LockExclusive() {
-        if (this.fp == 0) { return false; }
         #if WINDOWS
-        if (SeekFd(this.fd, 0, 0) < 0) { return false; }
-        // 用 _LK_NBLCK 自旋而非 _LK_LOCK：_LK_LOCK 会在
-        // 每次重试之间睡一整秒，因此毫秒级提交的写入者
-        // 每秒只能把锁交给等待者一次。
+        // 用 _LK_NBLCK 自旋而非 _LK_LOCK：每次尝试持实例锁保护 SeekFd+LockFd，睡眠在锁外执行。
         for (int waited = 0; waited < PageFile.LOCK_TIMEOUT_MS; waited = waited + 1) {
-            if (LockFd(this.fd, 2, 1) == 0) { return true; }
+            bool closed = false;
+            bool locked = false;
+            lock (this) {
+                if (this.fp == 0) { closed = true; }
+                else if (SeekFd(this.fd, 0, 0) >= 0 && LockFd(this.fd, 2, 1) == 0) { locked = true; }
+            }
+            if (closed) { return false; }
+            if (locked) { return true; }
             Thread.Sleep(1);
         }
         return false;
         #else
-        return FlockFd(this.fd, 2) == 0;
+        int curFd = -1;
+        lock (this) {
+            if (this.fp == 0) { return false; }
+            curFd = this.fd;
+        }
+        return FlockFd(curFd, 2) == 0;
         #endif
     }
 
     // 非阻塞独占锁：立即返回，抢不到即 false。用于
     // 「检测到别的持有者就拒绝打开」而不是排队等待。
     public bool TryLockExclusive() {
-        if (this.fp == 0) { return false; }
-        #if WINDOWS
-        if (SeekFd(this.fd, 0, 0) < 0) { return false; }
-        return LockFd(this.fd, 2, 1) == 0;  // _LK_NBLCK
-        #else
-        return FlockFd(this.fd, 6) == 0;  // LOCK_EX|LOCK_NB
-        #endif
+        lock (this) {
+            if (this.fp == 0) { return false; }
+            #if WINDOWS
+            if (SeekFd(this.fd, 0, 0) < 0) { return false; }
+            return LockFd(this.fd, 2, 1) == 0;  // _LK_NBLCK
+            #else
+            return FlockFd(this.fd, 6) == 0;  // LOCK_EX|LOCK_NB
+            #endif
+        }
     }
 
     // 释放 LockExclusive 取得的锁；成功返回 true。
     public bool Unlock() {
-        if (this.fp == 0) { return false; }
-        #if WINDOWS
-        if (SeekFd(this.fd, 0, 0) < 0) { return false; }
-        return LockFd(this.fd, 0, 1) == 0;  // _LK_UNLCK
-        #else
-        return FlockFd(this.fd, 8) == 0;
-        #endif
+        lock (this) {
+            if (this.fp == 0) { return false; }
+            #if WINDOWS
+            if (SeekFd(this.fd, 0, 0) < 0) { return false; }
+            return LockFd(this.fd, 0, 1) == 0;  // _LK_UNLCK
+            #else
+            return FlockFd(this.fd, 8) == 0;
+            #endif
+        }
     }
 
     // POSIX 上文件 fsync 不保证新建目录项落盘，发布 WAL/段/清单前
@@ -285,12 +334,14 @@ public class PageFile {
     // 关闭文件。进程退出时操作系统会兜底释放，但显式关闭
     // 能及时让出锁与句柄。
     public void Close() {
-        if (this.fp != 0) {
-            if (fclose(this.fp) != 0 && this.lastError == "") {
-                this.lastError = "file close failed";
+        lock (this) {
+            if (this.fp != 0) {
+                if (fclose(this.fp) != 0 && this.lastError == "") {
+                    this.lastError = "file close failed";
+                }
+                this.fp = 0;
+                this.fd = -1;
             }
-            this.fp = 0;
-            this.fd = -1;
         }
     }
 }

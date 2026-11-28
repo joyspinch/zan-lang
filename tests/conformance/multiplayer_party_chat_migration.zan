@@ -1,0 +1,56 @@
+using System;
+using Game.Net;
+
+namespace Conf;
+
+class MultiplayerPartyChatMigrationTest {
+    static void Main() {
+        // 1. 小队编组：队长退出自动顺延、就绪共识、排位分差合规校验
+        NetPartyCoordinator party = new NetPartyCoordinator("squad-1", 4, 300);
+        party.Join(10, "tank", 1500);
+        party.Join(20, "dps", 1700);
+        party.Join(30, "support", 2100); // 分差 600 > 300 -> 排位不合规
+        party.SetReady(10, true);
+        party.SetReady(20, true);
+        party.SetReady(30, true);
+        bool blockedWideSpread = party.AllMembersReady && !party.CanEnterRankedQueue();
+
+        // 原队长 10 退出 -> 队长自动顺延为 20；剩下 20(1700) 与 30(2100) 差 400 -> 仍超 300；再让 30 离队加入 40(1850) -> 差 150 合规
+        party.Leave(10);
+        bool leaderMigrated = party.LeaderPlayerId == 20;
+        party.Leave(30);
+        party.Join(40, "support", 1850);
+        party.SetReady(40, true);
+        bool partyOk = blockedWideSpread && leaderMigrated && party.CanEnterRankedQueue() && party.AverageMmr == 1775;
+        Console.WriteLine("net-party-leader-and-ranked-gate: " + Convert.ToString(partyOk ? 1 : 0));
+
+        // 2. 聊天风控：大小写不敏感敏感词脱敏、重复刷屏拦截与渐进自动禁言
+        NetChatModerationGuard guard = new NetChatModerationGuard(3, 5000, 2, 30000);
+        guard.AddBannedWord("cheat");
+        ChatModerationResult r1 = guard.EvaluateMessage(7, "No ChEaT allowed!", 1000); // 通过且脱敏，记 1 次 strike
+        ChatModerationResult r2 = guard.EvaluateMessage(7, "No ChEaT allowed!", 1200); // 重复刷屏拒收，第 2 次 strike -> 触发禁言至 31200
+        ChatModerationResult r3 = guard.EvaluateMessage(7, "clean hello", 2000);       // 仍在禁言期 -> 拒收 muted
+        ChatModerationResult r4 = guard.EvaluateMessage(7, "clean hello", 35000);      // 解禁后恢复通行
+        bool chatOk = r1.Allowed && r1.WasMasked && r1.SanitizedText == "No ***** allowed!"
+            && !r2.Allowed && r2.RejectReason == "duplicate_spam"
+            && !r3.Allowed && r3.RejectReason == "muted"
+            && r4.Allowed && !r4.WasMasked && r4.SanitizedText == "clean hello";
+        Console.WriteLine("net-chat-moderation-and-mute: " + Convert.ToString(chatOk ? 1 : 0));
+
+        // 3. 跨服无缝迁移票据：防伪签名校验、防重放一次性核销与 TTL 过期拦截
+        NetServerMigrationBroker broker = new NetServerMigrationBroker("prod-hmac-key-2026", 10000);
+        ServerMigrationTicket tk = broker.IssueTicket(99, "zone-north-2", "hp=100;gold=450", 5000);
+        string payload = "";
+        bool badSig = broker.RedeemTicket(tk.TicketId, 99, "zone-north-2", tk.SignatureHash ^ 1U, 6000, out payload);
+        bool wrongSrv = broker.RedeemTicket(tk.TicketId, 99, "zone-south-1", tk.SignatureHash, 6000, out payload);
+        bool okRedeem = broker.RedeemTicket(tk.TicketId, 99, "zone-north-2", tk.SignatureHash, 6000, out payload);
+        string payload2 = "";
+        bool replayBlocked = broker.RedeemTicket(tk.TicketId, 99, "zone-north-2", tk.SignatureHash, 6500, out payload2);
+        ServerMigrationTicket tkExp = broker.IssueTicket(99, "zone-north-2", "expired", 5000);
+        bool expiredBlocked = broker.RedeemTicket(tkExp.TicketId, 99, "zone-north-2", tkExp.SignatureHash, 20000, out payload2);
+
+        bool migOk = !badSig && !wrongSrv && okRedeem && payload == "hp=100;gold=450"
+            && !replayBlocked && !expiredBlocked;
+        Console.WriteLine("net-server-migration-ticket: " + Convert.ToString(migOk ? 1 : 0));
+    }
+}

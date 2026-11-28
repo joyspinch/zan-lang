@@ -1,0 +1,363 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Net;
+
+// 观战延迟回放帧记录。
+public class SpectatorFrameRecord {
+    public int Tick;
+    public long ServerTimeMs;
+    public string SnapshotPayload;
+
+    public SpectatorFrameRecord(int tick, long serverTimeMs, string snapshotPayload) {
+        this.Tick = tick;
+        this.ServerTimeMs = serverTimeMs;
+        this.SnapshotPayload = snapshotPayload != null ? snapshotPayload : "";
+    }
+}
+
+// 竞技防窥屏延迟观战缓冲器（Esports Delayed Spectator Buffer）：
+// - 强制保留 DelayTicks 防窥屏延迟窗口（只有 <= latestTick - DelayTicks 的帧才对观战者解锁）
+// - 支持慢放/倍速（0.25x..4.0x）、暂停/恢复与历史滑窗回拉（Seek），自动按 MaxHistoryFrames 限内存
+public class NetSpectatorDelayBuffer {
+    public int DelayTicks;
+    public int MaxHistoryFrames;
+    public float PlaybackSpeed;
+    public bool Paused;
+    public int LatestIngestedTick;
+    public int CurrentPlayTick;
+
+    private List<SpectatorFrameRecord> frames;
+    private float playTickAccumulator;
+
+    public NetSpectatorDelayBuffer(int delayTicks, int maxHistoryFrames) {
+        this.DelayTicks = delayTicks >= 0 ? delayTicks : 180;
+        this.MaxHistoryFrames = maxHistoryFrames > 16 ? maxHistoryFrames : 600;
+        this.PlaybackSpeed = 1.0f;
+        this.Paused = false;
+        this.LatestIngestedTick = 0;
+        this.CurrentPlayTick = 0;
+        this.frames = new List<SpectatorFrameRecord>();
+        this.playTickAccumulator = 0.0f;
+    }
+
+    public int BufferedCount { get { return this.frames.Count; } }
+
+    // 实时摄入权威服广播的最新快照帧。
+    public void PushLiveFrame(int tick, long serverTimeMs, string snapshotPayload) {
+        if (tick <= this.LatestIngestedTick && this.frames.Count > 0) { return; }
+        this.LatestIngestedTick = tick;
+        this.frames.Add(new SpectatorFrameRecord(tick, serverTimeMs, snapshotPayload));
+        while (this.frames.Count > this.MaxHistoryFrames) {
+            this.frames.RemoveAt(0);
+        }
+    }
+
+    public int SafeWatchableTick {
+        get {
+            int safe = this.LatestIngestedTick - this.DelayTicks;
+            return safe > 0 ? safe : 0;
+        }
+    }
+
+    public bool IsDelayReady {
+        get {
+            if (this.frames.Count == 0) { return false; }
+            return this.SafeWatchableTick >= this.frames[0].Tick;
+        }
+    }
+
+    public void SetPlaybackSpeed(float speed) {
+        if (speed < 0.25f) { speed = 0.25f; }
+        if (speed > 4.0f) { speed = 4.0f; }
+        this.PlaybackSpeed = speed;
+    }
+
+    // 观战进度条跳转（自动钳位到 [最早缓存帧 .. 防窥屏安全上限 SafeWatchableTick]）。
+    public bool SeekToTick(int targetTick) {
+        if (!this.IsDelayReady) { return false; }
+        int minT = this.frames[0].Tick;
+        int maxT = this.SafeWatchableTick;
+        int clamped = targetTick;
+        if (clamped < minT) { clamped = minT; }
+        if (clamped > maxT) { clamped = maxT; }
+        this.CurrentPlayTick = clamped;
+        this.playTickAccumulator = (float)clamped;
+        return true;
+    }
+
+    // 步进一帧观战播放器：按 PlaybackSpeed 推进播放指针并返回当前应渲染的观战帧（未满防窥屏延迟返回 null）。
+    public SpectatorFrameRecord StepPlayback(float tickDelta) {
+        if (!this.IsDelayReady) { return null; }
+        int minT = this.frames[0].Tick;
+        int maxT = this.SafeWatchableTick;
+        if (this.CurrentPlayTick < minT) {
+            this.CurrentPlayTick = minT;
+            this.playTickAccumulator = (float)minT;
+        }
+        if (!this.Paused && tickDelta > 0.0f) {
+            this.playTickAccumulator = this.playTickAccumulator + tickDelta * this.PlaybackSpeed;
+            if (this.playTickAccumulator > (float)maxT) {
+                this.playTickAccumulator = (float)maxT;
+            }
+            this.CurrentPlayTick = (int)this.playTickAccumulator;
+        }
+        if (this.CurrentPlayTick > maxT) { this.CurrentPlayTick = maxT; }
+
+        SpectatorFrameRecord best = null;
+        for (int i = 0; i < this.frames.Count; i = i + 1) {
+            SpectatorFrameRecord rec = this.frames[i];
+            if (rec.Tick <= this.CurrentPlayTick) {
+                best = rec;
+            } else {
+                break;
+            }
+        }
+        return best;
+    }
+}
+
+// 单个大区机房 RTT 探测样本记录。
+public class RegionPingProbe {
+    public string RegionId;
+    public int ProbesSent;
+    public int ProbesLost;
+    public float MedianRttMs;
+    public float EffectiveScoreMs;
+
+    private List<float> samples;
+
+    public RegionPingProbe(string regionId) {
+        this.RegionId = regionId != null ? regionId : "";
+        this.ProbesSent = 0;
+        this.ProbesLost = 0;
+        this.MedianRttMs = 9999.0f;
+        this.EffectiveScoreMs = 9999.0f;
+        this.samples = new List<float>();
+    }
+
+    public float LossRate {
+        get {
+            if (this.ProbesSent <= 0) { return 0.0f; }
+            return (float)this.ProbesLost / (float)this.ProbesSent;
+        }
+    }
+
+    public void RecordSample(bool success, float rttMs) {
+        this.ProbesSent = this.ProbesSent + 1;
+        if (!success || rttMs < 0.0f) {
+            this.ProbesLost = this.ProbesLost + 1;
+        } else {
+            this.samples.Add(rttMs);
+            if (this.samples.Count > 16) {
+                this.samples.RemoveAt(0);
+            }
+        }
+        this.Recompute();
+    }
+
+    private void Recompute() {
+        if (this.samples.Count == 0) {
+            this.MedianRttMs = 9999.0f;
+            this.EffectiveScoreMs = 9999.0f;
+            return;
+        }
+        int n = this.samples.Count;
+        float[] sorted = new float[n];
+        for (int i = 0; i < n; i = i + 1) { sorted[i] = this.samples[i]; }
+        for (int i = 0; i < n; i = i + 1) {
+            for (int j = i + 1; j < n; j = j + 1) {
+                if (sorted[j] < sorted[i]) {
+                    float t = sorted[i];
+                    sorted[i] = sorted[j];
+                    sorted[j] = t;
+                }
+            }
+        }
+        this.MedianRttMs = sorted[n / 2];
+        // 丢包每增加 1% 等价惩罚 +15ms 延迟，避免选中低 Ping 但高丢包的劣化线路
+        this.EffectiveScoreMs = this.MedianRttMs + this.LossRate * 1500.0f;
+    }
+}
+
+// 全球多机房智能选区探测与故障切换器：
+// 通过中位数去毛刺 + 丢包加权评分排出最优主大区与容灾备用大区。
+public class NetPingRegionSelector {
+    private List<RegionPingProbe> regions;
+    public float FailoverThresholdMs;
+
+    public NetPingRegionSelector() {
+        this.regions = new List<RegionPingProbe>();
+        this.FailoverThresholdMs = 220.0f;
+    }
+
+    public RegionPingProbe GetOrCreateRegion(string regionId) {
+        if (regionId == null || regionId == "") { return null; }
+        for (int i = 0; i < this.regions.Count; i = i + 1) {
+            if (this.regions[i].RegionId == regionId) { return this.regions[i]; }
+        }
+        RegionPingProbe p = new RegionPingProbe(regionId);
+        this.regions.Add(p);
+        return p;
+    }
+
+    public void RecordProbe(string regionId, bool success, float rttMs) {
+        RegionPingProbe p = this.GetOrCreateRegion(regionId);
+        if (p != null) { p.RecordSample(success, rttMs); }
+    }
+
+    // 返回综合评分最低（最流畅稳定）的前 maxCount 个推荐大区列表。
+    public List<RegionPingProbe> RankRegions(int maxCount) {
+        List<RegionPingProbe> ranked = new List<RegionPingProbe>();
+        for (int i = 0; i < this.regions.Count; i = i + 1) {
+            ranked.Add(this.regions[i]);
+        }
+        for (int i = 0; i < ranked.Count; i = i + 1) {
+            for (int j = i + 1; j < ranked.Count; j = j + 1) {
+                if (ranked[j].EffectiveScoreMs < ranked[i].EffectiveScoreMs) {
+                    RegionPingProbe t = ranked[i];
+                    ranked[i] = ranked[j];
+                    ranked[j] = t;
+                }
+            }
+        }
+        while (maxCount > 0 && ranked.Count > maxCount) {
+            ranked.RemoveAt(ranked.Count - 1);
+        }
+        return ranked;
+    }
+
+    public string SelectBestRegion() {
+        List<RegionPingProbe> top = this.RankRegions(1);
+        if (top.Count == 0 || top[0].EffectiveScoreMs >= 9000.0f) { return ""; }
+        return top[0].RegionId;
+    }
+
+    // 判断当前所在大区是否已经劣化超阈值且存在更健康的容灾备用大区。
+    public bool ShouldFailover(string currentRegionId, out string fallbackRegionId) {
+        fallbackRegionId = "";
+        RegionPingProbe cur = null;
+        for (int i = 0; i < this.regions.Count; i = i + 1) {
+            if (this.regions[i].RegionId == currentRegionId) {
+                cur = this.regions[i];
+                break;
+            }
+        }
+        if (cur == null || cur.EffectiveScoreMs < this.FailoverThresholdMs) { return false; }
+        List<RegionPingProbe> ranked = this.RankRegions(2);
+        for (int i = 0; i < ranked.Count; i = i + 1) {
+            if (ranked[i].RegionId != currentRegionId && ranked[i].EffectiveScoreMs < cur.EffectiveScoreMs - 30.0f) {
+                fallbackRegionId = ranked[i].RegionId;
+                return true;
+            }
+        }
+        return false;
+    }
+}
+
+// 玩家单局遥测结算统计。
+public class PlayerMatchStats {
+    public int PlayerId;
+    public int Kills;
+    public int Deaths;
+    public int Assists;
+    public int DamageDealt;
+    public int ObjectivesCaptured;
+
+    public PlayerMatchStats(int playerId) {
+        this.PlayerId = playerId;
+        this.Kills = 0;
+        this.Deaths = 0;
+        this.Assists = 0;
+        this.DamageDealt = 0;
+        this.ObjectivesCaptured = 0;
+    }
+}
+
+// 商业专用服对局遥测与 SLA 帧耗时直方图汇集器：
+// 记录权威服每 Tick 计算耗时并计算 p50/p95/p99 分位（监控 60Hz=16.6ms 预算红线），同时统计 KDA 与事件审计日志。
+public class NetMatchTelemetrySink {
+    public string MatchId;
+    public int OverBudgetTickCount;
+    public float TickBudgetMs;
+
+    private List<float> tickDurationsMs;
+    private List<PlayerMatchStats> playerStats;
+    private List<string> auditEvents;
+
+    public NetMatchTelemetrySink(string matchId, float tickBudgetMs) {
+        this.MatchId = matchId != null ? matchId : "";
+        this.TickBudgetMs = tickBudgetMs > 0.1f ? tickBudgetMs : 16.67f;
+        this.OverBudgetTickCount = 0;
+        this.tickDurationsMs = new List<float>();
+        this.playerStats = new List<PlayerMatchStats>();
+        this.auditEvents = new List<string>();
+    }
+
+    public int TickSampleCount { get { return this.tickDurationsMs.Count; } }
+    public int AuditEventCount { get { return this.auditEvents.Count; } }
+
+    public void RecordTickDuration(float durationMs) {
+        if (durationMs < 0.0f) { durationMs = 0.0f; }
+        this.tickDurationsMs.Add(durationMs);
+        if (durationMs > this.TickBudgetMs) {
+            this.OverBudgetTickCount = this.OverBudgetTickCount + 1;
+        }
+    }
+
+    // 计算当前对局 Tick 耗时第 p 百分位数（如 0.50 / 0.95 / 0.99）。
+    public float QueryTickPercentile(float percentile01) {
+        int n = this.tickDurationsMs.Count;
+        if (n == 0) { return 0.0f; }
+        float[] sorted = new float[n];
+        for (int i = 0; i < n; i = i + 1) { sorted[i] = this.tickDurationsMs[i]; }
+        for (int i = 0; i < n; i = i + 1) {
+            for (int j = i + 1; j < n; j = j + 1) {
+                if (sorted[j] < sorted[i]) {
+                    float t = sorted[i];
+                    sorted[i] = sorted[j];
+                    sorted[j] = t;
+                }
+            }
+        }
+        float p = percentile01;
+        if (p < 0.0f) { p = 0.0f; }
+        if (p > 1.0f) { p = 1.0f; }
+        int idx = (int)Math.Floor((double)(p * (float)(n - 1)));
+        if (idx < 0) { idx = 0; }
+        if (idx >= n) { idx = n - 1; }
+        return sorted[idx];
+    }
+
+    public PlayerMatchStats GetOrCreatePlayer(int playerId) {
+        for (int i = 0; i < this.playerStats.Count; i = i + 1) {
+            if (this.playerStats[i].PlayerId == playerId) { return this.playerStats[i]; }
+        }
+        PlayerMatchStats s = new PlayerMatchStats(playerId);
+        this.playerStats.Add(s);
+        return s;
+    }
+
+    public void RecordKill(int tick, int killerId, int victimId, int assistId) {
+        if (killerId > 0) { this.GetOrCreatePlayer(killerId).Kills = this.GetOrCreatePlayer(killerId).Kills + 1; }
+        if (victimId > 0) { this.GetOrCreatePlayer(victimId).Deaths = this.GetOrCreatePlayer(victimId).Deaths + 1; }
+        if (assistId > 0 && assistId != killerId) {
+            this.GetOrCreatePlayer(assistId).Assists = this.GetOrCreatePlayer(assistId).Assists + 1;
+        }
+        this.auditEvents.Add("t=" + Convert.ToString(tick) + ":kill:" + Convert.ToString(killerId) + "->" + Convert.ToString(victimId));
+    }
+
+    public void RecordDamage(int attackerId, int amount) {
+        if (attackerId <= 0 || amount <= 0) { return; }
+        PlayerMatchStats st = this.GetOrCreatePlayer(attackerId);
+        st.DamageDealt = st.DamageDealt + amount;
+    }
+
+    public void RecordObjective(int tick, int playerId, string objectiveName) {
+        if (playerId > 0) {
+            PlayerMatchStats st = this.GetOrCreatePlayer(playerId);
+            st.ObjectivesCaptured = st.ObjectivesCaptured + 1;
+        }
+        this.auditEvents.Add("t=" + Convert.ToString(tick) + ":obj:" + (objectiveName != null ? objectiveName : ""));
+    }
+}

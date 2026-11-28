@@ -25,10 +25,11 @@ public class StringExtensions {
     }
 
     public static StringView AsView(this StringBuilder sb, int start, int count) {
-        if (sb == null || count <= 0) { return StringView.Empty(); }
-        if (start < 0 || count < 0 || start + count > sb.Length) {
+        if (sb == null) { return StringView.Empty(); }
+        if (start < 0 || count < 0 || start > sb.Length || count > sb.Length - start) {
             throw new ArgumentOutOfRangeException("StringBuilder.AsView range invalid");
         }
+        if (count == 0) { return StringView.Empty(); }
         return new StringView(sb.BufferPtr() + (nint)start, count);
     }
 
@@ -52,7 +53,7 @@ public class StringExtensions {
         if (len >= 16) {
             nint p = (nint)s;
             Vector128 spVal = Vector128.Create((byte)32);
-            while (i + 16 <= len) {
+            while (len - i >= 16) {
                 Vector128 v = Vector128.Load(p + (nint)i);
                 Vector128 sp = Vector128.Equals(v, spVal);
                 if (Vector128.ExtractMostSignificantBits(sp) != 65535) { break; }
@@ -60,8 +61,17 @@ public class StringExtensions {
             }
         }
         while (i < len) {
-            if (!StringExtensions.IsWhitespaceByte(s[i] & 255)) { return false; }
-            i = i + 1;
+            int b = s[i] & 255;
+            if (b < 128) {
+                if (!StringExtensions.IsWhitespaceByte(b)) { return false; }
+                i = i + 1;
+            } else {
+                long res = Encoding.DecodeCodePointFast(s, i);
+                int used = (int)(res >> 32);
+                if (used <= 0) { used = 1; }
+                if (!StringExtensions.IsWhitespaceCodePoint((int)(res & 0xFFFFFFFFL))) { return false; }
+                i = i + used;
+            }
         }
         return true;
     }
@@ -73,6 +83,9 @@ public class StringExtensions {
         string firstRune = pad.Length == 1 ? pad : pad.RuneAt(0);
         if (firstRune.Length == 0) { firstRune = " "; }
         if (firstRune.Length == 1 && runes == s.Length) {
+            if (width > 2147483591) {
+                throw new ArgumentOutOfRangeException("width", "Pad width exceeds maximum string length");
+            }
             int p = firstRune[0] & 255;
             byte[] buf = new byte[width];
             int padStart = padLeft ? 0 : s.Length;
@@ -81,7 +94,11 @@ public class StringExtensions {
             if (s.Length > 0) { NativeMemory.PutString((nint)buf, strStart, s, s.Length); }
             return buf.ToStr(0, width);
         }
-        StringBuilder sb = new StringBuilder(s.Length + diff * firstRune.Length);
+        long outLen = (long)s.Length + (long)diff * (long)firstRune.Length;
+        if (outLen > 2147483591L) {
+            throw new ArgumentOutOfRangeException("width", "Pad result exceeds maximum string length");
+        }
+        StringBuilder sb = new StringBuilder((int)outLen);
         if (!padLeft) { sb.Append(s); }
         for (int k = 0; k < diff; k = k + 1) { sb.Append(firstRune); }
         if (padLeft) { sb.Append(s); }
@@ -161,13 +178,18 @@ public class StringExtensions {
     }
 
     public static string Insert(this string s, int index, string text) {
+        if (s == null) { return text; }
         if (text == null || text.Length == 0) { return s; }
         int slen = s.Length;
         int tlen = text.Length;
         int at = index;
         if (at < 0) { at = 0; }
         if (at > slen) { at = slen; }
-        int total = slen + tlen;
+        long totalL = (long)slen + (long)tlen;
+        if (totalL > 2147483591L) {
+            throw new ArgumentOutOfRangeException("text", "Insert result exceeds maximum string length");
+        }
+        int total = (int)totalL;
         byte[] buf = new byte[total];
         if (at > 0) { NativeMemory.PutString((nint)buf, 0, s, at); }
         NativeMemory.PutString((nint)buf, at, text, tlen);
@@ -176,12 +198,14 @@ public class StringExtensions {
     }
 
     public static string Remove(this string s, int start) {
+        if (s == null) { return null; }
         if (start <= 0) { return ""; }
         if (start >= s.Length) { return s; }
         return s.Substring(0, start);
     }
 
     public static string Remove(this string s, int start, int count) {
+        if (s == null) { return null; }
         int slen = s.Length;
         int at = start;
         if (at < 0) { at = 0; }

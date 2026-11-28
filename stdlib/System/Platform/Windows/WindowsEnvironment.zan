@@ -19,7 +19,7 @@ public class WindowsEnvironment : IPlatformEnvironment {
     static extern int WinGetEnvironmentVariable(nint name, nint buf, int size);
 
     [DllImport("advapi32", EntryPoint = "SystemFunction036")]
-    static extern int WinRtlGenRandom(byte[] buf, int len);
+    static extern byte WinRtlGenRandom(byte[] buf, int len);
 
     [DllImport("crt", EntryPoint = "zan_cpu_count")]
     static extern int NativeCpuCount();
@@ -34,6 +34,7 @@ public class WindowsEnvironment : IPlatformEnvironment {
 
     public string ExecutablePath() {
         nint buf = NativeMemory.Alloc(8192);
+        if (buf == 0) { return ""; }
         string exe = "";
         try {
             int n = WinGetModuleFileName(0, buf, 4096);
@@ -49,18 +50,22 @@ public class WindowsEnvironment : IPlatformEnvironment {
     public string GetEnvironmentVariable(string name) {
         if (name == null || name == "") { return ""; }
         nint wname = Wide.Of(name);
+        if (wname == 0) { return ""; }
         nint buf = 0;
         string text = "";
         try {
-            buf = NativeMemory.Alloc(2048);
+            int size = 1024;
+            buf = NativeMemory.Alloc(size * 2);
+            if (buf == 0) { return ""; }
             new Span<short>(buf, 1)[0] = 0;
-            int size = 1023;
             int units = WinGetEnvironmentVariable(wname, buf, size);
-            if (units >= size && units < 32768) {
+            for (int attempt = 0; attempt < 3 && units >= size && units <= 32768; attempt = attempt + 1) {
                 NativeMemory.Free(buf);
                 buf = 0;
                 size = units + 1;
                 buf = NativeMemory.Alloc(size * 2);
+                if (buf == 0) { return ""; }
+                new Span<short>(buf, 1)[0] = 0;
                 units = WinGetEnvironmentVariable(wname, buf, size);
             }
             if (units > 0 && units < size) { text = Wide.Read(buf); }
@@ -74,7 +79,15 @@ public class WindowsEnvironment : IPlatformEnvironment {
     public bool SetEnvironmentVariable(string name, string value) {
         if (name == null || name == "") { return false; }
         nint wname = Wide.Of(name);
-        nint wval = (value != null) ? Wide.Of(value) : 0;
+        if (wname == 0) { return false; }
+        nint wval = 0;
+        if (value != null) {
+            wval = Wide.Of(value);
+            if (wval == 0) {
+                Wide.Free(wname);
+                return false;
+            }
+        }
         int ok = 0;
         try {
             ok = WinSetEnvironmentVariable(wname, wval);
@@ -88,7 +101,7 @@ public class WindowsEnvironment : IPlatformEnvironment {
     public int GetRandomBytes(byte[] buf, int count) {
         // count 超容量兜底拒绝（公开入口已抛错；PAL 直接调用方也安全）。
         if (buf == null || count <= 0 || count > buf.Length) { return 0; }
-        int ok = WinRtlGenRandom(buf, count);
+        byte ok = WinRtlGenRandom(buf, count);
         if (ok == 0) { return 0; }
         return count;
     }

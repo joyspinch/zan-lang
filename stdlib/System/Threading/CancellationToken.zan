@@ -7,7 +7,6 @@ namespace System.Threading;
 public class CancellationToken : IDisposable {
     bool isCancellationRequested;
     bool closed;
-    nint syncLock;
     List<CancellationTokenEntry> callbacks;
     List<Gate> waiters;
     long nextCallbackId;
@@ -17,7 +16,6 @@ public class CancellationToken : IDisposable {
     public CancellationToken() {
         this.isCancellationRequested = false;
         this.closed = false;
-        this.syncLock = Mutex.Create();
         this.callbacks = new List<CancellationTokenEntry>();
         this.waiters = new List<Gate>();
         this.nextCallbackId = 0;
@@ -50,40 +48,42 @@ public class CancellationToken : IDisposable {
     // 令牌已 Close（未取消）返回 false 并唤醒挂起者，不再挂死。
     public async bool WaitHandle() {
         if (this.isCancellationRequested) { return true; }
-        nint lk = this.syncLock;
-        if (lk == 0) { return this.isCancellationRequested; }
         Gate mine = null;
         bool waiting = false;
         bool canceled = false;
-        Mutex.Lock(lk);
-        if (this.isCancellationRequested) {
-            canceled = true;
-        } else if (!this.closed) {
-            mine = new Gate();
-            this.waiters.Add(mine);
-            waiting = true;
+        lock (this) {
+            if (this.isCancellationRequested) {
+                canceled = true;
+            } else if (!this.closed) {
+                mine = new Gate();
+                this.waiters.Add(mine);
+                waiting = true;
+            }
         }
-        Mutex.Unlock(lk);
         if (mine != null) {
             try {
                 while (waiting) {
                     await mine.Wait();
-                    nint lk2 = this.syncLock;
-                    if (lk2 == 0) {
-                        waiting = false;
-                        canceled = this.isCancellationRequested;
-                        break;
+                    lock (this) {
+                        if (this.isCancellationRequested) {
+                            waiting = false;
+                            canceled = true;
+                        } else if (this.closed) {
+                            waiting = false;
+                        }
                     }
-                    Mutex.Lock(lk2);
-                    if (this.isCancellationRequested) {
-                        waiting = false;
-                        canceled = true;
-                    } else if (this.closed) {
-                        waiting = false;
-                    }
-                    Mutex.Unlock(lk2);
                 }
             } finally {
+                lock (this) {
+                    if (this.waiters != null) {
+                        for (int i = 0; i < this.waiters.Count; i = i + 1) {
+                            if (this.waiters[i] == mine) {
+                                this.waiters.RemoveAt(i);
+                                break;
+                            }
+                        }
+                    }
+                }
                 mine.Close();
             }
         }
@@ -95,27 +95,20 @@ public class CancellationToken : IDisposable {
         if (callback == null) {
             return new CancellationTokenRegistration(this, 0);
         }
-        nint lk = this.syncLock;
-        if (lk == 0) {
-            if (this.isCancellationRequested) {
-                callback();
-            }
-            return new CancellationTokenRegistration(this, 0);
-        }
         bool alreadyCanceled = false;
         long regId = 0;
-        Mutex.Lock(lk);
-        if (this.isCancellationRequested) {
-            alreadyCanceled = true;
-        } else if (!this.closed) {
-            this.nextCallbackId = this.nextCallbackId + 1;
-            regId = this.nextCallbackId;
-            if (this.callbacks == null) {
-                this.callbacks = new List<CancellationTokenEntry>();
+        lock (this) {
+            if (this.isCancellationRequested) {
+                alreadyCanceled = true;
+            } else if (!this.closed) {
+                this.nextCallbackId = this.nextCallbackId + 1;
+                regId = this.nextCallbackId;
+                if (this.callbacks == null) {
+                    this.callbacks = new List<CancellationTokenEntry>();
+                }
+                this.callbacks.Add(new CancellationTokenEntry(regId, callback));
             }
-            this.callbacks.Add(new CancellationTokenEntry(regId, callback));
         }
-        Mutex.Unlock(lk);
 
         if (alreadyCanceled) {
             callback();
@@ -126,18 +119,17 @@ public class CancellationToken : IDisposable {
 
     // 内部注销回调。
     public void Unregister(long id) {
-        nint lk = this.syncLock;
-        if (id == 0 || lk == 0) { return; }
-        Mutex.Lock(lk);
-        if (this.callbacks != null) {
-            for (int i = 0; i < this.callbacks.Count; i = i + 1) {
-                if (this.callbacks[i].id == id) {
-                    this.callbacks.RemoveAt(i);
-                    break;
+        if (id == 0) { return; }
+        lock (this) {
+            if (this.callbacks != null) {
+                for (int i = 0; i < this.callbacks.Count; i = i + 1) {
+                    if (this.callbacks[i].id == id) {
+                        this.callbacks.RemoveAt(i);
+                        break;
+                    }
                 }
             }
         }
-        Mutex.Unlock(lk);
     }
 
     // 须持锁调用：取走全部登记的私有等待门并重置登记列表。
@@ -159,25 +151,22 @@ public class CancellationToken : IDisposable {
     // 触发取消（内部由 CancellationTokenSource 调用）。
     public void CancelInternal() {
         if (this == CancellationToken.noneToken) { return; }
-        nint lk = this.syncLock;
-        if (lk == 0) { return; }
         List<Action> toInvoke = null;
         List<Gate> toWake = null;
-        Mutex.Lock(lk);
-        if (this.isCancellationRequested) {
-            Mutex.Unlock(lk);
-            return;
-        }
-        this.isCancellationRequested = true;
-        toWake = TakeWaiters();
-        if (this.callbacks != null && this.callbacks.Count > 0) {
-            toInvoke = new List<Action>();
-            for (int i = 0; i < this.callbacks.Count; i = i + 1) {
-                toInvoke.Add(this.callbacks[i].callback);
+        lock (this) {
+            if (this.isCancellationRequested) {
+                return;
             }
-            this.callbacks.Clear();
+            this.isCancellationRequested = true;
+            toWake = TakeWaiters();
+            if (this.callbacks != null && this.callbacks.Count > 0) {
+                toInvoke = new List<Action>();
+                for (int i = 0; i < this.callbacks.Count; i = i + 1) {
+                    toInvoke.Add(this.callbacks[i].callback);
+                }
+                this.callbacks.Clear();
+            }
         }
-        Mutex.Unlock(lk);
 
         WakeAll(toWake);
 
@@ -195,21 +184,17 @@ public class CancellationToken : IDisposable {
     // 关闭释放底层资源；挂起中的等待者被唤醒并从 WaitHandle 得到 false。
     public void Close() {
         if (this == CancellationToken.noneToken) { return; }
-        nint lk = this.syncLock;
-        if (lk == 0) { return; }
         List<Gate> toWake = null;
-        Mutex.Lock(lk);
-        if (!this.closed) {
-            this.closed = true;
-            toWake = TakeWaiters();
-            if (this.callbacks != null) {
-                this.callbacks.Clear();
+        lock (this) {
+            if (!this.closed) {
+                this.closed = true;
+                toWake = TakeWaiters();
+                if (this.callbacks != null) {
+                    this.callbacks.Clear();
+                }
             }
         }
-        this.syncLock = 0;
-        Mutex.Unlock(lk);
         WakeAll(toWake);
-        Mutex.Destroy(lk);
     }
 
     public void Dispose() {

@@ -235,16 +235,19 @@ public class QueryBuilder {
     }
 
     private QueryBuilder AppendCmpStr(string column, string op, string val) {
+        QueryBuilder.RequireIdent(column);
         this.whereParams.Add(val);
         return this.AppendWhereQuotedOp(column, op);
     }
 
     private QueryBuilder AppendCmpInt(string column, string op, int val) {
+        QueryBuilder.RequireIdent(column);
         this.whereParams.AddInt(val);
         return this.AppendWhereQuotedOp(column, op);
     }
 
     private QueryBuilder AppendCmpLong(string column, string op, long val) {
+        QueryBuilder.RequireIdent(column);
         this.whereParams.AddLong(val);
         return this.AppendWhereQuotedOp(column, op);
     }
@@ -256,8 +259,10 @@ public class QueryBuilder {
     public QueryBuilder WhereLeLong(string column, long val) { return this.AppendCmpLong(column, " <= ?", val); }
 
     public QueryBuilder WhereValueAt(DbValues vals, int i) {
+        string col = vals.NameAt(i);
+        QueryBuilder.RequireIdent(col);
         vals.BindTo(this.whereParams, i);
-        return this.AppendWhereQuotedOp(vals.NameAt(i), " = ?");
+        return this.AppendWhereQuotedOp(col, " = ?");
     }
 
     private QueryBuilder AppendWhereIn(string column, string op, int count) {
@@ -299,26 +304,30 @@ public class QueryBuilder {
     }
 
     public QueryBuilder WhereIn(string column, List<string> values) {
-        int n = values.Count;
+        QueryBuilder.RequireIdent(column);
+        int n = values != null ? values.Count : 0;
         for (int i = 0; i < n; i = i + 1) { this.whereParams.Add(values[i]); }
         return this.AppendWhereIn(column, " IN (", n);
     }
 
     // 空列表生成 IN (NULL) 恒假；避免非法 IN ()。
     public QueryBuilder WhereInInts(string column, List<int> values) {
-        int n = values.Count;
+        QueryBuilder.RequireIdent(column);
+        int n = values != null ? values.Count : 0;
         for (int i = 0; i < n; i = i + 1) { this.whereParams.AddInt(values[i]); }
         return this.AppendWhereIn(column, " IN (", n);
     }
 
     public QueryBuilder WhereInLongs(string column, List<long> values) {
-        int n = values.Count;
+        QueryBuilder.RequireIdent(column);
+        int n = values != null ? values.Count : 0;
         for (int i = 0; i < n; i = i + 1) { this.whereParams.AddLong(values[i]); }
         return this.AppendWhereIn(column, " IN (", n);
     }
 
     public QueryBuilder WhereNotIn(string column, List<string> values) {
-        int n = values.Count;
+        QueryBuilder.RequireIdent(column);
+        int n = values != null ? values.Count : 0;
         if (n == 0) { return this; }
         for (int i = 0; i < n; i = i + 1) { this.whereParams.Add(values[i]); }
         return this.AppendWhereIn(column, " NOT IN (", n);
@@ -376,6 +385,7 @@ public class QueryBuilder {
     public QueryBuilder WhereLeInt(string column, int val) { return this.AppendCmpInt(column, " <= ?", val); }
 
     public QueryBuilder WhereBetween(string column, string low, string high) {
+        QueryBuilder.RequireIdent(column);
         this.whereParams.Add(low);
         this.whereParams.Add(high);
         return this.AppendWhereQuotedOp(column, " BETWEEN ? AND ?");
@@ -657,39 +667,31 @@ public class QueryBuilder {
 
     // 仅用于无法参数化的 DDL DEFAULT 字面量；DML 一律走 `?` 参数绑定。
     public static string EscapeDdlLiteral(string val) {
+        return QueryBuilder.EscapeDdlLiteral(val, 0);
+    }
+
+    // 带方言感知的 DDL 字面量转义：剥离 NUL，双写单引号；MySQL/MariaDB 额外转义反斜杠。
+    public static string EscapeDdlLiteral(string val, int provider) {
         if (val == null || val.Length == 0) { return ""; }
+        bool escBackslash = provider == DbProvider.MySQL || provider == DbProvider.MariaDB;
         int n = val.Length;
-        nint vp = (nint)val;
-        int first = NativeMemory.Find(vp, 0, 39, n);
-        if (first < 0) { return val; }
-        int count = 0;
-        int pos = first;
-        while (pos >= 0) {
-            count = count + 1;
-            int next = pos + 1;
-            pos = next < n ? NativeMemory.Find(vp, next, 39, n - next) : -1;
-        }
-        int total = n + count;
-        byte[] buf = new byte[total];
-        nint bp = (nint)buf;
-        byte[] bspan = buf;
-        int cur = 0;
-        int dst = 0;
-        int hit = first;
-        while (hit >= 0) {
-            int run = hit - cur;
-            if (run > 0) {
-                NativeMemory.Copy(bp + (nint)dst, vp + (nint)cur, run);
-                dst = dst + run;
+        bool needEsc = false;
+        for (int i = 0; i < n; i = i + 1) {
+            int ch = val[i] & 255;
+            if (ch == 39 || ch == 0 || (escBackslash && ch == 92)) {
+                needEsc = true;
+                break;
             }
-            bspan[dst] = (byte)39;
-            bspan[dst + 1] = (byte)39;
-            dst = dst + 2;
-            cur = hit + 1;
-            hit = cur < n ? NativeMemory.Find(vp, cur, 39, n - cur) : -1;
         }
-        int rem = n - cur;
-        if (rem > 0) { NativeMemory.Copy(bp + (nint)dst, vp + (nint)cur, rem); }
-        return NativeMemory.GetString(bp, 0, total);
+        if (!needEsc) { return val; }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < n; i = i + 1) {
+            int ch = val[i] & 255;
+            if (ch == 0) { continue; }
+            if (ch == 39) { sb.Append("''"); }
+            else if (escBackslash && ch == 92) { sb.Append("\\\\"); }
+            else { sb.Append(val.Substring(i, 1)); }
+        }
+        return sb.ToString();
     }
 }
