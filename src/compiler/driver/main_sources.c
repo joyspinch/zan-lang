@@ -579,7 +579,9 @@ static void package_add_input(const char *path, void *context) {
 static int auto_include_namespace(const char *stdlib_root, const char *subdir,
                                   const char ***files, int *count, int *cap) {
   int found = glob_stdlib_dir(stdlib_root, subdir, files, count, cap);
-  int hierarchical = stdlib_has_dir(stdlib_root, subdir) == 0;
+  /* 精确命名空间导入：stdlib 与 packages 一律只加载声明目标命名空间的文件，
+   * 绝不因 using Foo 隐式级联吞入 Foo.Bar 等后代命名空间或兄弟包。 */
+  int hierarchical = 0;
   pkg_auto_include_t args = {files, count, cap};
   int package_count =
       package_visit_namespace(subdir, package_add_input, &args, hierarchical);

@@ -743,17 +743,15 @@ static void pi_process_dir(pi_dir_t *d, const char *stdlib_root) {
   double __g0 = now_ms();
   pi_glob_into(d, stdlib_root, d->subdir);
   double __g1 = now_ms();
-  int hierarchical = stdlib_has_dir(stdlib_root, d->subdir) == 0;
+  int hierarchical = 0;
   int found = d->file_count != before;
   int pre_visit = d->file_count;
   int package_count = package_visit_namespace(d->subdir, pi_add_package_source,
                                               d, hierarchical);
   double __g2 = now_ms();
   found = found || package_count > 0;
-  if (!hierarchical) {
-    for (int i = pre_visit; i < d->file_count; i++)
-      d->files[i].gate_live = 1;
-  }
+  for (int i = pre_visit; i < d->file_count; i++)
+    d->files[i].gate_live = 1;
   if (!found && package_project_root[0] != '\0' &&
       !stdlib_has_dir(stdlib_root, d->subdir) &&
       !project_namespace_declared(d->subdir)) {
@@ -778,29 +776,6 @@ static int pi_file_exact_dir(const pi_dir_t *d, const pi_file_t *f) {
   if (!f || !f->decl_ns || !f->decl_ns[0])
     return 1;
   return d && d->subdir && strcmp(d->subdir, f->decl_ns) == 0;
-}
-
-static int pi_descendant_segments_flagged(const char *dir_ns,
-                                          const char *decl_ns) {
-  if (!dir_ns || !decl_ns)
-    return 0;
-  size_t dlen = strlen(dir_ns);
-  if (strncmp(decl_ns, dir_ns, dlen) != 0 || decl_ns[dlen] != '/')
-    return 0;
-  const char *p = decl_ns + dlen + 1;
-  while (*p) {
-    const char *slash = strchr(p, '/');
-    size_t len = slash ? (size_t)(slash - p) : strlen(p);
-    if (len > 0) {
-      pi_name_t *seg = pi_intern(p, len);
-      if (!seg || !seg->flagged)
-        return 0;
-    }
-    if (!slash)
-      break;
-    p = slash + 1;
-  }
-  return 1;
 }
 
 static int pi_close_once(const char *stdlib_root) {
@@ -831,8 +806,7 @@ static int pi_close_once(const char *stdlib_root) {
                                        : (f->catalog && catalog_dir ? "catalog"
                                                                     : NULL))));
       }
-      if (!hit && (exact_ns ||
-                   pi_descendant_segments_flagged(d->subdir, f->decl_ns))) {
+      if (!hit && exact_ns) {
         for (int k = 0; k < f->top_count && !hit; k++)
           if (f->top[k]->flagged) {
             hit = 1;

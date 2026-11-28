@@ -1694,7 +1694,7 @@ static void index_needed_packages(lsp_server_t *s) {
     for (int i = 0; i < used_n && !intel_cancel_flag; i++) {
       pkg_root_set_t rs;
       rs.n = 0;
-      zan_pkg_source_index_visit(idx, used[i], pkg_root_visitor, &rs, 1);
+      zan_pkg_source_index_visit(idx, used[i], pkg_root_visitor, &rs, 0);
       for (int k = 0; k < rs.n; k++) {
         bool seen = false;
         for (int d = 0; d < done_n; d++) {

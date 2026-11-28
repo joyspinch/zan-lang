@@ -44,7 +44,8 @@ git hooks（`core.hooksPath`，`cmake -B build` 自动配置）每次 commit/mer
 14. **公共机制进 `packages/`，模板只放"这个游戏"本身**（判据：换个游戏还成立吗）。— §14
 15. **测试产物收口**：一用例 = 一条 ctest = 一个 exe，只进 `build\cases\`；日志归 `build\test-out\`；清扫用 `scripts/clean_build.ps1`。— §15
 16. **多任务并行走调度器**：`scripts/sched.ps1 register/heartbeat/finish`，同题拒重、超限排队；裸 ctest 也自动排队。— §16
-17. **代码规范机器硬拦截**：增量提交由 pre-commit 自动机检（禁手写 `__` 标识符、禁 stdlib 反向依赖 packages、公开 API 统一 PascalCase、新建文件 ≤3000 行、单函数 ≤400 行）。— §17
+17. **代码规范机器硬拦截**：增量提交由 pre-commit 自动机检（禁手写 `__` 标识符、禁 stdlib 反向依赖 packages、公开 API 统一 PascalCase、新建文件 ≤3000 行、单函数 ≤400 行、新包源码目录与命名空间对齐）。— §17
+18. **按导入精确裁剪（严禁级联吞并）**：`using X;` 只加载声明精确 `namespace X;` 的文件，绝不隐式拉入 `X.Y` 后代命名空间或兄弟包；全库与后续所有封装按功能拆细子命名空间、用组合/扩展替代巨石 `partial class`，用到哪块才 `using` 哪块。— §18
 
 ## Build / dev quickstart
 

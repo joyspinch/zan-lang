@@ -251,6 +251,39 @@ def get_staged_new_files() -> List[str]:
     return new_files
 
 
+def check_new_package_namespace_alignment(rel_path: str, lines: List[str]) -> Optional[str]:
+    """Rule 8: Newly added .zan files under packages/<Pkg>/src/<Dir>/ must declare
+    a namespace matching their directory path (Models/ leaf folder may use parent ns).
+    This prevents dumping unrelated modules into one flat root namespace."""
+    norm = rel_path.replace("\\", "/")
+    if not norm.endswith(".zan") or not norm.startswith("packages/"):
+        return None
+    m = re.match(r"^packages/[^/]+/src/(.+)/[^/]+\.zan$", norm)
+    if not m:
+        return None
+    dir_rel = m.group(1)
+    dir_ns = dir_rel.replace("/", ".")
+    allowed = {dir_ns}
+    parts = dir_rel.split("/")
+    if parts[-1] == "Models" and len(parts) >= 2:
+        allowed.add(".".join(parts[:-1]))
+    decl_ns = None
+    for raw in lines[:80]:
+        s = strip_comments_and_strings(raw).strip()
+        nm = re.match(r"^namespace\s+([A-Za-z0-9_.]+)\s*[;{]", s)
+        if nm:
+            decl_ns = nm.group(1)
+            break
+    if not decl_ns:
+        return None
+    if decl_ns not in allowed:
+        return (
+            f"新建包源码命名空间 '{decl_ns}' 与目录 '{dir_rel}' 不一致（期望 {' 或 '.join(sorted(allowed))}）。\n"
+            f"       请按精确命名空间导入规范（WC §18）将目录与 namespace 对齐，避免把独立模块堆进扁平根命名空间。"
+        )
+    return None
+
+
 def check_staged() -> int:
     """Run all checks against git staged changes."""
     staged_diff = parse_staged_diff()
@@ -258,7 +291,7 @@ def check_staged() -> int:
 
     violations = []
 
-    # 1. Check newly added file lengths
+    # 1. Check newly added file lengths & package namespace alignment
     for new_file in new_files:
         norm = new_file.replace("\\", "/")
         if norm.endswith((".zan", ".c", ".h")):
@@ -271,6 +304,9 @@ def check_staged() -> int:
                         f"[FAIL] {new_file}:1 - 新建文件行数 ({len(lines)} 行) 超过 {MAX_NEW_FILE_LINES} 行门禁上限。\n"
                         f"       请按模块职责拆分，禁止新增巨石单体文件。"
                     )
+                err = check_new_package_namespace_alignment(new_file, lines)
+                if err:
+                    violations.append(f"[FAIL] {new_file}:1 - {err}")
 
     # 2. Check added lines across staged diffs
     for rel_path, added_lines in staged_diff.items():

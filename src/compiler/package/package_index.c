@@ -657,9 +657,12 @@ int zan_pkg_source_index_visit(const zan_pkg_source_index_t *cindex,
   if (!index->all_expanded)
     pkg_index_expand_matching(index, target_ns, n, hierarchical, 0);
   pkg_index_namespace_t *ns = pkg_index_find_namespace(index, target_ns, n);
-  if (!pkg_ns_has_eligible(ns, hierarchical) && hierarchical &&
-      !index->all_expanded) {
-    /* 非 stdlib 命名空间按目录前缀未命中时回退全扫，确保自定义目录结构包不漏检。 */
+  int is_system_ns = (n == 6 && memcmp(target_ns, "System", 6) == 0) ||
+                     (n > 7 && memcmp(target_ns, "System.", 7) == 0);
+  if (!pkg_ns_has_eligible(ns, hierarchical) &&
+      (hierarchical || !is_system_ns) && !index->all_expanded) {
+    /* 非 System 命名空间按目录前缀未命中时回退全扫，确保自定义目录结构包
+     * （如 src/arbitrary 声明 namespace Fixture.Local）在精确导入下仍可定位。 */
     pkg_index_expand_matching(index, target_ns, n, hierarchical, 1);
     ns = pkg_index_find_namespace(index, target_ns, n);
   }

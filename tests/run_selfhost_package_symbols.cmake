@@ -15,7 +15,6 @@ public class PackageValue {
 file(WRITE "${_pkg_source}/wwwroot/resource.txt" "package resource")
 file(WRITE "${_pkg_project}/main.zan" [=[
 using Fixture.Local;
-using Fixture;
 using Project.Local;
 namespace Project.Local;
 class Program {
@@ -27,8 +26,8 @@ execute_process(COMMAND ${_pkg_env} "${GEN1}" "${_pkg_project}/main.zan" --packa
   -o "${_pkg_project}/scan.exe" WORKING_DIRECTORY "${_pkg_project}" RESULT_VARIABLE rc
   OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr TIMEOUT 30)
 if(NOT "${rc}" STREQUAL "3" OR NOT stderr MATCHES "ZANPKG_MISSING namespace=Fixture/Local\n"
-    OR NOT stderr MATCHES "ZANPKG_MISSING namespace=Fixture\n" OR stderr MATCHES "namespace=Project"
-    OR NOT stderr MATCHES "ZANPKG_STATUS action=list-missing status=ok count=2" OR EXISTS "${_pkg_project}/scan.exe")
+    OR stderr MATCHES "namespace=Project"
+    OR NOT stderr MATCHES "ZANPKG_STATUS action=list-missing status=ok count=1" OR EXISTS "${_pkg_project}/scan.exe")
   message(FATAL_ERROR "Missing-package scan returned unexpected results, rc=${rc}\n${stdout}${stderr}")
 endif()
 execute_process(COMMAND ${_pkg_env} "${GEN1}" "${_pkg_project}/main.zan" -o "${_pkg_project}/missing.exe"

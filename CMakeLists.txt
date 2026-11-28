@@ -3735,6 +3735,15 @@ add_test(NAME compiler_missing_namespace
 set_tests_properties(compiler_missing_namespace PROPERTIES TIMEOUT 150
   LABELS "full;standard;smoke")
 
+add_test(NAME compiler_exact_namespace_import
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSTDLIB=${CMAKE_SOURCE_DIR}/stdlib
+    -DWORK=${CMAKE_BINARY_DIR}/cases/compiler_exact_namespace_import
+    -P ${CMAKE_SOURCE_DIR}/tests/run_exact_namespace_import.cmake)
+set_tests_properties(compiler_exact_namespace_import PROPERTIES TIMEOUT 150
+  LABELS "full;standard;smoke")
+
 add_test(NAME package_install_mvc
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
