@@ -1,0 +1,318 @@
+// 回归测试：3D 帧会话缓存、真光照模型矩阵实例化与阴影批、Renderer3D 自动合批、光标显隐与指针锁接口。
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+using Gui;
+using Game.Graphics;
+using Game.Render3D;
+
+namespace Conf;
+
+class Game3DLitInstancingParityTest {
+    [DllImport("zan_gui")]
+    private static extern int zan_gui_read_pixel(int surfaceId, int x, int y);
+
+    private static Mat4 MakeCubeModel(int idx) {
+        int gx = idx % 4;
+        int gz = idx / 4;
+        float x = (float)(gx - 2) * 2.3f + 0.9f;
+        float z = -(float)gz * 2.5f - 6.0f;
+        float y = ((idx * 37) % 5) * 0.4f - 0.7f;
+        float yaw = (float)(idx % 17) * 0.41f;
+        float pitch = (float)(idx % 11) * 0.27f;
+        float sx = 0.75f + (float)(idx % 4) * 0.25f;
+        float sy = 0.65f + (float)((idx + 1) % 3) * 0.35f;
+        float sz = 0.80f + (float)((idx + 2) % 4) * 0.20f;
+        Mat4 t = Mat4.Translate(x, y, z);
+        Mat4 ry = Mat4.RotateAxis(0.0f, 1.0f, 0.0f, yaw);
+        Mat4 rx = Mat4.RotateAxis(1.0f, 0.0f, 0.0f, pitch);
+        Mat4 s = Mat4.Scale(sx, sy, sz);
+        return Mat4.Mul(t, Mat4.Mul(ry, Mat4.Mul(rx, s)));
+    }
+
+    private static void SetupLighting(Canvas c, Camera3D cam) {
+        float[] dirs = new float[] { -0.55f, 0.78f, 0.30f };
+        float[] cols = new float[] { 1.0f, 0.94f, 0.86f };
+        float[] amb = new float[] { 0.16f, 0.19f, 0.24f };
+        c.SetLights3D(dirs, cols, amb);
+        c.SetHemisphereAmbient3D(true, 0.22f, 0.28f, 0.38f, 0.12f, 0.10f, 0.08f);
+        c.SetFog3D(true, 0.42f, 0.52f, 0.68f, 10.0f, 55.0f);
+        c.SetHeightFog3D(true, -1.8f, 0.20f, 0.32f, 0.48f, 0.54f, 0.62f);
+        c.SetCamera3D(cam.Position.X, cam.Position.Y, cam.Position.Z);
+        float[] ptPos = new float[] {
+            -2.8f, 2.2f, -7.5f, 16.0f,
+             3.2f, 2.0f, -9.5f, 16.0f
+        };
+        float[] ptCol = new float[] {
+            2.4f, 1.0f, 0.35f,
+            0.40f, 1.45f, 2.1f
+        };
+        c.SetPointLights3D(ptPos, ptCol);
+        c.SetMaterial3D(0.35f, 0.40f, 0.0f, 0.0f, 0.0f);
+    }
+
+    private static int[] CapturePixels(Canvas c, int w, int h) {
+        int sid = c.SurfaceId();
+        int[] outp = new int[w * h];
+        for (int y = 0; y < h; y = y + 1) {
+            for (int x = 0; x < w; x = x + 1) {
+                outp[y * w + x] = zan_gui_read_pixel(sid, x, y);
+            }
+        }
+        return outp;
+    }
+
+    private static bool CompareBuffers(int[] a, int[] b, int w, int h, int bg, int minLit,
+                                       out int litPixels, out int interiorDiffs, out int edgeDiffs) {
+        litPixels = 0;
+        interiorDiffs = 0;
+        edgeDiffs = 0;
+        for (int y = 1; y < h - 1; y = y + 1) {
+            for (int x = 1; x < w - 1; x = x + 1) {
+                int idx = y * w + x;
+                int p0 = a[idx];
+                int p1 = b[idx];
+                if (p0 != bg) { litPixels = litPixels + 1; }
+                int dr = Math.Abs(((p0 >> 16) & 255) - ((p1 >> 16) & 255));
+                int dg = Math.Abs(((p0 >> 8) & 255) - ((p1 >> 8) & 255));
+                int db = Math.Abs((p0 & 255) - (p1 & 255));
+                int d = dr;
+                if (dg > d) { d = dg; }
+                if (db > d) { d = db; }
+                if (d > 2) {
+                    bool isSilhouette = (a[idx - 1] == bg || a[idx + 1] == bg
+                        || a[idx - w] == bg || a[idx + w] == bg
+                        || p0 == bg || p1 == bg);
+                    if (isSilhouette) { edgeDiffs = edgeDiffs + 1; }
+                    else { interiorDiffs = interiorDiffs + 1; }
+                }
+            }
+        }
+        return litPixels >= minLit && interiorDiffs == 0 && edgeDiffs <= 16;
+    }
+
+    private static bool TestLitInstancingAndFrameSession() {
+        Canvas.SetBackend(1);
+        int W = 256;
+        int H = 160;
+        Canvas c = new Canvas(W, H);
+        int bg = unchecked((int)0xFF182230);
+        Mesh3D cubeMesh = Primitives3D.CreateCube(1.0f, 1.0f, 1.0f);
+        Mesh3D planeMesh = Primitives3D.CreatePlane(1.6f, 1.6f, 1, 1);
+        int hCube = c.MeshUpload(cubeMesh);
+        int hPlane = c.MeshUpload(planeMesh);
+        if (hCube == 0) {
+            // 无 OpenGL 上下文的纯无头环境安全跳过像素校验
+            c.Destroy();
+            return true;
+        }
+        if (hCube < 0 || hPlane <= 0) {
+            c.Destroy();
+            return false;
+        }
+
+        int[] tex = new int[32 * 32];
+        for (int y = 0; y < 32; y = y + 1) {
+            for (int x = 0; x < 32; x = x + 1) {
+                bool chk = (((x >> 2) + (y >> 2)) & 1) == 0;
+                tex[y * 32 + x] = chk ? unchecked((int)0xFFD8D0C0) : unchecked((int)0xFF708090);
+            }
+        }
+        Canvas.ImageRegisterArgb("lit_inst_tex", tex, 32, 32);
+
+        Camera3D cam = new Camera3D();
+        cam.Position = new Vector3(0.0f, 4.0f, 4.0f);
+        cam.Target = new Vector3(0.0f, 0.0f, -12.0f);
+        cam.FieldOfView = 1.0472f;
+        cam.AspectRatio = (float)W / (float)H;
+        cam.NearPlane = 0.2f;
+        cam.FarPlane = 100.0f;
+        Mat4 vp = cam.ViewProjectionMatrix();
+
+        Mat4 lightView = Mat4.LookAt(-10.0f, 18.0f, 8.0f, 0.0f, 0.0f, -10.0f, 0.0f, 1.0f, 0.0f);
+        Mat4 lightProj = Mat4.Ortho(-18.0f, 18.0f, -18.0f, 18.0f, 1.0f, 55.0f);
+        Mat4 lightVP = Mat4.Mul(lightProj, lightView);
+
+        int N = 12;
+        Mat4[] models = new Mat4[N];
+        int[] tints = new int[N];
+        for (int i = 0; i < N; i = i + 1) {
+            models[i] = MakeCubeModel(i);
+            int r = 180 + (i * 19) % 70;
+            int g = 160 + (i * 29) % 80;
+            int b = 150 + (i * 37) % 90;
+            tints[i] = unchecked((int)(0xFF000000 | (r << 16) | (g << 8) | b));
+        }
+
+        // 1. 单物体：未开 BeginFrame3D vs 开启 BeginFrame3D 像素完全一致
+        c.Clear(bg);
+        SetupLighting(c, cam);
+        c.ShadowClear();
+        Mat4 singleModel = MakeCubeModel(1);
+        Mat4 singleMvp = Mat4.Mul(vp, singleModel);
+        c.DrawMesh3DEx(hCube, singleMvp, singleModel, tints[1], "lit_inst_tex");
+        int[] singleUnframedPx = CapturePixels(c, W, H);
+
+        c.Clear(bg);
+        SetupLighting(c, cam);
+        c.BeginFrame3D();
+        c.DrawMesh3DEx(hCube, singleMvp, singleModel, tints[1], "lit_inst_tex");
+        c.EndFrame3D();
+        int[] singleFramedPx = CapturePixels(c, W, H);
+
+        // 2. 12 个旋转+非等比缩放立方体（带 512 ShadowMap + 距离雾 + 高度雾 + 双点光 + 半球 IBL + PBR 贴图）：
+        //    帧会话单 draw 基线 vs MeshBatch.DrawShadow + MeshBatch.DrawLit 像素一致
+        c.Clear(bg);
+        SetupLighting(c, cam);
+        c.ShadowBegin(512, lightVP);
+        for (int i = 0; i < N; i = i + 1) {
+            c.ShadowDraw(hCube, models[i]);
+        }
+        c.ShadowEnd();
+        c.BeginFrame3D();
+        for (int i = 0; i < N; i = i + 1) {
+            Mat4 mvp = Mat4.Mul(vp, models[i]);
+            c.DrawMesh3DEx(hCube, mvp, models[i], tints[i], "lit_inst_tex");
+        }
+        c.EndFrame3D();
+        int[] framedRefPx = CapturePixels(c, W, H);
+
+        MeshBatch batch = MeshBatch.Create(64);
+        bool capOk = batch.Capacity() >= 64;
+        batch.Begin();
+        for (int i = 0; i < N; i = i + 1) {
+            batch.Add(hCube, "lit_inst_tex", models[i], tints[i]);
+        }
+        c.Clear(bg);
+        SetupLighting(c, cam);
+        c.ShadowBegin(512, lightVP);
+        int shOk = batch.DrawShadow(c);
+        c.ShadowEnd();
+        c.BeginFrame3D();
+        int litOk = batch.DrawLit(c, vp);
+        c.EndFrame3D();
+        int[] instPx = CapturePixels(c, W, H);
+        batch.Dispose();
+
+        // 3. Renderer3D 自动合批路径（多对象共享同一材质与网格）
+        Renderer3D renderer = new Renderer3D(32);
+        renderer.EnableShadows = true;
+        renderer.ShadowMapSize = 512;
+        renderer.EnableFog = true;
+        renderer.FogStart = 10.0f;
+        renderer.FogEnd = 55.0f;
+        renderer.EnableHemisphereAmbient = true;
+        SceneNode root = new SceneNode("root");
+        Material mat = Material.Solid(0.85f, 0.85f, 0.85f);
+        mat.TextureKey = "lit_inst_tex";
+        mat.Metallic = 0.35f;
+        mat.Roughness = 0.40f;
+        for (int i = 0; i < 8; i = i + 1) {
+            SceneNode node = new SceneNode("box");
+            node.MeshKey = hCube;
+            node.Material = mat;
+            node.CastShadow = true;
+            node.SetPosition((float)(i % 4 - 2) * 2.0f + 1.0f, 0.0f, -(float)(i / 4) * 2.5f - 6.0f);
+            node.SetEuler(0.0f, (float)i * 20.0f, 0.0f);
+            root.AddChild(node);
+        }
+        RenderPlan plan = new RenderPlan(cam);
+        plan.Lights.Add(Light.DirectionalLight(1.0f, 0.95f, 0.88f, 1.0f, new Vector3(0.5f, -0.8f, -0.35f)));
+        plan.Lights.Add(Light.PointLight(1.0f, 0.5f, 0.2f, 2.4f, new Vector3(-2.5f, 2.2f, -7.0f), 16.0f));
+        plan.Build(root);
+        c.Clear(bg);
+        int r3dOk = renderer.Draw(c, plan);
+        int[] r3dPx = CapturePixels(c, W, H);
+        int r3dLit = 0;
+        for (int i = 0; i < r3dPx.Length; i = i + 1) {
+            if (r3dPx[i] != bg) { r3dLit = r3dLit + 1; }
+        }
+
+        // 4. 法线随实例旋转验证：同一 MeshBatch 里画两块单面 Quad，左侧正面朝 +Z 光源，右侧绕 Y 转 70°
+        c.ShadowClear();
+        c.SetFog3D(false, 0.0f, 0.0f, 0.0f, 10.0f, 100.0f);
+        c.SetHeightFog3D(false, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+        c.SetHemisphereAmbient3D(false, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+        c.SetPointLights3D(new float[0], new float[0]);
+        c.SetLights3D(new float[] { 0.0f, 0.0f, 1.0f }, new float[] { 1.0f, 1.0f, 1.0f }, new float[] { 0.02f, 0.02f, 0.02f });
+        c.SetMaterial3D(0.0f, 1.0f, 0.0f, 0.0f, 0.0f);
+        Camera3D flatCam = new Camera3D();
+        flatCam.Position = new Vector3(0.0f, 0.0f, 5.0f);
+        flatCam.Target = new Vector3(0.0f, 0.0f, 0.0f);
+        flatCam.FieldOfView = 1.0472f;
+        flatCam.AspectRatio = (float)W / (float)H;
+        flatCam.NearPlane = 0.2f;
+        flatCam.FarPlane = 50.0f;
+        c.SetCamera3D(0.0f, 0.0f, 5.0f);
+        Mat4 flatVP = flatCam.ViewProjectionMatrix();
+
+        MeshBatch rotBatch = MeshBatch.Create(8);
+        rotBatch.Begin();
+        Mat4 faceCamera = Mat4.RotateAxis(1.0f, 0.0f, 0.0f, 1.5707963f);
+        rotBatch.Add(hPlane, "", Mat4.Mul(Mat4.Translate(-1.4f, 0.0f, 0.0f), faceCamera), unchecked((int)0xFFFFFFFF));
+        rotBatch.Add(hPlane, "", Mat4.Mul(Mat4.Translate(1.4f, 0.0f, 0.0f), Mat4.Mul(Mat4.RotateAxis(0.0f, 1.0f, 0.0f, 1.22f), faceCamera)), unchecked((int)0xFFFFFFFF));
+        c.Clear(bg);
+        c.BeginFrame3D();
+        rotBatch.DrawLit(c, flatVP);
+        c.EndFrame3D();
+        rotBatch.Dispose();
+
+        int leftMaxR = 0;
+        int rightMaxR = 0;
+        for (int y = 20; y < H - 20; y = y + 2) {
+            for (int x = 20; x < W - 20; x = x + 2) {
+                int p = zan_gui_read_pixel(c.SurfaceId(), x, y);
+                if (p == bg) { continue; }
+                int rr = (p >> 16) & 255;
+                if (x < W / 2) {
+                    if (rr > leftMaxR) { leftMaxR = rr; }
+                } else {
+                    if (rr > rightMaxR) { rightMaxR = rr; }
+                }
+            }
+        }
+
+        c.Destroy();
+
+        int lit1 = 0; int id1 = 0; int ed1 = 0;
+        bool singleParityOk = CompareBuffers(singleUnframedPx, singleFramedPx, W, H, bg, 100, out lit1, out id1, out ed1);
+        int lit2 = 0; int id2 = 0; int ed2 = 0;
+        bool instParityOk = CompareBuffers(framedRefPx, instPx, W, H, bg, 300, out lit2, out id2, out ed2);
+        bool rotNormalOk = leftMaxR > 180 && rightMaxR > 30 && leftMaxR > rightMaxR + 60;
+        bool allOk = capOk && shOk == 1 && litOk == 1 && singleParityOk && instParityOk
+            && r3dOk == 1 && r3dLit > 300 && rotNormalOk;
+        if (!allOk) {
+            Console.WriteLine("DIAG capOk=" + capOk + " sh=" + shOk + " lit=" + litOk
+                + " single=" + singleParityOk + "(" + lit1 + "," + id1 + "," + ed1 + ")"
+                + " inst=" + instParityOk + "(" + lit2 + "," + id2 + "," + ed2 + ")"
+                + " r3d=" + r3dOk + "/" + r3dLit
+                + " rot=" + leftMaxR + " vs " + rightMaxR);
+        }
+        return allOk;
+    }
+
+    private static bool TestCursorAndPointerLockApi() {
+        App app = App.CreateOffscreen("fps-cursor-api", 320, 200);
+        if (app == null) { return false; }
+        bool defVis = app.IsCursorVisible();
+        app.SetCursorVisible(false);
+        bool hidden = !app.IsCursorVisible();
+        app.SetCursorVisible(true);
+        bool shown = app.IsCursorVisible();
+        // 离屏窗口无原生 HWND，指针锁与原始位移调用应安全无崩溃且初始位移为 0
+        app.SetPointerLock(true);
+        app.ConsumeMouseDelta();
+        double dx = app.MouseDeltaX();
+        double dy = app.MouseDeltaY();
+        app.SetPointerLock(false);
+        bool unlocked = !app.IsPointerLock();
+        return defVis && hidden && shown && unlocked && dx == 0.0 && dy == 0.0;
+    }
+
+    public static void Main() {
+        bool ok3d = TestLitInstancingAndFrameSession();
+        bool okInput = TestCursorAndPointerLockApi();
+        Console.WriteLine("lit-instancing-and-frame-session: " + Convert.ToString(ok3d ? 1 : 0));
+        Console.WriteLine("cursor-and-pointer-lock-api: " + Convert.ToString(okInput ? 1 : 0));
+    }
+}

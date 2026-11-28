@@ -13,6 +13,20 @@ static int g_win_w = 0, g_win_h = 0;
 static char *g_clip_text_linux = NULL;
 static char *g_clip_read_linux = NULL;
 static Cursor g_cursors_linux[8];
+static Cursor g_blank_cursor_linux = 0;
+static int g_cursor_slot_linux = 0;
+static int g_cursor_visible_linux = 1;
+static Window g_pointer_lock_win_linux = 0;
+static int g_pointer_lock_active_linux = 0;
+static double g_mouse_delta_acc_x_linux = 0.0;
+static double g_mouse_delta_acc_y_linux = 0.0;
+static double g_mouse_delta_last_x_linux = 0.0;
+static double g_mouse_delta_last_y_linux = 0.0;
+static int g_warp_cx_linux = 0;
+static int g_warp_cy_linux = 0;
+static int g_xi_init_attempted_linux = 0;
+static int g_xi_ready_linux = 0;
+static int g_xi_opcode_linux = 0;
 static XIM g_xim = NULL;
 static XIC g_xic = NULL;
 static XFontSet g_ime_fontset_linux = NULL;
@@ -51,6 +65,7 @@ static zan_lwin_t *lwin_find(Window xid) {
 
 i32 zan_gui_get_dpi_scale(void);
 i32 zan_gui_is_maximized(iptr hwnd_val);
+i32 zan_gui_window_focused(iptr hwnd_val);
 i64 zan_gui_get_tick_ms(void);
 
 static void x11_set_scale_metrics(int scale) {
@@ -260,6 +275,157 @@ static void x11_serve_selection(XSelectionRequestEvent *req) {
     XFlush(g_display);
 }
 
+/* XInput2 minimal ABI for XI_RawMotion (loaded dynamically via dlopen so no link dep). */
+typedef struct {
+    int deviceid;
+    int mask_len;
+    unsigned char *mask;
+} zan_xi_event_mask_t;
+typedef struct {
+    int mask_len;
+    unsigned char *mask;
+    double *values;
+} zan_xi_valuator_state_t;
+typedef struct {
+    int type;
+    unsigned long serial;
+    Bool send_event;
+    Display *display;
+    int extension;
+    int evtype;
+    Time time;
+    int deviceid;
+    int sourceid;
+    int detail;
+    int flags;
+    zan_xi_valuator_state_t valuators;
+    double *raw_values;
+} zan_xi_raw_event_t;
+typedef int (*zan_xi_query_version_fn)(Display *, int *, int *);
+typedef int (*zan_xi_select_events_fn)(Display *, Window, zan_xi_event_mask_t *, int);
+
+static void x11_ensure_xi2(void) {
+    if (g_xi_init_attempted_linux || !g_display) return;
+    g_xi_init_attempted_linux = 1;
+    int ev = 0, err = 0;
+    if (!XQueryExtension(g_display, "XInputExtension", &g_xi_opcode_linux, &ev, &err)) return;
+    void *lib = dlopen("libXi.so.6", RTLD_LAZY | RTLD_LOCAL);
+    if (!lib) lib = dlopen("libXi.so", RTLD_LAZY | RTLD_LOCAL);
+    if (!lib) return;
+    zan_xi_query_version_fn qv = (zan_xi_query_version_fn)dlsym(lib, "XIQueryVersion");
+    zan_xi_select_events_fn se = (zan_xi_select_events_fn)dlsym(lib, "XISelectEvents");
+    if (!qv || !se) return;
+    int major = 2, minor = 0;
+    if (qv(g_display, &major, &minor) != Success || major < 2) return;
+    unsigned char mask_bytes[4];
+    memset(mask_bytes, 0, sizeof(mask_bytes));
+    mask_bytes[17 >> 3] |= (unsigned char)(1u << (17 & 7)); /* XI_RawMotion = 17 */
+    zan_xi_event_mask_t em;
+    em.deviceid = 1; /* XIAllMasterDevices */
+    em.mask_len = (int)sizeof(mask_bytes);
+    em.mask = mask_bytes;
+    se(g_display, DefaultRootWindow(g_display), &em, 1);
+    XFlush(g_display);
+    g_xi_ready_linux = 1;
+}
+
+static Cursor x11_blank_cursor(void) {
+    if (!g_display) return 0;
+    if (g_blank_cursor_linux) return g_blank_cursor_linux;
+    char zero = 0;
+    Pixmap pm = XCreateBitmapFromData(g_display, DefaultRootWindow(g_display), &zero, 1, 1);
+    if (!pm) return 0;
+    XColor black;
+    memset(&black, 0, sizeof(black));
+    g_blank_cursor_linux = XCreatePixmapCursor(g_display, pm, pm, &black, &black, 0, 0);
+    XFreePixmap(g_display, pm);
+    return g_blank_cursor_linux;
+}
+
+static Cursor x11_cursor_for_slot(int slot) {
+    if (slot < 0 || slot >= 8) slot = 0;
+    if (!g_cursors_linux[slot]) {
+        unsigned int shape = XC_left_ptr;
+        if (slot == 1) shape = XC_hand2;
+        else if (slot == 2) shape = XC_xterm;
+        else if (slot == 3) shape = XC_sb_h_double_arrow;
+        else if (slot == 4) shape = XC_sb_v_double_arrow;
+        else if (slot == 5) shape = XC_crosshair;
+        g_cursors_linux[slot] = XCreateFontCursor(g_display, shape);
+    }
+    return g_cursors_linux[slot];
+}
+
+static void x11_apply_cursor_to_windows(void) {
+    if (!g_display || g_lwin_count == 0) return;
+    int hidden = (!g_cursor_visible_linux || g_pointer_lock_active_linux) ? 1 : 0;
+    Cursor c = hidden ? x11_blank_cursor() : x11_cursor_for_slot(g_cursor_slot_linux);
+    for (int i = 0; i < g_lwin_count; i++) {
+        XDefineCursor(g_display, g_lwins[i].xid, c);
+    }
+    XFlush(g_display);
+}
+
+static void x11_apply_pointer_lock(Window xid, int active) {
+    if (!g_display) return;
+    if (active && xid) {
+        x11_ensure_xi2();
+        Cursor blank = x11_blank_cursor();
+        int gr = XGrabPointer(g_display, xid, True,
+                              ButtonPressMask | ButtonReleaseMask | PointerMotionMask,
+                              GrabModeAsync, GrabModeAsync, xid, blank, CurrentTime);
+        if (gr == GrabSuccess) {
+            g_pointer_lock_active_linux = 1;
+            zan_lwin_t *w = lwin_find(xid);
+            if (w && w->w > 0 && w->h > 0) {
+                g_warp_cx_linux = w->w / 2;
+                g_warp_cy_linux = w->h / 2;
+                XWarpPointer(g_display, None, xid, 0, 0, 0, 0,
+                             g_warp_cx_linux, g_warp_cy_linux);
+            }
+            g_mouse_delta_acc_x_linux = 0.0;
+            g_mouse_delta_acc_y_linux = 0.0;
+            x11_apply_cursor_to_windows();
+        }
+    } else {
+        if (g_pointer_lock_active_linux) {
+            XUngrabPointer(g_display, CurrentTime);
+            g_pointer_lock_active_linux = 0;
+        }
+        g_mouse_delta_acc_x_linux = 0.0;
+        g_mouse_delta_acc_y_linux = 0.0;
+        x11_apply_cursor_to_windows();
+    }
+}
+
+static int x11_any_window_focused(void) {
+    if (!g_display || g_lwin_count == 0) return 0;
+    Window focused = 0;
+    int revert = 0;
+    if (!XGetInputFocus(g_display, &focused, &revert)) return 0;
+    return lwin_find(focused) != NULL ? 1 : 0;
+}
+
+static void x11_handle_xi_event(XEvent *ev) {
+    if (!g_display || !g_xi_ready_linux) return;
+    if (ev->xcookie.extension != g_xi_opcode_linux) return;
+    if (!XGetEventData(g_display, &ev->xcookie)) return;
+    if (ev->xcookie.evtype == 17 && (g_pointer_lock_active_linux || x11_any_window_focused())) {
+        zan_xi_raw_event_t *raw = (zan_xi_raw_event_t *)ev->xcookie.data;
+        if (raw && raw->valuators.mask && raw->raw_values) {
+            double *val = raw->raw_values;
+            for (int i = 0; i < raw->valuators.mask_len * 8 && i < 2; i++) {
+                if (raw->valuators.mask[i >> 3] & (1u << (i & 7))) {
+                    if (i == 0) g_mouse_delta_acc_x_linux += *val;
+                    else if (i == 1) g_mouse_delta_acc_y_linux += *val;
+                    val++;
+                }
+            }
+        }
+    }
+    XFreeEventData(g_display, &ev->xcookie);
+}
+
 /* X11 buttons: 1=left 2=middle 3=right */
 static int x11_abi_button(unsigned int b) {
     if (b == 3) return 1;
@@ -271,6 +437,18 @@ static void x11_translate_event(XEvent *ev) {
     g_evwin_linux = ev->xany.window;
     switch (ev->type) {
     case MotionNotify:
+        if (g_pointer_lock_active_linux && !g_xi_ready_linux &&
+            ev->xmotion.window == g_pointer_lock_win_linux) {
+            int dx = ev->xmotion.x - g_warp_cx_linux;
+            int dy = ev->xmotion.y - g_warp_cy_linux;
+            if (dx != 0 || dy != 0) {
+                g_mouse_delta_acc_x_linux += (double)dx;
+                g_mouse_delta_acc_y_linux += (double)dy;
+                XWarpPointer(g_display, None, ev->xmotion.window, 0, 0, 0, 0,
+                             g_warp_cx_linux, g_warp_cy_linux);
+                XFlush(g_display);
+            }
+        }
         evq_push_linux(1, ev->xmotion.x, ev->xmotion.y, 0, 0,
                        x11_mods(ev->xmotion.state));
         break;
@@ -282,7 +460,8 @@ static void x11_translate_event(XEvent *ev) {
         } else if (ev->xbutton.button == 6 || ev->xbutton.button == 7) {
         } else if (ev->xbutton.button == 1) {
             zan_lwin_t *bw = lwin_find(ev->xbutton.window);
-            int dir = bw ? x11_caption_hit(bw, ev->xbutton.x, ev->xbutton.y) : -1;
+            int dir = (bw && !(g_pointer_lock_active_linux && ev->xbutton.window == g_pointer_lock_win_linux))
+                ? x11_caption_hit(bw, ev->xbutton.x, ev->xbutton.y) : -1;
             if (dir >= 0) {
                 x11_start_moveresize(ev->xbutton.window,
                                      ev->xbutton.x_root, ev->xbutton.y_root, dir);
@@ -353,6 +532,10 @@ static void x11_translate_event(XEvent *ev) {
                    ev->xconfigure.height != cw->h)) {
             cw->w = ev->xconfigure.width;
             cw->h = ev->xconfigure.height;
+            if (ev->xconfigure.window == g_pointer_lock_win_linux) {
+                g_warp_cx_linux = cw->w / 2;
+                g_warp_cy_linux = cw->h / 2;
+            }
             if (ev->xconfigure.window == g_primary_win) {
                 g_win_w = cw->w;
                 g_win_h = cw->h;
@@ -381,11 +564,17 @@ static void x11_translate_event(XEvent *ev) {
     case FocusIn: {
         zan_lwin_t *fw = lwin_find(ev->xfocus.window);
         if (fw && fw->xic) XSetICFocus(fw->xic);
+        if (g_pointer_lock_win_linux == ev->xfocus.window && !g_pointer_lock_active_linux) {
+            x11_apply_pointer_lock(ev->xfocus.window, 1);
+        }
         break;
     }
     case FocusOut: {
         zan_lwin_t *fw = lwin_find(ev->xfocus.window);
         if (fw && fw->xic) XUnsetICFocus(fw->xic);
+        if (g_pointer_lock_win_linux == ev->xfocus.window && g_pointer_lock_active_linux) {
+            x11_apply_pointer_lock(0, 0);
+        }
         evq_push_linux(9, 0, 0, 0, 0, 0);
         break;
     }
@@ -545,6 +734,10 @@ EXPORT i32 zan_gui_wait_event(void) {
         while (XPending(g_display) > 0) {
             x11_dnd_poll_timeout(0);
             XNextEvent(g_display, &ev);
+            if (ev.type == GenericEvent) {
+                x11_handle_xi_event(&ev);
+                continue;
+            }
             if (ev.type == SelectionRequest) {
                 x11_serve_selection(&ev.xselectionrequest);
                 continue;
@@ -591,6 +784,10 @@ EXPORT i32 zan_gui_wait_event_timeout(i32 ms) {
         while (XPending(g_display) > 0) {
             x11_dnd_poll_timeout(0);
             XNextEvent(g_display, &ev);
+            if (ev.type == GenericEvent) {
+                x11_handle_xi_event(&ev);
+                continue;
+            }
             if (ev.type == SelectionRequest) {
                 x11_serve_selection(&ev.xselectionrequest);
                 continue;
@@ -648,6 +845,10 @@ EXPORT i32 zan_gui_poll_event(void) {
         if (XPending(g_display) <= 0) return 1;
         XEvent ev;
         XNextEvent(g_display, &ev);
+        if (ev.type == GenericEvent) {
+            x11_handle_xi_event(&ev);
+            continue;
+        }
         if (ev.type == SelectionRequest) {
             x11_serve_selection(&ev.xselectionrequest);
             continue;
@@ -831,19 +1032,65 @@ EXPORT i32 zan_gui_set_cursor(i32 cursor_type) {
     if (!g_display || g_lwin_count == 0) return 1;
     int slot = (int)cursor_type;
     if (slot < 0 || slot >= 8) slot = 0;
-    if (!g_cursors_linux[slot]) {
-        unsigned int shape = XC_left_ptr;
-        if (slot == 1) shape = XC_hand2;
-        else if (slot == 2) shape = XC_xterm;
-        else if (slot == 3) shape = XC_sb_h_double_arrow;
-        else if (slot == 4) shape = XC_sb_v_double_arrow;
-        else if (slot == 5) shape = XC_crosshair;
-        g_cursors_linux[slot] = XCreateFontCursor(g_display, shape);
+    g_cursor_slot_linux = slot;
+    if (!g_cursor_visible_linux || g_pointer_lock_active_linux) {
+        return 0;
     }
-    for (int i = 0; i < g_lwin_count; i++)
-        XDefineCursor(g_display, g_lwins[i].xid, g_cursors_linux[slot]);
-    XFlush(g_display);
+    x11_apply_cursor_to_windows();
     return 0;
+}
+
+EXPORT void zan_gui_set_cursor_visible(i32 visible) {
+    g_cursor_visible_linux = visible ? 1 : 0;
+    x11_apply_cursor_to_windows();
+}
+
+EXPORT i32 zan_gui_is_cursor_visible(void) {
+    return g_cursor_visible_linux ? 1 : 0;
+}
+
+EXPORT void zan_gui_set_pointer_lock(iptr hwnd_val, i32 locked) {
+    if (!g_display) return;
+    Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_primary_win;
+    if (locked) {
+        if (!xid) return;
+        g_pointer_lock_win_linux = xid;
+        g_mouse_delta_last_x_linux = 0.0;
+        g_mouse_delta_last_y_linux = 0.0;
+        if (zan_gui_window_focused((iptr)(intptr_t)xid)) {
+            x11_apply_pointer_lock(xid, 1);
+        }
+    } else {
+        if (!xid || g_pointer_lock_win_linux == xid) {
+            g_pointer_lock_win_linux = 0;
+            g_mouse_delta_last_x_linux = 0.0;
+            g_mouse_delta_last_y_linux = 0.0;
+            x11_apply_pointer_lock(0, 0);
+        }
+    }
+}
+
+EXPORT i32 zan_gui_is_pointer_lock(iptr hwnd_val) {
+    if (!g_pointer_lock_win_linux) return 0;
+    Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_primary_win;
+    return xid != 0 && g_pointer_lock_win_linux == xid ? 1 : 0;
+}
+
+EXPORT void zan_gui_consume_mouse_delta(iptr hwnd_val) {
+    (void)hwnd_val;
+    x11_ensure_xi2();
+    g_mouse_delta_last_x_linux = g_mouse_delta_acc_x_linux;
+    g_mouse_delta_last_y_linux = g_mouse_delta_acc_y_linux;
+    g_mouse_delta_acc_x_linux = 0.0;
+    g_mouse_delta_acc_y_linux = 0.0;
+}
+
+EXPORT double zan_gui_mouse_delta_x(void) {
+    return g_mouse_delta_last_x_linux;
+}
+
+EXPORT double zan_gui_mouse_delta_y(void) {
+    return g_mouse_delta_last_y_linux;
 }
 
 EXPORT i64 zan_gui_get_tick_ms(void) {
@@ -1045,6 +1292,10 @@ EXPORT i32 zan_gui_destroy_window(iptr hwnd_val) {
     Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_primary_win;
     zan_lwin_t *w = lwin_find(xid);
     if (w) {
+        if (w->xid == g_pointer_lock_win_linux) {
+            g_pointer_lock_win_linux = 0;
+            x11_apply_pointer_lock(0, 0);
+        }
         x11_drop_destroy(w);
         zan_gui_release_window((void *)(intptr_t)w->xid);
         if (w->backbuf) XFreePixmap(g_display, w->backbuf);
@@ -1072,6 +1323,13 @@ EXPORT i32 zan_gui_destroy_window(iptr hwnd_val) {
                 g_cursors_linux[i] = 0;
             }
         }
+        if (g_blank_cursor_linux) {
+            XFreeCursor(g_display, g_blank_cursor_linux);
+            g_blank_cursor_linux = 0;
+        }
+        g_cursor_visible_linux = 1;
+        g_pointer_lock_win_linux = 0;
+        g_pointer_lock_active_linux = 0;
         if (g_xim) { XCloseIM(g_xim); g_xim = NULL; }
         if (g_ime_fontset_linux) {
             XFreeFontSet(g_display, g_ime_fontset_linux);

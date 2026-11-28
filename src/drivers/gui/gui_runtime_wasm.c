@@ -123,6 +123,13 @@ EXPORT i32 zan_gui_set_title(i64 h, const char *t) {
     return 0;
 }
 EXPORT i32 zan_gui_set_cursor(i32 cursor_type)     { (void)cursor_type; return 0; }
+EXPORT void zan_gui_set_cursor_visible(i32 visible) { (void)visible; }
+EXPORT i32 zan_gui_is_cursor_visible(void)         { return 1; }
+EXPORT void zan_gui_set_pointer_lock(i64 h, i32 locked) { (void)h; (void)locked; }
+EXPORT i32 zan_gui_is_pointer_lock(i64 h)          { (void)h; return 0; }
+EXPORT void zan_gui_consume_mouse_delta(i64 h)     { (void)h; }
+EXPORT double zan_gui_mouse_delta_x(void)          { return 0.0; }
+EXPORT double zan_gui_mouse_delta_y(void)          { return 0.0; }
 
 EXPORT i32 zan_gui_poll_event(void) {
     memset(g_pending_event, 0, sizeof(g_pending_event));

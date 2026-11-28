@@ -58,6 +58,11 @@ public class MeshBatch {
         return this.count;
     }
 
+    // 本批缓冲容量（Create 时指定）。
+    public int Capacity() {
+        return this.capInstances;
+    }
+
     private int GetOrAddTexture(string texture) {
         if (texture == null) { texture = ""; }
         int texId = this.lastTexKey;
@@ -128,10 +133,8 @@ public class MeshBatch {
         this.count = this.count + 1;
     }
 
-    // 整批提交到画布：Begin → 按 (mesh, texture) 连段分组提交 → End。
-    // 批内共享同一份深度缓冲：跨组网格之间做真实遮挡（一组转到另一组
-    // 背后时被正确挡住）。返回 1 = GPU 批次已提交；0 = 未提交（空批，
-    // 或 CPU 兜底档不支持 3D——调用方据此换 2D 回退）。
+    // 整批提交到画布（旧式 MVP 实例路径，向后兼容）：
+    // Begin → 按 (mesh, texture) 连段分组提交 → End。
     public int Draw(Canvas c) {
         if (this.count <= 0) { return 0; }
         if (c.DrawMesh3DBatchBegin() != 1) { return 0; }
@@ -147,7 +150,7 @@ public class MeshBatch {
             int run = j - i;
             int offset = 0;
             while (run > 0) {
-                int chunk = run > 1024 ? 1024 : run;
+                int chunk = run > 4096 ? 4096 : run;
                 c.DrawMesh3DBatch(mesh, this.texKeys[texId],
                                   this.buf + (i + offset) * 80, chunk);
                 offset = offset + chunk;
@@ -156,6 +159,61 @@ public class MeshBatch {
             i = j;
         }
         c.DrawMesh3DBatchEnd();
+        return 1;
+    }
+
+    // 完整光照实例化提交：每实例装填的是世界 Model 矩阵（而非 MVP），
+    // 批共享 ViewProjection 矩阵 vp；着色器按 Model 伴随矩阵正确旋转/缩放法线，
+    // 并接入完整阴影（3x3 PCF）、距离/高度雾、点光/聚光、半球 IBL、PBR 材质与 VFX。
+    // 可独立调用，也可在 BeginFrame3D..EndFrame3D 多 Pass 会话内复用共享深度缓冲。
+    public int DrawLit(Canvas c, Mat4 vp) {
+        if (this.count <= 0 || vp == null) { return 0; }
+        if (c.DrawMesh3DBatchBegin() != 1) { return 0; }
+        int i = 0;
+        while (i < this.count) {
+            int mesh = this.meshIds[i];
+            int texId = this.texIds[i];
+            int j = i;
+            while (j < this.count && this.meshIds[j] == mesh &&
+                   this.texIds[j] == texId) {
+                j = j + 1;
+            }
+            int run = j - i;
+            int offset = 0;
+            while (run > 0) {
+                int chunk = run > 4096 ? 4096 : run;
+                c.DrawMesh3DBatchLit(mesh, this.texKeys[texId], vp,
+                                     this.buf + (i + offset) * 80, chunk);
+                offset = offset + chunk;
+                run = run - chunk;
+            }
+            i = j;
+        }
+        c.DrawMesh3DBatchEnd();
+        return 1;
+    }
+
+    // 批量阴影投射提交（在 ShadowBegin..ShadowEnd 间调用）：
+    // 每实例装填的是世界 Model 矩阵，按 meshId 连段一次提交最多 4096 个实例。
+    public int DrawShadow(Canvas c) {
+        if (this.count <= 0) { return 0; }
+        int i = 0;
+        while (i < this.count) {
+            int mesh = this.meshIds[i];
+            int j = i;
+            while (j < this.count && this.meshIds[j] == mesh) {
+                j = j + 1;
+            }
+            int run = j - i;
+            int offset = 0;
+            while (run > 0) {
+                int chunk = run > 4096 ? 4096 : run;
+                c.ShadowDrawBatch(mesh, this.buf + (i + offset) * 80, chunk);
+                offset = offset + chunk;
+                run = run - chunk;
+            }
+            i = j;
+        }
         return 1;
     }
 

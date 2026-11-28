@@ -64,6 +64,10 @@ ZAN_GAME_API int32_t zan_game_shadow_begin(int32_t surface_id, int32_t map_size,
     const float *light_vp);
 ZAN_GAME_API int32_t zan_game_shadow_draw(int32_t surface_id, int32_t mesh,
     const float *model);
+/* 实例化阴影投射（与 zan_game_draw3d_batch_lit 共用 20 float 实例布局：
+ * 前 16 float 为列主序 model 矩阵，后 4 float 忽略）。 */
+ZAN_GAME_API int32_t zan_game_shadow_draw_batch(int32_t surface_id, int32_t mesh,
+    const float *instances, int32_t count);
 /* 蒙皮网格动态阴影投射（使用当前 zan_game_set_bones3d 上传的骨骼矩阵变形后写入 ShadowMap）。 */
 ZAN_GAME_API int32_t zan_game_shadow_draw_skinned(int32_t surface_id, int32_t mesh,
     const float *model);
@@ -77,13 +81,19 @@ ZAN_GAME_API int32_t zan_game_set_bones3d(int32_t count, const float *matrices16
 ZAN_GAME_API int32_t zan_game_draw3d_skinned(int32_t surface_id, int32_t mesh,
     const float *mvp, const float *model, int32_t color, const char *texture);
 
-/* 批量实例绘制：begin（清一次深度）→ 每网格一组 batch（instances 每实例
- * 20 float：mvp 16 列主序 + tint rgba 4）→ end（恢复状态，整批一次
- * Finish）。批内实例与跨网格组之间做深度解析。返回 1 = 已画，
- * 0 = 失败/CPU 兜底档。 */
+/* 批量实例绘制：begin（未在 begin_frame3d 内时清一次深度）→ 每网格一组 batch
+ * （instances 每实例 20 float：mvp 16 列主序 + tint rgba 4）→ end。
+ * 返回 1 = 已画，0 = 失败/CPU 兜底档。 */
 ZAN_GAME_API int32_t zan_game_draw3d_batch_begin(int32_t surface_id);
 ZAN_GAME_API int32_t zan_game_draw3d_batch(int32_t surface_id, int32_t mesh,
     const char *texture, const float *instances, int32_t count);
+/* 真光照批量实例绘制：每实例 20 float（model 16 列主序 + tint rgba 4），整批共享
+ * 相机 ViewProjection 矩阵 vp（16 float 列主序）。顶点着色器用伴随余子式矩阵精确变换
+ * 世界法线（支持任意旋转与非均匀缩放），片元着色器与 zan_game_draw3d_ex 共享完整
+ * 方向光/点光/聚光/半球IBL/3x3 PCF 阴影/PBR/法线ORM自发光贴图/距离雾/高度雾/VFX。
+ * 可在 zan_game_begin_frame3d 或 zan_game_draw3d_batch_begin 会话内直接调用。 */
+ZAN_GAME_API int32_t zan_game_draw3d_batch_lit(int32_t surface_id, int32_t mesh,
+    const char *texture, const float *vp, const float *instances, int32_t count);
 ZAN_GAME_API int32_t zan_game_draw3d_batch_end(int32_t surface_id);
 
 /* 3D 光照 uniform 通路（draw3d 与批量实例共用，A489）：count 为方向光

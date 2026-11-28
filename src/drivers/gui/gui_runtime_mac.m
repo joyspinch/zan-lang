@@ -107,6 +107,52 @@ static long g_evt[7];
 /* Handle of the window feeding the events currently being decoded. */
 static long g_evt_win = 0;
 
+/* Cursor visibility, pointer lock, and raw mouse delta state. */
+static int g_cursor_visible_mac = 1;
+static int g_cursor_hidden_applied_mac = 0;
+static NSWindow *g_pointer_lock_win_mac = nil;
+static int g_pointer_lock_active_mac = 0;
+static double g_mouse_delta_acc_x_mac = 0.0;
+static double g_mouse_delta_acc_y_mac = 0.0;
+static double g_mouse_delta_last_x_mac = 0.0;
+static double g_mouse_delta_last_y_mac = 0.0;
+
+static void mac_sync_cursor_hidden(void) {
+    int want_hidden = (!g_cursor_visible_mac || g_pointer_lock_active_mac) ? 1 : 0;
+    if (want_hidden && !g_cursor_hidden_applied_mac) {
+        [NSCursor hide];
+        g_cursor_hidden_applied_mac = 1;
+    } else if (!want_hidden && g_cursor_hidden_applied_mac) {
+        [NSCursor unhide];
+        g_cursor_hidden_applied_mac = 0;
+    }
+}
+
+static void mac_apply_pointer_lock(NSWindow *win, int active) {
+    if (active && win) {
+        NSArray<NSScreen *> *screens = [NSScreen screens];
+        NSScreen *primary = (screens && [screens count] > 0) ? [screens objectAtIndex:0] : [NSScreen mainScreen];
+        CGFloat primaryH = primary ? [primary frame].size.height : 0.0;
+        NSRect frame = [win frame];
+        CGFloat cgX = NSMidX(frame);
+        CGFloat cgY = primaryH > 0.0 ? (primaryH - NSMidY(frame)) : NSMidY(frame);
+        CGWarpMouseCursorPosition(CGPointMake(cgX, cgY));
+        CGAssociateMouseAndMouseCursorPosition(false);
+        g_pointer_lock_active_mac = 1;
+        g_mouse_delta_acc_x_mac = 0.0;
+        g_mouse_delta_acc_y_mac = 0.0;
+        mac_sync_cursor_hidden();
+    } else {
+        if (g_pointer_lock_active_mac) {
+            CGAssociateMouseAndMouseCursorPosition(true);
+            g_pointer_lock_active_mac = 0;
+        }
+        g_mouse_delta_acc_x_mac = 0.0;
+        g_mouse_delta_acc_y_mac = 0.0;
+        mac_sync_cursor_hidden();
+    }
+}
+
 static zan_mwin_t *mwin_find_win(NSWindow *w) {
     for (int i = 0; i < g_mwin_count; i++)
         if (g_mwins[i].window == w) return &g_mwins[i];
@@ -601,10 +647,26 @@ static int zan_points_to_pixels(CGFloat points, CGFloat scale) {
     zan_gui_wake();
 }
 - (void)windowDidMiniaturize:(NSNotification *)note {
+    NSWindow *win = [note object];
+    if (win && win == g_pointer_lock_win_mac && g_pointer_lock_active_mac) {
+        mac_apply_pointer_lock(nil, 0);
+    }
     [self windowDidChangeOcclusionState:note];
 }
 - (void)windowDidDeminiaturize:(NSNotification *)note {
     [self windowDidChangeOcclusionState:note];
+}
+- (void)windowDidResignKey:(NSNotification *)note {
+    NSWindow *win = [note object];
+    if (win && win == g_pointer_lock_win_mac && g_pointer_lock_active_mac) {
+        mac_apply_pointer_lock(nil, 0);
+    }
+}
+- (void)windowDidBecomeKey:(NSNotification *)note {
+    NSWindow *win = [note object];
+    if (win && win == g_pointer_lock_win_mac && !g_pointer_lock_active_mac) {
+        mac_apply_pointer_lock(win, 1);
+    }
 }
 @end
 
@@ -863,6 +925,10 @@ EXPORT i32 zan_gui_close_window(iptr hwnd_val) {
     if (!mw && hwnd_val == 0 && g_mwin_count == 1) mw = &g_mwins[0];
     if (!mw) return 0;
     zan_mwin_t closing = *mw;
+    if (closing.window == g_pointer_lock_win_mac) {
+        g_pointer_lock_win_mac = nil;
+        mac_apply_pointer_lock(nil, 0);
+    }
     mac_drop_close((iptr)closing.window);
     /* Remove the handle before AppKit callbacks can reenter the registry. */
     int idx = (int)(mw - g_mwins);
@@ -886,6 +952,9 @@ EXPORT i32 zan_gui_close_window(iptr hwnd_val) {
         }
     }
     if (g_mwin_count == 0) {
+        g_pointer_lock_win_mac = nil;
+        g_cursor_visible_mac = 1;
+        mac_apply_pointer_lock(nil, 0);
         free(g_mac_drop_returned);
         g_mac_drop_returned = NULL;
         [NSApp setDelegate:nil];
@@ -1022,19 +1091,24 @@ static void decode_event(NSEvent *ev) {
     case NSEventTypeLeftMouseDragged:
     case NSEventTypeRightMouseDragged:
     case NSEventTypeOtherMouseDragged:
+        g_mouse_delta_acc_x_mac += (double)[ev deltaX];
+        g_mouse_delta_acc_y_mac += (double)[ev deltaY];
         evq_push(1, lx, ly, 0, 0, mods);
         break;
     case NSEventTypeLeftMouseDown: {
         /* Caption drag: mirror the Win32/X11 WM_NCHITTEST logic. A press in the
          * title-bar strip that is left of the caption-button cluster drags the
          * window natively and is not delivered as a client click; presses over
-         * the buttons or below the caption fall through as ordinary clicks. */
-        int tbH = zan_titlebar_h_win(win);
-        int capW = (mw ? mw->caption_btns : g_caption_btn_count) * zan_caption_btn_w_win(win);
-        if (mw && mw->caption_zone_w > capW) capW = mw->caption_zone_w;
-        if (mw && ly >= 0 && ly < tbH && lx < mw->w - capW) {
-            [win performWindowDragWithEvent:ev];
-            break;
+         * the buttons or below the caption fall through as ordinary clicks.
+         * Suppressed while pointer lock is active so FPS clicks never drag the window. */
+        if (!(g_pointer_lock_active_mac && win == g_pointer_lock_win_mac)) {
+            int tbH = zan_titlebar_h_win(win);
+            int capW = (mw ? mw->caption_btns : g_caption_btn_count) * zan_caption_btn_w_win(win);
+            if (mw && mw->caption_zone_w > capW) capW = mw->caption_zone_w;
+            if (mw && ly >= 0 && ly < tbH && lx < mw->w - capW) {
+                [win performWindowDragWithEvent:ev];
+                break;
+            }
         }
         evq_push(2, lx, ly, 0, 0, mods);
         break;
@@ -1700,6 +1774,9 @@ EXPORT i32 zan_gui_set_title(iptr hwnd_val, const char *title) {
 
 EXPORT i32 zan_gui_set_cursor(i32 cursor) {
     ZAN_MAC_ENSURE_MAIN_THREAD(zan_gui_set_cursor(cursor));
+    if (!g_cursor_visible_mac || g_pointer_lock_active_mac) {
+        return 0;
+    }
     @autoreleasepool {
         @try {
             switch (cursor) {
@@ -1734,6 +1811,64 @@ EXPORT i32 zan_gui_set_cursor(i32 cursor) {
         }
     }
     return 0;
+}
+
+EXPORT void zan_gui_set_cursor_visible(i32 visible) {
+    ZAN_MAC_ENSURE_MAIN_THREAD_VOID(zan_gui_set_cursor_visible(visible));
+    @autoreleasepool {
+        g_cursor_visible_mac = visible ? 1 : 0;
+        mac_sync_cursor_hidden();
+    }
+}
+
+EXPORT i32 zan_gui_is_cursor_visible(void) {
+    return g_cursor_visible_mac ? 1 : 0;
+}
+
+EXPORT void zan_gui_set_pointer_lock(iptr hwnd_val, i32 locked) {
+    ZAN_MAC_ENSURE_MAIN_THREAD_VOID(zan_gui_set_pointer_lock(hwnd_val, locked));
+    @autoreleasepool {
+        zan_mwin_t *mw = mwin_find(hwnd_val);
+        if (!mw && hwnd_val == 0 && g_mwin_count > 0) mw = &g_mwins[0];
+        if (locked) {
+            if (!mw || !mw->window) return;
+            g_pointer_lock_win_mac = mw->window;
+            g_mouse_delta_last_x_mac = 0.0;
+            g_mouse_delta_last_y_mac = 0.0;
+            if ([mw->window isKeyWindow]) {
+                mac_apply_pointer_lock(mw->window, 1);
+            }
+        } else {
+            if (!mw || !mw->window || g_pointer_lock_win_mac == mw->window) {
+                g_pointer_lock_win_mac = nil;
+                g_mouse_delta_last_x_mac = 0.0;
+                g_mouse_delta_last_y_mac = 0.0;
+                mac_apply_pointer_lock(nil, 0);
+            }
+        }
+    }
+}
+
+EXPORT i32 zan_gui_is_pointer_lock(iptr hwnd_val) {
+    if (!g_pointer_lock_win_mac) return 0;
+    if (hwnd_val == 0) return 1;
+    return (NSWindow *)(intptr_t)hwnd_val == g_pointer_lock_win_mac ? 1 : 0;
+}
+
+EXPORT void zan_gui_consume_mouse_delta(iptr hwnd_val) {
+    (void)hwnd_val;
+    g_mouse_delta_last_x_mac = g_mouse_delta_acc_x_mac;
+    g_mouse_delta_last_y_mac = g_mouse_delta_acc_y_mac;
+    g_mouse_delta_acc_x_mac = 0.0;
+    g_mouse_delta_acc_y_mac = 0.0;
+}
+
+EXPORT double zan_gui_mouse_delta_x(void) {
+    return g_mouse_delta_last_x_mac;
+}
+
+EXPORT double zan_gui_mouse_delta_y(void) {
+    return g_mouse_delta_last_y_mac;
 }
 
 EXPORT i64 zan_gui_get_tick_ms(void) {

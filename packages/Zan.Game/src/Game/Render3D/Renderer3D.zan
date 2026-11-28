@@ -411,19 +411,43 @@ public class Renderer3D {
 
         Mat4 vp = plan.Camera.ViewProjectionMatrix();
         if (!needMultiPass) {
+            int cap = this.batch.Capacity();
+            if (cap <= 0) { cap = 1; }
+            if (n <= cap) {
+                this.batch.Begin();
+                for (int i = 0; i < n; i = i + 1) {
+                    RenderItem it = plan.ItemAt(i);
+                    if (it == null || it.MeshKey <= 0) { continue; }
+                    int tint = this.UseCpuLighting ? it.Tint : it.Albedo;
+                    this.batch.Add(it.MeshKey, it.TextureKey, it.Model, tint);
+                }
+                int batchOk = this.batch.DrawLit(canvas, vp);
+                if (batchOk == 1 && this.PostProcess != null && this.PostProcess.HasGpuPassEffect()) {
+                    canvas.PostProcess3D(this.PostProcess);
+                }
+                return batchOk;
+            }
+            if (canvas.BeginFrame3D() == 0) { return 0; }
+            int batchDrawn = 0;
             this.batch.Begin();
             for (int i = 0; i < n; i = i + 1) {
                 RenderItem it = plan.ItemAt(i);
                 if (it == null || it.MeshKey <= 0) { continue; }
-                RenderTransform.MulInto(this.scratch, vp, it.Model);
                 int tint = this.UseCpuLighting ? it.Tint : it.Albedo;
-                this.batch.Add(it.MeshKey, it.TextureKey, this.scratch, tint);
+                this.batch.Add(it.MeshKey, it.TextureKey, it.Model, tint);
+                if (this.batch.Count() >= cap) {
+                    if (this.batch.DrawLit(canvas, vp) == 1) { batchDrawn = batchDrawn + 1; }
+                    this.batch.Begin();
+                }
             }
-            int batchOk = this.batch.Draw(canvas);
-            if (batchOk == 1 && this.PostProcess != null && this.PostProcess.HasGpuPassEffect()) {
+            if (this.batch.Count() > 0 && this.batch.DrawLit(canvas, vp) == 1) {
+                batchDrawn = batchDrawn + 1;
+            }
+            canvas.EndFrame3D();
+            if (batchDrawn > 0 && this.PostProcess != null && this.PostProcess.HasGpuPassEffect()) {
                 canvas.PostProcess3D(this.PostProcess);
             }
-            return batchOk;
+            return batchDrawn > 0 ? 1 : 0;
         }
 
         canvas.SetCamera3D(plan.Camera.Position.X, plan.Camera.Position.Y, plan.Camera.Position.Z);
@@ -439,29 +463,68 @@ public class Renderer3D {
             this.HeightFogBaseY, this.HeightFogFalloff, this.HeightFogMaxDensity,
             this.HeightFogRed, this.HeightFogGreen, this.HeightFogBlue);
 
-        // Pass 1：方向光 ShadowMap 投射（同时支持静态与 GPU 蒙皮网格）
+        int batchCap = this.batch.Capacity();
+        if (batchCap <= 0) { batchCap = 1; }
+
+        // Pass 1：方向光 ShadowMap 投射（连续同网格静态物体自动合批实例化，同时支持蒙皮网格）
         bool shadowActive = false;
         if (this.EnableShadows) {
             Mat4 lightVp = this.ResolveShadowLightVp(plan);
             int mapSz = this.ShadowMapSize >= 256 ? this.ShadowMapSize : 1024;
             if (canvas.ShadowBegin(mapSz, lightVp) == 1) {
-                for (int i = 0; i < n; i = i + 1) {
-                    RenderItem it = plan.ItemAt(i);
-                    if (it == null || it.MeshKey <= 0 || !it.CastShadow || it.Layer == 1) { continue; }
-                    canvas.SetWindSway3D(it.WindSwayEnabled, it.WindSwayAmplitude,
-                        it.WindSwayFrequency, it.WindSwayPhase, it.WindSwayHeightScale);
+                RenderItem lastShadowWind = null;
+                int si = 0;
+                while (si < n) {
+                    RenderItem it = plan.ItemAt(si);
+                    if (it == null || it.MeshKey <= 0 || !it.CastShadow || it.Layer == 1) {
+                        si = si + 1;
+                        continue;
+                    }
+                    if (lastShadowWind == null || !SameWindSway(lastShadowWind, it)) {
+                        canvas.SetWindSway3D(it.WindSwayEnabled, it.WindSwayAmplitude,
+                            it.WindSwayFrequency, it.WindSwayPhase, it.WindSwayHeightScale);
+                        lastShadowWind = it;
+                    }
                     if (it.IsSkinned) {
                         if (it.Skeleton != null) { canvas.SetBones3D(it.Skeleton); }
                         canvas.ShadowDrawSkinned(it.MeshKey, it.Model);
+                        si = si + 1;
+                        continue;
+                    }
+                    int sj = si + 1;
+                    while (sj < n) {
+                        RenderItem nxt = plan.ItemAt(sj);
+                        if (nxt == null || nxt.MeshKey <= 0 || !nxt.CastShadow || nxt.Layer == 1) {
+                            break;
+                        }
+                        if (nxt.IsSkinned || nxt.MeshKey != it.MeshKey || !SameWindSway(it, nxt)) {
+                            break;
+                        }
+                        sj = sj + 1;
+                    }
+                    if (sj - si >= 2) {
+                        this.batch.Begin();
+                        for (int k = si; k < sj; k = k + 1) {
+                            RenderItem cur = plan.ItemAt(k);
+                            this.batch.Add(cur.MeshKey, "", cur.Model, -1);
+                            if (this.batch.Count() >= batchCap) {
+                                this.batch.DrawShadow(canvas);
+                                this.batch.Begin();
+                            }
+                        }
+                        if (this.batch.Count() > 0) {
+                            this.batch.DrawShadow(canvas);
+                        }
                     } else {
                         canvas.ShadowDraw(it.MeshKey, it.Model);
                     }
+                    si = sj;
                 }
                 shadowActive = canvas.ShadowEnd() == 1;
             }
         }
 
-        // 开启跨 Pass 共享 24-bit 深度缓冲帧
+        // 开启跨 Pass 共享 24-bit 深度缓冲帧（持久持有 GL 上下文，整个 3D 帧零重复 Begin/End）
         if (canvas.BeginFrame3D() == 0) {
             if (shadowActive) { canvas.ShadowClear(); }
             canvas.SetMaterial3D(0.0f, 1.0f, 0.0f, 0.0f, 0.0f);
@@ -473,82 +536,53 @@ public class Renderer3D {
         }
 
         int drawn = 0;
-        // Pass 2：不透明层（Layer == 0，静态与蒙皮共享深度，接收阴影/PBR高光/点光源/自发光/距离雾）
+        RenderItem lastMat = null;
+        // Pass 2：不透明层（Layer == 0，同网格同贴图同材质连续静态段自动合批真光照实例化；
+        // 其余静态与蒙皮走持久上下文零冗余材质直通绘制）
         canvas.SetBlend3D(false, true);
-        for (int i = 0; i < n; i = i + 1) {
-            RenderItem it = plan.ItemAt(i);
-            if (it == null || it.MeshKey <= 0 || it.Layer != 0) { continue; }
+        int oi = 0;
+        while (oi < n) {
+            RenderItem it = plan.ItemAt(oi);
+            if (it == null || it.MeshKey <= 0 || it.Layer != 0) {
+                oi = oi + 1;
+                continue;
+            }
+            ApplyMaterial(canvas, it, lastMat);
+            lastMat = it;
+            if (!it.IsSkinned && (!shadowActive || it.ReceiveShadow)) {
+                int oj = oi + 1;
+                while (oj < n) {
+                    RenderItem nxt = plan.ItemAt(oj);
+                    if (nxt == null || nxt.MeshKey <= 0 || nxt.Layer != 0 || nxt.IsSkinned) {
+                        break;
+                    }
+                    if (shadowActive && !nxt.ReceiveShadow) { break; }
+                    if (nxt.MeshKey != it.MeshKey || nxt.TextureKey != it.TextureKey) { break; }
+                    if (!SameMaterial(it, nxt)) { break; }
+                    oj = oj + 1;
+                }
+                if (oj - oi >= 2) {
+                    this.batch.Begin();
+                    int runOk = 0;
+                    for (int k = oi; k < oj; k = k + 1) {
+                        RenderItem cur = plan.ItemAt(k);
+                        int curTint = this.UseCpuLighting ? cur.Tint : cur.Albedo;
+                        this.batch.Add(cur.MeshKey, cur.TextureKey, cur.Model, curTint);
+                        if (this.batch.Count() >= batchCap) {
+                            if (this.batch.DrawLit(canvas, vp) == 1) { runOk = runOk + this.batch.Count(); }
+                            this.batch.Begin();
+                        }
+                    }
+                    if (this.batch.Count() > 0 && this.batch.DrawLit(canvas, vp) == 1) {
+                        runOk = runOk + this.batch.Count();
+                    }
+                    drawn = drawn + runOk;
+                    oi = oj;
+                    continue;
+                }
+            }
             RenderTransform.MulInto(this.scratch, vp, it.Model);
             int tint = this.UseCpuLighting ? it.Tint : it.Albedo;
-            canvas.SetMaterial3D(it.Metallic, it.Roughness,
-                                 it.EmissiveRed, it.EmissiveGreen, it.EmissiveBlue);
-            canvas.SetNormalMap3D(it.NormalMapKey, it.NormalScale);
-            canvas.SetPbrMaps3D(it.OrmMapKey, it.AoStrength);
-            canvas.SetAlphaCutoff3D(it.AlphaCutoff);
-            canvas.SetEmissiveMap3D(it.EmissiveMapKey);
-            canvas.SetUvTransform3D(it.UvScaleU, it.UvScaleV, it.UvOffsetU, it.UvOffsetV);
-            canvas.SetRimLight3D(it.RimRed, it.RimGreen, it.RimBlue, it.RimPower);
-            canvas.SetToonShading3D(it.ToonBands, it.ToonSpecularStep);
-            canvas.SetDissolve3D(it.DissolveThreshold, it.DissolveEdgeWidth,
-                it.DissolveEdgeRed, it.DissolveEdgeGreen, it.DissolveEdgeBlue);
-            canvas.SetTriplanar3D(it.TriplanarEnabled, it.TriplanarScale, it.TriplanarSharpness);
-            canvas.SetHitFlash3D(it.HitFlashRed, it.HitFlashGreen, it.HitFlashBlue, it.HitFlashAmount);
-            canvas.SetHoloScan3D(it.HoloScanEnabled, it.HoloScanFrequency, it.HoloScanPhase,
-                it.HoloScanStrength, it.HoloScanRed, it.HoloScanGreen, it.HoloScanBlue);
-            canvas.SetTopCover3D(it.TopCoverEnabled, it.TopCoverThreshold, it.TopCoverSharpness,
-                it.TopCoverAmount, it.TopCoverRed, it.TopCoverGreen, it.TopCoverBlue);
-            canvas.SetWindSway3D(it.WindSwayEnabled, it.WindSwayAmplitude,
-                it.WindSwayFrequency, it.WindSwayPhase, it.WindSwayHeightScale);
-            canvas.SetDistanceFade3D(it.DistanceFadeEnabled, it.DistanceFadeStart, it.DistanceFadeEnd);
-            canvas.SetWorldGrid3D(it.WorldGridEnabled, it.WorldGridCellSize, it.WorldGridLineWidth,
-                it.WorldGridStrength, it.WorldGridRed, it.WorldGridGreen, it.WorldGridBlue);
-            canvas.SetWaterCaustics3D(it.WaterCausticsEnabled, it.WaterCausticsScale,
-                it.WaterCausticsPhase, it.WaterCausticsStrength,
-                it.WaterCausticsRed, it.WaterCausticsGreen, it.WaterCausticsBlue);
-            canvas.SetIceFrost3D(it.IceFrostEnabled, it.IceFrostScale,
-                it.IceFrostGlintStrength, it.IceFrostFresnelPower,
-                it.IceFrostRed, it.IceFrostGreen, it.IceFrostBlue);
-            canvas.SetLavaCrust3D(it.LavaCrustEnabled, it.LavaCrustScale,
-                it.LavaCrustPhase, it.LavaCrustCrackWidth, it.LavaCrustStrength,
-                it.LavaCrustRed, it.LavaCrustGreen, it.LavaCrustBlue);
-            canvas.SetIridescence3D(it.IridescenceEnabled, it.IridescenceFilmThickness,
-                it.IridescencePhaseShift, it.IridescenceStrength);
-            canvas.SetSonarPulse3D(it.SonarPulseEnabled,
-                it.SonarOriginX, it.SonarOriginY, it.SonarOriginZ,
-                it.SonarRadius, it.SonarRingWidth, it.SonarStrength,
-                it.SonarRed, it.SonarGreen, it.SonarBlue);
-            canvas.SetForceFieldHex3D(it.ForceFieldEnabled, it.ForceFieldScale,
-                it.ForceFieldPhase, it.ForceFieldEdgeWidth, it.ForceFieldStrength,
-                it.ForceFieldRed, it.ForceFieldGreen, it.ForceFieldBlue);
-            canvas.SetRainRipples3D(it.RainRipplesEnabled, it.RainRipplesScale,
-                it.RainRipplesPhase, it.RainRipplesStrength,
-                it.RainRipplesRed, it.RainRipplesGreen, it.RainRipplesBlue);
-            canvas.SetXraySilhouette3D(it.XraySilhouetteEnabled, it.XraySilhouettePower,
-                it.XraySilhouetteStrength, it.XraySilhouetteRed,
-                it.XraySilhouetteGreen, it.XraySilhouetteBlue);
-            canvas.SetPortalVortex3D(it.PortalVortexEnabled, it.PortalVortexSwirlTurns,
-                it.PortalVortexPhase, it.PortalVortexStrength,
-                it.PortalVortexRed, it.PortalVortexGreen, it.PortalVortexBlue);
-            canvas.SetBlueprintWire3D(it.BlueprintWireEnabled, it.BlueprintWireDensity,
-                it.BlueprintWireLineWidth, it.BlueprintWireStrength,
-                it.BlueprintWireRed, it.BlueprintWireGreen, it.BlueprintWireBlue);
-            canvas.SetHeatHazeShimmer3D(it.HeatHazeEnabled, it.HeatHazeFreq,
-                it.HeatHazePhase, it.HeatHazeStrength,
-                it.HeatHazeRed, it.HeatHazeGreen, it.HeatHazeBlue);
-            canvas.SetPixelDitherFade3D(it.PixelDitherEnabled, it.PixelDitherOpacity,
-                it.PixelDitherScale);
-            canvas.SetCrosshatchInk3D(it.CrosshatchEnabled, it.CrosshatchDensity,
-                it.CrosshatchStrength, it.CrosshatchRed, it.CrosshatchGreen, it.CrosshatchBlue);
-            canvas.SetAnisoBrushed3D(it.AnisoBrushedEnabled, it.AnisoBrushedGrainFreq,
-                it.AnisoBrushedAnisotropy, it.AnisoBrushedStrength,
-                it.AnisoBrushedRed, it.AnisoBrushedGreen, it.AnisoBrushedBlue);
-            canvas.SetVelvetSheen3D(it.VelvetSheenEnabled, it.VelvetSheenRoughness,
-                it.VelvetSheenWeaveFreq, it.VelvetSheenStrength,
-                it.VelvetSheenRed, it.VelvetSheenGreen, it.VelvetSheenBlue);
-            canvas.SetSubsurfaceWrap3D(it.SubsurfaceEnabled, it.SubsurfaceWrap,
-                it.SubsurfaceTranslucency, it.SubsurfacePower,
-                it.SubsurfaceRed, it.SubsurfaceGreen, it.SubsurfaceBlue);
-            canvas.SetCull3D(it.CullMode);
             Mat4 modelMat = (!shadowActive || it.ReceiveShadow) ? it.Model : null;
             int ok;
             if (it.IsSkinned) {
@@ -558,6 +592,7 @@ public class Renderer3D {
                 ok = canvas.DrawMesh3DEx(it.MeshKey, this.scratch, modelMat, tint, it.TextureKey);
             }
             if (ok == 1) { drawn = drawn + 1; }
+            oi = oi + 1;
         }
 
         // Pass 3：透明与加法辉光层（Layer == 1，RenderPlan 已按视深从远到近排序；支持标准 Alpha 与 Additive 混合且禁写深度）
@@ -567,77 +602,10 @@ public class Renderer3D {
             if (it != null && it.MeshKey > 0 && it.Layer == 1) {
                 hasTransparent = true;
                 canvas.SetBlendMode3D(it.AdditiveBlend ? 2 : 1, false);
+                ApplyMaterial(canvas, it, lastMat);
+                lastMat = it;
                 RenderTransform.MulInto(this.scratch, vp, it.Model);
                 int tint = this.UseCpuLighting ? it.Tint : it.Albedo;
-                canvas.SetMaterial3D(it.Metallic, it.Roughness,
-                                     it.EmissiveRed, it.EmissiveGreen, it.EmissiveBlue);
-                canvas.SetNormalMap3D(it.NormalMapKey, it.NormalScale);
-                canvas.SetPbrMaps3D(it.OrmMapKey, it.AoStrength);
-                canvas.SetAlphaCutoff3D(it.AlphaCutoff);
-                canvas.SetEmissiveMap3D(it.EmissiveMapKey);
-                canvas.SetUvTransform3D(it.UvScaleU, it.UvScaleV, it.UvOffsetU, it.UvOffsetV);
-                canvas.SetRimLight3D(it.RimRed, it.RimGreen, it.RimBlue, it.RimPower);
-                canvas.SetToonShading3D(it.ToonBands, it.ToonSpecularStep);
-                canvas.SetDissolve3D(it.DissolveThreshold, it.DissolveEdgeWidth,
-                    it.DissolveEdgeRed, it.DissolveEdgeGreen, it.DissolveEdgeBlue);
-                canvas.SetTriplanar3D(it.TriplanarEnabled, it.TriplanarScale, it.TriplanarSharpness);
-                canvas.SetHitFlash3D(it.HitFlashRed, it.HitFlashGreen, it.HitFlashBlue, it.HitFlashAmount);
-                canvas.SetHoloScan3D(it.HoloScanEnabled, it.HoloScanFrequency, it.HoloScanPhase,
-                    it.HoloScanStrength, it.HoloScanRed, it.HoloScanGreen, it.HoloScanBlue);
-                canvas.SetTopCover3D(it.TopCoverEnabled, it.TopCoverThreshold, it.TopCoverSharpness,
-                    it.TopCoverAmount, it.TopCoverRed, it.TopCoverGreen, it.TopCoverBlue);
-                canvas.SetWindSway3D(it.WindSwayEnabled, it.WindSwayAmplitude,
-                    it.WindSwayFrequency, it.WindSwayPhase, it.WindSwayHeightScale);
-                canvas.SetDistanceFade3D(it.DistanceFadeEnabled, it.DistanceFadeStart, it.DistanceFadeEnd);
-                canvas.SetWorldGrid3D(it.WorldGridEnabled, it.WorldGridCellSize, it.WorldGridLineWidth,
-                    it.WorldGridStrength, it.WorldGridRed, it.WorldGridGreen, it.WorldGridBlue);
-                canvas.SetWaterCaustics3D(it.WaterCausticsEnabled, it.WaterCausticsScale,
-                    it.WaterCausticsPhase, it.WaterCausticsStrength,
-                    it.WaterCausticsRed, it.WaterCausticsGreen, it.WaterCausticsBlue);
-                canvas.SetIceFrost3D(it.IceFrostEnabled, it.IceFrostScale,
-                    it.IceFrostGlintStrength, it.IceFrostFresnelPower,
-                    it.IceFrostRed, it.IceFrostGreen, it.IceFrostBlue);
-                canvas.SetLavaCrust3D(it.LavaCrustEnabled, it.LavaCrustScale,
-                    it.LavaCrustPhase, it.LavaCrustCrackWidth, it.LavaCrustStrength,
-                    it.LavaCrustRed, it.LavaCrustGreen, it.LavaCrustBlue);
-                canvas.SetIridescence3D(it.IridescenceEnabled, it.IridescenceFilmThickness,
-                    it.IridescencePhaseShift, it.IridescenceStrength);
-                canvas.SetSonarPulse3D(it.SonarPulseEnabled,
-                    it.SonarOriginX, it.SonarOriginY, it.SonarOriginZ,
-                    it.SonarRadius, it.SonarRingWidth, it.SonarStrength,
-                    it.SonarRed, it.SonarGreen, it.SonarBlue);
-                canvas.SetForceFieldHex3D(it.ForceFieldEnabled, it.ForceFieldScale,
-                    it.ForceFieldPhase, it.ForceFieldEdgeWidth, it.ForceFieldStrength,
-                    it.ForceFieldRed, it.ForceFieldGreen, it.ForceFieldBlue);
-                canvas.SetRainRipples3D(it.RainRipplesEnabled, it.RainRipplesScale,
-                    it.RainRipplesPhase, it.RainRipplesStrength,
-                    it.RainRipplesRed, it.RainRipplesGreen, it.RainRipplesBlue);
-                canvas.SetXraySilhouette3D(it.XraySilhouetteEnabled, it.XraySilhouettePower,
-                    it.XraySilhouetteStrength, it.XraySilhouetteRed,
-                    it.XraySilhouetteGreen, it.XraySilhouetteBlue);
-                canvas.SetPortalVortex3D(it.PortalVortexEnabled, it.PortalVortexSwirlTurns,
-                    it.PortalVortexPhase, it.PortalVortexStrength,
-                    it.PortalVortexRed, it.PortalVortexGreen, it.PortalVortexBlue);
-                canvas.SetBlueprintWire3D(it.BlueprintWireEnabled, it.BlueprintWireDensity,
-                    it.BlueprintWireLineWidth, it.BlueprintWireStrength,
-                    it.BlueprintWireRed, it.BlueprintWireGreen, it.BlueprintWireBlue);
-                canvas.SetHeatHazeShimmer3D(it.HeatHazeEnabled, it.HeatHazeFreq,
-                    it.HeatHazePhase, it.HeatHazeStrength,
-                    it.HeatHazeRed, it.HeatHazeGreen, it.HeatHazeBlue);
-                canvas.SetPixelDitherFade3D(it.PixelDitherEnabled, it.PixelDitherOpacity,
-                    it.PixelDitherScale);
-                canvas.SetCrosshatchInk3D(it.CrosshatchEnabled, it.CrosshatchDensity,
-                    it.CrosshatchStrength, it.CrosshatchRed, it.CrosshatchGreen, it.CrosshatchBlue);
-                canvas.SetAnisoBrushed3D(it.AnisoBrushedEnabled, it.AnisoBrushedGrainFreq,
-                    it.AnisoBrushedAnisotropy, it.AnisoBrushedStrength,
-                    it.AnisoBrushedRed, it.AnisoBrushedGreen, it.AnisoBrushedBlue);
-                canvas.SetVelvetSheen3D(it.VelvetSheenEnabled, it.VelvetSheenRoughness,
-                    it.VelvetSheenWeaveFreq, it.VelvetSheenStrength,
-                    it.VelvetSheenRed, it.VelvetSheenGreen, it.VelvetSheenBlue);
-                canvas.SetSubsurfaceWrap3D(it.SubsurfaceEnabled, it.SubsurfaceWrap,
-                    it.SubsurfaceTranslucency, it.SubsurfacePower,
-                    it.SubsurfaceRed, it.SubsurfaceGreen, it.SubsurfaceBlue);
-                canvas.SetCull3D(it.CullMode);
                 Mat4 modelMat = (!shadowActive || it.ReceiveShadow) ? it.Model : null;
                 int ok;
                 if (it.IsSkinned) {
@@ -697,6 +665,214 @@ public class Renderer3D {
             canvas.PostProcess3D(this.PostProcess);
         }
         return drawn > 0 ? 1 : 0;
+    }
+
+    private static bool SameKey(string a, string b) {
+        string sa = a == null ? "" : a;
+        string sb = b == null ? "" : b;
+        return sa == sb;
+    }
+
+    private static bool SameWindSway(RenderItem a, RenderItem b) {
+        if (a.WindSwayEnabled != b.WindSwayEnabled) { return false; }
+        if (!a.WindSwayEnabled) { return true; }
+        return a.WindSwayAmplitude == b.WindSwayAmplitude
+            && a.WindSwayFrequency == b.WindSwayFrequency
+            && a.WindSwayPhase == b.WindSwayPhase
+            && a.WindSwayHeightScale == b.WindSwayHeightScale;
+    }
+
+    private static bool SameMaterial(RenderItem a, RenderItem b) {
+        if (a == b) { return true; }
+        if (a.Metallic != b.Metallic || a.Roughness != b.Roughness
+            || a.EmissiveRed != b.EmissiveRed || a.EmissiveGreen != b.EmissiveGreen
+            || a.EmissiveBlue != b.EmissiveBlue || a.CullMode != b.CullMode
+            || a.AlphaCutoff != b.AlphaCutoff) { return false; }
+        if (!SameKey(a.NormalMapKey, b.NormalMapKey) || a.NormalScale != b.NormalScale) { return false; }
+        if (!SameKey(a.OrmMapKey, b.OrmMapKey) || a.AoStrength != b.AoStrength) { return false; }
+        if (!SameKey(a.EmissiveMapKey, b.EmissiveMapKey)) { return false; }
+        if (a.UvScaleU != b.UvScaleU || a.UvScaleV != b.UvScaleV
+            || a.UvOffsetU != b.UvOffsetU || a.UvOffsetV != b.UvOffsetV) { return false; }
+        if (a.RimRed != b.RimRed || a.RimGreen != b.RimGreen
+            || a.RimBlue != b.RimBlue || a.RimPower != b.RimPower) { return false; }
+        if (a.ToonBands != b.ToonBands || a.ToonSpecularStep != b.ToonSpecularStep) { return false; }
+        if (a.DissolveThreshold != b.DissolveThreshold) { return false; }
+        if (a.DissolveThreshold > 0.0f && (a.DissolveEdgeWidth != b.DissolveEdgeWidth
+            || a.DissolveEdgeRed != b.DissolveEdgeRed || a.DissolveEdgeGreen != b.DissolveEdgeGreen
+            || a.DissolveEdgeBlue != b.DissolveEdgeBlue)) { return false; }
+        if (a.TriplanarEnabled != b.TriplanarEnabled) { return false; }
+        if (a.TriplanarEnabled && (a.TriplanarScale != b.TriplanarScale
+            || a.TriplanarSharpness != b.TriplanarSharpness)) { return false; }
+        if (a.HitFlashAmount != b.HitFlashAmount) { return false; }
+        if (a.HitFlashAmount > 0.0f && (a.HitFlashRed != b.HitFlashRed
+            || a.HitFlashGreen != b.HitFlashGreen || a.HitFlashBlue != b.HitFlashBlue)) { return false; }
+        if (a.HoloScanEnabled != b.HoloScanEnabled) { return false; }
+        if (a.HoloScanEnabled && (a.HoloScanFrequency != b.HoloScanFrequency
+            || a.HoloScanPhase != b.HoloScanPhase || a.HoloScanStrength != b.HoloScanStrength
+            || a.HoloScanRed != b.HoloScanRed || a.HoloScanGreen != b.HoloScanGreen
+            || a.HoloScanBlue != b.HoloScanBlue)) { return false; }
+        if (a.TopCoverEnabled != b.TopCoverEnabled) { return false; }
+        if (a.TopCoverEnabled && (a.TopCoverThreshold != b.TopCoverThreshold
+            || a.TopCoverSharpness != b.TopCoverSharpness || a.TopCoverAmount != b.TopCoverAmount
+            || a.TopCoverRed != b.TopCoverRed || a.TopCoverGreen != b.TopCoverGreen
+            || a.TopCoverBlue != b.TopCoverBlue)) { return false; }
+        if (!SameWindSway(a, b)) { return false; }
+        if (a.DistanceFadeEnabled != b.DistanceFadeEnabled) { return false; }
+        if (a.DistanceFadeEnabled && (a.DistanceFadeStart != b.DistanceFadeStart
+            || a.DistanceFadeEnd != b.DistanceFadeEnd)) { return false; }
+        if (a.WorldGridEnabled != b.WorldGridEnabled) { return false; }
+        if (a.WorldGridEnabled && (a.WorldGridCellSize != b.WorldGridCellSize
+            || a.WorldGridLineWidth != b.WorldGridLineWidth || a.WorldGridStrength != b.WorldGridStrength
+            || a.WorldGridRed != b.WorldGridRed || a.WorldGridGreen != b.WorldGridGreen
+            || a.WorldGridBlue != b.WorldGridBlue)) { return false; }
+        if (a.WaterCausticsEnabled != b.WaterCausticsEnabled) { return false; }
+        if (a.WaterCausticsEnabled && (a.WaterCausticsScale != b.WaterCausticsScale
+            || a.WaterCausticsPhase != b.WaterCausticsPhase || a.WaterCausticsStrength != b.WaterCausticsStrength
+            || a.WaterCausticsRed != b.WaterCausticsRed || a.WaterCausticsGreen != b.WaterCausticsGreen
+            || a.WaterCausticsBlue != b.WaterCausticsBlue)) { return false; }
+        if (a.IceFrostEnabled != b.IceFrostEnabled) { return false; }
+        if (a.IceFrostEnabled && (a.IceFrostScale != b.IceFrostScale
+            || a.IceFrostGlintStrength != b.IceFrostGlintStrength || a.IceFrostFresnelPower != b.IceFrostFresnelPower
+            || a.IceFrostRed != b.IceFrostRed || a.IceFrostGreen != b.IceFrostGreen
+            || a.IceFrostBlue != b.IceFrostBlue)) { return false; }
+        if (a.LavaCrustEnabled != b.LavaCrustEnabled) { return false; }
+        if (a.LavaCrustEnabled && (a.LavaCrustScale != b.LavaCrustScale
+            || a.LavaCrustPhase != b.LavaCrustPhase || a.LavaCrustCrackWidth != b.LavaCrustCrackWidth
+            || a.LavaCrustStrength != b.LavaCrustStrength || a.LavaCrustRed != b.LavaCrustRed
+            || a.LavaCrustGreen != b.LavaCrustGreen || a.LavaCrustBlue != b.LavaCrustBlue)) { return false; }
+        if (a.IridescenceEnabled != b.IridescenceEnabled) { return false; }
+        if (a.IridescenceEnabled && (a.IridescenceFilmThickness != b.IridescenceFilmThickness
+            || a.IridescencePhaseShift != b.IridescencePhaseShift
+            || a.IridescenceStrength != b.IridescenceStrength)) { return false; }
+        if (a.SonarPulseEnabled != b.SonarPulseEnabled) { return false; }
+        if (a.SonarPulseEnabled && (a.SonarOriginX != b.SonarOriginX || a.SonarOriginY != b.SonarOriginY
+            || a.SonarOriginZ != b.SonarOriginZ || a.SonarRadius != b.SonarRadius
+            || a.SonarRingWidth != b.SonarRingWidth || a.SonarStrength != b.SonarStrength
+            || a.SonarRed != b.SonarRed || a.SonarGreen != b.SonarGreen || a.SonarBlue != b.SonarBlue)) { return false; }
+        if (a.ForceFieldEnabled != b.ForceFieldEnabled) { return false; }
+        if (a.ForceFieldEnabled && (a.ForceFieldScale != b.ForceFieldScale
+            || a.ForceFieldPhase != b.ForceFieldPhase || a.ForceFieldEdgeWidth != b.ForceFieldEdgeWidth
+            || a.ForceFieldStrength != b.ForceFieldStrength || a.ForceFieldRed != b.ForceFieldRed
+            || a.ForceFieldGreen != b.ForceFieldGreen || a.ForceFieldBlue != b.ForceFieldBlue)) { return false; }
+        if (a.RainRipplesEnabled != b.RainRipplesEnabled) { return false; }
+        if (a.RainRipplesEnabled && (a.RainRipplesScale != b.RainRipplesScale
+            || a.RainRipplesPhase != b.RainRipplesPhase || a.RainRipplesStrength != b.RainRipplesStrength
+            || a.RainRipplesRed != b.RainRipplesRed || a.RainRipplesGreen != b.RainRipplesGreen
+            || a.RainRipplesBlue != b.RainRipplesBlue)) { return false; }
+        if (a.XraySilhouetteEnabled != b.XraySilhouetteEnabled) { return false; }
+        if (a.XraySilhouetteEnabled && (a.XraySilhouettePower != b.XraySilhouettePower
+            || a.XraySilhouetteStrength != b.XraySilhouetteStrength || a.XraySilhouetteRed != b.XraySilhouetteRed
+            || a.XraySilhouetteGreen != b.XraySilhouetteGreen || a.XraySilhouetteBlue != b.XraySilhouetteBlue)) { return false; }
+        if (a.PortalVortexEnabled != b.PortalVortexEnabled) { return false; }
+        if (a.PortalVortexEnabled && (a.PortalVortexSwirlTurns != b.PortalVortexSwirlTurns
+            || a.PortalVortexPhase != b.PortalVortexPhase || a.PortalVortexStrength != b.PortalVortexStrength
+            || a.PortalVortexRed != b.PortalVortexRed || a.PortalVortexGreen != b.PortalVortexGreen
+            || a.PortalVortexBlue != b.PortalVortexBlue)) { return false; }
+        if (a.BlueprintWireEnabled != b.BlueprintWireEnabled) { return false; }
+        if (a.BlueprintWireEnabled && (a.BlueprintWireDensity != b.BlueprintWireDensity
+            || a.BlueprintWireLineWidth != b.BlueprintWireLineWidth || a.BlueprintWireStrength != b.BlueprintWireStrength
+            || a.BlueprintWireRed != b.BlueprintWireRed || a.BlueprintWireGreen != b.BlueprintWireGreen
+            || a.BlueprintWireBlue != b.BlueprintWireBlue)) { return false; }
+        if (a.HeatHazeEnabled != b.HeatHazeEnabled) { return false; }
+        if (a.HeatHazeEnabled && (a.HeatHazeFreq != b.HeatHazeFreq || a.HeatHazePhase != b.HeatHazePhase
+            || a.HeatHazeStrength != b.HeatHazeStrength || a.HeatHazeRed != b.HeatHazeRed
+            || a.HeatHazeGreen != b.HeatHazeGreen || a.HeatHazeBlue != b.HeatHazeBlue)) { return false; }
+        if (a.PixelDitherEnabled != b.PixelDitherEnabled) { return false; }
+        if (a.PixelDitherEnabled && (a.PixelDitherOpacity != b.PixelDitherOpacity
+            || a.PixelDitherScale != b.PixelDitherScale)) { return false; }
+        if (a.CrosshatchEnabled != b.CrosshatchEnabled) { return false; }
+        if (a.CrosshatchEnabled && (a.CrosshatchDensity != b.CrosshatchDensity
+            || a.CrosshatchStrength != b.CrosshatchStrength || a.CrosshatchRed != b.CrosshatchRed
+            || a.CrosshatchGreen != b.CrosshatchGreen || a.CrosshatchBlue != b.CrosshatchBlue)) { return false; }
+        if (a.AnisoBrushedEnabled != b.AnisoBrushedEnabled) { return false; }
+        if (a.AnisoBrushedEnabled && (a.AnisoBrushedGrainFreq != b.AnisoBrushedGrainFreq
+            || a.AnisoBrushedAnisotropy != b.AnisoBrushedAnisotropy || a.AnisoBrushedStrength != b.AnisoBrushedStrength
+            || a.AnisoBrushedRed != b.AnisoBrushedRed || a.AnisoBrushedGreen != b.AnisoBrushedGreen
+            || a.AnisoBrushedBlue != b.AnisoBrushedBlue)) { return false; }
+        if (a.VelvetSheenEnabled != b.VelvetSheenEnabled) { return false; }
+        if (a.VelvetSheenEnabled && (a.VelvetSheenRoughness != b.VelvetSheenRoughness
+            || a.VelvetSheenWeaveFreq != b.VelvetSheenWeaveFreq || a.VelvetSheenStrength != b.VelvetSheenStrength
+            || a.VelvetSheenRed != b.VelvetSheenRed || a.VelvetSheenGreen != b.VelvetSheenGreen
+            || a.VelvetSheenBlue != b.VelvetSheenBlue)) { return false; }
+        if (a.SubsurfaceEnabled != b.SubsurfaceEnabled) { return false; }
+        if (a.SubsurfaceEnabled && (a.SubsurfaceWrap != b.SubsurfaceWrap
+            || a.SubsurfaceTranslucency != b.SubsurfaceTranslucency || a.SubsurfacePower != b.SubsurfacePower
+            || a.SubsurfaceRed != b.SubsurfaceRed || a.SubsurfaceGreen != b.SubsurfaceGreen
+            || a.SubsurfaceBlue != b.SubsurfaceBlue)) { return false; }
+        return true;
+    }
+
+    private static void ApplyMaterial(Canvas canvas, RenderItem it, RenderItem prev) {
+        if (prev != null && SameMaterial(prev, it)) { return; }
+        canvas.SetMaterial3D(it.Metallic, it.Roughness,
+                             it.EmissiveRed, it.EmissiveGreen, it.EmissiveBlue);
+        canvas.SetNormalMap3D(it.NormalMapKey, it.NormalScale);
+        canvas.SetPbrMaps3D(it.OrmMapKey, it.AoStrength);
+        canvas.SetAlphaCutoff3D(it.AlphaCutoff);
+        canvas.SetEmissiveMap3D(it.EmissiveMapKey);
+        canvas.SetUvTransform3D(it.UvScaleU, it.UvScaleV, it.UvOffsetU, it.UvOffsetV);
+        canvas.SetRimLight3D(it.RimRed, it.RimGreen, it.RimBlue, it.RimPower);
+        canvas.SetToonShading3D(it.ToonBands, it.ToonSpecularStep);
+        canvas.SetDissolve3D(it.DissolveThreshold, it.DissolveEdgeWidth,
+            it.DissolveEdgeRed, it.DissolveEdgeGreen, it.DissolveEdgeBlue);
+        canvas.SetTriplanar3D(it.TriplanarEnabled, it.TriplanarScale, it.TriplanarSharpness);
+        canvas.SetHitFlash3D(it.HitFlashRed, it.HitFlashGreen, it.HitFlashBlue, it.HitFlashAmount);
+        canvas.SetHoloScan3D(it.HoloScanEnabled, it.HoloScanFrequency, it.HoloScanPhase,
+            it.HoloScanStrength, it.HoloScanRed, it.HoloScanGreen, it.HoloScanBlue);
+        canvas.SetTopCover3D(it.TopCoverEnabled, it.TopCoverThreshold, it.TopCoverSharpness,
+            it.TopCoverAmount, it.TopCoverRed, it.TopCoverGreen, it.TopCoverBlue);
+        canvas.SetWindSway3D(it.WindSwayEnabled, it.WindSwayAmplitude,
+            it.WindSwayFrequency, it.WindSwayPhase, it.WindSwayHeightScale);
+        canvas.SetDistanceFade3D(it.DistanceFadeEnabled, it.DistanceFadeStart, it.DistanceFadeEnd);
+        canvas.SetWorldGrid3D(it.WorldGridEnabled, it.WorldGridCellSize, it.WorldGridLineWidth,
+            it.WorldGridStrength, it.WorldGridRed, it.WorldGridGreen, it.WorldGridBlue);
+        canvas.SetWaterCaustics3D(it.WaterCausticsEnabled, it.WaterCausticsScale,
+            it.WaterCausticsPhase, it.WaterCausticsStrength,
+            it.WaterCausticsRed, it.WaterCausticsGreen, it.WaterCausticsBlue);
+        canvas.SetIceFrost3D(it.IceFrostEnabled, it.IceFrostScale,
+            it.IceFrostGlintStrength, it.IceFrostFresnelPower,
+            it.IceFrostRed, it.IceFrostGreen, it.IceFrostBlue);
+        canvas.SetLavaCrust3D(it.LavaCrustEnabled, it.LavaCrustScale,
+            it.LavaCrustPhase, it.LavaCrustCrackWidth, it.LavaCrustStrength,
+            it.LavaCrustRed, it.LavaCrustGreen, it.LavaCrustBlue);
+        canvas.SetIridescence3D(it.IridescenceEnabled, it.IridescenceFilmThickness,
+            it.IridescencePhaseShift, it.IridescenceStrength);
+        canvas.SetSonarPulse3D(it.SonarPulseEnabled,
+            it.SonarOriginX, it.SonarOriginY, it.SonarOriginZ,
+            it.SonarRadius, it.SonarRingWidth, it.SonarStrength,
+            it.SonarRed, it.SonarGreen, it.SonarBlue);
+        canvas.SetForceFieldHex3D(it.ForceFieldEnabled, it.ForceFieldScale,
+            it.ForceFieldPhase, it.ForceFieldEdgeWidth, it.ForceFieldStrength,
+            it.ForceFieldRed, it.ForceFieldGreen, it.ForceFieldBlue);
+        canvas.SetRainRipples3D(it.RainRipplesEnabled, it.RainRipplesScale,
+            it.RainRipplesPhase, it.RainRipplesStrength,
+            it.RainRipplesRed, it.RainRipplesGreen, it.RainRipplesBlue);
+        canvas.SetXraySilhouette3D(it.XraySilhouetteEnabled, it.XraySilhouettePower,
+            it.XraySilhouetteStrength, it.XraySilhouetteRed,
+            it.XraySilhouetteGreen, it.XraySilhouetteBlue);
+        canvas.SetPortalVortex3D(it.PortalVortexEnabled, it.PortalVortexSwirlTurns,
+            it.PortalVortexPhase, it.PortalVortexStrength,
+            it.PortalVortexRed, it.PortalVortexGreen, it.PortalVortexBlue);
+        canvas.SetBlueprintWire3D(it.BlueprintWireEnabled, it.BlueprintWireDensity,
+            it.BlueprintWireLineWidth, it.BlueprintWireStrength,
+            it.BlueprintWireRed, it.BlueprintWireGreen, it.BlueprintWireBlue);
+        canvas.SetHeatHazeShimmer3D(it.HeatHazeEnabled, it.HeatHazeFreq,
+            it.HeatHazePhase, it.HeatHazeStrength,
+            it.HeatHazeRed, it.HeatHazeGreen, it.HeatHazeBlue);
+        canvas.SetPixelDitherFade3D(it.PixelDitherEnabled, it.PixelDitherOpacity,
+            it.PixelDitherScale);
+        canvas.SetCrosshatchInk3D(it.CrosshatchEnabled, it.CrosshatchDensity,
+            it.CrosshatchStrength, it.CrosshatchRed, it.CrosshatchGreen, it.CrosshatchBlue);
+        canvas.SetAnisoBrushed3D(it.AnisoBrushedEnabled, it.AnisoBrushedGrainFreq,
+            it.AnisoBrushedAnisotropy, it.AnisoBrushedStrength,
+            it.AnisoBrushedRed, it.AnisoBrushedGreen, it.AnisoBrushedBlue);
+        canvas.SetVelvetSheen3D(it.VelvetSheenEnabled, it.VelvetSheenRoughness,
+            it.VelvetSheenWeaveFreq, it.VelvetSheenStrength,
+            it.VelvetSheenRed, it.VelvetSheenGreen, it.VelvetSheenBlue);
+        canvas.SetSubsurfaceWrap3D(it.SubsurfaceEnabled, it.SubsurfaceWrap,
+            it.SubsurfaceTranslucency, it.SubsurfacePower,
+            it.SubsurfaceRed, it.SubsurfaceGreen, it.SubsurfaceBlue);
+        canvas.SetCull3D(it.CullMode);
     }
 
     // 释放批次缓冲。此后本对象不可再用。

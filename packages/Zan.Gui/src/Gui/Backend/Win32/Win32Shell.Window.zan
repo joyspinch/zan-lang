@@ -461,13 +461,148 @@ public partial class Win32Shell {
         }
         return Win32Shell.cursorCache[0];
     }
+    static bool IsCursorEffectivelyHidden() {
+        return !Win32Shell.cursorVisible
+            || (Win32Shell.pointerLockHwnd != 0 && Win32Shell.pointerLockActive);
+    }
+    static void ApplyCursorNow() {
+        if (Win32Shell.IsCursorEffectivelyHidden()) {
+            Win32Shell.appliedCursorKind = -2;
+            Win32Shell.SetCursor(0);
+            return;
+        }
+        int k = Win32Shell.desiredCursorKind;
+        if (k < 0) { k = 0; }
+        Win32Shell.appliedCursorKind = k;
+        Win32Shell.SetCursor(Win32Shell.CursorHandleOf(k));
+    }
     static void SetCursorShape(int kind) {
         if (kind < 0) { kind = 0; }
         Win32Shell.desiredCursorKind = kind;
+        if (Win32Shell.IsCursorEffectivelyHidden()) {
+            if (Win32Shell.appliedCursorKind != -2) {
+                Win32Shell.appliedCursorKind = -2;
+                Win32Shell.SetCursor(0);
+            }
+            return;
+        }
         if (kind == Win32Shell.appliedCursorKind) { return; }
         Win32Shell.appliedCursorKind = kind;
         Win32Shell.SetCursor(Win32Shell.CursorHandleOf(kind));
     }
+    static void SetCursorVisible(bool visible) {
+        Win32Shell.Init();
+        Win32Shell.cursorVisible = visible;
+        Win32Shell.appliedCursorKind = -1;
+        Win32Shell.ApplyCursorNow();
+    }
+    static bool IsCursorVisible() {
+        Win32Shell.Init();
+        return Win32Shell.cursorVisible;
+    }
+    static void EnsureRawMouseInput() {
+        if (Win32Shell.rawMouseRegistered) { return; }
+        // RAWINPUTDEVICE (x64 sizeof == 16): usUsagePage(2)=1, usUsage(2)=2, dwFlags(4)=0, hwndTarget(8)=0
+        nint rid = NativeMemory.Alloc(16);
+        new Span<int>(rid, 1)[0] = 0x00020001;
+        new Span<int>(rid + 4, 1)[0] = 0;
+        new Span<long>(rid + 8, 1)[0] = 0;
+        if (Win32Shell.RegisterRawInputDevices(rid, 1, 16) != 0) {
+            Win32Shell.rawMouseRegistered = true;
+        }
+        NativeMemory.Free(rid);
+    }
+    static void ResetMouseDelta() {
+        Win32Shell.mouseDeltaAccX = 0.0;
+        Win32Shell.mouseDeltaAccY = 0.0;
+        Win32Shell.mouseDeltaLastX = 0.0;
+        Win32Shell.mouseDeltaLastY = 0.0;
+    }
+    static void ApplyPointerLockClip(nint hwnd, bool recenter) {
+        if (hwnd == 0) { return; }
+        nint rc = NativeMemory.Alloc(16);
+        if (Win32Shell.GetClientRect(hwnd, rc) != 0) {
+            int cw = Win32Shell.S32(rc, 8) - Win32Shell.S32(rc, 0);
+            int ch = Win32Shell.S32(rc, 12) - Win32Shell.S32(rc, 4);
+            if (cw > 0 && ch > 0) {
+                nint ptTL = rc;
+                nint ptBR = rc + 8;
+                Win32Shell.ClientToScreen(hwnd, ptTL);
+                Win32Shell.ClientToScreen(hwnd, ptBR);
+                int left = Win32Shell.S32(rc, 0);
+                int top = Win32Shell.S32(rc, 4);
+                int right = Win32Shell.S32(rc, 8);
+                int bottom = Win32Shell.S32(rc, 12);
+                if (right > left && bottom > top) {
+                    Win32Shell.ClipCursor(rc);
+                    Win32Shell.pointerLockActive = true;
+                    if (recenter) {
+                        Win32Shell.SetCursorPos((left + right) / 2, (top + bottom) / 2);
+                    }
+                    Win32Shell.ApplyCursorNow();
+                }
+            }
+        }
+        NativeMemory.Free(rc);
+    }
+    static void ReleasePointerLockClip() {
+        if (Win32Shell.pointerLockActive) {
+            Win32Shell.ClipCursor(0);
+            Win32Shell.pointerLockActive = false;
+        }
+        Win32Shell.appliedCursorKind = -1;
+        Win32Shell.ApplyCursorNow();
+    }
+    static void SetPointerLock(nint hwnd, bool locked) {
+        Win32Shell.Init();
+        if (hwnd == 0) { hwnd = Win32Shell.mainHwnd; }
+        if (locked) {
+            if (hwnd == 0) { return; }
+            Win32Shell.EnsureRawMouseInput();
+            Win32Shell.pointerLockHwnd = hwnd;
+            Win32Shell.ResetMouseDelta();
+            if (Win32Shell.Focused(hwnd)) {
+                Win32Shell.ApplyPointerLockClip(hwnd, true);
+            }
+        } else {
+            if (hwnd == 0 || Win32Shell.pointerLockHwnd == hwnd) {
+                Win32Shell.pointerLockHwnd = 0;
+                Win32Shell.ReleasePointerLockClip();
+                Win32Shell.ResetMouseDelta();
+            }
+        }
+    }
+    static bool IsPointerLock(nint hwnd) {
+        Win32Shell.Init();
+        if (hwnd == 0) { hwnd = Win32Shell.mainHwnd; }
+        return hwnd != 0 && Win32Shell.pointerLockHwnd == hwnd;
+    }
+    static void HandleRawInput(nint hRawInput) {
+        if (hRawInput == 0 || Win32Shell.rawInputBuf == 0 || Win32Shell.rawInputSize == 0) { return; }
+        new Span<int>(Win32Shell.rawInputSize, 1)[0] = 64;
+        // RID_INPUT = 0x10000003, sizeof(RAWINPUTHEADER) = 24 on x64
+        int bytes = Win32Shell.GetRawInputData(hRawInput, 0x10000003,
+            Win32Shell.rawInputBuf, Win32Shell.rawInputSize, 24);
+        if (bytes < 44) { return; }
+        int dwType = Win32Shell.S32(Win32Shell.rawInputBuf, 0);
+        if (dwType != 0) { return; } // RIM_TYPEMOUSE == 0
+        int usFlags = Win32Shell.S32(Win32Shell.rawInputBuf, 24) & 65535;
+        if ((usFlags & 1) != 0) { return; } // MOUSE_MOVE_ABSOLUTE: skip tablet/RDP absolute events
+        int dx = Win32Shell.S32(Win32Shell.rawInputBuf, 36);
+        int dy = Win32Shell.S32(Win32Shell.rawInputBuf, 40);
+        Win32Shell.mouseDeltaAccX = Win32Shell.mouseDeltaAccX + (double)dx;
+        Win32Shell.mouseDeltaAccY = Win32Shell.mouseDeltaAccY + (double)dy;
+    }
+    static void ConsumeMouseDelta(nint hwnd) {
+        Win32Shell.Init();
+        Win32Shell.EnsureRawMouseInput();
+        Win32Shell.mouseDeltaLastX = Win32Shell.mouseDeltaAccX;
+        Win32Shell.mouseDeltaLastY = Win32Shell.mouseDeltaAccY;
+        Win32Shell.mouseDeltaAccX = 0.0;
+        Win32Shell.mouseDeltaAccY = 0.0;
+    }
+    static double MouseDeltaX() { return Win32Shell.mouseDeltaLastX; }
+    static double MouseDeltaY() { return Win32Shell.mouseDeltaLastY; }
     static List<long> noLayerHosts;
     static bool IsLayerHost(nint hwnd) {
         if (hwnd == 0 || Win32Shell.noLayerHosts == null) { return false; }

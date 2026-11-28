@@ -24,9 +24,10 @@
 #ifndef ZGL_DEPTH_COMPONENT24
 #define ZGL_DEPTH_COMPONENT24 0x81A6
 #endif
-/* 实例记录：mvp 16 个 float（列主序）+ tint rgba 4 个 float（线性 0..1）。 */
+/* 实例记录：mvp/model 16 个 float（列主序）+ tint rgba 4 个 float（线性 0..1）。 */
 #define ZAN_GAME_INSTANCE_FLOATS 20
-#define ZAN_GAME_INSTANCE_CAP 1024
+#define ZAN_GAME_INSTANCE_CAP 4096
+#define ZAN_GAME_TEX_CACHE_CAP 8
 
 typedef struct {
     char key[ZAN_GAME_KEY_CAP];
@@ -131,17 +132,16 @@ typedef struct {
 
 typedef struct {
     zgl_uint renderbuffer;
+    zgl_uint attached_fbo;
     int width, height;
 } zan_game_depth;
 
-/* 着色器程序按 [colored][instanced] 惰性建，属性位置全部显式 layout，
- * 同一网格 VAO 可跨程序复用。u_mvp/u_color 仅非实例化程序使用。
- * 光照 uniform 全局共享（g_game_light_*），按版本号惰性上传：程序内
- * uniform 状态跨调用保持，只有 set_lights3d 递增版本后才重传，批量
- * 通路中途换光照也能在下一次提交时生效。 */
+/* 着色器程序按 [colored][mode] 惰性建（mode: 0=单次真光照, 1=历史MVP批量,
+ * 2=真光照Model批量），属性位置全部显式 layout，同一网格 VAO 可跨程序复用。
+ * 光照/材质/阴影/特效 uniform 分组按版本号惰性上传，值未变零 GL 调用。 */
 typedef struct {
     zgl_uint program;
-    zgl_int u_mvp, u_model, u_light_vp, u_tex, u_shadow_map, u_shadow_on, u_color;
+    zgl_int u_mvp, u_vp, u_model, u_light_vp, u_tex, u_shadow_map, u_shadow_on, u_color;
     zgl_int u_normal_map, u_normal_on, u_normal_scale;
     zgl_int u_orm_map, u_orm_on, u_ao_strength, u_alpha_cutoff;
     zgl_int u_emissive_map, u_emissive_on, u_uv_transform, u_rim_light, u_toon;
@@ -175,6 +175,11 @@ typedef struct {
     zgl_int u_fog_color, u_fog_params;
     zgl_int u_bones;
     uint32_t light_version;
+    uint32_t mat_version;
+    uint32_t shadow_version;
+    uint32_t vfx_version;
+    int last_use_shadow;
+    int tex_units_bound;
 } zan_game_program;
 
 typedef struct {
@@ -313,22 +318,49 @@ static float g_game_post_daltonize[2] = { 0.0f, 0.0f }; /* mode (0..3), strength
 static float g_game_post_lens_distort[2] = { 0.0f, 1.0f }; /* k1 (-0.6..0.6), zoom (0.5..1.5) */
 static float g_game_post_god_rays[4] = { 0.0f, 0.92f, 0.5f, 0.5f }; /* strength, decay, light_x, light_y */
 static uint32_t g_game_light_version = 1;
+static uint32_t g_game_mat_version = 1;
+static uint32_t g_game_shadow_version = 1;
+static uint32_t g_game_vfx_version = 1;
+
+typedef struct {
+    char key[256];
+    const zan_bitmap *bitmap;
+    uint64_t serial;
+    zgl_uint tex;
+    uint32_t gen;
+} zan_game_tex_cache_entry;
+
+static zan_game_tex_cache_entry g_game_tex_cache[ZAN_GAME_TEX_CACHE_CAP];
+static uint32_t g_game_tex_cache_gen = 1;
+static int g_game_tex_cache_next = 0;
+static zgl_uint g_game_white_tex = 0;
 
 static zan_game_mesh *g_game_meshes = NULL;
 static int g_game_mesh_cap = 0;
 static zan_game_depth g_game_depth[ZAN_GAME_SURFACE_CAP];
 static const zan_gl_api *g_game_gl;
 static uint64_t g_game_epoch;
-static zan_game_program g_game_progs[2][2];
+static zan_game_program g_game_progs[2][3];
 static zan_game_program g_game_skin_prog;
 static zan_game_shadow_program g_game_shadow_prog;
+static zan_game_shadow_program g_game_shadow_inst_prog;
 static zan_game_shadow_program g_game_shadow_skin_prog;
 static zgl_uint g_game_instance_vbo;
 static int32_t g_game_batch_surface = -1;
+static int g_game_batch_owns_gpu = 0;
 static zan_gpu_frame g_game_batch_frame;
 static int g_game_batch_clip_empty;
 static zgl_uint g_game_batch_prog = 0;
 static zgl_uint g_game_batch_tex = 0;
+static int32_t g_game_frame_surface = -1;
+static zan_gpu_frame g_game_frame_gpu;
+static int g_game_frame_clip_empty = 0;
+static zgl_uint g_game_cur_prog = 0;
+static zgl_uint g_game_cur_tex[5] = { 0, 0, 0, 0, 0 };
+static int g_game_cur_blend = -1;
+static int g_game_cur_depth_write = -1;
+static int g_game_cur_cull = -1;
+static zgl_uint g_game_shadow_cur_prog = 0;
 static int g_game_cleanup_registered;
 static uint32_t g_game_next_mesh_id = 1;
 
@@ -382,6 +414,17 @@ static const char *zan_game_glsl_head(void) {
  * 都按此约定），clip 直接输出即可。曾在这里对 clip.y 取反，整幅 3D
  * 世界上下颠倒而 HUD 正常（macOS 上 fps-3d 可见）。 */
 
+#define ZAN_GAME_3D_WORLD_NORMAL(M) \
+"    mat3 _m3 = mat3(" M ");\n" \
+"    mat3 _cof = mat3(\n" \
+"        cross(_m3[1], _m3[2]),\n" \
+"        cross(_m3[2], _m3[0]),\n" \
+"        cross(_m3[0], _m3[1])\n" \
+"    );\n" \
+"    float _det = dot(_m3[0], _cof[0]);\n" \
+"    vec3 _wn = (abs(_det) > 1e-8) ? (_cof * a_normal) * (_det < 0.0 ? -1.0 : 1.0) : (_m3 * a_normal);\n" \
+"    v_normal = normalize(_wn);\n"
+
 static const char *const ZAN_GAME_3D_VS_PLAIN =
 "layout(location = 0) in vec3 a_pos;\n"
 "layout(location = 1) in vec3 a_normal;\n"
@@ -405,7 +448,7 @@ static const char *const ZAN_GAME_3D_VS_PLAIN =
 "    }\n"
 "    vec4 wp = uModel * vec4(lp, 1.0);\n"
 "    v_uv = a_uv * uUvTransform.xy + uUvTransform.zw;\n"
-"    v_normal = normalize(mat3(uModel) * a_normal);\n"
+ZAN_GAME_3D_WORLD_NORMAL("uModel")
 "    v_world_pos = wp.xyz;\n"
 "    v_light_pos = uLightVP * wp;\n"
 "    vec4 clip = uMVP * vec4(lp, 1.0);\n"
@@ -437,7 +480,7 @@ static const char *const ZAN_GAME_3D_VS_COLOR =
 "    }\n"
 "    vec4 wp = uModel * vec4(lp, 1.0);\n"
 "    v_uv = a_uv * uUvTransform.xy + uUvTransform.zw;\n"
-"    v_normal = normalize(mat3(uModel) * a_normal);\n"
+ZAN_GAME_3D_WORLD_NORMAL("uModel")
 "    v_world_pos = wp.xyz;\n"
 "    v_color = a_color;\n"
 "    v_light_pos = uLightVP * wp;\n"
@@ -501,6 +544,22 @@ static const char *const ZAN_GAME_3D_VS_SHADOW =
 "    gl_Position = uLightVP * (uModel * vec4(lp, 1.0));\n"
 "}\n";
 
+static const char *const ZAN_GAME_3D_VS_SHADOW_INST =
+"layout(location = 0) in vec3 a_pos;\n"
+"layout(location = 4) in mat4 i_model;\n"
+"uniform mat4 uLightVP;\n"
+"uniform vec4 uWindParams;\n"
+"void main() {\n"
+"    vec3 lp = a_pos;\n"
+"    if (uWindParams.x > 0.0001) {\n"
+"        float wh = max(lp.y, 0.0) * uWindParams.w;\n"
+"        float ww = sin(uWindParams.z + lp.x * uWindParams.y + lp.z * uWindParams.y * 0.7) * uWindParams.x * wh;\n"
+"        lp.x += ww;\n"
+"        lp.z += ww * 0.35;\n"
+"    }\n"
+"    gl_Position = uLightVP * (i_model * vec4(lp, 1.0));\n"
+"}\n";
+
 static const char *const ZAN_GAME_3D_VS_SHADOW_SKINNED =
 "layout(location = 0) in vec3 a_pos;\n"
 "layout(location = 9) in vec4 a_joints;\n"
@@ -557,6 +616,73 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
 "    v_tint = i_tint;\n"
 "    vec4 clip = i_mvp * vec4(a_pos, 1.0);\n"
 "    gl_Position = clip;\n"
+"}\n";
+
+static const char *const ZAN_GAME_3D_VS_INST_LIT =
+"layout(location = 0) in vec3 a_pos;\n"
+"layout(location = 1) in vec3 a_normal;\n"
+"layout(location = 2) in vec2 a_uv;\n"
+"layout(location = 4) in mat4 i_model;\n"
+"layout(location = 8) in vec4 i_tint;\n"
+"uniform mat4 uVP;\n"
+"uniform mat4 uLightVP;\n"
+"uniform vec4 uUvTransform;\n"
+"uniform vec4 uWindParams;\n"
+"out vec2 v_uv;\n"
+"out vec3 v_normal;\n"
+"out vec3 v_world_pos;\n"
+"out vec4 v_light_pos;\n"
+"out vec4 v_tint;\n"
+"void main() {\n"
+"    vec3 lp = a_pos;\n"
+"    if (uWindParams.x > 0.0001) {\n"
+"        float wh = max(lp.y, 0.0) * uWindParams.w;\n"
+"        float ww = sin(uWindParams.z + lp.x * uWindParams.y + lp.z * uWindParams.y * 0.7) * uWindParams.x * wh;\n"
+"        lp.x += ww;\n"
+"        lp.z += ww * 0.35;\n"
+"    }\n"
+"    vec4 wp = i_model * vec4(lp, 1.0);\n"
+"    v_uv = a_uv * uUvTransform.xy + uUvTransform.zw;\n"
+ZAN_GAME_3D_WORLD_NORMAL("i_model")
+"    v_world_pos = wp.xyz;\n"
+"    v_light_pos = uLightVP * wp;\n"
+"    v_tint = i_tint;\n"
+"    gl_Position = uVP * wp;\n"
+"}\n";
+
+static const char *const ZAN_GAME_3D_VS_INST_LIT_COLOR =
+"layout(location = 0) in vec3 a_pos;\n"
+"layout(location = 1) in vec3 a_normal;\n"
+"layout(location = 2) in vec2 a_uv;\n"
+"layout(location = 3) in vec4 a_color;\n"
+"layout(location = 4) in mat4 i_model;\n"
+"layout(location = 8) in vec4 i_tint;\n"
+"uniform mat4 uVP;\n"
+"uniform mat4 uLightVP;\n"
+"uniform vec4 uUvTransform;\n"
+"uniform vec4 uWindParams;\n"
+"out vec2 v_uv;\n"
+"out vec3 v_normal;\n"
+"out vec3 v_world_pos;\n"
+"out vec4 v_color;\n"
+"out vec4 v_light_pos;\n"
+"out vec4 v_tint;\n"
+"void main() {\n"
+"    vec3 lp = a_pos;\n"
+"    if (uWindParams.x > 0.0001) {\n"
+"        float wh = max(lp.y, 0.0) * uWindParams.w;\n"
+"        float ww = sin(uWindParams.z + lp.x * uWindParams.y + lp.z * uWindParams.y * 0.7) * uWindParams.x * wh;\n"
+"        lp.x += ww;\n"
+"        lp.z += ww * 0.35;\n"
+"    }\n"
+"    vec4 wp = i_model * vec4(lp, 1.0);\n"
+"    v_uv = a_uv * uUvTransform.xy + uUvTransform.zw;\n"
+ZAN_GAME_3D_WORLD_NORMAL("i_model")
+"    v_world_pos = wp.xyz;\n"
+"    v_color = a_color;\n"
+"    v_light_pos = uLightVP * wp;\n"
+"    v_tint = i_tint;\n"
+"    gl_Position = uVP * wp;\n"
 "}\n";
 
 /* 光照 uniform（A489）：四份片元着色器共享同一段光照计算——环境光 +
@@ -1104,6 +1230,37 @@ ZAN_GAME_3D_LIGHT_BODY
 "    frag = vec4(rgb, tex.a * v_tint.a * v_color.a);\n"
 "}\n";
 
+static const char *const ZAN_GAME_3D_FS_INST_LIT =
+ZAN_GAME_3D_LIGHT_UNIFORMS
+ZAN_GAME_3D_SHADOW_UNIFORMS
+"uniform sampler2D uTex;\n"
+"in vec2 v_uv;\n"
+"in vec3 v_normal;\n"
+"in vec4 v_tint;\n"
+"out vec4 frag;\n"
+"void main() {\n"
+ZAN_GAME_3D_SHADOW_FACTOR
+ZAN_GAME_3D_LIGHT_SHADOW_BODY
+ZAN_GAME_3D_SAMPLE_ALBEDO
+ZAN_GAME_3D_FINAL_COMPOSE("tex.rgb * v_tint.rgb", "tex.a * v_tint.a")
+"}\n";
+
+static const char *const ZAN_GAME_3D_FS_INST_LIT_COLOR =
+ZAN_GAME_3D_LIGHT_UNIFORMS
+ZAN_GAME_3D_SHADOW_UNIFORMS
+"uniform sampler2D uTex;\n"
+"in vec2 v_uv;\n"
+"in vec3 v_normal;\n"
+"in vec4 v_color;\n"
+"in vec4 v_tint;\n"
+"out vec4 frag;\n"
+"void main() {\n"
+ZAN_GAME_3D_SHADOW_FACTOR
+ZAN_GAME_3D_LIGHT_SHADOW_BODY
+ZAN_GAME_3D_SAMPLE_ALBEDO
+ZAN_GAME_3D_FINAL_COMPOSE("tex.rgb * v_tint.rgb * v_color.rgb", "tex.a * v_tint.a * v_color.a")
+"}\n";
+
 static const char *const ZAN_GAME_POST_VS =
 "out vec2 v_uv;\n"
 "void main() {\n"
@@ -1647,16 +1804,29 @@ static void zan_game_drop_shadow(void) {
     g_game_shadow_surface = -1;
 }
 
+static void zan_game_invalidate_state_cache(void) {
+    g_game_cur_prog = 0;
+    for (int i = 0; i < 5; ++i) g_game_cur_tex[i] = 0;
+    g_game_cur_blend = -1;
+    g_game_cur_depth_write = -1;
+    g_game_cur_cull = -1;
+    g_game_batch_prog = 0;
+    g_game_batch_tex = 0;
+    g_game_shadow_cur_prog = 0;
+}
+
 static void zan_game_forget_gpu(void) {
     if (g_game_gl) {
         for (int r = 0; r < 2; ++r)
-            for (int c = 0; c < 2; ++c)
+            for (int c = 0; c < 3; ++c)
                 if (g_game_progs[r][c].program)
                     g_game_gl->DeleteProgram(g_game_progs[r][c].program);
         if (g_game_skin_prog.program)
             g_game_gl->DeleteProgram(g_game_skin_prog.program);
         if (g_game_shadow_prog.program)
             g_game_gl->DeleteProgram(g_game_shadow_prog.program);
+        if (g_game_shadow_inst_prog.program)
+            g_game_gl->DeleteProgram(g_game_shadow_inst_prog.program);
         if (g_game_shadow_skin_prog.program)
             g_game_gl->DeleteProgram(g_game_shadow_skin_prog.program);
         if (g_game_instance_vbo)
@@ -1671,14 +1841,23 @@ static void zan_game_forget_gpu(void) {
     memset(g_game_progs, 0, sizeof(g_game_progs));
     memset(&g_game_skin_prog, 0, sizeof(g_game_skin_prog));
     memset(&g_game_shadow_prog, 0, sizeof(g_game_shadow_prog));
+    memset(&g_game_shadow_inst_prog, 0, sizeof(g_game_shadow_inst_prog));
     memset(&g_game_shadow_skin_prog, 0, sizeof(g_game_shadow_skin_prog));
+    memset(g_game_tex_cache, 0, sizeof(g_game_tex_cache));
+    g_game_tex_cache_gen++;
+    g_game_tex_cache_next = 0;
+    g_game_white_tex = 0;
     g_game_instance_vbo = 0;
     g_game_batch_surface = -1;
+    g_game_batch_owns_gpu = 0;
+    g_game_frame_surface = -1;
+    g_game_frame_clip_empty = 0;
     g_game_shadow_surface = -1;
     g_game_shadow_ready = 0;
     g_game_preserve_depth = 0;
     g_game_epoch = 0;
     g_game_gl = NULL;
+    zan_game_invalidate_state_cache();
 }
 
 static void zan_game_gpu_cleanup(int32_t surface_id) {
@@ -1699,7 +1878,7 @@ static void zan_game_gpu_cleanup(int32_t surface_id) {
     zan_game_forget_gpu();
 }
 
-static int zan_game_gpu_prepare(const zan_gpu_frame *frame) {
+static int zan_game_gpu_prepare_fast(const zan_gpu_frame *frame) {
     if (!frame->api || !frame->framebuffer || frame->width <= 0 ||
         frame->height <= 0) return 0;
     if (g_game_gl && g_game_epoch != frame->epoch) {
@@ -1711,23 +1890,34 @@ static int zan_game_gpu_prepare(const zan_gpu_frame *frame) {
         if (!zan_gui_gpu_register_cleanup(zan_game_gpu_cleanup)) return 0;
         g_game_cleanup_registered = 1;
     }
+    return 1;
+}
+
+static int zan_game_gpu_prepare(const zan_gpu_frame *frame) {
+    if (!zan_game_gpu_prepare_fast(frame)) return 0;
     for (int i = 0; i < ZAN_GAME_GL_ERROR_LIMIT; ++i)
         if (g_game_gl->GetError() == ZGL_NO_ERROR) return 1;
     return 0;
 }
 
-/* 惰性取用着色器程序变体。属性位置为显式 layout 常量，创建时校验链接器
- * 确实落在这些位置（VAO 配置按常量位置写死，错位即整体失败，不带病运行）。 */
-static zan_game_program *zan_game_program_get(int colored, int instanced) {
+/* 惰性取用着色器程序变体：mode 0=单次真光照, 1=历史MVP批量, 2=真光照Model批量。
+ * 属性位置为显式 layout 常量，创建时校验链接器确实落在这些位置。 */
+static zan_game_program *zan_game_program_get(int colored, int mode) {
+    if (mode < 0 || mode > 2) return NULL;
     zan_game_program *prog =
-        &g_game_progs[colored ? 1 : 0][instanced ? 1 : 0];
+        &g_game_progs[colored ? 1 : 0][mode];
     if (prog->program) return prog;
-    const char *vs = instanced
-        ? (colored ? ZAN_GAME_3D_VS_INST_COLOR : ZAN_GAME_3D_VS_INST)
-        : (colored ? ZAN_GAME_3D_VS_COLOR : ZAN_GAME_3D_VS_PLAIN);
-    const char *fs = instanced
-        ? (colored ? ZAN_GAME_3D_FS_INST_COLOR : ZAN_GAME_3D_FS_INST)
-        : (colored ? ZAN_GAME_3D_FS_COLOR : ZAN_GAME_3D_FS_PLAIN);
+    int full_lit = (mode != 1);
+    const char *vs = (mode == 2)
+        ? (colored ? ZAN_GAME_3D_VS_INST_LIT_COLOR : ZAN_GAME_3D_VS_INST_LIT)
+        : ((mode == 1)
+            ? (colored ? ZAN_GAME_3D_VS_INST_COLOR : ZAN_GAME_3D_VS_INST)
+            : (colored ? ZAN_GAME_3D_VS_COLOR : ZAN_GAME_3D_VS_PLAIN));
+    const char *fs = (mode == 2)
+        ? (colored ? ZAN_GAME_3D_FS_INST_LIT_COLOR : ZAN_GAME_3D_FS_INST_LIT)
+        : ((mode == 1)
+            ? (colored ? ZAN_GAME_3D_FS_INST_COLOR : ZAN_GAME_3D_FS_INST)
+            : (colored ? ZAN_GAME_3D_FS_COLOR : ZAN_GAME_3D_FS_PLAIN));
     char vs_src[4096];
     char fs_src[32768];
     const char *head = zan_game_glsl_head();
@@ -1739,160 +1929,163 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
     zgl_int pos = g_game_gl->GetAttribLocation(program, "a_pos");
     zgl_int normal = g_game_gl->GetAttribLocation(program, "a_normal");
     zgl_int uv = g_game_gl->GetAttribLocation(program, "a_uv");
-    zgl_int mvp = instanced ? 0
-        : g_game_gl->GetUniformLocation(program, "uMVP");
-    zgl_int model = instanced ? -1
-        : g_game_gl->GetUniformLocation(program, "uModel");
-    zgl_int light_vp = instanced ? -1
+    zgl_int mvp = (mode == 0)
+        ? g_game_gl->GetUniformLocation(program, "uMVP") : -1;
+    zgl_int vp = (mode == 2)
+        ? g_game_gl->GetUniformLocation(program, "uVP") : -1;
+    zgl_int model = (mode == 0)
+        ? g_game_gl->GetUniformLocation(program, "uModel") : -1;
+    zgl_int light_vp = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uLightVP");
-    zgl_int shadow_map = instanced ? -1
+    zgl_int shadow_map = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uShadowMap");
-    zgl_int shadow_on = instanced ? -1
+    zgl_int shadow_on = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uShadowOn");
-    zgl_int normal_map = instanced ? -1
+    zgl_int normal_map = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uNormalMap");
-    zgl_int normal_on = instanced ? -1
+    zgl_int normal_on = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uNormalOn");
-    zgl_int normal_scale = instanced ? -1
+    zgl_int normal_scale = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uNormalScale");
-    zgl_int orm_map = instanced ? -1
+    zgl_int orm_map = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uOrmMap");
-    zgl_int orm_on = instanced ? -1
+    zgl_int orm_on = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uOrmOn");
-    zgl_int ao_strength = instanced ? -1
+    zgl_int ao_strength = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uAoStrength");
-    zgl_int alpha_cutoff = instanced ? -1
+    zgl_int alpha_cutoff = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uAlphaCutoff");
-    zgl_int emissive_map = instanced ? -1
+    zgl_int emissive_map = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uEmissiveMap");
-    zgl_int emissive_on = instanced ? -1
+    zgl_int emissive_on = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uEmissiveOn");
-    zgl_int uv_transform = instanced ? -1
+    zgl_int uv_transform = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uUvTransform");
-    zgl_int rim_light = instanced ? -1
+    zgl_int rim_light = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uRimLight");
-    zgl_int toon = instanced ? -1
+    zgl_int toon = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uToon");
-    zgl_int dissolve = instanced ? -1
+    zgl_int dissolve = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uDissolve");
-    zgl_int dissolve_edge = instanced ? -1
+    zgl_int dissolve_edge = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uDissolveEdge");
-    zgl_int clip_plane = instanced ? -1
+    zgl_int clip_plane = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uClipPlane");
-    zgl_int clip_on = instanced ? -1
+    zgl_int clip_on = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uClipOn");
-    zgl_int triplanar = instanced ? -1
+    zgl_int triplanar = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uTriplanar");
-    zgl_int height_fog_params = instanced ? -1
+    zgl_int height_fog_params = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uHeightFogParams");
-    zgl_int height_fog_color = instanced ? -1
+    zgl_int height_fog_color = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uHeightFogColor");
-    zgl_int hit_flash = instanced ? -1
+    zgl_int hit_flash = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uHitFlash");
-    zgl_int holo_scan_params = instanced ? -1
+    zgl_int holo_scan_params = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uHoloScanParams");
-    zgl_int holo_scan_color = instanced ? -1
+    zgl_int holo_scan_color = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uHoloScanColor");
-    zgl_int top_cover_params = instanced ? -1
+    zgl_int top_cover_params = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uTopCoverParams");
-    zgl_int top_cover_color = instanced ? -1
+    zgl_int top_cover_color = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uTopCoverColor");
-    zgl_int wind_params = instanced ? -1
+    zgl_int wind_params = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uWindParams");
-    zgl_int dist_fade = instanced ? -1
+    zgl_int dist_fade = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uDistFade");
-    zgl_int world_grid_params = instanced ? -1
+    zgl_int world_grid_params = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uWorldGridParams");
-    zgl_int world_grid_color = instanced ? -1
+    zgl_int world_grid_color = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uWorldGridColor");
-    zgl_int caustics_params = instanced ? -1
+    zgl_int caustics_params = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uCausticsParams");
-    zgl_int caustics_color = instanced ? -1
+    zgl_int caustics_color = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uCausticsColor");
-    zgl_int ice_frost_params = instanced ? -1
+    zgl_int ice_frost_params = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uIceFrostParams");
-    zgl_int ice_frost_color = instanced ? -1
+    zgl_int ice_frost_color = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uIceFrostColor");
-    zgl_int lava_crust_params = instanced ? -1
+    zgl_int lava_crust_params = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uLavaCrustParams");
-    zgl_int lava_crust_color = instanced ? -1
+    zgl_int lava_crust_color = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uLavaCrustColor");
-    zgl_int iridescence_params = instanced ? -1
+    zgl_int iridescence_params = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uIridescenceParams");
-    zgl_int sonar_origin_radius = instanced ? -1
+    zgl_int sonar_origin_radius = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uSonarOriginRadius");
-    zgl_int sonar_style = instanced ? -1
+    zgl_int sonar_style = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uSonarStyle");
-    zgl_int sonar_color = instanced ? -1
+    zgl_int sonar_color = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uSonarColor");
-    zgl_int force_field_params = instanced ? -1
+    zgl_int force_field_params = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uForceFieldParams");
-    zgl_int force_field_color = instanced ? -1
+    zgl_int force_field_color = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uForceFieldColor");
-    zgl_int rain_ripples_params = instanced ? -1
+    zgl_int rain_ripples_params = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uRainRipplesParams");
-    zgl_int rain_ripples_color = instanced ? -1
+    zgl_int rain_ripples_color = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uRainRipplesColor");
-    zgl_int xray_params = instanced ? -1
+    zgl_int xray_params = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uXrayParams");
-    zgl_int xray_color = instanced ? -1
+    zgl_int xray_color = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uXrayColor");
-    zgl_int portal_vortex_params = instanced ? -1
+    zgl_int portal_vortex_params = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uPortalVortexParams");
-    zgl_int portal_vortex_color = instanced ? -1
+    zgl_int portal_vortex_color = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uPortalVortexColor");
-    zgl_int blueprint_wire_params = instanced ? -1
+    zgl_int blueprint_wire_params = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uBlueprintWireParams");
-    zgl_int blueprint_wire_color = instanced ? -1
+    zgl_int blueprint_wire_color = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uBlueprintWireColor");
-    zgl_int heat_haze_params = instanced ? -1
+    zgl_int heat_haze_params = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uHeatHazeParams");
-    zgl_int heat_haze_color = instanced ? -1
+    zgl_int heat_haze_color = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uHeatHazeColor");
-    zgl_int pixel_dither_params = instanced ? -1
+    zgl_int pixel_dither_params = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uPixelDitherParams");
-    zgl_int crosshatch_params = instanced ? -1
+    zgl_int crosshatch_params = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uCrosshatchParams");
-    zgl_int crosshatch_color = instanced ? -1
+    zgl_int crosshatch_color = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uCrosshatchColor");
-    zgl_int aniso_brushed_params = instanced ? -1
+    zgl_int aniso_brushed_params = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uAnisoBrushedParams");
-    zgl_int aniso_brushed_color = instanced ? -1
+    zgl_int aniso_brushed_color = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uAnisoBrushedColor");
-    zgl_int velvet_sheen_params = instanced ? -1
+    zgl_int velvet_sheen_params = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uVelvetSheenParams");
-    zgl_int velvet_sheen_color = instanced ? -1
+    zgl_int velvet_sheen_color = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uVelvetSheenColor");
-    zgl_int subsurface_params = instanced ? -1
+    zgl_int subsurface_params = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uSubsurfaceParams");
-    zgl_int subsurface_color = instanced ? -1
+    zgl_int subsurface_color = !full_lit ? -1
         : g_game_gl->GetUniformLocation(program, "uSubsurfaceColor");
-    zgl_int color = instanced ? 0
-        : g_game_gl->GetUniformLocation(program, "uColor");
+    zgl_int color = (mode == 0)
+        ? g_game_gl->GetUniformLocation(program, "uColor") : -1;
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
     zgl_int light_color =
         g_game_gl->GetUniformLocation(program, "uLightColor[0]");
     zgl_int light_count = g_game_gl->GetUniformLocation(program, "uLightCount");
     zgl_int ambient = g_game_gl->GetUniformLocation(program, "uAmbient");
-    zgl_int cam_pos = instanced ? -1 : g_game_gl->GetUniformLocation(program, "uCamPos");
-    zgl_int cam_valid = instanced ? -1 : g_game_gl->GetUniformLocation(program, "uCamValid");
-    zgl_int material = instanced ? -1 : g_game_gl->GetUniformLocation(program, "uMaterial");
-    zgl_int emissive = instanced ? -1 : g_game_gl->GetUniformLocation(program, "uEmissive");
-    zgl_int point_pos = instanced ? -1 : g_game_gl->GetUniformLocation(program, "uPointPos[0]");
-    zgl_int point_color = instanced ? -1 : g_game_gl->GetUniformLocation(program, "uPointColor[0]");
-    zgl_int point_count = instanced ? -1 : g_game_gl->GetUniformLocation(program, "uPointCount");
-    zgl_int spot_pos = instanced ? -1 : g_game_gl->GetUniformLocation(program, "uSpotPos[0]");
-    zgl_int spot_dir = instanced ? -1 : g_game_gl->GetUniformLocation(program, "uSpotDir[0]");
-    zgl_int spot_color = instanced ? -1 : g_game_gl->GetUniformLocation(program, "uSpotColor[0]");
-    zgl_int spot_count = instanced ? -1 : g_game_gl->GetUniformLocation(program, "uSpotCount");
-    zgl_int hemi_sky = instanced ? -1 : g_game_gl->GetUniformLocation(program, "uHemiSky");
-    zgl_int hemi_ground = instanced ? -1 : g_game_gl->GetUniformLocation(program, "uHemiGround");
-    zgl_int hemi_on = instanced ? -1 : g_game_gl->GetUniformLocation(program, "uHemiOn");
-    zgl_int fog_color = instanced ? -1 : g_game_gl->GetUniformLocation(program, "uFogColor");
-    zgl_int fog_params = instanced ? -1 : g_game_gl->GetUniformLocation(program, "uFogParams");
+    zgl_int cam_pos = !full_lit ? -1 : g_game_gl->GetUniformLocation(program, "uCamPos");
+    zgl_int cam_valid = !full_lit ? -1 : g_game_gl->GetUniformLocation(program, "uCamValid");
+    zgl_int material = !full_lit ? -1 : g_game_gl->GetUniformLocation(program, "uMaterial");
+    zgl_int emissive = !full_lit ? -1 : g_game_gl->GetUniformLocation(program, "uEmissive");
+    zgl_int point_pos = !full_lit ? -1 : g_game_gl->GetUniformLocation(program, "uPointPos[0]");
+    zgl_int point_color = !full_lit ? -1 : g_game_gl->GetUniformLocation(program, "uPointColor[0]");
+    zgl_int point_count = !full_lit ? -1 : g_game_gl->GetUniformLocation(program, "uPointCount");
+    zgl_int spot_pos = !full_lit ? -1 : g_game_gl->GetUniformLocation(program, "uSpotPos[0]");
+    zgl_int spot_dir = !full_lit ? -1 : g_game_gl->GetUniformLocation(program, "uSpotDir[0]");
+    zgl_int spot_color = !full_lit ? -1 : g_game_gl->GetUniformLocation(program, "uSpotColor[0]");
+    zgl_int spot_count = !full_lit ? -1 : g_game_gl->GetUniformLocation(program, "uSpotCount");
+    zgl_int hemi_sky = !full_lit ? -1 : g_game_gl->GetUniformLocation(program, "uHemiSky");
+    zgl_int hemi_ground = !full_lit ? -1 : g_game_gl->GetUniformLocation(program, "uHemiGround");
+    zgl_int hemi_on = !full_lit ? -1 : g_game_gl->GetUniformLocation(program, "uHemiOn");
+    zgl_int fog_color = !full_lit ? -1 : g_game_gl->GetUniformLocation(program, "uFogColor");
+    zgl_int fog_params = !full_lit ? -1 : g_game_gl->GetUniformLocation(program, "uFogParams");
     int ok = tex >= 0 && pos == ZAN_GAME_LOC_POS &&
         normal == ZAN_GAME_LOC_NORMAL && uv == ZAN_GAME_LOC_UV &&
-        mvp >= 0 && color >= 0 &&
+        (mode != 0 || (mvp >= 0 && color >= 0)) &&
+        (mode != 2 || vp >= 0) &&
         light_dir >= 0 && light_color >= 0 &&
         light_count >= 0 && ambient >= 0 &&
         g_game_gl->GetError() == ZGL_NO_ERROR;
@@ -1900,8 +2093,14 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
         ok = g_game_gl->GetAttribLocation(program, "a_color") ==
             ZAN_GAME_LOC_COLOR;
     }
-    if (ok && instanced) {
+    if (ok && mode == 1) {
         ok = g_game_gl->GetAttribLocation(program, "i_mvp") ==
+                ZAN_GAME_LOC_IMVP &&
+            g_game_gl->GetAttribLocation(program, "i_tint") ==
+                ZAN_GAME_LOC_ITINT;
+    }
+    if (ok && mode == 2) {
+        ok = g_game_gl->GetAttribLocation(program, "i_model") ==
                 ZAN_GAME_LOC_IMVP &&
             g_game_gl->GetAttribLocation(program, "i_tint") ==
                 ZAN_GAME_LOC_ITINT;
@@ -1912,6 +2111,7 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
     }
     prog->program = program;
     prog->u_mvp = mvp;
+    prog->u_vp = vp;
     prog->u_model = model;
     prog->u_light_vp = light_vp;
     prog->u_tex = tex;
@@ -1999,6 +2199,11 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
     prog->u_fog_params = fog_params;
     prog->u_bones = -1;
     prog->light_version = 0;
+    prog->mat_version = 0;
+    prog->shadow_version = 0;
+    prog->vfx_version = 0;
+    prog->last_use_shadow = -1;
+    prog->tex_units_bound = 0;
     return prog;
 }
 
@@ -2200,7 +2405,13 @@ static zan_game_program *zan_game_skin_program_get(void) {
     g_game_skin_prog.u_hemi_on = hemi_on;
     g_game_skin_prog.u_fog_color = fog_color;
     g_game_skin_prog.u_fog_params = fog_params;
+    g_game_skin_prog.u_vp = -1;
     g_game_skin_prog.light_version = 0;
+    g_game_skin_prog.mat_version = 0;
+    g_game_skin_prog.shadow_version = 0;
+    g_game_skin_prog.vfx_version = 0;
+    g_game_skin_prog.last_use_shadow = -1;
+    g_game_skin_prog.tex_units_bound = 0;
     return &g_game_skin_prog;
 }
 
@@ -2228,6 +2439,32 @@ static zan_game_shadow_program *zan_game_shadow_program_get(void) {
     g_game_shadow_prog.u_bones = -1;
     g_game_shadow_prog.u_wind_params = wind_params;
     return &g_game_shadow_prog;
+}
+
+static zan_game_shadow_program *zan_game_shadow_inst_program_get(void) {
+    if (g_game_shadow_inst_prog.program) return &g_game_shadow_inst_prog;
+    char vs_src[1024];
+    char fs_src[512];
+    const char *head = zan_game_glsl_head();
+    snprintf(vs_src, sizeof(vs_src), "%s%s", head, ZAN_GAME_3D_VS_SHADOW_INST);
+    snprintf(fs_src, sizeof(fs_src), "%s%s", head, ZAN_GAME_3D_FS_SHADOW);
+    zgl_uint program = zan_gui_gpu_program(vs_src, fs_src);
+    if (!program) return NULL;
+    zgl_int pos = g_game_gl->GetAttribLocation(program, "a_pos");
+    zgl_int imodel = g_game_gl->GetAttribLocation(program, "i_model");
+    zgl_int light_vp = g_game_gl->GetUniformLocation(program, "uLightVP");
+    zgl_int wind_params = g_game_gl->GetUniformLocation(program, "uWindParams");
+    if (pos != ZAN_GAME_LOC_POS || imodel != ZAN_GAME_LOC_IMVP ||
+        light_vp < 0 || g_game_gl->GetError() != ZGL_NO_ERROR) {
+        g_game_gl->DeleteProgram(program);
+        return NULL;
+    }
+    g_game_shadow_inst_prog.program = program;
+    g_game_shadow_inst_prog.u_light_vp = light_vp;
+    g_game_shadow_inst_prog.u_model = -1;
+    g_game_shadow_inst_prog.u_bones = -1;
+    g_game_shadow_inst_prog.u_wind_params = wind_params;
+    return &g_game_shadow_inst_prog;
 }
 
 static zan_game_shadow_program *zan_game_shadow_skin_program_get(void) {
@@ -2258,8 +2495,67 @@ static zan_game_shadow_program *zan_game_shadow_skin_program_get(void) {
     return &g_game_shadow_skin_prog;
 }
 
-/* 光照 uniform 上传：程序间 uniform 状态互不共享，每个程序按全局版本
- * 号判重；版本只在 set_lights3d 递增，常态绘制零额外调用。 */
+static zgl_uint zan_game_resolve_tex(const char *texture, int fallback_white) {
+    if (!texture || !texture[0]) {
+        if (!fallback_white) return 0;
+        if (!g_game_white_tex) g_game_white_tex = zan_gui_gpu_texture(&g_game_white);
+        return g_game_white_tex;
+    }
+    for (int i = 0; i < ZAN_GAME_TEX_CACHE_CAP; ++i) {
+        zan_game_tex_cache_entry *e = &g_game_tex_cache[i];
+        if (e->gen == g_game_tex_cache_gen && e->tex &&
+            strcmp(e->key, texture) == 0 &&
+            e->bitmap && e->bitmap->serial == e->serial) {
+            return e->tex;
+        }
+    }
+    const zan_bitmap *bitmap = zan_image_get(texture);
+    if (!zan_game_bitmap_valid(bitmap)) {
+        if (!fallback_white) return 0;
+        if (!g_game_white_tex) g_game_white_tex = zan_gui_gpu_texture(&g_game_white);
+        return g_game_white_tex;
+    }
+    zgl_uint tex = zan_gui_gpu_texture(bitmap);
+    if (!tex && fallback_white) {
+        if (!g_game_white_tex) g_game_white_tex = zan_gui_gpu_texture(&g_game_white);
+        return g_game_white_tex;
+    }
+    if (tex && strlen(texture) < sizeof(g_game_tex_cache[0].key)) {
+        zan_game_tex_cache_entry *dst = &g_game_tex_cache[g_game_tex_cache_next];
+        g_game_tex_cache_next = (g_game_tex_cache_next + 1) % ZAN_GAME_TEX_CACHE_CAP;
+        snprintf(dst->key, sizeof(dst->key), "%s", texture);
+        dst->bitmap = bitmap;
+        dst->serial = bitmap->serial;
+        dst->tex = tex;
+        dst->gen = g_game_tex_cache_gen;
+    }
+    return tex;
+}
+
+static void zan_game_bind_tex_unit(const zan_gl_api *gl, int unit, zgl_uint tex) {
+    if (g_game_cur_tex[unit] == tex) return;
+    gl->ActiveTexture((zgl_enum)(ZGL_TEXTURE0 + unit));
+    gl->BindTexture(ZGL_TEXTURE_2D, tex);
+    g_game_cur_tex[unit] = tex;
+}
+
+static void zan_game_use_program(const zan_gl_api *gl, zan_game_program *prog) {
+    if (g_game_cur_prog != prog->program) {
+        gl->UseProgram(prog->program);
+        g_game_cur_prog = prog->program;
+    }
+    if (!prog->tex_units_bound) {
+        if (prog->u_tex >= 0) gl->Uniform1i(prog->u_tex, 0);
+        if (prog->u_shadow_map >= 0) gl->Uniform1i(prog->u_shadow_map, 1);
+        if (prog->u_normal_map >= 0) gl->Uniform1i(prog->u_normal_map, 2);
+        if (prog->u_orm_map >= 0) gl->Uniform1i(prog->u_orm_map, 3);
+        if (prog->u_emissive_map >= 0) gl->Uniform1i(prog->u_emissive_map, 4);
+        prog->tex_units_bound = 1;
+    }
+}
+
+/* 场景光照/相机/雾/裁剪面 uniform 上传：按 g_game_light_version 判重，
+ * 不受单物件材质切换干扰，常态绘制零额外调用。 */
 static void zan_game_upload_lights(zan_game_program *prog) {
     if (prog->light_version == g_game_light_version) return;
     const zan_gl_api *gl = g_game_gl;
@@ -2271,8 +2567,6 @@ static void zan_game_upload_lights(zan_game_program *prog) {
     gl->Uniform3fv(prog->u_ambient, 1, g_game_ambient);
     if (prog->u_cam_pos >= 0) gl->Uniform3fv(prog->u_cam_pos, 1, g_game_cam_pos);
     if (prog->u_cam_valid >= 0) gl->Uniform1i(prog->u_cam_valid, g_game_cam_valid);
-    if (prog->u_material >= 0) gl->Uniform2f(prog->u_material, g_game_material[0], g_game_material[1]);
-    if (prog->u_emissive >= 0) gl->Uniform3fv(prog->u_emissive, 1, g_game_emissive);
     if (prog->u_point_pos >= 0 && gl->Uniform4fv) {
         gl->Uniform4fv(prog->u_point_pos, ZAN_GAME_MAX_LIGHTS, &g_game_point_pos[0][0]);
     }
@@ -2295,6 +2589,22 @@ static void zan_game_upload_lights(zan_game_program *prog) {
     if (prog->u_hemi_on >= 0) gl->Uniform1i(prog->u_hemi_on, g_game_hemi_on);
     if (prog->u_fog_color >= 0) gl->Uniform3fv(prog->u_fog_color, 1, g_game_fog_color);
     if (prog->u_fog_params >= 0) gl->Uniform3fv(prog->u_fog_params, 1, g_game_fog_params);
+    if (prog->u_height_fog_params >= 0) {
+        gl->Uniform4f(prog->u_height_fog_params,
+            g_game_height_fog_params[0], g_game_height_fog_params[1],
+            g_game_height_fog_params[2], g_game_height_fog_params[3]);
+    }
+    if (prog->u_height_fog_color >= 0) {
+        gl->Uniform3fv(prog->u_height_fog_color, 1, g_game_height_fog_color);
+    }
+    if (prog->u_clip_plane >= 0) {
+        gl->Uniform4f(prog->u_clip_plane,
+            g_game_clip_plane[0], g_game_clip_plane[1],
+            g_game_clip_plane[2], g_game_clip_plane[3]);
+    }
+    if (prog->u_clip_on >= 0) {
+        gl->Uniform1i(prog->u_clip_on, g_game_clip_on);
+    }
     prog->light_version = g_game_light_version;
 }
 
@@ -2359,7 +2669,13 @@ ZAN_GAME_API int32_t zan_game_mesh_create_ex(int32_t surface_id,
         if ((uint32_t)indices[i] >= (uint32_t)count) return 0;
 
     zan_gpu_frame frame;
-    if (!zan_gui_gpu_begin(surface_id, &frame)) return 0;
+    int owns_gpu = 0;
+    if (g_game_frame_surface == surface_id) {
+        frame = g_game_frame_gpu;
+    } else {
+        if (!zan_gui_gpu_begin(surface_id, &frame)) return 0;
+        owns_gpu = 1;
+    }
     int32_t result = 0;
     if (!zan_game_gpu_prepare(&frame)) goto done;
     zan_game_mesh *mesh = zan_game_mesh_alloc();
@@ -2426,7 +2742,10 @@ failed:
     gl->BindVertexArray(0);
     zan_game_drop_mesh(mesh);
 done:
-    zan_gui_gpu_end(surface_id);
+    if (owns_gpu) {
+        zan_gui_gpu_end(surface_id);
+        zan_game_invalidate_state_cache();
+    }
     return result;
 }
 
@@ -2449,13 +2768,17 @@ static int zan_game_depth_ready(int32_t surface_id, const zan_gpu_frame *frame) 
         }
         depth->width = frame->width;
         depth->height = frame->height;
+        depth->attached_fbo = 0;
     }
-    gl->FramebufferRenderbuffer(ZGL_FRAMEBUFFER, ZGL_DEPTH_ATTACHMENT,
-                               ZGL_RENDERBUFFER, depth->renderbuffer);
-    if (gl->CheckFramebufferStatus(ZGL_FRAMEBUFFER) != ZGL_FRAMEBUFFER_COMPLETE ||
-        gl->GetError() != ZGL_NO_ERROR) {
-        zan_game_drop_depth(depth);
-        return 0;
+    if (depth->attached_fbo != frame->framebuffer) {
+        gl->FramebufferRenderbuffer(ZGL_FRAMEBUFFER, ZGL_DEPTH_ATTACHMENT,
+                                   ZGL_RENDERBUFFER, depth->renderbuffer);
+        if (gl->CheckFramebufferStatus(ZGL_FRAMEBUFFER) != ZGL_FRAMEBUFFER_COMPLETE ||
+            gl->GetError() != ZGL_NO_ERROR) {
+            zan_game_drop_depth(depth);
+            return 0;
+        }
+        depth->attached_fbo = frame->framebuffer;
     }
     return 1;
 }
@@ -2481,121 +2804,122 @@ static void zan_game_clip(const zan_gpu_frame *frame, int *x, int *y,
 #define ZAN_GAME_GL_FRONT 0x0404
 
 static void zan_game_apply_blend_state(const zan_gl_api *gl) {
-    if (g_game_blend_enabled == 2) {
-        gl->Enable(ZGL_BLEND);
-        if (gl->BlendFuncSeparate) {
-            gl->BlendFuncSeparate(ZGL_SRC_ALPHA, ZGL_ONE,
-                                  ZGL_ONE, ZGL_ONE_MINUS_SRC_ALPHA);
+    if (g_game_cur_blend != g_game_blend_enabled) {
+        if (g_game_blend_enabled == 2) {
+            gl->Enable(ZGL_BLEND);
+            if (gl->BlendFuncSeparate) {
+                gl->BlendFuncSeparate(ZGL_SRC_ALPHA, ZGL_ONE,
+                                      ZGL_ONE, ZGL_ONE_MINUS_SRC_ALPHA);
+            } else {
+                gl->BlendFunc(ZGL_SRC_ALPHA, ZGL_ONE);
+            }
+        } else if (g_game_blend_enabled == 1) {
+            gl->Enable(ZGL_BLEND);
+            if (gl->BlendFuncSeparate) {
+                gl->BlendFuncSeparate(ZGL_SRC_ALPHA, ZGL_ONE_MINUS_SRC_ALPHA,
+                                      ZGL_ONE, ZGL_ONE_MINUS_SRC_ALPHA);
+            } else {
+                gl->BlendFunc(ZGL_SRC_ALPHA, ZGL_ONE_MINUS_SRC_ALPHA);
+            }
         } else {
-            gl->BlendFunc(ZGL_SRC_ALPHA, ZGL_ONE);
+            gl->Disable(ZGL_BLEND);
         }
-    } else if (g_game_blend_enabled == 1) {
-        gl->Enable(ZGL_BLEND);
-        if (gl->BlendFuncSeparate) {
-            gl->BlendFuncSeparate(ZGL_SRC_ALPHA, ZGL_ONE_MINUS_SRC_ALPHA,
-                                  ZGL_ONE, ZGL_ONE_MINUS_SRC_ALPHA);
+        g_game_cur_blend = g_game_blend_enabled;
+    }
+    if (g_game_cur_depth_write != g_game_depth_write) {
+        if (gl->DepthMask) {
+            gl->DepthMask(g_game_depth_write ? ZGL_TRUE : ZGL_FALSE);
+        }
+        g_game_cur_depth_write = g_game_depth_write;
+    }
+    if (g_game_cur_cull != g_game_cull_mode) {
+        if (g_game_cull_mode != 0 && gl->CullFace) {
+            gl->Enable(ZGL_CULL_FACE);
+            /* clip 不翻 Y，标准 CCW 即正面 */
+            if (gl->FrontFace) gl->FrontFace(ZGL_CCW);
+            gl->CullFace(g_game_cull_mode == 2 ? ZAN_GAME_GL_FRONT : ZGL_BACK);
         } else {
-            gl->BlendFunc(ZGL_SRC_ALPHA, ZGL_ONE_MINUS_SRC_ALPHA);
+            gl->Disable(ZGL_CULL_FACE);
+            if (gl->FrontFace) gl->FrontFace(ZGL_CCW);
         }
-    } else {
-        gl->Disable(ZGL_BLEND);
-    }
-    if (gl->DepthMask) {
-        gl->DepthMask(g_game_depth_write ? ZGL_TRUE : ZGL_FALSE);
-    }
-    if (g_game_cull_mode != 0 && gl->CullFace) {
-        gl->Enable(ZGL_CULL_FACE);
-        /* clip 不翻 Y，标准 CCW 即正面 */
-        if (gl->FrontFace) gl->FrontFace(ZGL_CCW);
-        gl->CullFace(g_game_cull_mode == 2 ? ZAN_GAME_GL_FRONT : ZGL_BACK);
-    } else {
-        gl->Disable(ZGL_CULL_FACE);
-        if (gl->FrontFace) gl->FrontFace(ZGL_CCW);
+        g_game_cur_cull = g_game_cull_mode;
     }
 }
 
 static void zan_game_restore_cull_state(const zan_gl_api *gl) {
     gl->Disable(ZGL_CULL_FACE);
     if (gl->FrontFace) gl->FrontFace(ZGL_CCW);
+    g_game_cur_cull = -1;
 }
 
 static void zan_game_bind_shadow_uniforms(const zan_gl_api *gl, zan_game_program *prog,
-                                          const float *model) {
+                                          const float *model, int allow_shadow) {
     if (prog->u_model >= 0) {
         gl->UniformMatrix4fv(prog->u_model, 1, ZGL_FALSE,
             model ? model : g_game_identity_mat4);
     }
-    if (prog->u_light_vp >= 0) {
-        gl->UniformMatrix4fv(prog->u_light_vp, 1, ZGL_FALSE, g_game_shadow_light_vp);
-    }
-    int use_shadow = g_game_shadow_ready && g_game_shadow_tex && model != NULL;
-    if (prog->u_shadow_on >= 0) {
-        gl->Uniform1i(prog->u_shadow_on, use_shadow ? 1 : 0);
+    int use_shadow = g_game_shadow_ready && g_game_shadow_tex && allow_shadow;
+    if (prog->shadow_version != g_game_shadow_version ||
+        prog->last_use_shadow != use_shadow) {
+        if (prog->u_light_vp >= 0) {
+            gl->UniformMatrix4fv(prog->u_light_vp, 1, ZGL_FALSE, g_game_shadow_light_vp);
+        }
+        if (prog->u_shadow_on >= 0) {
+            gl->Uniform1i(prog->u_shadow_on, use_shadow ? 1 : 0);
+        }
+        prog->shadow_version = g_game_shadow_version;
+        prog->last_use_shadow = use_shadow;
     }
     if (prog->u_shadow_map >= 0) {
-        gl->ActiveTexture(ZGL_TEXTURE1);
-        gl->BindTexture(ZGL_TEXTURE_2D, use_shadow ? g_game_shadow_tex : 0);
-        gl->Uniform1i(prog->u_shadow_map, 1);
+        zan_game_bind_tex_unit(gl, 1, use_shadow ? g_game_shadow_tex : 0);
     }
-    zgl_uint ntex = 0;
-    if (g_game_normal_key[0] && g_game_normal_scale > 0.0001f) {
-        const zan_bitmap *nbmp = zan_image_get(g_game_normal_key);
-        if (zan_game_bitmap_valid(nbmp)) {
-            ntex = zan_gui_gpu_texture(nbmp);
+    if (prog->mat_version != g_game_mat_version) {
+        if (prog->u_material >= 0) {
+            gl->Uniform2f(prog->u_material, g_game_material[0], g_game_material[1]);
+        }
+        if (prog->u_emissive >= 0) {
+            gl->Uniform3fv(prog->u_emissive, 1, g_game_emissive);
+        }
+        zgl_uint ntex = (g_game_normal_key[0] && g_game_normal_scale > 0.0001f)
+            ? zan_game_resolve_tex(g_game_normal_key, 0) : 0;
+        if (prog->u_normal_on >= 0) gl->Uniform1i(prog->u_normal_on, ntex ? 1 : 0);
+        if (prog->u_normal_scale >= 0 && gl->Uniform1f) {
+            gl->Uniform1f(prog->u_normal_scale, ntex ? g_game_normal_scale : 0.0f);
+        }
+        if (prog->u_normal_map >= 0) zan_game_bind_tex_unit(gl, 2, ntex);
+        zgl_uint orm_tex = g_game_orm_key[0]
+            ? zan_game_resolve_tex(g_game_orm_key, 0) : 0;
+        if (prog->u_orm_on >= 0) gl->Uniform1i(prog->u_orm_on, orm_tex ? 1 : 0);
+        if (prog->u_ao_strength >= 0 && gl->Uniform1f) {
+            gl->Uniform1f(prog->u_ao_strength, orm_tex ? g_game_ao_strength : 0.0f);
+        }
+        if (prog->u_orm_map >= 0) zan_game_bind_tex_unit(gl, 3, orm_tex);
+        if (prog->u_alpha_cutoff >= 0 && gl->Uniform1f) {
+            gl->Uniform1f(prog->u_alpha_cutoff, g_game_alpha_cutoff);
+        }
+        zgl_uint em_tex = g_game_emissive_key[0]
+            ? zan_game_resolve_tex(g_game_emissive_key, 0) : 0;
+        if (prog->u_emissive_on >= 0) gl->Uniform1i(prog->u_emissive_on, em_tex ? 1 : 0);
+        if (prog->u_emissive_map >= 0) zan_game_bind_tex_unit(gl, 4, em_tex);
+        if (prog->u_uv_transform >= 0) {
+            gl->Uniform4f(prog->u_uv_transform,
+                g_game_uv_transform[0], g_game_uv_transform[1],
+                g_game_uv_transform[2], g_game_uv_transform[3]);
+        }
+        prog->mat_version = g_game_mat_version;
+    } else {
+        /* 贴图单元可能被其他程序/跨帧重绑，若有启用贴图则确保已绑（命中 cache 为零 GL 调用） */
+        if (g_game_normal_key[0] && g_game_normal_scale > 0.0001f && prog->u_normal_map >= 0) {
+            zan_game_bind_tex_unit(gl, 2, zan_game_resolve_tex(g_game_normal_key, 0));
+        }
+        if (g_game_orm_key[0] && prog->u_orm_map >= 0) {
+            zan_game_bind_tex_unit(gl, 3, zan_game_resolve_tex(g_game_orm_key, 0));
+        }
+        if (g_game_emissive_key[0] && prog->u_emissive_map >= 0) {
+            zan_game_bind_tex_unit(gl, 4, zan_game_resolve_tex(g_game_emissive_key, 0));
         }
     }
-    if (prog->u_normal_on >= 0) {
-        gl->Uniform1i(prog->u_normal_on, ntex ? 1 : 0);
-    }
-    if (prog->u_normal_scale >= 0 && gl->Uniform1f) {
-        gl->Uniform1f(prog->u_normal_scale, ntex ? g_game_normal_scale : 0.0f);
-    }
-    if (prog->u_normal_map >= 0) {
-        gl->ActiveTexture(ZGL_TEXTURE0 + 2);
-        gl->BindTexture(ZGL_TEXTURE_2D, ntex);
-        gl->Uniform1i(prog->u_normal_map, 2);
-    }
-    zgl_uint orm_tex = 0;
-    if (g_game_orm_key[0]) {
-        const zan_bitmap *obmp = zan_image_get(g_game_orm_key);
-        if (zan_game_bitmap_valid(obmp)) {
-            orm_tex = zan_gui_gpu_texture(obmp);
-        }
-    }
-    if (prog->u_orm_on >= 0) {
-        gl->Uniform1i(prog->u_orm_on, orm_tex ? 1 : 0);
-    }
-    if (prog->u_ao_strength >= 0 && gl->Uniform1f) {
-        gl->Uniform1f(prog->u_ao_strength, orm_tex ? g_game_ao_strength : 0.0f);
-    }
-    if (prog->u_orm_map >= 0) {
-        gl->ActiveTexture(ZGL_TEXTURE0 + 3);
-        gl->BindTexture(ZGL_TEXTURE_2D, orm_tex);
-        gl->Uniform1i(prog->u_orm_map, 3);
-    }
-    if (prog->u_alpha_cutoff >= 0 && gl->Uniform1f) {
-        gl->Uniform1f(prog->u_alpha_cutoff, g_game_alpha_cutoff);
-    }
-    zgl_uint em_tex = 0;
-    if (g_game_emissive_key[0]) {
-        const zan_bitmap *ebmp = zan_image_get(g_game_emissive_key);
-        if (zan_game_bitmap_valid(ebmp)) {
-            em_tex = zan_gui_gpu_texture(ebmp);
-        }
-    }
-    if (prog->u_emissive_on >= 0) {
-        gl->Uniform1i(prog->u_emissive_on, em_tex ? 1 : 0);
-    }
-    if (prog->u_emissive_map >= 0) {
-        gl->ActiveTexture(ZGL_TEXTURE0 + 4);
-        gl->BindTexture(ZGL_TEXTURE_2D, em_tex);
-        gl->Uniform1i(prog->u_emissive_map, 4);
-    }
-    if (prog->u_uv_transform >= 0) {
-        gl->Uniform4f(prog->u_uv_transform,
-            g_game_uv_transform[0], g_game_uv_transform[1],
-            g_game_uv_transform[2], g_game_uv_transform[3]);
-    }
+    if (prog->vfx_version == g_game_vfx_version) return;
     if (prog->u_rim_light >= 0) {
         gl->Uniform4f(prog->u_rim_light,
             g_game_rim_light[0], g_game_rim_light[1],
@@ -2610,24 +2934,8 @@ static void zan_game_bind_shadow_uniforms(const zan_gl_api *gl, zan_game_program
     if (prog->u_dissolve_edge >= 0) {
         gl->Uniform3fv(prog->u_dissolve_edge, 1, g_game_dissolve_edge);
     }
-    if (prog->u_clip_plane >= 0) {
-        gl->Uniform4f(prog->u_clip_plane,
-            g_game_clip_plane[0], g_game_clip_plane[1],
-            g_game_clip_plane[2], g_game_clip_plane[3]);
-    }
-    if (prog->u_clip_on >= 0) {
-        gl->Uniform1i(prog->u_clip_on, g_game_clip_on);
-    }
     if (prog->u_triplanar >= 0) {
         gl->Uniform3fv(prog->u_triplanar, 1, g_game_triplanar);
-    }
-    if (prog->u_height_fog_params >= 0) {
-        gl->Uniform4f(prog->u_height_fog_params,
-            g_game_height_fog_params[0], g_game_height_fog_params[1],
-            g_game_height_fog_params[2], g_game_height_fog_params[3]);
-    }
-    if (prog->u_height_fog_color >= 0) {
-        gl->Uniform3fv(prog->u_height_fog_color, 1, g_game_height_fog_color);
     }
     if (prog->u_hit_flash >= 0) {
         gl->Uniform4f(prog->u_hit_flash,
@@ -2789,138 +3097,40 @@ static void zan_game_bind_shadow_uniforms(const zan_gl_api *gl, zan_game_program
     if (prog->u_subsurface_color >= 0) {
         gl->Uniform3fv(prog->u_subsurface_color, 1, g_game_subsurface_color);
     }
+    prog->vfx_version = g_game_vfx_version;
 }
 
-ZAN_GAME_API int32_t zan_game_draw3d_ex(int32_t surface_id, int32_t mesh_id,
-    const float *mvp, const float *model, int32_t color, const char *texture) {
-    if (!mvp || mesh_id <= 0 || surface_id < 0 ||
-        surface_id >= ZAN_GAME_SURFACE_CAP) return 0;
-    zan_gpu_frame frame;
-    if (!zan_gui_gpu_begin(surface_id, &frame)) return 0;
-    int32_t result = 0;
-    if (!zan_game_gpu_prepare(&frame)) goto done;
-    zan_game_mesh *mesh = zan_game_find_mesh(mesh_id, frame.epoch);
-    if (!mesh) goto done;
-    zan_game_program *prog = zan_game_program_get(mesh->colored, 0);
-    if (!prog) goto done;
-    int clip_x, clip_y, clip_w, clip_h;
-    zan_game_clip(&frame, &clip_x, &clip_y, &clip_w, &clip_h);
-    if (!clip_w || !clip_h) { result = 1; goto done; }
-
-    const zan_bitmap *bitmap = texture && texture[0] ? zan_image_get(texture) : NULL;
-    if (!zan_game_bitmap_valid(bitmap)) bitmap = &g_game_white;
-    zgl_uint tex = zan_gui_gpu_texture(bitmap);
-    if (!tex && bitmap != &g_game_white) tex = zan_gui_gpu_texture(&g_game_white);
-    if (!tex) goto done;
-
-    const zan_gl_api *gl = frame.api;
-    gl->BindFramebuffer(ZGL_FRAMEBUFFER, frame.framebuffer);
-    if (!zan_game_depth_ready(surface_id, &frame)) goto done;
-    gl->Viewport(0, 0, frame.width, frame.height);
-    gl->Enable(ZGL_SCISSOR_TEST);
-    gl->Scissor(clip_x, clip_y, clip_w, clip_h);
-    if (!g_game_blend_enabled && !g_game_preserve_depth) {
-        if (gl->DepthMask) gl->DepthMask(ZGL_TRUE);
-        gl->ClearColor(0.0f, 0.0f, 0.0f, 0.0f);
-        gl->Clear(ZGL_DEPTH_BUFFER_BIT);
-    }
-    gl->Enable(ZGL_DEPTH_TEST);
-    gl->DepthFunc(ZGL_LEQUAL);
-    zan_game_apply_blend_state(gl);
-    gl->UseProgram(prog->program);
-    zan_game_upload_lights(prog);
-    gl->UniformMatrix4fv(prog->u_mvp, 1, ZGL_FALSE, mvp);
-    zan_game_bind_shadow_uniforms(gl, prog, model);
-    uint32_t argb = (uint32_t)color;
-    gl->Uniform4f(prog->u_color,
-        (float)((argb >> 16) & 255) / 255.0f,
-        (float)((argb >> 8) & 255) / 255.0f,
-        (float)(argb & 255) / 255.0f,
-        (float)((argb >> 24) & 255) / 255.0f);
-    gl->ActiveTexture(ZGL_TEXTURE0);
-    gl->BindTexture(ZGL_TEXTURE_2D, tex);
-    gl->Uniform1i(prog->u_tex, 0);
-    gl->BindVertexArray(mesh->vao);
-    gl->DrawElements(ZGL_TRIANGLES, mesh->index_count, ZGL_UNSIGNED_SHORT, NULL);
-    gl->BindVertexArray(0);
-    zan_game_restore_cull_state(gl);
-    if (gl->DepthMask) gl->DepthMask(ZGL_TRUE);
-    gl->Finish();
-    result = gl->GetError() == ZGL_NO_ERROR;
-
-done:
-    zan_gui_gpu_end(surface_id);
-    return result;
-}
-
-ZAN_GAME_API int32_t zan_game_draw3d(int32_t surface_id, int32_t mesh_id,
-    const float *mvp, int32_t color, const char *texture) {
-    return zan_game_draw3d_ex(surface_id, mesh_id, mvp, NULL, color, texture);
-}
-
-/* ---- 批量实例绘制 ----------------------------------------------------
- * begin 一次（清一次深度、绑定 FBO/深度/scissor、关 blend）→
- * 每网格一组 batch 提交（一次 DrawElementsInstanced，实例记录
- * mvp 16 float 列主序 + tint rgba 4 float）→ end 一次（恢复状态，
- * 整批恰好一次 Finish）。批内实例与跨网格组之间都做深度解析，
- * 这是与 draw3d（每次清深度、调用序遮挡）的本质差别。
- * 批活跃期间不要混用 draw3d/mesh_create。 */
-
-ZAN_GAME_API int32_t zan_game_draw3d_batch_begin(int32_t surface_id) {
-    if (surface_id < 0 || surface_id >= ZAN_GAME_SURFACE_CAP ||
-        g_game_batch_surface != -1) return 0;
-    zan_gpu_frame frame;
-    if (!zan_gui_gpu_begin(surface_id, &frame)) return 0;
-    if (!zan_game_gpu_prepare(&frame)) {
-        zan_gui_gpu_end(surface_id);
-        return 0;
-    }
-    int clip_x, clip_y, clip_w, clip_h;
-    zan_game_clip(&frame, &clip_x, &clip_y, &clip_w, &clip_h);
-    const zan_gl_api *gl = frame.api;
-    if (!g_game_instance_vbo) {
-        gl->GenBuffers(1, &g_game_instance_vbo);
-        if (!g_game_instance_vbo) {
-            zan_gui_gpu_end(surface_id);
-            return 0;
-        }
-        gl->BindBuffer(ZGL_ARRAY_BUFFER, g_game_instance_vbo);
-        gl->BufferData(ZGL_ARRAY_BUFFER,
-            (zgl_sizeiptr)((size_t)ZAN_GAME_INSTANCE_CAP *
-                ZAN_GAME_INSTANCE_FLOATS * sizeof(float)),
-            NULL, ZGL_STREAM_DRAW);
-        gl->BindBuffer(ZGL_ARRAY_BUFFER, 0);
-    }
-    if (gl->GetError() != ZGL_NO_ERROR) {
-        zan_gui_gpu_end(surface_id);
-        return 0;
-    }
-    gl->BindFramebuffer(ZGL_FRAMEBUFFER, frame.framebuffer);
-    if (!zan_game_depth_ready(surface_id, &frame)) {
-        zan_gui_gpu_end(surface_id);
-        return 0;
-    }
-    gl->Viewport(0, 0, frame.width, frame.height);
-    gl->Enable(ZGL_SCISSOR_TEST);
-    gl->Scissor(clip_x, clip_y, clip_w, clip_h);
-    if (gl->DepthMask) gl->DepthMask(ZGL_TRUE);
-    gl->ClearColor(0.0f, 0.0f, 0.0f, 0.0f);
-    gl->Clear(ZGL_DEPTH_BUFFER_BIT);
-    gl->Enable(ZGL_DEPTH_TEST);
-    gl->DepthFunc(ZGL_LEQUAL);
-    zan_game_apply_blend_state(gl);
-    g_game_batch_frame = frame;
-    g_game_batch_clip_empty = !clip_w || !clip_h;
-    g_game_batch_surface = surface_id;
-    g_game_batch_prog = 0;
-    g_game_batch_tex = 0;
+static int zan_game_ensure_instance_vbo(const zan_gl_api *gl) {
+    if (g_game_instance_vbo) return 1;
+    gl->GenBuffers(1, &g_game_instance_vbo);
+    if (!g_game_instance_vbo) return 0;
+    gl->BindBuffer(ZGL_ARRAY_BUFFER, g_game_instance_vbo);
+    gl->BufferData(ZGL_ARRAY_BUFFER,
+        (zgl_sizeiptr)((size_t)ZAN_GAME_INSTANCE_CAP *
+            ZAN_GAME_INSTANCE_FLOATS * sizeof(float)),
+        NULL, ZGL_STREAM_DRAW);
+    gl->BindBuffer(ZGL_ARRAY_BUFFER, 0);
     return 1;
+}
+
+static void zan_game_upload_instances(const zan_gl_api *gl,
+                                      const float *instances, int32_t count) {
+    zgl_sizeiptr cap_bytes = (zgl_sizeiptr)((size_t)ZAN_GAME_INSTANCE_CAP *
+        ZAN_GAME_INSTANCE_FLOATS * sizeof(float));
+    zgl_sizeiptr upload_bytes = (zgl_sizeiptr)((size_t)count *
+        ZAN_GAME_INSTANCE_FLOATS * sizeof(float));
+    gl->BindBuffer(ZGL_ARRAY_BUFFER, g_game_instance_vbo);
+    /* Buffer orphaning: 向驱动申请新存储区避免与仍在管线中的上一批 stall */
+    gl->BufferData(ZGL_ARRAY_BUFFER, cap_bytes, NULL, ZGL_STREAM_DRAW);
+    gl->BufferSubData(ZGL_ARRAY_BUFFER, 0, upload_bytes, instances);
+    gl->BindBuffer(ZGL_ARRAY_BUFFER, 0);
 }
 
 /* 给网格 VAO 配实例属性（每网格一次，指向共享实例 VBO，divisor=1）。
  * mat4 属性占 location 4..7 连续四槽 + tint 在 8。 */
 static int zan_game_mesh_inst_ready(zan_game_mesh *mesh, const zan_gl_api *gl) {
     if (mesh->inst_ready) return 1;
+    if (!zan_game_ensure_instance_vbo(gl)) return 0;
     gl->BindVertexArray(mesh->vao);
     gl->BindBuffer(ZGL_ARRAY_BUFFER, g_game_instance_vbo);
     const zgl_uint locs[] = {
@@ -2942,8 +3152,144 @@ static int zan_game_mesh_inst_ready(zan_game_mesh *mesh, const zan_gl_api *gl) {
     gl->VertexAttribDivisor(ZAN_GAME_LOC_ITINT, 1);
     gl->BindBuffer(ZGL_ARRAY_BUFFER, 0);
     gl->BindVertexArray(0);
-    if (gl->GetError() != ZGL_NO_ERROR) return 0;
     mesh->inst_ready = 1;
+    return 1;
+}
+
+ZAN_GAME_API int32_t zan_game_draw3d_ex(int32_t surface_id, int32_t mesh_id,
+    const float *mvp, const float *model, int32_t color, const char *texture) {
+    if (!mvp || mesh_id <= 0 || surface_id < 0 ||
+        surface_id >= ZAN_GAME_SURFACE_CAP) return 0;
+    int in_frame = (g_game_frame_surface == surface_id);
+    zan_gpu_frame frame;
+    if (in_frame) {
+        if (g_game_frame_clip_empty) return 1;
+        frame = g_game_frame_gpu;
+    } else {
+        if (!zan_gui_gpu_begin(surface_id, &frame)) return 0;
+        zan_game_invalidate_state_cache();
+        g_game_tex_cache_gen++;
+    }
+    int32_t result = 0;
+    if (!zan_game_gpu_prepare_fast(&frame)) goto done;
+    zan_game_mesh *mesh = zan_game_find_mesh(mesh_id, frame.epoch);
+    if (!mesh) goto done;
+    zan_game_program *prog = zan_game_program_get(mesh->colored, 0);
+    if (!prog) goto done;
+
+    const zan_gl_api *gl = frame.api;
+    if (!in_frame) {
+        int clip_x, clip_y, clip_w, clip_h;
+        zan_game_clip(&frame, &clip_x, &clip_y, &clip_w, &clip_h);
+        if (!clip_w || !clip_h) { result = 1; goto done; }
+        gl->BindFramebuffer(ZGL_FRAMEBUFFER, frame.framebuffer);
+        if (!zan_game_depth_ready(surface_id, &frame)) goto done;
+        gl->Viewport(0, 0, frame.width, frame.height);
+        gl->Enable(ZGL_SCISSOR_TEST);
+        gl->Scissor(clip_x, clip_y, clip_w, clip_h);
+        if (!g_game_blend_enabled && !g_game_preserve_depth) {
+            if (gl->DepthMask) gl->DepthMask(ZGL_TRUE);
+            g_game_cur_depth_write = 1;
+            gl->ClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+            gl->Clear(ZGL_DEPTH_BUFFER_BIT);
+        }
+        gl->Enable(ZGL_DEPTH_TEST);
+        gl->DepthFunc(ZGL_LEQUAL);
+    }
+
+    zgl_uint tex = zan_game_resolve_tex(texture, 1);
+    if (!tex) goto done;
+
+    zan_game_apply_blend_state(gl);
+    zan_game_use_program(gl, prog);
+    zan_game_upload_lights(prog);
+    gl->UniformMatrix4fv(prog->u_mvp, 1, ZGL_FALSE, mvp);
+    zan_game_bind_shadow_uniforms(gl, prog, model, model != NULL);
+    uint32_t argb = (uint32_t)color;
+    gl->Uniform4f(prog->u_color,
+        (float)((argb >> 16) & 255) / 255.0f,
+        (float)((argb >> 8) & 255) / 255.0f,
+        (float)(argb & 255) / 255.0f,
+        (float)((argb >> 24) & 255) / 255.0f);
+    zan_game_bind_tex_unit(gl, 0, tex);
+    gl->BindVertexArray(mesh->vao);
+    gl->DrawElements(ZGL_TRIANGLES, mesh->index_count, ZGL_UNSIGNED_SHORT, NULL);
+    if (!in_frame) {
+        gl->BindVertexArray(0);
+        zan_game_restore_cull_state(gl);
+        if (gl->DepthMask) gl->DepthMask(ZGL_TRUE);
+    }
+    result = 1;
+
+done:
+    if (!in_frame) {
+        zan_gui_gpu_end(surface_id);
+        zan_game_invalidate_state_cache();
+    }
+    return result;
+}
+
+ZAN_GAME_API int32_t zan_game_draw3d(int32_t surface_id, int32_t mesh_id,
+    const float *mvp, int32_t color, const char *texture) {
+    return zan_game_draw3d_ex(surface_id, mesh_id, mvp, NULL, color, texture);
+}
+
+/* ---- 批量实例绘制 ----------------------------------------------------
+ * begin 一次（若不在 begin_frame3d 内则清一次深度、绑定 FBO/深度/scissor）→
+ * 每网格一组 batch / batch_lit 提交（一次 DrawElementsInstanced）→ end 一次。
+ * batch_lit 可直接在 begin_frame3d 或 draw3d_batch_begin 会话内调用，支持
+ * 完整方向光/点光/聚光/半球IBL/3x3 PCF 阴影/PBR/贴图/雾/VFX。 */
+
+ZAN_GAME_API int32_t zan_game_draw3d_batch_begin(int32_t surface_id) {
+    if (surface_id < 0 || surface_id >= ZAN_GAME_SURFACE_CAP ||
+        g_game_batch_surface != -1) return 0;
+    int in_frame = (g_game_frame_surface == surface_id);
+    zan_gpu_frame frame;
+    if (in_frame) {
+        frame = g_game_frame_gpu;
+    } else {
+        if (!zan_gui_gpu_begin(surface_id, &frame)) return 0;
+        zan_game_invalidate_state_cache();
+        g_game_tex_cache_gen++;
+    }
+    if (!zan_game_gpu_prepare_fast(&frame)) {
+        if (!in_frame) zan_gui_gpu_end(surface_id);
+        return 0;
+    }
+    const zan_gl_api *gl = frame.api;
+    if (!zan_game_ensure_instance_vbo(gl)) {
+        if (!in_frame) zan_gui_gpu_end(surface_id);
+        return 0;
+    }
+    int clip_empty = g_game_frame_clip_empty;
+    if (!in_frame) {
+        int clip_x, clip_y, clip_w, clip_h;
+        zan_game_clip(&frame, &clip_x, &clip_y, &clip_w, &clip_h);
+        clip_empty = !clip_w || !clip_h;
+        gl->BindFramebuffer(ZGL_FRAMEBUFFER, frame.framebuffer);
+        if (!zan_game_depth_ready(surface_id, &frame)) {
+            zan_gui_gpu_end(surface_id);
+            return 0;
+        }
+        gl->Viewport(0, 0, frame.width, frame.height);
+        gl->Enable(ZGL_SCISSOR_TEST);
+        gl->Scissor(clip_x, clip_y, clip_w, clip_h);
+        if (!g_game_preserve_depth) {
+            if (gl->DepthMask) gl->DepthMask(ZGL_TRUE);
+            g_game_cur_depth_write = 1;
+            gl->ClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+            gl->Clear(ZGL_DEPTH_BUFFER_BIT);
+        }
+        gl->Enable(ZGL_DEPTH_TEST);
+        gl->DepthFunc(ZGL_LEQUAL);
+    }
+    zan_game_apply_blend_state(gl);
+    g_game_batch_frame = frame;
+    g_game_batch_clip_empty = clip_empty;
+    g_game_batch_surface = surface_id;
+    g_game_batch_owns_gpu = in_frame ? 0 : 1;
+    g_game_batch_prog = 0;
+    g_game_batch_tex = 0;
     return 1;
 }
 
@@ -2952,57 +3298,87 @@ ZAN_GAME_API int32_t zan_game_draw3d_batch(int32_t surface_id, int32_t mesh_id,
     if (surface_id < 0 || surface_id != g_game_batch_surface || !instances ||
         count <= 0 || count > ZAN_GAME_INSTANCE_CAP || mesh_id <= 0) return 0;
     zan_gpu_frame *frame = &g_game_batch_frame;
-    if (!zan_game_gpu_prepare(frame)) return 0;
+    if (!zan_game_gpu_prepare_fast(frame)) return 0;
     zan_game_mesh *mesh = zan_game_find_mesh(mesh_id, frame->epoch);
     if (!mesh) return 0;
     zan_game_program *prog = zan_game_program_get(mesh->colored, 1);
     if (!prog || !g_game_instance_vbo) return 0;
     if (g_game_batch_clip_empty) return 1;
 
-    const zan_bitmap *bitmap = texture && texture[0] ? zan_image_get(texture) : NULL;
-    if (!zan_game_bitmap_valid(bitmap)) bitmap = &g_game_white;
-    zgl_uint tex = zan_gui_gpu_texture(bitmap);
-    if (!tex && bitmap != &g_game_white) tex = zan_gui_gpu_texture(&g_game_white);
+    zgl_uint tex = zan_game_resolve_tex(texture, 1);
     if (!tex) return 0;
 
     const zan_gl_api *gl = frame->api;
-    gl->BindBuffer(ZGL_ARRAY_BUFFER, g_game_instance_vbo);
-    gl->BufferSubData(ZGL_ARRAY_BUFFER, 0,
-        (zgl_sizeiptr)((size_t)count * ZAN_GAME_INSTANCE_FLOATS *
-            sizeof(float)), instances);
-    gl->BindBuffer(ZGL_ARRAY_BUFFER, 0);
+    zan_game_upload_instances(gl, instances, count);
     if (!zan_game_mesh_inst_ready(mesh, gl)) return 0;
-    if (prog->program != g_game_batch_prog ||
-        prog->light_version != g_game_light_version) {
-        gl->UseProgram(prog->program);
-        gl->Uniform1i(prog->u_tex, 0);
-        zan_game_upload_lights(prog);
-        g_game_batch_prog = prog->program;
-    }
-    if (tex != g_game_batch_tex) {
-        gl->ActiveTexture(ZGL_TEXTURE0);
-        gl->BindTexture(ZGL_TEXTURE_2D, tex);
-        g_game_batch_tex = tex;
-    }
+    zan_game_apply_blend_state(gl);
+    zan_game_use_program(gl, prog);
+    zan_game_upload_lights(prog);
+    zan_game_bind_tex_unit(gl, 0, tex);
     gl->BindVertexArray(mesh->vao);
     gl->DrawElementsInstanced(ZGL_TRIANGLES, mesh->index_count,
         ZGL_UNSIGNED_SHORT, NULL, count);
-    gl->BindVertexArray(0);
-    return gl->GetError() == ZGL_NO_ERROR;
+    return 1;
+}
+
+ZAN_GAME_API int32_t zan_game_draw3d_batch_lit(int32_t surface_id, int32_t mesh_id,
+    const char *texture, const float *vp, const float *instances, int32_t count) {
+    if (surface_id < 0 || !vp || !instances ||
+        count <= 0 || count > ZAN_GAME_INSTANCE_CAP || mesh_id <= 0) return 0;
+    zan_gpu_frame *frame = NULL;
+    int clip_empty = 0;
+    if (surface_id == g_game_batch_surface) {
+        frame = &g_game_batch_frame;
+        clip_empty = g_game_batch_clip_empty;
+    } else if (surface_id == g_game_frame_surface) {
+        frame = &g_game_frame_gpu;
+        clip_empty = g_game_frame_clip_empty;
+    } else {
+        return 0;
+    }
+    if (clip_empty) return 1;
+    if (!zan_game_gpu_prepare_fast(frame)) return 0;
+    zan_game_mesh *mesh = zan_game_find_mesh(mesh_id, frame->epoch);
+    if (!mesh) return 0;
+    zan_game_program *prog = zan_game_program_get(mesh->colored, 2);
+    if (!prog) return 0;
+
+    const zan_gl_api *gl = frame->api;
+    if (!zan_game_ensure_instance_vbo(gl)) return 0;
+    zgl_uint tex = zan_game_resolve_tex(texture, 1);
+    if (!tex) return 0;
+
+    zan_game_upload_instances(gl, instances, count);
+    if (!zan_game_mesh_inst_ready(mesh, gl)) return 0;
+    zan_game_apply_blend_state(gl);
+    zan_game_use_program(gl, prog);
+    zan_game_upload_lights(prog);
+    gl->UniformMatrix4fv(prog->u_vp, 1, ZGL_FALSE, vp);
+    zan_game_bind_shadow_uniforms(gl, prog, NULL, 1);
+    zan_game_bind_tex_unit(gl, 0, tex);
+    gl->BindVertexArray(mesh->vao);
+    gl->DrawElementsInstanced(ZGL_TRIANGLES, mesh->index_count,
+        ZGL_UNSIGNED_SHORT, NULL, count);
+    return 1;
 }
 
 ZAN_GAME_API int32_t zan_game_draw3d_batch_end(int32_t surface_id) {
     if (surface_id < 0 || surface_id != g_game_batch_surface) return 0;
-    if (g_game_gl) {
+    int owns_gpu = g_game_batch_owns_gpu;
+    if (g_game_gl && owns_gpu) {
+        g_game_gl->BindVertexArray(0);
         zan_game_restore_cull_state(g_game_gl);
         if (g_game_gl->DepthMask) g_game_gl->DepthMask(ZGL_TRUE);
-        g_game_gl->Finish();
     }
     g_game_batch_surface = -1;
+    g_game_batch_owns_gpu = 0;
     g_game_batch_clip_empty = 0;
     g_game_batch_prog = 0;
     g_game_batch_tex = 0;
-    zan_gui_gpu_end(surface_id);
+    if (owns_gpu) {
+        zan_gui_gpu_end(surface_id);
+        zan_game_invalidate_state_cache();
+    }
     return 1;
 }
 
@@ -3042,26 +3418,67 @@ ZAN_GAME_API int32_t zan_game_set_cull3d(int32_t mode) {
 
 ZAN_GAME_API int32_t zan_game_begin_frame3d(int32_t surface_id) {
     if (surface_id < 0 || surface_id >= ZAN_GAME_SURFACE_CAP) return 0;
+    if (g_game_frame_surface >= 0) {
+        zan_game_end_frame3d();
+    }
     zan_gpu_frame frame;
     if (!zan_gui_gpu_begin(surface_id, &frame)) return 0;
-    int32_t result = 0;
-    if (!zan_game_gpu_prepare(&frame)) goto done;
+    if (!zan_game_gpu_prepare(&frame)) {
+        zan_gui_gpu_end(surface_id);
+        return 0;
+    }
+    zan_game_invalidate_state_cache();
+    g_game_tex_cache_gen++;
+
     const zan_gl_api *gl = frame.api;
     gl->BindFramebuffer(ZGL_FRAMEBUFFER, frame.framebuffer);
-    if (!zan_game_depth_ready(surface_id, &frame)) goto done;
+    if (!zan_game_depth_ready(surface_id, &frame)) {
+        zan_gui_gpu_end(surface_id);
+        return 0;
+    }
     gl->Disable(ZGL_SCISSOR_TEST);
     if (gl->DepthMask) gl->DepthMask(ZGL_TRUE);
+    g_game_cur_depth_write = 1;
+    gl->ClearColor(0.0f, 0.0f, 0.0f, 0.0f);
     gl->Clear(ZGL_DEPTH_BUFFER_BIT);
+
+    int clip_x, clip_y, clip_w, clip_h;
+    zan_game_clip(&frame, &clip_x, &clip_y, &clip_w, &clip_h);
+    gl->Viewport(0, 0, frame.width, frame.height);
+    gl->Enable(ZGL_SCISSOR_TEST);
+    if (clip_w > 0 && clip_h > 0) {
+        gl->Scissor(clip_x, clip_y, clip_w, clip_h);
+    }
+    gl->Enable(ZGL_DEPTH_TEST);
+    gl->DepthFunc(ZGL_LEQUAL);
+
+    g_game_frame_gpu = frame;
+    g_game_frame_surface = surface_id;
+    g_game_frame_clip_empty = (!clip_w || !clip_h) ? 1 : 0;
     g_game_preserve_depth = 1;
-    result = gl->GetError() == ZGL_NO_ERROR;
-done:
-    zan_gui_gpu_end(surface_id);
-    return result;
+    return 1;
 }
 
 ZAN_GAME_API void zan_game_end_frame3d(void) {
+    if (g_game_frame_surface >= 0) {
+        int32_t sid = g_game_frame_surface;
+        const zan_gl_api *gl = g_game_frame_gpu.api;
+        if (gl) {
+            gl->BindVertexArray(0);
+            zan_game_restore_cull_state(gl);
+            if (gl->DepthMask) gl->DepthMask(ZGL_TRUE);
+            gl->Disable(ZGL_DEPTH_TEST);
+            gl->Disable(ZGL_BLEND);
+        }
+        g_game_frame_surface = -1;
+        g_game_frame_clip_empty = 0;
+        zan_gui_gpu_end(sid);
+        zan_game_invalidate_state_cache();
+    }
     g_game_preserve_depth = 0;
 }
+
+static int g_game_shadow_owns_gpu = 0;
 
 static int zan_game_shadow_fbo_ready(const zan_gl_api *gl, int map_size) {
     if (g_game_shadow_fbo && g_game_shadow_size == map_size) return 1;
@@ -3099,15 +3516,20 @@ ZAN_GAME_API int32_t zan_game_shadow_begin(int32_t surface_id, int32_t map_size,
         g_game_shadow_surface != -1 || g_game_batch_surface != -1) return 0;
     if (map_size < ZAN_GAME_SHADOW_MIN_SIZE) map_size = ZAN_GAME_SHADOW_MIN_SIZE;
     if (map_size > ZAN_GAME_SHADOW_MAX_SIZE) map_size = ZAN_GAME_SHADOW_MAX_SIZE;
+    int in_frame = (g_game_frame_surface == surface_id);
     zan_gpu_frame frame;
-    if (!zan_gui_gpu_begin(surface_id, &frame)) return 0;
+    if (in_frame) {
+        frame = g_game_frame_gpu;
+    } else {
+        if (!zan_gui_gpu_begin(surface_id, &frame)) return 0;
+    }
     if (!zan_game_gpu_prepare(&frame) || !zan_game_shadow_program_get()) {
-        zan_gui_gpu_end(surface_id);
+        if (!in_frame) zan_gui_gpu_end(surface_id);
         return 0;
     }
     const zan_gl_api *gl = frame.api;
     if (!zan_game_shadow_fbo_ready(gl, map_size)) {
-        zan_gui_gpu_end(surface_id);
+        if (!in_frame) zan_gui_gpu_end(surface_id);
         return 0;
     }
     memcpy(g_game_shadow_light_vp, light_vp, 16 * sizeof(float));
@@ -3119,6 +3541,7 @@ ZAN_GAME_API int32_t zan_game_shadow_begin(int32_t surface_id, int32_t map_size,
     gl->Enable(ZGL_DEPTH_TEST);
     gl->DepthFunc(ZGL_LEQUAL);
     gl->Disable(ZGL_BLEND);
+    gl->Disable(ZGL_CULL_FACE);
     if (gl->PolygonOffset) {
         gl->Enable(ZGL_POLYGON_OFFSET_FILL);
         gl->PolygonOffset(2.0f, 4.0f);
@@ -3126,7 +3549,10 @@ ZAN_GAME_API int32_t zan_game_shadow_begin(int32_t surface_id, int32_t map_size,
     gl->Clear(ZGL_DEPTH_BUFFER_BIT);
     g_game_shadow_frame = frame;
     g_game_shadow_surface = surface_id;
+    g_game_shadow_owns_gpu = in_frame ? 0 : 1;
+    g_game_shadow_cur_prog = 0;
     g_game_shadow_ready = 0;
+    g_game_shadow_version++;
     return 1;
 }
 
@@ -3135,14 +3561,17 @@ ZAN_GAME_API int32_t zan_game_shadow_draw(int32_t surface_id, int32_t mesh_id,
     if (surface_id < 0 || surface_id != g_game_shadow_surface ||
         mesh_id <= 0 || !model) return 0;
     zan_gpu_frame *frame = &g_game_shadow_frame;
-    if (!zan_game_gpu_prepare(frame)) return 0;
+    if (!zan_game_gpu_prepare_fast(frame)) return 0;
     zan_game_mesh *mesh = zan_game_find_mesh(mesh_id, frame->epoch);
     if (!mesh) return 0;
     zan_game_shadow_program *prog = zan_game_shadow_program_get();
     if (!prog) return 0;
     const zan_gl_api *gl = frame->api;
-    gl->UseProgram(prog->program);
-    gl->UniformMatrix4fv(prog->u_light_vp, 1, ZGL_FALSE, g_game_shadow_light_vp);
+    if (g_game_shadow_cur_prog != prog->program) {
+        gl->UseProgram(prog->program);
+        gl->UniformMatrix4fv(prog->u_light_vp, 1, ZGL_FALSE, g_game_shadow_light_vp);
+        g_game_shadow_cur_prog = prog->program;
+    }
     gl->UniformMatrix4fv(prog->u_model, 1, ZGL_FALSE, model);
     if (prog->u_wind_params >= 0) {
         gl->Uniform4f(prog->u_wind_params,
@@ -3151,8 +3580,38 @@ ZAN_GAME_API int32_t zan_game_shadow_draw(int32_t surface_id, int32_t mesh_id,
     }
     gl->BindVertexArray(mesh->vao);
     gl->DrawElements(ZGL_TRIANGLES, mesh->index_count, ZGL_UNSIGNED_SHORT, NULL);
-    gl->BindVertexArray(0);
-    return gl->GetError() == ZGL_NO_ERROR;
+    return 1;
+}
+
+ZAN_GAME_API int32_t zan_game_shadow_draw_batch(int32_t surface_id, int32_t mesh_id,
+    const float *instances, int32_t count) {
+    if (surface_id < 0 || surface_id != g_game_shadow_surface ||
+        mesh_id <= 0 || !instances || count <= 0 ||
+        count > ZAN_GAME_INSTANCE_CAP) return 0;
+    zan_gpu_frame *frame = &g_game_shadow_frame;
+    if (!zan_game_gpu_prepare_fast(frame)) return 0;
+    zan_game_mesh *mesh = zan_game_find_mesh(mesh_id, frame->epoch);
+    if (!mesh) return 0;
+    zan_game_shadow_program *prog = zan_game_shadow_inst_program_get();
+    if (!prog) return 0;
+    const zan_gl_api *gl = frame->api;
+    if (!zan_game_ensure_instance_vbo(gl)) return 0;
+    zan_game_upload_instances(gl, instances, count);
+    if (!zan_game_mesh_inst_ready(mesh, gl)) return 0;
+    if (g_game_shadow_cur_prog != prog->program) {
+        gl->UseProgram(prog->program);
+        gl->UniformMatrix4fv(prog->u_light_vp, 1, ZGL_FALSE, g_game_shadow_light_vp);
+        g_game_shadow_cur_prog = prog->program;
+    }
+    if (prog->u_wind_params >= 0) {
+        gl->Uniform4f(prog->u_wind_params,
+            g_game_wind_params[0], g_game_wind_params[1],
+            g_game_wind_params[2], g_game_wind_params[3]);
+    }
+    gl->BindVertexArray(mesh->vao);
+    gl->DrawElementsInstanced(ZGL_TRIANGLES, mesh->index_count,
+        ZGL_UNSIGNED_SHORT, NULL, count);
+    return 1;
 }
 
 ZAN_GAME_API int32_t zan_game_shadow_draw_skinned(int32_t surface_id, int32_t mesh_id,
@@ -3160,7 +3619,7 @@ ZAN_GAME_API int32_t zan_game_shadow_draw_skinned(int32_t surface_id, int32_t me
     if (surface_id < 0 || surface_id != g_game_shadow_surface ||
         mesh_id <= 0 || !model) return 0;
     zan_gpu_frame *frame = &g_game_shadow_frame;
-    if (!zan_game_gpu_prepare(frame)) return 0;
+    if (!zan_game_gpu_prepare_fast(frame)) return 0;
     zan_game_mesh *mesh = zan_game_find_mesh(mesh_id, frame->epoch);
     if (!mesh || !mesh->skinned) return 0;
     zan_game_shadow_program *prog = zan_game_shadow_skin_program_get();
@@ -3171,36 +3630,59 @@ ZAN_GAME_API int32_t zan_game_shadow_draw_skinned(int32_t surface_id, int32_t me
             memcpy(&g_game_bones[i * 16], g_game_identity_mat4, 16 * sizeof(float));
         }
     }
-    gl->UseProgram(prog->program);
-    gl->UniformMatrix4fv(prog->u_light_vp, 1, ZGL_FALSE, g_game_shadow_light_vp);
+    if (g_game_shadow_cur_prog != prog->program) {
+        gl->UseProgram(prog->program);
+        gl->UniformMatrix4fv(prog->u_light_vp, 1, ZGL_FALSE, g_game_shadow_light_vp);
+        g_game_shadow_cur_prog = prog->program;
+    }
     gl->UniformMatrix4fv(prog->u_model, 1, ZGL_FALSE, model);
     gl->UniformMatrix4fv(prog->u_bones, ZAN_GAME_MAX_BONES, ZGL_FALSE, g_game_bones);
     gl->BindVertexArray(mesh->vao);
     gl->DrawElements(ZGL_TRIANGLES, mesh->index_count, ZGL_UNSIGNED_SHORT, NULL);
-    gl->BindVertexArray(0);
-    return gl->GetError() == ZGL_NO_ERROR;
+    return 1;
 }
 
 ZAN_GAME_API int32_t zan_game_shadow_end(int32_t surface_id) {
     if (surface_id < 0 || surface_id != g_game_shadow_surface) return 0;
+    int owns_gpu = g_game_shadow_owns_gpu;
     const zan_gl_api *gl = g_game_shadow_frame.api;
     if (gl) {
+        gl->BindVertexArray(0);
         if (gl->PolygonOffset) gl->Disable(ZGL_POLYGON_OFFSET_FILL);
         if (gl->ColorMask) gl->ColorMask(ZGL_TRUE, ZGL_TRUE, ZGL_TRUE, ZGL_TRUE);
         gl->BindFramebuffer(ZGL_FRAMEBUFFER, g_game_shadow_frame.framebuffer);
-        gl->Finish();
+        if (!owns_gpu) {
+            int clip_x, clip_y, clip_w, clip_h;
+            zan_game_clip(&g_game_frame_gpu, &clip_x, &clip_y, &clip_w, &clip_h);
+            gl->Viewport(0, 0, g_game_frame_gpu.width, g_game_frame_gpu.height);
+            gl->Enable(ZGL_SCISSOR_TEST);
+            if (clip_w > 0 && clip_h > 0) gl->Scissor(clip_x, clip_y, clip_w, clip_h);
+            gl->Enable(ZGL_DEPTH_TEST);
+            gl->DepthFunc(ZGL_LEQUAL);
+        }
     }
     g_game_shadow_surface = -1;
+    g_game_shadow_owns_gpu = 0;
+    g_game_shadow_cur_prog = 0;
     g_game_shadow_ready = 1;
-    zan_gui_gpu_end(surface_id);
+    g_game_shadow_version++;
+    if (owns_gpu) {
+        zan_gui_gpu_end(surface_id);
+    }
+    zan_game_invalidate_state_cache();
     return 1;
 }
 
 ZAN_GAME_API void zan_game_shadow_clear(void) {
-    g_game_shadow_ready = 0;
+    if (g_game_shadow_ready) {
+        g_game_shadow_ready = 0;
+        g_game_shadow_version++;
+    }
 }
 
 ZAN_GAME_API void zan_game_set_camera3d(float x, float y, float z) {
+    if (g_game_cam_valid && g_game_cam_pos[0] == x &&
+        g_game_cam_pos[1] == y && g_game_cam_pos[2] == z) return;
     g_game_cam_pos[0] = x;
     g_game_cam_pos[1] = y;
     g_game_cam_pos[2] = z;
@@ -3214,12 +3696,15 @@ ZAN_GAME_API void zan_game_set_material3d(float metallic, float roughness,
     if (metallic > 1.0f) metallic = 1.0f;
     if (roughness < 0.05f) roughness = 0.05f;
     if (roughness > 1.0f) roughness = 1.0f;
+    if (g_game_material[0] == metallic && g_game_material[1] == roughness &&
+        g_game_emissive[0] == em_r && g_game_emissive[1] == em_g &&
+        g_game_emissive[2] == em_b) return;
     g_game_material[0] = metallic;
     g_game_material[1] = roughness;
     g_game_emissive[0] = em_r;
     g_game_emissive[1] = em_g;
     g_game_emissive[2] = em_b;
-    g_game_light_version++;
+    g_game_mat_version++;
 }
 
 ZAN_GAME_API int32_t zan_game_set_point_lights3d(int32_t count,
@@ -3248,14 +3733,19 @@ ZAN_GAME_API int32_t zan_game_set_point_lights3d(int32_t count,
 
 ZAN_GAME_API void zan_game_set_fog3d(int32_t enabled, float r, float g, float b,
     float start_dist, float end_dist) {
+    float span = end_dist - start_dist;
+    if (span < 0.0001f) span = 0.0001f;
+    float on = enabled ? 1.0f : 0.0f;
+    float inv_span = 1.0f / span;
+    if (g_game_fog_params[0] == on && g_game_fog_params[1] == start_dist &&
+        g_game_fog_params[2] == inv_span && g_game_fog_color[0] == r &&
+        g_game_fog_color[1] == g && g_game_fog_color[2] == b) return;
     g_game_fog_color[0] = r;
     g_game_fog_color[1] = g;
     g_game_fog_color[2] = b;
-    float span = end_dist - start_dist;
-    if (span < 0.0001f) span = 0.0001f;
-    g_game_fog_params[0] = enabled ? 1.0f : 0.0f;
+    g_game_fog_params[0] = on;
     g_game_fog_params[1] = start_dist;
-    g_game_fog_params[2] = 1.0f / span;
+    g_game_fog_params[2] = inv_span;
     g_game_light_version++;
 }
 
@@ -3276,67 +3766,78 @@ ZAN_GAME_API int32_t zan_game_draw3d_skinned(int32_t surface_id, int32_t mesh_id
     const float *mvp, const float *model, int32_t color, const char *texture) {
     if (!mvp || mesh_id <= 0 || surface_id < 0 ||
         surface_id >= ZAN_GAME_SURFACE_CAP) return 0;
+    int in_frame = (g_game_frame_surface == surface_id);
     zan_gpu_frame frame;
-    if (!zan_gui_gpu_begin(surface_id, &frame)) return 0;
+    if (in_frame) {
+        if (g_game_frame_clip_empty) return 1;
+        frame = g_game_frame_gpu;
+    } else {
+        if (!zan_gui_gpu_begin(surface_id, &frame)) return 0;
+        zan_game_invalidate_state_cache();
+        g_game_tex_cache_gen++;
+    }
     int32_t result = 0;
-    if (!zan_game_gpu_prepare(&frame)) goto done;
+    if (!zan_game_gpu_prepare_fast(&frame)) goto done;
     zan_game_mesh *mesh = zan_game_find_mesh(mesh_id, frame.epoch);
     if (!mesh || !mesh->skinned) goto done;
     zan_game_program *prog = zan_game_skin_program_get();
     if (!prog) goto done;
-    int clip_x, clip_y, clip_w, clip_h;
-    zan_game_clip(&frame, &clip_x, &clip_y, &clip_w, &clip_h);
-    if (!clip_w || !clip_h) { result = 1; goto done; }
-
-    const zan_bitmap *bitmap = texture && texture[0] ? zan_image_get(texture) : NULL;
-    if (!zan_game_bitmap_valid(bitmap)) bitmap = &g_game_white;
-    zgl_uint tex = zan_gui_gpu_texture(bitmap);
-    if (!tex && bitmap != &g_game_white) tex = zan_gui_gpu_texture(&g_game_white);
-    if (!tex) goto done;
 
     const zan_gl_api *gl = frame.api;
+    if (!in_frame) {
+        int clip_x, clip_y, clip_w, clip_h;
+        zan_game_clip(&frame, &clip_x, &clip_y, &clip_w, &clip_h);
+        if (!clip_w || !clip_h) { result = 1; goto done; }
+        gl->BindFramebuffer(ZGL_FRAMEBUFFER, frame.framebuffer);
+        if (!zan_game_depth_ready(surface_id, &frame)) goto done;
+        gl->Viewport(0, 0, frame.width, frame.height);
+        gl->Enable(ZGL_SCISSOR_TEST);
+        gl->Scissor(clip_x, clip_y, clip_w, clip_h);
+        if (!g_game_blend_enabled && !g_game_preserve_depth) {
+            if (gl->DepthMask) gl->DepthMask(ZGL_TRUE);
+            g_game_cur_depth_write = 1;
+            gl->ClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+            gl->Clear(ZGL_DEPTH_BUFFER_BIT);
+        }
+        gl->Enable(ZGL_DEPTH_TEST);
+        gl->DepthFunc(ZGL_LEQUAL);
+    }
+
+    zgl_uint tex = zan_game_resolve_tex(texture, 1);
+    if (!tex) goto done;
+
     if (g_game_bone_count == 0) {
         for (int i = 0; i < ZAN_GAME_MAX_BONES; ++i) {
             memcpy(&g_game_bones[i * 16], g_game_identity_mat4, 16 * sizeof(float));
         }
     }
-    gl->BindFramebuffer(ZGL_FRAMEBUFFER, frame.framebuffer);
-    if (!zan_game_depth_ready(surface_id, &frame)) goto done;
-    gl->Viewport(0, 0, frame.width, frame.height);
-    gl->Enable(ZGL_SCISSOR_TEST);
-    gl->Scissor(clip_x, clip_y, clip_w, clip_h);
-    if (!g_game_blend_enabled && !g_game_preserve_depth) {
-        if (gl->DepthMask) gl->DepthMask(ZGL_TRUE);
-        gl->ClearColor(0.0f, 0.0f, 0.0f, 0.0f);
-        gl->Clear(ZGL_DEPTH_BUFFER_BIT);
-    }
-    gl->Enable(ZGL_DEPTH_TEST);
-    gl->DepthFunc(ZGL_LEQUAL);
     zan_game_apply_blend_state(gl);
-    gl->UseProgram(prog->program);
+    zan_game_use_program(gl, prog);
     zan_game_upload_lights(prog);
     gl->UniformMatrix4fv(prog->u_mvp, 1, ZGL_FALSE, mvp);
     gl->UniformMatrix4fv(prog->u_bones, ZAN_GAME_MAX_BONES, ZGL_FALSE, g_game_bones);
-    zan_game_bind_shadow_uniforms(gl, prog, model);
+    zan_game_bind_shadow_uniforms(gl, prog, model, model != NULL);
     uint32_t argb = (uint32_t)color;
     gl->Uniform4f(prog->u_color,
         (float)((argb >> 16) & 255) / 255.0f,
         (float)((argb >> 8) & 255) / 255.0f,
         (float)(argb & 255) / 255.0f,
         (float)((argb >> 24) & 255) / 255.0f);
-    gl->ActiveTexture(ZGL_TEXTURE0);
-    gl->BindTexture(ZGL_TEXTURE_2D, tex);
-    gl->Uniform1i(prog->u_tex, 0);
+    zan_game_bind_tex_unit(gl, 0, tex);
     gl->BindVertexArray(mesh->vao);
     gl->DrawElements(ZGL_TRIANGLES, mesh->index_count, ZGL_UNSIGNED_SHORT, NULL);
-    gl->BindVertexArray(0);
-    zan_game_restore_cull_state(gl);
-    if (gl->DepthMask) gl->DepthMask(ZGL_TRUE);
-    gl->Finish();
-    result = gl->GetError() == ZGL_NO_ERROR;
+    if (!in_frame) {
+        gl->BindVertexArray(0);
+        zan_game_restore_cull_state(gl);
+        if (gl->DepthMask) gl->DepthMask(ZGL_TRUE);
+    }
+    result = 1;
 
 done:
-    zan_gui_gpu_end(surface_id);
+    if (!in_frame) {
+        zan_gui_gpu_end(surface_id);
+        zan_game_invalidate_state_cache();
+    }
     return result;
 }
 
@@ -3443,8 +3944,13 @@ ZAN_GAME_API int32_t zan_game_postprocess3d(int32_t surface_id, float exposure,
     int32_t tonemap_mode, float vignette, float bloom_threshold,
     float bloom_intensity) {
     if (surface_id < 0 || surface_id >= ZAN_GAME_SURFACE_CAP) return 0;
+    int in_frame = (g_game_frame_surface == surface_id);
     zan_gpu_frame frame;
-    if (!zan_gui_gpu_begin(surface_id, &frame)) return 0;
+    if (in_frame) {
+        frame = g_game_frame_gpu;
+    } else {
+        if (!zan_gui_gpu_begin(surface_id, &frame)) return 0;
+    }
     int32_t result = 0;
     if (!zan_game_gpu_prepare(&frame)) goto done;
     zan_game_post_program *prog = zan_game_post_program_get();
@@ -3600,22 +4106,28 @@ ZAN_GAME_API int32_t zan_game_postprocess3d(int32_t surface_id, float exposure,
     gl->BindVertexArray(g_game_post_vao);
     gl->DrawArrays(ZGL_TRIANGLES, 0, 3);
     gl->BindVertexArray(0);
-    gl->Finish();
-    result = gl->GetError() == ZGL_NO_ERROR;
+    result = 1;
 
 done:
-    zan_gui_gpu_end(surface_id);
+    zan_game_invalidate_state_cache();
+    if (!in_frame) {
+        zan_gui_gpu_end(surface_id);
+    }
     return result;
 }
 
 ZAN_GAME_API void zan_game_set_normal_map3d(const char *texture, float scale) {
     if (!texture || !texture[0] || scale <= 0.0f) {
+        if (g_game_normal_key[0] == '\0' && g_game_normal_scale == 0.0f) return;
         g_game_normal_key[0] = '\0';
         g_game_normal_scale = 0.0f;
+        g_game_mat_version++;
         return;
     }
+    if (g_game_normal_scale == scale && strcmp(g_game_normal_key, texture) == 0) return;
     snprintf(g_game_normal_key, sizeof(g_game_normal_key), "%s", texture);
     g_game_normal_scale = scale;
+    g_game_mat_version++;
 }
 
 static zan_game_skybox_program *zan_game_skybox_program_get(void) {
@@ -3644,10 +4156,16 @@ ZAN_GAME_API int32_t zan_game_skybox3d(int32_t surface_id,
     const float *sun_dir3, const float *top_rgb3, const float *horizon_rgb3,
     const float *ground_rgb3) {
     if (surface_id < 0 || surface_id >= ZAN_GAME_SURFACE_CAP || !cam_basis9) return 0;
+    int in_frame = (g_game_frame_surface == surface_id);
     zan_gpu_frame frame;
-    if (!zan_gui_gpu_begin(surface_id, &frame)) return 0;
+    if (in_frame) {
+        if (g_game_frame_clip_empty) return 1;
+        frame = g_game_frame_gpu;
+    } else {
+        if (!zan_gui_gpu_begin(surface_id, &frame)) return 0;
+    }
     int32_t result = 0;
-    if (!zan_game_gpu_prepare(&frame)) goto done;
+    if (!zan_game_gpu_prepare_fast(&frame)) goto done;
     zan_game_skybox_program *prog = zan_game_skybox_program_get();
     if (!prog) goto done;
     const zan_gl_api *gl = frame.api;
@@ -3671,10 +4189,12 @@ ZAN_GAME_API int32_t zan_game_skybox3d(int32_t surface_id,
     if (tan_half_fov <= 0.001f) tan_half_fov = 0.57735f;
     if (aspect <= 0.001f) aspect = (float)frame.width / (float)(frame.height > 0 ? frame.height : 1);
 
-    gl->BindFramebuffer(ZGL_FRAMEBUFFER, frame.framebuffer);
-    gl->Viewport(0, 0, frame.width, frame.height);
-    gl->Enable(ZGL_SCISSOR_TEST);
-    gl->Scissor(clip_x, clip_y, clip_w, clip_h);
+    if (!in_frame) {
+        gl->BindFramebuffer(ZGL_FRAMEBUFFER, frame.framebuffer);
+        gl->Viewport(0, 0, frame.width, frame.height);
+        gl->Enable(ZGL_SCISSOR_TEST);
+        gl->Scissor(clip_x, clip_y, clip_w, clip_h);
+    }
     gl->Disable(ZGL_DEPTH_TEST);
     if (gl->DepthMask) gl->DepthMask(ZGL_FALSE);
     gl->Disable(ZGL_BLEND);
@@ -3693,11 +4213,20 @@ ZAN_GAME_API int32_t zan_game_skybox3d(int32_t surface_id,
     gl->DrawArrays(ZGL_TRIANGLES, 0, 3);
     gl->BindVertexArray(0);
     if (gl->DepthMask) gl->DepthMask(ZGL_TRUE);
-    gl->Finish();
-    result = gl->GetError() == ZGL_NO_ERROR;
+    if (in_frame) {
+        gl->Enable(ZGL_DEPTH_TEST);
+        gl->DepthFunc(ZGL_LEQUAL);
+        g_game_cur_prog = 0;
+        g_game_cur_blend = 0;
+        g_game_cur_depth_write = 1;
+    }
+    result = 1;
 
 done:
-    zan_gui_gpu_end(surface_id);
+    if (!in_frame) {
+        zan_game_invalidate_state_cache();
+        zan_gui_gpu_end(surface_id);
+    }
     return result;
 }
 
@@ -3740,46 +4269,63 @@ ZAN_GAME_API void zan_game_set_hemi_ambient3d(int32_t enabled,
 ZAN_GAME_API void zan_game_set_pbr_maps3d(const char *orm_texture,
     float ao_strength) {
     if (!orm_texture || !orm_texture[0]) {
+        if (g_game_orm_key[0] == '\0' && g_game_ao_strength == 1.0f) return;
         g_game_orm_key[0] = '\0';
         g_game_ao_strength = 1.0f;
+        g_game_mat_version++;
         return;
     }
-    snprintf(g_game_orm_key, sizeof(g_game_orm_key), "%s", orm_texture);
     if (ao_strength < 0.0f) ao_strength = 0.0f;
     if (ao_strength > 1.0f) ao_strength = 1.0f;
+    if (g_game_ao_strength == ao_strength && strcmp(g_game_orm_key, orm_texture) == 0) return;
+    snprintf(g_game_orm_key, sizeof(g_game_orm_key), "%s", orm_texture);
     g_game_ao_strength = ao_strength;
+    g_game_mat_version++;
 }
 
 ZAN_GAME_API void zan_game_set_alpha_cutoff3d(float cutoff) {
-    if (cutoff <= 0.0f) {
-        g_game_alpha_cutoff = 0.0f;
-        return;
-    }
-    if (cutoff > 1.0f) cutoff = 1.0f;
+    if (cutoff <= 0.0f) cutoff = 0.0f;
+    else if (cutoff > 1.0f) cutoff = 1.0f;
+    if (g_game_alpha_cutoff == cutoff) return;
     g_game_alpha_cutoff = cutoff;
+    g_game_mat_version++;
 }
 
 ZAN_GAME_API void zan_game_set_emissive_map3d(const char *texture) {
     if (!texture || !texture[0]) {
+        if (g_game_emissive_key[0] == '\0') return;
         g_game_emissive_key[0] = '\0';
+        g_game_mat_version++;
         return;
     }
+    if (strcmp(g_game_emissive_key, texture) == 0) return;
     snprintf(g_game_emissive_key, sizeof(g_game_emissive_key), "%s", texture);
+    g_game_mat_version++;
 }
 
 ZAN_GAME_API void zan_game_set_uv_transform3d(float scale_u, float scale_v,
     float offset_u, float offset_v) {
+    if (g_game_uv_transform[0] == scale_u && g_game_uv_transform[1] == scale_v &&
+        g_game_uv_transform[2] == offset_u && g_game_uv_transform[3] == offset_v) return;
     g_game_uv_transform[0] = scale_u;
     g_game_uv_transform[1] = scale_v;
     g_game_uv_transform[2] = offset_u;
     g_game_uv_transform[3] = offset_v;
+    g_game_mat_version++;
 }
 
 ZAN_GAME_API void zan_game_set_rim_light3d(float r, float g, float b, float power) {
-    g_game_rim_light[0] = r > 0.0f ? r : 0.0f;
-    g_game_rim_light[1] = g > 0.0f ? g : 0.0f;
-    g_game_rim_light[2] = b > 0.0f ? b : 0.0f;
-    g_game_rim_light[3] = power >= 0.25f ? power : 0.25f;
+    float nr = r > 0.0f ? r : 0.0f;
+    float ng = g > 0.0f ? g : 0.0f;
+    float nb = b > 0.0f ? b : 0.0f;
+    float np = power >= 0.25f ? power : 0.25f;
+    if (g_game_rim_light[0] == nr && g_game_rim_light[1] == ng &&
+        g_game_rim_light[2] == nb && g_game_rim_light[3] == np) return;
+    g_game_rim_light[0] = nr;
+    g_game_rim_light[1] = ng;
+    g_game_rim_light[2] = nb;
+    g_game_rim_light[3] = np;
+    g_game_vfx_version++;
 }
 
 ZAN_GAME_API void zan_game_set_color_grade3d(float saturation, float contrast,
@@ -3792,10 +4338,13 @@ ZAN_GAME_API void zan_game_set_color_grade3d(float saturation, float contrast,
 }
 
 ZAN_GAME_API void zan_game_set_toon_shading3d(float bands, float specular_step) {
-    g_game_toon[0] = bands >= 2.0f ? bands : 0.0f;
+    float nb = bands >= 2.0f ? bands : 0.0f;
     if (specular_step < 0.05f) specular_step = 0.05f;
     if (specular_step > 0.98f) specular_step = 0.98f;
+    if (g_game_toon[0] == nb && g_game_toon[1] == specular_step) return;
+    g_game_toon[0] = nb;
     g_game_toon[1] = specular_step;
+    g_game_vfx_version++;
 }
 
 ZAN_GAME_API void zan_game_set_post_lens3d(float fxaa_strength, float chromatic_strength) {
@@ -3813,49 +4362,83 @@ ZAN_GAME_API void zan_game_set_dissolve3d(float threshold, float edge_width,
     if (threshold > 1.2f) threshold = 1.2f;
     if (edge_width < 0.0f) edge_width = 0.0f;
     if (edge_width > 0.5f) edge_width = 0.5f;
+    float er = edge_r > 0.0f ? edge_r : 0.0f;
+    float eg = edge_g > 0.0f ? edge_g : 0.0f;
+    float eb = edge_b > 0.0f ? edge_b : 0.0f;
+    if (g_game_dissolve[0] == threshold && g_game_dissolve[1] == edge_width &&
+        g_game_dissolve_edge[0] == er && g_game_dissolve_edge[1] == eg &&
+        g_game_dissolve_edge[2] == eb) return;
     g_game_dissolve[0] = threshold;
     g_game_dissolve[1] = edge_width;
-    g_game_dissolve_edge[0] = edge_r > 0.0f ? edge_r : 0.0f;
-    g_game_dissolve_edge[1] = edge_g > 0.0f ? edge_g : 0.0f;
-    g_game_dissolve_edge[2] = edge_b > 0.0f ? edge_b : 0.0f;
+    g_game_dissolve_edge[0] = er;
+    g_game_dissolve_edge[1] = eg;
+    g_game_dissolve_edge[2] = eb;
+    g_game_vfx_version++;
 }
 
 ZAN_GAME_API void zan_game_set_clip_plane3d(int32_t enabled,
     float nx, float ny, float nz, float d) {
-    g_game_clip_on = enabled ? 1 : 0;
+    int on = enabled ? 1 : 0;
+    if (g_game_clip_on == on && g_game_clip_plane[0] == nx &&
+        g_game_clip_plane[1] == ny && g_game_clip_plane[2] == nz &&
+        g_game_clip_plane[3] == d) return;
+    g_game_clip_on = on;
     g_game_clip_plane[0] = nx;
     g_game_clip_plane[1] = ny;
     g_game_clip_plane[2] = nz;
     g_game_clip_plane[3] = d;
+    g_game_light_version++;
 }
 
 ZAN_GAME_API void zan_game_set_triplanar3d(int32_t enabled, float scale,
     float sharpness) {
-    g_game_triplanar[0] = enabled ? 1.0f : 0.0f;
-    g_game_triplanar[1] = scale > 0.0001f ? scale : 1.0f;
-    g_game_triplanar[2] = sharpness >= 1.0f ? sharpness : 4.0f;
+    float p0 = enabled ? 1.0f : 0.0f;
+    float p1 = scale > 0.0001f ? scale : 1.0f;
+    float p2 = sharpness >= 1.0f ? sharpness : 4.0f;
+    if (g_game_triplanar[0] == p0 && g_game_triplanar[1] == p1 &&
+        g_game_triplanar[2] == p2) return;
+    g_game_triplanar[0] = p0;
+    g_game_triplanar[1] = p1;
+    g_game_triplanar[2] = p2;
+    g_game_vfx_version++;
 }
 
 ZAN_GAME_API void zan_game_set_height_fog3d(int32_t enabled, float base_y,
     float falloff, float max_density, float r, float g, float b) {
-    g_game_height_fog_params[0] = base_y;
-    g_game_height_fog_params[1] = falloff > 0.001f ? falloff : 0.001f;
+    float p1 = falloff > 0.001f ? falloff : 0.001f;
     if (max_density < 0.0f) max_density = 0.0f;
     if (max_density > 1.0f) max_density = 1.0f;
+    float p3 = enabled ? 1.0f : 0.0f;
+    float cr = r > 0.0f ? r : 0.0f;
+    float cg = g > 0.0f ? g : 0.0f;
+    float cb = b > 0.0f ? b : 0.0f;
+    if (g_game_height_fog_params[0] == base_y && g_game_height_fog_params[1] == p1 &&
+        g_game_height_fog_params[2] == max_density && g_game_height_fog_params[3] == p3 &&
+        g_game_height_fog_color[0] == cr && g_game_height_fog_color[1] == cg &&
+        g_game_height_fog_color[2] == cb) return;
+    g_game_height_fog_params[0] = base_y;
+    g_game_height_fog_params[1] = p1;
     g_game_height_fog_params[2] = max_density;
-    g_game_height_fog_params[3] = enabled ? 1.0f : 0.0f;
-    g_game_height_fog_color[0] = r > 0.0f ? r : 0.0f;
-    g_game_height_fog_color[1] = g > 0.0f ? g : 0.0f;
-    g_game_height_fog_color[2] = b > 0.0f ? b : 0.0f;
+    g_game_height_fog_params[3] = p3;
+    g_game_height_fog_color[0] = cr;
+    g_game_height_fog_color[1] = cg;
+    g_game_height_fog_color[2] = cb;
+    g_game_light_version++;
 }
 
 ZAN_GAME_API void zan_game_set_hit_flash3d(float r, float g, float b, float amount) {
-    g_game_hit_flash[0] = r > 0.0f ? r : 0.0f;
-    g_game_hit_flash[1] = g > 0.0f ? g : 0.0f;
-    g_game_hit_flash[2] = b > 0.0f ? b : 0.0f;
+    float nr = r > 0.0f ? r : 0.0f;
+    float ng = g > 0.0f ? g : 0.0f;
+    float nb = b > 0.0f ? b : 0.0f;
     if (amount < 0.0f) amount = 0.0f;
     if (amount > 1.0f) amount = 1.0f;
+    if (g_game_hit_flash[0] == nr && g_game_hit_flash[1] == ng &&
+        g_game_hit_flash[2] == nb && g_game_hit_flash[3] == amount) return;
+    g_game_hit_flash[0] = nr;
+    g_game_hit_flash[1] = ng;
+    g_game_hit_flash[2] = nb;
     g_game_hit_flash[3] = amount;
+    g_game_vfx_version++;
 }
 
 ZAN_GAME_API void zan_game_set_post_film3d(float sharpen_strength,
@@ -3871,15 +4454,25 @@ ZAN_GAME_API void zan_game_set_post_film3d(float sharpen_strength,
 
 ZAN_GAME_API void zan_game_set_holo_scan3d(int32_t enabled, float freq,
     float phase, float strength, float r, float g, float b) {
-    g_game_holo_scan_params[0] = enabled ? 1.0f : 0.0f;
-    g_game_holo_scan_params[1] = freq > 0.001f ? freq : 12.0f;
-    g_game_holo_scan_params[2] = phase;
+    float p0 = enabled ? 1.0f : 0.0f;
+    float p1 = freq > 0.001f ? freq : 12.0f;
     if (strength < 0.0f) strength = 0.0f;
     if (strength > 2.0f) strength = 2.0f;
+    float cr = r > 0.0f ? r : 0.0f;
+    float cg = g > 0.0f ? g : 0.0f;
+    float cb = b > 0.0f ? b : 0.0f;
+    if (g_game_holo_scan_params[0] == p0 && g_game_holo_scan_params[1] == p1 &&
+        g_game_holo_scan_params[2] == phase && g_game_holo_scan_params[3] == strength &&
+        g_game_holo_scan_color[0] == cr && g_game_holo_scan_color[1] == cg &&
+        g_game_holo_scan_color[2] == cb) return;
+    g_game_holo_scan_params[0] = p0;
+    g_game_holo_scan_params[1] = p1;
+    g_game_holo_scan_params[2] = phase;
     g_game_holo_scan_params[3] = strength;
-    g_game_holo_scan_color[0] = r > 0.0f ? r : 0.0f;
-    g_game_holo_scan_color[1] = g > 0.0f ? g : 0.0f;
-    g_game_holo_scan_color[2] = b > 0.0f ? b : 0.0f;
+    g_game_holo_scan_color[0] = cr;
+    g_game_holo_scan_color[1] = cg;
+    g_game_holo_scan_color[2] = cb;
+    g_game_vfx_version++;
 }
 
 ZAN_GAME_API void zan_game_set_post_cinema3d(float letterbox_ratio,
@@ -3896,19 +4489,28 @@ ZAN_GAME_API void zan_game_set_post_cinema3d(float letterbox_ratio,
 
 ZAN_GAME_API void zan_game_set_top_cover3d(int32_t enabled, float threshold,
     float sharpness, float amount, float r, float g, float b) {
-    g_game_top_cover_params[0] = enabled ? 1.0f : 0.0f;
+    float p0 = enabled ? 1.0f : 0.0f;
     if (threshold < -1.0f) threshold = -1.0f;
     if (threshold > 1.0f) threshold = 1.0f;
-    g_game_top_cover_params[1] = threshold;
     if (sharpness < 0.01f) sharpness = 0.01f;
     if (sharpness > 1.0f) sharpness = 1.0f;
-    g_game_top_cover_params[2] = sharpness;
     if (amount < 0.0f) amount = 0.0f;
     if (amount > 1.0f) amount = 1.0f;
+    float cr = r > 0.0f ? r : 0.0f;
+    float cg = g > 0.0f ? g : 0.0f;
+    float cb = b > 0.0f ? b : 0.0f;
+    if (g_game_top_cover_params[0] == p0 && g_game_top_cover_params[1] == threshold &&
+        g_game_top_cover_params[2] == sharpness && g_game_top_cover_params[3] == amount &&
+        g_game_top_cover_color[0] == cr && g_game_top_cover_color[1] == cg &&
+        g_game_top_cover_color[2] == cb) return;
+    g_game_top_cover_params[0] = p0;
+    g_game_top_cover_params[1] = threshold;
+    g_game_top_cover_params[2] = sharpness;
     g_game_top_cover_params[3] = amount;
-    g_game_top_cover_color[0] = r > 0.0f ? r : 0.0f;
-    g_game_top_cover_color[1] = g > 0.0f ? g : 0.0f;
-    g_game_top_cover_color[2] = b > 0.0f ? b : 0.0f;
+    g_game_top_cover_color[0] = cr;
+    g_game_top_cover_color[1] = cg;
+    g_game_top_cover_color[2] = cb;
+    g_game_vfx_version++;
 }
 
 ZAN_GAME_API void zan_game_set_post_radial_blur3d(float strength,
@@ -3927,14 +4529,21 @@ ZAN_GAME_API void zan_game_set_post_radial_blur3d(float strength,
 ZAN_GAME_API void zan_game_set_wind_sway3d(int32_t enabled, float amplitude,
     float freq, float phase, float height_scale) {
     if (!enabled || amplitude <= 0.0f) {
+        if (g_game_wind_params[0] == 0.0f) return;
         g_game_wind_params[0] = 0.0f;
+        g_game_vfx_version++;
         return;
     }
     if (amplitude > 2.0f) amplitude = 2.0f;
+    float p1 = freq > 0.0f ? freq : 1.5f;
+    float p3 = height_scale > 0.0f ? height_scale : 1.0f;
+    if (g_game_wind_params[0] == amplitude && g_game_wind_params[1] == p1 &&
+        g_game_wind_params[2] == phase && g_game_wind_params[3] == p3) return;
     g_game_wind_params[0] = amplitude;
-    g_game_wind_params[1] = freq > 0.0f ? freq : 1.5f;
+    g_game_wind_params[1] = p1;
     g_game_wind_params[2] = phase;
-    g_game_wind_params[3] = height_scale > 0.0f ? height_scale : 1.0f;
+    g_game_wind_params[3] = p3;
+    g_game_vfx_version++;
 }
 
 ZAN_GAME_API void zan_game_set_post_pixelate3d(float pixel_size,
@@ -3949,9 +4558,13 @@ ZAN_GAME_API void zan_game_set_post_pixelate3d(float pixel_size,
 
 ZAN_GAME_API void zan_game_set_distance_fade3d(int32_t enabled,
     float start_dist, float end_dist) {
-    g_game_dist_fade[0] = enabled ? 1.0f : 0.0f;
+    float p0 = enabled ? 1.0f : 0.0f;
+    if (g_game_dist_fade[0] == p0 && g_game_dist_fade[1] == start_dist &&
+        g_game_dist_fade[2] == end_dist) return;
+    g_game_dist_fade[0] = p0;
     g_game_dist_fade[1] = start_dist;
     g_game_dist_fade[2] = end_dist;
+    g_game_vfx_version++;
 }
 
 ZAN_GAME_API void zan_game_set_post_duotone3d(float strength,
@@ -3970,17 +4583,27 @@ ZAN_GAME_API void zan_game_set_post_duotone3d(float strength,
 
 ZAN_GAME_API void zan_game_set_world_grid3d(int32_t enabled, float cell_size,
     float line_width, float strength, float r, float g, float b) {
-    g_game_world_grid_params[0] = enabled ? 1.0f : 0.0f;
-    g_game_world_grid_params[1] = cell_size > 0.05f ? cell_size : 1.0f;
+    float p0 = enabled ? 1.0f : 0.0f;
+    float p1 = cell_size > 0.05f ? cell_size : 1.0f;
     if (line_width < 0.005f) line_width = 0.005f;
     if (line_width > 0.45f) line_width = 0.45f;
-    g_game_world_grid_params[2] = line_width;
     if (strength < 0.0f) strength = 0.0f;
     if (strength > 1.0f) strength = 1.0f;
+    float cr = r > 0.0f ? r : 0.0f;
+    float cg = g > 0.0f ? g : 0.0f;
+    float cb = b > 0.0f ? b : 0.0f;
+    if (g_game_world_grid_params[0] == p0 && g_game_world_grid_params[1] == p1 &&
+        g_game_world_grid_params[2] == line_width && g_game_world_grid_params[3] == strength &&
+        g_game_world_grid_color[0] == cr && g_game_world_grid_color[1] == cg &&
+        g_game_world_grid_color[2] == cb) return;
+    g_game_world_grid_params[0] = p0;
+    g_game_world_grid_params[1] = p1;
+    g_game_world_grid_params[2] = line_width;
     g_game_world_grid_params[3] = strength;
-    g_game_world_grid_color[0] = r > 0.0f ? r : 0.0f;
-    g_game_world_grid_color[1] = g > 0.0f ? g : 0.0f;
-    g_game_world_grid_color[2] = b > 0.0f ? b : 0.0f;
+    g_game_world_grid_color[0] = cr;
+    g_game_world_grid_color[1] = cg;
+    g_game_world_grid_color[2] = cb;
+    g_game_vfx_version++;
 }
 
 ZAN_GAME_API void zan_game_set_post_crt_scanline3d(float scanline_intensity,
@@ -3999,15 +4622,25 @@ ZAN_GAME_API void zan_game_set_post_crt_scanline3d(float scanline_intensity,
 
 ZAN_GAME_API void zan_game_set_water_caustics3d(int32_t enabled, float scale,
     float phase, float strength, float r, float g, float b) {
-    g_game_caustics_params[0] = enabled ? 1.0f : 0.0f;
-    g_game_caustics_params[1] = scale > 0.1f ? scale : 1.0f;
-    g_game_caustics_params[2] = phase;
+    float p0 = enabled ? 1.0f : 0.0f;
+    float p1 = scale > 0.1f ? scale : 1.0f;
     if (strength < 0.0f) strength = 0.0f;
     if (strength > 2.0f) strength = 2.0f;
+    float cr = r > 0.0f ? r : 0.0f;
+    float cg = g > 0.0f ? g : 0.0f;
+    float cb = b > 0.0f ? b : 0.0f;
+    if (g_game_caustics_params[0] == p0 && g_game_caustics_params[1] == p1 &&
+        g_game_caustics_params[2] == phase && g_game_caustics_params[3] == strength &&
+        g_game_caustics_color[0] == cr && g_game_caustics_color[1] == cg &&
+        g_game_caustics_color[2] == cb) return;
+    g_game_caustics_params[0] = p0;
+    g_game_caustics_params[1] = p1;
+    g_game_caustics_params[2] = phase;
     g_game_caustics_params[3] = strength;
-    g_game_caustics_color[0] = r > 0.0f ? r : 0.0f;
-    g_game_caustics_color[1] = g > 0.0f ? g : 0.0f;
-    g_game_caustics_color[2] = b > 0.0f ? b : 0.0f;
+    g_game_caustics_color[0] = cr;
+    g_game_caustics_color[1] = cg;
+    g_game_caustics_color[2] = cb;
+    g_game_vfx_version++;
 }
 
 ZAN_GAME_API void zan_game_set_post_edge_outline3d(float strength,
@@ -4025,17 +4658,27 @@ ZAN_GAME_API void zan_game_set_post_edge_outline3d(float strength,
 
 ZAN_GAME_API void zan_game_set_ice_frost3d(int32_t enabled, float scale,
     float glint_strength, float fresnel_power, float r, float g, float b) {
-    g_game_ice_frost_params[0] = enabled ? 1.0f : 0.0f;
-    g_game_ice_frost_params[1] = scale > 0.2f ? scale : 2.0f;
+    float p0 = enabled ? 1.0f : 0.0f;
+    float p1 = scale > 0.2f ? scale : 2.0f;
     if (glint_strength < 0.0f) glint_strength = 0.0f;
     if (glint_strength > 2.0f) glint_strength = 2.0f;
-    g_game_ice_frost_params[2] = glint_strength;
     if (fresnel_power < 0.5f) fresnel_power = 0.5f;
     if (fresnel_power > 8.0f) fresnel_power = 8.0f;
+    float cr = r > 0.0f ? r : 0.0f;
+    float cg = g > 0.0f ? g : 0.0f;
+    float cb = b > 0.0f ? b : 0.0f;
+    if (g_game_ice_frost_params[0] == p0 && g_game_ice_frost_params[1] == p1 &&
+        g_game_ice_frost_params[2] == glint_strength && g_game_ice_frost_params[3] == fresnel_power &&
+        g_game_ice_frost_color[0] == cr && g_game_ice_frost_color[1] == cg &&
+        g_game_ice_frost_color[2] == cb) return;
+    g_game_ice_frost_params[0] = p0;
+    g_game_ice_frost_params[1] = p1;
+    g_game_ice_frost_params[2] = glint_strength;
     g_game_ice_frost_params[3] = fresnel_power;
-    g_game_ice_frost_color[0] = r > 0.0f ? r : 0.0f;
-    g_game_ice_frost_color[1] = g > 0.0f ? g : 0.0f;
-    g_game_ice_frost_color[2] = b > 0.0f ? b : 0.0f;
+    g_game_ice_frost_color[0] = cr;
+    g_game_ice_frost_color[1] = cg;
+    g_game_ice_frost_color[2] = cb;
+    g_game_vfx_version++;
 }
 
 ZAN_GAME_API void zan_game_set_post_thermal_heat3d(float strength,
@@ -4053,18 +4696,28 @@ ZAN_GAME_API void zan_game_set_post_thermal_heat3d(float strength,
 
 ZAN_GAME_API void zan_game_set_lava_crust3d(int32_t enabled, float scale,
     float phase, float crack_width, float strength, float r, float g, float b) {
-    g_game_lava_crust_params[0] = enabled ? 1.0f : 0.0f;
-    g_game_lava_crust_params[1] = scale > 0.2f ? scale : 1.5f;
-    g_game_lava_crust_params[2] = phase;
+    float p0 = enabled ? 1.0f : 0.0f;
+    float p1 = scale > 0.2f ? scale : 1.5f;
     if (crack_width < 0.02f) crack_width = 0.02f;
     if (crack_width > 0.6f) crack_width = 0.6f;
-    g_game_lava_crust_params[3] = crack_width;
-    g_game_lava_crust_color[0] = r > 0.0f ? r : 0.0f;
-    g_game_lava_crust_color[1] = g > 0.0f ? g : 0.0f;
-    g_game_lava_crust_color[2] = b > 0.0f ? b : 0.0f;
+    float cr = r > 0.0f ? r : 0.0f;
+    float cg = g > 0.0f ? g : 0.0f;
+    float cb = b > 0.0f ? b : 0.0f;
     if (strength < 0.0f) strength = 0.0f;
     if (strength > 3.0f) strength = 3.0f;
+    if (g_game_lava_crust_params[0] == p0 && g_game_lava_crust_params[1] == p1 &&
+        g_game_lava_crust_params[2] == phase && g_game_lava_crust_params[3] == crack_width &&
+        g_game_lava_crust_color[0] == cr && g_game_lava_crust_color[1] == cg &&
+        g_game_lava_crust_color[2] == cb && g_game_lava_crust_color[3] == strength) return;
+    g_game_lava_crust_params[0] = p0;
+    g_game_lava_crust_params[1] = p1;
+    g_game_lava_crust_params[2] = phase;
+    g_game_lava_crust_params[3] = crack_width;
+    g_game_lava_crust_color[0] = cr;
+    g_game_lava_crust_color[1] = cg;
+    g_game_lava_crust_color[2] = cb;
     g_game_lava_crust_color[3] = strength;
+    g_game_vfx_version++;
 }
 
 ZAN_GAME_API void zan_game_set_post_screen_tint_flash3d(float edge_strength,
@@ -4082,14 +4735,18 @@ ZAN_GAME_API void zan_game_set_post_screen_tint_flash3d(float edge_strength,
 
 ZAN_GAME_API void zan_game_set_iridescence3d(int32_t enabled,
     float film_thickness, float phase_shift, float strength) {
-    g_game_iridescence_params[0] = enabled ? 1.0f : 0.0f;
+    float p0 = enabled ? 1.0f : 0.0f;
     if (film_thickness < 0.5f) film_thickness = 0.5f;
     if (film_thickness > 6.0f) film_thickness = 6.0f;
-    g_game_iridescence_params[1] = film_thickness;
-    g_game_iridescence_params[2] = phase_shift;
     if (strength < 0.0f) strength = 0.0f;
     if (strength > 2.0f) strength = 2.0f;
+    if (g_game_iridescence_params[0] == p0 && g_game_iridescence_params[1] == film_thickness &&
+        g_game_iridescence_params[2] == phase_shift && g_game_iridescence_params[3] == strength) return;
+    g_game_iridescence_params[0] = p0;
+    g_game_iridescence_params[1] = film_thickness;
+    g_game_iridescence_params[2] = phase_shift;
     g_game_iridescence_params[3] = strength;
+    g_game_vfx_version++;
 }
 
 ZAN_GAME_API void zan_game_set_post_night_vision3d(float strength, float gain,
@@ -4109,18 +4766,30 @@ ZAN_GAME_API void zan_game_set_post_night_vision3d(float strength, float gain,
 ZAN_GAME_API void zan_game_set_sonar_pulse3d(int32_t enabled,
     float origin_x, float origin_y, float origin_z,
     float radius, float ring_width, float strength, float r, float g, float b) {
+    float nr = radius > 0.05f ? radius : 0.05f;
+    float s0 = enabled ? 1.0f : 0.0f;
+    float s1 = ring_width > 0.05f ? ring_width : 0.05f;
+    if (strength < 0.0f) strength = 0.0f;
+    if (strength > 3.0f) strength = 3.0f;
+    float cr = r > 0.0f ? r : 0.0f;
+    float cg = g > 0.0f ? g : 0.0f;
+    float cb = b > 0.0f ? b : 0.0f;
+    if (g_game_sonar_origin_radius[0] == origin_x && g_game_sonar_origin_radius[1] == origin_y &&
+        g_game_sonar_origin_radius[2] == origin_z && g_game_sonar_origin_radius[3] == nr &&
+        g_game_sonar_style[0] == s0 && g_game_sonar_style[1] == s1 &&
+        g_game_sonar_style[2] == strength && g_game_sonar_color[0] == cr &&
+        g_game_sonar_color[1] == cg && g_game_sonar_color[2] == cb) return;
     g_game_sonar_origin_radius[0] = origin_x;
     g_game_sonar_origin_radius[1] = origin_y;
     g_game_sonar_origin_radius[2] = origin_z;
-    g_game_sonar_origin_radius[3] = radius > 0.05f ? radius : 0.05f;
-    g_game_sonar_style[0] = enabled ? 1.0f : 0.0f;
-    g_game_sonar_style[1] = ring_width > 0.05f ? ring_width : 0.05f;
-    if (strength < 0.0f) strength = 0.0f;
-    if (strength > 3.0f) strength = 3.0f;
+    g_game_sonar_origin_radius[3] = nr;
+    g_game_sonar_style[0] = s0;
+    g_game_sonar_style[1] = s1;
     g_game_sonar_style[2] = strength;
-    g_game_sonar_color[0] = r > 0.0f ? r : 0.0f;
-    g_game_sonar_color[1] = g > 0.0f ? g : 0.0f;
-    g_game_sonar_color[2] = b > 0.0f ? b : 0.0f;
+    g_game_sonar_color[0] = cr;
+    g_game_sonar_color[1] = cg;
+    g_game_sonar_color[2] = cb;
+    g_game_vfx_version++;
 }
 
 ZAN_GAME_API void zan_game_set_post_halftone_comic3d(float strength,
@@ -4139,18 +4808,28 @@ ZAN_GAME_API void zan_game_set_post_halftone_comic3d(float strength,
 ZAN_GAME_API void zan_game_set_force_field_hex3d(int32_t enabled,
     float scale, float phase, float edge_width, float strength,
     float r, float g, float b) {
-    g_game_force_field_params[0] = enabled ? 1.0f : 0.0f;
-    g_game_force_field_params[1] = scale > 0.25f ? scale : 2.0f;
-    g_game_force_field_params[2] = phase;
+    float p0 = enabled ? 1.0f : 0.0f;
+    float p1 = scale > 0.25f ? scale : 2.0f;
     if (edge_width < 0.02f) edge_width = 0.02f;
     if (edge_width > 0.35f) edge_width = 0.35f;
-    g_game_force_field_params[3] = edge_width;
-    g_game_force_field_color[0] = r > 0.0f ? r : 0.0f;
-    g_game_force_field_color[1] = g > 0.0f ? g : 0.0f;
-    g_game_force_field_color[2] = b > 0.0f ? b : 0.0f;
+    float cr = r > 0.0f ? r : 0.0f;
+    float cg = g > 0.0f ? g : 0.0f;
+    float cb = b > 0.0f ? b : 0.0f;
     if (strength < 0.0f) strength = 0.0f;
     if (strength > 3.0f) strength = 3.0f;
+    if (g_game_force_field_params[0] == p0 && g_game_force_field_params[1] == p1 &&
+        g_game_force_field_params[2] == phase && g_game_force_field_params[3] == edge_width &&
+        g_game_force_field_color[0] == cr && g_game_force_field_color[1] == cg &&
+        g_game_force_field_color[2] == cb && g_game_force_field_color[3] == strength) return;
+    g_game_force_field_params[0] = p0;
+    g_game_force_field_params[1] = p1;
+    g_game_force_field_params[2] = phase;
+    g_game_force_field_params[3] = edge_width;
+    g_game_force_field_color[0] = cr;
+    g_game_force_field_color[1] = cg;
+    g_game_force_field_color[2] = cb;
     g_game_force_field_color[3] = strength;
+    g_game_vfx_version++;
 }
 
 ZAN_GAME_API void zan_game_set_post_glitch_rgb3d(float intensity,
@@ -4166,15 +4845,25 @@ ZAN_GAME_API void zan_game_set_post_glitch_rgb3d(float intensity,
 
 ZAN_GAME_API void zan_game_set_rain_ripples3d(int32_t enabled, float scale,
     float phase, float strength, float r, float g, float b) {
-    g_game_rain_ripples_params[0] = enabled ? 1.0f : 0.0f;
-    g_game_rain_ripples_params[1] = scale > 0.25f ? scale : 2.0f;
-    g_game_rain_ripples_params[2] = phase;
+    float p0 = enabled ? 1.0f : 0.0f;
+    float p1 = scale > 0.25f ? scale : 2.0f;
     if (strength < 0.0f) strength = 0.0f;
     if (strength > 3.0f) strength = 3.0f;
+    float cr = r > 0.0f ? r : 0.0f;
+    float cg = g > 0.0f ? g : 0.0f;
+    float cb = b > 0.0f ? b : 0.0f;
+    if (g_game_rain_ripples_params[0] == p0 && g_game_rain_ripples_params[1] == p1 &&
+        g_game_rain_ripples_params[2] == phase && g_game_rain_ripples_params[3] == strength &&
+        g_game_rain_ripples_color[0] == cr && g_game_rain_ripples_color[1] == cg &&
+        g_game_rain_ripples_color[2] == cb) return;
+    g_game_rain_ripples_params[0] = p0;
+    g_game_rain_ripples_params[1] = p1;
+    g_game_rain_ripples_params[2] = phase;
     g_game_rain_ripples_params[3] = strength;
-    g_game_rain_ripples_color[0] = r > 0.0f ? r : 0.0f;
-    g_game_rain_ripples_color[1] = g > 0.0f ? g : 0.0f;
-    g_game_rain_ripples_color[2] = b > 0.0f ? b : 0.0f;
+    g_game_rain_ripples_color[0] = cr;
+    g_game_rain_ripples_color[1] = cg;
+    g_game_rain_ripples_color[2] = cb;
+    g_game_vfx_version++;
 }
 
 ZAN_GAME_API void zan_game_set_post_tilt_shift3d(float strength,
@@ -4192,16 +4881,24 @@ ZAN_GAME_API void zan_game_set_post_tilt_shift3d(float strength,
 
 ZAN_GAME_API void zan_game_set_xray_silhouette3d(int32_t enabled, float power,
     float strength, float r, float g, float b) {
-    g_game_xray_params[0] = enabled ? 1.0f : 0.0f;
+    float p0 = enabled ? 1.0f : 0.0f;
     if (power < 0.5f) power = 0.5f;
     if (power > 8.0f) power = 8.0f;
-    g_game_xray_params[1] = power;
     if (strength < 0.0f) strength = 0.0f;
     if (strength > 3.0f) strength = 3.0f;
+    float cr = r > 0.0f ? r : 0.0f;
+    float cg = g > 0.0f ? g : 0.0f;
+    float cb = b > 0.0f ? b : 0.0f;
+    if (g_game_xray_params[0] == p0 && g_game_xray_params[1] == power &&
+        g_game_xray_params[2] == strength && g_game_xray_color[0] == cr &&
+        g_game_xray_color[1] == cg && g_game_xray_color[2] == cb) return;
+    g_game_xray_params[0] = p0;
+    g_game_xray_params[1] = power;
     g_game_xray_params[2] = strength;
-    g_game_xray_color[0] = r > 0.0f ? r : 0.0f;
-    g_game_xray_color[1] = g > 0.0f ? g : 0.0f;
-    g_game_xray_color[2] = b > 0.0f ? b : 0.0f;
+    g_game_xray_color[0] = cr;
+    g_game_xray_color[1] = cg;
+    g_game_xray_color[2] = cb;
+    g_game_vfx_version++;
 }
 
 ZAN_GAME_API void zan_game_set_post_vignette_frost3d(float intensity,
@@ -4219,15 +4916,24 @@ ZAN_GAME_API void zan_game_set_post_vignette_frost3d(float intensity,
 
 ZAN_GAME_API void zan_game_set_portal_vortex3d(int32_t enabled,
     float swirl_turns, float phase, float strength, float r, float g, float b) {
-    g_game_portal_vortex_params[0] = enabled ? 1.0f : 0.0f;
-    g_game_portal_vortex_params[1] = swirl_turns;
-    g_game_portal_vortex_params[2] = phase;
+    float p0 = enabled ? 1.0f : 0.0f;
     if (strength < 0.0f) strength = 0.0f;
     if (strength > 3.0f) strength = 3.0f;
+    float cr = r > 0.0f ? r : 0.0f;
+    float cg = g > 0.0f ? g : 0.0f;
+    float cb = b > 0.0f ? b : 0.0f;
+    if (g_game_portal_vortex_params[0] == p0 && g_game_portal_vortex_params[1] == swirl_turns &&
+        g_game_portal_vortex_params[2] == phase && g_game_portal_vortex_params[3] == strength &&
+        g_game_portal_vortex_color[0] == cr && g_game_portal_vortex_color[1] == cg &&
+        g_game_portal_vortex_color[2] == cb) return;
+    g_game_portal_vortex_params[0] = p0;
+    g_game_portal_vortex_params[1] = swirl_turns;
+    g_game_portal_vortex_params[2] = phase;
     g_game_portal_vortex_params[3] = strength;
-    g_game_portal_vortex_color[0] = r > 0.0f ? r : 0.0f;
-    g_game_portal_vortex_color[1] = g > 0.0f ? g : 0.0f;
-    g_game_portal_vortex_color[2] = b > 0.0f ? b : 0.0f;
+    g_game_portal_vortex_color[0] = cr;
+    g_game_portal_vortex_color[1] = cg;
+    g_game_portal_vortex_color[2] = cb;
+    g_game_vfx_version++;
 }
 
 ZAN_GAME_API void zan_game_set_post_sepia_vintage3d(float strength,
@@ -4244,17 +4950,27 @@ ZAN_GAME_API void zan_game_set_post_sepia_vintage3d(float strength,
 ZAN_GAME_API void zan_game_set_blueprint_wire3d(int32_t enabled,
     float grid_density, float line_width, float strength,
     float r, float g, float b) {
-    g_game_blueprint_wire_params[0] = enabled ? 1.0f : 0.0f;
-    g_game_blueprint_wire_params[1] = grid_density > 0.25f ? grid_density : 2.0f;
+    float p0 = enabled ? 1.0f : 0.0f;
+    float p1 = grid_density > 0.25f ? grid_density : 2.0f;
     if (line_width < 0.01f) line_width = 0.01f;
     if (line_width > 0.25f) line_width = 0.25f;
-    g_game_blueprint_wire_params[2] = line_width;
     if (strength < 0.0f) strength = 0.0f;
     if (strength > 3.0f) strength = 3.0f;
+    float cr = r > 0.0f ? r : 0.0f;
+    float cg = g > 0.0f ? g : 0.0f;
+    float cb = b > 0.0f ? b : 0.0f;
+    if (g_game_blueprint_wire_params[0] == p0 && g_game_blueprint_wire_params[1] == p1 &&
+        g_game_blueprint_wire_params[2] == line_width && g_game_blueprint_wire_params[3] == strength &&
+        g_game_blueprint_wire_color[0] == cr && g_game_blueprint_wire_color[1] == cg &&
+        g_game_blueprint_wire_color[2] == cb) return;
+    g_game_blueprint_wire_params[0] = p0;
+    g_game_blueprint_wire_params[1] = p1;
+    g_game_blueprint_wire_params[2] = line_width;
     g_game_blueprint_wire_params[3] = strength;
-    g_game_blueprint_wire_color[0] = r > 0.0f ? r : 0.0f;
-    g_game_blueprint_wire_color[1] = g > 0.0f ? g : 0.0f;
-    g_game_blueprint_wire_color[2] = b > 0.0f ? b : 0.0f;
+    g_game_blueprint_wire_color[0] = cr;
+    g_game_blueprint_wire_color[1] = cg;
+    g_game_blueprint_wire_color[2] = cb;
+    g_game_vfx_version++;
 }
 
 ZAN_GAME_API void zan_game_set_post_sun_bloom_streak3d(float strength,
@@ -4272,15 +4988,25 @@ ZAN_GAME_API void zan_game_set_post_sun_bloom_streak3d(float strength,
 
 ZAN_GAME_API void zan_game_set_heat_haze_shimmer3d(int32_t enabled,
     float freq, float phase, float strength, float r, float g, float b) {
-    g_game_heat_haze_params[0] = enabled ? 1.0f : 0.0f;
-    g_game_heat_haze_params[1] = freq > 0.5f ? freq : 4.0f;
-    g_game_heat_haze_params[2] = phase;
+    float p0 = enabled ? 1.0f : 0.0f;
+    float p1 = freq > 0.5f ? freq : 4.0f;
     if (strength < 0.0f) strength = 0.0f;
     if (strength > 3.0f) strength = 3.0f;
+    float cr = r > 0.0f ? r : 0.0f;
+    float cg = g > 0.0f ? g : 0.0f;
+    float cb = b > 0.0f ? b : 0.0f;
+    if (g_game_heat_haze_params[0] == p0 && g_game_heat_haze_params[1] == p1 &&
+        g_game_heat_haze_params[2] == phase && g_game_heat_haze_params[3] == strength &&
+        g_game_heat_haze_color[0] == cr && g_game_heat_haze_color[1] == cg &&
+        g_game_heat_haze_color[2] == cb) return;
+    g_game_heat_haze_params[0] = p0;
+    g_game_heat_haze_params[1] = p1;
+    g_game_heat_haze_params[2] = phase;
     g_game_heat_haze_params[3] = strength;
-    g_game_heat_haze_color[0] = r > 0.0f ? r : 0.0f;
-    g_game_heat_haze_color[1] = g > 0.0f ? g : 0.0f;
-    g_game_heat_haze_color[2] = b > 0.0f ? b : 0.0f;
+    g_game_heat_haze_color[0] = cr;
+    g_game_heat_haze_color[1] = cg;
+    g_game_heat_haze_color[2] = cb;
+    g_game_vfx_version++;
 }
 
 ZAN_GAME_API void zan_game_set_post_split_tone3d(float strength, float balance,
@@ -4302,13 +5028,17 @@ ZAN_GAME_API void zan_game_set_post_split_tone3d(float strength, float balance,
 
 ZAN_GAME_API void zan_game_set_pixel_dither_fade3d(int32_t enabled,
     float opacity, float pixel_scale) {
-    g_game_pixel_dither_params[0] = enabled ? 1.0f : 0.0f;
+    float p0 = enabled ? 1.0f : 0.0f;
     if (opacity < 0.0f) opacity = 0.0f;
     if (opacity > 1.0f) opacity = 1.0f;
-    g_game_pixel_dither_params[1] = opacity;
     if (pixel_scale < 1.0f) pixel_scale = 1.0f;
     if (pixel_scale > 8.0f) pixel_scale = 8.0f;
+    if (g_game_pixel_dither_params[0] == p0 && g_game_pixel_dither_params[1] == opacity &&
+        g_game_pixel_dither_params[2] == pixel_scale) return;
+    g_game_pixel_dither_params[0] = p0;
+    g_game_pixel_dither_params[1] = opacity;
     g_game_pixel_dither_params[2] = pixel_scale;
+    g_game_vfx_version++;
 }
 
 ZAN_GAME_API void zan_game_set_post_oil_paint3d(float strength, float radius) {
@@ -4322,14 +5052,23 @@ ZAN_GAME_API void zan_game_set_post_oil_paint3d(float strength, float radius) {
 
 ZAN_GAME_API void zan_game_set_crosshatch_ink3d(int32_t enabled, float density,
     float ink_strength, float r, float g, float b) {
-    g_game_crosshatch_params[0] = enabled ? 1.0f : 0.0f;
-    g_game_crosshatch_params[1] = density > 2.0f ? density : 8.0f;
+    float p0 = enabled ? 1.0f : 0.0f;
+    float p1 = density > 2.0f ? density : 8.0f;
     if (ink_strength < 0.0f) ink_strength = 0.0f;
     if (ink_strength > 1.0f) ink_strength = 1.0f;
+    float cr = r > 0.0f ? r : 0.0f;
+    float cg = g > 0.0f ? g : 0.0f;
+    float cb = b > 0.0f ? b : 0.0f;
+    if (g_game_crosshatch_params[0] == p0 && g_game_crosshatch_params[1] == p1 &&
+        g_game_crosshatch_params[2] == ink_strength && g_game_crosshatch_color[0] == cr &&
+        g_game_crosshatch_color[1] == cg && g_game_crosshatch_color[2] == cb) return;
+    g_game_crosshatch_params[0] = p0;
+    g_game_crosshatch_params[1] = p1;
     g_game_crosshatch_params[2] = ink_strength;
-    g_game_crosshatch_color[0] = r > 0.0f ? r : 0.0f;
-    g_game_crosshatch_color[1] = g > 0.0f ? g : 0.0f;
-    g_game_crosshatch_color[2] = b > 0.0f ? b : 0.0f;
+    g_game_crosshatch_color[0] = cr;
+    g_game_crosshatch_color[1] = cg;
+    g_game_crosshatch_color[2] = cb;
+    g_game_vfx_version++;
 }
 
 ZAN_GAME_API void zan_game_set_post_scope_edge_blur3d(float strength,
@@ -4345,17 +5084,27 @@ ZAN_GAME_API void zan_game_set_post_scope_edge_blur3d(float strength,
 ZAN_GAME_API void zan_game_set_aniso_brushed3d(int32_t enabled,
     float grain_freq, float anisotropy, float strength,
     float r, float g, float b) {
-    g_game_aniso_brushed_params[0] = enabled ? 1.0f : 0.0f;
-    g_game_aniso_brushed_params[1] = grain_freq > 1.0f ? grain_freq : 12.0f;
+    float p0 = enabled ? 1.0f : 0.0f;
+    float p1 = grain_freq > 1.0f ? grain_freq : 12.0f;
     if (anisotropy < 2.0f) anisotropy = 2.0f;
     if (anisotropy > 64.0f) anisotropy = 64.0f;
-    g_game_aniso_brushed_params[2] = anisotropy;
     if (strength < 0.0f) strength = 0.0f;
     if (strength > 3.0f) strength = 3.0f;
+    float cr = r > 0.0f ? r : 0.0f;
+    float cg = g > 0.0f ? g : 0.0f;
+    float cb = b > 0.0f ? b : 0.0f;
+    if (g_game_aniso_brushed_params[0] == p0 && g_game_aniso_brushed_params[1] == p1 &&
+        g_game_aniso_brushed_params[2] == anisotropy && g_game_aniso_brushed_params[3] == strength &&
+        g_game_aniso_brushed_color[0] == cr && g_game_aniso_brushed_color[1] == cg &&
+        g_game_aniso_brushed_color[2] == cb) return;
+    g_game_aniso_brushed_params[0] = p0;
+    g_game_aniso_brushed_params[1] = p1;
+    g_game_aniso_brushed_params[2] = anisotropy;
     g_game_aniso_brushed_params[3] = strength;
-    g_game_aniso_brushed_color[0] = r > 0.0f ? r : 0.0f;
-    g_game_aniso_brushed_color[1] = g > 0.0f ? g : 0.0f;
-    g_game_aniso_brushed_color[2] = b > 0.0f ? b : 0.0f;
+    g_game_aniso_brushed_color[0] = cr;
+    g_game_aniso_brushed_color[1] = cg;
+    g_game_aniso_brushed_color[2] = cb;
+    g_game_vfx_version++;
 }
 
 ZAN_GAME_API void zan_game_set_post_daltonize3d(float mode, float strength) {
@@ -4370,17 +5119,27 @@ ZAN_GAME_API void zan_game_set_post_daltonize3d(float mode, float strength) {
 ZAN_GAME_API void zan_game_set_velvet_sheen3d(int32_t enabled,
     float roughness, float weave_freq, float strength,
     float r, float g, float b) {
-    g_game_velvet_sheen_params[0] = enabled ? 1.0f : 0.0f;
+    float p0 = enabled ? 1.0f : 0.0f;
     if (roughness < 0.12f) roughness = 0.12f;
     if (roughness > 1.0f) roughness = 1.0f;
-    g_game_velvet_sheen_params[1] = roughness;
-    g_game_velvet_sheen_params[2] = weave_freq > 2.0f ? weave_freq : 16.0f;
+    float p2 = weave_freq > 2.0f ? weave_freq : 16.0f;
     if (strength < 0.0f) strength = 0.0f;
     if (strength > 3.0f) strength = 3.0f;
+    float cr = r > 0.0f ? r : 0.0f;
+    float cg = g > 0.0f ? g : 0.0f;
+    float cb = b > 0.0f ? b : 0.0f;
+    if (g_game_velvet_sheen_params[0] == p0 && g_game_velvet_sheen_params[1] == roughness &&
+        g_game_velvet_sheen_params[2] == p2 && g_game_velvet_sheen_params[3] == strength &&
+        g_game_velvet_sheen_color[0] == cr && g_game_velvet_sheen_color[1] == cg &&
+        g_game_velvet_sheen_color[2] == cb) return;
+    g_game_velvet_sheen_params[0] = p0;
+    g_game_velvet_sheen_params[1] = roughness;
+    g_game_velvet_sheen_params[2] = p2;
     g_game_velvet_sheen_params[3] = strength;
-    g_game_velvet_sheen_color[0] = r > 0.0f ? r : 0.0f;
-    g_game_velvet_sheen_color[1] = g > 0.0f ? g : 0.0f;
-    g_game_velvet_sheen_color[2] = b > 0.0f ? b : 0.0f;
+    g_game_velvet_sheen_color[0] = cr;
+    g_game_velvet_sheen_color[1] = cg;
+    g_game_velvet_sheen_color[2] = cb;
+    g_game_vfx_version++;
 }
 
 ZAN_GAME_API void zan_game_set_post_lens_distort3d(float k1, float zoom) {
@@ -4395,19 +5154,28 @@ ZAN_GAME_API void zan_game_set_post_lens_distort3d(float k1, float zoom) {
 ZAN_GAME_API void zan_game_set_subsurface_wrap3d(int32_t enabled,
     float wrap, float translucency, float power,
     float r, float g, float b) {
-    g_game_subsurface_params[0] = enabled ? 1.0f : 0.0f;
+    float p0 = enabled ? 1.0f : 0.0f;
     if (wrap < 0.0f) wrap = 0.0f;
     if (wrap > 1.0f) wrap = 1.0f;
-    g_game_subsurface_params[1] = wrap;
     if (translucency < 0.0f) translucency = 0.0f;
     if (translucency > 2.0f) translucency = 2.0f;
-    g_game_subsurface_params[2] = translucency;
     if (power < 1.0f) power = 1.0f;
     if (power > 8.0f) power = 8.0f;
+    float cr = r > 0.0f ? r : 0.0f;
+    float cg = g > 0.0f ? g : 0.0f;
+    float cb = b > 0.0f ? b : 0.0f;
+    if (g_game_subsurface_params[0] == p0 && g_game_subsurface_params[1] == wrap &&
+        g_game_subsurface_params[2] == translucency && g_game_subsurface_params[3] == power &&
+        g_game_subsurface_color[0] == cr && g_game_subsurface_color[1] == cg &&
+        g_game_subsurface_color[2] == cb) return;
+    g_game_subsurface_params[0] = p0;
+    g_game_subsurface_params[1] = wrap;
+    g_game_subsurface_params[2] = translucency;
     g_game_subsurface_params[3] = power;
-    g_game_subsurface_color[0] = r > 0.0f ? r : 0.0f;
-    g_game_subsurface_color[1] = g > 0.0f ? g : 0.0f;
-    g_game_subsurface_color[2] = b > 0.0f ? b : 0.0f;
+    g_game_subsurface_color[0] = cr;
+    g_game_subsurface_color[1] = cg;
+    g_game_subsurface_color[2] = cb;
+    g_game_vfx_version++;
 }
 
 ZAN_GAME_API void zan_game_set_post_god_rays3d(float strength, float decay,
