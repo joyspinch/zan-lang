@@ -18,19 +18,22 @@ namespace Testing.Fixtures;
 //
 // **并发**：非线程安全（内部有状态）。要并行就每个线程各建一个。
 public class FixtureRandom {
-    private RandomExt rng;
+    internal RandomExt rng;
     private long seed;
+    private byte[] scratch;
 
     // 用当前时刻做种子（每次创建都不一样）。
     public FixtureRandom() {
         this.seed = DateTime.UtcNow().ToUnixMilliseconds();
         this.rng = new RandomExt(this.seed);
+        this.scratch = new byte[64];
     }
 
     // 固定种子（可复现）。seed 为 0 时 `RandomExt` 会换成非零常量。
     public FixtureRandom(long seed) {
         this.seed = seed;
         this.rng = new RandomExt(seed);
+        this.scratch = new byte[64];
     }
 
     // 固定种子的静态便捷入口。
@@ -176,14 +179,16 @@ public class FixtureRandom {
     // **不用 `Guid.NewV4()`**：那走操作系统随机源，不可复现——同一批测试两次
     // 跑出来的样本不一致，失败样本就复现不了。
     public string Uuid() {
-        byte[] outBuf = new byte[36];
+        nint bp = (nint)this.scratch;
+        Span<byte> outBuf = new Span<byte>(bp, 36);
+        RandomExt r = this.rng;
         int di = 0;
         for (int i = 0; i < 16; i = i + 1) {
             if (i == 4 || i == 6 || i == 8 || i == 10) {
                 outBuf[di] = 45;
                 di = di + 1;
             }
-            int v = this.rng.NextInt(0, 256);
+            int v = r.NextInt(0, 256);
             if (i == 6) { v = (v & 15) | 64; }
             else if (i == 8) { v = (v & 63) | 128; }
             int hi = (v >> 4) & 15;
@@ -192,7 +197,7 @@ public class FixtureRandom {
             outBuf[di + 1] = (byte)(lo < 10 ? 48 + lo : 87 + lo);
             di = di + 2;
         }
-        return NativeMemory.GetString((nint)outBuf, 0, 36);
+        return NativeMemory.GetString(bp, 0, 36);
     }
 
     // [minYear, maxYear] 之间的随机时刻（UTC）。
@@ -269,19 +274,25 @@ public class FixtureRandom {
         return this.rng.Shuffled<T>(items);
     }
 
-    // 按字符集生成 count 个字符。
+    // 按字符集生成 count 个字符（复用实例 scratch 缓冲，零临时 byte[] 分配）。
     private string Chars(string charset, int count) {
         if (count <= 0 || charset == null || charset.Length == 0) { return ""; }
         if (count > 16777216) {
             throw new FixtureException(FixtureError.InvalidArgument, "",
                 "FixtureRandom: string length exceeds limit");
         }
-        byte[] buf = new byte[count];
-        int clen = charset.Length;
-        for (int i = 0; i < count; i = i + 1) {
-            buf[i] = (byte)(charset[this.rng.NextInt(0, clen)] & 255);
+        if (this.scratch.Length < count) {
+            this.scratch = new byte[count];
         }
-        return NativeMemory.GetString((nint)buf, 0, count);
+        nint bp = (nint)this.scratch;
+        Span<byte> dst = new Span<byte>(bp, count);
+        int clen = charset.Length;
+        Span<byte> cs = new Span<byte>((nint)charset, clen);
+        RandomExt r = this.rng;
+        for (int i = 0; i < count; i = i + 1) {
+            dst[i] = cs[r.NextInt(0, clen)];
+        }
+        return NativeMemory.GetString(bp, 0, count);
     }
 
     // 可打印 ASCII 字符集。

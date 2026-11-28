@@ -108,10 +108,56 @@ public class ArpgValue {
 
     // 返回键 first 次出现的下标；不存在或非对象返回 -1。
     public int IndexOf(string key) {
-        for (int i = 0; i < this.properties.Count; i = i + 1) {
+        int n = this.properties.Count;
+        for (int i = 0; i < n; i = i + 1) {
             if (this.properties[i].key == key) { return i; }
         }
         return -1;
+    }
+
+    internal ArpgValue GetSlicePtr(nint pathPtr, int start, int end) {
+        if (this.kind != ArpgValueKind.Object()) { return null; }
+        int len = end - start;
+        int n = this.properties.Count;
+        nint segPtr = pathPtr + (nint)start;
+        for (int i = 0; i < n; i = i + 1) {
+            if (this.properties[i].key.Length == len
+                && NativeMemory.Compare((nint)this.properties[i].key, segPtr, len) == 0) {
+                return this.properties[i].propertyValue;
+            }
+        }
+        return null;
+    }
+
+    // 零分配迭代解析点分路径片段 path[start..end)（Span + NativeMemory.Compare）。
+    internal ArpgValue ResolveSlice(string path, int start, int end) {
+        if (path == null || start >= end) { return this; }
+        nint pp = (nint)path;
+        Span<byte> sp = new Span<byte>(pp, end);
+        int dot = -1;
+        for (int i = start; i < end; i = i + 1) {
+            if (sp[i] == 46) { dot = i; break; }
+        }
+        if (dot < 0) {
+            return this.GetSlicePtr(pp, start, end);
+        }
+        ArpgValue cur = this.GetSlicePtr(pp, start, dot);
+        if (cur == null) { return null; }
+        int pos = dot + 1;
+        if (pos == end) { return cur; }
+        while (pos < end) {
+            dot = -1;
+            for (int i = pos; i < end; i = i + 1) {
+                if (sp[i] == 46) { dot = i; break; }
+            }
+            if (dot < 0) {
+                return cur.GetSlicePtr(pp, pos, end);
+            }
+            cur = cur.GetSlicePtr(pp, pos, dot);
+            if (cur == null) { return null; }
+            pos = dot + 1;
+        }
+        return cur;
     }
 
     // 设置属性；若当前不是对象值会自动转为对象（原有标量值被
@@ -162,12 +208,8 @@ public class ArpgValue {
     // 按 "a.b.c" 点分路径逐层取属性。path 为 null/空时返回自身；
     // 任一层缺失返回 null。
     public ArpgValue Resolve(string path) {
-        if (path == null || path == "") { return this; }
-        int dot = DotAt(path);
-        if (dot < 0) { return this.Get(path); }
-        ArpgValue child = this.Get(path.Substring(0, dot));
-        if (child == null) { return null; }
-        return child.Resolve(path.Substring(dot + 1));
+        if (path == null || path.Length == 0) { return this; }
+        return this.ResolveSlice(path, 0, path.Length);
     }
 
     // 按点分路径设置属性；中间层不存在或不是对象时自动创建

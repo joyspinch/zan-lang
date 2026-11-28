@@ -26,17 +26,67 @@ public class AiEndpoint {
         || this.host == "::1";
     }
 
-    // 规范化 URL（scheme + authority + path）。
+    // 规范化 URL（scheme + authority + path，单次精确 byte[] 组装）。
     public string Canonical() {
-        string scheme = this.tls ? "https://" : "http://";
-        string authority = this.host;
-        if (authority != null && authority.IndexOf(":") >= 0 && !authority.StartsWith("[")) {
-            authority = "[" + authority + "]";
+        string h = this.host == null ? "" : this.host;
+        string p = this.path == null ? "" : this.path;
+        int hlen = h.Length;
+        int plen = p.Length;
+        bool needBrackets = false;
+        if (hlen > 0) {
+            Span<byte> hs = new Span<byte>((nint)h, hlen);
+            if (hs[0] != 91) {
+                for (int i = 0; i < hlen; i = i + 1) {
+                    if (hs[i] == 58) { needBrackets = true; break; }
+                }
+            }
         }
-        if ((this.tls && this.port != 443) || (!this.tls && this.port != 80)) {
-            authority = authority + ":" + Convert.ToString(this.port);
+        bool needPort = (this.tls && this.port != 443) || (!this.tls && this.port != 80);
+        int portLen = 0;
+        int pv = this.port;
+        if (needPort) {
+            if (pv == 0) {
+                portLen = 1;
+            } else {
+                int tmp = pv < 0 ? -pv : pv;
+                if (pv < 0) { portLen = 1; }
+                while (tmp > 0) { portLen = portLen + 1; tmp = tmp / 10; }
+            }
         }
-        return scheme + authority + this.path;
+        int schemeLen = this.tls ? 8 : 7;
+        int total = schemeLen + hlen + (needBrackets ? 2 : 0) + (needPort ? 1 + portLen : 0) + plen;
+        byte[] buf = new byte[total];
+        nint bp = (nint)buf;
+        if (this.tls) {
+            NativeMemory.Copy(bp, (nint)"https://", 8);
+        } else {
+            NativeMemory.Copy(bp, (nint)"http://", 7);
+        }
+        int di = schemeLen;
+        if (needBrackets) { buf[di] = 91; di = di + 1; }
+        if (hlen > 0) { NativeMemory.Copy(bp + (nint)di, (nint)h, hlen); di = di + hlen; }
+        if (needBrackets) { buf[di] = 93; di = di + 1; }
+        if (needPort) {
+            buf[di] = 58;
+            di = di + 1;
+            if (pv == 0) {
+                buf[di] = 48;
+                di = di + 1;
+            } else {
+                int endPos = di + portLen;
+                int w = endPos;
+                int tmp = pv < 0 ? -pv : pv;
+                while (tmp > 0) {
+                    w = w - 1;
+                    buf[w] = (byte)(48 + (tmp % 10));
+                    tmp = tmp / 10;
+                }
+                if (pv < 0) { buf[di] = 45; }
+                di = endPos;
+            }
+        }
+        if (plen > 0) { NativeMemory.Copy(bp + (nint)di, (nint)p, plen); }
+        return NativeMemory.GetString(bp, 0, total);
     }
 
     // 解析 base URL。失败返回 null。
@@ -45,70 +95,90 @@ public class AiEndpoint {
     // 反斜杠(\)/userinfo(@)。非法端口回落到默认端口（443/80）。
     public static AiEndpoint Parse(string url) {
         if (url == null) { return null; }
-        AiEndpoint e = new AiEndpoint();
-        string rest = url;
-        e.tls = true;
-        e.port = 443;
-        if (rest.StartsWith("https://")) {
-            rest = rest.Substring(8);
-        } else if (rest.StartsWith("http://")) {
-            rest = rest.Substring(7);
-            e.tls = false;
-            e.port = 80;
+        int len = url.Length;
+        if (len < 8) { return null; }
+        nint up = (nint)url;
+        Span<byte> sp = new Span<byte>(up, len);
+        bool tls = true;
+        int port = 443;
+        int start = 0;
+        if (sp[0] == 104 && sp[1] == 116 && sp[2] == 116 && sp[3] == 112
+            && sp[4] == 115 && sp[5] == 58 && sp[6] == 47 && sp[7] == 47) {
+            start = 8;
+        } else if (sp[0] == 104 && sp[1] == 116 && sp[2] == 116 && sp[3] == 112
+            && sp[4] == 58 && sp[5] == 47 && sp[6] == 47) {
+            start = 7;
+            tls = false;
+            port = 80;
         } else {
             return null;
         }
-        for (int i = 0; i < rest.Length; i = i + 1) {
-            int c = rest[i] & 255;
+
+        // 单遍扫描校验非法字符、authority 中的 '@'/'?' 并定位首个 '/' 与 ':'。
+        int slash = -1;
+        int firstColon = -1;
+        for (int i = start; i < len; i = i + 1) {
+            int c = (int)sp[i];
             if (c <= 32 || c == 127 || c == 35 || c == 92) {
                 return null;
             }
+            if (slash < 0) {
+                if (c == 47) { slash = i; }
+                else if (c == 64 || c == 63) { return null; }
+                else if (c == 58 && firstColon < 0) { firstColon = i; }
+            }
         }
-        int slash = rest.IndexOf("/");
-        string hostPort = rest;
-        e.path = "";
+
+        int hpEnd = slash >= 0 ? slash : len;
+        if (hpEnd <= start) { return null; }
+
+        int hostStart = start;
+        int hostEnd = hpEnd;
+        if (sp[start] == 91) {
+            int rb = -1;
+            for (int i = start + 1; i < hpEnd; i = i + 1) {
+                if (sp[i] == 93) { rb = i; break; }
+            }
+            if (rb <= start + 1) { return null; }
+            hostStart = start + 1;
+            hostEnd = rb;
+            if (rb + 1 < hpEnd) {
+                if (sp[rb + 1] != 58) { return null; }
+                port = AiEndpoint.ParsePortSpan(sp, rb + 2, hpEnd, port);
+            }
+        } else if (firstColon >= 0) {
+            if (firstColon == start) { return null; }
+            hostEnd = firstColon;
+            port = AiEndpoint.ParsePortSpan(sp, firstColon + 1, hpEnd, port);
+        }
+        if (hostEnd <= hostStart) { return null; }
+
+        string pathStr = "";
         if (slash >= 0) {
-            hostPort = rest.Substring(0, slash);
-            e.path = rest.Substring(slash);
-        }
-        int plen = e.path.Length;
-        while (plen > 0 && (e.path[plen - 1] & 255) == 47) {
-            plen = plen - 1;
-        }
-        if (plen < e.path.Length) {
-            e.path = e.path.Substring(0, plen);
-        }
-        // userinfo（"user:pass@host"）与权威段里的 '?' 不合法——凭据要走 header，不进 URL。
-        if (hostPort.IndexOf("@") >= 0 || hostPort.IndexOf("?") >= 0) { return null; }
-        if (hostPort.StartsWith("[")) {
-            int rb = hostPort.IndexOf("]");
-            if (rb <= 1) { return null; }
-            e.host = hostPort.Substring(1, rb - 1);
-            if (rb + 1 < hostPort.Length) {
-                if ((hostPort[rb + 1] & 255) != 58) { return null; }
-                e.port = AiEndpoint.ParsePort(hostPort.Substring(rb + 2), e.port);
+            int pathEnd = len;
+            while (pathEnd > slash && sp[pathEnd - 1] == 47) {
+                pathEnd = pathEnd - 1;
             }
-        } else {
-            int colon = hostPort.IndexOf(":");
-            if (colon >= 0) {
-                if (colon == 0) { return null; }
-                e.host = hostPort.Substring(0, colon);
-                string portText = hostPort.Substring(colon + 1);
-                e.port = AiEndpoint.ParsePort(portText, e.port);
-            } else {
-                e.host = hostPort;
+            if (pathEnd > slash) {
+                pathStr = NativeMemory.GetString(up, slash, pathEnd - slash);
             }
         }
-        if (e.host.Length == 0) { return null; }
+
+        AiEndpoint e = new AiEndpoint();
+        e.tls = tls;
+        e.port = port;
+        e.host = NativeMemory.GetString(up, hostStart, hostEnd - hostStart);
+        e.path = pathStr;
         return e;
     }
 
     // 端口解析：全数字且在 1..65535 之间才认，否则回落到默认值（防超长串溢出）。
-    private static int ParsePort(string text, int dflt) {
-        if (text == null || text.Length == 0 || text.Length > 5) { return dflt; }
+    private static int ParsePortSpan(Span<byte> sp, int start, int end, int dflt) {
+        int n = end - start;
+        if (n <= 0 || n > 5) { return dflt; }
         int p = 0;
-        for (int i = 0; i < text.Length; i = i + 1) {
-            int c = text[i] & 255;
+        for (int i = start; i < end; i = i + 1) {
+            int c = (int)sp[i];
             if (c < 48 || c > 57) { return dflt; }
             p = p * 10 + (c - 48);
         }

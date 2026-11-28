@@ -10,12 +10,109 @@ public class ArpgTemplateParser {
     public string input;
     public ArpgValue source;
     public int position;
+    private byte[] outBuf;
+    private int outLen;
 
     // 构造求值器：input 为模板原文，source 为 `&path&` 的解析根。
     public ArpgTemplateParser(string input, ArpgValue source) {
         this.input = input;
         this.source = source;
         this.position = 0;
+        this.outBuf = null;
+        this.outLen = 0;
+    }
+
+    private void InitOut(int cap) {
+        int c = cap < 64 ? 64 : cap;
+        if (this.outBuf == null || this.outBuf.Length < c) {
+            this.outBuf = new byte[c];
+        }
+        this.outLen = 0;
+    }
+
+    private void EnsureOut(int add) {
+        int need = this.outLen + add;
+        if (need <= this.outBuf.Length) { return; }
+        int cap = this.outBuf.Length * 2;
+        if (cap < need) { cap = need; }
+        byte[] next = new byte[cap];
+        if (this.outLen > 0) {
+            NativeMemory.Copy((nint)next, (nint)this.outBuf, this.outLen);
+        }
+        this.outBuf = next;
+    }
+
+    private void AppendSlice(nint srcPtr, int start, int count) {
+        if (count <= 0) { return; }
+        this.EnsureOut(count);
+        NativeMemory.Copy((nint)this.outBuf + (nint)this.outLen, srcPtr + (nint)start, count);
+        this.outLen = this.outLen + count;
+    }
+
+    private void AppendValue(ArpgValue val) {
+        int k = val.kind;
+        if (k == ArpgValueKind.Text()) {
+            if (val.textValue == null || val.textValue.Length == 0) { return; }
+            int n = val.textValue.Length;
+            this.EnsureOut(n);
+            NativeMemory.Copy((nint)this.outBuf + (nint)this.outLen, (nint)val.textValue, n);
+            this.outLen = this.outLen + n;
+            return;
+        }
+        if (k == ArpgValueKind.Number()) {
+            double d = val.numberValue;
+            if (d > 0.0 && d <= 999999999999.0) {
+                long iv = (long)d;
+                if ((double)iv == d) {
+                    this.EnsureOut(16);
+                    Span<byte> ob = new Span<byte>((nint)this.outBuf, this.outBuf.Length);
+                    int start = this.outLen;
+                    int pos = start;
+                    long cur = iv;
+                    while (cur > 0L) {
+                        long q = cur / 10L;
+                        ob[pos] = (byte)(48 + (int)(cur - q * 10L));
+                        pos = pos + 1;
+                        cur = q;
+                    }
+                    int lo = start;
+                    int hi = pos - 1;
+                    while (lo < hi) {
+                        byte tmp = ob[lo];
+                        ob[lo] = ob[hi];
+                        ob[hi] = tmp;
+                        lo = lo + 1;
+                        hi = hi - 1;
+                    }
+                    this.outLen = pos;
+                    return;
+                }
+            } else if (d == 0.0 && NativeMemory.AsI64(d) == 0L) {
+                this.EnsureOut(1);
+                this.outBuf[this.outLen] = 48;
+                this.outLen = this.outLen + 1;
+                return;
+            }
+            string ns = Convert.ToString(d);
+            int nn = ns.Length;
+            if (nn > 0) {
+                this.EnsureOut(nn);
+                NativeMemory.Copy((nint)this.outBuf + (nint)this.outLen, (nint)ns, nn);
+                this.outLen = this.outLen + nn;
+            }
+            return;
+        }
+        if (k == ArpgValueKind.Boolean()) {
+            if (val.boolValue) {
+                this.EnsureOut(4);
+                NativeMemory.Copy((nint)this.outBuf + (nint)this.outLen, (nint)"true", 4);
+                this.outLen = this.outLen + 4;
+            } else {
+                this.EnsureOut(5);
+                NativeMemory.Copy((nint)this.outBuf + (nint)this.outLen, (nint)"false", 5);
+                this.outLen = this.outLen + 5;
+            }
+        }
     }
 
     // 判断 text 在 position 处是否以 prefix 开头（越界为 false）。
@@ -24,33 +121,29 @@ public class ArpgTemplateParser {
         if (position < 0 || position + n > text.Length) {
             return false;
         }
-        for (int i = 0; i < n; i = i + 1) {
-            if ((text[position + i] & 255) != (prefix[i] & 255)) { return false; }
-        }
-        return true;
+        return NativeMemory.Compare((nint)text + (nint)position, (nint)prefix, n) == 0;
     }
 
     // 去除 text 两端的空格/制表/回车/换行字符。
     public static string Trim(string text) {
+        int n = text.Length;
+        if (n == 0) { return text; }
+        nint tp = (nint)text;
+        Span<byte> sp = new Span<byte>(tp, n);
         int start = 0;
-        int end = text.Length;
+        int end = n;
         while (start < end) {
-            int c = text[start] & 255;
-            if (c == 32 || c == 9 || c == 13 || c == 10) {
-                start = start + 1;
-            } else {
-                break;
-            }
+            int c = (int)sp[start];
+            if (c != 32 && c != 9 && c != 13 && c != 10) { break; }
+            start = start + 1;
         }
         while (end > start) {
-            int c = text[end - 1] & 255;
-            if (c == 32 || c == 9 || c == 13 || c == 10) {
-                end = end - 1;
-            } else {
-                break;
-            }
+            int c = (int)sp[end - 1];
+            if (c != 32 && c != 9 && c != 13 && c != 10) { break; }
+            end = end - 1;
         }
-        return text.Substring(start, end - start);
+        if (start == 0 && end == n) { return text; }
+        return NativeMemory.GetString(tp, start, end - start);
     }
 
     // 从 start 起查找 token 首次出现的下标；找不到返回 -1。
@@ -65,19 +158,14 @@ public class ArpgTemplateParser {
         return expression.IndexOf(token);
     }
 
-    // 判断 text 是否形如数值字面量（可选 +/- 前缀、数字与小数点，
-    // 至少含一个数字）。空串为 false。
-    public static bool LooksNumeric(string text) {
-        if (text == null || text.Length == 0) { return false; }
-        int i = 0;
+    private static bool LooksNumericSpan(Span<byte> sp, int start, int end) {
+        if (start >= end) { return false; }
+        int i = start;
         bool digit = false;
-        int c0 = text[0] & 255;
-        if (c0 == 45 || c0 == 43) {
-            i = 1;
-        }
-        int n = text.Length;
-        while (i < n) {
-            int c = text[i] & 255;
+        int c0 = (int)sp[i];
+        if (c0 == 45 || c0 == 43) { i = i + 1; }
+        while (i < end) {
+            int c = (int)sp[i];
             if (c >= 48 && c <= 57) {
                 digit = true;
             } else if (c != 46) {
@@ -88,28 +176,183 @@ public class ArpgTemplateParser {
         return digit;
     }
 
+    private static double ParseNumericSpan(string text, Span<byte> sp, int start, int end) {
+        int i = start;
+        bool neg = false;
+        int c0 = (int)sp[i];
+        if (c0 == 45) { neg = true; i = i + 1; }
+        else if (c0 == 43) { i = i + 1; }
+        if (end - i <= 15) {
+            long acc = 0L;
+            bool pureInt = true;
+            int j = i;
+            while (j < end) {
+                int c = (int)sp[j];
+                if (c >= 48 && c <= 57) {
+                    acc = acc * 10L + (long)(c - 48);
+                } else {
+                    pureInt = false;
+                    break;
+                }
+                j = j + 1;
+            }
+            if (pureInt) {
+                return neg ? (double)(-acc) : (double)acc;
+            }
+        }
+        return NativeMemory.GetString((nint)text, start, end - start).ToDouble();
+    }
+
+    // 判断 text 是否形如数值字面量（可选 +/- 前缀、数字与小数点，
+    // 至少含一个数字）。空串为 false。
+    public static bool LooksNumeric(string text) {
+        if (text == null || text.Length == 0) { return false; }
+        int n = text.Length;
+        return ArpgTemplateParser.LooksNumericSpan(new Span<byte>((nint)text, n), 0, n);
+    }
+
+    // 零分配求值操作数切片（全标量 out，无 string ARC retain/release）。
+    private void EvalOperandSlice(
+        string src, Span<byte> sp, int start, int end,
+        out int kind, out double numVal, out bool boolVal,
+        out nint strPtr, out int strLen
+    ) {
+        while (start < end) {
+            int c = (int)sp[start];
+            if (c != 32 && c != 9 && c != 13 && c != 10) { break; }
+            start = start + 1;
+        }
+        while (end > start) {
+            int c = (int)sp[end - 1];
+            if (c != 32 && c != 9 && c != 13 && c != 10) { break; }
+            end = end - 1;
+        }
+        int len = end - start;
+        kind = ArpgValueKind.Null();
+        numVal = 0.0;
+        boolVal = false;
+        strPtr = (nint)0;
+        strLen = 0;
+
+        if (len >= 2) {
+            int first = (int)sp[start];
+            int last = (int)sp[end - 1];
+            if (first == 38 && last == 38) {
+                ArpgValue resolved = this.source.ResolveSlice(src, start + 1, end - 1);
+                if (resolved == null) { return; }
+                kind = resolved.kind;
+                numVal = resolved.numberValue;
+                boolVal = resolved.boolValue;
+                if (kind == ArpgValueKind.Text() && resolved.textValue != null) {
+                    strPtr = (nint)resolved.textValue;
+                    strLen = resolved.textValue.Length;
+                }
+                return;
+            }
+            if ((first == 39 && last == 39) || (first == 34 && last == 34)) {
+                kind = ArpgValueKind.Text();
+                strPtr = (nint)src + (nint)(start + 1);
+                strLen = len - 2;
+                return;
+            }
+        }
+        if (len == 4 && sp[start] == 116 && sp[start + 1] == 114 && sp[start + 2] == 117 && sp[start + 3] == 101) {
+            kind = ArpgValueKind.Boolean();
+            boolVal = true;
+            return;
+        }
+        if (len == 5 && sp[start] == 102 && sp[start + 1] == 97 && sp[start + 2] == 108 && sp[start + 3] == 115 && sp[start + 4] == 101) {
+            kind = ArpgValueKind.Boolean();
+            boolVal = false;
+            return;
+        }
+        if (ArpgTemplateParser.LooksNumericSpan(sp, start, end)) {
+            kind = ArpgValueKind.Number();
+            numVal = ArpgTemplateParser.ParseNumericSpan(src, sp, start, end);
+            return;
+        }
+        kind = ArpgValueKind.Text();
+        strPtr = (nint)src + (nint)start;
+        strLen = len;
+    }
+
+    private static double OperandAsNumber(int kind, double numVal, bool boolVal, nint strPtr, int strLen) {
+        if (kind == ArpgValueKind.Number()) { return numVal; }
+        if (kind == ArpgValueKind.Boolean()) { return boolVal ? 1.0 : 0.0; }
+        if (kind == ArpgValueKind.Text() && strLen > 0) {
+            return NativeMemory.GetString(strPtr, 0, strLen).ToDouble();
+        }
+        return 0.0;
+    }
+
+    // opKind: 1="==", 2="!=", 3=">", 4=">=", 5="<", 6="<="
+    private bool CompareSlices(
+        string lSrc, Span<byte> lSp, int lStart, int lEnd,
+        string rSrc, Span<byte> rSp, int rStart, int rEnd,
+        int opKind
+    ) {
+        int lk = 0; double ln = 0.0; bool lb = false; nint lp = (nint)0; int ll = 0;
+        int rk = 0; double rn = 0.0; bool rb = false; nint rp = (nint)0; int rl = 0;
+        this.EvalOperandSlice(lSrc, lSp, lStart, lEnd, out lk, out ln, out lb, out lp, out ll);
+        this.EvalOperandSlice(rSrc, rSp, rStart, rEnd, out rk, out rn, out rb, out rp, out rl);
+        bool numeric = lk == ArpgValueKind.Number() || rk == ArpgValueKind.Number();
+        if (opKind == 1 || opKind == 2) {
+            bool eq;
+            if (numeric) {
+                eq = ArpgTemplateParser.OperandAsNumber(lk, ln, lb, lp, ll)
+                    == ArpgTemplateParser.OperandAsNumber(rk, rn, rb, rp, rl);
+            } else {
+                nint ap = (nint)0; int alen = 0;
+                if (lk == ArpgValueKind.Text()) { ap = lp; alen = ll; }
+                else if (lk == ArpgValueKind.Boolean()) {
+                    if (lb) { ap = (nint)"true"; alen = 4; }
+                    else { ap = (nint)"false"; alen = 5; }
+                }
+                nint bp = (nint)0; int blen = 0;
+                if (rk == ArpgValueKind.Text()) { bp = rp; blen = rl; }
+                else if (rk == ArpgValueKind.Boolean()) {
+                    if (rb) { bp = (nint)"true"; blen = 4; }
+                    else { bp = (nint)"false"; blen = 5; }
+                }
+                eq = alen == blen && (alen == 0 || NativeMemory.Compare(ap, bp, alen) == 0);
+            }
+            return opKind == 1 ? eq : !eq;
+        }
+        double lv = ArpgTemplateParser.OperandAsNumber(lk, ln, lb, lp, ll);
+        double rv = ArpgTemplateParser.OperandAsNumber(rk, rn, rb, rp, rl);
+        if (opKind == 3) { return lv > rv; }
+        if (opKind == 4) { return lv >= rv; }
+        if (opKind == 5) { return lv < rv; }
+        if (opKind == 6) { return lv <= rv; }
+        return false;
+    }
+
     // 解析单个操作数：`&path&` 解析为数据源值（缺失返回 Null）；
     // 引号包裹为文本字面量；true/false 为布尔；数字形态为数值；
     // 其余按原文文本处理。
     public ArpgValue Operand(string token) {
         string newValue = Trim(token);
-        if (newValue.Length >= 2) {
-            int first = newValue[0] & 255;
-            int last = newValue[newValue.Length - 1] & 255;
+        int n = newValue.Length;
+        if (n >= 2) {
+            Span<byte> sp = new Span<byte>((nint)newValue, n);
+            int first = (int)sp[0];
+            int last = (int)sp[n - 1];
             if (first == 38 && last == 38) {
-                ArpgValue resolved = this.source.Resolve(
-                    newValue.Substring(1, newValue.Length - 2));
+                ArpgValue resolved = this.source.ResolveSlice(newValue, 1, n - 1);
                 if (resolved == null) { return ArpgValue.Null(); }
                 return resolved;
             }
             if ((first == 39 && last == 39) || (first == 34 && last == 34)) {
-                return ArpgValue.Text(newValue.Substring(1, newValue.Length - 2));
+                return ArpgValue.Text(NativeMemory.GetString((nint)newValue, 1, n - 2));
             }
         }
         if (newValue == "true") { return ArpgValue.Boolean(true); }
         if (newValue == "false") { return ArpgValue.Boolean(false); }
-        if (LooksNumeric(newValue)) {
-            return ArpgValue.Number(newValue.ToDouble());
+        if (n > 0) {
+            Span<byte> sp = new Span<byte>((nint)newValue, n);
+            if (ArpgTemplateParser.LooksNumericSpan(sp, 0, n)) {
+                return ArpgValue.Number(ArpgTemplateParser.ParseNumericSpan(newValue, sp, 0, n));
+            }
         }
         return ArpgValue.Text(newValue);
     }
@@ -117,178 +360,325 @@ public class ArpgTemplateParser {
     // 比较两个操作数。==/!= 在任一侧为 Number 时按数值比较，
     // 否则按文本比较；>/>=/</<= 恒按数值比较。未知运算返回 false。
     public bool Compare(string leftToken, string rightToken, string operation) {
-        ArpgValue left = this.Operand(leftToken);
-        ArpgValue right = this.Operand(rightToken);
-        bool numeric = left.Kind() == ArpgValueKind.Number()
-            || right.Kind() == ArpgValueKind.Number();
-        if (operation == "==") {
-            if (numeric) { return left.AsNumber() == right.AsNumber(); }
-            return left.AsText() == right.AsText();
+        int opKind = 0;
+        if (operation == "==") { opKind = 1; }
+        else if (operation == "!=") { opKind = 2; }
+        else if (operation == ">") { opKind = 3; }
+        else if (operation == ">=") { opKind = 4; }
+        else if (operation == "<") { opKind = 5; }
+        else if (operation == "<=") { opKind = 6; }
+        if (opKind == 0) { return false; }
+        int ln = leftToken.Length;
+        int rn = rightToken.Length;
+        return this.CompareSlices(
+            leftToken, new Span<byte>((nint)leftToken, ln), 0, ln,
+            rightToken, new Span<byte>((nint)rightToken, rn), 0, rn,
+            opKind);
+    }
+
+    private bool EvaluateConditionSlice(string src, Span<byte> sp, int start, int end) {
+        while (start < end) {
+            int c = (int)sp[start];
+            if (c != 32 && c != 9 && c != 13 && c != 10) { break; }
+            start = start + 1;
         }
-        if (operation == "!=") {
-            if (numeric) { return left.AsNumber() != right.AsNumber(); }
-            return left.AsText() != right.AsText();
+        while (end > start) {
+            int c = (int)sp[end - 1];
+            if (c != 32 && c != 9 && c != 13 && c != 10) { break; }
+            end = end - 1;
         }
-        if (operation == ">") { return left.AsNumber() > right.AsNumber(); }
-        if (operation == ">=") { return left.AsNumber() >= right.AsNumber(); }
-        if (operation == "<") { return left.AsNumber() < right.AsNumber(); }
-        if (operation == "<=") { return left.AsNumber() <= right.AsNumber(); }
-        return false;
+        // 单遍记录 6 种运算符各自首次出现位置，保持 >= <= == != > < 的严格优先级。
+        int pGe = -1;
+        int pLe = -1;
+        int pEq = -1;
+        int pNe = -1;
+        int pGt = -1;
+        int pLt = -1;
+        for (int i = start; i < end; i = i + 1) {
+            int c = (int)sp[i];
+            if (c == 62) {
+                if (pGe < 0 && i + 1 < end && sp[i + 1] == 61) { pGe = i; }
+                if (pGt < 0) { pGt = i; }
+            } else if (c == 60) {
+                if (pLe < 0 && i + 1 < end && sp[i + 1] == 61) { pLe = i; }
+                if (pLt < 0) { pLt = i; }
+            } else if (c == 61) {
+                if (pEq < 0 && i + 1 < end && sp[i + 1] == 61) { pEq = i; }
+            } else if (c == 33) {
+                if (pNe < 0 && i + 1 < end && sp[i + 1] == 61) { pNe = i; }
+            }
+        }
+        int idx = -1;
+        int opLen = 0;
+        int opKind = 0;
+        if (pGe >= 0) { idx = pGe; opLen = 2; opKind = 4; }
+        else if (pLe >= 0) { idx = pLe; opLen = 2; opKind = 6; }
+        else if (pEq >= 0) { idx = pEq; opLen = 2; opKind = 1; }
+        else if (pNe >= 0) { idx = pNe; opLen = 2; opKind = 2; }
+        else if (pGt >= 0) { idx = pGt; opLen = 1; opKind = 3; }
+        else if (pLt >= 0) { idx = pLt; opLen = 1; opKind = 5; }
+
+        if (idx < 0) {
+            int k = 0; double nv = 0.0; bool bv = false; nint sp0 = (nint)0; int slen = 0;
+            this.EvalOperandSlice(src, sp, start, end, out k, out nv, out bv, out sp0, out slen);
+            if (k == ArpgValueKind.Boolean()) { return bv; }
+            if (k == ArpgValueKind.Number()) { return nv != 0.0; }
+            if (k == ArpgValueKind.Text()) {
+                if (slen == 0) { return false; }
+                if (slen == 1 && NativeMemory.Compare(sp0, (nint)"0", 1) == 0) { return false; }
+                if (slen == 5 && NativeMemory.Compare(sp0, (nint)"false", 5) == 0) { return false; }
+                return true;
+            }
+            return false;
+        }
+        return this.CompareSlices(src, sp, start, idx, src, sp, idx + opLen, end, opKind);
     }
 
     // 求值条件表达式：按 >= <= == != > < 顺序检测运算符并比较；
     // 无运算符时按布尔操作数解释。
     public bool EvaluateCondition(string expression) {
-        string newValue = Trim(expression);
-        string operation = "";
-        int index = FindOperator(newValue, ">=");
-        if (index >= 0) {
-            operation = ">=";
-        } else {
-            index = FindOperator(newValue, "<=");
-            if (index >= 0) {
-                operation = "<=";
-            } else {
-                index = FindOperator(newValue, "==");
-                if (index >= 0) {
-                    operation = "==";
-                } else {
-                    index = FindOperator(newValue, "!=");
-                    if (index >= 0) {
-                        operation = "!=";
-                    } else {
-                        index = FindOperator(newValue, ">");
-                        if (index >= 0) {
-                            operation = ">";
-                        } else {
-                            index = FindOperator(newValue, "<");
-                            if (index >= 0) { operation = "<"; }
-                        }
-                    }
+        int n = expression.Length;
+        return this.EvaluateConditionSlice(expression, new Span<byte>((nint)expression, n), 0, n);
+    }
+
+    // 匹配 '{' 处的控制标签：0=非标签, 1={if }, 2={elseif }, 3={else}, 4={end}
+    private static int MatchTag(Span<byte> sp, int pos, int n) {
+        int rem = n - pos;
+        if (rem >= 4 && sp[pos + 1] == 105 && sp[pos + 2] == 102 && sp[pos + 3] == 32) {
+            return 1;
+        }
+        if (rem >= 5 && sp[pos + 1] == 101) {
+            int c2 = (int)sp[pos + 2];
+            if (c2 == 110 && sp[pos + 3] == 100 && sp[pos + 4] == 125) {
+                return 4;
+            }
+            if (c2 == 108 && rem >= 6 && sp[pos + 3] == 115 && sp[pos + 4] == 101) {
+                int c5 = (int)sp[pos + 5];
+                if (c5 == 125) { return 3; }
+                if (c5 == 105 && rem >= 8 && sp[pos + 6] == 102 && sp[pos + 7] == 32) {
+                    return 2;
                 }
             }
         }
-        if (index < 0) { return this.Operand(newValue).AsBoolean(); }
-        return this.Compare(
-            newValue.Substring(0, index),
-            newValue.Substring(index + operation.Length),
-            operation);
+        return 0;
+    }
+
+    private void SkipConditional(Span<byte> sp, int n) {
+        int term = 0;
+        int cs = 0;
+        int ce = 0;
+        this.SkipSection(sp, n, out term, out cs, out ce);
+        while (term == ArpgTemplateTerminator.ElseIf()) {
+            this.SkipSection(sp, n, out term, out cs, out ce);
+        }
+        if (term == ArpgTemplateTerminator.Else()) {
+            this.SkipSection(sp, n, out term, out cs, out ce);
+        }
+    }
+
+    private void SkipSection(Span<byte> sp, int n, out int term, out int condStart, out int condEnd) {
+        int pos = this.position;
+        term = ArpgTemplateTerminator.None();
+        condStart = 0;
+        condEnd = 0;
+        while (pos < n) {
+            int c = (int)sp[pos];
+            if (c == 123) {
+                int tag = ArpgTemplateParser.MatchTag(sp, pos, n);
+                if (tag == 2) {
+                    int close = -1;
+                    for (int i = pos + 8; i < n; i = i + 1) { if (sp[i] == 125) { close = i; break; } }
+                    if (close < 0) { this.position = n; return; }
+                    term = ArpgTemplateTerminator.ElseIf();
+                    condStart = pos + 8;
+                    condEnd = close;
+                    this.position = close + 1;
+                    return;
+                }
+                if (tag == 3) {
+                    term = ArpgTemplateTerminator.Else();
+                    this.position = pos + 6;
+                    return;
+                }
+                if (tag == 4) {
+                    term = ArpgTemplateTerminator.End();
+                    this.position = pos + 5;
+                    return;
+                }
+                if (tag == 1) {
+                    int close = -1;
+                    for (int i = pos + 4; i < n; i = i + 1) { if (sp[i] == 125) { close = i; break; } }
+                    if (close < 0) { this.position = n; return; }
+                    this.position = close + 1;
+                    this.SkipConditional(sp, n);
+                    pos = this.position;
+                    continue;
+                }
+                pos = pos + 1;
+            } else if (c == 38) {
+                int close = -1;
+                for (int i = pos + 1; i < n; i = i + 1) { if (sp[i] == 38) { close = i; break; } }
+                pos = close < 0 ? pos + 1 : close + 1;
+            } else {
+                pos = pos + 1;
+            }
+        }
+        this.position = n;
+    }
+
+    private void ParseConditionalInto(
+        string condSrc, Span<byte> condSp, int condStart, int condEnd,
+        string src, nint srcPtr, Span<byte> sp, int n
+    ) {
+        bool selected = this.EvaluateConditionSlice(condSrc, condSp, condStart, condEnd);
+        int term = 0;
+        int nextCs = 0;
+        int nextCe = 0;
+        if (selected) {
+            this.ParseSectionInto(src, srcPtr, sp, n, out term, out nextCs, out nextCe);
+        } else {
+            this.SkipSection(sp, n, out term, out nextCs, out nextCe);
+        }
+
+        while (term == ArpgTemplateTerminator.ElseIf()) {
+            if (!selected && this.EvaluateConditionSlice(src, sp, nextCs, nextCe)) {
+                selected = true;
+                this.ParseSectionInto(src, srcPtr, sp, n, out term, out nextCs, out nextCe);
+            } else {
+                this.SkipSection(sp, n, out term, out nextCs, out nextCe);
+            }
+        }
+        if (term == ArpgTemplateTerminator.Else()) {
+            if (!selected) {
+                this.ParseSectionInto(src, srcPtr, sp, n, out term, out nextCs, out nextCe);
+            } else {
+                this.SkipSection(sp, n, out term, out nextCs, out nextCe);
+            }
+        }
+    }
+
+    private void ParseSectionInto(
+        string src, nint srcPtr, Span<byte> sp, int n,
+        out int term, out int condStart, out int condEnd
+    ) {
+        int pos = this.position;
+        int litStart = pos;
+        term = ArpgTemplateTerminator.None();
+        condStart = 0;
+        condEnd = 0;
+
+        while (pos < n) {
+            int c = (int)sp[pos];
+            if (c == 123) {
+                int tag = ArpgTemplateParser.MatchTag(sp, pos, n);
+                if (tag == 2) {
+                    if (pos > litStart) { this.AppendSlice(srcPtr, litStart, pos - litStart); }
+                    int close = -1;
+                    for (int i = pos + 8; i < n; i = i + 1) { if (sp[i] == 125) { close = i; break; } }
+                    if (close < 0) {
+                        this.AppendSlice(srcPtr, pos, n - pos);
+                        this.position = n;
+                        return;
+                    }
+                    term = ArpgTemplateTerminator.ElseIf();
+                    condStart = pos + 8;
+                    condEnd = close;
+                    this.position = close + 1;
+                    return;
+                }
+                if (tag == 3) {
+                    if (pos > litStart) { this.AppendSlice(srcPtr, litStart, pos - litStart); }
+                    term = ArpgTemplateTerminator.Else();
+                    this.position = pos + 6;
+                    return;
+                }
+                if (tag == 4) {
+                    if (pos > litStart) { this.AppendSlice(srcPtr, litStart, pos - litStart); }
+                    term = ArpgTemplateTerminator.End();
+                    this.position = pos + 5;
+                    return;
+                }
+                if (tag == 1) {
+                    if (pos > litStart) { this.AppendSlice(srcPtr, litStart, pos - litStart); }
+                    int close = -1;
+                    for (int i = pos + 4; i < n; i = i + 1) { if (sp[i] == 125) { close = i; break; } }
+                    if (close < 0) {
+                        this.AppendSlice(srcPtr, pos, n - pos);
+                        this.position = n;
+                        return;
+                    }
+                    this.position = close + 1;
+                    this.ParseConditionalInto(src, sp, pos + 4, close, src, srcPtr, sp, n);
+                    pos = this.position;
+                    litStart = pos;
+                    continue;
+                }
+                pos = pos + 1;
+            } else if (c == 38) {
+                int close = -1;
+                for (int i = pos + 1; i < n; i = i + 1) { if (sp[i] == 38) { close = i; break; } }
+                if (close < 0) {
+                    pos = pos + 1;
+                } else {
+                    if (pos > litStart) { this.AppendSlice(srcPtr, litStart, pos - litStart); }
+                    ArpgValue resolved = this.source.ResolveSlice(src, pos + 1, close);
+                    if (resolved != null) { this.AppendValue(resolved); }
+                    pos = close + 1;
+                    litStart = pos;
+                }
+            } else {
+                pos = pos + 1;
+            }
+        }
+        if (pos > litStart) {
+            this.AppendSlice(srcPtr, litStart, pos - litStart);
+        }
+        this.position = n;
+    }
+
+    internal string EvaluateAll() {
+        int n = this.input.Length;
+        this.InitOut(n);
+        nint srcPtr = (nint)this.input;
+        Span<byte> sp = new Span<byte>(srcPtr, n);
+        int term = 0;
+        int cs = 0;
+        int ce = 0;
+        this.ParseSectionInto(this.input, srcPtr, sp, n, out term, out cs, out ce);
+        if (this.outLen == 0) { return ""; }
+        return NativeMemory.GetString((nint)this.outBuf, 0, this.outLen);
     }
 
     // 求值一段 {if 条件}…{elseif}…{else}…{end} 分支，返回
     // 命中分支的文本（无命中且无 else 时为空串）。
     public string ParseConditional(string condition) {
-        ArpgTemplateSection section = this.ParseSection();
-        bool selected = this.EvaluateCondition(condition);
-        string result = "";
-        if (selected) { result = section.Text(); }
-
-        while (section.Terminator() == ArpgTemplateTerminator.ElseIf()) {
-            string branchCondition = section.Condition();
-            section = this.ParseSection();
-            if (!selected && this.EvaluateCondition(branchCondition)) {
-                result = section.Text();
-                selected = true;
-            }
-        }
-        if (section.Terminator() == ArpgTemplateTerminator.Else()) {
-            section = this.ParseSection();
-            if (!selected) { result = section.Text(); }
-        }
-        return result;
+        int n = this.input.Length;
+        this.InitOut(64);
+        nint srcPtr = (nint)this.input;
+        Span<byte> sp = new Span<byte>(srcPtr, n);
+        int clen = condition.Length;
+        Span<byte> condSp = new Span<byte>((nint)condition, clen);
+        this.ParseConditionalInto(condition, condSp, 0, clen, this.input, srcPtr, sp, n);
+        if (this.outLen == 0) { return ""; }
+        return NativeMemory.GetString((nint)this.outBuf, 0, this.outLen);
     }
 
     // 从当前位置解析下一段：展开 `&path&` 占位符与嵌套 {if}，
     // 在 {elseif}/{else}/{end} 或输入末尾处停止，返回文本段并
     // 前进 position。
     public ArpgTemplateSection ParseSection() {
-        StringBuilder output = new StringBuilder();
         int n = this.input.Length;
-        int litStart = this.position;
-        while (this.position < n) {
-            int c = this.input[this.position] & 255;
-            if (c == 123) {
-                if (StartsAt(this.input, this.position, "{elseif ")) {
-                    if (this.position > litStart) {
-                        output.Append(this.input.Substring(litStart, this.position - litStart));
-                    }
-                    int close = this.Find("}", this.position + 8);
-                    if (close < 0) {
-                        output.Append(this.input.Substring(this.position));
-                        this.position = n;
-                        return new ArpgTemplateSection(
-                            output.ToString(),
-                            ArpgTemplateTerminator.None(),
-                            "");
-                    }
-                    string condition = this.input.Substring(
-                        this.position + 8, close - this.position - 8);
-                    this.position = close + 1;
-                    return new ArpgTemplateSection(
-                        output.ToString(),
-                        ArpgTemplateTerminator.ElseIf(),
-                        condition);
-                }
-                if (StartsAt(this.input, this.position, "{else}")) {
-                    if (this.position > litStart) {
-                        output.Append(this.input.Substring(litStart, this.position - litStart));
-                    }
-                    this.position = this.position + 6;
-                    return new ArpgTemplateSection(
-                        output.ToString(), ArpgTemplateTerminator.Else(), "");
-                }
-                if (StartsAt(this.input, this.position, "{end}")) {
-                    if (this.position > litStart) {
-                        output.Append(this.input.Substring(litStart, this.position - litStart));
-                    }
-                    this.position = this.position + 5;
-                    return new ArpgTemplateSection(
-                        output.ToString(), ArpgTemplateTerminator.End(), "");
-                }
-                if (StartsAt(this.input, this.position, "{if ")) {
-                    if (this.position > litStart) {
-                        output.Append(this.input.Substring(litStart, this.position - litStart));
-                    }
-                    int close = this.Find("}", this.position + 4);
-                    if (close < 0) {
-                        output.Append(this.input.Substring(this.position));
-                        this.position = n;
-                        return new ArpgTemplateSection(
-                            output.ToString(),
-                            ArpgTemplateTerminator.None(),
-                            "");
-                    }
-                    string condition = this.input.Substring(
-                        this.position + 4, close - this.position - 4);
-                    this.position = close + 1;
-                    output.Append(this.ParseConditional(condition));
-                    litStart = this.position;
-                    continue;
-                }
-                this.position = this.position + 1;
-            } else if (c == 38) {
-                int close = this.Find("&", this.position + 1);
-                if (close < 0) {
-                    this.position = this.position + 1;
-                } else {
-                    if (this.position > litStart) {
-                        output.Append(this.input.Substring(litStart, this.position - litStart));
-                    }
-                    string path = this.input.Substring(
-                        this.position + 1, close - this.position - 1);
-                    ArpgValue resolved = this.source.Resolve(path);
-                    if (resolved != null) { output.Append(resolved.AsText()); }
-                    this.position = close + 1;
-                    litStart = this.position;
-                }
-            } else {
-                this.position = this.position + 1;
-            }
-        }
-        if (this.position > litStart) {
-            output.Append(this.input.Substring(litStart, this.position - litStart));
-        }
-        return new ArpgTemplateSection(
-            output.ToString(), ArpgTemplateTerminator.None(), "");
+        this.InitOut(n - this.position);
+        nint srcPtr = (nint)this.input;
+        Span<byte> sp = new Span<byte>(srcPtr, n);
+        int term = 0;
+        int cs = 0;
+        int ce = 0;
+        this.ParseSectionInto(this.input, srcPtr, sp, n, out term, out cs, out ce);
+        string text = this.outLen == 0 ? "" : NativeMemory.GetString((nint)this.outBuf, 0, this.outLen);
+        string cond = (term == ArpgTemplateTerminator.ElseIf() && ce > cs)
+            ? NativeMemory.GetString(srcPtr, cs, ce - cs)
+            : "";
+        return new ArpgTemplateSection(text, term, cond);
     }
 }
