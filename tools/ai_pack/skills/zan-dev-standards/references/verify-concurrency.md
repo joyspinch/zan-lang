@@ -279,3 +279,29 @@
   回退掉——这比"内容被裹走"严重得多。读 HEAD → 改索引 → 提交，尽量在
   同一个命令里做完。
 
+### 包级并发/生命周期加固（ARC 零泄漏与原生边界沉淀）
+
+- **静态监视器锁用 `.rodata` 字符串常量，不用 `new object()`**：
+  `static object lk = new object();` 会成为永久存活的堆根，在 `--check-leaks`
+  下必然报 1 条泄漏；改为 `static string lk = "<Namespace>.<Class>.<Field>";`
+  配合 `lock (<Class>.lk)` 复用编译期常量，跨线程互斥语义一致且零泄漏。
+- **回调卸载竞态：静态委托字段先快照到局部变量再判空调用**：全局热键、
+  钩子、托盘等静态回调若在 `if (cb != null)` 与 `cb(...)` 之间被并发
+  `Uninstall()`/`Remove()` 置空，二次读取会空引用崩溃。调用侧必须
+  `Callback fn = Class.cb; if (fn != null) { fn(...); }`；卸载侧先解注册原生
+  钩子再清空静态委托。
+- **关闭传输与结束远端会话要分清契约**：带会话状态的客户端（如 MCP）同步
+  `Close()`/`Dispose()` 仅释放本地传输连接，不得清空只读会话元数据
+  （`initialized` / `serverInfo`）；仅显式异步结束方法（`CloseAsync()`）才通知
+  对端并重置会话状态。加固生命周期前先核对既有测试断言。
+- **Win32 / POSIX 原生调用的防破坏与防泄漏边界**：
+  - `RegDeleteTreeW(hive, subKey)` 收到空/null `subKey` 会递归删除整棵根键，
+    包装层必须先拦截并返回 `87`（`ERROR_INVALID_PARAMETER`）。
+  - 调用外部 CLI（`xdotool`、`pkill` 等）传负坐标或任意模式串前必须插 `--`，
+    防止被解析为选项标志。
+  - Win32 出参结构体先 `NativeMemory.Fill(..., 0)` 并检查返回值；Linux sysfs
+    微瓦时/微安时电量百分比换算用 64 位 `long`（`energyNow * 100L / energyFull`），
+    防 32 位 `int` 在 >21.4 Wh 电池上溢出。
+  - GDI / Clipboard / COM / Menu / 临时脚本句柄一律 `try/finally` 释放，禁止早退泄漏。
+
+
