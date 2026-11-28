@@ -8,25 +8,8 @@ class PinWorldTest {
         }
     }
 
-    static PinWorld Copy(PinWorld source) {
-        PinWorld copy = new PinWorld();
-        copy.StartRound(source.level, 0);
-        copy.pins.Clear();
-        for (int i = 0; i < source.pins.Count; i = i + 1) {
-            copy.pins.Add(new Pin(source.pins[i].angle, source.pins[i].preset));
-        }
-        copy.rotation = source.rotation;
-        copy.elapsedMs = source.elapsedMs;
-        copy.inserted = source.inserted;
-        return copy;
-    }
-
-    static bool SafeShot(PinWorld source) {
-        PinWorld next = PinWorldTest.Copy(source);
-        next.Shoot();
-        for (int i = 0; i < 12; i = i + 1) { next.Step(16); }
-        return next.state != RoundState.Failed && next.inserted == source.inserted + 1;
-    }
+    // Full-state lookahead (phase clock, wobble, boss ring) lives in the model.
+    static bool SafeShot(PinWorld source) { return source.SafeShot(); }
 
     #if !PIN_SCENE_TEST
     static void Main() { PinWorldTest.Run(); }
@@ -34,7 +17,9 @@ class PinWorldTest {
 
     static void Run() {
         PinWorld g = new PinWorld();
-        PinWorldTest.Require(g.level == 1 && g.target == 5 && g.pins.Count == 2, "first round setup");
+        PinLevel first = PinLevels.Get(1);
+        PinWorldTest.Require(g.level == 1 && g.target == first.phases[0].target
+            && g.pins.Count == first.phases[0].presets.Count && g.PhaseCount() == 1, "first round setup");
         PinWorldTest.Require(g.Shoot() && !g.Shoot(), "one needle in flight");
         g.TogglePause();
         double radius = g.shotRadius;
@@ -46,7 +31,7 @@ class PinWorldTest {
         PinWorldTest.Require(!g.Shoot(), "paused round rejects shots");
         g.TogglePause();
         g.Step(192);
-        PinWorldTest.Require(g.inserted == 1 && !g.flying && g.Remaining() == 4, "first pin attaches once");
+        PinWorldTest.Require(g.inserted == 1 && !g.flying && g.Remaining() == g.target - 1, "first pin attaches once");
         g.Step(16);
         PinWorldTest.Require(g.inserted == 1, "idle frames do not attach another pin");
 
@@ -72,6 +57,7 @@ class PinWorldTest {
         g.Step(1000);
         PinWorldTest.Require(g.elapsedMs == frozenTime && g.pulseMs == 0, "failed wheel freezes but feedback ends");
 
+        // Rotor mechanics by level.
         g.StartRound(4, 0);
         double speed = g.AngularSpeed();
         g.Step(1000);
@@ -79,28 +65,63 @@ class PinWorldTest {
         g.StartRound(7, 0);
         speed = g.AngularSpeed();
         g.Step(4000);
-        PinWorldTest.Require(speed * g.AngularSpeed() < 0, "reverse rounds change direction");
+        PinWorldTest.Require(speed * g.AngularSpeed() < 0, "sudden-reversal rounds change direction");
+        g.StartRound(7, 0);
+        bool warned = false;
+        for (int i = 0; i < 200 && !warned; i = i + 1) { g.Step(16); warned = g.FlipWarning(); }
+        PinWorldTest.Require(warned && g.NextFlipIn() > 0 && g.NextFlipIn() <= PinWorld.FlipWarnMs,
+            "reversals are telegraphed before they happen");
         g.StartRound(2, 0);
-        PinWorldTest.Require(g.AngularSpeed() < 0, "even rounds start counterclockwise");
+        PinWorldTest.Require(g.AngularSpeed() < 0, "level 2 starts counterclockwise");
+        g.StartRound(24, 0);
+        double maxSway = 0;
+        for (int i = 0; i < 200; i = i + 1) { g.Step(16); maxSway = Math.Max(maxSway, Math.Abs(g.wobble)); }
+        PinWorldTest.Require(maxSway > 10 && maxSway <= g.Phase().wobblePx + 0.0001, "wobbling rotor sways within range");
 
         PinWorld batch = new PinWorld();
         PinWorld small = new PinWorld();
-        batch.StartRound(8, 87);
-        small.StartRound(8, 87);
+        batch.StartRound(28, 87);
+        small.StartRound(28, 87);
         batch.Shoot();
         small.Shoot();
         batch.Step(160);
         for (int i = 0; i < 10; i = i + 1) { small.Step(16); }
         PinWorldTest.Require(Math.Abs(batch.rotation - small.rotation) < 0.000001
-            && batch.shotRadius == small.shotRadius && batch.state == small.state,
+            && batch.shotRadius == small.shotRadius && batch.state == small.state
+            && Math.Abs(batch.wobble - small.wobble) < 0.000001,
             "fixed substeps are independent of caller chunking");
 
+        // Boss rings: clearing a ring re-arms the rotor and blocks fire for the interlude.
+        int bosses = 0;
+        for (int level = 10; level <= PinLevels.Count; level = level + 10) {
+            PinLevel spec = PinLevels.Get(level);
+            PinWorldTest.Require(spec.Boss() && spec.phases.Count >= 2, "boss level " + level + " has several rings");
+            g.StartRound(level, 0);
+            int ringsSeen = 1;
+            bool interludeChecked = false;
+            for (int tick = 0; tick < 12000 && g.state == RoundState.Playing; tick = tick + 1) {
+                int phase = g.phase;
+                if (!g.flying && g.SafeShot()) { g.Shoot(); }
+                g.Step(16);
+                if (g.phase != phase) {
+                    ringsSeen = ringsSeen + 1;
+                    PinWorldTest.Require(g.inserted == 0 && g.pins.Count == g.Phase().presets.Count
+                        && !g.Armed() && !g.Shoot(), "ring change re-arms the rotor with fire held");
+                    interludeChecked = true;
+                }
+            }
+            PinWorldTest.Require(g.state == RoundState.Cleared && ringsSeen == spec.phases.Count && interludeChecked
+                && g.totalInserted == spec.TotalPins(), "boss level " + level + " clears every ring");
+            bosses = bosses + 1;
+        }
+
+        // Every level is solvable by a correct player from several start angles.
         int solved = 0;
-        for (int level = 1; level <= 20; level = level + 1) {
+        for (int level = 1; level <= PinLevels.Count; level = level + 1) {
             for (int seed = 0; seed < 4; seed = seed + 1) {
                 g.StartRound(level, seed * 83);
-                for (int tick = 0; tick < 7500 && g.state == RoundState.Playing; tick = tick + 1) {
-                    if (!g.flying && PinWorldTest.SafeShot(g)) { g.Shoot(); }
+                for (int tick = 0; tick < 12000 && g.state == RoundState.Playing; tick = tick + 1) {
+                    if (!g.flying && g.SafeShot()) { g.Shoot(); }
                     g.Step(16);
                     PinWorldTest.Require(g.inserted >= 0 && g.inserted <= g.target, "insertion bounds");
                     for (int i = 0; i < g.pins.Count; i = i + 1) {
@@ -125,7 +146,7 @@ class PinWorldTest {
             for (int seed = 0; seed < 12; seed = seed + 1) {
                 g.StartRound(level, seed * 29);
                 int rhythm = 16 + seed * 8;
-                for (int tick = 0; tick < 5000 && g.state == RoundState.Playing; tick = tick + 1) {
+                for (int tick = 0; tick < 8000 && g.state == RoundState.Playing; tick = tick + 1) {
                     if (tick % rhythm == 0) { g.Shoot(); }
                     g.Step(16);
                 }
@@ -134,10 +155,15 @@ class PinWorldTest {
             }
         }
         PinWorldTest.Require(wins > 0 && losses > 0, "medium players exercise both outcomes");
+
         g.StartRound(99, 0);
-        PinWorldTest.Require(g.target == 18 && g.pins.Count == 6 && g.flying == false,
-            "late levels stay bounded and restart resets flight");
-        Console.WriteLine("PASS pin-circle: boundaries, pause, substeps, " + solved
-            + " solved rounds, 120 rhythmic players (wins=" + wins + ", losses=" + losses + ")");
+        PinLevel last = PinLevels.Get(PinLevels.Count);
+        PinWorldTest.Require(g.level == PinLevels.Count && g.target == last.phases[0].target
+            && g.pins.Count == last.phases[0].presets.Count && g.phase == 0 && g.flying == false,
+            "late levels clamp to the last level and restart resets flight");
+        g.StartRound(-3, 0);
+        PinWorldTest.Require(g.level == 1, "levels below 1 clamp to the first level");
+        Console.WriteLine("PASS pin-circle: boundaries, pause, substeps, mechanics, " + bosses + " boss levels, "
+            + solved + " solved rounds, 120 rhythmic players (wins=" + wins + ", losses=" + losses + ")");
     }
 }

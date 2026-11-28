@@ -17,7 +17,7 @@ WORK = ROOT / "build/test-out/pin-circle-tests"
 CASES = ROOT / "build/cases"
 SOURCES = sorted((TEMPLATE / "src").rglob("*.zan"))
 SCENE_SOURCES = [source for source in SOURCES if source.name != "main.zan"]
-MODEL_SOURCES = [TEMPLATE / "src/PinWorld.zan", *sorted((TEMPLATE / "src/Entities").glob("*.zan"))]
+MODEL_SOURCES = [TEMPLATE / "src/PinWorld.zan", TEMPLATE / "src/PinLevels.zan", *sorted((TEMPLATE / "src/Entities").glob("*.zan"))]
 
 
 def compile_program(compiler, name, sources, publish=False, assets=False):

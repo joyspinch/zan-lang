@@ -7,8 +7,8 @@ using Game.Foundation.Gui;
 
 namespace PinCircle;
 
-// One retained tree, shared by the existing three scene instances. Only the
-// world remains in PinView; all player-facing controls use Gui input and skin.
+// One retained tree, shared by every scene instance. Only the world remains in
+// PinView; all player-facing controls use Gui input and the brass/jade skin.
 public class PinHud : UiViewOwner {
     PinWorld game;
     PinShell shell;
@@ -17,25 +17,26 @@ public class PinHud : UiViewOwner {
     weak SceneRouter router;
     HudLayer layer;
     UiViewScope scope;
-    Action startAction;
-    Action homeAction;
-    Action pauseAction;
-    Action confirmAction;
-    Action backAction;
-    Action muteAction;
+    List<Action> actions;
     Panel root;
     Panel menu;
     Panel play;
+    Panel select;
     Panel modal;
     Panel card;
     Panel instrument;
     Label remaining;
     Label rotorCaption;
+    Label banner;
+    Label close;
     Label medal;
     Image titleArt;
-    Label best;
+    Label startCaption;
+    Label chapter;
     Label level;
     Label pattern;
+    Label tryStar;
+    Label timeStar;
     Label status;
     Label heading;
     Label detail;
@@ -44,15 +45,25 @@ public class PinHud : UiViewOwner {
     Label fireCaption;
     Label playHint;
     Label record;
+    Label selectSummary;
     Button start;
+    Button levels;
     Button home;
     Button pause;
     Button confirm;
+    Button cardLevels;
     Button back;
     Button mute;
+    Button selectBack;
     List<Panel> dots;
+    List<Label> stars;
+    List<Label> chapters;
+    List<Button> cells;
+    List<Label> cellNumbers;
+    List<Label> cellStars;
     string mode;
     int animationMs;
+    int selected;
     bool paused;
     bool muteShown;
     bool muteSynced;
@@ -61,6 +72,8 @@ public class PinHud : UiViewOwner {
         this.game = game;
         this.view = view;
         this.shell = view.shell;
+        this.actions = new List<Action>();
+        this.selected = 1;
         app.UseCss(PinHud.Css());
         this.layer = new HudLayer();
         this.root = new Panel("pin-hud");
@@ -68,6 +81,17 @@ public class PinHud : UiViewOwner {
         this.instrument = this.Group(this.root, "pin-instrument");
         this.remaining = this.LabelAt(this.instrument, "", "pin-paper", "remaining");
         this.rotorCaption = this.LabelAt(this.instrument, "", "pin-gold", "rotor-caption");
+        this.BuildMenu();
+        this.BuildSelect();
+        this.BuildPlay();
+        this.BuildModal();
+        // Sound toggle sits above every page so M and the button stay in sync.
+        this.mute = this.ButtonAt(this.root, "♪", "pin-tool", "mute");
+        this.layer.Add(this.root);
+        this.layer.SetVisible(false);
+    }
+
+    void BuildMenu() {
         this.menu = this.Group(this.root, "pin-menu");
         this.LabelAt(this.menu, "O R B I T   /   P R E C I S I O N", "pin-gold", "eyebrow");
         this.LabelAt(this.menu, "一 瞬 之 间  ·  恰 好 入 隙", "pin-muted", "subtitle");
@@ -75,39 +99,81 @@ public class PinHud : UiViewOwner {
         this.titleArt.Class = "pin-title-art";
         this.menu.Add(this.titleArt);
         this.start = this.ButtonAt(this.menu, "▷", "pin-seal", "start");
-        this.LabelAt(this.menu, "开 始 挑 战", "pin-paper", "start-caption");
-        this.LabelAt(this.menu, "空格 / 点击发射  ·  P 暂停  ·  M 静音", "pin-muted", "menu-hint");
-        this.best = this.LabelAt(this.menu, "", "pin-gold", "best");
+        this.startCaption = this.LabelAt(this.menu, "", "pin-paper", "start-caption");
+        this.levels = this.ButtonAt(this.menu, "", "pin-pill", "levels");
+        this.LabelAt(this.menu, "空格 / 点击发射  ·  L 选关  ·  P 暂停  ·  M 静音", "pin-muted", "menu-hint");
+    }
+
+    void BuildSelect() {
+        this.select = this.Group(this.root, "pin-select");
+        this.selectBack = this.ButtonAt(this.select, "←", "pin-tool", "select-back");
+        this.LabelAt(this.select, "选 择 关 卡", "pin-paper", "select-title");
+        this.selectSummary = this.LabelAt(this.select, "", "pin-gold", "select-summary");
+        this.LabelAt(this.select, "方向键选择  ·  Enter 开始  ·  Esc 返回", "pin-muted", "select-hint");
+        this.chapters = new List<Label>();
+        for (int c = 0; c < 4; c = c + 1) {
+            this.chapters.Add(this.LabelAt(this.select, "—  " + PinLevels.Chapter(c * 10 + 1) + "  —", "pin-gold", "chapter" + c));
+        }
+        this.cells = new List<Button>();
+        this.cellNumbers = new List<Label>();
+        this.cellStars = new List<Label>();
+        for (int i = 1; i <= PinLevels.Count; i = i + 1) {
+            Button cell = this.ButtonAt(this.select, "", "pin-cell", "lv" + i);
+            Label number = new Label(Convert.ToString(i));
+            number.Class = "pin-label pin-cell-number";
+            cell.Add(number);
+            Label mark = new Label("");
+            mark.Class = "pin-label pin-cell-stars";
+            cell.Add(mark);
+            if (PinLevels.IsBoss(i)) {
+                Label tag = new Label("首 领");
+                tag.name = "boss";
+                tag.Class = "pin-label pin-cell-tag";
+                cell.Add(tag);
+            }
+            this.cells.Add(cell);
+            this.cellNumbers.Add(number);
+            this.cellStars.Add(mark);
+        }
+    }
+
+    void BuildPlay() {
         this.play = this.Group(this.root, "pin-play");
         this.home = this.ButtonAt(this.play, "←", "pin-tool", "home");
         this.pause = this.ButtonAt(this.play, "Ⅱ", "pin-tool", "pause");
-        this.LabelAt(this.play, "星 环 机 关", "pin-gold", "title");
+        this.chapter = this.LabelAt(this.play, "", "pin-gold", "title");
         this.level = this.LabelAt(this.play, "", "pin-paper", "level");
         this.dots = new List<Panel>();
-        for (int i = 0; i < 18; i = i + 1) {
+        for (int i = 0; i < 20; i = i + 1) {
             Panel dot = new Panel("pin-dot");
             dot.Class = "pin-dot";
             this.play.Add(dot);
             this.dots.Add(dot);
         }
+        this.tryStar = this.LabelAt(this.play, "", "pin-gold pin-right", "try-star");
+        this.timeStar = this.LabelAt(this.play, "", "pin-gold pin-left", "time-star");
         this.pattern = this.LabelAt(this.play, "", "pin-muted", "pattern");
         this.fireCaption = this.LabelAt(this.play, "轻触发射", "pin-paper", "fire-caption");
         this.playHint = this.LabelAt(this.play, "点击空白处或按空格发射  ·  避开针球与针杆", "pin-muted", "play-hint");
+        this.banner = this.LabelAt(this.play, "", "pin-banner pin-gold", "banner");
+        this.close = this.LabelAt(this.play, "CLOSE!", "pin-close", "close");
+    }
+
+    void BuildModal() {
         this.modal = this.Group(this.root, "pin-modal");
         this.card = this.Group(this.modal, "pin-card");
         this.status = this.LabelAt(this.card, "", "pin-gold", "status");
         this.medal = this.LabelAt(this.card, "◇", "pin-medal", "medal");
+        this.stars = new List<Label>();
+        for (int i = 0; i < 3; i = i + 1) { this.stars.Add(this.LabelAt(this.card, "★", "pin-star", "star" + i)); }
         this.heading = this.LabelAt(this.card, "", "pin-paper", "heading");
         this.detail = this.LabelAt(this.card, "", "pin-muted", "detail");
         this.record = this.LabelAt(this.card, "", "pin-gold", "record");
         this.confirm = this.ButtonAt(this.card, "▷", "pin-seal", "confirm");
         this.caption = this.LabelAt(this.card, "", "pin-paper", "confirm-caption");
-        this.back = this.ButtonAt(this.card, "返回主菜单", "pin-back", "back");
+        this.cardLevels = this.ButtonAt(this.card, "选择关卡", "pin-pill", "card-levels");
+        this.back = this.ButtonAt(this.card, "返回主菜单", "pin-pill", "back");
         this.hint = this.LabelAt(this.modal, "", "pin-muted", "result-hint");
-        // Sound toggle sits above every page so M and the button stay in sync.
-        this.mute = this.ButtonAt(this.root, "♪", "pin-tool", "mute");
-        this.layer.Add(this.root);
-        this.layer.SetVisible(false);
     }
 
     Panel Group(Control parent, string cls) {
@@ -124,7 +190,8 @@ public class PinHud : UiViewOwner {
         return label;
     }
     Button ButtonAt(Control parent, string text, string cls, string name) {
-        Button button = new Button(text);
+        bool round = cls == "pin-seal" || cls == "pin-tool";
+        Button button = new Button(round ? "" : text);
         button.name = name;
         button.Class = cls;
         if (cls == "pin-seal") {
@@ -132,8 +199,27 @@ public class PinHud : UiViewOwner {
             art.Class = "pin-seal-art";
             button.InsertAt(0, art);
         }
+        // Round buttons carry their glyph as a child label: the button's own
+        // text label is not painted once an inline border-radius is set.
+        if (round) {
+            Label glyph = new Label(text);
+            glyph.name = "glyph";
+            glyph.Class = "pin-label pin-glyph";
+            button.Add(glyph);
+        }
         parent.Add(button);
         return button;
+    }
+
+    void SetGlyph(Button button, string text) {
+        Control glyph = button.FindByName("glyph");
+        if (glyph != null) { glyph.SetProp("text", text); }
+    }
+
+    void Wire(string name, Button button) {
+        Action run = this.scope.Action(name, button).Run;
+        button.OnClick(run);
+        this.actions.Add(run);
     }
 
     void Enter(SceneRouter router, HtmlScene scene, string mode) {
@@ -143,22 +229,35 @@ public class PinHud : UiViewOwner {
         this.mode = mode;
         App app = router.Host().App();
         this.scope = new UiViewScope(app, this, this.root);
-        this.startAction = this.scope.Action("start", this.start).Run;
-        this.homeAction = this.scope.Action("home", this.home).Run;
-        this.pauseAction = this.scope.Action("pause", this.pause).Run;
-        this.confirmAction = this.scope.Action("confirm", this.confirm).Run;
-        this.backAction = this.scope.Action("home", this.back).Run;
-        this.muteAction = this.scope.Action("mute", this.mute).Run;
-        this.start.OnClick(this.startAction);
-        this.home.OnClick(this.homeAction);
-        this.pause.OnClick(this.pauseAction);
-        this.confirm.OnClick(this.confirmAction);
-        this.back.OnClick(this.backAction);
-        this.mute.OnClick(this.muteAction);
+        this.Wire("start", this.start);
+        this.Wire("levels", this.levels);
+        this.Wire("home", this.home);
+        this.Wire("pause", this.pause);
+        this.Wire("confirm", this.confirm);
+        this.Wire("levels", this.cardLevels);
+        this.Wire("home", this.back);
+        this.Wire("mute", this.mute);
+        this.Wire("home", this.selectBack);
+        for (int i = 0; i < this.cells.Count; i = i + 1) { this.Wire("cell", this.cells[i]); }
         this.root.OnPreviewRouted(this.scope.Action("world", this.root).Pointer);
         this.Sync(0);
         this.layer.SetVisible(true);
         this.layer.Bind(app);
+    }
+
+    List<Button> Wired() {
+        List<Button> list = new List<Button>();
+        list.Add(this.start);
+        list.Add(this.levels);
+        list.Add(this.home);
+        list.Add(this.pause);
+        list.Add(this.confirm);
+        list.Add(this.cardLevels);
+        list.Add(this.back);
+        list.Add(this.mute);
+        list.Add(this.selectBack);
+        for (int i = 0; i < this.cells.Count; i = i + 1) { list.Add(this.cells[i]); }
+        return list;
     }
 
     void Exit() {
@@ -169,23 +268,29 @@ public class PinHud : UiViewOwner {
         // Retire queued actions before releasing capture/focus can call back.
         if (previous != null) { previous.Retire(); }
         this.layer.SetVisible(false);
-        if (this.startAction != null) { this.start.Click.Remove(this.startAction); }
-        if (this.homeAction != null) { this.home.Click.Remove(this.homeAction); }
-        if (this.pauseAction != null) { this.pause.Click.Remove(this.pauseAction); }
-        if (this.confirmAction != null) { this.confirm.Click.Remove(this.confirmAction); }
-        if (this.backAction != null) { this.back.Click.Remove(this.backAction); }
-        if (this.muteAction != null) { this.mute.Click.Remove(this.muteAction); }
-        this.startAction = null;
-        this.homeAction = null;
-        this.pauseAction = null;
-        this.confirmAction = null;
-        this.backAction = null;
-        this.muteAction = null;
+        if (this.actions.Count > 0) {
+            List<Button> wired = this.Wired();
+            for (int i = 0; i < wired.Count && i < this.actions.Count; i = i + 1) {
+                wired[i].Click.Remove(this.actions[i]);
+            }
+        }
+        this.actions.Clear();
         this.root.OnPreviewRouted(null);
     }
 
     void Sync(int animationMs) {
         this.SyncState(animationMs);
+    }
+
+    static string StarText(int n) {
+        string s = "";
+        for (int i = 0; i < 3; i = i + 1) { s = s + (i < n ? "★" : "☆"); }
+        return s;
+    }
+
+    static string Seconds(int ms) {
+        int tenths = (ms + 50) / 100;
+        return (tenths / 10) + "." + (tenths % 10);
     }
 
     void SyncState(int animationMs) {
@@ -204,55 +309,144 @@ public class PinHud : UiViewOwner {
             else { app.ReleaseInputSubtree(this.modal); }
         }
         bool result = this.paused || this.mode == "over";
+        bool playing = this.mode == "play" && !result;
         this.menu.SetShown(this.mode == "menu");
-        this.play.SetShown(this.mode != "menu");
-        this.home.SetShown(this.mode == "play" && !result);
-        this.pause.SetShown(this.mode == "play" && !result);
-        this.fireCaption.SetShown(this.mode == "play" && !result);
+        this.select.SetShown(this.mode == "select");
+        this.play.SetShown(this.mode == "play" || this.mode == "over");
+        this.instrument.SetShown(this.mode != "select");
+        this.home.SetShown(playing);
+        this.pause.SetShown(playing);
+        this.fireCaption.SetShown(playing && this.game.state == RoundState.Playing);
         // Controls hint: always for first runs, otherwise until the first pin lands.
-        this.playHint.SetShown(this.mode == "play" && !result
-            && (this.game.inserted == 0 || this.Shell().Plays() <= 1));
+        this.playHint.SetShown(playing && this.game.state == RoundState.Playing
+            && (this.game.totalInserted == 0 || this.Shell().Plays() <= 1));
         this.mute.SetShown(!result);
         bool muted = this.Shell().Muted();
         if (!this.muteSynced || muted != this.muteShown) {
             this.muteSynced = true;
             this.muteShown = muted;
-            this.mute.SetText(muted ? "×" : "♪");
+            this.SetGlyph(this.mute, muted ? "×" : "♪");
             this.mute.SetProp("class", muted ? "pin-tool pin-tool-off" : "pin-tool");
         }
-        this.remaining.SetProp("text", this.mode == "menu" ? "01" : Convert.ToString(this.game.Remaining()));
-        this.rotorCaption.SetProp("text", this.mode == "menu" ? "入 隙" : "待 发 射");
-        this.modal.SetShown(result);
-        long bestLevel = this.Shell().BestLevel();
-        long plays = this.Shell().Plays();
-        this.best.SetProp("text", bestLevel > 0
-            ? "最高通关  第 " + bestLevel + " 关   ·   已玩 " + plays + " 局"
-            : (plays > 0 ? "尚未通关   ·   已玩 " + plays + " 局" : "首次挑战  ·  从第 1 关开始"));
-        this.level.SetProp("text", "第 " + this.game.level + " 关");
-        this.pattern.SetProp("text", this.game.PatternName());
-        for (int i = 0; i < this.dots.Count; i = i + 1) {
-            this.dots[i].SetShown(i < this.game.target);
-            this.dots[i].SetProp("class", i < this.game.inserted ? "pin-dot pin-dot-filled" : "pin-dot");
-        }
-        bool won = this.game.state == RoundState.Cleared;
-        bool newBest = !this.paused && won && this.Shell().NewBest();
-        this.status.SetProp("text", this.paused ? "TAKE A BREATH" : (newBest ? "★  NEW BEST  ★" : (won ? "PERFECT TIMING" : "ONE MORE TRY")));
-        this.record.SetProp("text", newBest ? "新纪录  ·  最高通关第 " + this.game.level + " 关"
-            : (this.Shell().BestLevel() > 0 ? "最高通关  第 " + this.Shell().BestLevel() + " 关" : "尚未通关"));
-        this.heading.SetProp("text", this.paused ? "蓄 势 待 发" : (won ? "针 针 入 隙" : "再 差 一 瞬"));
-        this.detail.SetProp("text", "第 " + this.game.level + " 关   /   已入隙 " + this.game.inserted + " · " + this.game.target);
-        this.confirm.SetText(!this.paused && !won ? "↶" : "▷");
-        this.medal.SetProp("text", this.paused ? "Ⅱ" : (won ? "✓" : "!"));
-        this.medal.SetProp("class", "pin-label pin-medal " + (this.paused ? "pin-gold" : (won ? "pin-jade" : "pin-danger")));
-        this.caption.SetProp("text", this.paused ? "继续挑战" : (won ? "开启下一关" : "重试本关"));
-        this.hint.SetProp("text", this.paused ? "P / 空格继续  ·  Esc 返回菜单  ·  M 静音" : "Enter / 空格继续  ·  Esc 返回菜单  ·  M 静音");
-        this.confirm.Disabled = this.mode == "over" && animationMs < 240;
+        this.SyncMenu();
+        this.SyncPlay(playing);
+        this.SyncSelect();
+        this.SyncCard();
         // Configure child styles before the shared HUD scope measures them.
         // Enter uses this same path before its first Bind and first input.
         if (activeRouter != null) {
             App app = activeRouter.Host().App();
             this.Layout(this.layer.BoundsWidth(app), this.layer.BoundsHeight(app));
         }
+    }
+
+    void SyncMenu() {
+        if (this.mode != "menu") { return; }
+        int next = this.Shell().NextLevel();
+        long cleared = this.Shell().BestLevel();
+        this.startCaption.SetProp("text", cleared <= 0 ? "开 始 挑 战" : "继 续  ·  第 " + next + " 关");
+        this.levels.SetText("选择关卡   ★ " + this.Shell().TotalStars() + " / " + (PinLevels.Count * 3));
+        this.remaining.SetProp("text", next < 10 ? "0" + next : Convert.ToString(next));
+        this.rotorCaption.SetProp("text", "关 卡");
+    }
+
+    void SyncPlay(bool playing) {
+        if (this.mode != "play" && this.mode != "over") { return; }
+        PinFx fx = this.view.fx;
+        this.chapter.SetProp("text", PinLevels.Chapter(this.game.level));
+        this.level.SetProp("text", "第 " + this.game.level + " 关  ·  " + this.game.spec.name);
+        this.pattern.SetProp("text", this.game.PatternName());
+        this.pattern.SetProp("class", this.game.FlipWarning() ? "pin-label pin-danger" : "pin-label pin-muted");
+        for (int i = 0; i < this.dots.Count; i = i + 1) {
+            this.dots[i].SetShown(i < this.game.target);
+            this.dots[i].SetProp("class", i < this.game.inserted ? "pin-dot pin-dot-filled" : "pin-dot");
+        }
+        bool live = playing && this.game.state == RoundState.Playing;
+        bool firstTry = this.Shell().Attempts() <= 1;
+        this.tryStar.SetShown(live);
+        this.timeStar.SetShown(live);
+        this.tryStar.SetProp("text", firstTry ? "★ 一次通关" : "☆ 第 " + this.Shell().Attempts() + " 次尝试");
+        this.tryStar.SetProp("class", firstTry ? "pin-label pin-gold pin-right" : "pin-label pin-dim pin-right");
+        int left = this.game.ParMs() - this.game.elapsedMs;
+        this.timeStar.SetProp("text", left >= 0 ? "★ 限时 " + PinHud.Seconds(left) + "s" : "☆ 限时已过");
+        this.timeStar.SetProp("class", left >= 0 ? (left < 3000 ? "pin-label pin-danger pin-left" : "pin-label pin-gold pin-left")
+            : "pin-label pin-dim pin-left");
+        bool bannerOn = fx.bannerMs > 0;
+        this.banner.SetShown(bannerOn && this.mode == "play");
+        if (bannerOn) {
+            this.banner.SetProp("text", fx.bannerText);
+            this.banner.SetProp("class", "pin-label pin-banner " + fx.bannerTone);
+        }
+        this.close.SetShown(fx.closeMs > 0 && this.mode == "play" && this.game.state != RoundState.Failed);
+        this.remaining.SetShown(!bannerOn || this.mode != "play");
+        this.rotorCaption.SetShown(!bannerOn || this.mode != "play");
+        this.remaining.SetProp("text", Convert.ToString(this.game.Remaining()));
+        this.rotorCaption.SetProp("text", this.game.Armed() ? "待 发 射" : "换 环 中");
+    }
+
+    void SyncSelect() {
+        if (this.mode != "select") { return; }
+        int unlocked = this.Shell().Unlocked();
+        int next = this.Shell().NextLevel();
+        this.selectSummary.SetProp("text", "★ " + this.Shell().TotalStars() + " / " + (PinLevels.Count * 3)
+            + "    ·    已通关 " + this.Shell().BestLevel() + " / " + PinLevels.Count);
+        for (int i = 0; i < this.cells.Count; i = i + 1) {
+            int lv = i + 1;
+            bool open = lv <= unlocked;
+            int got = this.Shell().Stars(lv);
+            string cls = "pin-cell";
+            if (PinLevels.IsBoss(lv)) { cls = cls + " pin-cell-boss"; }
+            if (open && lv == next && got == 0) { cls = cls + " pin-cell-next"; }
+            if (lv == this.selected) { cls = cls + " pin-cell-sel"; }
+            if (this.cells[i].Class != cls) { this.cells[i].SetProp("class", cls); }
+            this.cells[i].Disabled = !open;
+            this.cellNumbers[i].SetProp("class", open ? "pin-label pin-cell-number" : "pin-label pin-cell-number pin-locked");
+            this.cellStars[i].SetProp("text", !open ? "未 解 锁" : (got > 0 ? PinHud.StarText(got) : "· · ·"));
+            this.cellStars[i].SetProp("class", got > 0 ? "pin-label pin-cell-stars pin-gold" : "pin-label pin-cell-stars pin-dim");
+        }
+    }
+
+    void SyncCard() {
+        bool won = this.game.state == RoundState.Cleared;
+        bool over = this.mode == "over";
+        bool result = this.paused || over;
+        this.modal.SetShown(result);
+        if (!result) { return; }
+        bool newBest = over && won && this.Shell().NewBest();
+        int got = over && won ? this.Shell().LastStars() : 0;
+        int bestStars = this.Shell().Stars(this.game.level);
+        this.status.SetProp("text", this.paused ? "TAKE A BREATH"
+            : (newBest ? "★  NEW BEST  ★" : (won ? (got == 3 ? "FLAWLESS" : "PERFECT TIMING") : "ONE MORE TRY")));
+        this.medal.SetShown(!(over && won));
+        for (int i = 0; i < 3; i = i + 1) {
+            this.stars[i].SetShown(over && won);
+            this.stars[i].SetProp("class", i < got ? "pin-label pin-star pin-star-on" : "pin-label pin-star pin-star-off");
+        }
+        if (this.paused) {
+            this.record.SetProp("text", bestStars > 0 ? "本关最佳  " + PinHud.StarText(bestStars) : "本关尚未通关");
+        } else if (won) {
+            this.record.SetProp("text", newBest ? "新纪录  ·  已解锁第 " + PinLevels.Clamp(this.game.level + 1) + " 关"
+                : (this.Shell().NewStars() ? "刷新本关星级  " + PinHud.StarText(bestStars) : "本关最佳  " + PinHud.StarText(bestStars)));
+        } else {
+            this.record.SetProp("text", "已入隙 " + this.game.totalInserted + " / " + this.game.spec.TotalPins()
+                + (this.game.Boss() ? "  ·  第 " + (this.game.phase + 1) + " 环" : ""));
+        }
+        this.heading.SetProp("text", this.paused ? "蓄 势 待 发" : (won ? "针 针 入 隙" : "再 差 一 瞬"));
+        if (won && over) {
+            this.detail.SetProp("text", "用时 " + PinHud.Seconds(this.game.elapsedMs) + " 秒  ·  限时 "
+                + PinHud.Seconds(this.game.ParMs()) + " 秒" + (this.game.closeCount > 0 ? "  ·  险中 " + this.game.closeCount : ""));
+        } else {
+            this.detail.SetProp("text", "第 " + this.game.level + " 关 · " + this.game.spec.name
+                + (this.paused ? "   /   已入隙 " + this.game.inserted + " · " + this.game.target : ""));
+        }
+        bool last = won && this.game.level >= PinLevels.Count;
+        this.SetGlyph(this.confirm, !this.paused && !won ? "↶" : "▷");
+        this.medal.SetProp("text", this.paused ? "Ⅱ" : (won ? "✓" : "!"));
+        this.medal.SetProp("class", "pin-label pin-medal " + (this.paused ? "pin-gold" : (won ? "pin-jade" : "pin-danger")));
+        this.caption.SetProp("text", this.paused ? "继续挑战" : (won ? (last ? "再战终章" : "开启下一关") : "重试本关"));
+        this.hint.SetProp("text", this.paused ? "P / 空格继续  ·  L 选关  ·  Esc 返回菜单"
+            : "Enter / 空格继续  ·  L 选关  ·  Esc 返回菜单");
+        this.confirm.Disabled = over && this.animationMs < 240;
     }
 
     void Render(App app) { this.layer.Paint(app); }
@@ -278,8 +472,22 @@ public class PinHud : UiViewOwner {
             if (view != null) { view.ToggleMute(); }
             return;
         }
-        if (name == "home") { this.shell.Play("click"); }
-        if (name == "home") { owner.Go("menu"); }
+        if (name == "home") {
+            this.shell.Play("click");
+            owner.Go("menu");
+            return;
+        }
+        if (name == "levels") {
+            this.shell.Play("click");
+            owner.Go("select");
+            return;
+        }
+        if (name == "cell" && active is PinSelectScene) {
+            for (int i = 0; i < this.cells.Count; i = i + 1) {
+                if (sender == this.cells[i]) { ((PinSelectScene)active).Launch(i + 1); }
+            }
+            return;
+        }
         if (name == "start" && active is PinMenuScene) { ((PinMenuScene)active).Start(); }
         if (name == "pause" && active is PinPlayScene) { ((PinPlayScene)active).TogglePause(); }
         if (name == "confirm") {
@@ -318,48 +526,135 @@ public class PinHud : UiViewOwner {
         int action = cy + (int)(PinWorld.LaunchRadius * 1.32 * s);
         int menuY = height - (int)(196 * s);
         int ry = height / 2 - (int)(12 * s);
+        this.Box(this.root, 0, 0, width, height, 0);
         this.Box(this.instrument, 0, 0, width, height, 0);
-        int rotorY = cy + (this.mode == "menu" ? (int)(36*s) : 0);
-        this.Box(this.remaining, 0, rotorY-(int)(34*s), width, (int)(64*s), (int)(54*s));
-        this.Box(this.rotorCaption, 0, rotorY+(int)(30*s), width, (int)(28*s), (int)(18*s));
-        this.Box(this.titleArt, cx-(int)(240*s), (int)(80*s), (int)(480*s), (int)(90*s), 0);
         this.Box(this.menu, 0, 0, width, height, 0);
+        this.Box(this.select, 0, 0, width, height, 0);
         this.Box(this.play, 0, 0, width, height, 0);
         this.Box(this.modal, 0, 0, width, height, 0);
-        this.Place(this.menu, "eyebrow", 0, (int)(40*s), width, (int)(28*s), (int)(18*s));
-        this.Place(this.menu, "subtitle", 0, (int)(172*s), width, (int)(28*s), (int)(18*s));
-        this.Box(this.start, cx-(int)(52*s), menuY-(int)(52*s), (int)(104*s), (int)(104*s), (int)(40*s));
-        this.Place(this.menu, "start-caption", 0, menuY+(int)(64*s), width, (int)(36*s), (int)(27*s));
-        this.Place(this.menu, "menu-hint", 0, height-(int)(78*s), width, (int)(28*s), (int)(18*s));
-        this.Box(this.best, 0, height-(int)(40*s), width, (int)(28*s), (int)(18*s));
-        this.Box(this.home, (int)(20*s), (int)(24*s), (int)(48*s), (int)(48*s), (int)(26*s));
-        this.Box(this.pause, width-(int)(68*s), (int)(24*s), (int)(48*s), (int)(48*s), (int)(24*s));
-        this.Place(this.play, "title", (int)(132*s), (int)(22*s), width-(int)(264*s), (int)(28*s), (int)(18*s));
-        this.Box(this.level, (int)(132*s), (int)(56*s), width-(int)(264*s), (int)(36*s), (int)(27*s));
-        int muteX = this.mode == "menu" ? width-(int)(68*s) : width-(int)(124*s);
-        this.Box(this.mute, muteX, (int)(24*s), (int)(48*s), (int)(48*s), (int)(22*s));
+        // The rotor readout rides the wobbling, recoiling rotor.
+        int rotorX = 0;
+        int rotorY = cy + (this.mode == "menu" ? (int)(36 * s) : 0);
+        if (this.mode == "play" && this.view != null) {
+            rotorX = (int)(this.game.wobble * 1.32 * s);
+            rotorY = rotorY + (int)(this.view.fx.recoilY * 1.32 * s);
+        }
+        this.Box(this.remaining, rotorX, rotorY - (int)(34 * s), width, (int)(64 * s), (int)(54 * s));
+        this.Box(this.rotorCaption, rotorX, rotorY + (int)(30 * s), width, (int)(28 * s), (int)(18 * s));
+        int muteX = this.mode == "menu" || this.mode == "select" ? width - (int)(68 * s) : width - (int)(124 * s);
+        this.RoundBox(this.mute, muteX, (int)(24 * s), (int)(48 * s), (int)(22 * s));
+        if (this.mode == "menu") { this.LayoutMenu(width, height, s, cx, menuY); }
+        if (this.mode == "select") { this.LayoutSelect(width, height, s); }
+        if (this.mode == "play" || this.mode == "over") { this.LayoutPlay(width, height, s, cx, cy, action, rotorX); }
+        if (this.paused || this.mode == "over") { this.LayoutCard(width, height, s, cx, ry); }
+    }
+
+    void LayoutMenu(int width, int height, double s, int cx, int menuY) {
+        this.Box(this.titleArt, cx - (int)(240 * s), (int)(80 * s), (int)(480 * s), (int)(90 * s), 0);
+        this.Place(this.menu, "eyebrow", 0, (int)(40 * s), width, (int)(28 * s), (int)(18 * s));
+        this.Place(this.menu, "subtitle", 0, (int)(172 * s), width, (int)(28 * s), (int)(18 * s));
+        this.RoundBox(this.start, cx - (int)(52 * s), menuY - (int)(52 * s), (int)(104 * s), (int)(40 * s));
+        this.Box(this.startCaption, 0, menuY + (int)(58 * s), width, (int)(34 * s), (int)(24 * s));
+        this.PillBox(this.levels, cx - (int)(130 * s), menuY + (int)(98 * s), (int)(260 * s), (int)(44 * s), (int)(17 * s));
+        this.Place(this.menu, "menu-hint", 0, height - (int)(40 * s), width, (int)(26 * s), (int)(15 * s));
+    }
+
+    void LayoutSelect(int width, int height, double s) {
+        this.RoundBox(this.selectBack, (int)(20 * s), (int)(24 * s), (int)(48 * s), (int)(26 * s));
+        this.Place(this.select, "select-title", 0, (int)(26 * s), width, (int)(36 * s), (int)(26 * s));
+        this.Box(this.selectSummary, 0, (int)(64 * s), width, (int)(24 * s), (int)(16 * s));
+        this.Place(this.select, "select-hint", 0, height - (int)(42 * s), width, (int)(26 * s), (int)(15 * s));
+        int cellW = (int)(88 * s);
+        int cellH = (int)(66 * s);
+        int gap = (int)(12 * s);
+        int left = (width - (cellW * 5 + gap * 4)) / 2;
+        for (int c = 0; c < 4; c = c + 1) {
+            int top = (int)((106 + c * 182) * s);
+            this.Box(this.chapters[c], 0, top, width, (int)(24 * s), (int)(15 * s));
+            for (int k = 0; k < 10; k = k + 1) {
+                int index = c * 10 + k;
+                int x = left + (k % 5) * (cellW + gap);
+                int y = top + (int)(28 * s) + (k / 5) * (cellH + (int)(10 * s));
+                Button cell = this.cells[index];
+                string style = "left:" + x + "dpx;top:" + y + "dpx;width:" + cellW + "dpx;height:" + cellH
+                    + "dpx;border-radius:" + (int)(14 * s) + "dpx";
+                if (cell.inlineStyleCss != style) { cell.SetProp("style", style); }
+                this.Box(this.cellNumbers[index], 0, (int)(12 * s), cellW, (int)(30 * s), (int)(23 * s));
+                this.Box(this.cellStars[index], 0, (int)(42 * s), cellW, (int)(18 * s), (int)(13 * s));
+                Control tag = cell.FindByName("boss");
+                if (tag != null) { this.Box(tag, cellW / 2 - (int)(19 * s), (int)(1 * s), (int)(38 * s), (int)(13 * s), (int)(10 * s)); }
+            }
+        }
+    }
+
+    void LayoutPlay(int width, int height, double s, int cx, int cy, int action, int rotorX) {
+        this.RoundBox(this.home, (int)(20 * s), (int)(24 * s), (int)(48 * s), (int)(26 * s));
+        this.RoundBox(this.pause, width - (int)(68 * s), (int)(24 * s), (int)(48 * s), (int)(24 * s));
+        this.Box(this.chapter, (int)(132 * s), (int)(22 * s), width - (int)(264 * s), (int)(28 * s), (int)(16 * s));
+        this.Box(this.level, (int)(132 * s), (int)(54 * s), width - (int)(264 * s), (int)(36 * s), (int)(25 * s));
         for (int i = 0; i < this.dots.Count; i = i + 1) {
             int dx = cx + (int)((i * 2 - this.game.target + 1) * 8 * s);
-            this.Box(this.dots[i], dx-(int)(3*s), (int)(109*s), (int)(6*s), (int)(6*s), 0);
+            this.Box(this.dots[i], dx - (int)(3 * s), (int)(118 * s), (int)(6 * s), (int)(6 * s), 0);
         }
-        this.Box(this.pattern, 0, cy+(int)(204*1.32*s), width, (int)(28*s), (int)(18*s));
-        this.Place(this.play, "fire-caption", 0, action+(int)(44*s), width, (int)(36*s), (int)(27*s));
-        this.Place(this.play, "play-hint", 0, height-(int)(28*s), width, (int)(28*s), (int)(18*s));
-        double entry = 1 - Math.Pow(1 - Math.Min(1, this.animationMs / 300.0), 3);
-        int y = ry-(int)(230*s)+(int)((1-entry)*16*s);
-        int cardX = cx-(int)(200*s);
-        this.Box(this.card, cardX, y, (int)(400*s), (int)(480*s), 0);
-        this.Place(this.card, "status", 0, (int)(32*s), (int)(400*s), (int)(28*s), (int)(18*s));
-        this.Place(this.card, "medal", 0, (int)(74*s), (int)(400*s), (int)(64*s), (int)(48*s));
-        this.Box(this.heading, 0, (int)(150*s), (int)(400*s), (int)(48*s), (int)(36*s));
-        this.Box(this.detail, 0, (int)(204*s), (int)(400*s), (int)(26*s), (int)(18*s));
-        this.Box(this.record, 0, (int)(234*s), (int)(400*s), (int)(26*s), (int)(18*s));
-        // Buttons remain at the old hit centers while the decorative panel enters.
-        this.Box(this.confirm, cx-cardX-(int)(44*s), ry+(int)(36*s)-y, (int)(88*s), (int)(88*s), (int)(36*s));
-        this.Box(this.caption, 0, ry+(int)(138*s)-y, (int)(400*s), (int)(36*s), (int)(27*s));
-        this.Box(this.back, (int)(124*s), ry+(int)(182*s)-y, (int)(152*s), (int)(48*s), (int)(18*s));
-        this.Box(this.hint, 0, height-(int)(44*s), width, (int)(28*s), (int)(18*s));
+        // Live star conditions sit either side of the centre line under the title.
+        this.Box(this.tryStar, cx - (int)(172 * s), (int)(92 * s), (int)(160 * s), (int)(22 * s), (int)(14 * s));
+        this.Box(this.timeStar, cx + (int)(12 * s), (int)(92 * s), (int)(160 * s), (int)(22 * s), (int)(14 * s));
+        this.Box(this.pattern, 0, cy + (int)(204 * 1.32 * s), width, (int)(28 * s), (int)(17 * s));
+        this.Place(this.play, "fire-caption", 0, action + (int)(44 * s), width, (int)(36 * s), (int)(27 * s));
+        this.Place(this.play, "play-hint", 0, height - (int)(28 * s), width, (int)(28 * s), (int)(16 * s));
+        PinFx fx = this.view.fx;
+        if (fx.bannerMs > 0) {
+            double t = fx.bannerMs;
+            double pop = t < 160 ? 0.6 + 0.5 * t / 160.0 : (t < 260 ? 1.1 - 0.1 * (t - 160) / 100.0 : 1.0);
+            double fade = t < 900 ? 1.0 : Math.Max(0.0, 1.0 - (t - 900) / 400.0);
+            int font = (int)(46 * s * pop);
+            string style = "left:" + rotorX + "dpx;top:" + (cy - (int)(36 * s)) + "dpx;width:" + width + "dpx;height:"
+                + (int)(72 * s) + "dpx;font-size:" + font + "dpx;opacity:" + Convert.ToString(fade);
+            if (this.banner.inlineStyleCss != style) { this.banner.SetProp("style", style); }
+        }
+        if (fx.closeMs > 0) {
+            double k = 1.0 - fx.closeMs / 820.0;
+            double fade = k < 0.6 ? 1.0 : Math.Max(0.0, 1.0 - (k - 0.6) / 0.4);
+            int font = (int)(24 * s * (k < 0.12 ? 0.7 + 2.5 * k : 1.0));
+            int y = cy + (int)((150 - k * 46) * 1.32 * s);
+            string style = "left:" + (cx + (int)(26 * s)) + "dpx;top:" + y + "dpx;width:" + (int)(150 * s) + "dpx;height:"
+                + (int)(34 * s) + "dpx;font-size:" + font + "dpx;opacity:" + Convert.ToString(fade);
+            if (this.close.inlineStyleCss != style) { this.close.SetProp("style", style); }
+        }
     }
+
+    void LayoutCard(int width, int height, double s, int cx, int ry) {
+        double entry = 1 - Math.Pow(1 - Math.Min(1, this.animationMs / 300.0), 3);
+        int cardW = (int)(400 * s);
+        int y = ry - (int)(236 * s) + (int)((1 - entry) * 16 * s);
+        int cardX = cx - (int)(200 * s);
+        string cardStyle = "left:" + cardX + "dpx;top:" + y + "dpx;width:" + cardW + "dpx;height:" + (int)(500 * s)
+            + "dpx;border-radius:" + (int)(22 * s) + "dpx";
+        if (this.card.inlineStyleCss != cardStyle) { this.card.SetProp("style", cardStyle); }
+        this.Place(this.card, "status", 0, (int)(28 * s), cardW, (int)(28 * s), (int)(17 * s));
+        this.Place(this.card, "medal", 0, (int)(66 * s), cardW, (int)(64 * s), (int)(48 * s));
+        // Stars pop in one after another once the card has landed.
+        for (int i = 0; i < 3; i = i + 1) {
+            int t = this.animationMs - 380 - i * 260;
+            double pop = t <= 0 ? 0.0 : (t < 140 ? 1.35 * t / 140.0 : (t < 240 ? 1.35 - 0.35 * (t - 140) / 100.0 : 1.0));
+            bool lit = this.mode == "over" && this.game.state == RoundState.Cleared && i < this.Shell().LastStars();
+            if (!lit) { pop = 1.0; }
+            int font = (int)(54 * s * pop);
+            int sx = cardW / 2 + (int)((i - 1) * 84 * s) - (int)(40 * s);
+            int sy = (int)((i == 1 ? 60 : 72) * s);
+            this.Box(this.stars[i], sx, sy, (int)(80 * s), (int)(70 * s), font < 1 ? 1 : font);
+        }
+        this.Box(this.heading, 0, (int)(142 * s), cardW, (int)(46 * s), (int)(34 * s));
+        this.Box(this.detail, 0, (int)(194 * s), cardW, (int)(24 * s), (int)(15 * s));
+        this.Box(this.record, 0, (int)(222 * s), cardW, (int)(24 * s), (int)(16 * s));
+        // Buttons remain at the old hit centers while the decorative panel enters.
+        this.RoundBox(this.confirm, cx - cardX - (int)(44 * s), ry + (int)(36 * s) - y, (int)(88 * s), (int)(36 * s));
+        this.Box(this.caption, 0, ry + (int)(132 * s) - y, cardW, (int)(34 * s), (int)(25 * s));
+        this.PillBox(this.cardLevels, (int)(36 * s), ry + (int)(180 * s) - y, (int)(156 * s), (int)(44 * s), (int)(16 * s));
+        this.PillBox(this.back, cardW - (int)(192 * s), ry + (int)(180 * s) - y, (int)(156 * s), (int)(44 * s), (int)(16 * s));
+        this.Box(this.hint, 0, height - (int)(44 * s), width, (int)(28 * s), (int)(17 * s));
+    }
+
     PinShell Shell() { return this.shell; }
     void Place(Control parent, string name, int x, int y, int w, int h, int font) {
         Control child = parent.FindByName(name);
@@ -370,25 +665,50 @@ public class PinHud : UiViewOwner {
         if (font > 0) { style = style + ";font-size:" + font + "dpx"; }
         if (control.inlineStyleCss != style) { control.SetProp("style", style); }
     }
+    // Circular buttons: the radius is half the side, in device pixels.
+    void RoundBox(Control control, int x, int y, int size, int font) {
+        string style = "left:" + x + "dpx;top:" + y + "dpx;width:" + size + "dpx;height:" + size
+            + "dpx;font-size:" + font + "dpx;border-radius:" + (size / 2) + "dpx";
+        if (control.inlineStyleCss != style) { control.SetProp("style", style); }
+        Control glyph = control.FindByName("glyph");
+        if (glyph != null) { this.Box(glyph, 0, (size - font * 13 / 10) / 2, size, font * 13 / 10 + 2, font); }
+    }
+    void PillBox(Control control, int x, int y, int w, int h, int font) {
+        string style = "left:" + x + "dpx;top:" + y + "dpx;width:" + w + "dpx;height:" + h
+            + "dpx;font-size:" + font + "dpx;border-radius:" + (h / 2) + "dpx";
+        if (control.inlineStyleCss != style) { control.SetProp("style", style); }
+    }
     static string Css() {
-        return ".pin-hud,.pin-menu,.pin-play{position:relative;background:transparent;padding:0;border:0}"
-            + ".pin-menu,.pin-play,.pin-modal,.pin-card,.pin-instrument,.pin-title-art{position:absolute;padding:0;margin:0}"
+        return ".pin-hud,.pin-menu,.pin-play,.pin-select{position:relative;background:transparent;padding:0;border:0}"
+            + ".pin-menu,.pin-play,.pin-select,.pin-modal,.pin-card,.pin-instrument,.pin-title-art{position:absolute;padding:0;margin:0}"
             + ".pin-title-art{background:transparent;border:0;box-shadow:none}"
+            + ".pin-select{background:rgba(2,18,22,0.72);border:0}"
             + ".pin-modal{background:rgba(1,16,20,0.80);border:0}"
-            + ".pin-card{background:#051d21;border:2dpx solid #735d37;border-radius:var(--radius-large);box-shadow:0 8dpx 24dpx rgba(0,0,0,0.35)}"
+            + ".pin-card{background:linear-gradient(180deg,#0a2a2d,#041619);border:2dpx solid #8a6f42;box-shadow:0 10dpx 28dpx rgba(0,0,0,0.45)}"
             + "label.pin-label{position:absolute;padding:0;margin:0;border:0;background:transparent;text-align:center;vertical-align:top}"
-            + ".pin-dot{position:absolute;background:rgba(217,183,123,0.28);border:0;border-radius:var(--radius-full)}.pin-dot-filled{background:#69e4c4}"
-            + "label.pin-paper{color:#f7eed6}label.pin-gold{color:#d9b77b}label.pin-muted{color:#89aba8}label.pin-medal,label.pin-jade{color:#69e4c4}label.pin-danger{color:#ff8b76}"
-            + "button.pin-tool,button.pin-seal,button.pin-back{position:absolute;padding:0;margin:0;justify-content:center;align-items:center;color:#f7eed6;background:#092f32;border:1dpx solid #735d37;border-radius:var(--radius-full)}"
-            + "button.pin-seal{background:radial-gradient(circle,#174b47,#051c21);border:2dpx solid #d9b77b;box-shadow:0 0 12dpx rgba(105,228,196,0.12)}"
+            + "label.pin-left{text-align:left}label.pin-right{text-align:right}"
+            + ".pin-dot{position:absolute;background:rgba(217,183,123,0.28);border:0;border-radius:3dpx}.pin-dot-filled{background:#69e4c4}"
+            + "label.pin-paper{color:#f7eed6}label.pin-gold{color:#d9b77b}label.pin-muted{color:#89aba8}label.pin-dim{color:#58736e}"
+            + "label.pin-medal,label.pin-jade{color:#69e4c4}label.pin-danger{color:#ff8b76}"
+            + "label.pin-banner{font-weight:bold;letter-spacing:6dpx;text-shadow:0 2dpx 10dpx rgba(0,0,0,0.85)}"
+            + "label.pin-close{color:#f7eed6;font-weight:bold;text-align:left;text-shadow:0 0 8dpx rgba(105,228,196,0.9)}"
+            + "label.pin-star{font-weight:bold}label.pin-star-on{color:#f2c96b;text-shadow:0 0 12dpx rgba(242,201,107,0.7)}label.pin-star-off{color:#2c4a48}"
+            + "button.pin-tool,button.pin-seal,button.pin-pill,button.pin-cell{position:absolute;padding:0;margin:0;justify-content:center;align-items:center;color:#f7eed6;background:#092f32;border:1dpx solid #735d37}"
+            + "button.pin-seal{background:radial-gradient(circle,#174b47,#051c21);border:2dpx solid #d9b77b;box-shadow:0 0 14dpx rgba(105,228,196,0.18)}"
             + "image.pin-seal-art{position:absolute;left:4%;top:4%;width:92%;height:92%;background:transparent;border:0;padding:0}button.pin-seal label{z-index:1}"
-            + "button.pin-back{background:transparent;border-color:transparent;color:#89aba8}"
-            + "button.pin-tool label,button.pin-seal label,button.pin-back label{background:transparent;border:0;font-size:inherit;color:inherit;text-align:center;padding:0;margin:0}"
+            + "button.pin-pill{background:linear-gradient(180deg,#0e3a3b,#062224);border:1dpx solid #8a6f42;color:#e9dcb8}"
+            + "button.pin-cell{background:linear-gradient(180deg,#0d3436,#05191c);border:1dpx solid #5d4c30;color:#f7eed6}"
+            + "button.pin-cell-boss{border:2dpx solid #c7955a;background:linear-gradient(180deg,#3a2a17,#0b1d1e)}"
+            + "button.pin-cell-next{border:2dpx solid #69e4c4;box-shadow:0 0 12dpx rgba(105,228,196,0.45)}"
+            + "button.pin-cell-sel{border:2dpx solid #f7eed6;box-shadow:0 0 14dpx rgba(247,238,214,0.35)}"
+            + "label.pin-glyph{color:inherit;z-index:1}label.pin-cell-number{color:#f7eed6;font-weight:bold}label.pin-locked{color:#3c5652}label.pin-cell-stars{letter-spacing:1dpx}"
+            + "label.pin-cell-tag{color:#1a1208;background:#d9b77b;border-radius:4dpx;letter-spacing:0}"
+            + "button.pin-tool label,button.pin-seal label,button.pin-pill label{background:transparent;border:0;font-size:inherit;color:inherit;text-align:center;padding:0;margin:0}"
             + "button.pin-tool-off{color:#89aba8;border-color:#ff8b76}"
-            + "button.pin-tool:hover,button.pin-seal:hover,button.pin-back:hover{background:#164b45;color:#f7eed6;border-color:#69e4c4}"
-            + "button.pin-tool:active,button.pin-seal:active,button.pin-back:active{background:#236758;border-color:#f7eed6}"
-            + "button.pin-tool:focus,button.pin-seal:focus,button.pin-back:focus{border:2dpx solid #69e4c4}"
-            + "button.pin-tool:disabled,button.pin-seal:disabled,button.pin-back:disabled{background:#122e30;color:#58736e;border-color:#46605a}";
+            + "button.pin-tool:hover,button.pin-seal:hover,button.pin-pill:hover,button.pin-cell:hover{background:#164b45;color:#f7eed6;border-color:#69e4c4}"
+            + "button.pin-tool:active,button.pin-seal:active,button.pin-pill:active,button.pin-cell:active{background:#236758;border-color:#f7eed6}"
+            + "button.pin-tool:focus,button.pin-seal:focus,button.pin-pill:focus,button.pin-cell:focus{border:2dpx solid #69e4c4}"
+            + "button.pin-tool:disabled,button.pin-seal:disabled,button.pin-pill:disabled{background:#122e30;color:#58736e;border-color:#46605a}"
+            + "button.pin-cell:disabled{background:rgba(6,24,27,0.75);color:#3c5652;border:1dpx dashed #2f4744;box-shadow:none}";
     }
 }
-

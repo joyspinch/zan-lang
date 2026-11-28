@@ -1,0 +1,300 @@
+using System;
+using Game.Foundation;
+
+namespace PinCircle;
+
+public class Spark {
+    double x;
+    double y;
+    double vx;
+    double vy;
+    int life;
+    int max;
+    int color;
+    double size;
+}
+
+// Presentation-only feedback driven by world state changes: spark rings and
+// rotor recoil on insert, "close!" pops, boss ring shatter, the clear
+// flourish (spin-up then pins fly out) and the fail hit-stop + slow-mo.
+// Coordinates are world units on the launcher axis frame: (0,0) is the rest
+// position of the rotor centre, +y points at the launcher. The simulation
+// never reads any of this.
+public class PinFx {
+    const int Gold = 0xFFD9B77B;
+    const int Jade = 0xFF69E4C4;
+    const int Paper = 0xFFF7EED6;
+    const int Danger = 0xFFFF8B76;
+    List<Spark> sparks;
+    int rng;
+    double recoilY;
+    double recoilV;
+    int ringMs;
+    int closeMs;
+    int bannerMs;
+    string bannerText;
+    string bannerTone;
+    int failMs;
+    bool failing;
+    double needleX;
+    double needleY;
+    double needleVx;
+    double needleVy;
+    double needleSpin;
+    double needleAngle;
+    double spinRate;
+    double extraRotation;
+    bool clearing;
+    int clearMs;
+    int burstMs;
+    List<double> burstAngles;
+    List<bool> burstPreset;
+    double burstRotation;
+    double burstWobble;
+    int shakeMs;
+    double shakeAmp;
+    int flashMs;
+    int clock;
+    // Snapshot taken before each world step.
+    int prevInserted;
+    int prevPhase;
+    RoundState prevState;
+    double prevSpeed;
+    double prevWobble;
+    double prevRotation;
+    List<double> snapAngles;
+    List<bool> snapPreset;
+    bool prevWarn;
+    bool warnEdge;
+
+    PinFx() {
+        this.sparks = new List<Spark>();
+        this.burstAngles = new List<double>();
+        this.burstPreset = new List<bool>();
+        this.snapAngles = new List<double>();
+        this.snapPreset = new List<bool>();
+        this.rng = 12345;
+        this.bannerText = "";
+        this.bannerTone = "pin-gold";
+    }
+
+    void Reset() {
+        this.sparks.Clear();
+        this.recoilY = 0;
+        this.recoilV = 0;
+        this.ringMs = 0;
+        this.closeMs = 0;
+        this.bannerMs = 0;
+        this.failing = false;
+        this.failMs = 0;
+        this.clearing = false;
+        this.clearMs = 0;
+        this.burstMs = 0;
+        this.extraRotation = 0;
+        this.spinRate = 0;
+        this.shakeMs = 0;
+        this.flashMs = 0;
+        this.prevWarn = false;
+        this.warnEdge = false;
+    }
+
+    double Rand() {
+        long next = ((long)this.rng * 48271) % 2147483647;
+        this.rng = (int)next;
+        return (this.rng % 10000) / 10000.0;
+    }
+
+    void Spray(double x, double y, int count, double minSpeed, double maxSpeed, int life, bool warm) {
+        for (int i = 0; i < count; i = i + 1) {
+            Spark s = new Spark();
+            double a = i * 6.283185307179586 / count + this.Rand() * 0.5;
+            double v = minSpeed + (maxSpeed - minSpeed) * this.Rand();
+            s.x = x;
+            s.y = y;
+            s.vx = Math.Cos(a) * v;
+            s.vy = Math.Sin(a) * v;
+            s.max = life / 2 + (int)(this.Rand() * life / 2);
+            s.life = s.max;
+            double pick = this.Rand();
+            s.color = warm ? (pick < 0.5 ? PinFx.Danger : PinFx.Gold)
+                : (pick < 0.45 ? PinFx.Gold : (pick < 0.8 ? PinFx.Jade : PinFx.Paper));
+            s.size = 1.5 + this.Rand() * 2.0;
+            this.sparks.Add(s);
+        }
+    }
+
+    void Before(PinWorld game) {
+        this.prevInserted = game.inserted;
+        this.prevPhase = game.phase;
+        this.prevState = game.state;
+        this.prevSpeed = game.AngularSpeed();
+        this.prevWobble = game.wobble;
+        this.prevRotation = game.rotation;
+        this.snapAngles.Clear();
+        this.snapPreset.Clear();
+        for (int i = 0; i < game.pins.Count; i = i + 1) {
+            this.snapAngles.Add(game.pins[i].angle);
+            this.snapPreset.Add(game.pins[i].preset);
+        }
+    }
+
+    // Compare against the snapshot; returns nothing, the scene reads flags.
+    void After(PinWorld game) {
+        bool phaseChanged = game.phase != this.prevPhase && game.level > 0;
+        bool landed = game.inserted > this.prevInserted || phaseChanged
+            || (game.state == RoundState.Cleared && this.prevState == RoundState.Playing);
+        if (landed) { this.OnLanded(game); }
+        if (phaseChanged) { this.OnPhase(game); }
+        if (this.prevState == RoundState.Playing && game.state == RoundState.Failed) { this.OnFail(game); }
+        if (this.prevState == RoundState.Playing && game.state == RoundState.Cleared) { this.OnClear(game); }
+        bool warn = game.FlipWarning();
+        this.warnEdge = warn && !this.prevWarn;
+        this.prevWarn = warn;
+    }
+
+    void OnLanded(PinWorld game) {
+        // The shaft tip bites the rim on the launcher axis.
+        double tip = PinWorld.PinRadius - PinWorld.ShaftLength;
+        this.Spray(0, tip + 2, 16, 90, 260, 420, false);
+        this.Spray(0, PinWorld.PinRadius, 6, 40, 110, 300, false);
+        this.recoilV = this.recoilV - 260;
+        this.ringMs = 280;
+        if (game.lastClose) {
+            this.closeMs = 820;
+            this.Spray(0, PinWorld.PinRadius, 10, 120, 220, 360, false);
+        }
+    }
+
+    void OnPhase(PinWorld game) {
+        this.burstAngles.Clear();
+        this.burstPreset.Clear();
+        for (int i = 0; i < this.snapAngles.Count; i = i + 1) {
+            this.burstAngles.Add(this.snapAngles[i]);
+            this.burstPreset.Add(this.snapPreset[i]);
+        }
+        // The needle that finished the ring is part of the burst too.
+        this.burstAngles.Add(PinWorld.Wrap(Math.Atan2(PinWorld.PinRadius, -this.prevWobble) - this.prevRotation));
+        this.burstPreset.Add(false);
+        this.burstRotation = this.prevRotation;
+        this.burstWobble = this.prevWobble;
+        this.burstMs = 1;
+        this.Spray(this.prevWobble, 0, 28, 160, 420, 700, false);
+        this.shakeMs = 320;
+        this.shakeAmp = 6;
+        this.bannerText = "第 " + (game.phase + 1) + " 环";
+        this.bannerTone = "pin-gold";
+        this.bannerMs = 1;
+    }
+
+    void OnFail(PinWorld game) {
+        this.failing = true;
+        this.failMs = 0;
+        this.needleX = 0;
+        this.needleY = game.shotRadius;
+        this.needleVx = this.prevSpeed >= 0 ? 150 : -150;
+        this.needleVy = 340;
+        this.needleSpin = this.prevSpeed >= 0 ? 7 : -7;
+        this.needleAngle = 0;
+        this.spinRate = this.prevSpeed;
+        this.shakeMs = 460;
+        this.shakeAmp = 8;
+        this.flashMs = 420;
+        this.Spray(0, game.shotRadius, 18, 80, 240, 520, true);
+        this.bannerText = "失 手";
+        this.bannerTone = "pin-danger";
+        this.bannerMs = 1;
+    }
+
+    void OnClear(PinWorld game) {
+        this.clearing = true;
+        this.clearMs = 0;
+        this.spinRate = this.prevSpeed == 0 ? 1.0 : this.prevSpeed;
+        this.bannerText = "通 关";
+        this.bannerTone = "pin-jade";
+        this.bannerMs = 1;
+    }
+
+    // Slow-mo curve after a collision: a 70ms hit-stop, ~0.2x for half a
+    // second, then ease back to real time.
+    double FailScale() {
+        if (!this.failing) { return 1.0; }
+        if (this.failMs < 70) { return 0.0; }
+        if (this.failMs < 620) { return 0.2; }
+        return Math.Min(1.0, 0.2 + (this.failMs - 620) / 520.0 * 0.8);
+    }
+
+    bool SlowMo() { return this.failing && this.failMs < 900; }
+
+    void Tick(int dtMs) {
+        this.clock = this.clock + dtMs;
+        double scale = this.FailScale();
+        double dt = dtMs * scale / 1000.0;
+        if (this.failing) {
+            this.failMs = this.failMs + dtMs;
+            this.needleVy = this.needleVy + 1100 * dt;
+            this.needleX = this.needleX + this.needleVx * dt;
+            this.needleY = this.needleY + this.needleVy * dt;
+            this.needleAngle = this.needleAngle + this.needleSpin * dt;
+            this.extraRotation = this.extraRotation + this.spinRate * dt;
+            this.spinRate = this.spinRate * Math.Pow(0.4, dt);
+        }
+        if (this.clearing) {
+            this.clearMs = this.clearMs + dtMs;
+            double target = (this.spinRate >= 0 ? 1.0 : -1.0) * 11.0;
+            double k = Math.Min(1.0, this.clearMs / 900.0);
+            double rate = this.spinRate + (target - this.spinRate) * k * k;
+            if (this.clearMs > 1400) { rate = rate * Math.Max(0.0, 1.0 - (this.clearMs - 1400) / 1600.0); }
+            this.extraRotation = this.extraRotation + rate * dtMs / 1000.0;
+            if (this.clearMs >= 640 && this.clearMs - dtMs < 640) {
+                this.Spray(0, 0, 36, 180, 520, 900, false);
+                this.shakeMs = 260;
+                this.shakeAmp = 4;
+                this.ringMs = 520;
+            }
+        }
+        if (this.burstMs > 0) {
+            this.burstMs = this.burstMs + dtMs;
+            if (this.burstMs > 1000) { this.burstMs = 0; }
+        }
+        if (this.bannerMs > 0) {
+            this.bannerMs = this.bannerMs + dtMs;
+            if (this.bannerMs > 1300) { this.bannerMs = 0; }
+        }
+        // Rotor recoil: a stiff damped spring back to rest.
+        double accel = -900 * this.recoilY / 10.0 - 26 * this.recoilV;
+        double sdt = dtMs / 1000.0;
+        this.recoilV = this.recoilV + accel * sdt;
+        this.recoilY = this.recoilY + this.recoilV * sdt;
+        if (this.ringMs > 0) { this.ringMs = this.ringMs > dtMs ? this.ringMs - dtMs : 0; }
+        if (this.closeMs > 0) { this.closeMs = this.closeMs > dtMs ? this.closeMs - dtMs : 0; }
+        if (this.shakeMs > 0) { this.shakeMs = this.shakeMs > dtMs ? this.shakeMs - dtMs : 0; }
+        if (this.flashMs > 0) { this.flashMs = this.flashMs > dtMs ? this.flashMs - dtMs : 0; }
+        int lifeStep = (int)Math.Max(1.0, dtMs * scale);
+        if (scale <= 0) { lifeStep = 0; }
+        for (int i = this.sparks.Count - 1; i >= 0; i = i - 1) {
+            Spark s = this.sparks[i];
+            s.life = s.life - lifeStep;
+            if (s.life <= 0) { this.sparks.RemoveAt(i); continue; }
+            s.vx = s.vx * Math.Pow(0.08, dt);
+            s.vy = s.vy * Math.Pow(0.08, dt) + 260 * dt;
+            s.x = s.x + s.vx * dt;
+            s.y = s.y + s.vy * dt;
+        }
+    }
+
+    double ShakeX() {
+        if (this.shakeMs <= 0) { return 0; }
+        return Math.Sin(this.clock / 17.0) * this.shakeAmp * this.shakeMs / 460.0;
+    }
+    double ShakeY() {
+        if (this.shakeMs <= 0) { return 0; }
+        return Math.Cos(this.clock / 23.0) * this.shakeAmp * 0.6 * this.shakeMs / 460.0;
+    }
+
+    // Clear flourish: pins fly outward and fade after the spin-up.
+    double FlyOut() {
+        if (!this.clearing || this.clearMs < 640) { return 0; }
+        double t = Math.Min(1.0, (this.clearMs - 640) / 700.0);
+        return t;
+    }
+}
