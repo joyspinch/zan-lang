@@ -1,0 +1,69 @@
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+using System.Text;
+using Game.Animation;
+using Game.Assets;
+
+namespace T;
+
+// glTF 骨架上方的非关节祖先（Armature 节点 0.01 缩放，常见于厘米制 FBX 转换）必须进入关节世界变换：
+// GltfLoader 把它累积成 Skeleton.RootTransform；动画只写局部姿势时仍保持米制，蒙皮矩阵在绑定姿势下为单位阵。
+class Program {
+    static void F(List<byte> b, float f) {
+        int bits = BitConverter.SingleToInt32Bits(f);
+        b.Add((byte)(bits & 255)); b.Add((byte)((bits >> 8) & 255)); b.Add((byte)((bits >> 16) & 255)); b.Add((byte)((bits >> 24) & 255));
+    }
+    static void InvBind(List<byte> b, float ty) {
+        // 关节全局 = S(0.01) · T(0, ty, 0)  → 逆 = S(100) · T(0, -ty*0.01, 0)，列主序
+        F(b, 100); F(b, 0); F(b, 0); F(b, 0);
+        F(b, 0); F(b, 100); F(b, 0); F(b, 0);
+        F(b, 0); F(b, 0); F(b, 100); F(b, 0);
+        F(b, 0); F(b, -ty); F(b, 0); F(b, 1);
+    }
+    static string R(float v) { return (Math.Round(v * 1000.0f) / 1000.0).ToString(); }
+
+    static void Main() {
+        List<byte> bin = new List<byte>();
+        InvBind(bin, 100.0f);
+        InvBind(bin, 150.0f);
+        byte[] raw = new byte[bin.Count];
+        for (int i = 0; i < bin.Count; i = i + 1) { raw[i] = bin[i]; }
+        string b64 = Convert.ToBase64String(raw);
+        string json = "{\"asset\":{\"version\":\"2.0\"},"
+            + "\"buffers\":[{\"byteLength\":" + raw.Length.ToString() + ",\"uri\":\"data:application/octet-stream;base64," + b64 + "\"}],"
+            + "\"bufferViews\":[{\"buffer\":0,\"byteOffset\":0,\"byteLength\":" + raw.Length.ToString() + "}],"
+            + "\"accessors\":[{\"bufferView\":0,\"componentType\":5126,\"count\":2,\"type\":\"MAT4\"}],"
+            + "\"nodes\":["
+            + "{\"name\":\"Armature\",\"scale\":[0.01,0.01,0.01],\"children\":[1]},"
+            + "{\"name\":\"Hips\",\"translation\":[0,100,0],\"children\":[2]},"
+            + "{\"name\":\"Spine\",\"translation\":[0,50,0]}"
+            + "],"
+            + "\"skins\":[{\"joints\":[1,2],\"inverseBindMatrices\":0}]}";
+        byte[] jb = Encoding.GetBytes(json);
+        GltfModel m = GltfLoader.LoadGltfBytes(jb, null, "");
+        Skeleton s = m.Skeleton;
+        int hips = s.IndexOf("Hips"); int spine = s.IndexOf("Spine");
+        s.ResetToBindPose(); s.ComputeWorldPoses();
+        Vector3 h = s.WorldPosition(hips); Vector3 sp = s.WorldPosition(spine);
+        Console.WriteLine("root scale=" + R(s.RootTransform.Scale.Y) + " hips=" + R(h.Y) + " spine=" + R(sp.Y));
+        Transform3D skin = s.SkinMatrix(spine);
+        Console.WriteLine("bind skin pos=" + R(skin.Position.Y) + " scale=" + R(skin.Scale.Y));
+        // 动画写局部（厘米）：仍落在米制世界里
+        Transform3D lp = s.LocalPose(hips);
+        lp.Position = new Vector3(0.0f, 110.0f, 0.0f);
+        s.SetLocalPose(hips, lp);
+        s.ComputeWorldPoses();
+        Console.WriteLine("animated hips=" + R(s.WorldPosition(hips).Y) + " spine=" + R(s.WorldPosition(spine).Y) + " skinDy=" + R(s.SkinMatrix(spine).Position.Y));
+        // SetWorldPose 反解：根骨骼的父变换是 RootTransform
+        Transform3D w = s.WorldPose(hips);
+        w.Position = new Vector3(0.0f, 2.0f, 0.0f);
+        s.SetWorldPose(hips, w);
+        Console.WriteLine("setworld local=" + R(s.LocalPose(hips).Position.Y) + " world=" + R(s.WorldPosition(hips).Y));
+        // 没有祖先的骨架：根变换保持单位
+        Skeleton plain = new Skeleton();
+        plain.AddBone("a", -1, new Transform3D(new Vector3(0.0f, 1.0f, 0.0f), Quaternion.Identity, Vector3.One));
+        plain.ComputeWorldPoses();
+        Console.WriteLine("plain=" + R(plain.WorldPosition(0).Y) + " rootScale=" + R(plain.RootTransform.Scale.X));
+    }
+}
