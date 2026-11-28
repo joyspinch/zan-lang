@@ -108,9 +108,7 @@ public partial class HttpClient {
                 long v = 0;
                 bool any = false;
                 while (j < n && (head[j] & 255) >= 48 && (head[j] & 255) <= 57) {
-                    int d = (head[j] & 255) - 48;
-                    if (v > (9223372036854775807L - (long)d) / 10L) { return 0; }
-                    v = v * 10 + (long)d;
+                    v = v * 10 + (long)((head[j] & 255) - 48);
                     j = j + 1;
                     any = true;
                 }
@@ -123,46 +121,33 @@ public partial class HttpClient {
     // 读取整数值的响应头（大小写不敏感，从行首匹配），
     // 例如 HeaderInt(head, "content-length")。不存在时返回 0。
     private static int HeaderInt(string head, string lowerName) {
-        long v = HttpClient.HeaderLong(head, lowerName);
-        if (v < 0L || v > 2147483647L) { return 0; }
-        return (int)v;
+        return (int)HttpClient.HeaderLong(head, lowerName);
     }
 
     // 从 "Content-Range: bytes X-Y/Z" 头取得资源总大小（Z 值），
-    // 无该头时返回 0。严格限定在 Content-Range 行内解析，避免跨行误读后续头部的 '/'。
+    // 无该头时返回 0。支持 64 位大文件。
     public static long RangeTotal(string head) {
-        if (head == null || head.Length == 0) { return 0; }
         int n = head.Length;
         string key = "content-range";
         int kl = key.Length;
         int idx = 0 - 1;
         int i = 0;
-        while (i + kl < n) {
+        while (i + kl <= n) {
             if ((i == 0 || (head[i - 1] & 255) == 10)
-                && (head[i + kl] & 255) == 58
                 && HttpClient.AsciiNameEqualsAt(head, i, key, kl)) {
-                idx = i + kl + 1;
+                idx = i;
                 break;
             }
             i = i + 1;
         }
         if (idx < 0) { return 0; }
-        int lineEnd = idx;
-        while (lineEnd < n && (head[lineEnd] & 255) != 10 && (head[lineEnd] & 255) != 13) {
-            lineEnd = lineEnd + 1;
-        }
-        int slash = -1;
-        for (int s = idx; s < lineEnd; s = s + 1) {
-            if ((head[s] & 255) == 47) { slash = s; break; }
-        }
+        int slash = head.IndexOf("/", idx);
         if (slash < 0) { return 0; }
         long v = 0;
         bool any = false;
         int j = slash + 1;
-        while (j < lineEnd && (head[j] & 255) >= 48 && (head[j] & 255) <= 57) {
-            int d = (head[j] & 255) - 48;
-            if (v > (9223372036854775807L - (long)d) / 10L) { return 0; }
-            v = v * 10 + (long)d;
+        while (j < n && (head[j] & 255) >= 48 && (head[j] & 255) <= 57) {
+            v = v * 10 + (long)((head[j] & 255) - 48);
             j = j + 1;
             any = true;
         }
@@ -223,17 +208,11 @@ public partial class HttpClient {
         sb.Append(boundary);
         sb.Append("--\r\n");
         string bodyStr = sb.ToString();
-        bool addedCt = false;
         if (!this.HasHeaderName("Content-Type")) {
             this.SetHeader("Content-Type",
                 "multipart/form-data; boundary=" + boundary);
-            addedCt = true;
         }
-        try {
-            return await this.RequestAsync("POST", path, bodyStr);
-        } finally {
-            if (addedCt) { this.RemoveHeader("Content-Type"); }
-        }
+        return await this.RequestAsync("POST", path, bodyStr);
     }
 
     // 字节安全的 multipart/form-data 上传：
@@ -265,24 +244,18 @@ public partial class HttpClient {
         long total = (long)head.Length + fileLen + (long)tail.Length;
         this.CheckTargetPolicy();
         this.CheckRequestLimit(total);
-        bool addedCt = false;
         if (!this.HasHeaderName("Content-Type")) {
             this.SetHeader("Content-Type",
                 "multipart/form-data; boundary=" + boundary);
-            addedCt = true;
         }
-        try {
-            // 先完整发送 multipart 首跳，再仅对安全改写的 GET 跟随重定向。
-            HttpResponse resp = await this.SendBytesBodyAsync("POST", path, head,
-                localPath, fileLen, tail, total);
-            if (this.callPolicy != null && this.callPolicy.MaxRedirects() > 0) {
-                return await this.FollowBytesFromResponse("POST", path, "",
-                    HttpClient.SendBytesOnceAsync, resp);
-            }
-            return resp;
-        } finally {
-            if (addedCt) { this.RemoveHeader("Content-Type"); }
+        // 先完整发送 multipart 首跳，再仅对安全改写的 GET 跟随重定向。
+        HttpResponse resp = await this.SendBytesBodyAsync("POST", path, head,
+            localPath, fileLen, tail, total);
+        if (this.callPolicy != null && this.callPolicy.MaxRedirects() > 0) {
+            return await this.FollowBytesFromResponse("POST", path, "",
+                HttpClient.SendBytesOnceAsync, resp);
         }
+        return resp;
     }
 
     // 将 <paramref name="path"/> 下载到
@@ -478,129 +451,85 @@ public partial class HttpClient {
         }
 
         bool finished = false;
-        bool writeFailed = false;
-        bool protoFailed = false;
-        bool timedOut = false;
-        try {
-            while (!finished) {
-                if (chunked) {
-                    bool progressed = true;
-                    while (progressed) {
-                        progressed = false;
-                        int crlf = pending.IndexOf("\r\n", 0);
-                        if (crlf < 0) {
-                            if (pending.Length > 4096) {
-                                this.SetDownloadError("分块大小行超长");
-                                protoFailed = true;
-                                finished = true;
-                                break;
-                            }
+        while (!finished) {
+            if (chunked) {
+                bool progressed = true;
+                while (progressed) {
+                    progressed = false;
+                    int crlf = pending.IndexOf("\r\n", 0);
+                    if (crlf >= 0) {
+                        int size = HttpClient.ParseHex(pending.Substring(0, crlf));
+                        if (size < 0) {
+                            // 坏的块大小行（超限/非法）：立即中止下载并报错，绝不把畸形分块头当作文件正文落盘。
+                            fclose(outfp);
+                            this.SetDownloadError("无效的分块传输编码");
+                            HttpDeadline.Disarm(watch);
+                            channel.Dispose();
+                            return 0 - 1;
+                        }
+                        if (size == 0) {
+                            finished = true;
+                            progressed = false;
                         } else {
-                            int size = HttpClient.ParseHex(pending.Substring(0, crlf));
-                            if (size < 0) {
-                                this.SetDownloadError("无效的分块传输编码");
-                                protoFailed = true;
-                                finished = true;
-                                break;
-                            }
-                            if (size == 0) {
-                                finished = true;
-                                progressed = false;
-                            } else {
-                                if (bodyLimit > 0 && written > bodyLimit - size) {
+                            int need = crlf + 2 + size + 2;
+                            if (pending.Length >= need) {
+                                string piece = pending.Substring(crlf + 2, size);
+                                if (bodyLimit > 0 && written > bodyLimit - piece.Length) {
+                                    fclose(outfp);
                                     this.SetDownloadError("响应正文超过 " + Convert.ToString(bodyLimit) + " bytes");
-                                    protoFailed = true;
-                                    finished = true;
-                                    break;
+                                    HttpDeadline.Disarm(watch);
+                                    channel.Dispose();
+                                    return 0 - 1;
                                 }
-                                if (crlf > 2147483647 - 4 - size) {
-                                    this.SetDownloadError("无效的分块传输编码");
-                                    protoFailed = true;
-                                    finished = true;
-                                    break;
-                                }
-                                int need = crlf + 2 + size + 2;
-                                if (pending.Length >= need) {
-                                    if ((pending[crlf + 2 + size] & 255) != 13
-                                        || (pending[crlf + 2 + size + 1] & 255) != 10) {
-                                        this.SetDownloadError("无效的分块结束分隔符");
-                                        protoFailed = true;
-                                        finished = true;
-                                        break;
-                                    }
-                                    string piece = pending.Substring(crlf + 2, size);
-                                    long w = fwrite(piece, 1, piece.Length, outfp);
-                                    if (w != (long)piece.Length) {
-                                        this.SetDownloadError("写入本地文件失败");
-                                        writeFailed = true;
-                                        finished = true;
-                                        break;
-                                    }
-                                    written = written + piece.Length;
-                                    File.WriteAllText(progressFile,
-                                        Convert.ToString(written) + "/" + Convert.ToString(total));
-                                    pending = pending.Substring(need, pending.Length - need);
-                                    progressed = true;
-                                }
+                                fwrite(piece, 1, piece.Length, outfp);
+                                written = written + piece.Length;
+                                File.WriteAllText(progressFile,
+                                    Convert.ToString(written) + "/" + Convert.ToString(total));
+                                pending = pending.Substring(need, pending.Length - need);
+                                progressed = true;
                             }
                         }
                     }
-                } else {
-                    if (pending.Length > 0) {
-                        if (bodyLimit > 0 && written > bodyLimit - pending.Length) {
-                            this.SetDownloadError("响应正文超过 " + Convert.ToString(bodyLimit) + " bytes");
-                            protoFailed = true;
-                            finished = true;
-                            break;
-                        }
-                        long w = fwrite(pending, 1, pending.Length, outfp);
-                        if (w != (long)pending.Length) {
-                            this.SetDownloadError("写入本地文件失败");
-                            writeFailed = true;
-                            finished = true;
-                            break;
-                        }
-                        written = written + pending.Length;
-                        File.WriteAllText(progressFile,
-                            Convert.ToString(written) + "/" + Convert.ToString(total));
-                        pending = "";
-                    }
-                    if (total > 0 && written >= total) { finished = true; }
                 }
-
-                if (!finished) {
-                    string c;
-                    if (this.useTls) { c = await stream.RecvAsync(65536); }
-                    else { c = await conn.RecvAsync(65536); }
-                    if (c.Length == 0) { finished = true; }
-                    else {
-                        if (chunked && pending.Length > 16777215 + 65536 - c.Length) {
-                            this.SetDownloadError("分块缓冲超限");
-                            protoFailed = true;
-                            finished = true;
-                        } else {
-                            pending = pending + c;
-                            HttpDeadline.Touch(watch, this.IdleBudget());
-                        }
+            } else {
+                if (pending.Length > 0) {
+                    if (bodyLimit > 0 && written > bodyLimit - pending.Length) {
+                        fclose(outfp);
+                        this.SetDownloadError("响应正文超过 " + Convert.ToString(bodyLimit) + " bytes");
+                        HttpDeadline.Disarm(watch);
+                        channel.Dispose();
+                        return 0 - 1;
                     }
+                    fwrite(pending, 1, pending.Length, outfp);
+                    written = written + pending.Length;
+                    File.WriteAllText(progressFile,
+                        Convert.ToString(written) + "/" + Convert.ToString(total));
+                    pending = "";
                 }
+                if (total > 0 && written >= total) { finished = true; }
             }
-        } finally {
-            fclose(outfp);
-            timedOut = HttpDeadline.Expired(watch);
-            HttpDeadline.Disarm(watch);
-            channel.Dispose();
-            if (timedOut && !protoFailed && !writeFailed) {
-                this.SetDownloadError("下载正文超时");
+
+            if (!finished) {
+                string c;
+                if (this.useTls) { c = await stream.RecvAsync(65536); }
+                else { c = await conn.RecvAsync(65536); }
+                if (c.Length == 0) { finished = true; }
+                else {
+                    pending = pending + c;
+                    HttpDeadline.Touch(watch, this.IdleBudget());
+                }
             }
         }
 
-        if (protoFailed || writeFailed) {
-            return 0 - 1;
-        }
+        fclose(outfp);
+        bool late = HttpDeadline.Expired(watch);
+        HttpDeadline.Disarm(watch);
+        channel.Dispose();
+
         File.WriteAllText(progressFile,
             Convert.ToString(written) + "/" + Convert.ToString(total));
-        if (timedOut) {
+        if (late) {
+            this.SetDownloadError("下载正文超时");
             return 0 - 1;
         }
         if (total > 0 && written < total) {
@@ -873,63 +802,58 @@ public partial class HttpClient {
         string buf = HttpClient.NewBuffer(65537);
         bool finished = false;
         bool cancelled = false;
-        bool writeFailed = false;
-        bool limitFailed = false;
-        bool late = false;
         int lastBodyN = 0;
         long lastReport = 0 - 1;
         long lastReportMs = 0;
-        try {
-            while (!finished) {
-                int n;
-                if (extraLen > 0) {
-                    NativeMemory.Copy((nint)buf, (nint)headChunk + (nint)extraStart, extraLen);
-                    n = extraLen;
-                    extraLen = 0;
-                } else if (this.useTls) { n = await stream.RecvIntoAsync(buf, 65536); }
-                else { n = await Socket.RecvIntoAsync(conn.Sock(), buf, 65536); }
-                lastBodyN = n;
-                if (n <= 0) { finished = true; }
-                else {
-                    if (bodyLimit > 0 && written > bodyLimit - n) {
-                        this.SetDownloadError("响应正文超过 " + Convert.ToString(bodyLimit) + " bytes");
-                        limitFailed = true;
-                        finished = true;
-                        break;
-                    }
-                    long w = fwrite(buf, 1, n, outfp);
-                    if (w != (long)n) {
-                        this.SetDownloadError("写入本地文件失败");
-                        writeFailed = true;
-                        finished = true;
-                        break;
-                    }
-                    written = written + w;
-                    long nowMs = Stopwatch.GetMilliseconds();
-                    if (lastReport < 0 || written - lastReport >= 1048576
-                            || nowMs - lastReportMs >= 200) {
-                        File.WriteAllText(progressFile,
-                            Convert.ToString(written) + "/" + Convert.ToString(total));
-                        lastReport = written;
-                        lastReportMs = nowMs;
-                    }
-                    if (total > 0 && written >= total) { finished = true; }
-                    if (!HttpDeadline.Expired(watch)) {
-                        HttpDeadline.Touch(watch, this.IdleBudget());
-                    }
-                    if (!finished && this.CancelRequested()) {
-                        finished = true;
-                        cancelled = true;
-                    }
+        while (!finished) {
+            int n;
+            if (extraLen > 0) {
+                NativeMemory.Copy((nint)buf, (nint)headChunk + (nint)extraStart, extraLen);
+                n = extraLen;
+                extraLen = 0;
+            } else if (this.useTls) { n = await stream.RecvIntoAsync(buf, 65536); }
+            else { n = await Socket.RecvIntoAsync(conn.Sock(), buf, 65536); }
+            lastBodyN = n;
+            if (n <= 0) { finished = true; }
+            else {
+                if (bodyLimit > 0 && written > bodyLimit - n) {
+                    fclose(outfp);
+                    this.SetDownloadError("响应正文超过 " + Convert.ToString(bodyLimit) + " bytes");
+                    HttpDeadline.Disarm(watch);
+                    channel.Dispose();
+                    return 0 - 1;
+                }
+                long w = fwrite(buf, 1, n, outfp);
+                if (w < n) { finished = true; }
+                written = written + w;
+                // 进度以时间为主、字节为辅：每 200ms（或每 1 MB）刷一次，
+                // 慢链路上界面也在动——只按字节报的话 100 KB/s 的链路
+                // 十秒才动一格，看着像卡死。
+                long nowMs = Stopwatch.GetMilliseconds();
+                if (lastReport < 0 || written - lastReport >= 1048576
+                        || nowMs - lastReportMs >= 200) {
+                    File.WriteAllText(progressFile,
+                        Convert.ToString(written) + "/" + Convert.ToString(total));
+                    lastReport = written;
+                    lastReportMs = nowMs;
+                }
+                if (total > 0 && written >= total) { finished = true; }
+                if (!HttpDeadline.Expired(watch)) {
+                    HttpDeadline.Touch(watch, this.IdleBudget());
+                }
+                // 块边界上优雅退出：已写入的字节都是完整的，下一轮
+                // 同一个调用会从这里接着下。
+                if (!finished && this.CancelRequested()) {
+                    finished = true;
+                    cancelled = true;
                 }
             }
-        } finally {
-            fclose(outfp);
-            late = HttpDeadline.Expired(watch);
-            HttpDeadline.Disarm(watch);
-            channel.Dispose();
         }
-        if (limitFailed || writeFailed) { return 0 - 1; }
+        fclose(outfp);
+
+        bool late = HttpDeadline.Expired(watch);
+        HttpDeadline.Disarm(watch);
+        channel.Dispose();
         File.WriteAllText(progressFile,
             Convert.ToString(written) + "/" + Convert.ToString(total));
         if (cancelled) { return 0 - 2; }

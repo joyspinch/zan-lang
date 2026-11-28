@@ -64,25 +64,58 @@ public class HttpDeadline {
         }
     }
 
-    // 为 token 重启阶段窗口。统一在锁内校验 generation 与过期并触发非阻塞 shutdown，
-    // 消除无锁快路径在 Disarm/复用间的 ABA 竞态与 FD 复用误杀。
+    // 为 token 重启阶段窗口。阶段预算为非正值时仍保留
+    // total deadline；不能因为关闭某一阶段而把总截止时间一并关闭。
     public static void Touch(HttpDeadlineToken token, int timeoutMs) {
         if (token == null || token.disarmed) { return; }
+        HttpDeadlineSlot fast = token.slotRef;
+        if (fast != null) {
+            long expectedGen = (((long)token.generation) << 1) | (long)1;
+            if (fast.stateGen.Load() != expectedGen) { return; }
+            if (fast.firedFlag.Load() != 0) { return; }
+            long now = Stopwatch.GetMilliseconds();
+            long curDeadline = fast.deadlineMs.Load();
+            if (now >= curDeadline) {
+                nint sock = fast.sock;
+                if (fast.stateGen.Load() == expectedGen
+                    && fast.firedFlag.CompareExchange(0, 1) == 0) {
+                    fast.deadlineMs.Store(now + 3600000);
+                    if (sock >= 0) { Socket.ShutdownBoth(sock); }
+                }
+                return;
+            }
+            long next = 0;
+            if (timeoutMs > 0) { next = now + (long)timeoutMs; }
+            if (fast.totalDeadline > 0
+                && (next <= 0 || next > fast.totalDeadline)) {
+                next = fast.totalDeadline;
+            }
+            if (next <= 0) { return; }
+            if (next != curDeadline) {
+                fast.deadlineMs.Store(next);
+            }
+            return;
+        }
         List<HttpDeadlineSlot> s = HttpDeadline.slots;
         if (s == null) { return; }
+        nint expiredSock = -1;
         lock (s) {
             if (token.disarmed || token.slot < 0 || token.slot >= s.Count) { return; }
             HttpDeadlineSlot slot = s[token.slot];
             if (!slot.active || slot.generation != token.generation) { return; }
+            // Sweep 已经触发时不能被阶段切换重新武装；否则发送阶段
+            // 的超时可能在 await 返回后被 Touch 清掉。
             if (slot.fired || slot.firedFlag.Load() != 0) { return; }
             nowMs = Stopwatch.GetMilliseconds();
+            // 在扫描器尚未轮到本槽位时也要观察到过期，避免一次迟到的
+            // 收包把已经耗尽的窗口重新推到未来。
             long cur = slot.deadlineMs.Load();
             if (nowMs >= cur) {
                 if (slot.firedFlag.CompareExchange(0, 1) == 0) {
                     slot.deadline = nowMs + 3600000;
                     slot.deadlineMs.Store(slot.deadline);
                     slot.fired = true;
-                    if (slot.sock >= 0) { Socket.ShutdownBoth(slot.sock); }
+                    expiredSock = slot.sock;
                 }
             } else {
                 long next = 0;
@@ -97,6 +130,7 @@ public class HttpDeadline {
                 slot.fired = false;
             }
         }
+        if (expiredSock >= 0) { Socket.ShutdownBoth(expiredSock); }
     }
 
     // 当扫描器已对 token 执行挂断时返回 true。
@@ -144,6 +178,7 @@ public class HttpDeadline {
     public static bool SweepOnce() {
         List<HttpDeadlineSlot> s = HttpDeadline.slots;
         if (s == null) { return false; }
+        List<nint> expired = null;
         bool hasActive = false;
         lock (s) {
             nowMs = Stopwatch.GetMilliseconds();
@@ -154,15 +189,23 @@ public class HttpDeadline {
                 if (slot.active && sock >= 0 && slot.firedFlag.Load() == 0) {
                     long cur = slot.deadlineMs.Load();
                     if (nowMs >= cur && slot.firedFlag.CompareExchange(0, 1) == 0) {
+                        // fired 保持到归属者查询/Disarm；generation 防止旧 token
+                        // 在槽位复用后误触碰新连接。
                         slot.deadline = nowMs + 3600000;
                         slot.deadlineMs.Store(slot.deadline);
                         slot.fired = true;
-                        // 在锁内执行非阻塞 shutdown，防止 Disarm+Close 后 OS 复用同一 FD 导致误杀新连接。
-                        Socket.ShutdownBoth(sock);
+                        if (expired == null) { expired = new List<nint>(); }
+                        expired.Add(sock);
                     }
                 }
             }
             hasActive = activeCount > 0;
+        }
+        // 在锁外执行系统调用 shutdown，避免阻塞其他连接的 Arm/Disarm。
+        if (expired != null) {
+            for (int i = 0; i < expired.Count; i = i + 1) {
+                Socket.ShutdownBoth(expired[i]);
+            }
         }
         return hasActive;
     }

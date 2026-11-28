@@ -48,122 +48,76 @@ public class IPAddress {
         return IPAddress.ParseIPv4Slice(str, 0, str.Length) >= 0L;
     }
 
-    private static int HexVal(int c) {
-        if (c >= 48 && c <= 57) { return c - 48; }
-        if (c >= 65 && c <= 70) { return c - 55; }
-        if (c >= 97 && c <= 102) { return c - 87; }
-        return -1;
-    }
-
-    // RFC 4291 / RFC 5952 规范 16 字节 IPv6 解析器（含内嵌 IPv4 尾段，拒绝单前导/单尾随 ':' 及非法分组）。
-    private static bool ParseIPv6Bytes(string str, byte[] out16) {
-        if (str == null || out16 == null || out16.Length < 16) { return false; }
-        int len = str.Length;
-        if (len < 2 || len > 45) { return false; }
-        Span<byte> sb = new Span<byte>((nint)str, len);
-
-        int[] left = new int[8];
-        int[] right = new int[8];
-        int leftCount = 0;
-        int rightCount = 0;
-        bool seenDouble = false;
-        int i = 0;
-
-        if ((sb[0] & 255) == 58) {
-            if ((sb[1] & 255) != 58) { return false; } // 禁止单前导 ':'（如 ":1::2"）
-            seenDouble = true;
-            i = 2;
-            if (i == len) {
-                for (int k = 0; k < 16; k = k + 1) { out16[k] = 0; }
-                return true;
-            }
-        }
-
-        while (i < len) {
-            int segStart = i;
-            int val = 0;
-            int digits = 0;
-            bool hitDot = false;
-            while (i < len) {
-                int c = sb[i] & 255;
-                if (c == 58) { break; }
-                if (c == 46) { hitDot = true; break; }
-                int hv = IPAddress.HexVal(c);
-                if (hv < 0 || digits >= 4) { return false; }
-                val = (val << 4) | hv;
-                digits = digits + 1;
-                i = i + 1;
-            }
-            if (hitDot) {
-                // IPv4 尾段必须占完整末尾（2 个 16 位组）
-                long v4 = IPAddress.ParseIPv4Slice(str, segStart, len - segStart);
-                if (v4 < 0L) { return false; }
-                int hi16 = (int)((v4 >> 16) & 65535L);
-                int lo16 = (int)(v4 & 65535L);
-                if (!seenDouble) {
-                    if (leftCount + 2 > 8) { return false; }
-                    left[leftCount] = hi16; left[leftCount + 1] = lo16;
-                    leftCount = leftCount + 2;
-                } else {
-                    if (rightCount + 2 > 8) { return false; }
-                    right[rightCount] = hi16; right[rightCount + 1] = lo16;
-                    rightCount = rightCount + 2;
-                }
-                i = len;
-                break;
-            }
-            if (digits == 0) { return false; }
-            if (!seenDouble) {
-                if (leftCount >= 8) { return false; }
-                left[leftCount] = val;
-                leftCount = leftCount + 1;
-            } else {
-                if (rightCount >= 8) { return false; }
-                right[rightCount] = val;
-                rightCount = rightCount + 1;
-            }
-            if (i == len) { break; }
-            // 当前字节必为 ':'
-            i = i + 1;
-            if (i == len) { return false; } // 禁止单尾随 ':'（如 "1::2:"）
-            if ((sb[i] & 255) == 58) {
-                if (seenDouble) { return false; } // 禁止多重 "::"
-                seenDouble = true;
-                i = i + 1;
-                if (i < len && (sb[i] & 255) == 58) { return false; } // 禁止 ":::"
-            }
-        }
-
-        if (seenDouble) {
-            if (leftCount + rightCount > 7) { return false; }
-        } else {
-            if (leftCount != 8) { return false; }
-        }
-
-        int zeros = 8 - leftCount - rightCount;
-        int pos = 0;
-        for (int k = 0; k < leftCount; k = k + 1) {
-            out16[pos] = (byte)((left[k] >> 8) & 255);
-            out16[pos + 1] = (byte)(left[k] & 255);
-            pos = pos + 2;
-        }
-        for (int k = 0; k < zeros; k = k + 1) {
-            out16[pos] = 0;
-            out16[pos + 1] = 0;
-            pos = pos + 2;
-        }
-        for (int k = 0; k < rightCount; k = k + 1) {
-            out16[pos] = (byte)((right[k] >> 8) & 255);
-            out16[pos + 1] = (byte)(right[k] & 255);
-            pos = pos + 2;
+    private static bool SliceEquals(Span<byte> sb, int len, string target) {
+        if (len != target.Length) { return false; }
+        for (int i = 0; i < len; i = i + 1) {
+            if ((sb[i] & 255) != (target[i] & 255)) { return false; }
         }
         return true;
     }
 
     // 检查字符串是否为规范的 IPv6 地址格式（RFC 4291 / RFC 5952）。
+    // 单遍 Span 扫描同时校验 ":::"、多重 "::"、hex 字符与 IPv4 映射混合地址（零子串）。
     public static bool IsIPv6(string str) {
-        byte[] b = new byte[16];
-        return IPAddress.ParseIPv6Bytes(str, b);
+        if (str == null) { return false; }
+        int len = str.Length;
+        if (len < 2 || len > 45) { return false; }
+        nint sp = (nint)str;
+        Span<byte> sb = new Span<byte>(sp, len);
+
+        int colonCount = 0;
+        int doubleColonCount = 0;
+        int consecutiveColons = 0;
+        int groupDigits = 0;
+        int groups = 0;
+        int lastColon = -1;
+
+        for (int i = 0; i < len; i = i + 1) {
+            int c = sb[i] & 255;
+            if (c == 58) { // ':'
+                colonCount = colonCount + 1;
+                consecutiveColons = consecutiveColons + 1;
+                lastColon = i;
+                if (consecutiveColons == 2) {
+                    doubleColonCount = doubleColonCount + 1;
+                    if (doubleColonCount > 1) { return false; }
+                } else if (consecutiveColons >= 3) {
+                    return false;
+                }
+                if (groupDigits > 0) {
+                    groups = groups + 1;
+                    groupDigits = 0;
+                }
+            } else if (c == 46) { // '.' -> RFC 4291 §2.5.5.2 IPv4-Mapped 混合地址
+                if (lastColon < 0) { return false; }
+                int v4Start = lastColon + 1;
+                int v4Len = len - v4Start;
+                if (IPAddress.ParseIPv4Slice(str, v4Start, v4Len) < 0L) { return false; }
+                if (lastColon == 2) {
+                    return IPAddress.SliceEquals(sb, 2, "::");
+                }
+                if (lastColon == 6) {
+                    return IPAddress.SliceEquals(sb, 6, "::ffff") || IPAddress.SliceEquals(sb, 6, "::FFFF");
+                }
+                if (lastColon == 14) {
+                    return IPAddress.SliceEquals(sb, 14, "0:0:0:0:0:ffff") || IPAddress.SliceEquals(sb, 14, "0:0:0:0:0:FFFF");
+                }
+                return false;
+            } else {
+                consecutiveColons = 0;
+                bool isHex = (c >= 48 && c <= 57) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102);
+                if (!isHex || groupDigits >= 4) { return false; }
+                groupDigits = groupDigits + 1;
+            }
+        }
+        if (groupDigits > 0) {
+            groups = groups + 1;
+        }
+        // 结尾哨兵使无压缩形态的 colonCount == 7 对应原逻辑的 8
+        if (doubleColonCount > 0) {
+            return groups <= 7;
+        }
+        return groups == 8 && colonCount == 7;
     }
 
     // 将点分十进制 IPv4 地址解析为 32 位无符号整数（存储在 long 中），非法时返回 -1。
@@ -198,79 +152,54 @@ public class IPAddress {
         return (ipVal & mask) == (netVal & mask);
     }
 
-    private static bool IsPrivateIPv4Val(long v) {
-        // 10.0.0.0/8
-        if ((v & 4278190080L) == 167772160L) { return true; }
-        // 172.16.0.0/12
-        if ((v & 4293918720L) == 2886729728L) { return true; }
-        // 192.168.0.0/16
-        if ((v & 4294901760L) == 3232235520L) { return true; }
-        // 169.254.0.0/16
-        if ((v & 4294901760L) == 2851995648L) { return true; }
-        return false;
-    }
-
-    private static bool IsIPv4Mapped(byte[] b) {
-        for (int i = 0; i < 10; i = i + 1) {
-            if ((b[i] & 255) != 0) { return false; }
-        }
-        return (b[10] & 255) == 255 && (b[11] & 255) == 255;
-    }
-
-    private static long ExtractTailIPv4(byte[] b) {
-        return (((long)(b[12] & 255)) << 24)
-            | (((long)(b[13] & 255)) << 16)
-            | (((long)(b[14] & 255)) << 8)
-            | ((long)(b[15] & 255));
-    }
-
-    // 检查 IP 是否为本地环回地址（127.0.0.0/8、规范 ::1 及其任意压缩形态、以及 ::ffff:127.0.0.0/104）。
+    // 检查 IP 是否为本地环回地址（127.0.0.0/8 或 ::1）。
     public static bool IsLoopback(string ip) {
-        if (ip == null || ip.Length == 0) { return false; }
-        long v4 = IPAddress.ParseIPv4Slice(ip, 0, ip.Length);
-        if (v4 >= 0L) {
-            return (v4 & 4278190080L) == 2130706432L; // 127.0.0.0/8
-        }
-        byte[] b = new byte[16];
-        if (!IPAddress.ParseIPv6Bytes(ip, b)) { return false; }
-        bool prefixZero10 = true;
-        for (int i = 0; i < 10; i = i + 1) {
-            if ((b[i] & 255) != 0) { prefixZero10 = false; break; }
-        }
-        if (!prefixZero10) { return false; }
-        int b10 = b[10] & 255;
-        int b11 = b[11] & 255;
-        // 规范 ::1（含 0::1 / 0000::1 等所有展开/压缩形式）
-        if (b10 == 0 && b11 == 0 && (b[12] & 255) == 0 && (b[13] & 255) == 0
-            && (b[14] & 255) == 0 && (b[15] & 255) == 1) {
-            return true;
-        }
-        // IPv4-Mapped (::ffff:127.0.0.0/104) 与 IPv4-Compatible (::127.0.0.0/104)
-        if ((b10 == 255 && b11 == 255) || (b10 == 0 && b11 == 0)) {
-            return (b[12] & 255) == 127;
+        if (ip == null) { return false; }
+        int len = ip.Length;
+        if (len == 0) { return false; }
+        if (len == 3 && ip == "::1") { return true; }
+        if (len == 15 && ip == "0:0:0:0:0:0:0:1") { return true; }
+        if (len >= 7 && (ip[0] & 255) == 49 && (ip[1] & 255) == 50
+            && (ip[2] & 255) == 55 && (ip[3] & 255) == 46) {
+            return IPAddress.ParseIPv4Slice(ip, 0, len) >= 0L;
         }
         return false;
     }
 
-    // 检查 IP 是否为私有内网或链路本地地址（RFC 1918 / RFC 3927 / RFC 4193 / RFC 4291，
-    // 含大小写无关 IPv6 与 IPv4-Mapped ::ffff:10/172.16/192.168/169.254 防 SSRF 绕过）。
+    // 检查 IP 是否为私有内网或链路本地地址（RFC 1918 / RFC 3927 / RFC 4193 / RFC 4291）。
+    // 单次 ParseIPv4 + 4 条位掩码直接判定，消除 5 倍重复解析与 CIDR 串分配。
     public static bool IsPrivate(string ip) {
         if (ip == null || ip.Length == 0) { return false; }
         long v = IPAddress.ParseIPv4Slice(ip, 0, ip.Length);
         if (v >= 0L) {
-            return IPAddress.IsPrivateIPv4Val(v);
+            // 10.0.0.0/8
+            if ((v & 4278190080L) == 167772160L) { return true; }
+            // 172.16.0.0/12
+            if ((v & 4293918720L) == 2886729728L) { return true; }
+            // 192.168.0.0/16
+            if ((v & 4294901760L) == 3232235520L) { return true; }
+            // 169.254.0.0/16
+            if ((v & 4294901760L) == 2851995648L) { return true; }
+            return false;
         }
-        byte[] b = new byte[16];
-        if (!IPAddress.ParseIPv6Bytes(ip, b)) { return false; }
-        int b0 = b[0] & 255;
-        int b1 = b[1] & 255;
-        // ULA: fc00::/7
-        if ((b0 & 254) == 252) { return true; }
-        // Link-Local: fe80::/10
-        if (b0 == 254 && (b1 & 192) == 128) { return true; }
-        // IPv4-Mapped (::ffff:x.y.z.w) 映射到 IPv4 私有段判定
-        if (IPAddress.IsIPv4Mapped(b)) {
-            return IPAddress.IsPrivateIPv4Val(IPAddress.ExtractTailIPv4(b));
+        if (IPAddress.IsIPv6(ip)) {
+            int c0 = ip[0] & 255;
+            int c1 = ip[1] & 255;
+            if (c0 == 102 || c0 == 70) { // 'f' or 'F'
+                // ULA: fc00::/7 ("fc"/"FC"/"fd"/"FD")
+                if (c0 == 102 && (c1 == 99 || c1 == 100)) { return true; }
+                if (c0 == 70 && (c1 == 67 || c1 == 68)) { return true; }
+                // Link-Local: fe80::/10 ("fe8".."feb" / "FE8".."FEB")
+                if (ip.Length >= 3) {
+                    int c2 = ip[2] & 255;
+                    if (c0 == 102 && c1 == 101 && (c2 == 56 || c2 == 57 || c2 == 97 || c2 == 98)) {
+                        return true;
+                    }
+                    if (c0 == 70 && c1 == 69 && (c2 == 56 || c2 == 57 || c2 == 65 || c2 == 66)) {
+                        return true;
+                    }
+                }
+            }
         }
         return false;
     }

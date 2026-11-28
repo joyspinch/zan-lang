@@ -22,7 +22,6 @@ public class HttpsServer : IDisposable {
     public int maxHeaderBytes;
     public int requestTimeoutMs;
     public HttpRequestHandler requestHandler;
-    private bool disposed;
 
     public HttpsServer(string host, int port) {
         this.host = host;
@@ -35,7 +34,6 @@ public class HttpsServer : IDisposable {
         this.requestTimeoutMs = 30000;
         this.requestHandler = null;
         this.tls = null;
-        this.disposed = false;
     }
 
     // 从 PEM 证书链与 PEM 私钥创建 HTTPS 服务器；
@@ -57,20 +55,20 @@ public class HttpsServer : IDisposable {
     // 设置单个请求的最大可接受大小（字节），
     // （请求头 + 请求体）。
     public HttpsServer SetMaxRequestBytes(int bytes) {
-        if (bytes > 0) { this.maxRequestBytes = bytes; }
+        this.maxRequestBytes = bytes;
         return this;
     }
 
     // 设置请求头块的最大字节数，超过则返回 431。
     public HttpsServer SetMaxHeaderBytes(int bytes) {
-        if (bytes > 0) { this.maxHeaderBytes = bytes; }
+        this.maxHeaderBytes = bytes;
         return this;
     }
 
     // 设置读取请求头和请求体的截止时间（毫秒）。
     // 0 表示禁用。默认 30 秒。
     public HttpsServer SetTimeout(int ms) {
-        this.requestTimeoutMs = ms >= 0 ? ms : 0;
+        this.requestTimeoutMs = ms;
         return this;
     }
 
@@ -101,7 +99,7 @@ public class HttpsServer : IDisposable {
             if (clientSock >= 0) {
                 bool accepted = false;
                 lock (this) {
-                    if (!this.disposed && this.tls != null && this.activeConnections < this.maxConnections) {
+                    if (this.activeConnections < this.maxConnections) {
                         this.activeConnections = this.activeConnections + 1;
                         accepted = true;
                     }
@@ -121,7 +119,7 @@ public class HttpsServer : IDisposable {
     // 不做 TLS 握手——每个 TLS 连接都持有 SSL/BIO 与缓冲，必须像
     // HttpServer 一样设闸）。
     public HttpsServer SetMaxConnections(int max) {
-        if (max > 0) { this.maxConnections = max; }
+        this.maxConnections = max;
         return this;
     }
 
@@ -137,29 +135,16 @@ public class HttpsServer : IDisposable {
 
     public void Dispose() {
         this.Stop();
-        TlsContext toFree = null;
-        lock (this) {
-            this.disposed = true;
-            if (this.activeConnections == 0 && this.tls != null) {
-                toFree = this.tls;
-                this.tls = null;
-            }
-        }
-        if (toFree != null) {
-            toFree.Free();
-        }
     }
 
     private async void HandleConnection(nint clientSock) {
         try {
             Socket.SetNonBlocking(clientSock);
-            TlsContext ctx = this.tls;
-            if (ctx == null) { return; }
             TlsStream stream;
             if (this.requestTimeoutMs > 0) {
-                stream = await TlsStream.AcceptAsync(ctx, clientSock, this.requestTimeoutMs);
+                stream = await TlsStream.AcceptAsync(this.tls, clientSock, this.requestTimeoutMs);
             } else {
-                stream = await TlsStream.AcceptAsync(ctx, clientSock);
+                stream = await TlsStream.AcceptAsync(this.tls, clientSock);
             }
             if (stream == null) { return; }
 
@@ -177,18 +162,10 @@ public class HttpsServer : IDisposable {
             }
         } finally {
             Socket.Close(clientSock);
-            TlsContext toFree = null;
             lock (this) {
                 if (this.activeConnections > 0) {
                     this.activeConnections = this.activeConnections - 1;
                 }
-                if (this.disposed && this.activeConnections == 0 && this.tls != null) {
-                    toFree = this.tls;
-                    this.tls = null;
-                }
-            }
-            if (toFree != null) {
-                toFree.Free();
             }
         }
     }

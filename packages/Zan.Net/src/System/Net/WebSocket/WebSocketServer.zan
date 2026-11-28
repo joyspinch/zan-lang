@@ -24,45 +24,24 @@ public class WebSocketConnection : IDisposable {
     public bool connected;
     // 协程安全发送锁：禁止跨 await 持有 OS Mutex，防止 M:N 调度切换线程导致死锁。
     private AsyncRwLock sendLock;
-    private int activeSends;
-    private bool disposed;
 
     public WebSocketConnection(nint sock, TcpClient client) {
         this.sock = sock;
         this.client = client;
         this.connected = true;
         this.sendLock = new AsyncRwLock();
-        this.activeSends = 0;
-        this.disposed = false;
     }
 
     internal async int SendEncodedAsync(byte[] encoded, int frameLen) {
         if (encoded == null || frameLen <= 0) { return -1; }
-        AsyncRwLock lk = null;
-        lock (this) {
-            if (this.disposed || this.sendLock == null) { return -1; }
-            lk = this.sendLock;
-            this.activeSends = this.activeSends + 1;
-        }
+        AsyncRwLock lk = this.sendLock;
+        if (lk == null) { return -1; }
+        await lk.EnterWrite();
         try {
-            await lk.EnterWrite();
-            try {
-                TcpClient c = this.client;
-                if (c == null || this.disposed) { return -1; }
-                return await c.SendBytesAsync(encoded, frameLen);
-            } finally {
-                lk.ExitWrite();
-            }
+            if (this.client == null) { return -1; }
+            return await this.client.SendBytesAsync(encoded, frameLen);
         } finally {
-            AsyncRwLock toClose = null;
-            lock (this) {
-                if (this.activeSends > 0) { this.activeSends = this.activeSends - 1; }
-                if (this.disposed && this.activeSends == 0 && this.sendLock != null) {
-                    toClose = this.sendLock;
-                    this.sendLock = null;
-                }
-            }
-            if (toClose != null) { toClose.Close(); }
+            lk.ExitWrite();
         }
     }
 
@@ -117,21 +96,18 @@ public class WebSocketConnection : IDisposable {
         this.connected = false;
         TcpClient c = null;
         nint s = -1;
-        AsyncRwLock toClose = null;
         lock (this) {
-            this.disposed = true;
             c = this.client;
             this.client = null;
             s = this.sock;
             this.sock = -1;
-            if (this.activeSends == 0 && this.sendLock != null) {
-                toClose = this.sendLock;
-                this.sendLock = null;
-            }
         }
         if (c != null) { c.Close(); }
         else if (s >= 0) { Socket.Close(s); }
-        if (toClose != null) { toClose.Close(); }
+        if (this.sendLock != null) {
+            this.sendLock.Close();
+            this.sendLock = null;
+        }
     }
 }
 
@@ -158,6 +134,7 @@ public class WebSocketServer : IDisposable {
     public WebSocketConnectionHandler closeHandler;
 
     public List<WebSocketConnection> connections;
+    private Mutex connLock;
 
     public WebSocketServer(string host, int port) {
         this.host = host;
@@ -171,6 +148,7 @@ public class WebSocketServer : IDisposable {
         this.connectHandler = null;
         this.closeHandler = null;
         this.connections = new List<WebSocketConnection>();
+        this.connLock = new Mutex();
     }
 
     public WebSocketServer OnMessage(WebSocketMessageHandler handler) {
@@ -194,12 +172,12 @@ public class WebSocketServer : IDisposable {
     }
 
     public WebSocketServer SetMaxConnections(int max) {
-        if (max > 0) { this.maxConnections = max; }
+        this.maxConnections = max;
         return this;
     }
 
     public WebSocketServer SetTimeout(int ms) {
-        this.requestTimeoutMs = ms >= 0 ? ms : 0;
+        this.requestTimeoutMs = ms;
         return this;
     }
 
@@ -215,11 +193,14 @@ public class WebSocketServer : IDisposable {
             if (clientSock >= 0) {
                 Socket.SetNoDelay(clientSock);
                 bool accepted = false;
-                lock (this) {
+                this.connLock.WaitOne();
+                try {
                     if (this.activeConnections < this.maxConnections) {
                         this.activeConnections = this.activeConnections + 1;
                         accepted = true;
                     }
+                } finally {
+                    this.connLock.ReleaseMutex();
                 }
                 if (!accepted) {
                     Socket.Close(clientSock);
@@ -320,9 +301,15 @@ public class WebSocketServer : IDisposable {
             } else {
                 Socket.Close(clientSock);
             }
-            lock (this) {
-                if (this.activeConnections > 0) {
-                    this.activeConnections = this.activeConnections - 1;
+            Mutex lk = this.connLock;
+            if (lk != null) {
+                lk.WaitOne();
+                try {
+                    if (this.activeConnections > 0) {
+                        this.activeConnections = this.activeConnections - 1;
+                    }
+                } finally {
+                    lk.ReleaseMutex();
                 }
             }
         }
@@ -412,31 +399,46 @@ public class WebSocketServer : IDisposable {
     }
 
     private void AddConnection(WebSocketConnection conn) {
-        lock (this) {
+        Mutex lk = this.connLock;
+        if (lk == null) { return; }
+        lk.WaitOne();
+        try {
             this.connections.Add(conn);
+        } finally {
+            lk.ReleaseMutex();
         }
     }
 
     private void RemoveConnection(WebSocketConnection conn) {
-        lock (this) {
+        Mutex lk = this.connLock;
+        if (lk == null) { return; }
+        lk.WaitOne();
+        try {
             for (int i = 0; i < this.connections.Count; i = i + 1) {
                 if (this.connections[i] == conn) {
                     this.connections.RemoveAt(i);
                     break;
                 }
             }
+        } finally {
+            lk.ReleaseMutex();
         }
     }
 
     // 向当前所有活跃客户端广播文本消息
     public void Broadcast(string message) {
         if (message == null || message.Length == 0) { return; }
+        Mutex lk = this.connLock;
+        if (lk == null) { return; }
         List<WebSocketConnection> snap = new List<WebSocketConnection>();
-        lock (this) {
+        lk.WaitOne();
+        try {
             for (int i = 0; i < this.connections.Count; i = i + 1) {
                 WebSocketConnection c = this.connections[i];
                 if (c.connected) { snap.Add(c); }
             }
+        } finally {
+            lk.ReleaseMutex();
         }
         for (int i = 0; i < snap.Count; i = i + 1) {
             Task.Spawn(snap[i].SendAsync(message));
@@ -449,12 +451,17 @@ public class WebSocketServer : IDisposable {
         if (this.listener != null) {
             this.listener.Stop();
         }
+        Mutex lk = this.connLock;
+        if (lk == null) { return; }
         List<WebSocketConnection> snap = new List<WebSocketConnection>();
-        lock (this) {
+        lk.WaitOne();
+        try {
             for (int i = 0; i < this.connections.Count; i = i + 1) {
                 snap.Add(this.connections[i]);
             }
             this.connections.Clear();
+        } finally {
+            lk.ReleaseMutex();
         }
         for (int i = 0; i < snap.Count; i = i + 1) {
             Task.Spawn(snap[i].CloseAsync());
@@ -463,5 +470,9 @@ public class WebSocketServer : IDisposable {
 
     public void Dispose() {
         this.Stop();
+        if (this.connLock != null) {
+            this.connLock.Close();
+            this.connLock = null;
+        }
     }
 }

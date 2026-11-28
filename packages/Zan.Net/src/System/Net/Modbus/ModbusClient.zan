@@ -1,6 +1,5 @@
 using System;
 using System.Net.Sockets;
-using System.Net.Http;
 using System.Threading;
 using System.Collections.Generic;
 
@@ -17,7 +16,6 @@ public class ModbusClient : IDisposable {
     private bool busy;
     private Queue<AsyncGate> waiters;
     private string lastError;
-    private int timeoutMs;
 
     // 构造
     public ModbusClient() {
@@ -28,13 +26,6 @@ public class ModbusClient : IDisposable {
         this.busy = false;
         this.waiters = new Queue<AsyncGate>();
         this.lastError = "";
-        this.timeoutMs = 10000;
-    }
-
-    // 设置单次事务读写超时（毫秒，默认 10000；<=0 表示不设时限）。
-    public ModbusClient SetTimeout(int ms) {
-        this.timeoutMs = ms >= 0 ? ms : 0;
-        return this;
     }
 
     // 连接 Modbus TCP 端点（unit 为单元/从站 id，直连 TCP 设备通常为 1）。
@@ -75,23 +66,14 @@ public class ModbusClient : IDisposable {
     }
 
     // 跨多次 recv 精确读取 need 字节；对端关闭或出错时置 connected=false 并返回已读缓冲。
-    private async byte[] ReadBytesAsync(TcpClient c, int need, HttpDeadlineToken watch) {
+    private async byte[] ReadBytesAsync(int need) {
         if (need <= 0) { return new byte[1]; }
-        if (c == null) { this.connected = false; return new byte[1]; }
         byte[] buf = new byte[need + 1];
         byte[] tmp = new byte[need + 1];
-        nint sock = c.GetSocket();
+        nint sock = this.conn.GetSocket();
         int got = 0;
         while (got < need) {
-            if (!this.connected || (watch != null && HttpDeadline.Expired(watch))) {
-                this.connected = false;
-                return buf;
-            }
             await Socket.ReadReady(sock);
-            if (!this.connected || (watch != null && HttpDeadline.Expired(watch))) {
-                this.connected = false;
-                return buf;
-            }
             int n = Socket.Recv(sock, tmp, need - got);
             if (n == -1) {
                 // EWOULDBLOCK / 虚假就绪，继续等待
@@ -166,9 +148,7 @@ public class ModbusClient : IDisposable {
 
     private async byte[] TransactInternalAsync(byte[] pdu, int pduLen) {
         this.lastError = "";
-        TcpClient c = null;
-        lock (this) { c = this.conn; }
-        if (!this.connected || c == null) {
+        if (!this.connected) {
             return this.FailFrame("not connected", false);
         }
         int tid = this.nextTid & 65535;
@@ -185,58 +165,48 @@ public class ModbusClient : IDisposable {
         if (pduLen > 0) {
             NativeMemory.Copy((nint)req + (nint)7, (nint)pdu, pduLen);
         }
-        HttpDeadlineToken watch = this.timeoutMs > 0
-            ? HttpDeadline.Arm(c.GetSocket(), this.timeoutMs, this.timeoutMs)
-            : null;
-        try {
-            int sent = await c.SendBytesAsync(req, 7 + pduLen);
-            if (sent < 7 + pduLen) {
-                return this.FailFrame("send failed", true);
-            }
+        int _s = await this.conn.SendBytesAsync(req, 7 + pduLen);
 
-            byte[] mbap = await ReadBytesAsync(c, 7, watch);
-            if (!this.connected) {
-                return this.FailFrame(watch != null && HttpDeadline.Expired(watch) ? "timeout" : "connection closed", false);
-            }
-            int respTid = ((mbap[0] & 255) << 8) + (mbap[1] & 255);
-            if (respTid != tid) {
-                return this.FailFrame("transaction id mismatch", true);
-            }
-            int proto = ((mbap[2] & 255) << 8) + (mbap[3] & 255);
-            if (proto != 0) {
-                return this.FailFrame("bad protocol id", true);
-            }
-            int len = ((mbap[4] & 255) << 8) + (mbap[5] & 255);
-            if (len < 2 || len > 260) {
-                return this.FailFrame("bad frame length", true);
-            }
-            int respUnit = mbap[6] & 255;
-            if (respUnit != this.unitId) {
-                return this.FailFrame("unit id mismatch", true);
-            }
-            // MBAP 长度计入 unit id + PDU；unit id 已在 mbap[6] 读取。
-            byte[] body = await ReadBytesAsync(c, len - 1, watch);
-            if (!this.connected) {
-                return this.FailFrame(watch != null && HttpDeadline.Expired(watch) ? "timeout" : "connection closed", false);
-            }
-            int expectedFc = pdu[0] & 255;
-            int respFc = body[0] & 255;
-            // body[0] 为功能码回显；0x80 位表示异常应答。
-            if ((respFc & 128) != 0) {
-                int exCode = len - 1 >= 2 ? (body[1] & 255) : 0;
-                return this.FailFrame("exception code " + Convert.ToString(exCode), false);
-            }
-            if (respFc != expectedFc) {
-                return this.FailFrame("function code mismatch", true);
-            }
-            byte[] outb = new byte[len - 1];
-            if (len > 1) {
-                NativeMemory.Copy((nint)outb, (nint)body, len - 1);
-            }
-            return outb;
-        } finally {
-            HttpDeadline.Disarm(watch);
+        byte[] mbap = await ReadBytesAsync(7);
+        if (!this.connected) {
+            return this.FailFrame("connection closed", false);
         }
+        int respTid = ((mbap[0] & 255) << 8) + (mbap[1] & 255);
+        if (respTid != tid) {
+            return this.FailFrame("transaction id mismatch", true);
+        }
+        int proto = ((mbap[2] & 255) << 8) + (mbap[3] & 255);
+        if (proto != 0) {
+            return this.FailFrame("bad protocol id", true);
+        }
+        int len = ((mbap[4] & 255) << 8) + (mbap[5] & 255);
+        if (len < 2 || len > 260) {
+            return this.FailFrame("bad frame length", true);
+        }
+        int respUnit = mbap[6] & 255;
+        if (respUnit != this.unitId) {
+            return this.FailFrame("unit id mismatch", true);
+        }
+        // MBAP 长度计入 unit id + PDU；unit id 已在 mbap[6] 读取。
+        byte[] body = await ReadBytesAsync(len - 1);
+        if (!this.connected) {
+            return this.FailFrame("connection closed", false);
+        }
+        int expectedFc = pdu[0] & 255;
+        int respFc = body[0] & 255;
+        // body[0] 为功能码回显；0x80 位表示异常应答。
+        if ((respFc & 128) != 0) {
+            int exCode = len - 1 >= 2 ? (body[1] & 255) : 0;
+            return this.FailFrame("exception code " + Convert.ToString(exCode), false);
+        }
+        if (respFc != expectedFc) {
+            return this.FailFrame("function code mismatch", true);
+        }
+        byte[] outb = new byte[len];
+        if (len > 1) {
+            NativeMemory.Copy((nint)outb, (nint)body, len - 1);
+        }
+        return outb;
     }
 
     // 线圈（fc 1）与离散输入（fc 2）共用的读取器：

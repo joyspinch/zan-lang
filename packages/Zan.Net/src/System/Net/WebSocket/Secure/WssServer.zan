@@ -25,45 +25,24 @@ public class WssConnection : IDisposable {
     public bool connected;
     // 协程安全发送锁：禁止跨 await 持有 OS Mutex，防止 M:N 调度切换线程导致死锁。
     private AsyncRwLock sendLock;
-    private int activeSends;
-    private bool disposed;
 
     public WssConnection(nint sock, TlsStream stream) {
         this.sock = sock;
         this.stream = stream;
         this.connected = true;
         this.sendLock = new AsyncRwLock();
-        this.activeSends = 0;
-        this.disposed = false;
     }
 
     internal async int SendEncodedAsync(byte[] encoded, int frameLen) {
         if (encoded == null || frameLen <= 0) { return -1; }
-        AsyncRwLock lk = null;
-        lock (this) {
-            if (this.disposed || this.sendLock == null) { return -1; }
-            lk = this.sendLock;
-            this.activeSends = this.activeSends + 1;
-        }
+        AsyncRwLock lk = this.sendLock;
+        if (lk == null) { return -1; }
+        await lk.EnterWrite();
         try {
-            await lk.EnterWrite();
-            try {
-                TlsStream st = this.stream;
-                if (st == null || this.disposed) { return -1; }
-                return await st.SendAsync(encoded, frameLen);
-            } finally {
-                lk.ExitWrite();
-            }
+            if (this.stream == null) { return -1; }
+            return await this.stream.SendAsync(encoded, frameLen);
         } finally {
-            AsyncRwLock toClose = null;
-            lock (this) {
-                if (this.activeSends > 0) { this.activeSends = this.activeSends - 1; }
-                if (this.disposed && this.activeSends == 0 && this.sendLock != null) {
-                    toClose = this.sendLock;
-                    this.sendLock = null;
-                }
-            }
-            if (toClose != null) { toClose.Close(); }
+            lk.ExitWrite();
         }
     }
 
@@ -119,21 +98,18 @@ public class WssConnection : IDisposable {
         this.connected = false;
         TlsStream st = null;
         nint s = -1;
-        AsyncRwLock toClose = null;
         lock (this) {
-            this.disposed = true;
             st = this.stream;
             this.stream = null;
             s = this.sock;
             this.sock = -1;
-            if (this.activeSends == 0 && this.sendLock != null) {
-                toClose = this.sendLock;
-                this.sendLock = null;
-            }
         }
         if (st != null) { st.Close(); }
         if (s >= 0) { Socket.Close(s); }
-        if (toClose != null) { toClose.Close(); }
+        if (this.sendLock != null) {
+            this.sendLock.Close();
+            this.sendLock = null;
+        }
     }
 }
 
@@ -154,7 +130,7 @@ public class WssServer : IDisposable {
     public WssConnectionHandler connectHandler;
     public WssConnectionHandler closeHandler;
     public List<WssConnection> connections;
-    private bool disposed;
+    private Mutex connLock;
 
     public WssServer(string host, int port) {
         this.host = host;
@@ -169,7 +145,7 @@ public class WssServer : IDisposable {
         this.closeHandler = null;
         this.tls = null;
         this.connections = new List<WssConnection>();
-        this.disposed = false;
+        this.connLock = new Mutex();
     }
 
     // 从 PEM 证书链和 PEM 私钥创建
@@ -207,14 +183,14 @@ public class WssServer : IDisposable {
     // 设置最大并发连接数；超限连接立即关闭（TLS 连接各持
     // SSL/BIO 与缓冲，必须设闸）。
     public WssServer SetMaxConnections(int max) {
-        if (max > 0) { this.maxConnections = max; }
+        this.maxConnections = max;
         return this;
     }
 
     // 设置 TLS 握手及 Upgrade 头的超时（毫秒）。默认 30 秒；
     // 非正值禁用超时，建立连接后的帧循环不受此限制。
     public WssServer SetTimeout(int ms) {
-        this.requestTimeoutMs = ms >= 0 ? ms : 0;
+        this.requestTimeoutMs = ms;
         return this;
     }
 
@@ -231,7 +207,7 @@ public class WssServer : IDisposable {
             if (clientSock >= 0) {
                 bool accepted = false;
                 lock (this) {
-                    if (!this.disposed && this.tls != null && this.activeConnections < this.maxConnections) {
+                    if (this.activeConnections < this.maxConnections) {
                         this.activeConnections = this.activeConnections + 1;
                         accepted = true;
                     }
@@ -247,31 +223,46 @@ public class WssServer : IDisposable {
     }
 
     private void AddConnection(WssConnection conn) {
-        lock (this) {
+        Mutex lk = this.connLock;
+        if (lk == null) { return; }
+        lk.WaitOne();
+        try {
             this.connections.Add(conn);
+        } finally {
+            lk.ReleaseMutex();
         }
     }
 
     private void RemoveConnection(WssConnection conn) {
-        lock (this) {
+        Mutex lk = this.connLock;
+        if (lk == null) { return; }
+        lk.WaitOne();
+        try {
             for (int i = 0; i < this.connections.Count; i = i + 1) {
                 if (this.connections[i] == conn) {
                     this.connections.RemoveAt(i);
                     break;
                 }
             }
+        } finally {
+            lk.ReleaseMutex();
         }
     }
 
     // 向当前所有活跃 WSS 客户端广播文本消息
     public void Broadcast(string message) {
         if (message == null || message.Length == 0) { return; }
+        Mutex lk = this.connLock;
+        if (lk == null) { return; }
         List<WssConnection> snap = new List<WssConnection>();
-        lock (this) {
+        lk.WaitOne();
+        try {
             for (int i = 0; i < this.connections.Count; i = i + 1) {
                 WssConnection c = this.connections[i];
                 if (c.connected) { snap.Add(c); }
             }
+        } finally {
+            lk.ReleaseMutex();
         }
         for (int i = 0; i < snap.Count; i = i + 1) {
             Task.Spawn(snap[i].SendAsync(message));
@@ -284,12 +275,17 @@ public class WssServer : IDisposable {
         if (this.listener != null) {
             this.listener.Stop();
         }
+        Mutex lk = this.connLock;
+        if (lk == null) { return; }
         List<WssConnection> snap = new List<WssConnection>();
-        lock (this) {
+        lk.WaitOne();
+        try {
             for (int i = 0; i < this.connections.Count; i = i + 1) {
                 snap.Add(this.connections[i]);
             }
             this.connections.Clear();
+        } finally {
+            lk.ReleaseMutex();
         }
         for (int i = 0; i < snap.Count; i = i + 1) {
             Task.Spawn(snap[i].CloseAsync());
@@ -298,16 +294,9 @@ public class WssServer : IDisposable {
 
     public void Dispose() {
         this.Stop();
-        TlsContext toFree = null;
-        lock (this) {
-            this.disposed = true;
-            if (this.activeConnections == 0 && this.tls != null) {
-                toFree = this.tls;
-                this.tls = null;
-            }
-        }
-        if (toFree != null) {
-            toFree.Free();
+        if (this.connLock != null) {
+            this.connLock.Close();
+            this.connLock = null;
         }
     }
 
@@ -317,18 +306,10 @@ public class WssServer : IDisposable {
         try {
             await this.HandleConnectionInner(clientSock);
         } finally {
-            TlsContext toFree = null;
             lock (this) {
                 if (this.activeConnections > 0) {
                     this.activeConnections = this.activeConnections - 1;
                 }
-                if (this.disposed && this.activeConnections == 0 && this.tls != null) {
-                    toFree = this.tls;
-                    this.tls = null;
-                }
-            }
-            if (toFree != null) {
-                toFree.Free();
             }
         }
     }
