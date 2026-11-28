@@ -412,6 +412,13 @@
    - 坑：交叉边若直接接到原报告块，它有多个前驱，late ARC 2b（把 retain 挪到
      冷边）找不到单前驱的落脚块，b 的 retain/release 照留——所以交叉点放在
      **报告块之后**。区域上限 400 条指令：1500 时 zandoc text +14%。
+   - 坑：克隆后改 CFG 一律 `removePredecessor(..., /*KeepOneInputPHIs=*/true)`。
+     折掉单入口 phi 会 RAUW 成剩下那个输入，而 `ValueToValueMapTy` 跟随 RAUW，
+     phi 的克隆映射被并到 scratch 上，`fix_exits` 把失败侧的 scratch 接进克隆
+     出口的 phi（不支配 → 清理 pass 变 poison → release 野指针，survivor HUD
+     重开崩溃）。现象是"-g / 加日志就不崩、换 ARC 窗口就变"；排查法：在每轮
+     `step` 后 `verifyFunction`，第一个 "does not dominate all uses" 就是祸首。
+     判定器 `tests/conformance/guard_version_region_phi.zan`。
    - 实测（user 秒，带检查 / --no-runtime-checks）：nbody 1.9→~0.5 / 0.4，
      fannkuch 2.3→1.75 / 1.75，sort 0.36→0.30 / 0.28。剩余 nbody 差距是外层
      `Body a` 的 retain/release：内层快环有出口到慢环，late ARC 跨循环对消
