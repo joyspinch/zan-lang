@@ -730,6 +730,7 @@ internal static class GameGpuResources {
             return GameGpuState.WhiteTex;
         }
         uint tex = GlBridge.GpuTexture(bmpPtr);
+        if (tex != 0u) { Prepare3DTexture(tex, view); }
         if (tex == 0u && fallbackWhite) {
             if (GameGpuState.WhiteTex == 0u) {
                 GameGpuState.WhiteTex = GlBridge.GpuTexture(GlBridge.WhiteBitmapPtr());
@@ -747,6 +748,74 @@ internal static class GameGpuResources {
         }
         return tex;
     }
+
+    // ---- 3D 材质纹理：REPEAT 平铺 + CPU 生成 mip 链 + 三线性 + 各向异性 ----
+    // GUI 驱动按 2D 贴图规则建纹理（CLAMP、无 mip）。3D 世界材质需要平铺与远处不闪烁：
+    // GL 函数表没有 glGenerateMipmap，这里在 CPU 上逐级 2×2 平均后用 TexImage2D 上传各级。
+    // 每个 (纹理, 位图序号) 只处理一次；关闭：Texture3DQuality = 0。
+    public static int Texture3DQuality = 2;     // 0 不处理 1 仅 REPEAT 2 REPEAT + mip + 各向异性
+    public static int MaxAnisotropy = 8;
+    private static Dictionary<uint, ulong> prepared3D;
+
+    public static void Prepare3DTexture(uint tex, BitmapView view) {
+        if (Texture3DQuality <= 0 || view.Pixels == 0 || view.Width <= 0 || view.Height <= 0) { return; }
+        if (prepared3D == null) { prepared3D = new Dictionary<uint, ulong>(); }
+        if (prepared3D.ContainsKey(tex) && prepared3D[tex] == view.Serial) { return; }
+        prepared3D[tex] = view.Serial;
+        GlApi gl = GameGpuState.Gl;
+        if (gl == null) { return; }
+        gl.ActiveTexture(GlBridge.TEXTURE0);
+        gl.BindTexture(GlBridge.TEXTURE_2D, tex);
+        GameGpuState.CurTex[0] = tex;
+        gl.TexParameteri(GlBridge.TEXTURE_2D, GlBridge.TEXTURE_WRAP_S, (int)REPEAT);
+        gl.TexParameteri(GlBridge.TEXTURE_2D, GlBridge.TEXTURE_WRAP_T, (int)REPEAT);
+        if (Texture3DQuality < 2 || view.Width < 4 || view.Height < 4) { return; }
+        bool gles = GlBridge.IsGlesVersion(gl);
+        uint fmt = gles ? GlBridge.RGBA : BGRA;
+        int w = view.Width; int h = view.Height;
+        // 第 0 级拷成紧密排列，便于逐级缩小
+        nint src = NativeMemory.Alloc(w * h * 4);
+        Span<uint> s0 = new Span<uint>(src, w * h);
+        Span<uint> vp = new Span<uint>(view.Pixels, view.Stride * h);
+        for (int y = 0; y < h; y = y + 1) {
+            int ro = y * view.Stride;
+            int wo = y * w;
+            for (int x = 0; x < w; x = x + 1) { s0[wo + x] = vp[ro + x]; }
+        }
+        int level = 0;
+        while (w > 1 || h > 1) {
+            int nw = w > 1 ? w / 2 : 1; int nh = h > 1 ? h / 2 : 1;
+            nint dst = NativeMemory.Alloc(nw * nh * 4);
+            Span<uint> a = new Span<uint>(src, w * h);
+            Span<uint> b = new Span<uint>(dst, nw * nh);
+            for (int y = 0; y < nh; y = y + 1) {
+                int y0 = y * 2; int y1 = y0 + 1 < h ? y0 + 1 : y0;
+                for (int x = 0; x < nw; x = x + 1) {
+                    int x0 = x * 2; int x1 = x0 + 1 < w ? x0 + 1 : x0;
+                    uint p0 = a[y0 * w + x0]; uint p1 = a[y0 * w + x1]; uint p2 = a[y1 * w + x0]; uint p3 = a[y1 * w + x1];
+                    uint c0 = (((p0 & 0xFFu) + (p1 & 0xFFu) + (p2 & 0xFFu) + (p3 & 0xFFu) + 2u) >> 2);
+                    uint c1 = ((((p0 >> 8) & 0xFFu) + ((p1 >> 8) & 0xFFu) + ((p2 >> 8) & 0xFFu) + ((p3 >> 8) & 0xFFu) + 2u) >> 2);
+                    uint c2 = ((((p0 >> 16) & 0xFFu) + ((p1 >> 16) & 0xFFu) + ((p2 >> 16) & 0xFFu) + ((p3 >> 16) & 0xFFu) + 2u) >> 2);
+                    uint c3 = ((((p0 >> 24) & 0xFFu) + ((p1 >> 24) & 0xFFu) + ((p2 >> 24) & 0xFFu) + ((p3 >> 24) & 0xFFu) + 2u) >> 2);
+                    b[y * nw + x] = c0 | (c1 << 8) | (c2 << 16) | (c3 << 24);
+                }
+            }
+            level = level + 1;
+            gl.TexImage2D(GlBridge.TEXTURE_2D, level, (int)GlBridge.RGBA8, nw, nh, 0, fmt, GlBridge.UNSIGNED_BYTE, dst);
+            NativeMemory.Free(src);
+            src = dst; w = nw; h = nh;
+        }
+        NativeMemory.Free(src);
+        gl.TexParameteri(GlBridge.TEXTURE_2D, TEXTURE_MAX_LEVEL, level);
+        gl.TexParameteri(GlBridge.TEXTURE_2D, GlBridge.TEXTURE_MIN_FILTER, (int)LINEAR_MIPMAP_LINEAR);
+        gl.TexParameteri(GlBridge.TEXTURE_2D, GlBridge.TEXTURE_MAG_FILTER, (int)GlBridge.LINEAR);
+        if (MaxAnisotropy > 1) { gl.TexParameteri(GlBridge.TEXTURE_2D, TEXTURE_MAX_ANISOTROPY, MaxAnisotropy); }
+    }
+    private const uint REPEAT = 0x2901u;
+    private const uint BGRA = 0x80E1u;
+    private const uint LINEAR_MIPMAP_LINEAR = 0x2703u;
+    private const uint TEXTURE_MAX_LEVEL = 0x813Du;
+    private const uint TEXTURE_MAX_ANISOTROPY = 0x84FEu;
 
     public static void BindTexUnit(GlApi gl, int unit, uint tex) {
         if (GameGpuState.CurTex[unit] == tex) { return; }
