@@ -360,6 +360,17 @@ ZAN_GAME_API void zan_game_set_portal_vortex3d(int32_t enabled,
 ZAN_GAME_API void zan_game_set_post_sepia_vintage3d(float strength,
     float scratch_amount, float seed);
 
+/* GPU 3D 世界空间 CAD 工程蓝图线框网格（Blueprint Wireframe Grid，零贴图零额外 Pass）：
+ * enabled != 0 时按世界三平面法线加权生成不拉伸的工程蓝图正交网格线，strength [0..3]。 */
+ZAN_GAME_API void zan_game_set_blueprint_wire3d(int32_t enabled,
+    float grid_density, float line_width, float strength,
+    float r, float g, float b);
+
+/* GPU 后处理变形宽银幕水平镜头炫光条纹（Anamorphic Lens Streak，单 Pass 零额外 FBO）：
+ * strength [0..3] 控制水平炫光强度，threshold [0..2] 控制高亮提取阈值，r/g/b 为炫光染色。 */
+ZAN_GAME_API void zan_game_set_post_sun_bloom_streak3d(float strength,
+    float threshold, float r, float g, float b);
+
 #ifdef __cplusplus
 }
 #endif

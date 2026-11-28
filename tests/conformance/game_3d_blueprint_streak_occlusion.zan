@@ -1,0 +1,156 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Game.Graphics;
+using Game.Render3D;
+
+namespace Conf;
+
+class Game3DBlueprintStreakOcclusionTest {
+    [DllImport("zan_gui")]
+    private static extern int zan_gui_read_pixel(int surfaceId, int x, int y);
+
+    static int AbsInt(int v) { return v < 0 ? -v : v; }
+    static int RedOf(int argb) { return (argb >> 16) & 255; }
+    static int GreenOf(int argb) { return (argb >> 8) & 255; }
+    static int BlueOf(int argb) { return argb & 255; }
+
+    static int PixelDiffRgb(int a, int b) {
+        return AbsInt(RedOf(a) - RedOf(b))
+            + AbsInt(GreenOf(a) - GreenOf(b))
+            + AbsInt(BlueOf(a) - BlueOf(b));
+    }
+
+    static void Main() {
+        Canvas.SetBackend(1);
+        Canvas cv = new Canvas(128, 128);
+        int sid = cv.SurfaceId();
+        Renderer3D ren = new Renderer3D(16);
+        ren.UseCpuLighting = false;
+
+        // 1. GPU 3D 世界空间 CAD 工程蓝图线框网格：横纵网格均出现高对比度蓝图线与暗网格心
+        Mesh3D wall = new Mesh3D();
+        wall.Vertex(-2.0f, -2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        wall.Vertex( 2.0f, -2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+        wall.Vertex( 2.0f,  2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        wall.Vertex(-2.0f,  2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f);
+        wall.Triangle(0, 1, 2);
+        wall.Triangle(0, 2, 3);
+        int wallKey = cv.MeshUpload(wall);
+
+        Camera3D cam = new Camera3D();
+        cam.Position = new Vector3(0.0f, 0.0f, 3.2f);
+        cam.Target = new Vector3(0.0f, 0.0f, 0.0f);
+        cam.AspectRatio = 1.0f;
+        cam.FieldOfView = 1.1f;
+
+        Material bpMat = Material.Solid(0.0f, 0.0f, 0.0f);
+        bpMat.EmissiveRed = 0.02f;
+        bpMat.EmissiveGreen = 0.04f;
+        bpMat.EmissiveBlue = 0.08f;
+
+        SceneNode root1 = new SceneNode("root1");
+        SceneNode wallNode = new SceneNode("wall");
+        wallNode.MeshKey = wallKey;
+        wallNode.BoundsRadius = 6.0f;
+        wallNode.Material = bpMat;
+        root1.AddChild(wallNode);
+
+        RenderPlan plan1 = new RenderPlan(cam);
+        bpMat.BlueprintWireEnabled = true;
+        bpMat.BlueprintWireDensity = 1.5f;
+        bpMat.BlueprintWireLineWidth = 0.09f;
+        bpMat.BlueprintWireStrength = 1.8f;
+        bpMat.BlueprintWireRed = 0.10f;
+        bpMat.BlueprintWireGreen = 0.78f;
+        bpMat.BlueprintWireBlue = 1.0f;
+
+        cv.Clear(unchecked((int)0xFF000000));
+        plan1.Build(root1);
+        ren.Draw(cv, plan1);
+
+        int maxB = 0;
+        int minB = 255;
+        int litCount = 0;
+        int darkCount = 0;
+        // y=54 位于世界空间 Y 网格心，水平扫描会周期性穿过垂直网格线与暗网格心；y=64 恰好落在 Y=0 水平蓝图网格线上
+        for (int i = 20; i <= 108; i = i + 2) {
+            int bH = BlueOf(zan_gui_read_pixel(sid, i, 54));
+            if (bH > maxB) { maxB = bH; }
+            if (bH < minB) { minB = bH; }
+            if (bH >= 160) { litCount = litCount + 1; }
+            if (bH <= 35) { darkCount = darkCount + 1; }
+        }
+        int horizLineB = BlueOf(zan_gui_read_pixel(sid, 50, 64));
+        bool bpOk = maxB >= 180 && minB <= 35 && litCount >= 4 && darkCount >= 16 && horizLineB >= 180;
+        Console.WriteLine("blueprint_wire_ok=" + Convert.ToString(bpOk ? 1 : 0));
+
+        // 2. GPU 后处理变形宽银幕水平镜头炫光条纹（Anamorphic Sun Bloom Streak）：左右横拉高亮，垂直零扩散
+        Mesh3D sunBox = new Mesh3D();
+        sunBox.Vertex(-0.25f, -0.25f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        sunBox.Vertex( 0.25f, -0.25f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+        sunBox.Vertex( 0.25f,  0.25f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        sunBox.Vertex(-0.25f,  0.25f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f);
+        sunBox.Triangle(0, 1, 2);
+        sunBox.Triangle(0, 2, 3);
+        int sunKey = cv.MeshUpload(sunBox);
+
+        Material whiteMat = Material.Solid(0.0f, 0.0f, 0.0f);
+        whiteMat.EmissiveRed = 1.0f;
+        whiteMat.EmissiveGreen = 1.0f;
+        whiteMat.EmissiveBlue = 1.0f;
+
+        SceneNode root2 = new SceneNode("root2");
+        SceneNode sunNode = new SceneNode("sun");
+        sunNode.MeshKey = sunKey;
+        sunNode.BoundsRadius = 4.0f;
+        sunNode.Material = whiteMat;
+        root2.AddChild(sunNode);
+
+        RenderPlan plan2 = new RenderPlan(cam);
+        cv.Clear(unchecked((int)0xFF000000));
+        plan2.Build(root2);
+        ren.Draw(cv, plan2);
+        int leftBase = zan_gui_read_pixel(sid, 48, 64);
+        int rightBase = zan_gui_read_pixel(sid, 80, 64);
+        int topBase = zan_gui_read_pixel(sid, 64, 44);
+
+        PostProcess post = new PostProcess();
+        post.SunStreakStrength = 2.0f;
+        post.SunStreakThreshold = 0.5f;
+        post.SunStreakRed = 0.20f;
+        post.SunStreakGreen = 0.75f;
+        post.SunStreakBlue = 1.0f;
+        ren.PostProcess = post;
+
+        cv.Clear(unchecked((int)0xFF000000));
+        plan2.Build(root2);
+        ren.Draw(cv, plan2);
+        int leftStreak = zan_gui_read_pixel(sid, 48, 64);
+        int rightStreak = zan_gui_read_pixel(sid, 80, 64);
+        int topStreak = zan_gui_read_pixel(sid, 64, 44);
+
+        bool streakOk = BlueOf(leftBase) == 0 && BlueOf(rightBase) == 0
+            && BlueOf(leftStreak) >= 85 && BlueOf(rightStreak) >= 85
+            && PixelDiffRgb(topStreak, topBase) == 0;
+        Console.WriteLine("sun_streak_ok=" + Convert.ToString(streakOk ? 1 : 0));
+
+        ren.Dispose();
+
+        // 3. OcclusionQueryBudget3D：帧配额公平轮询 + 连续遮挡帧防闪隐滞回
+        OcclusionQueryBudget3D occ = new OcclusionQueryBudget3D(2, 2);
+        occ.RegisterActor(10);
+        occ.RegisterActor(20);
+        occ.RegisterActor(30);
+        List<int> f1 = occ.SelectBatchForFrame(); // [10, 20]
+        List<int> f2 = occ.SelectBatchForFrame(); // [30, 10]
+
+        bool stillVisAfter1 = occ.ReportQueryResult(10, true); // 1 帧遮挡维持可见
+        bool hiddenAfter2 = !occ.ReportQueryResult(10, true);  // 连续 2 帧遮挡后隐藏
+        bool restoredVis = occ.ReportQueryResult(10, false);   // 一旦可见立即恢复
+        bool occOk = f1.Count == 2 && f1[0] == 10 && f1[1] == 20
+            && f2.Count == 2 && f2[0] == 30 && f2[1] == 10
+            && stillVisAfter1 && hiddenAfter2 && restoredVis && occ.IsVisible(10);
+        Console.WriteLine("occlusion_budget_ok=" + Convert.ToString(occOk ? 1 : 0));
+    }
+}

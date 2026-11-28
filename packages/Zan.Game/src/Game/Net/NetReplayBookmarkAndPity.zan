@@ -1,0 +1,145 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Net;
+
+// 自动合并后的精彩回放高光剪辑片段窗口。
+public class HighlightClipWindow {
+    public long StartMs;
+    public long EndMs;
+    public int PeakScore;
+
+    public HighlightClipWindow(long startMs, long endMs, int peakScore) {
+        this.StartMs = startMs;
+        this.EndMs = endMs;
+        this.PeakScore = peakScore;
+    }
+}
+
+// 商业竞技自动高光剪辑书签器：按前后滚时间窗自动合并重叠连杀/残局片段并保留峰值精彩度。
+public class NetHighlightClipBookmarker {
+    private List<HighlightClipWindow> clips;
+    public long PreRollMs;
+    public long PostRollMs;
+
+    public NetHighlightClipBookmarker(long preRollMs, long postRollMs) {
+        this.clips = new List<HighlightClipWindow>();
+        this.PreRollMs = preRollMs >= 0L ? preRollMs : 4000L;
+        this.PostRollMs = postRollMs >= 0L ? postRollMs : 3000L;
+    }
+
+    public void MarkMoment(long eventMs, int excitementScore) {
+        long s = eventMs - this.PreRollMs;
+        if (s < 0L) { s = 0L; }
+        long e = eventMs + this.PostRollMs;
+
+        for (int i = 0; i < this.clips.Count; i = i + 1) {
+            HighlightClipWindow c = this.clips[i];
+            if (s <= c.EndMs && e >= c.StartMs) {
+                if (s < c.StartMs) { c.StartMs = s; }
+                if (e > c.EndMs) { c.EndMs = e; }
+                c.PeakScore = c.PeakScore + excitementScore;
+                return;
+            }
+        }
+        this.clips.Add(new HighlightClipWindow(s, e, excitementScore));
+    }
+
+    public int ClipCount() { return this.clips.Count; }
+
+    public HighlightClipWindow ClipAt(int index) {
+        if (index < 0 || index >= this.clips.Count) { return null; }
+        return this.clips[index];
+    }
+}
+
+// 商业合规抽卡软/硬保底与大小保底概率递增器：透明保底进度、软保底线性增幅与歪后必出当期 UP。
+public class NetGachaPityCounter {
+    public int PullsSinceTop;
+    public int SoftPityStart;
+    public int HardPityPulls;
+    public float BaseRate;
+    public float SoftStepRate;
+    public bool GuaranteedFeatured;
+
+    public NetGachaPityCounter(float baseRate, int softPityStart, int hardPityPulls, float softStepRate) {
+        this.PullsSinceTop = 0;
+        this.BaseRate = baseRate > 0.0f ? baseRate : 0.006f;
+        this.SoftPityStart = softPityStart > 0 ? softPityStart : 74;
+        this.HardPityPulls = hardPityPulls > this.SoftPityStart ? hardPityPulls : 90;
+        this.SoftStepRate = softStepRate > 0.0f ? softStepRate : 0.06f;
+        this.GuaranteedFeatured = false;
+    }
+
+    // 查询下一抽的最高稀有度有效概率（硬保底直接返回 1.0）。
+    public float NextPullTopRate() {
+        int nextPull = this.PullsSinceTop + 1;
+        if (nextPull >= this.HardPityPulls) { return 1.0f; }
+        if (nextPull < this.SoftPityStart) { return this.BaseRate; }
+        int steps = nextPull - this.SoftPityStart + 1;
+        float rate = this.BaseRate + (float)steps * this.SoftStepRate;
+        return rate > 1.0f ? 1.0f : rate;
+    }
+
+    // 记录一抽结果：topHit=true 时清零计数并更新大小保底（若先前已大保底则本次强制命中当期）。
+    public bool RecordPullResult(bool topHit, bool wonFiftyFifty) {
+        if (!topHit) {
+            this.PullsSinceTop = this.PullsSinceTop + 1;
+            return false;
+        }
+        bool gotFeatured = this.GuaranteedFeatured || wonFiftyFifty;
+        this.PullsSinceTop = 0;
+        this.GuaranteedFeatured = !gotFeatured;
+        return gotFeatured;
+    }
+}
+
+// 专用游戏服优雅排空生命周期状态。
+public enum ServerDrainPhase {
+    Accepting = 0,
+    Draining = 1,
+    ReadyToShutdown = 2
+}
+
+// 商业零停机专用服优雅排空控制器：进入排空后拒收新对局，在活跃对局归零或硬截止时间到达时安全放行停机。
+public class NetServerGracefulDrain {
+    public ServerDrainPhase Phase;
+    public int ActiveMatches;
+    public long DrainDeadlineMs;
+
+    public NetServerGracefulDrain() {
+        this.Phase = ServerDrainPhase.Accepting;
+        this.ActiveMatches = 0;
+        this.DrainDeadlineMs = 0L;
+    }
+
+    public bool TryAllocateMatch() {
+        if (this.Phase != ServerDrainPhase.Accepting) { return false; }
+        this.ActiveMatches = this.ActiveMatches + 1;
+        return true;
+    }
+
+    public void BeginDrain(long nowMs, long maxDrainMs) {
+        if (this.Phase == ServerDrainPhase.ReadyToShutdown) { return; }
+        this.DrainDeadlineMs = nowMs + (maxDrainMs > 0L ? maxDrainMs : 300000L);
+        if (this.ActiveMatches <= 0) {
+            this.Phase = ServerDrainPhase.ReadyToShutdown;
+        } else {
+            this.Phase = ServerDrainPhase.Draining;
+        }
+    }
+
+    public void NotifyMatchEnded(long nowMs) {
+        if (this.ActiveMatches > 0) { this.ActiveMatches = this.ActiveMatches - 1; }
+        this.CheckShutdownReady(nowMs);
+    }
+
+    public bool CheckShutdownReady(long nowMs) {
+        if (this.Phase == ServerDrainPhase.Draining) {
+            if (this.ActiveMatches <= 0 || nowMs >= this.DrainDeadlineMs) {
+                this.Phase = ServerDrainPhase.ReadyToShutdown;
+            }
+        }
+        return this.Phase == ServerDrainPhase.ReadyToShutdown;
+    }
+}

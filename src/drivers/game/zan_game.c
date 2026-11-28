@@ -160,6 +160,7 @@ typedef struct {
     zgl_int u_rain_ripples_params, u_rain_ripples_color;
     zgl_int u_xray_params, u_xray_color;
     zgl_int u_portal_vortex_params, u_portal_vortex_color;
+    zgl_int u_blueprint_wire_params, u_blueprint_wire_color;
     zgl_int u_light_dir, u_light_color, u_light_count, u_ambient;
     zgl_int u_cam_pos, u_cam_valid, u_material, u_emissive;
     zgl_int u_point_pos, u_point_color, u_point_count;
@@ -260,6 +261,8 @@ static float g_game_xray_params[3] = { 0.0f, 2.5f, 0.0f }; /* enabled, power, st
 static float g_game_xray_color[3] = { 0.2f, 0.85f, 1.0f };
 static float g_game_portal_vortex_params[4] = { 0.0f, 3.0f, 0.0f, 0.0f }; /* enabled, swirl_turns, phase, strength */
 static float g_game_portal_vortex_color[3] = { 0.55f, 0.25f, 1.0f };
+static float g_game_blueprint_wire_params[4] = { 0.0f, 2.0f, 0.06f, 0.0f }; /* enabled, density, line_width, strength */
+static float g_game_blueprint_wire_color[3] = { 0.15f, 0.78f, 1.0f };
 static float g_game_color_grade[2] = { 1.0f, 1.0f }; /* saturation, contrast */
 static float g_game_color_tint[3] = { 1.0f, 1.0f, 1.0f };
 static float g_game_post_lens[2] = { 0.0f, 0.0f }; /* fxaa, chromatic */
@@ -282,6 +285,8 @@ static float g_game_post_tilt_shift[3] = { 0.0f, 0.5f, 0.15f }; /* strength, foc
 static float g_game_post_frost_params[2] = { 0.0f, 0.45f }; /* intensity, radius */
 static float g_game_post_frost_color[3] = { 0.55f, 0.88f, 1.0f };
 static float g_game_post_sepia[3] = { 0.0f, 0.0f, 0.0f }; /* strength, scratch_amount, seed */
+static float g_game_post_streak_params[2] = { 0.0f, 0.75f }; /* strength, threshold */
+static float g_game_post_streak_color[3] = { 0.25f, 0.78f, 1.0f };
 static uint32_t g_game_light_version = 1;
 
 static zan_game_mesh *g_game_meshes = NULL;
@@ -598,6 +603,8 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
 "uniform vec3 uXrayColor;\n" \
 "uniform vec4 uPortalVortexParams;\n" \
 "uniform vec3 uPortalVortexColor;\n" \
+"uniform vec4 uBlueprintWireParams;\n" \
+"uniform vec3 uBlueprintWireColor;\n" \
 "uniform vec3 uCamPos;\n" \
 "uniform int uCamValid;\n" \
 "uniform vec2 uMaterial;\n" \
@@ -877,6 +884,16 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
     "            rgb += uPortalVortexColor * (pRing * (0.25 + 0.75 * pArm * pArm) * clamp(uPortalVortexParams.w, 0.0, 3.0));\n" \
     "        }\n" \
     "    }\n" \
+    "    if (uBlueprintWireParams.x > 0.5 && uBlueprintWireParams.w > 0.0005) {\n" \
+    "        vec3 bp = abs(fract(v_world_pos * max(uBlueprintWireParams.y, 0.25) + vec3(0.5)) - vec3(0.5));\n" \
+    "        float bpW = clamp(uBlueprintWireParams.z, 0.01, 0.25);\n" \
+    "        vec3 bpMask = vec3(1.0) - abs(N);\n" \
+    "        float bpX = bpMask.x * smoothstep(bpW, 0.0, bp.x);\n" \
+    "        float bpY = bpMask.y * smoothstep(bpW, 0.0, bp.y);\n" \
+    "        float bpZ = bpMask.z * smoothstep(bpW, 0.0, bp.z);\n" \
+    "        float bpLine = max(bpX, max(bpY, bpZ));\n" \
+    "        rgb += uBlueprintWireColor * (bpLine * clamp(uBlueprintWireParams.w, 0.0, 3.0));\n" \
+    "    }\n" \
     "    if (uCamValid != 0) {\n" \
     "        float ndv = clamp(dot(N, V), 0.0, 1.0);\n" \
     "        if (uXrayParams.x > 0.5 && uXrayParams.z > 0.0005) {\n" \
@@ -1029,6 +1046,8 @@ static const char *const ZAN_GAME_POST_FS =
 "uniform vec2 uPostFrostParams;\n"
 "uniform vec3 uPostFrostColor;\n"
 "uniform vec3 uPostSepia;\n"
+"uniform vec2 uPostStreakParams;\n"
+"uniform vec3 uPostStreakColor;\n"
 "in vec2 v_uv;\n"
 "out vec4 frag;\n"
 "vec3 brightPass(vec3 c, float th) {\n"
@@ -1223,6 +1242,19 @@ static const char *const ZAN_GAME_POST_FS =
     "        vec3 htCol = mix(clamp(col * 1.15 + vec3(0.06), 0.0, 1.0), col * 0.08, htInk);\n"
     "        col = mix(col, htCol, clamp(uPostHalftone.x, 0.0, 1.0));\n"
     "    }\n"
+    "    if (uPostStreakParams.x > 0.0005) {\n"
+    "        vec3 stAcc = vec3(0.0);\n"
+    "        float stTh = clamp(uPostStreakParams.y, 0.0, 2.0);\n"
+    "        for (int si = 1; si <= 4; ++si) {\n"
+    "            float sf = float(si);\n"
+    "            float sw = 1.0 - sf * 0.18;\n"
+    "            float sOff = uTexelSize.x * (sf * 5.0);\n"
+    "            stAcc += brightPass(texture(uScene, clamp(vec2(uv.x + sOff, uv.y), vec2(0.0), vec2(1.0))).rgb, stTh) * sw;\n"
+    "            stAcc += brightPass(texture(uScene, clamp(vec2(uv.x - sOff, uv.y), vec2(0.0), vec2(1.0))).rgb, stTh) * sw;\n"
+    "        }\n"
+    "        float stLum = dot(stAcc, vec3(0.299, 0.587, 0.114));\n"
+    "        col += uPostStreakColor * (stLum * 0.35 * clamp(uPostStreakParams.x, 0.0, 3.0));\n"
+    "    }\n"
     "    if (uPostSepia.x > 0.0005) {\n"
     "        vec3 sepCol = vec3(\n"
     "            dot(col, vec3(0.393, 0.769, 0.189)),\n"
@@ -1306,6 +1338,8 @@ typedef struct {
     zgl_int u_post_frost_params;
     zgl_int u_post_frost_color;
     zgl_int u_post_sepia;
+    zgl_int u_post_streak_params;
+    zgl_int u_post_streak_color;
 } zan_game_post_program;
 
 static const char *const ZAN_GAME_SKYBOX_FS =
@@ -1597,6 +1631,10 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
         : g_game_gl->GetUniformLocation(program, "uPortalVortexParams");
     zgl_int portal_vortex_color = instanced ? -1
         : g_game_gl->GetUniformLocation(program, "uPortalVortexColor");
+    zgl_int blueprint_wire_params = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uBlueprintWireParams");
+    zgl_int blueprint_wire_color = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uBlueprintWireColor");
     zgl_int color = instanced ? 0
         : g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
@@ -1693,6 +1731,8 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
     prog->u_xray_color = xray_color;
     prog->u_portal_vortex_params = portal_vortex_params;
     prog->u_portal_vortex_color = portal_vortex_color;
+    prog->u_blueprint_wire_params = blueprint_wire_params;
+    prog->u_blueprint_wire_color = blueprint_wire_color;
     prog->u_color = color;
     prog->u_light_dir = light_dir;
     prog->u_light_color = light_color;
@@ -1786,6 +1826,8 @@ static zan_game_program *zan_game_skin_program_get(void) {
     zgl_int xray_color = g_game_gl->GetUniformLocation(program, "uXrayColor");
     zgl_int portal_vortex_params = g_game_gl->GetUniformLocation(program, "uPortalVortexParams");
     zgl_int portal_vortex_color = g_game_gl->GetUniformLocation(program, "uPortalVortexColor");
+    zgl_int blueprint_wire_params = g_game_gl->GetUniformLocation(program, "uBlueprintWireParams");
+    zgl_int blueprint_wire_color = g_game_gl->GetUniformLocation(program, "uBlueprintWireColor");
     zgl_int color = g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
     zgl_int light_color = g_game_gl->GetUniformLocation(program, "uLightColor[0]");
@@ -1870,6 +1912,8 @@ static zan_game_program *zan_game_skin_program_get(void) {
     g_game_skin_prog.u_xray_color = xray_color;
     g_game_skin_prog.u_portal_vortex_params = portal_vortex_params;
     g_game_skin_prog.u_portal_vortex_color = portal_vortex_color;
+    g_game_skin_prog.u_blueprint_wire_params = blueprint_wire_params;
+    g_game_skin_prog.u_blueprint_wire_color = blueprint_wire_color;
     g_game_skin_prog.u_color = color;
     g_game_skin_prog.u_light_dir = light_dir;
     g_game_skin_prog.u_light_color = light_color;
@@ -2430,6 +2474,14 @@ static void zan_game_bind_shadow_uniforms(const zan_gl_api *gl, zan_game_program
     }
     if (prog->u_portal_vortex_color >= 0) {
         gl->Uniform3fv(prog->u_portal_vortex_color, 1, g_game_portal_vortex_color);
+    }
+    if (prog->u_blueprint_wire_params >= 0) {
+        gl->Uniform4f(prog->u_blueprint_wire_params,
+            g_game_blueprint_wire_params[0], g_game_blueprint_wire_params[1],
+            g_game_blueprint_wire_params[2], g_game_blueprint_wire_params[3]);
+    }
+    if (prog->u_blueprint_wire_color >= 0) {
+        gl->Uniform3fv(prog->u_blueprint_wire_color, 1, g_game_blueprint_wire_color);
     }
 }
 
@@ -3020,6 +3072,8 @@ static zan_game_post_program *zan_game_post_program_get(void) {
     g_game_post_prog.u_post_frost_params = g_game_gl->GetUniformLocation(prog, "uPostFrostParams");
     g_game_post_prog.u_post_frost_color = g_game_gl->GetUniformLocation(prog, "uPostFrostColor");
     g_game_post_prog.u_post_sepia = g_game_gl->GetUniformLocation(prog, "uPostSepia");
+    g_game_post_prog.u_post_streak_params = g_game_gl->GetUniformLocation(prog, "uPostStreakParams");
+    g_game_post_prog.u_post_streak_color = g_game_gl->GetUniformLocation(prog, "uPostStreakColor");
     return &g_game_post_prog;
 }
 
@@ -3190,6 +3244,13 @@ ZAN_GAME_API int32_t zan_game_postprocess3d(int32_t surface_id, float exposure,
     }
     if (prog->u_post_sepia >= 0) {
         gl->Uniform3fv(prog->u_post_sepia, 1, g_game_post_sepia);
+    }
+    if (prog->u_post_streak_params >= 0) {
+        gl->Uniform2f(prog->u_post_streak_params,
+            g_game_post_streak_params[0], g_game_post_streak_params[1]);
+    }
+    if (prog->u_post_streak_color >= 0) {
+        gl->Uniform3fv(prog->u_post_streak_color, 1, g_game_post_streak_color);
     }
     gl->BindVertexArray(g_game_post_vao);
     gl->DrawArrays(ZGL_TRIANGLES, 0, 3);
@@ -3833,4 +3894,33 @@ ZAN_GAME_API void zan_game_set_post_sepia_vintage3d(float strength,
     g_game_post_sepia[0] = strength;
     g_game_post_sepia[1] = scratch_amount;
     g_game_post_sepia[2] = seed;
+}
+
+ZAN_GAME_API void zan_game_set_blueprint_wire3d(int32_t enabled,
+    float grid_density, float line_width, float strength,
+    float r, float g, float b) {
+    g_game_blueprint_wire_params[0] = enabled ? 1.0f : 0.0f;
+    g_game_blueprint_wire_params[1] = grid_density > 0.25f ? grid_density : 2.0f;
+    if (line_width < 0.01f) line_width = 0.01f;
+    if (line_width > 0.25f) line_width = 0.25f;
+    g_game_blueprint_wire_params[2] = line_width;
+    if (strength < 0.0f) strength = 0.0f;
+    if (strength > 3.0f) strength = 3.0f;
+    g_game_blueprint_wire_params[3] = strength;
+    g_game_blueprint_wire_color[0] = r > 0.0f ? r : 0.0f;
+    g_game_blueprint_wire_color[1] = g > 0.0f ? g : 0.0f;
+    g_game_blueprint_wire_color[2] = b > 0.0f ? b : 0.0f;
+}
+
+ZAN_GAME_API void zan_game_set_post_sun_bloom_streak3d(float strength,
+    float threshold, float r, float g, float b) {
+    if (strength < 0.0f) strength = 0.0f;
+    if (strength > 3.0f) strength = 3.0f;
+    if (threshold < 0.0f) threshold = 0.0f;
+    if (threshold > 2.0f) threshold = 2.0f;
+    g_game_post_streak_params[0] = strength;
+    g_game_post_streak_params[1] = threshold;
+    g_game_post_streak_color[0] = r > 0.0f ? r : 0.0f;
+    g_game_post_streak_color[1] = g > 0.0f ? g : 0.0f;
+    g_game_post_streak_color[2] = b > 0.0f ? b : 0.0f;
 }
