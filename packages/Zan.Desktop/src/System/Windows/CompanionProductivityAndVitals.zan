@@ -1,0 +1,326 @@
+using System;
+using System.Collections.Generic;
+using System.Management;
+
+namespace System.Windows;
+
+// 商业桌面陪伴番茄钟专注增强会话器（复用 PomodoroPhase 常量）：
+// - 在标准 专注 -> 短休 -> 长休 状态机上补充离席(AFK)自动暂停/恢复保护、暂停/跳过控制
+// - 完成每轮专注自动累计连击（FocusStreak）并按连击倍率结算陪伴成长经验（EarnedXp）与金币（EarnedCoins）
+public class CompanionPomodoroSession {
+    public float WorkDurationSec;
+    public float ShortBreakSec;
+    public float LongBreakSec;
+    public int CyclesPerLongBreak;
+
+    public int Phase;
+    public float RemainingSec;
+    public bool Paused;
+    public bool AutoPausedByAfk;
+    public int CompletedWorkCycles;
+    public int FocusStreak;
+    public int EarnedXp;
+    public int EarnedCoins;
+    public int BaseWorkXp;
+    public int BaseWorkCoins;
+
+    public CompanionPomodoroSession(float workSec, float shortBreakSec, float longBreakSec, int cyclesPerLongBreak) {
+        this.WorkDurationSec = workSec > 1.0f ? workSec : 1500.0f;
+        this.ShortBreakSec = shortBreakSec > 1.0f ? shortBreakSec : 300.0f;
+        this.LongBreakSec = longBreakSec > 1.0f ? longBreakSec : 900.0f;
+        this.CyclesPerLongBreak = cyclesPerLongBreak >= 2 ? cyclesPerLongBreak : 4;
+        this.Phase = PomodoroPhase.Stopped;
+        this.RemainingSec = this.WorkDurationSec;
+        this.Paused = false;
+        this.AutoPausedByAfk = false;
+        this.CompletedWorkCycles = 0;
+        this.FocusStreak = 0;
+        this.EarnedXp = 0;
+        this.EarnedCoins = 0;
+        this.BaseWorkXp = 50;
+        this.BaseWorkCoins = 20;
+    }
+
+    public void StartWork() {
+        this.Phase = PomodoroPhase.Focus;
+        this.RemainingSec = this.WorkDurationSec;
+        this.Paused = false;
+        this.AutoPausedByAfk = false;
+    }
+
+    public void Pause() {
+        this.Paused = true;
+    }
+
+    public void Resume() {
+        this.Paused = false;
+        this.AutoPausedByAfk = false;
+    }
+
+    // 与 UserActivityMonitor 联动：用户离席时自动暂停专注倒计时，回到电脑前自动恢复。
+    public void SyncAfkState(bool userIsAfk) {
+        if (this.Phase != PomodoroPhase.Focus) { return; }
+        if (userIsAfk && !this.Paused) {
+            this.Paused = true;
+            this.AutoPausedByAfk = true;
+        } else if (!userIsAfk && this.AutoPausedByAfk) {
+            this.Paused = false;
+            this.AutoPausedByAfk = false;
+        }
+    }
+
+    // 推进番茄钟 dtSec 秒；若本次步进刚刚完成一轮专注周期，返回 true。
+    public bool Tick(float dtSec) {
+        if (this.Phase == PomodoroPhase.Stopped || this.Paused || dtSec <= 0.0f) { return false; }
+        this.RemainingSec = this.RemainingSec - dtSec;
+        if (this.RemainingSec > 0.0f) { return false; }
+
+        if (this.Phase == PomodoroPhase.Focus) {
+            this.CompletedWorkCycles = this.CompletedWorkCycles + 1;
+            this.FocusStreak = this.FocusStreak + 1;
+            int bonusPct = (this.FocusStreak - 1) * 10;
+            if (bonusPct > 50) { bonusPct = 50; }
+            this.EarnedXp = this.EarnedXp + this.BaseWorkXp + (this.BaseWorkXp * bonusPct) / 100;
+            this.EarnedCoins = this.EarnedCoins + this.BaseWorkCoins + (this.BaseWorkCoins * bonusPct) / 100;
+
+            if (this.CompletedWorkCycles % this.CyclesPerLongBreak == 0) {
+                this.Phase = PomodoroPhase.LongBreak;
+                this.RemainingSec = this.LongBreakSec;
+            } else {
+                this.Phase = PomodoroPhase.ShortBreak;
+                this.RemainingSec = this.ShortBreakSec;
+            }
+            return true;
+        }
+
+        // 休息阶段结束，自动切回下一轮专注
+        this.Phase = PomodoroPhase.Focus;
+        this.RemainingSec = this.WorkDurationSec;
+        return false;
+    }
+
+    public void SkipCurrentPhase() {
+        if (this.Phase == PomodoroPhase.Stopped) { return; }
+        if (this.Phase == PomodoroPhase.Focus) {
+            this.FocusStreak = 0;
+            this.Phase = PomodoroPhase.ShortBreak;
+            this.RemainingSec = this.ShortBreakSec;
+        } else {
+            this.Phase = PomodoroPhase.Focus;
+            this.RemainingSec = this.WorkDurationSec;
+        }
+    }
+}
+
+// 商业专注白噪音/氛围混音通道（雨声 / 咖啡馆 / 壁炉 / 键盘声 / 海浪等）。
+public class AmbientSoundChannel {
+    public string Name;
+    public float Gain;
+    public bool Enabled;
+
+    public AmbientSoundChannel(string name, float gain, bool enabled) {
+        this.Name = name != null ? name : "";
+        this.Gain = gain < 0.0f ? 0.0f : (gain > 1.0f ? 1.0f : gain);
+        this.Enabled = enabled;
+    }
+}
+
+// 多通道专注氛围白噪音混音器（Spirit City / Chill Corner 标配）：
+// 支持主音量、通知闪避（Ducking）、全屏静音与各独立氛围通道增益计算。
+public class CompanionAmbientSoundMixer {
+    public float MasterVolume;
+    public float DuckMultiplier;
+    public bool Muted;
+    private List<AmbientSoundChannel> channels;
+
+    public CompanionAmbientSoundMixer() {
+        this.MasterVolume = 0.8f;
+        this.DuckMultiplier = 1.0f;
+        this.Muted = false;
+        this.channels = new List<AmbientSoundChannel>();
+    }
+
+    public int ChannelCount { get { return this.channels.Count; } }
+
+    public AmbientSoundChannel SetChannel(string name, float gain, bool enabled) {
+        if (name == null || name == "") { return null; }
+        float g = gain < 0.0f ? 0.0f : (gain > 1.0f ? 1.0f : gain);
+        for (int i = 0; i < this.channels.Count; i = i + 1) {
+            if (this.channels[i].Name == name) {
+                this.channels[i].Gain = g;
+                this.channels[i].Enabled = enabled;
+                return this.channels[i];
+            }
+        }
+        AmbientSoundChannel ch = new AmbientSoundChannel(name, g, enabled);
+        this.channels.Add(ch);
+        return ch;
+    }
+
+    // 计算某通道当前最终输出增益（已叠加主音量、闪避倍率与静音状态）。
+    public float ComputeEffectiveGain(string name) {
+        if (this.Muted) { return 0.0f; }
+        for (int i = 0; i < this.channels.Count; i = i + 1) {
+            AmbientSoundChannel ch = this.channels[i];
+            if (ch.Name == name) {
+                if (!ch.Enabled) { return 0.0f; }
+                return ch.Gain * this.MasterVolume * this.DuckMultiplier;
+            }
+        }
+        return 0.0f;
+    }
+}
+
+// 桌面便签 / 每日打卡习惯条目。
+public class CompanionTodoItem {
+    public int Id;
+    public string Title;
+    public bool IsDailyHabit;
+    public bool Pinned;
+    public bool Completed;
+    public int StreakDays;
+    public int LastCompletedDayIndex;
+
+    public CompanionTodoItem(int id, string title, bool isDailyHabit, bool pinned) {
+        this.Id = id;
+        this.Title = title != null ? title : "";
+        this.IsDailyHabit = isDailyHabit;
+        this.Pinned = pinned;
+        this.Completed = false;
+        this.StreakDays = 0;
+        this.LastCompletedDayIndex = -1000;
+    }
+}
+
+// 商业桌面陪伴便签与每日习惯打卡板：
+// 支持置顶便签、每日循环打卡与跨天连签结算（RolloverToDay）。
+public class CompanionHabitAndTodoBoard {
+    private List<CompanionTodoItem> items;
+    private int nextId;
+    public int CurrentDayIndex;
+
+    public CompanionHabitAndTodoBoard(int initialDayIndex) {
+        this.items = new List<CompanionTodoItem>();
+        this.nextId = 1;
+        this.CurrentDayIndex = initialDayIndex;
+    }
+
+    public int ItemCount { get { return this.items.Count; } }
+
+    public CompanionTodoItem AddItem(string title, bool isDailyHabit, bool pinned) {
+        CompanionTodoItem item = new CompanionTodoItem(this.nextId, title, isDailyHabit, pinned);
+        this.nextId = this.nextId + 1;
+        this.items.Add(item);
+        return item;
+    }
+
+    public CompanionTodoItem FindById(int id) {
+        for (int i = 0; i < this.items.Count; i = i + 1) {
+            if (this.items[i].Id == id) { return this.items[i]; }
+        }
+        return null;
+    }
+
+    public bool MarkCompleted(int id) {
+        CompanionTodoItem item = this.FindById(id);
+        if (item == null) { return false; }
+        if (!item.Completed) {
+            item.Completed = true;
+            if (item.IsDailyHabit) {
+                if (item.LastCompletedDayIndex == this.CurrentDayIndex - 1) {
+                    item.StreakDays = item.StreakDays + 1;
+                } else if (item.LastCompletedDayIndex != this.CurrentDayIndex) {
+                    item.StreakDays = 1;
+                }
+                item.LastCompletedDayIndex = this.CurrentDayIndex;
+            }
+        }
+        return true;
+    }
+
+    // 跨天结算：重置每日习惯的当日完成态；若前一天未完成则连签清零。
+    public void RolloverToDay(int newDayIndex) {
+        if (newDayIndex <= this.CurrentDayIndex) { return; }
+        this.CurrentDayIndex = newDayIndex;
+        for (int i = 0; i < this.items.Count; i = i + 1) {
+            CompanionTodoItem it = this.items[i];
+            if (it.IsDailyHabit) {
+                if (it.LastCompletedDayIndex < newDayIndex - 1) {
+                    it.StreakDays = 0;
+                }
+                it.Completed = false;
+            }
+        }
+    }
+
+    public float CompletionRatio {
+        get {
+            if (this.items.Count == 0) { return 1.0f; }
+            int done = 0;
+            for (int i = 0; i < this.items.Count; i = i + 1) {
+                if (this.items[i].Completed) { done = done + 1; }
+            }
+            return (float)done / (float)this.items.Count;
+        }
+    }
+}
+
+// 桌宠系统体征情绪状态（用于驱动出汗/扇风/提醒清理内存/打盹等生动桌面反馈）。
+public static class CompanionVitalsMood {
+    public const int Calm = 0;
+    public const int Busy = 1;
+    public const int Overheated = 2;
+    public const int MemoryStressed = 3;
+    public const int SleepingAfk = 4;
+}
+
+// 实时主机体征快照。
+public class CompanionVitalsSnapshot {
+    public int LogicalCores;
+    public long TotalMemoryMb;
+    public long AvailableMemoryMb;
+    public int MemoryUsagePercent;
+    public int CpuUsagePercent;
+    public long SystemIdleMs;
+    public int Mood;
+}
+
+// 商业桌面陪伴主机体征感知与情绪映射器：
+// 复用 System.Management.Memory / Cpu 与 UserActivityMonitor 零重复 P/Invoke，跨 Windows/Linux/macOS 采集真实体征。
+public class CompanionSystemVitalsAdvisor {
+    public int CpuBusyThresholdPercent;
+    public int CpuOverheatThresholdPercent;
+    public int MemoryStressThresholdPercent;
+    public long AfkSleepThresholdMs;
+
+    public CompanionSystemVitalsAdvisor() {
+        this.CpuBusyThresholdPercent = 65;
+        this.CpuOverheatThresholdPercent = 88;
+        this.MemoryStressThresholdPercent = 85;
+        this.AfkSleepThresholdMs = 300000;
+    }
+
+    // 根据 CPU / 内存 / 键鼠空闲时长确定性评估桌宠情绪（便于无头测试与动画状态机绑定）。
+    public int EvaluateMood(int cpuPercent, int memPercent, long idleMs) {
+        if (idleMs >= this.AfkSleepThresholdMs) { return CompanionVitalsMood.SleepingAfk; }
+        if (memPercent >= this.MemoryStressThresholdPercent) { return CompanionVitalsMood.MemoryStressed; }
+        if (cpuPercent >= this.CpuOverheatThresholdPercent) { return CompanionVitalsMood.Overheated; }
+        if (cpuPercent >= this.CpuBusyThresholdPercent) { return CompanionVitalsMood.Busy; }
+        return CompanionVitalsMood.Calm;
+    }
+
+    // 采集当前真实操作系统内存、CPU 核心数与全局键鼠空闲时长（不额外休眠，零阻塞）。
+    public CompanionVitalsSnapshot SampleLiveVitals(int cachedCpuPercent) {
+        CompanionVitalsSnapshot snap = new CompanionVitalsSnapshot();
+        MemoryStatus mem = Memory.GetStatus();
+        snap.LogicalCores = Cpu.LogicalCores();
+        snap.TotalMemoryMb = mem.totalPhys / (1024L * 1024L);
+        snap.AvailableMemoryMb = mem.availPhys / (1024L * 1024L);
+        snap.MemoryUsagePercent = mem.usagePercent;
+        snap.CpuUsagePercent = cachedCpuPercent >= 0 ? cachedCpuPercent : 0;
+        long idle = UserActivityMonitor.QuerySystemIdleMs();
+        snap.SystemIdleMs = idle >= 0 ? idle : 0;
+        snap.Mood = this.EvaluateMood(snap.CpuUsagePercent, snap.MemoryUsagePercent, snap.SystemIdleMs);
+        return snap;
+    }
+}

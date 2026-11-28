@@ -1,0 +1,102 @@
+using System;
+using System.Numerics;
+
+namespace Game.Render3D;
+
+// 商业 3D 动作/射击相机打击感控制器（GDC Squirrel Eiserloh Trauma-Squared 震屏 + 顿帧 HitStop + 冲刺/开镜 FOV 动态平滑插值）。
+public class CameraJuice3D {
+    public float Trauma;
+    public float TraumaDecayPerSec;
+    public float MaxOffsetX;
+    public float MaxOffsetY;
+    public float MaxOffsetZ;
+    public float ShakeFrequencyHz;
+
+    public float HitStopRemainingSec;
+    public float BaseFovRad;
+    public float TargetFovOffsetRad;
+    public float CurrentFovOffsetRad;
+    public float FovSmoothSpeed;
+
+    private float elapsedSec;
+
+    public CameraJuice3D(float baseFovRad) {
+        this.Trauma = 0.0f;
+        this.TraumaDecayPerSec = 1.6f;
+        this.MaxOffsetX = 0.35f;
+        this.MaxOffsetY = 0.25f;
+        this.MaxOffsetZ = 0.15f;
+        this.ShakeFrequencyHz = 28.0f;
+        this.HitStopRemainingSec = 0.0f;
+        this.BaseFovRad = baseFovRad > 0.1f ? baseFovRad : 1.0472f;
+        this.TargetFovOffsetRad = 0.0f;
+        this.CurrentFovOffsetRad = 0.0f;
+        this.FovSmoothSpeed = 10.0f;
+        this.elapsedSec = 0.0f;
+    }
+
+    // 叠加一次冲击创伤值（自动钳位到 [0, 1]；实际振幅为 Trauma^2 呈平滑指数感衰减）。
+    public void AddTrauma(float amount) {
+        if (amount <= 0.0f) { return; }
+        this.Trauma = this.Trauma + amount;
+        if (this.Trauma > 1.0f) { this.Trauma = 1.0f; }
+    }
+
+    // 触发命中顿帧（HitStop）：在 durationSec 秒内将有效玩法步进 dt 压为 0（取较长值防止短顿帧覆盖重击顿帧）。
+    public void TriggerHitStop(float durationSec) {
+        if (durationSec > this.HitStopRemainingSec) {
+            this.HitStopRemainingSec = durationSec;
+        }
+    }
+
+    public void SetFovKick(float offsetRad) {
+        this.TargetFovOffsetRad = offsetRad;
+    }
+
+    public float CurrentShakeIntensity { get { return this.Trauma * this.Trauma; } }
+    public float EffectiveFovRad { get { return this.BaseFovRad + this.CurrentFovOffsetRad; } }
+
+    // 步进真实帧间隔 rawDtSec：推进震屏/FOV 与顿帧计时，返回本帧玩法逻辑应使用的有效 dt（顿帧期间返回 0）。
+    public float StepRawDelta(float rawDtSec) {
+        if (rawDtSec <= 0.0f) { return 0.0f; }
+        this.elapsedSec = this.elapsedSec + rawDtSec;
+
+        if (this.Trauma > 0.0f) {
+            this.Trauma = this.Trauma - this.TraumaDecayPerSec * rawDtSec;
+            if (this.Trauma < 0.0f) { this.Trauma = 0.0f; }
+        }
+
+        float alpha = 1.0f - (float)Math.Exp((double)(-this.FovSmoothSpeed * rawDtSec));
+        if (alpha < 0.0f) { alpha = 0.0f; }
+        if (alpha > 1.0f) { alpha = 1.0f; }
+        this.CurrentFovOffsetRad = this.CurrentFovOffsetRad
+            + (this.TargetFovOffsetRad - this.CurrentFovOffsetRad) * alpha;
+
+        if (this.HitStopRemainingSec > 0.0f) {
+            this.HitStopRemainingSec = this.HitStopRemainingSec - rawDtSec;
+            if (this.HitStopRemainingSec < 0.0f) { this.HitStopRemainingSec = 0.0f; }
+            return 0.0f;
+        }
+        return rawDtSec;
+    }
+
+    // 计算当前帧确定性非对称多频震屏位移向量（无需随机数发生器，帧间连续无跳变）。
+    public Vector3 SampleShakeOffset() {
+        float shake = this.Trauma * this.Trauma;
+        if (shake <= 0.0001f) { return new Vector3(0.0f, 0.0f, 0.0f); }
+        double w = (double)(this.elapsedSec * this.ShakeFrequencyHz * 6.2831853f);
+        float ox = (float)(Math.Sin(w * 1.0) * 0.65 + Math.Sin(w * 2.37 + 1.1) * 0.35) * this.MaxOffsetX * shake;
+        float oy = (float)(Math.Cos(w * 1.19 + 0.7) * 0.65 + Math.Sin(w * 2.71 + 2.3) * 0.35) * this.MaxOffsetY * shake;
+        float oz = (float)(Math.Sin(w * 0.83 + 2.0)) * this.MaxOffsetZ * shake;
+        return new Vector3(ox, oy, oz);
+    }
+
+    // 将当前震屏与 FOV 脉冲应用到目标 Camera3D（基于调用方提供的干净基准位置与注视点）。
+    public void ApplyToCamera(Camera3D camera, Vector3 basePos, Vector3 baseTarget) {
+        if (camera == null) { return; }
+        Vector3 off = this.SampleShakeOffset();
+        camera.Position = new Vector3(basePos.X + off.X, basePos.Y + off.Y, basePos.Z + off.Z);
+        camera.Target = new Vector3(baseTarget.X + off.X * 0.5f, baseTarget.Y + off.Y * 0.5f, baseTarget.Z + off.Z * 0.5f);
+        camera.FieldOfView = this.EffectiveFovRad;
+    }
+}

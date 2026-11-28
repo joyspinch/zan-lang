@@ -166,6 +166,15 @@ ZAN_GAME_API void zan_game_set_emissive_map3d(const char *texture);
 ZAN_GAME_API void zan_game_set_uv_transform3d(float scale_u, float scale_v,
     float offset_u, float offset_v);
 
+/* GPU 菲涅尔轮廓边缘光（Rim Light，用于 3D 动作/二次元角色轮廓高光与受击闪白）：
+ * rgb 为边缘光线性颜色（全 0 关闭，零开销），power 为锐度指数（推荐 2.0..5.0）。 */
+ZAN_GAME_API void zan_game_set_rim_light3d(float r, float g, float b, float power);
+
+/* GPU 后处理调色参数（在 zan_game_postprocess3d 色调映射后、暗角前生效，零额外 Pass）：
+ * saturation（0=黑白, 1=原色, >1 增饱和）、contrast（1=原对比度）、tint RGB（1,1,1=无偏色）。 */
+ZAN_GAME_API void zan_game_set_color_grade3d(float saturation, float contrast,
+    float tint_r, float tint_g, float tint_b);
+
 #ifdef __cplusplus
 }
 #endif

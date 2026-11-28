@@ -144,7 +144,7 @@ typedef struct {
     zgl_int u_mvp, u_model, u_light_vp, u_tex, u_shadow_map, u_shadow_on, u_color;
     zgl_int u_normal_map, u_normal_on, u_normal_scale;
     zgl_int u_orm_map, u_orm_on, u_ao_strength, u_alpha_cutoff;
-    zgl_int u_emissive_map, u_emissive_on, u_uv_transform;
+    zgl_int u_emissive_map, u_emissive_on, u_uv_transform, u_rim_light;
     zgl_int u_light_dir, u_light_color, u_light_count, u_ambient;
     zgl_int u_cam_pos, u_cam_valid, u_material, u_emissive;
     zgl_int u_point_pos, u_point_color, u_point_count;
@@ -208,6 +208,9 @@ static float g_game_ao_strength = 1.0f;
 static float g_game_alpha_cutoff = 0.0f;
 static char g_game_emissive_key[256] = { 0 };
 static float g_game_uv_transform[4] = { 1.0f, 1.0f, 0.0f, 0.0f };
+static float g_game_rim_light[4] = { 0.0f, 0.0f, 0.0f, 3.0f };
+static float g_game_color_grade[2] = { 1.0f, 1.0f }; /* saturation, contrast */
+static float g_game_color_tint[3] = { 1.0f, 1.0f, 1.0f };
 static uint32_t g_game_light_version = 1;
 
 static zan_game_mesh *g_game_meshes = NULL;
@@ -455,6 +458,7 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
 "uniform float uAlphaCutoff;\n" \
 "uniform sampler2D uEmissiveMap;\n" \
 "uniform int uEmissiveOn;\n" \
+"uniform vec4 uRimLight;\n" \
 "uniform vec3 uCamPos;\n" \
 "uniform int uCamValid;\n" \
 "uniform vec2 uMaterial;\n" \
@@ -592,6 +596,21 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
     "    vec3 specTint = mix(vec3(1.0), baseRgb, metal);\n" \
     "    vec3 emitRgb = (uEmissiveOn != 0) ? (uEmissive * texture(uEmissiveMap, v_uv).rgb) : uEmissive;\n" \
     "    vec3 rgb = baseRgb * mix(light, light * (0.35 + 0.65 * rough), metal) + specTint * specAcc + emitRgb;\n" \
+    "    if (uCamValid != 0) {\n" \
+    "        float ndv = clamp(dot(N, V), 0.0, 1.0);\n" \
+    "        if (uHemiOn != 0) {\n" \
+    "            vec3 R = reflect(-V, N);\n" \
+    "            vec3 envSpec = mix(uHemiGround, uHemiSky, clamp(R.y * 0.5 + 0.5, 0.0, 1.0));\n" \
+    "            vec3 f0 = mix(vec3(0.04), baseRgb, metal);\n" \
+    "            float fTerm = pow(1.0 - ndv, 5.0);\n" \
+    "            vec3 fresnel = f0 + (vec3(1.0) - f0) * fTerm;\n" \
+    "            float smoothness = 1.0 - rough;\n" \
+    "            rgb += envSpec * fresnel * (smoothness * smoothness) * ao * 0.75;\n" \
+    "        }\n" \
+    "        if ((uRimLight.r + uRimLight.g + uRimLight.b) > 0.0001) {\n" \
+    "            rgb += uRimLight.rgb * pow(1.0 - ndv, max(uRimLight.w, 0.25));\n" \
+    "        }\n" \
+    "    }\n" \
 "    if (uFogParams.x > 0.5 && uCamValid != 0) {\n" \
 "        float fogDist = length(uCamPos - v_world_pos);\n" \
 "        float fogT = clamp((fogDist - uFogParams.y) * uFogParams.z, 0.0, 1.0);\n" \
@@ -674,6 +693,8 @@ static const char *const ZAN_GAME_POST_FS =
 "uniform int uTonemap;\n"
 "uniform float uVignette;\n"
 "uniform vec2 uBloom;\n"
+"uniform vec2 uColorGrade;\n"
+"uniform vec3 uColorTint;\n"
 "in vec2 v_uv;\n"
 "out vec4 frag;\n"
 "vec3 brightPass(vec3 c, float th) {\n"
@@ -705,12 +726,16 @@ static const char *const ZAN_GAME_POST_FS =
 "        col += glow * uBloom.y;\n"
 "    }\n"
 "    col *= max(uExposure, 0.0);\n"
-"    if (uTonemap == 1) {\n"
-"        col = col / (vec3(1.0) + col);\n"
-"    } else if (uTonemap == 2) {\n"
-"        col = (col * (2.51 * col + 0.03)) / (col * (2.43 * col + 0.59) + 0.14);\n"
-"    }\n"
-"    if (uVignette > 0.001) {\n"
+    "    if (uTonemap == 1) {\n"
+    "        col = col / (vec3(1.0) + col);\n"
+    "    } else if (uTonemap == 2) {\n"
+    "        col = (col * (2.51 * col + 0.03)) / (col * (2.43 * col + 0.59) + 0.14);\n"
+    "    }\n"
+    "    float luma = dot(col, vec3(0.2126, 0.7152, 0.0722));\n"
+    "    col = mix(vec3(luma), col, uColorGrade.x);\n"
+    "    col = (col - vec3(0.5)) * uColorGrade.y + vec3(0.5);\n"
+    "    col *= uColorTint;\n"
+    "    if (uVignette > 0.001) {\n"
 "        vec2 d = (v_uv - vec2(0.5)) * 2.0;\n"
 "        float vig = clamp(1.0 - uVignette * dot(d, d) * 0.5, 0.0, 1.0);\n"
 "        col *= vig;\n"
@@ -726,6 +751,8 @@ typedef struct {
     zgl_int u_tonemap;
     zgl_int u_vignette;
     zgl_int u_bloom;
+    zgl_int u_color_grade;
+    zgl_int u_color_tint;
 } zan_game_post_program;
 
 static const char *const ZAN_GAME_SKYBOX_FS =
@@ -945,6 +972,8 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
         : g_game_gl->GetUniformLocation(program, "uEmissiveOn");
     zgl_int uv_transform = instanced ? -1
         : g_game_gl->GetUniformLocation(program, "uUvTransform");
+    zgl_int rim_light = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uRimLight");
     zgl_int color = instanced ? 0
         : g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
@@ -1005,6 +1034,7 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
     prog->u_emissive_map = emissive_map;
     prog->u_emissive_on = emissive_on;
     prog->u_uv_transform = uv_transform;
+    prog->u_rim_light = rim_light;
     prog->u_color = color;
     prog->u_light_dir = light_dir;
     prog->u_light_color = light_color;
@@ -1062,6 +1092,7 @@ static zan_game_program *zan_game_skin_program_get(void) {
     zgl_int emissive_map = g_game_gl->GetUniformLocation(program, "uEmissiveMap");
     zgl_int emissive_on = g_game_gl->GetUniformLocation(program, "uEmissiveOn");
     zgl_int uv_transform = g_game_gl->GetUniformLocation(program, "uUvTransform");
+    zgl_int rim_light = g_game_gl->GetUniformLocation(program, "uRimLight");
     zgl_int color = g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
     zgl_int light_color = g_game_gl->GetUniformLocation(program, "uLightColor[0]");
@@ -1110,6 +1141,7 @@ static zan_game_program *zan_game_skin_program_get(void) {
     g_game_skin_prog.u_emissive_map = emissive_map;
     g_game_skin_prog.u_emissive_on = emissive_on;
     g_game_skin_prog.u_uv_transform = uv_transform;
+    g_game_skin_prog.u_rim_light = rim_light;
     g_game_skin_prog.u_color = color;
     g_game_skin_prog.u_light_dir = light_dir;
     g_game_skin_prog.u_light_color = light_color;
@@ -1525,6 +1557,11 @@ static void zan_game_bind_shadow_uniforms(const zan_gl_api *gl, zan_game_program
         gl->Uniform4f(prog->u_uv_transform,
             g_game_uv_transform[0], g_game_uv_transform[1],
             g_game_uv_transform[2], g_game_uv_transform[3]);
+    }
+    if (prog->u_rim_light >= 0) {
+        gl->Uniform4f(prog->u_rim_light,
+            g_game_rim_light[0], g_game_rim_light[1],
+            g_game_rim_light[2], g_game_rim_light[3]);
     }
 }
 
@@ -2088,6 +2125,8 @@ static zan_game_post_program *zan_game_post_program_get(void) {
     g_game_post_prog.u_tonemap = g_game_gl->GetUniformLocation(prog, "uTonemap");
     g_game_post_prog.u_vignette = g_game_gl->GetUniformLocation(prog, "uVignette");
     g_game_post_prog.u_bloom = g_game_gl->GetUniformLocation(prog, "uBloom");
+    g_game_post_prog.u_color_grade = g_game_gl->GetUniformLocation(prog, "uColorGrade");
+    g_game_post_prog.u_color_tint = g_game_gl->GetUniformLocation(prog, "uColorTint");
     return &g_game_post_prog;
 }
 
@@ -2182,6 +2221,12 @@ ZAN_GAME_API int32_t zan_game_postprocess3d(int32_t surface_id, float exposure,
     if (prog->u_tonemap >= 0) gl->Uniform1i(prog->u_tonemap, tonemap_mode);
     if (prog->u_vignette >= 0 && gl->Uniform1f) gl->Uniform1f(prog->u_vignette, vignette);
     if (prog->u_bloom >= 0) gl->Uniform2f(prog->u_bloom, bloom_threshold, bloom_intensity);
+    if (prog->u_color_grade >= 0) {
+        gl->Uniform2f(prog->u_color_grade, g_game_color_grade[0], g_game_color_grade[1]);
+    }
+    if (prog->u_color_tint >= 0) {
+        gl->Uniform3fv(prog->u_color_tint, 1, g_game_color_tint);
+    }
     gl->BindVertexArray(g_game_post_vao);
     gl->DrawArrays(ZGL_TRIANGLES, 0, 3);
     gl->BindVertexArray(0);
@@ -2358,4 +2403,20 @@ ZAN_GAME_API void zan_game_set_uv_transform3d(float scale_u, float scale_v,
     g_game_uv_transform[1] = scale_v;
     g_game_uv_transform[2] = offset_u;
     g_game_uv_transform[3] = offset_v;
+}
+
+ZAN_GAME_API void zan_game_set_rim_light3d(float r, float g, float b, float power) {
+    g_game_rim_light[0] = r > 0.0f ? r : 0.0f;
+    g_game_rim_light[1] = g > 0.0f ? g : 0.0f;
+    g_game_rim_light[2] = b > 0.0f ? b : 0.0f;
+    g_game_rim_light[3] = power >= 0.25f ? power : 0.25f;
+}
+
+ZAN_GAME_API void zan_game_set_color_grade3d(float saturation, float contrast,
+    float tint_r, float tint_g, float tint_b) {
+    g_game_color_grade[0] = saturation >= 0.0f ? saturation : 0.0f;
+    g_game_color_grade[1] = contrast >= 0.0f ? contrast : 0.0f;
+    g_game_color_tint[0] = tint_r >= 0.0f ? tint_r : 0.0f;
+    g_game_color_tint[1] = tint_g >= 0.0f ? tint_g : 0.0f;
+    g_game_color_tint[2] = tint_b >= 0.0f ? tint_b : 0.0f;
 }
