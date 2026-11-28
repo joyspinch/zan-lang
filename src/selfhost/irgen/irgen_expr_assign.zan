@@ -372,7 +372,7 @@ partial class Irgen {
                 Node lty = locType[li];
                 if (IsNullableValue(lty)) {
                     string place = locReg[li];
-                    if (curAsync && locBox[li]) {
+                    if ((curAsync || locCell[li] == "") && locBox[li]) {
                         string cell = NT();
                         L("  " + cell + " = load i8*, i8** " + place);
                         place = NT();
@@ -391,7 +391,7 @@ partial class Irgen {
                 if (NeedsStructCopy(lty, v)) { v = StructCopyTemp(v, lty); }
                 v = NarrowToDeclared(v, lty);
                 string lt = MapType(lty);
-                if (curAsync && locBox[li]) {
+                if ((curAsync || locCell[li] == "") && locBox[li]) {
                     // the local lives in a heap cell: write through the cell
                     string c = NT();
                     L("  " + c + " = load i8*, i8** " + locReg[li]);
@@ -1095,41 +1095,69 @@ partial class Irgen {
             // ReleaseLocalsFrom does not release it (the tested object is
             // already released by its owner, matching C11 gen0 semantics).
             plt = MapType(e.type);
+            bool tyNeedsArc = ArcManaged(e.type) || IsStr(e.type) || e.type.ival >= 1;
+            string nullLit0 = "null";
+            if (!IsPtrLL(plt)) { nullLit0 = "0"; }
             if (curAsync && (int)e.ival >= 0 && (int)e.ival < asyncLocalRegs.Count) {
                 int slot = (int)e.ival;
-                reg = asyncLocalRegs[slot];
+                string slotReg = asyncLocalRegs[slot];
+                bool isBx = asyncLocalBox[slot];
+                ownBind = tyNeedsArc;
                 locName.Add(e.sval);
                 locType.Add(e.type);
-                locReg.Add(reg);
-                locBox.Add(asyncLocalBox[slot]);
+                locReg.Add(slotReg);
+                locBox.Add(isBx);
                 locIter.Add(false);
                 locCell.Add("");
-                locRef.Add(true);
+                locRef.Add(false);
                 locOpaque.Add(false);
+                if (ifCondPatternLocs != null) { ifCondPatternLocs.Add(locName.Count - 1); }
+                if (isBx) {
+                    string cell = OwnedCell(e.type);
+                    L("  store i8* " + cell + ", i8** " + slotReg);
+                    ArmAsyncLocal(slotReg, e.type, true);
+                    reg = NT();
+                    L("  " + reg + " = bitcast i8* " + cell + " to " + plt + "*");
+                } else {
+                    reg = slotReg;
+                    L("  store " + plt + " " + nullLit0 + ", " + plt + "* " + reg);
+                    if (ownBind) { ArmAsyncLocal(slotReg, e.type, false); }
+                }
             } else {
                 int li = LocalIdx(e.sval);
                 if (li >= 0) {
                     reg = locReg[li];
-                    locRef[li] = true;
+                    if (locBox[li] && locCell[li] == "") {
+                        string c = NT();
+                        L("  " + c + " = load i8*, i8** " + reg);
+                        reg = NT();
+                        L("  " + reg + " = bitcast i8* " + c + " to " + plt + "*");
+                    }
+                    ownBind = (li >= locRef.Count || !locRef[li]) && tyNeedsArc;
+                    if (ownBind) {
+                        string old = NT();
+                        L("  " + old + " = load " + plt + ", " + plt + "* " + reg);
+                        L("  store " + plt + " " + nullLit0 + ", " + plt + "* " + reg);
+                        EmitArcRelease(old, e.type);
+                    }
                 } else {
                     reg = AddLocal(e.sval, e.type);
                     if (ifCondPatternLocs != null) { ifCondPatternLocs.Add(locName.Count - 1); }
-                    // in an if condition the binding OWNS its value (the C
-                    // host's rule; GenIf releases it when the if ends): an
-                    // ordinary armed local, retained below on a match
-                    ownBind = ifCondOwnsPattern && !ShouldBox(e.sval)
-                        && (ArcManaged(e.type) || IsStr(e.type));
-                    locRef[locName.Count - 1] = !ownBind;
-                    if (ShouldBox(e.sval)) {
+                    bool isBx = ShouldBox(e.sval);
+                    // in an if/loop condition or boxed capture, the binding OWNS
+                    // its value (the C host's rule; GenIf/GenWhile releases it
+                    // when the scope ends): an ordinary armed local or capture
+                    // cell, retained below on a match
+                    ownBind = (ifCondOwnsPattern || isBx) && tyNeedsArc;
+                    locRef[locName.Count - 1] = !(ownBind || isBx);
+                    if (isBx) {
                         reg = BoxLocal(locName.Count - 1);
                     } else {
                         EA(reg, plt);
                     }
                 }
             }
-            string nullLit = "null";
-            if (!IsPtrLL(plt)) { nullLit = "0"; }
-            L("  store " + plt + " " + nullLit + ", " + plt + "* " + reg);
+            L("  store " + plt + " " + nullLit0 + ", " + plt + "* " + reg);
         }
         string res;
         if (IsClosedListType(e.type)) {

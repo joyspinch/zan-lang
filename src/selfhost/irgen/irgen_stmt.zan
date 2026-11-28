@@ -631,7 +631,7 @@ partial class Irgen {
         bool svOwn = ifCondOwnsPattern;
         List<int> svPat = ifCondPatternLocs;
         List<int> patLocs = new List<int>();
-        ifCondOwnsPattern = !curAsync;
+        ifCondOwnsPattern = true;
         ifCondPatternLocs = patLocs;
         string c = GenCond(s.a);
         ifCondOwnsPattern = svOwn;
@@ -649,7 +649,7 @@ partial class Irgen {
             if (!term) { L("  br label %L" + lend); }
         }
         Label(lend);
-        if (!curAsync && patLocs.Count > 0) {
+        if (patLocs.Count > 0) {
             int pi = 0;
             while (pi < patLocs.Count) {
                 int idx = patLocs[pi];
@@ -670,7 +670,7 @@ partial class Irgen {
     string GenLoopCond(Node cond) {
         BranchTempScope condBts = EnterBranchTempScope();
         bool svOwn = ifCondOwnsPattern;
-        ifCondOwnsPattern = !curAsync;
+        ifCondOwnsPattern = true;
         string c = GenCond(cond);
         ifCondOwnsPattern = svOwn;
         LeaveBranchTempScope(condBts);
@@ -678,7 +678,7 @@ partial class Irgen {
     }
     // Release (without forgetting) the locals a loop condition declared.
     void ReleaseCondLocals(int from) {
-        if (!curAsync && locName.Count > from) { ReleaseLocalsFrom(from); }
+        if (locName.Count > from) { ReleaseLocalsFrom(from); }
     }
 
     void GenWhile(Node s) {
@@ -701,7 +701,7 @@ partial class Irgen {
         if (!term) { ReleaseCondLocals(condScope); EmitAsyncPreemptSite(lc); }
         Label(lend);
         ReleaseCondLocals(condScope);
-        if (!curAsync && locName.Count > condScope) { TrimLocals(condScope); }
+        if (locName.Count > condScope) { TrimLocals(condScope); }
         syncFlow.breakScope = savedBreakScope; syncFlow.continueScope = savedContinueScope;
         brkTarget = sb; contTarget = sc;
         brkFinBase = sbf; contFinBase = scf;
@@ -724,21 +724,24 @@ partial class Irgen {
         if (!term) {
             L("  br label %L" + lc);
             Label(lc);
+            int condScope = locName.Count;
             string c = "";
             if (s.a != null && s.a.kind == AK.Block()) {
                 int bi = 0;
                 while (bi < s.a.kids.Count) {
                     Node bs = s.a.kids[bi];
                     if (bi == s.a.kids.Count - 1 && bs.kind == AK.ExprStmt()) {
-                        c = GenCond(bs.a);
+                        c = GenLoopCond(bs.a);
                     } else {
                         GenStmt(bs);
                     }
                     bi = bi + 1;
                 }
             } else {
-                c = GenCond(s.a);
+                c = GenLoopCond(s.a);
             }
+            ReleaseCondLocals(condScope);
+            if (locName.Count > condScope) { TrimLocals(condScope); }
             if (curAsync) {
                 int lback = NL();
                 L("  br i1 " + c + ", label %L" + lback + ", label %L" + lend);
@@ -790,7 +793,9 @@ partial class Irgen {
             if (s.c.kind == AK.Block() || s.c.kind == AK.ExprStmt()) {
                 GenStmt(s.c);
             } else {
+                BranchTempScope incBts = EnterBranchTempScope();
                 GenExpr(s.c);
+                LeaveBranchTempScope(incBts);
             }
         }
         EmitAsyncPreemptSite(lc);
@@ -946,7 +951,7 @@ partial class Irgen {
     // the loop: a dropped loop compiles but computes the wrong answer.
     void GenForeach(Node s) {
         int feScope = locName.Count;
-        ResetStmtTemps();
+        BranchTempScope feCollBts = EnterBranchTempScope();
         ExprVal coll = GenExpr(s.b);
         bool feDict = coll.ty != null && (coll.ty.sval == "Dictionary" || coll.ty.sval.IndexOf("Dictionary<") == 0
                                           || coll.ty.sval == "Dict" || coll.ty.sval.IndexOf("Dict<") == 0);
@@ -967,8 +972,8 @@ partial class Irgen {
         bool feStr = IsStr(coll.ty);
         if (!feList && !feArr && !feStr) {
             // the duck-typed enumerable protocol (GetEnumerator/MoveNext/Current)
-            if (GenForeachEnumerable(s, coll)) { return; }
-            EmitTempReleases();
+            if (GenForeachEnumerable(s, coll, feCollBts)) { return; }
+            LeaveBranchTempScope(feCollBts);
             string cn = "?"; if (coll.ty != null) { cn = coll.ty.sval; }
             diags.Error("foreach over '" + cn + "' is not supported by the self-hosted compiler yet (List<T>, T[] and string are)", s.line, s.col);
             return;
@@ -1036,7 +1041,7 @@ partial class Irgen {
                 if (!TransferTempOwner(dictOrig)) { EmitArcRetain(dictOrig.op, dictOrig.ty); }
             }
         }
-        EmitTempReleases();
+        LeaveBranchTempScope(feCollBts);
         string idx = NT();
         if (!curAsync) {
             EA(idx, "i64");
@@ -1233,7 +1238,7 @@ partial class Irgen {
     // `Foo<T>.GetEnumerator()` needs no specialization here.
     // Returns false when the collection does not speak the protocol (the
     // caller then reports the collection as unsupported).
-    bool GenForeachEnumerable(Node s, ExprVal coll) {
+    bool GenForeachEnumerable(Node s, ExprVal coll, BranchTempScope feCollBts) {
         Node cls = ClassOf(coll.ty);
         if (cls == null) { return false; }
         Node gm = FindMethodUp(cls, "GetEnumerator");
@@ -1278,7 +1283,7 @@ partial class Irgen {
         L("  store " + enTy + " " + en.op + ", " + enTy + "* " + enReg);
         if (!TransferTempOwner(en)) { EmitArcRetain(en.op, enumTy); }
         if (curAsync) { ArmAsyncLocal(enReg, enumTy, false); }
-        EmitTempReleases();
+        LeaveBranchTempScope(feCollBts);
         string elt = MapType(elemTy);
         string ereg = AddLocal(s.sval, elemTy);
         // the element variable is a per-iteration capture: every closure made
