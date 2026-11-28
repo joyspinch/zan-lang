@@ -237,8 +237,8 @@ public class BackdropPainter {
             host.bgSnapGen = 0;
             if (host.shapeShadow > 0) { this.PaintShapeShadow(); }
             this.PaintShapeFill();
-            // 异形背景只绘制上述静态形状；渐变壁纸与动态 Fx 不进入此分支。
-            // 仍记录主题渐变参数，防止切换渐变状态后复用旧主题基面。
+            // 异形背景与单圆角渐变/玻璃壁纸均在此缓存；记录主题渐变参数，
+            // 防止切换渐变/玻璃状态后复用旧主题基面。
             if (!host.Damage.partialFrame) {
                 c.SnapshotRect(0, 0, width, height, slot);
                 this.RememberShapeBackground(width, height, slot);
@@ -310,7 +310,57 @@ public class BackdropPainter {
         }
     }
 
-    // 用皮肤底色铺满异形窗口的轮廓（见 RenderBackground）。
+    private void PaintBackdropOverlay(int x, int y, int w, int h) {
+        App host = app;
+        if (host == null || host.theme == null) { return; }
+        Theme t = host.theme;
+        if (t.gradient != 0) {
+            if (t.glass != 0) {
+                this.BackdropGlassWallpaper(x, y, w, h);
+            } else {
+                this.BackdropGradientWallpaper(x, y, w, h);
+            }
+        }
+        this.RenderWallpaperImage(x, y, w, h);
+    }
+
+    private void PaintRoundedShapeOverlay(int px, int py, int pw, int ph, int pr) {
+        App host = app;
+        if (host == null || host.canvas == null || pw <= 0 || ph <= 0) { return; }
+        Canvas c = host.canvas;
+        if (pr <= 0) {
+            c.PushClip(px, py, pw, ph);
+            try { this.PaintBackdropOverlay(px, py, pw, ph); }
+            finally { c.PopClip(); }
+            return;
+        }
+        int midH = ph - pr * 2;
+        if (midH > 0) {
+            c.PushClip(px, py + pr, pw, midH);
+            try { this.PaintBackdropOverlay(px, py, pw, ph); }
+            finally { c.PopClip(); }
+        }
+        for (int dy = 0; dy < pr; dy = dy + 1) {
+            int ry = pr - dy;
+            int inside = pr * pr - ry * ry;
+            int dx = inside > 0 ? App.ISqrt(inside) : 0;
+            int inset = pr - dx;
+            int spanW = pw - inset * 2;
+            if (spanW <= 0) { continue; }
+            int yTop = py + dy;
+            c.PushClip(px + inset, yTop, spanW, 1);
+            try { this.PaintBackdropOverlay(px, py, pw, ph); }
+            finally { c.PopClip(); }
+            int yBot = py + ph - 1 - dy;
+            if (yBot != yTop) {
+                c.PushClip(px + inset, yBot, spanW, 1);
+                try { this.PaintBackdropOverlay(px, py, pw, ph); }
+                finally { c.PopClip(); }
+            }
+        }
+    }
+
+    // 用皮肤底色或圆角渐变/玻璃壁纸铺满异形窗口的轮廓（见 RenderBackground）。
     // 类型 3 的阴影带只是把系统表面撑大，不参与填充。
     // 填充铺满整个轮廓：内容贴着窗口边缘，投影从轮廓边缘向外
     // 衰减到阴影带里（见 PaintShapeShadow）；落在轮廓内的那半圈
@@ -330,6 +380,33 @@ public class BackdropPainter {
         if (col == 0) {
             StyleBox winStyle = Style.PartRef(host, "window", "base", "", "", "", Style.SNormal());
             col = winStyle.BgOr(0);
+        }
+
+        // 单圆角异形窗口（如 ZanIDE 12px 圆角框）：若皮肤启用了渐变或壁纸，
+        // 按圆角轮廓绘制垂直渐变与裁切在轮廓内的玻璃/渐变彩斑与壁纸，
+        // 避免与普通矩形窗口出现质感落差，同时保持外圈阴影带零污染。
+        if (host.theme != null && (host.theme.gradient != 0 || host.bgImagePath != "")) {
+            WindowShapeRegion shape = host.BackdropShape();
+            if (shape != null) {
+                int px = host.Scale(shape.x);
+                int py = host.Scale(shape.y);
+                int pw = host.Scale(shape.width);
+                int ph = host.Scale(shape.height);
+                int pr = host.Scale(shape.radius);
+                if (pr < 0) { pr = 0; }
+                if (pr * 2 > pw) { pr = pw / 2; }
+                if (pr * 2 > ph) { pr = ph / 2; }
+                if (pw > 0 && ph > 0) {
+                    if (host.theme.gradient != 0) {
+                        host.canvas.FillVGradMask(px, py, pw, ph, pr, 15,
+                            host.theme.bgGradTop, host.theme.bgGradBottom);
+                    } else {
+                        this.PaintShapeRegions(col, !host.Damage.partialFrame && host.shapeShadow == 0);
+                    }
+                    this.PaintRoundedShapeOverlay(px, py, pw, ph, pr);
+                    return;
+                }
+            }
         }
 
         // Only a full, single-region background without shadow is an initial layer.
