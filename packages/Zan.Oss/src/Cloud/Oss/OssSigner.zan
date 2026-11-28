@@ -8,38 +8,115 @@ namespace Cloud.Oss;
 /// Base64/十六进制、两种日期格式。单独成实体，是为了签名算法能脱离网络
 /// 单独编译、离线对账。</summary>
 public class OssSigner {
-    /// <summary>RFC 3986 百分号编码：除 A-Z a-z 0-9 与 - _ . ~ 外全部转义，
-    /// 空格转 %20（不是 +）。</summary>
-    public static string Rfc3986(string s) {
-        if (s == null) { return ""; }
-        StringBuilder sb = null;
-        int start = 0;
-        int n = s.Length;
-        for (int i = 0; i < n; i = i + 1) {
-            int c = s[i] & 255;
-            if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57)
-                || c == 45 || c == 95 || c == 46 || c == 126) {
-                continue;
-            }
-            if (sb == null) { sb = new StringBuilder(); }
-            if (i > start) { sb.Append(s.Substring(start, i - start)); }
-            sb.Append("%");
-            sb.Append(OssSigner.HexByte(c));
-            start = i + 1;
+    // 256B RFC 3986 字符分类表：1 = 非保留字符 (A-Z a-z 0-9 - _ . ~)，2 = '/'，0 = 需百分号编码。
+    private static byte[] unreservedLut;
+    private static const string DAY_NAMES = "SunMonTueWedThuFriSat";
+    private static const string MONTH_NAMES = "JanFebMarAprMayJunJulAugSepOctNovDec";
+
+    private static byte[] EnsureLut() {
+        if (OssSigner.unreservedLut == null) {
+            byte[] t = new byte[256];
+            for (int c = 65; c <= 90; c = c + 1) { t[c] = 1; }
+            for (int c = 97; c <= 122; c = c + 1) { t[c] = 1; }
+            for (int c = 48; c <= 57; c = c + 1) { t[c] = 1; }
+            t[45] = 1;   // '-'
+            t[95] = 1;   // '_'
+            t[46] = 1;   // '.'
+            t[126] = 1;  // '~'
+            t[47] = 2;   // '/'
+            OssSigner.unreservedLut = t;
         }
-        if (sb == null) { return s; }
-        if (n > start) { sb.Append(s.Substring(start, n - start)); }
-        return sb.ToString();
+        return OssSigner.unreservedLut;
     }
 
-    /// <summary>单字节转两位大写十六进制（寄存器无分支算术直出，零分配）。</summary>
+    /// <summary>RFC 3986 百分号编码：除 A-Z a-z 0-9 与 - _ . ~ 外全部转义，
+    /// 空格转 %20（不是 +）。256B 查表 + 精确单次 byte[] 分配，零 HexByte/Substring。</summary>
+    public static string Rfc3986(string s) {
+        if (s == null || s.Length == 0) { return ""; }
+        return OssSigner.Rfc3986Slice(s, 0, s.Length, false);
+    }
+
+    internal static string Rfc3986Slice(string s, int start, int end, bool keepSlash) {
+        int len = end - start;
+        if (len <= 0) { return ""; }
+        byte[] lut = OssSigner.EnsureLut();
+        int escCount = 0;
+        for (int i = start; i < end; i = i + 1) {
+            int cls = lut[s[i] & 255] & 255;
+            if (cls == 0 || (!keepSlash && cls == 2)) {
+                escCount = escCount + 1;
+            }
+        }
+        if (escCount == 0) {
+            if (start == 0 && end == s.Length) { return s; }
+            return s.Substring(start, len);
+        }
+        int outLen = len + escCount * 2;
+        byte[] buf = new byte[outLen];
+        int di = 0;
+        for (int i = start; i < end; i = i + 1) {
+            int c = s[i] & 255;
+            int cls = lut[c] & 255;
+            if (cls == 1 || (keepSlash && cls == 2)) {
+                buf[di] = (byte)c;
+                di = di + 1;
+            } else {
+                int h = (c >> 4) & 15;
+                int l = c & 15;
+                buf[di] = 37;  // '%'
+                buf[di + 1] = (byte)(h < 10 ? h + 48 : h + 55);
+                buf[di + 2] = (byte)(l < 10 ? l + 48 : l + 55);
+                di = di + 3;
+            }
+        }
+        return NativeMemory.GetString((nint)buf, 0, outLen);
+    }
+
+    // 单遍规范化 S3 URI：若不以 '/' 开头则补前导 '/'，保留 '/' 其余按 RFC 3986 编码。
+    internal static string Rfc3986CanonicalUri(string path) {
+        if (path == null || path.Length == 0) { return "/"; }
+        int len = path.Length;
+        int needLead = (path[0] & 255) == 47 ? 0 : 1;
+        byte[] lut = OssSigner.EnsureLut();
+        int escCount = 0;
+        for (int i = 0; i < len; i = i + 1) {
+            if ((lut[path[i] & 255] & 255) == 0) {
+                escCount = escCount + 1;
+            }
+        }
+        if (needLead == 0 && escCount == 0) { return path; }
+        int outLen = needLead + len + escCount * 2;
+        byte[] buf = new byte[outLen];
+        int di = 0;
+        if (needLead == 1) {
+            buf[0] = 47;
+            di = 1;
+        }
+        for (int i = 0; i < len; i = i + 1) {
+            int c = path[i] & 255;
+            if ((lut[c] & 255) != 0) {
+                buf[di] = (byte)c;
+                di = di + 1;
+            } else {
+                int h = (c >> 4) & 15;
+                int l = c & 15;
+                buf[di] = 37;
+                buf[di + 1] = (byte)(h < 10 ? h + 48 : h + 55);
+                buf[di + 2] = (byte)(l < 10 ? l + 48 : l + 55);
+                di = di + 3;
+            }
+        }
+        return NativeMemory.GetString((nint)buf, 0, outLen);
+    }
+
+    /// <summary>单字节转两位大写十六进制（寄存器无分支算术直出）。</summary>
     public static string HexByte(int v) {
         int h = (v >> 4) & 15;
         int l = v & 15;
         byte[] buf = new byte[2];
         buf[0] = (byte)(h < 10 ? h + 48 : h + 55);
         buf[1] = (byte)(l < 10 ? l + 48 : l + 55);
-        return buf.ToStr(0, 2);
+        return NativeMemory.GetString((nint)buf, 0, 2);
     }
 
     /// <summary>HMAC-SHA1。</summary>
@@ -82,36 +159,161 @@ public class OssSigner {
         return Hex.Encode(h, 32);
     }
 
-    /// <summary>HTTP Date 头格式：Tue, 20 Oct 2026 08:00:00 GMT。</summary>
+    private static void Write2(byte[] buf, int p, int v) {
+        if (v < 0) { v = 0; }
+        if (v > 99) { v = 99; }
+        buf[p] = (byte)(48 + v / 10);
+        buf[p + 1] = (byte)(48 + v % 10);
+    }
+
+    private static void Write4(byte[] buf, int p, int y) {
+        buf[p] = (byte)(48 + (y / 1000) % 10);
+        buf[p + 1] = (byte)(48 + (y / 100) % 10);
+        buf[p + 2] = (byte)(48 + (y / 10) % 10);
+        buf[p + 3] = (byte)(48 + y % 10);
+    }
+
+    private static long FloorDivL(long a, long b) {
+        long q = a / b;
+        long r = a - q * b;
+        if (r != 0 && ((r < 0) != (b < 0))) { q = q - 1; }
+        return q;
+    }
+
+    private static int FloorDiv(int a, int b) {
+        int q = a / b;
+        int r = a - q * b;
+        if (r != 0 && ((r < 0) != (b < 0))) { q = q - 1; }
+        return q;
+    }
+
+    private static int FloorMod(int a, int b) {
+        int r = a % b;
+        if (r < 0) { r = r + b; }
+        return r;
+    }
+
+    /// <summary>HTTP Date 头格式：Tue, 20 Oct 2026 08:00:00 GMT。内联 Howard Hinnant 历算 + 29B 定长直写（零 DateTime 堆分配）。</summary>
     public static string GmtDate(long unixSeconds) {
-        DateTime t = DateTime.FromUnixSeconds(unixSeconds);
-        string[] days = new string[] { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
-        string[] months = new string[] { "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-            "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
-        return days[t.DayOfWeek()] + ", " + OssSigner.Pad2(t.Day()) + " " + months[t.Month() - 1]
-            + " " + Convert.ToString(t.Year()) + " " + OssSigner.Pad2(t.Hour())
-            + ":" + OssSigner.Pad2(t.Minute()) + ":" + OssSigner.Pad2(t.Second()) + " GMT";
+        int days = (int)OssSigner.FloorDivL(unixSeconds, 86400);
+        int sod = (int)(unixSeconds - (long)days * 86400);
+        int hour = sod / 3600;
+        int minute = (sod / 60) - hour * 60;
+        int second = sod - hour * 3600 - minute * 60;
+        int dow = OssSigner.FloorMod(days + 4, 7) * 3;
+
+        int z = days + 719468;
+        int era = OssSigner.FloorDiv(z, 146097);
+        int doe = z - era * 146097;
+        int yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        int year = yoe + era * 400;
+        int doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        int mp = (5 * doy + 2) / 153;
+        int day = doy - (153 * mp + 2) / 5 + 1;
+        int month = mp < 10 ? mp + 3 : mp - 9;
+        if (month <= 2) { year = year + 1; }
+        int mon = (month - 1) * 3;
+
+        if (year >= 1000 && year <= 9999) {
+            byte[] buf = new byte[29];
+            buf[0] = (byte)(OssSigner.DAY_NAMES[dow] & 255);
+            buf[1] = (byte)(OssSigner.DAY_NAMES[dow + 1] & 255);
+            buf[2] = (byte)(OssSigner.DAY_NAMES[dow + 2] & 255);
+            buf[3] = 44;  // ','
+            buf[4] = 32;  // ' '
+            OssSigner.Write2(buf, 5, day);
+            buf[7] = 32;
+            buf[8] = (byte)(OssSigner.MONTH_NAMES[mon] & 255);
+            buf[9] = (byte)(OssSigner.MONTH_NAMES[mon + 1] & 255);
+            buf[10] = (byte)(OssSigner.MONTH_NAMES[mon + 2] & 255);
+            buf[11] = 32;
+            OssSigner.Write4(buf, 12, year);
+            buf[16] = 32;
+            OssSigner.Write2(buf, 17, hour);
+            buf[19] = 58;  // ':'
+            OssSigner.Write2(buf, 20, minute);
+            buf[22] = 58;  // ':'
+            OssSigner.Write2(buf, 23, second);
+            buf[25] = 32;
+            buf[26] = 71;  // 'G'
+            buf[27] = 77;  // 'M'
+            buf[28] = 84;  // 'T'
+            return NativeMemory.GetString((nint)buf, 0, 29);
+        }
+        return OssSigner.DAY_NAMES.Substring(dow, 3) + ", " + OssSigner.Pad2(day) + " "
+            + OssSigner.MONTH_NAMES.Substring(mon, 3) + " " + Convert.ToString(year) + " "
+            + OssSigner.Pad2(hour) + ":" + OssSigner.Pad2(minute) + ":"
+            + OssSigner.Pad2(second) + " GMT";
     }
 
-    /// <summary>AMZ 格式：20261020T080000Z。</summary>
+    /// <summary>AMZ 格式：20261020T080000Z。内联历算 + 16B 定长直写（零 DateTime 堆分配）。</summary>
     public static string AmzDate(long unixSeconds) {
-        DateTime t = DateTime.FromUnixSeconds(unixSeconds);
-        return OssSigner.AmzDateOnly(unixSeconds) + "T" + OssSigner.Pad2(t.Hour())
-            + OssSigner.Pad2(t.Minute()) + OssSigner.Pad2(t.Second()) + "Z";
+        int days = (int)OssSigner.FloorDivL(unixSeconds, 86400);
+        int sod = (int)(unixSeconds - (long)days * 86400);
+        int hour = sod / 3600;
+        int minute = (sod / 60) - hour * 60;
+        int second = sod - hour * 3600 - minute * 60;
+
+        int z = days + 719468;
+        int era = OssSigner.FloorDiv(z, 146097);
+        int doe = z - era * 146097;
+        int yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        int year = yoe + era * 400;
+        int doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        int mp = (5 * doy + 2) / 153;
+        int day = doy - (153 * mp + 2) / 5 + 1;
+        int month = mp < 10 ? mp + 3 : mp - 9;
+        if (month <= 2) { year = year + 1; }
+
+        if (year >= 1000 && year <= 9999) {
+            byte[] buf = new byte[16];
+            OssSigner.Write4(buf, 0, year);
+            OssSigner.Write2(buf, 4, month);
+            OssSigner.Write2(buf, 6, day);
+            buf[8] = 84;  // 'T'
+            OssSigner.Write2(buf, 9, hour);
+            OssSigner.Write2(buf, 11, minute);
+            OssSigner.Write2(buf, 13, second);
+            buf[15] = 90;  // 'Z'
+            return NativeMemory.GetString((nint)buf, 0, 16);
+        }
+        return Convert.ToString(year) + OssSigner.Pad2(month) + OssSigner.Pad2(day)
+            + "T" + OssSigner.Pad2(hour) + OssSigner.Pad2(minute)
+            + OssSigner.Pad2(second) + "Z";
     }
 
-    /// <summary>AMZ 日期：20261020。</summary>
+    /// <summary>AMZ 日期：20261020。内联历算 + 8B 定长直写（零 DateTime 堆分配）。</summary>
     public static string AmzDateOnly(long unixSeconds) {
-        DateTime t = DateTime.FromUnixSeconds(unixSeconds);
-        return Convert.ToString(t.Year()) + OssSigner.Pad2(t.Month())
-            + OssSigner.Pad2(t.Day());
+        int days = (int)OssSigner.FloorDivL(unixSeconds, 86400);
+        int z = days + 719468;
+        int era = OssSigner.FloorDiv(z, 146097);
+        int doe = z - era * 146097;
+        int yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        int year = yoe + era * 400;
+        int doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        int mp = (5 * doy + 2) / 153;
+        int day = doy - (153 * mp + 2) / 5 + 1;
+        int month = mp < 10 ? mp + 3 : mp - 9;
+        if (month <= 2) { year = year + 1; }
+
+        if (year >= 1000 && year <= 9999) {
+            byte[] buf = new byte[8];
+            OssSigner.Write4(buf, 0, year);
+            OssSigner.Write2(buf, 4, month);
+            OssSigner.Write2(buf, 6, day);
+            return NativeMemory.GetString((nint)buf, 0, 8);
+        }
+        return Convert.ToString(year) + OssSigner.Pad2(month)
+            + OssSigner.Pad2(day);
     }
 
     /// <summary>补零到两位。</summary>
     public static string Pad2(int v) {
         if (v < 0) { v = 0; }
         if (v > 99) { v = 99; }
-        if (v < 10) { return "0" + Convert.ToString(v); }
-        return Convert.ToString(v);
+        byte[] buf = new byte[2];
+        buf[0] = (byte)(48 + v / 10);
+        buf[1] = (byte)(48 + v % 10);
+        return NativeMemory.GetString((nint)buf, 0, 2);
     }
 }

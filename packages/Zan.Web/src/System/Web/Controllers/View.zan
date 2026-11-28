@@ -94,7 +94,7 @@ public class View {
         if (name == null || !map.TryGetValue(name, out nodes)) {
             return View.SafeMissingComment(name);
         }
-        StringBuilder sb = new StringBuilder();
+        StringBuilder sb = new StringBuilder(256);
         View.Emit(nodes, data, null, null, sb);
         return sb.ToString();
     }
@@ -115,7 +115,7 @@ public class View {
             string modLayout = name.Substring(0, dot) + ".layout";
             if (map.ContainsKey(modLayout)) { layoutKey = modLayout; }
         }
-        StringBuilder sb = new StringBuilder();
+        StringBuilder sb = new StringBuilder(512);
         List<VNode> layout = null;
         if (!map.TryGetValue(layoutKey, out layout)) {
             View.Emit(page, data, null, null, sb);
@@ -126,158 +126,423 @@ public class View {
     }
 
     public static string RenderStr(string tpl, ViewData data, StrMap row) {
-        StringBuilder sb = new StringBuilder();
-        View.Emit(View.Compile(tpl), data, row, null, sb);
+        if (tpl == null || tpl.Length == 0) { return ""; }
+        // 扁平字节码直编译+直渲染：零 VNode 堆对象、零字面量 Substring 拷贝（全走 StringView）。
+        List<int> ops = new List<int>();
+        List<int> argA = new List<int>();
+        List<int> argB = new List<int>();
+        List<string> keys = new List<string>();
+        int[] state = new int[2];
+        state[0] = 0;
+        state[1] = 0;
+        View.CompileFlat(tpl, tpl.Length, state, 0, ops, argA, argB, keys);
+        StringBuilder sb = new StringBuilder(tpl.Length + 128);
+        StrMap vars = data != null ? data.Vars() : null;
+        View.ExecFlat(tpl, (nint)tpl, ops, argA, argB, keys, 0, ops.Count, data, vars, row, sb);
         return sb.ToString();
     }
 
-    public static List<VNode> Compile(string tpl) {
-        List<VNode> nodes = new List<VNode>();
-        int i = 0;
-        int n = tpl.Length;
+    // 扁平指令集：0=Lit(a=start,b=len), 1=EscVar(key), 2=RawVar(key),
+    // 3=If(key, a=elsePc or endPc, b=endPc), 4=Each(key, a=endPc), 5=ContentSlot。
+    private static void CompileFlat(string tpl, int n, int[] state, int mode,
+                                    List<int> ops, List<int> argA, List<int> argB, List<string> keys) {
+        int i = state[0];
         while (i < n) {
-            int open = View.Find(tpl, "{{", i);
-	            if (open < 0) {
-	                nodes.Add(new VNode(VNodeKind.Literal, tpl.Substring(i, n - i)));
-	                return nodes;
-	            }
-	            if (open > i) { nodes.Add(new VNode(VNodeKind.Literal, tpl.Substring(i, open - i))); }
-	            // {{{raw}}}
-	            if (open + 2 < n && (tpl[open + 2] & 255) == 123) {
-	                int close = View.Find(tpl, "}}}", open + 3);
-	                if (close < 0) { return nodes; }
-	                nodes.Add(new VNode(VNodeKind.RawVar,
-	                    View.Trim(tpl.Substring(open + 3, close - open - 3))));
-	                i = close + 3;
-	            } else {
-	                int close = View.Find(tpl, "}}", open + 2);
-	                if (close < 0) { return nodes; }
-	                string tag = View.Trim(tpl.Substring(open + 2, close - open - 2));
-	                if (tag.Length > 4 && tag.Substring(0, 4) == "#if ") {
-	                    int endIf = View.FindTag(tpl, "{{/if}}", close + 2);
-	                    if (endIf < 0) { return nodes; }
-	                    VNode node = new VNode(VNodeKind.If,
-	                        View.Trim(tag.Substring(4, tag.Length - 4)));
-	                    // {{else}} 拆分（Bug#11）：同层 else 之前的段是真分支，
-	                    // 之后的段是假分支。嵌套 if/each 内的 else 属于内层，
-	                    // 由 FindElse 的深度计数跳过；无 else 时走原单段编译，
-	                    // 向后兼容（修复前 else 只是被当空变量吞掉、真分支
-	                    // 照样渲染假分支正文——12 处视图因此双渲染）。
-	                    int anElse = View.FindElse(tpl, close + 2, endIf);
-	                    if (anElse >= 0) {
-	                        node.SetBody(View.Compile(
-	                            tpl.Substring(close + 2, anElse - close - 2)));
-	                        node.SetElseBody(View.Compile(
-	                            tpl.Substring(anElse + 8, endIf - anElse - 8)));
-	                    } else {
-	                        node.SetBody(View.Compile(
-	                            tpl.Substring(close + 2, endIf - close - 2)));
-	                    }
-	                    nodes.Add(node);
-	                    i = endIf + 7;
-	                } else if (tag.Length > 6 && tag.Substring(0, 6) == "#each ") {
-	                    int endEach = View.FindTag(tpl, "{{/each}}", close + 2);
-	                    if (endEach < 0) { return nodes; }
-	                    VNode node = new VNode(VNodeKind.Each,
-	                        View.Trim(tag.Substring(6, tag.Length - 6)));
-	                    node.SetBody(View.Compile(
-	                        tpl.Substring(close + 2, endEach - close - 2)));
-	                    nodes.Add(node);
-	                    i = endEach + 9;
-	                } else if (tag == "content") {
-	                    nodes.Add(new VNode(VNodeKind.ContentSlot, ""));
-	                    i = close + 2;
-	                } else {
-	                    nodes.Add(new VNode(VNodeKind.EscapedVar, tag));
-	                    i = close + 2;
-	                }
-	            }
-	        }
-	        return nodes;
-	    }
+            int open = tpl.IndexOf("{{", i);
+            if (open < 0) {
+                ops.Add(0); argA.Add(i); argB.Add(n - i); keys.Add("");
+                state[0] = n;
+                state[1] = 0;
+                return;
+            }
+            if (open > i) {
+                ops.Add(0); argA.Add(i); argB.Add(open - i); keys.Add("");
+            }
+            if (open + 2 < n && (tpl[open + 2] & 255) == 123) {
+                int close = tpl.IndexOf("}}}", open + 3);
+                if (close < 0) {
+                    state[0] = n;
+                    state[1] = 0;
+                    return;
+                }
+                ops.Add(2); argA.Add(0); argB.Add(0); keys.Add(View.TrimSlice(tpl, open + 3, close));
+                i = close + 3;
+                continue;
+            }
+            int close2 = tpl.IndexOf("}}", open + 2);
+            if (close2 < 0) {
+                state[0] = n;
+                state[1] = 0;
+                return;
+            }
+            int rawStart = open + 2;
+            int rawLen = close2 - rawStart;
+            if (mode == 1 && rawLen == 4
+                && (tpl[rawStart] & 255) == 101 && (tpl[rawStart + 1] & 255) == 108
+                && (tpl[rawStart + 2] & 255) == 115 && (tpl[rawStart + 3] & 255) == 101) {
+                state[0] = close2 + 2;
+                state[1] = 1;
+                return;
+            }
+            if ((mode == 1 || mode == 2) && rawLen == 3
+                && (tpl[rawStart] & 255) == 47 && (tpl[rawStart + 1] & 255) == 105
+                && (tpl[rawStart + 2] & 255) == 102) {
+                state[0] = close2 + 2;
+                state[1] = 2;
+                return;
+            }
+            if (mode == 3 && rawLen == 5
+                && (tpl[rawStart] & 255) == 47 && (tpl[rawStart + 1] & 255) == 101
+                && (tpl[rawStart + 2] & 255) == 97 && (tpl[rawStart + 3] & 255) == 99
+                && (tpl[rawStart + 4] & 255) == 104) {
+                state[0] = close2 + 2;
+                state[1] = 3;
+                return;
+            }
+            int ts = rawStart;
+            int te = close2;
+            while (ts < te && (tpl[ts] & 255) == 32) { ts = ts + 1; }
+            while (te > ts && (tpl[te - 1] & 255) == 32) { te = te - 1; }
+            int tlen = te - ts;
+            if (tlen > 4 && (tpl[ts] & 255) == 35 && (tpl[ts + 1] & 255) == 105
+                && (tpl[ts + 2] & 255) == 102 && (tpl[ts + 3] & 255) == 32) {
+                int ifPc = ops.Count;
+                ops.Add(3); argA.Add(0); argB.Add(0); keys.Add(View.TrimSlice(tpl, ts + 4, te));
+                state[0] = close2 + 2;
+                View.CompileFlat(tpl, n, state, 1, ops, argA, argB, keys);
+                if (state[1] == 0) {
+                    while (ops.Count > ifPc) {
+                        ops.RemoveAt(ops.Count - 1);
+                        argA.RemoveAt(argA.Count - 1);
+                        argB.RemoveAt(argB.Count - 1);
+                        keys.RemoveAt(keys.Count - 1);
+                    }
+                    return;
+                }
+                int elsePc = ops.Count;
+                if (state[1] == 1) {
+                    View.CompileFlat(tpl, n, state, 2, ops, argA, argB, keys);
+                    if (state[1] != 2) {
+                        while (ops.Count > ifPc) {
+                            ops.RemoveAt(ops.Count - 1);
+                            argA.RemoveAt(argA.Count - 1);
+                            argB.RemoveAt(argB.Count - 1);
+                            keys.RemoveAt(keys.Count - 1);
+                        }
+                        return;
+                    }
+                }
+                argA[ifPc] = elsePc;
+                argB[ifPc] = ops.Count;
+                i = state[0];
+            } else if (tlen > 6 && (tpl[ts] & 255) == 35 && (tpl[ts + 1] & 255) == 101
+                && (tpl[ts + 2] & 255) == 97 && (tpl[ts + 3] & 255) == 99
+                && (tpl[ts + 4] & 255) == 104 && (tpl[ts + 5] & 255) == 32) {
+                int eachPc = ops.Count;
+                ops.Add(4); argA.Add(0); argB.Add(0); keys.Add(View.TrimSlice(tpl, ts + 6, te));
+                state[0] = close2 + 2;
+                View.CompileFlat(tpl, n, state, 3, ops, argA, argB, keys);
+                if (state[1] != 3) {
+                    while (ops.Count > eachPc) {
+                        ops.RemoveAt(ops.Count - 1);
+                        argA.RemoveAt(argA.Count - 1);
+                        argB.RemoveAt(argB.Count - 1);
+                        keys.RemoveAt(keys.Count - 1);
+                    }
+                    return;
+                }
+                argA[eachPc] = ops.Count;
+                i = state[0];
+            } else if (tlen == 7 && (tpl[ts] & 255) == 99 && (tpl[ts + 1] & 255) == 111
+                && (tpl[ts + 2] & 255) == 110 && (tpl[ts + 3] & 255) == 116
+                && (tpl[ts + 4] & 255) == 101 && (tpl[ts + 5] & 255) == 110
+                && (tpl[ts + 6] & 255) == 116) {
+                ops.Add(5); argA.Add(0); argB.Add(0); keys.Add("");
+                i = close2 + 2;
+            } else {
+                ops.Add(1); argA.Add(0); argB.Add(0);
+                keys.Add(tlen > 0 ? tpl.Substring(ts, tlen) : "");
+                i = close2 + 2;
+            }
+        }
+        state[0] = n;
+        state[1] = 0;
+    }
 
-	    private static void Emit(List<VNode> nodes, ViewData data, StrMap row,
-	                     List<VNode> content, StringBuilder sb) {
-	        for (int i = 0; i < nodes.Count; i = i + 1) {
-	            VNode nd = nodes[i];
-	            int kind = nd.Kind();
-	            if (kind == VNodeKind.Literal) {
-	                sb.Append(nd.Text());
-		            } else if (kind == VNodeKind.EscapedVar) {
-		                View.HtmlEscapeInto(View.Lookup(nd.Text(), data, row), sb);
-	            } else if (kind == VNodeKind.RawVar) {
-	                sb.Append(View.Lookup(nd.Text(), data, row));
-	            } else if (kind == VNodeKind.If) {
-	                string val = View.Lookup(nd.Text(), data, row);
-	                if (val.Length > 0 && val != "0" && val != "false") {
-	                    View.Emit(nd.Body(), data, row, content, sb);
-	                } else if (nd.ElseBody() != null) {
-	                    View.Emit(nd.ElseBody(), data, row, content, sb);
-	                }
-	            } else if (kind == VNodeKind.Each) {
-	                List<StrMap> rows = null;
-	                if (data != null) { rows = data.ListOf(nd.Text()); }
-	                if (rows != null) {
-	                    for (int r = 0; r < rows.Count; r = r + 1) {
-	                        View.Emit(nd.Body(), data, rows[r], content, sb);
-	                    }
-	                }
-	            } else {
-	                /* {{content}} 双语义（Bug#2）：编译期不区分，发射期按可解析性
-	                   定优先级——layout 填洞进行中（content != null）照旧填洞；
-	                   否则同名变量可解析（行字段或 ViewData）即按转义变量插值；
-	                   都不满足才回落字面量占位（旧文本替换行为的兼容面）。 */
-	                if (content != null) {
-	                    View.Emit(content, data, row, null, sb);
-		                } else if (View.HasVar("content", data, row)) {
-		                    View.HtmlEscapeInto(View.Lookup("content", data, row), sb);
-	                } else {
-	                    sb.Append("{{content}}");
-	                }
-	            }
-	        }
-	    }
+    private static void ExecFlat(string tpl, nint tp,
+                                 List<int> ops, List<int> argA, List<int> argB, List<string> keys,
+                                 int pc, int endPc, ViewData data, StrMap vars, StrMap row,
+                                 StringBuilder sb) {
+        while (pc < endPc) {
+            int op = ops[pc];
+            if (op == 0) {
+                sb.Append(new StringView(tp + (nint)argA[pc], argB[pc]));
+                pc = pc + 1;
+            } else if (op == 1) {
+                View.HtmlEscapeInto(View.LookupFast(keys[pc], vars, row), sb);
+                pc = pc + 1;
+            } else if (op == 2) {
+                sb.Append(View.LookupFast(keys[pc], vars, row));
+                pc = pc + 1;
+            } else if (op == 3) {
+                string val = View.LookupFast(keys[pc], vars, row);
+                int vlen = val.Length;
+                int elsePc = argA[pc];
+                int nextPc = argB[pc];
+                if (vlen > 0 && !(vlen == 1 && (val[0] & 255) == 48)
+                    && !(vlen == 5 && val == "false")) {
+                    View.ExecFlat(tpl, tp, ops, argA, argB, keys, pc + 1, elsePc, data, vars, row, sb);
+                } else if (elsePc < nextPc) {
+                    View.ExecFlat(tpl, tp, ops, argA, argB, keys, elsePc, nextPc, data, vars, row, sb);
+                }
+                pc = nextPc;
+            } else if (op == 4) {
+                int nextPc = argA[pc];
+                List<StrMap> rows = data != null ? data.ListOf(keys[pc]) : null;
+                if (rows != null) {
+                    int rcount = rows.Count;
+                    for (int r = 0; r < rcount; r = r + 1) {
+                        View.ExecFlat(tpl, tp, ops, argA, argB, keys, pc + 1, nextPc, data, vars, rows[r], sb);
+                    }
+                }
+                pc = nextPc;
+            } else {
+                string cval = "";
+                if (View.TryLookupFast("content", vars, row, out cval)) {
+                    View.HtmlEscapeInto(cval, sb);
+                } else {
+                    sb.Append("{{content}}");
+                }
+                pc = pc + 1;
+            }
+        }
+    }
 
-	    /* 每个 {{变量}} 都走这里：行字段优先，其次 ViewData。曾 Has + Get
-	       各哈希一次（SipHash），最坏四次；改单次探测。 */
-	    private static string Lookup(string key, ViewData data, StrMap row) {
-	        string value = "";
-	        if (row != null && row.TryGet(key, out value)) {
-	            return value != null ? value : "";
-	        }
-	        if (data != null) {
-	            StrMap vars = data.Vars();
-	            if (vars != null && vars.TryGet(key, out value)) {
-	                return value != null ? value : "";
-	            }
-	        }
-	        return "";
-	    }
+    private static string TrimSlice(string s, int start, int end) {
+        while (start < end && (s[start] & 255) == 32) { start = start + 1; }
+        while (end > start && (s[end - 1] & 255) == 32) { end = end - 1; }
+        return start < end ? s.Substring(start, end - start) : "";
+    }
 
-	    /* 变量可解析判定：Lookup 的布尔面——供 {{content}} 双语义分派
-	       （Bug#2）等需要区分「解析得到空串」与「根本没有此名」的场合。 */
-	    // 该名字当前是否可解析（行字段或 ViewData 里有它）；只判存在，不取值。
-	    private static bool HasVar(string key, ViewData data, StrMap row) {
-	        if (row != null && row.Has(key)) { return true; }
-	        if (data != null && data.Vars() != null && data.Vars().Has(key)) { return true; }
-	        return false;
-	    }
+    // 单遍 O(N) 区间递归下降编译：彻底消除 FindTag/FindElse 的 O(N^2) 尾部重扫与嵌套 Substring 拷贝。
+    // state[0] = 当前游标，state[1] = 停止原因（0=EOF, 1={{else}}, 2={{/if}}, 3={{/each}}）。
+    // mode: 0=顶层, 1=#if 真分支, 2=#if 假分支, 3=#each 循环体。
+    private static List<VNode> CompileBlock(string tpl, int n, int[] state, int mode) {
+        List<VNode> nodes = new List<VNode>();
+        int i = state[0];
+        while (i < n) {
+            int open = tpl.IndexOf("{{", i);
+            if (open < 0) {
+                nodes.Add(new VNode(VNodeKind.Literal, tpl.Substring(i, n - i)));
+                state[0] = n;
+                state[1] = 0;
+                return nodes;
+            }
+            if (open > i) {
+                nodes.Add(new VNode(VNodeKind.Literal, tpl.Substring(i, open - i)));
+            }
+            // {{{raw}}}
+            if (open + 2 < n && (tpl[open + 2] & 255) == 123) {
+                int close = tpl.IndexOf("}}}", open + 3);
+                if (close < 0) {
+                    state[0] = n;
+                    state[1] = 0;
+                    return nodes;
+                }
+                nodes.Add(new VNode(VNodeKind.RawVar, View.TrimSlice(tpl, open + 3, close)));
+                i = close + 3;
+                continue;
+            }
+            int close2 = tpl.IndexOf("}}", open + 2);
+            if (close2 < 0) {
+                state[0] = n;
+                state[1] = 0;
+                return nodes;
+            }
+            int rawStart = open + 2;
+            int rawLen = close2 - rawStart;
+            // 精确匹配控制结束符（与旧 FindTag / FindElse 的字面量口径完全一致）
+            if (mode == 1 && rawLen == 4
+                && (tpl[rawStart] & 255) == 101 && (tpl[rawStart + 1] & 255) == 108
+                && (tpl[rawStart + 2] & 255) == 115 && (tpl[rawStart + 3] & 255) == 101) {
+                state[0] = close2 + 2;
+                state[1] = 1;
+                return nodes;
+            }
+            if ((mode == 1 || mode == 2) && rawLen == 3
+                && (tpl[rawStart] & 255) == 47 && (tpl[rawStart + 1] & 255) == 105
+                && (tpl[rawStart + 2] & 255) == 102) {
+                state[0] = close2 + 2;
+                state[1] = 2;
+                return nodes;
+            }
+            if (mode == 3 && rawLen == 5
+                && (tpl[rawStart] & 255) == 47 && (tpl[rawStart + 1] & 255) == 101
+                && (tpl[rawStart + 2] & 255) == 97 && (tpl[rawStart + 3] & 255) == 99
+                && (tpl[rawStart + 4] & 255) == 104) {
+                state[0] = close2 + 2;
+                state[1] = 3;
+                return nodes;
+            }
+            int ts = rawStart;
+            int te = close2;
+            while (ts < te && (tpl[ts] & 255) == 32) { ts = ts + 1; }
+            while (te > ts && (tpl[te - 1] & 255) == 32) { te = te - 1; }
+            int tlen = te - ts;
+            if (tlen > 4 && (tpl[ts] & 255) == 35 && (tpl[ts + 1] & 255) == 105
+                && (tpl[ts + 2] & 255) == 102 && (tpl[ts + 3] & 255) == 32) {
+                string condName = View.TrimSlice(tpl, ts + 4, te);
+                state[0] = close2 + 2;
+                List<VNode> thenBody = View.CompileBlock(tpl, n, state, 1);
+                if (state[1] == 0) {
+                    return nodes;
+                }
+                VNode node = new VNode(VNodeKind.If, condName);
+                node.SetBody(thenBody);
+                if (state[1] == 1) {
+                    List<VNode> elseBody = View.CompileBlock(tpl, n, state, 2);
+                    if (state[1] != 2) {
+                        return nodes;
+                    }
+                    node.SetElseBody(elseBody);
+                }
+                nodes.Add(node);
+                i = state[0];
+            } else if (tlen > 6 && (tpl[ts] & 255) == 35 && (tpl[ts + 1] & 255) == 101
+                && (tpl[ts + 2] & 255) == 97 && (tpl[ts + 3] & 255) == 99
+                && (tpl[ts + 4] & 255) == 104 && (tpl[ts + 5] & 255) == 32) {
+                string listName = View.TrimSlice(tpl, ts + 6, te);
+                state[0] = close2 + 2;
+                List<VNode> eachBody = View.CompileBlock(tpl, n, state, 3);
+                if (state[1] != 3) {
+                    return nodes;
+                }
+                VNode node = new VNode(VNodeKind.Each, listName);
+                node.SetBody(eachBody);
+                nodes.Add(node);
+                i = state[0];
+            } else if (tlen == 7 && (tpl[ts] & 255) == 99 && (tpl[ts + 1] & 255) == 111
+                && (tpl[ts + 2] & 255) == 110 && (tpl[ts + 3] & 255) == 116
+                && (tpl[ts + 4] & 255) == 101 && (tpl[ts + 5] & 255) == 110
+                && (tpl[ts + 6] & 255) == 116) {
+                nodes.Add(new VNode(VNodeKind.ContentSlot, ""));
+                i = close2 + 2;
+            } else {
+                nodes.Add(new VNode(VNodeKind.EscapedVar, tlen > 0 ? tpl.Substring(ts, tlen) : ""));
+                i = close2 + 2;
+            }
+        }
+        state[0] = n;
+        state[1] = 0;
+        return nodes;
+    }
 
-    // HTML 转义直写目标 StringBuilder，借用 StringView 切片零分配拼接，消除 Substring 与临时缓冲。
+    public static List<VNode> Compile(string tpl) {
+        if (tpl == null || tpl.Length == 0) { return new List<VNode>(); }
+        int[] state = new int[2];
+        state[0] = 0;
+        state[1] = 0;
+        return View.CompileBlock(tpl, tpl.Length, state, 0);
+    }
+
+    private static void Emit(List<VNode> nodes, ViewData data, StrMap row,
+                             List<VNode> content, StringBuilder sb) {
+        StrMap vars = data != null ? data.Vars() : null;
+        View.EmitFast(nodes, data, vars, row, content, sb);
+    }
+
+    private static void EmitFast(List<VNode> nodes, ViewData data, StrMap vars, StrMap row,
+                                 List<VNode> content, StringBuilder sb) {
+        int count = nodes.Count;
+        for (int i = 0; i < count; i = i + 1) {
+            VNode nd = nodes[i];
+            int kind = nd.Kind();
+            if (kind == VNodeKind.Literal) {
+                sb.Append(nd.Text());
+            } else if (kind == VNodeKind.EscapedVar) {
+                View.HtmlEscapeInto(View.LookupFast(nd.Text(), vars, row), sb);
+            } else if (kind == VNodeKind.RawVar) {
+                sb.Append(View.LookupFast(nd.Text(), vars, row));
+            } else if (kind == VNodeKind.If) {
+                string val = View.LookupFast(nd.Text(), vars, row);
+                int vlen = val.Length;
+                if (vlen > 0 && !(vlen == 1 && (val[0] & 255) == 48)
+                    && !(vlen == 5 && val == "false")) {
+                    View.EmitFast(nd.Body(), data, vars, row, content, sb);
+                } else if (nd.ElseBody() != null) {
+                    View.EmitFast(nd.ElseBody(), data, vars, row, content, sb);
+                }
+            } else if (kind == VNodeKind.Each) {
+                List<StrMap> rows = null;
+                if (data != null) { rows = data.ListOf(nd.Text()); }
+                if (rows != null) {
+                    List<VNode> body = nd.Body();
+                    int rcount = rows.Count;
+                    for (int r = 0; r < rcount; r = r + 1) {
+                        View.EmitFast(body, data, vars, rows[r], content, sb);
+                    }
+                }
+            } else {
+                /* {{content}} 双语义（Bug#2）：layout 填洞优先；否则单次探测解析同名变量；
+                   都不满足才回落字面量占位。 */
+                if (content != null) {
+                    View.EmitFast(content, data, vars, row, null, sb);
+                } else {
+                    string cval = "";
+                    if (View.TryLookupFast("content", vars, row, out cval)) {
+                        View.HtmlEscapeInto(cval, sb);
+                    } else {
+                        sb.Append("{{content}}");
+                    }
+                }
+            }
+        }
+    }
+
+    /* 每个 {{变量}} 都走这里：行字段优先，其次外提的 vars。单次探测。 */
+    private static string LookupFast(string key, StrMap vars, StrMap row) {
+        string value = "";
+        if (row != null && row.TryGet(key, out value)) {
+            return value != null ? value : "";
+        }
+        if (vars != null && vars.TryGet(key, out value)) {
+            return value != null ? value : "";
+        }
+        return "";
+    }
+
+    private static bool TryLookupFast(string key, StrMap vars, StrMap row, out string outVal) {
+        string value = "";
+        if (row != null && row.TryGet(key, out value)) {
+            outVal = value != null ? value : "";
+            return true;
+        }
+        if (vars != null && vars.TryGet(key, out value)) {
+            outVal = value != null ? value : "";
+            return true;
+        }
+        outVal = "";
+        return false;
+    }
+
+    // HTML 转义直写目标 StringBuilder，位掩码快筛 + StringView 切片零分配拼接。
+    // 特殊字符 < (60), > (62), & (38), " (34), ' (39) 全落在 [34..62]，
+    // 掩码 (1<<0)|(1<<4)|(1<<5)|(1<<26)|(1<<28) = 335544369。
     private static void HtmlEscapeInto(string s, StringBuilder sb) {
         if (s == null || s.Length == 0) { return; }
         int n = s.Length;
         int first = -1;
         for (int k = 0; k < n; k = k + 1) {
-            int ch = s[k] & 255;
-            if (ch == 60 || ch == 62 || ch == 38 || ch == 34 || ch == 39) { first = k; break; }
+            int d = (s[k] & 255) - 34;
+            if (d >= 0 && d <= 28 && ((335544369 >> d) & 1) != 0) { first = k; break; }
         }
         if (first < 0) { sb.Append(s); return; }
         nint basePtr = (nint)s;
         int start = 0;
         for (int i = first; i < n; i = i + 1) {
             int c = s[i] & 255;
-            if (c != 60 && c != 62 && c != 38 && c != 34 && c != 39) { continue; }
+            int d = c - 34;
+            if (d < 0 || d > 28 || ((335544369 >> d) & 1) == 0) { continue; }
             if (i > start) { sb.Append(new StringView(basePtr + (nint)start, i - start)); }
             if (c == 60) { sb.Append("&lt;"); }
             else if (c == 62) { sb.Append("&gt;"); }
@@ -289,95 +554,18 @@ public class View {
         if (n > start) { sb.Append(new StringView(basePtr + (nint)start, n - start)); }
     }
 
-    // HTML 转义 < > & " '。单遍扫描：先找首个需转义字符，没有则原串返回
-    // （曾对五个字符各 IndexOf 一遍再扫一遍）。
+    // HTML 转义 < > & " '。位掩码单遍扫描，无需转义时原串返回。
     public static string HtmlEscape(string s) {
         if (s == null) { return ""; }
         int n = s.Length;
         int first = -1;
         for (int k = 0; k < n; k = k + 1) {
-            int ch = s[k] & 255;
-            if (ch == 60 || ch == 62 || ch == 38 || ch == 34 || ch == 39) { first = k; break; }
+            int d = (s[k] & 255) - 34;
+            if (d >= 0 && d <= 28 && ((335544369 >> d) & 1) != 0) { first = k; break; }
         }
         if (first < 0) { return s; }
-        StringBuilder sb = new StringBuilder();
+        StringBuilder sb = new StringBuilder(n + 16);
         View.HtmlEscapeInto(s, sb);
         return sb.ToString();
-    }
-
-    // 从 from 起查找子串（原生 IndexOf；from<=0 从头找）。
-    private static int Find(string hay, string needle, int from) {
-        if (from <= 0) { return hay.IndexOf(needle); }
-        if (from >= hay.Length) { return -1; }
-        return hay.IndexOf(needle, from);
-    }
-
-    private static int FindTag(string tpl, string closeTag, int from) {
-        string openPrefix = "{{#if";
-        if (closeTag == "{{/each}}") { openPrefix = "{{#each"; }
-        int depth = 0;
-        int i = from;
-        int n = tpl.Length;
-        while (i < n) {
-            int nextOpen = View.Find(tpl, openPrefix, i);
-            int nextClose = View.Find(tpl, closeTag, i);
-            if (nextClose < 0) { return -1; }
-            if (nextOpen >= 0 && nextOpen < nextClose) {
-                depth = depth + 1;
-                i = nextOpen + openPrefix.Length;
-            } else if (depth > 0) {
-                depth = depth - 1;
-                i = nextClose + closeTag.Length;
-            } else {
-                return nextClose;
-            }
-        }
-        return -1;
-    }
-
-    private static int FindElse(string tpl, int from, int end) {
-        int depth = 0;
-        int i = from;
-        while (i < end) {
-            int openIf = View.Find(tpl, "{{#if ", i);
-            int openEach = View.Find(tpl, "{{#each ", i);
-            int closeIf = View.Find(tpl, "{{/if}}", i);
-            int closeEach = View.Find(tpl, "{{/each}}", i);
-            int anElse = View.Find(tpl, "{{else}}", i);
-            int best = -1;
-            if (openIf >= 0) { best = openIf; }
-            if (openEach >= 0 && (best < 0 || openEach < best)) { best = openEach; }
-            if (closeIf >= 0 && (best < 0 || closeIf < best)) { best = closeIf; }
-            if (closeEach >= 0 && (best < 0 || closeEach < best)) { best = closeEach; }
-            if (anElse >= 0 && (best < 0 || anElse < best)) { best = anElse; }
-            if (best < 0 || best >= end) { return -1; }
-            if (best == anElse) {
-                if (depth == 0) { return anElse; }
-                i = anElse + 8;
-            } else if (best == openIf) {
-                depth = depth + 1;
-                i = openIf + 6;
-            } else if (best == openEach) {
-                depth = depth + 1;
-                i = openEach + 8;
-            } else if (best == closeIf) {
-                depth = depth - 1;
-                i = closeIf + 7;
-            } else {
-                depth = depth - 1;
-                i = closeEach + 9;
-            }
-        }
-        return -1;
-    }
-
-    // 去除首尾 ASCII 空格。
-    private static string Trim(string s) {
-        int a = 0;
-        int b = s.Length;
-        for (; a < b && (s[a] & 255) == 32; a = a + 1) { }
-        while (b > a && (s[b - 1] & 255) == 32) { b = b - 1; }
-        if (a == 0 && b == s.Length) { return s; }
-        return s.Substring(a, b - a);
     }
 }

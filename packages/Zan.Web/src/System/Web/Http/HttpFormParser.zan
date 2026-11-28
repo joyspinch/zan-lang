@@ -38,34 +38,38 @@ public class HttpFormParser {
         int bIdx = HttpFormParser.FindNoCaseFrom(contentType, "boundary=", 0);
         if (bIdx < 0) { return; }
         int bs = bIdx + 9;
-        int be = bs;
-        while (be < contentType.Length && (contentType[be] & 255) != 59) { be = be + 1; }
-        string raw = contentType.Substring(bs, be - bs);
-        // boundary 参数可带引号。
-        if (raw.Length >= 2 && (raw[0] & 255) == 34
-            && (raw[raw.Length - 1] & 255) == 34) {
-            raw = raw.Substring(1, raw.Length - 2);
+        int ctLen = contentType.Length;
+        int be = NativeMemory.Find((nint)contentType, bs, 59, ctLen - bs);
+        if (be < 0) { be = ctLen; }
+        // boundary 参数可带引号，切片原地去引号并校验，避免中间 raw Substring。
+        if (be - bs >= 2 && (contentType[bs] & 255) == 34
+            && (contentType[be - 1] & 255) == 34) {
+            bs = bs + 1;
+            be = be - 1;
         }
-        if (raw.Length == 0) { return; }
+        int rlen = be - bs;
+        if (rlen <= 0 || rlen > 70) { return; }
         // RFC 2046 §5.1.1：boundary 只允许 bchars（字母数字与 '()+_,-./:=?）且上限 70 字符。
-        if (raw.Length > 70) { return; }
-        int bi = 0;
-        while (bi < raw.Length) {
-            int bc = raw[bi] & 255;
-            bool legal = (bc >= 48 && bc <= 57)  // 0-9
-                || (bc >= 65 && bc <= 90)  // A-Z
-                || (bc >= 97 && bc <= 122)  // a-z
-                || bc == 39 || bc == 40 || bc == 41  // ' ( )
-                || (bc >= 43 && bc <= 47)  // + , - . /
-                || bc == 58 || bc == 61 || bc == 63  // : = ?
-                || bc == 95;  // _
+        for (int bi = bs; bi < be; bi = bi + 1) {
+            int bc = contentType[bi] & 255;
+            bool legal = (bc >= 48 && bc <= 57)
+                || (bc >= 65 && bc <= 90)
+                || (bc >= 97 && bc <= 122)
+                || bc == 39 || bc == 40 || bc == 41
+                || (bc >= 43 && bc <= 47)
+                || bc == 58 || bc == 61 || bc == 63
+                || bc == 95;
             if (!legal) { return; }
-            bi = bi + 1;
         }
-        string delim = "--" + raw;
+        byte[] dbuf = new byte[rlen + 2];
+        dbuf[0] = 45;
+        dbuf[1] = 45;
+        NativeMemory.Copy((nint)dbuf + (nint)2, (nint)contentType + (nint)bs, rlen);
+        string delim = NativeMemory.GetString((nint)dbuf, 0, rlen + 2);
         int n = body.Length;
-        int dlen = delim.Length;
-        int pos = HttpFormParser.FindFrom(body, delim, 0);
+        int dlen = rlen + 2;
+        nint bp = n > 0 ? (nint)body : 0;
+        int pos = body.IndexOf(delim, 0);
         while (pos >= 0) {
             int after = pos + dlen;
             if (after + 1 < n && (body[after] & 255) == 45
@@ -78,12 +82,11 @@ public class HttpFormParser {
             } else if (after < n && (body[after] & 255) == 10) {
                 after = after + 1;
             }
-            int hb = HttpFormParser.FindFrom(body, "\r\n\r\n", after);
+            int hb = body.IndexOf("\r\n\r\n", after);
             if (hb < 0 || hb + 4 > n) { break; }
-            string head = body.Substring(after, hb + 4 - after);
             int vStart = hb + 4;
-            string name = HttpFormParser.DispositionName(head);
-            int next = HttpFormParser.FindFrom(body, delim, vStart);
+            string name = HttpFormParser.DispositionNameSlice(body, bp, after, vStart);
+            int next = body.IndexOf(delim, vStart);
             if (name.Length > 0 && next > vStart) {
                 int vEnd = next;
                 if (vEnd > vStart && (body[vEnd - 1] & 255) == 10) { vEnd = vEnd - 1; }
@@ -96,22 +99,53 @@ public class HttpFormParser {
     }
 
     public static string DispositionName(string head) {
-        if (HttpFormParser.FindNoCaseFrom(head, "filename=", 0) >= 0) { return ""; }
-        int k = HttpFormParser.FindNoCaseFrom(head, "name=", 0);
-        if (k < 0) { return ""; }
-        int qs = k + 5;
-        if (qs < head.Length && (head[qs] & 255) == 34) {
-            int qe = HttpFormParser.FindFrom(head, "\"", qs + 1);
+        if (head == null || head.Length == 0) { return ""; }
+        return HttpFormParser.DispositionNameSlice(head, (nint)head, 0, head.Length);
+    }
+
+    private static bool MatchLower4(string s, int pos, int c0, int c1, int c2, int c3) {
+        int a0 = s[pos] & 255; if (a0 >= 65 && a0 <= 90) { a0 = a0 + 32; }
+        if (a0 != c0) { return false; }
+        int a1 = s[pos + 1] & 255; if (a1 >= 65 && a1 <= 90) { a1 = a1 + 32; }
+        if (a1 != c1) { return false; }
+        int a2 = s[pos + 2] & 255; if (a2 >= 65 && a2 <= 90) { a2 = a2 + 32; }
+        if (a2 != c2) { return false; }
+        int a3 = s[pos + 3] & 255; if (a3 >= 65 && a3 <= 90) { a3 = a3 + 32; }
+        return a3 == c3;
+    }
+
+    // 锚定 '=' 单遍扫描头部切片：彻底消除 "Content-Disposition: form-data" 上的 'f'/'n' 误命中。
+    private static string DispositionNameSlice(string s, nint sp, int start, int end) {
+        int firstNameVal = -1;
+        int p = start;
+        while (p < end) {
+            int eq = NativeMemory.Find(sp, p, 61, end - p);  // '='
+            if (eq < 0) { break; }
+            if (eq >= start + 4 && HttpFormParser.MatchLower4(s, eq - 4, 110, 97, 109, 101)) {
+                // "...name="：检查前面是否 "file"（即 "filename="）
+                if (eq >= start + 8 && HttpFormParser.MatchLower4(s, eq - 8, 102, 105, 108, 101)) {
+                    return "";
+                }
+                if (firstNameVal < 0) {
+                    firstNameVal = eq + 1;
+                }
+            }
+            p = eq + 1;
+        }
+        if (firstNameVal < 0) { return ""; }
+        int qs = firstNameVal;
+        if (qs < end && (s[qs] & 255) == 34) {
+            int qe = NativeMemory.Find(sp, qs + 1, 34, end - (qs + 1));
             if (qe < 0) { return ""; }
-            return head.Substring(qs + 1, qe - qs - 1);
+            return s.Substring(qs + 1, qe - qs - 1);
         }
         int e = qs;
-        while (e < head.Length) {
-            int c = head[e] & 255;
+        while (e < end) {
+            int c = s[e] & 255;
             if (c == 59 || c == 13 || c == 10) { break; }  // ';' CR LF
             e = e + 1;
         }
-        return head.Substring(qs, e - qs);
+        return s.Substring(qs, e - qs);
     }
 
     public static int FindFrom(string hay, string needle, int from) {
@@ -124,11 +158,15 @@ public class HttpFormParser {
     }
 
     public static int FindNoCaseFrom(string hay, string needle, int from) {
-        int n = hay.Length;
+        return HttpFormParser.FindNoCaseRange(hay, from, hay.Length, needle);
+    }
+
+    private static int FindNoCaseRange(string hay, int from, int end, string needle) {
         int m = needle.Length;
         if (from < 0) { from = 0; }
-        if (m == 0) { return from <= n ? from : -1; }
-        int limit = n - m + 1;
+        if (end > hay.Length) { end = hay.Length; }
+        if (m == 0) { return from <= end ? from : -1; }
+        int limit = end - m + 1;
         if (from >= limit) { return -1; }
         int c0 = needle[0] & 255;
         int lo = (c0 >= 65 && c0 <= 90) ? (c0 + 32) : c0;
@@ -159,11 +197,53 @@ public class HttpFormParser {
         return -1;
     }
 
+    // 切片直解 URL 表单字段：无 '+'/'%' 时跳过 Encoding.UrlDecode 直接切片；
+    // 含编码字节时单遍直解入 byte[]，消除 Substring + UrlDecode 二次分配。
+    private static string DecodeFormSlice(string s, nint sp, int start, int end) {
+        int len = end - start;
+        if (len <= 0) { return ""; }
+        int rel = NativeMemory.IndexOfAny(sp + (nint)start, len, 43, 37);  // '+' or '%'
+        if (rel < 0) {
+            return s.Substring(start, len);
+        }
+        byte[] outBuf = new byte[len];
+        if (rel > 0) {
+            NativeMemory.Copy((nint)outBuf, sp + (nint)start, rel);
+        }
+        int di = rel;
+        int i = start + rel;
+        while (i < end) {
+            int c = s[i] & 255;
+            if (c == 43) {
+                outBuf[di] = 32;
+                di = di + 1;
+                i = i + 1;
+            } else if (c == 37 && i + 2 < end) {
+                int h = Encoding.HexDigit(s[i + 1] & 255);
+                int l = Encoding.HexDigit(s[i + 2] & 255);
+                if (h >= 0 && l >= 0) {
+                    outBuf[di] = (byte)((h << 4) | l);
+                    di = di + 1;
+                    i = i + 3;
+                } else {
+                    outBuf[di] = 37;
+                    di = di + 1;
+                    i = i + 1;
+                }
+            } else {
+                outBuf[di] = (byte)c;
+                di = di + 1;
+                i = i + 1;
+            }
+        }
+        return NativeMemory.GetString((nint)outBuf, 0, di);
+    }
+
     public static void ParsePairs(string s, StrMap into) {
         if (s == null || into == null) { return; }
         int i = 0;
         int n = s.Length;
-        nint sp = (nint)s;
+        nint sp = n > 0 ? (nint)s : 0;
         int pairCount = 0;
         while (i < n && pairCount < 4096) {
             int amp = NativeMemory.Find(sp, i, 38, n - i);  // '&'
@@ -171,13 +251,19 @@ public class HttpFormParser {
             int eq = e > i ? NativeMemory.Find(sp, i, 61, e - i) : -1;  // '='
             if (eq > i) {
                 pairCount = pairCount + 1;
-                string k = Encoding.UrlDecode(s.Substring(i, eq - i));
-                string v = Encoding.UrlDecode(s.Substring(eq + 1, e - eq - 1));
-                int kl = k.Length;
-                if (kl > 2 && (k[kl - 2] & 255) == 91 && (k[kl - 1] & 255) == 93) {
-                    k = k.Substring(0, kl - 2);
-                    string prev = into.GetOr(k, "");
-                    if (prev.Length > 0) {
+                bool isArr = (eq - i > 2) && (s[eq - 2] & 255) == 91 && (s[eq - 1] & 255) == 93;
+                string k = HttpFormParser.DecodeFormSlice(s, sp, i, isArr ? (eq - 2) : eq);
+                string v = HttpFormParser.DecodeFormSlice(s, sp, eq + 1, e);
+                if (!isArr) {
+                    int kl = k.Length;
+                    if (kl > 2 && (k[kl - 2] & 255) == 91 && (k[kl - 1] & 255) == 93) {
+                        k = k.Substring(0, kl - 2);
+                        isArr = true;
+                    }
+                }
+                if (isArr) {
+                    string prev = "";
+                    if (into.TryGet(k, out prev) && prev != null && prev.Length > 0) {
                         if (prev.Length >= 65536 || v.Length > 65536 - prev.Length) {
                             i = e + 1;
                             continue;
