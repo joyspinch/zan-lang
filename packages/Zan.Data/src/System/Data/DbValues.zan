@@ -8,6 +8,7 @@ public class DbValues {
 
     public DbValues() {
         this.items = new List<DbValue>();
+        this.items.Reserve(8);
     }
 
     // 设置文本列（覆盖之前的值）。
@@ -42,11 +43,14 @@ public class DbValues {
         return this.push(name, DbParams.KindNull, "", 0, 0.0);
     }
 
-    // 追加一列；同名列已存在时原位覆盖（保持首次出现的顺序）。
+    // 追加一列；同名列已存在时原位覆盖（保持首次出现的顺序，免新对象分配）。
     public DbValues push(string name, int kind, string t, long i, double d) {
         int at = this.IndexOf(name);
         if (at >= 0) {
-            this.items[at] = new DbValue(name, kind, t, i, d);
+            this.items[at].kind = kind;
+            this.items[at].text = t;
+            this.items[at].ival = i;
+            this.items[at].dval = d;
             return this;
         }
         this.items.Add(new DbValue(name, kind, t, i, d));
@@ -64,7 +68,8 @@ public class DbValues {
 
     // 列的索引，不存在时为 -1。
     public int IndexOf(string name) {
-        for (int i = 0; i < this.items.Count; i = i + 1) {
+        int n = this.items.Count;
+        for (int i = 0; i < n; i = i + 1) {
             if (this.items[i].name == name) { return i; }
         }
         return 0 - 1;
@@ -82,10 +87,10 @@ public class DbValues {
 
     // 按原样把索引 i 处的值追加到参数列表。
     public void BindTo(DbParams ps, int i) {
-        DbValue v = this.items[i];
-        if (v.kind == DbParams.KindInt) { ps.AddLong(v.ival); }
-        else if (v.kind == DbParams.KindDouble) { ps.AddDouble(v.dval); }
-        else if (v.kind == DbParams.KindText) { ps.Add(v.text); }
+        int k = this.items[i].kind;
+        if (k == DbParams.KindInt) { ps.AddLong(this.items[i].ival); }
+        else if (k == DbParams.KindDouble) { ps.AddDouble(this.items[i].dval); }
+        else if (k == DbParams.KindText) { ps.Add(this.items[i].text); }
         else { ps.AddNull(); }
     }
 
@@ -95,74 +100,135 @@ public class DbValues {
     // 会抛出指明列名的 Exception，而不是
     // 到达数据库时以类型错误的形式暴露。
     public void BindAs(DbParams ps, int i, int want) {
-        DbValue v = this.items[i];
-        if (v.kind == DbParams.KindNull || want == DbParams.KindNull ||
-            want == v.kind) {
-            this.BindTo(ps, i);
+        int k = this.items[i].kind;
+        if (k == DbParams.KindNull || want == DbParams.KindNull || want == k) {
+            if (k == DbParams.KindInt) { ps.AddLong(this.items[i].ival); }
+            else if (k == DbParams.KindDouble) { ps.AddDouble(this.items[i].dval); }
+            else if (k == DbParams.KindText) { ps.Add(this.items[i].text); }
+            else { ps.AddNull(); }
             return;
         }
         if (want == DbParams.KindInt) {
-            if (v.kind == DbParams.KindDouble) {
-                double d = v.dval;
+            if (k == DbParams.KindDouble) {
+                double d = this.items[i].dval;
                 long r = (long)d;
-                if ((double)r != d) { this.reject(v, "int"); }
+                if ((double)r != d) { this.reject(this.items[i], "int"); }
                 ps.AddLong(r);
                 return;
             }
-            ps.AddLong(this.parseInt(v));
+            ps.AddLong(this.parseInt(this.items[i]));
             return;
         }
         if (want == DbParams.KindDouble) {
-            if (v.kind == DbParams.KindInt) { ps.AddDouble((double)v.ival); return; }
-            ps.AddDouble(this.parseDouble(v));
+            if (k == DbParams.KindInt) { ps.AddDouble((double)this.items[i].ival); return; }
+            ps.AddDouble(this.parseDouble(this.items[i]));
             return;
         }
-        if (v.kind == DbParams.KindInt) { ps.Add(Convert.ToString(v.ival)); return; }
-        ps.Add(Convert.ToString(v.dval));
+        if (k == DbParams.KindInt) { ps.Add(Convert.ToString(this.items[i].ival)); return; }
+        ps.Add(Convert.ToString(this.items[i].dval));
     }
 
     // 严格解析文本为 64 位整数：接受可选正负号与纯数字，
-    // "true"/"false" 分别为 1/0；任何其他形状抛出 reject。
+    // "true"/"false" 分别为 1/0；任何其他形状抛出 reject（Span 零 Trim 分配）。
     private long parseInt(DbValue v) {
-        string t = v.text.Trim();
-        if (t == "true") { return 1; }
-        if (t == "false") { return 0; }
-        int n = t.Length;
-        if (n == 0) { this.reject(v, "int"); }
-        int i = 0;
-        int sign = 1;
-        if (t[0] == 45) { sign = 0 - 1; i = 1; }
-        else if (t[0] == 43) { i = 1; }
-        if (i >= n) { this.reject(v, "int"); }
-        long acc = 0;
-        while (i < n) {
-            int c = t[i] & 255;
+        int slen = v.text.Length;
+        Span<byte> sp = new Span<byte>((nint)v.text, slen);
+        int a = 0;
+        int b = slen;
+        while (a < b) {
+            int c = (int)sp[a];
+            if (c != 32 && (c < 9 || c > 13)) { break; }
+            a = a + 1;
+        }
+        while (b > a) {
+            int c = (int)sp[b - 1];
+            if (c != 32 && (c < 9 || c > 13)) { break; }
+            b = b - 1;
+        }
+        int len = b - a;
+        if (len == 0) { this.reject(v, "int"); }
+        if (len == 4 && sp[a] == 116 && sp[a + 1] == 114 && sp[a + 2] == 117 && sp[a + 3] == 101) {
+            return 1;
+        }
+        if (len == 5 && sp[a] == 102 && sp[a + 1] == 97 && sp[a + 2] == 108 && sp[a + 3] == 115 && sp[a + 4] == 101) {
+            return 0;
+        }
+        int i = a;
+        long sign = 1L;
+        int c0 = (int)sp[i];
+        if (c0 == 45) { sign = -1L; i = i + 1; }
+        else if (c0 == 43) { i = i + 1; }
+        if (i >= b) { this.reject(v, "int"); }
+        long acc = 0L;
+        while (i < b) {
+            int c = (int)sp[i];
             if (c < 48 || c > 57) { this.reject(v, "int"); }
-            acc = acc * 10 + (long)(c - 48);
+            acc = acc * 10L + (long)(c - 48);
             i = i + 1;
         }
-        return acc * (long)sign;
+        return acc * sign;
     }
 
     // 严格解析文本为双精度数：可选正负号、数字与至多一个小数点，
-    // 其余字符（包括空格之外的内容）抛出 reject。
+    // 其余字符（包括空格之外的内容）抛出 reject（Span 零 Trim 分配 + 精确小数快路径）。
     private double parseDouble(DbValue v) {
-        string t = v.text.Trim();
-        if (t.Length == 0) { this.reject(v, "double"); }
-        int i = 0;
-        int n = t.Length;
-        if (t[0] == 45 || t[0] == 43) { i = 1; }
+        int slen = v.text.Length;
+        Span<byte> sp = new Span<byte>((nint)v.text, slen);
+        int a = 0;
+        int b = slen;
+        while (a < b) {
+            int c = (int)sp[a];
+            if (c != 32 && (c < 9 || c > 13)) { break; }
+            a = a + 1;
+        }
+        while (b > a) {
+            int c = (int)sp[b - 1];
+            if (c != 32 && (c < 9 || c > 13)) { break; }
+            b = b - 1;
+        }
+        if (a >= b) { this.reject(v, "double"); }
+        int i = a;
+        bool neg = false;
+        int c0 = (int)sp[i];
+        if (c0 == 45) { neg = true; i = i + 1; }
+        else if (c0 == 43) { i = i + 1; }
         bool digit = false;
         bool dot = false;
-        while (i < n) {
-            int c = t[i] & 255;
-            if (c >= 48 && c <= 57) { digit = true; }
-            else if (c == 46 && !dot) { dot = true; }
-            else { this.reject(v, "double"); }
+        int sigDigits = 0;
+        int fracDigits = 0;
+        long mant = 0L;
+        while (i < b) {
+            int c = (int)sp[i];
+            if (c >= 48 && c <= 57) {
+                digit = true;
+                int d = c - 48;
+                if (sigDigits < 15) {
+                    if (mant != 0L || d != 0) { sigDigits = sigDigits + 1; }
+                    mant = mant * 10L + (long)d;
+                } else {
+                    sigDigits = sigDigits + 1;
+                }
+                if (dot) { fracDigits = fracDigits + 1; }
+            } else if (c == 46 && !dot) {
+                dot = true;
+            } else {
+                this.reject(v, "double");
+            }
             i = i + 1;
         }
         if (!digit) { this.reject(v, "double"); }
-        return Convert.ToDouble(t);
+        if (sigDigits <= 15 && fracDigits <= 6) {
+            double res = (double)mant;
+            if (fracDigits == 1) { res = res / 10.0; }
+            else if (fracDigits == 2) { res = res / 100.0; }
+            else if (fracDigits == 3) { res = res / 1000.0; }
+            else if (fracDigits == 4) { res = res / 10000.0; }
+            else if (fracDigits == 5) { res = res / 100000.0; }
+            else if (fracDigits == 6) { res = res / 1000000.0; }
+            return neg ? -res : res;
+        }
+        if (a == 0 && b == slen) { return Convert.ToDouble(v.text); }
+        return Convert.ToDouble(NativeMemory.GetString((nint)v.text, a, b - a));
     }
 
     // 抛出指明列名、原值与目标类型的转换失败异常。

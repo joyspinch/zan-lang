@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Numerics;
 using System.Text;
 
 namespace Testing.Fixtures;
@@ -20,64 +21,175 @@ namespace Testing.Fixtures;
 // **并发**：非线程安全（复用同一个随机源）。
 public class FixtureText {
     private FixtureRandom random;
+    private RandomExt rng;
+    private byte[] scratch;
 
     public FixtureText(FixtureRandom random) {
         this.random = random != null ? random : new FixtureRandom();
+        this.rng = this.random.rng;
+        this.scratch = new byte[256];
+    }
+
+    private void EnsureScratch(int need) {
+        if (this.scratch.Length < need) {
+            this.scratch = new byte[need];
+        }
     }
 
     // 名。
     public string FirstName() {
-        return this.random.Pick<string>(FixtureText.FirstNames());
+        return FixtureText.FirstNameAt(this.rng.NextInt(0, 20));
     }
 
     // 姓。
     public string LastName() {
-        return this.random.Pick<string>(FixtureText.LastNames());
+        return FixtureText.LastNameAt(this.rng.NextInt(0, 20));
     }
 
     // 姓名（姓 + 名）。
     public string FullName() {
-        return this.LastName() + this.FirstName();
+        string last = FixtureText.LastNameAt(this.rng.NextInt(0, 20));
+        string first = FixtureText.FirstNameAt(this.rng.NextInt(0, 20));
+        int ll = last.Length;
+        int fl = first.Length;
+        nint bp = (nint)this.scratch;
+        NativeMemory.Copy(bp, (nint)last, ll);
+        NativeMemory.Copy(bp + (nint)ll, (nint)first, fl);
+        return NativeMemory.GetString(bp, 0, ll + fl);
     }
 
     // 登录名（小写字母与数字，5..12 位）。
     public string UserName() {
-        return this.random.Alphanumeric(5, 12).ToLowerAscii();
+        return this.random.Alphanumeric(5, 12);
+    }
+
+    private static int WriteAlnum(Span<byte> buf, int di, RandomExt r, int minLen, int maxLen) {
+        int len = r.NextInt(minLen, maxLen + 1);
+        for (int i = 0; i < len; i = i + 1) {
+            int v = r.NextInt(0, 36);
+            buf[di] = (byte)(v < 26 ? 97 + v : 48 + (v - 26));
+            di = di + 1;
+        }
+        return di;
+    }
+
+    private static int WriteIntSmall(Span<byte> buf, int di, int v) {
+        if (v >= 100) {
+            int d0 = v / 100;
+            int rem = v - d0 * 100;
+            int d1 = rem / 10;
+            buf[di] = (byte)(48 + d0);
+            buf[di + 1] = (byte)(48 + d1);
+            buf[di + 2] = (byte)(48 + (rem - d1 * 10));
+            return di + 3;
+        }
+        if (v >= 10) {
+            int d1 = v / 10;
+            buf[di] = (byte)(48 + d1);
+            buf[di + 1] = (byte)(48 + (v - d1 * 10));
+            return di + 2;
+        }
+        buf[di] = (byte)(48 + v);
+        return di + 1;
     }
 
     // 邮箱（`名.姓@域名` 形态）。
     public string Email() {
-        return this.UserName() + "@" + this.Domain();
+        nint bp = (nint)this.scratch;
+        Span<byte> buf = new Span<byte>(bp, 40);
+        int di = FixtureText.WriteAlnum(buf, 0, this.rng, 5, 12);
+        buf[di] = 64;
+        di = FixtureText.WriteAlnum(buf, di + 1, this.rng, 4, 10);
+        buf[di] = 46;
+        di = di + 1;
+        string tld = FixtureText.TldAt(this.rng.NextInt(0, 6));
+        int tl = tld.Length;
+        NativeMemory.Copy(bp + (nint)di, (nint)tld, tl);
+        return NativeMemory.GetString(bp, 0, di + tl);
     }
 
     // 域名（`词.后缀` 形态）。
     public string Domain() {
-        return this.random.Alphanumeric(4, 10).ToLowerAscii() + "." + this.random.Pick<string>(FixtureText.Tlds());
+        nint bp = (nint)this.scratch;
+        Span<byte> buf = new Span<byte>(bp, 24);
+        int di = FixtureText.WriteAlnum(buf, 0, this.rng, 4, 10);
+        buf[di] = 46;
+        di = di + 1;
+        string tld = FixtureText.TldAt(this.rng.NextInt(0, 6));
+        int tl = tld.Length;
+        NativeMemory.Copy(bp + (nint)di, (nint)tld, tl);
+        return NativeMemory.GetString(bp, 0, di + tl);
     }
 
     // URL（https）。
     public string Url() {
-        return "https://" + this.Domain() + "/" + this.Slug();
+        nint bp = (nint)this.scratch;
+        Span<byte> buf = new Span<byte>(bp, 64);
+        RandomExt r = this.rng;
+        NativeMemory.Copy(bp, (nint)"https://", 8);
+        int di = FixtureText.WriteAlnum(buf, 8, r, 4, 10);
+        buf[di] = 46;
+        di = di + 1;
+        string tld = FixtureText.TldAt(r.NextInt(0, 6));
+        int tl = tld.Length;
+        NativeMemory.Copy(bp + (nint)di, (nint)tld, tl);
+        di = di + tl;
+        buf[di] = 47;
+        di = di + 1;
+        int count = r.NextInt(2, 5);
+        for (int i = 0; i < count; i = i + 1) {
+            if (i > 0) { buf[di] = 45; di = di + 1; }
+            string w = FixtureText.WordAt(r.NextInt(0, 20));
+            int wl = w.Length;
+            NativeMemory.Copy(bp + (nint)di, (nint)w, wl);
+            di = di + wl;
+        }
+        return NativeMemory.GetString(bp, 0, di);
     }
 
     // 国际电话号码（保留测试号段 + 假号）。
     public string PhoneNumber() {
-        return "+1-555-" + this.random.Digits(3) + "-" + this.random.Digits(4);
+        nint bp = (nint)this.scratch;
+        Span<byte> buf = new Span<byte>(bp, 15);
+        RandomExt r = this.rng;
+        NativeMemory.Copy(bp, (nint)"+1-555-", 7);
+        buf[7] = (byte)(48 + r.NextInt(0, 10));
+        buf[8] = (byte)(48 + r.NextInt(0, 10));
+        buf[9] = (byte)(48 + r.NextInt(0, 10));
+        buf[10] = 45;
+        buf[11] = (byte)(48 + r.NextInt(0, 10));
+        buf[12] = (byte)(48 + r.NextInt(0, 10));
+        buf[13] = (byte)(48 + r.NextInt(0, 10));
+        buf[14] = (byte)(48 + r.NextInt(0, 10));
+        return NativeMemory.GetString(bp, 0, 15);
     }
 
     // 街道地址。
     public string StreetAddress() {
-        return this.random.Int(1, 999).ToString() + " " + this.random.Pick<string>(FixtureText.Streets()) + " St";
+        int num = this.rng.NextInt(1, 999);
+        string street = FixtureText.StreetAt(this.rng.NextInt(0, 10));
+        int sl = street.Length;
+        nint bp = (nint)this.scratch;
+        Span<byte> buf = new Span<byte>(bp, 20);
+        int di = FixtureText.WriteIntSmall(buf, 0, num);
+        buf[di] = 32;
+        di = di + 1;
+        NativeMemory.Copy(bp + (nint)di, (nint)street, sl);
+        di = di + sl;
+        buf[di] = 32;
+        buf[di + 1] = 83;
+        buf[di + 2] = 116;
+        return NativeMemory.GetString(bp, 0, di + 3);
     }
 
     // 城市。
     public string City() {
-        return this.random.Pick<string>(FixtureText.Cities());
+        return FixtureText.CityAt(this.rng.NextInt(0, 15));
     }
 
     // 国家。
     public string Country() {
-        return this.random.Pick<string>(FixtureText.Countries());
+        return FixtureText.CountryAt(this.rng.NextInt(0, 10));
     }
 
     // 邮政编码（5 位数字）。
@@ -87,59 +199,123 @@ public class FixtureText {
 
     // 公司名。
     public string Company() {
-        return this.random.Pick<string>(FixtureText.CompanyWords()) + " " +
-            this.random.Pick<string>(FixtureText.CompanySuffixes());
+        string w = FixtureText.CompanyWordAt(this.rng.NextInt(0, 10));
+        string s = FixtureText.CompanySuffixAt(this.rng.NextInt(0, 6));
+        int wl = w.Length;
+        int sl = s.Length;
+        nint bp = (nint)this.scratch;
+        Span<byte> buf = new Span<byte>(bp, wl + 1 + sl);
+        NativeMemory.Copy(bp, (nint)w, wl);
+        buf[wl] = 32;
+        NativeMemory.Copy(bp + (nint)(wl + 1), (nint)s, sl);
+        return NativeMemory.GetString(bp, 0, wl + 1 + sl);
     }
 
     // 一个句子（3..12 个词，带句号）。
     public string Sentence() {
-        int count = this.random.Int(3, 13);
-        string text = this.Words(count);
-        return text + ".";
+        RandomExt r = this.rng;
+        int count = r.NextInt(3, 13);
+        nint bp = (nint)this.scratch;
+        Span<byte> buf = new Span<byte>(bp, 100);
+        int di = 0;
+        for (int i = 0; i < count; i = i + 1) {
+            if (i > 0) { buf[di] = 32; di = di + 1; }
+            string w = FixtureText.WordAt(r.NextInt(0, 20));
+            int wl = w.Length;
+            NativeMemory.Copy(bp + (nint)di, (nint)w, wl);
+            di = di + wl;
+        }
+        buf[di] = 46;
+        return NativeMemory.GetString(bp, 0, di + 1);
     }
 
     // 一段话（若干句子）。
     public string Paragraph(int sentences) {
         if (sentences <= 0) { return ""; }
-        StringBuilder text = new StringBuilder();
-        for (int i = 0; i < sentences; i = i + 1) {
-            if (i > 0) { text.Append(" "); }
-            text.Append(this.Sentence());
+        int need = sentences * 97;
+        this.EnsureScratch(need);
+        nint bp = (nint)this.scratch;
+        Span<byte> buf = new Span<byte>(bp, need);
+        RandomExt r = this.rng;
+        int di = 0;
+        for (int s = 0; s < sentences; s = s + 1) {
+            if (s > 0) { buf[di] = 32; di = di + 1; }
+            int count = r.NextInt(3, 13);
+            for (int i = 0; i < count; i = i + 1) {
+                if (i > 0) { buf[di] = 32; di = di + 1; }
+                string w = FixtureText.WordAt(r.NextInt(0, 20));
+                int wl = w.Length;
+                NativeMemory.Copy(bp + (nint)di, (nint)w, wl);
+                di = di + wl;
+            }
+            buf[di] = 46;
+            di = di + 1;
         }
-        return text.ToString();
+        return NativeMemory.GetString(bp, 0, di);
     }
 
     // 若干个词（空格分隔）。
     public string Words(int count) {
-        StringBuilder text = new StringBuilder();
+        if (count <= 0) { return ""; }
+        int need = count * 8;
+        this.EnsureScratch(need);
+        nint bp = (nint)this.scratch;
+        Span<byte> buf = new Span<byte>(bp, need);
+        RandomExt r = this.rng;
+        int di = 0;
         for (int i = 0; i < count; i = i + 1) {
-            if (i > 0) { text.Append(" "); }
-            text.Append(this.random.Pick<string>(FixtureText.WordList()));
+            if (i > 0) { buf[di] = 32; di = di + 1; }
+            string w = FixtureText.WordAt(r.NextInt(0, 20));
+            int wl = w.Length;
+            NativeMemory.Copy(bp + (nint)di, (nint)w, wl);
+            di = di + wl;
         }
-        return text.ToString();
+        return NativeMemory.GetString(bp, 0, di);
     }
 
     // URL 友好的短标识（kebab-case）。
     public string Slug() {
-        int count = this.random.Int(2, 5);
-        StringBuilder text = new StringBuilder();
+        RandomExt r = this.rng;
+        int count = r.NextInt(2, 5);
+        nint bp = (nint)this.scratch;
+        Span<byte> buf = new Span<byte>(bp, 36);
+        int di = 0;
         for (int i = 0; i < count; i = i + 1) {
-            if (i > 0) { text.Append("-"); }
-            text.Append(this.random.Pick<string>(FixtureText.WordList()));
+            if (i > 0) { buf[di] = 45; di = di + 1; }
+            string w = FixtureText.WordAt(r.NextInt(0, 20));
+            int wl = w.Length;
+            NativeMemory.Copy(bp + (nint)di, (nint)w, wl);
+            di = di + wl;
         }
-        return text.ToString().ToLowerAscii();
+        return NativeMemory.GetString(bp, 0, di);
     }
 
     // 十六进制颜色（`#rrggbb`）。
     public string ColorHex() {
-        return "#" + this.random.Hex(6);
+        nint bp = (nint)this.scratch;
+        Span<byte> buf = new Span<byte>(bp, 7);
+        RandomExt r = this.rng;
+        buf[0] = 35;
+        for (int i = 1; i < 7; i = i + 1) {
+            int v = r.NextInt(0, 16);
+            buf[i] = (byte)(v < 10 ? 48 + v : 87 + v);
+        }
+        return NativeMemory.GetString(bp, 0, 7);
     }
 
     // 语义化版本号（`1.2.3`）。
     public string SemanticVersion() {
-        return this.random.Int(0, 5).ToString() + "." +
-            this.random.Int(0, 20).ToString() + "." +
-            this.random.Int(0, 30).ToString();
+        int a = this.rng.NextInt(0, 5);
+        int b = this.rng.NextInt(0, 20);
+        int c = this.rng.NextInt(0, 30);
+        nint bp = (nint)this.scratch;
+        Span<byte> buf = new Span<byte>(bp, 8);
+        buf[0] = (byte)(48 + a);
+        buf[1] = 46;
+        int di = FixtureText.WriteIntSmall(buf, 2, b);
+        buf[di] = 46;
+        di = FixtureText.WriteIntSmall(buf, di + 1, c);
+        return NativeMemory.GetString(bp, 0, di);
     }
 
     // 信用卡号（**保留的测试卡号段**，不生成可真实扣款的号）。
@@ -147,73 +323,176 @@ public class FixtureText {
     // 4242 开头是支付网关公开的测试卡号段；这里再拼 12 位随机数字，够跑
     // Luhn 校验与长度校验，但不会撞上真实卡号。
     public string CreditCardNumber() {
-        return "4242" + this.random.Digits(12);
+        nint bp = (nint)this.scratch;
+        Span<byte> buf = new Span<byte>(bp, 16);
+        RandomExt r = this.rng;
+        buf[0] = 52; buf[1] = 50; buf[2] = 52; buf[3] = 50;
+        for (int i = 4; i < 16; i = i + 1) {
+            buf[i] = (byte)(48 + r.NextInt(0, 10));
+        }
+        return NativeMemory.GetString(bp, 0, 16);
     }
 
-    // 名词表。
-    private static string[] WordList() {
-        return new string[] {
-            "data", "network", "signal", "buffer", "kernel", "module", "packet",
-            "router", "server", "client", "token", "cache", "stream", "record",
-            "engine", "bridge", "worker", "queue", "index", "graph"
-        };
+    // 零堆分配静态字面量分发（无 static string[] 退出残余，零 GC/ARC 分配）。
+    private static string WordAt(int i) {
+        switch (i) {
+            case 0: return "data";
+            case 1: return "network";
+            case 2: return "signal";
+            case 3: return "buffer";
+            case 4: return "kernel";
+            case 5: return "module";
+            case 6: return "packet";
+            case 7: return "router";
+            case 8: return "server";
+            case 9: return "client";
+            case 10: return "token";
+            case 11: return "cache";
+            case 12: return "stream";
+            case 13: return "record";
+            case 14: return "engine";
+            case 15: return "bridge";
+            case 16: return "worker";
+            case 17: return "queue";
+            case 18: return "index";
+            default: return "graph";
+        }
     }
 
-    // 名（中文）。
-    private static string[] FirstNames() {
-        return new string[] {
-            "伟", "芳", "娜", "秀英", "敏", "静", "丽", "强", "磊", "洋",
-            "艳", "勇", "军", "杰", "娟", "涛", "明", "超", "秀兰", "霞"
-        };
+    private static string FirstNameAt(int i) {
+        switch (i) {
+            case 0: return "伟";
+            case 1: return "芳";
+            case 2: return "娜";
+            case 3: return "秀英";
+            case 4: return "敏";
+            case 5: return "静";
+            case 6: return "丽";
+            case 7: return "强";
+            case 8: return "磊";
+            case 9: return "洋";
+            case 10: return "艳";
+            case 11: return "勇";
+            case 12: return "军";
+            case 13: return "杰";
+            case 14: return "娟";
+            case 15: return "涛";
+            case 16: return "明";
+            case 17: return "超";
+            case 18: return "秀兰";
+            default: return "霞";
+        }
     }
 
-    // 姓（中文）。
-    private static string[] LastNames() {
-        return new string[] {
-            "王", "李", "张", "刘", "陈", "杨", "黄", "赵", "吴", "周",
-            "徐", "孙", "马", "朱", "胡", "郭", "何", "高", "林", "罗"
-        };
+    private static string LastNameAt(int i) {
+        switch (i) {
+            case 0: return "王";
+            case 1: return "李";
+            case 2: return "张";
+            case 3: return "刘";
+            case 4: return "陈";
+            case 5: return "杨";
+            case 6: return "黄";
+            case 7: return "赵";
+            case 8: return "吴";
+            case 9: return "周";
+            case 10: return "徐";
+            case 11: return "孙";
+            case 12: return "马";
+            case 13: return "朱";
+            case 14: return "胡";
+            case 15: return "郭";
+            case 16: return "何";
+            case 17: return "高";
+            case 18: return "林";
+            default: return "罗";
+        }
     }
 
-    // 城市。
-    private static string[] Cities() {
-        return new string[] {
-            "北京", "上海", "广州", "深圳", "杭州", "成都", "武汉", "西安",
-            "南京", "重庆", "天津", "苏州", "青岛", "长沙", "郑州"
-        };
+    private static string CityAt(int i) {
+        switch (i) {
+            case 0: return "北京";
+            case 1: return "上海";
+            case 2: return "广州";
+            case 3: return "深圳";
+            case 4: return "杭州";
+            case 5: return "成都";
+            case 6: return "武汉";
+            case 7: return "西安";
+            case 8: return "南京";
+            case 9: return "重庆";
+            case 10: return "天津";
+            case 11: return "苏州";
+            case 12: return "青岛";
+            case 13: return "长沙";
+            default: return "郑州";
+        }
     }
 
-    // 国家。
-    private static string[] Countries() {
-        return new string[] {
-            "中国", "日本", "韩国", "美国", "德国", "法国", "英国", "加拿大",
-            "澳大利亚", "新加坡"
-        };
+    private static string CountryAt(int i) {
+        switch (i) {
+            case 0: return "中国";
+            case 1: return "日本";
+            case 2: return "韩国";
+            case 3: return "美国";
+            case 4: return "德国";
+            case 5: return "法国";
+            case 6: return "英国";
+            case 7: return "加拿大";
+            case 8: return "澳大利亚";
+            default: return "新加坡";
+        }
     }
 
-    // 街道名。
-    private static string[] Streets() {
-        return new string[] {
-            "Main", "Oak", "Pine", "Maple", "Cedar", "Elm", "Sunset", "Highland",
-            "River", "Lake"
-        };
+    private static string StreetAt(int i) {
+        switch (i) {
+            case 0: return "Main";
+            case 1: return "Oak";
+            case 2: return "Pine";
+            case 3: return "Maple";
+            case 4: return "Cedar";
+            case 5: return "Elm";
+            case 6: return "Sunset";
+            case 7: return "Highland";
+            case 8: return "River";
+            default: return "Lake";
+        }
     }
 
-    // 公司名用词。
-    private static string[] CompanyWords() {
-        return new string[] {
-            "Blue", "Silver", "North", "Quantum", "Iron", "Vertex", "Lumen",
-            "Orbit", "Summit", "Cobalt"
-        };
+    private static string CompanyWordAt(int i) {
+        switch (i) {
+            case 0: return "Blue";
+            case 1: return "Silver";
+            case 2: return "North";
+            case 3: return "Quantum";
+            case 4: return "Iron";
+            case 5: return "Vertex";
+            case 6: return "Lumen";
+            case 7: return "Orbit";
+            case 8: return "Summit";
+            default: return "Cobalt";
+        }
     }
 
-    // 公司后缀。
-    private static string[] CompanySuffixes() {
-        return new string[] { "Labs", "Systems", "Works", "Group", "Technologies", "Dynamics" };
+    private static string CompanySuffixAt(int i) {
+        switch (i) {
+            case 0: return "Labs";
+            case 1: return "Systems";
+            case 2: return "Works";
+            case 3: return "Group";
+            case 4: return "Technologies";
+            default: return "Dynamics";
+        }
     }
 
-    // 顶级域名。
-    private static string[] Tlds() {
-        return new string[] { "com", "net", "org", "io", "dev", "example" };
+    private static string TldAt(int i) {
+        switch (i) {
+            case 0: return "com";
+            case 1: return "net";
+            case 2: return "org";
+            case 3: return "io";
+            case 4: return "dev";
+            default: return "example";
+        }
     }
 }

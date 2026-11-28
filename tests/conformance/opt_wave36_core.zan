@@ -1,0 +1,256 @@
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Net.External;
+using Cloud.Oss;
+using Ai;
+using Ai.Mcp;
+using Game.Arpg;
+using Testing.Fixtures;
+
+class Program {
+    static void Check(bool cond, string label) {
+        if (!cond) {
+            Console.WriteLine("FAIL: " + label);
+            Environment.Exit(1);
+        }
+    }
+
+    static void TestOssConfig() {
+        OssConfig c1 = new OssConfig();
+        c1.endpoint = "https://oss-cn-hangzhou.aliyuncs.com";
+        c1.bucket = "bkt";
+        Check(c1.Parse() && c1.endpointTls && c1.endpointHost == "oss-cn-hangzhou.aliyuncs.com" && c1.endpointPort == 443, "oss c1");
+        Check(c1.VirtualHost() && !c1.UsesBucketPrefix(), "oss c1 vhost");
+        Check(c1.ObjectKey("///dir/sub/file.txt") == "dir/sub/file.txt", "oss key1");
+
+        OssConfig c2 = new OssConfig();
+        c2.endpoint = "  http://127.0.0.1:9000/  ";
+        c2.bucket = "dev";
+        c2.pathStyle = true;
+        c2.basePath = "  /app/v1/  ";
+        Check(c2.Parse() && !c2.endpointTls && c2.endpointHost == "127.0.0.1" && c2.endpointPort == 9000, "oss c2");
+        Check(!c2.VirtualHost() && c2.UsesBucketPrefix(), "oss c2 pathstyle");
+        Check(c2.ObjectKey("/img/a.png") == "app/v1/img/a.png", "oss key2");
+        Check(c2.ObjectKey("///") == "app/v1", "oss key empty");
+
+        OssConfig c3 = new OssConfig();
+        c3.endpoint = "https://{bucket}.s3.us-east-1.amazonaws.com:8443";
+        c3.bucket = "mybkt";
+        c3.pathStyle = true;
+        Check(c3.Parse() && c3.hostHasBucket && !c3.pathStyle && c3.endpointHost == "mybkt.s3.us-east-1.amazonaws.com" && c3.endpointPort == 8443, "oss c3");
+        Check(OssConfig.HasBucketPlaceholder(c3.endpoint) && !OssConfig.HasBucketPlaceholder("https://a.com"), "oss placeholder");
+        Check(OssConfig.Substitute("pre-{x}-post", "{x}", "VAL") == "pre-VAL-post", "oss sub");
+
+        OssConfig c4 = new OssConfig();
+        c4.endpoint = "http://[::1]:9001";
+        Check(c4.Parse() && c4.endpointHost == "::1" && c4.endpointPort == 9001, "oss ipv6");
+
+        string[] bad = new string[] {
+            "", "   ", "https://", "https://a.com?x=1", "https://a.com#frag",
+            "https://a.com:99999", "https://a.com:0", "https://a.com:abc",
+            "https://a.com\nbad", "https://bad host.com"
+        };
+        for (int i = 0; i < bad.Length; i = i + 1) {
+            OssConfig bc = new OssConfig();
+            bc.endpoint = bad[i];
+            bc.bucket = "b";
+            Check(!bc.Parse(), "oss bad " + Convert.ToString(i));
+        }
+        Console.WriteLine("OSS_OK");
+    }
+
+    static void TestAiEndpoints() {
+        AiEndpoint a1 = AiEndpoint.Parse("https://api.openai.com/v1/chat/completions///");
+        Check(a1 != null && a1.Tls() && a1.Host() == "api.openai.com" && a1.Port() == 443 && a1.Path() == "/v1/chat/completions", "ai a1");
+        Check(a1.Canonical() == "https://api.openai.com/v1/chat/completions" && !a1.Local(), "ai a1 canon");
+
+        AiEndpoint a2 = AiEndpoint.Parse("http://127.0.0.1:11434/api/chat");
+        Check(a2 != null && !a2.Tls() && a2.Host() == "127.0.0.1" && a2.Port() == 11434 && a2.Path() == "/api/chat" && a2.Local(), "ai a2");
+        Check(a2.Canonical() == "http://127.0.0.1:11434/api/chat", "ai a2 canon");
+
+        AiEndpoint a3 = AiEndpoint.Parse("https://[::1]:8443/v1");
+        Check(a3 != null && a3.Host() == "::1" && a3.Port() == 8443 && a3.Local() && a3.Canonical() == "https://[::1]:8443/v1", "ai a3 ipv6");
+
+        AiEndpoint a4 = AiEndpoint.Parse("https://example.com:99999/v1");
+        Check(a4 != null && a4.Port() == 443 && a4.Canonical() == "https://example.com/v1", "ai a4 bad port fallback");
+
+        McpEndpoint m1 = McpEndpoint.Parse("  https://mcp.example.com/rpc///  \r\n");
+        Check(m1 != null && m1.Tls() && m1.Host() == "mcp.example.com" && m1.Port() == 443 && m1.Path() == "/rpc" && m1.RequestPath() == "/rpc", "mcp m1");
+
+        McpEndpoint m2 = McpEndpoint.Parse("\thttp://localhost:8080/\t");
+        Check(m2 != null && !m2.Tls() && m2.Host() == "localhost" && m2.Port() == 8080 && m2.Path() == "" && m2.RequestPath() == "/" && m2.Local(), "mcp m2");
+
+        string[] badA = new string[] { "", "ftp://x.com", "https://", "https://user@x.com/a", "https://x.com/a#frag", "https://x.com\\a" };
+        for (int i = 0; i < badA.Length; i = i + 1) {
+            Check(AiEndpoint.Parse(badA[i]) == null, "ai bad " + Convert.ToString(i));
+            Check(McpEndpoint.Parse(badA[i]) == null, "mcp bad " + Convert.ToString(i));
+        }
+        Console.WriteLine("AI_OK");
+    }
+
+    static void TestArpgTemplate() {
+        ArpgValue root = ArpgValue.Object();
+        root.SetPath("hero.name", ArpgValue.Text("Ariadne"));
+        root.SetPath("hero.level", ArpgValue.Integer(42));
+        root.SetPath("hero.zero", ArpgValue.Number(0.0));
+        root.SetPath("hero.frac", ArpgValue.Number(12.5));
+        root.SetPath("hero.neg", ArpgValue.Number(-5.0));
+        root.SetPath("hero.vip", ArpgValue.Boolean(true));
+        root.SetPath("hero.zeroStr", ArpgValue.Text("0"));
+        root.SetPath("hero.falseStr", ArpgValue.Text("false"));
+        root.SetPath("hero.role", ArpgValue.Text("mage"));
+
+        string tpl = "[&hero.name&] Lv.&hero.level& z=&hero.zero& f=&hero.frac& n=&hero.neg& {if &hero.level& >= 40}{if &hero.role& == 'mage'}Archmage{else}Veteran{end}{elseif &hero.level& >= 20}Adept{else}Novice{end} {if &hero.vip&}VIP{end}{if &hero.zeroStr&}BAD1{end}{if &hero.falseStr&}BAD2{end} {raw}&unclosed";
+        string got = ArpgTemplate.EvaluateValue(tpl, root);
+        Check(got == "[Ariadne] Lv.42 z=0 f=12.5 n=-5 Archmage VIP {raw}&unclosed", "tpl full: " + got);
+
+        ArpgTemplateParser p = new ArpgTemplateParser("hello", root);
+        Check(ArpgTemplateParser.Trim("  \tabc\r\n ") == "abc", "tpl trim");
+        Check(ArpgTemplateParser.LooksNumeric("-12.5") && !ArpgTemplateParser.LooksNumeric("abc"), "tpl numeric");
+        Check(p.Compare("&hero.level&", "42", "==") && p.Compare("&hero.level&", "40", ">"), "tpl compare");
+        Check(p.EvaluateCondition("&hero.role& != 'warrior'"), "tpl cond ne");
+        Check(root.Resolve("hero.level").AsText() == "42" && root.Resolve("hero.missing") == null, "tpl resolve");
+        Console.WriteLine("TPL_OK");
+    }
+
+    static void TestArpgFormula() {
+        ArpgAttributes a = new ArpgAttributes();
+        a.SetMaxHp(500.0);
+        a.SetCustom("atk", 120.0);
+        a.SetCustom("int", 85.0);
+        a.SetCustom("crit", 35.0);
+
+        ArpgAttributes b = new ArpgAttributes();
+        b.SetCustom("def", 45.0);
+        b.SetCustom("res", 30.0);
+
+        ArpgFormula f1 = new ArpgFormula("clamp((a.atk * 3 - b.def * 2) + max(a.int, 50) / 5 + 2 ^ 4, 10, 1000)", a, b);
+        int v1 = f1.Evaluate();
+        Check(f1.IsValid() && v1 == 303, "formula v1=" + Convert.ToString(v1));
+
+        ArpgFormula f2 = new ArpgFormula("--min(a.crit * 4, b.res * 5) - (3 ^ 5) + 0 ^ 0", a, b);
+        int v2 = f2.Evaluate();
+        Check(f2.IsValid() && v2 == (140 - 243 + 1), "formula v2=" + Convert.ToString(v2));
+
+        ArpgFormula bad1 = new ArpgFormula("10 / 0", a, b);
+        bad1.Evaluate();
+        Check(!bad1.IsValid(), "formula div0");
+
+        ArpgFormula bad2 = new ArpgFormula("2 ^ -1", a, b);
+        bad2.Evaluate();
+        Check(!bad2.IsValid(), "formula negpow");
+
+        ArpgFormula bad3 = new ArpgFormula("1 + 2 extra", a, b);
+        bad3.Evaluate();
+        Check(!bad3.IsValid(), "formula trailing");
+
+        ArpgAttributes buff = new ArpgAttributes();
+        buff.SetMaxHp(100.0);
+        buff.SetCustom("atk", 25.0);
+        buff.SetCustom("haste", 15.0);
+
+        ArpgAttributes cloned = a.Clone();
+        cloned.AddModifiersFrom(buff);
+        Check(cloned.MaxHp() == 600.0 && cloned.GetCustom("atk") == 145.0 && cloned.GetCustom("haste") == 15.0, "attrs mod");
+        Check(a.GetCustom("atk") == 120.0 && a.GetCustom("haste") == 0.0, "attrs clone isolation");
+        Console.WriteLine("FORMULA_OK");
+    }
+
+    static void TestFixtures() {
+        FixtureRandom r1 = FixtureRandom.Seeded(42L);
+        FixtureText t1 = new FixtureText(r1);
+        FixtureRandom r2 = FixtureRandom.Seeded(42L);
+        FixtureText t2 = new FixtureText(r2);
+
+        string u1 = r1.Uuid();
+        string u2 = r2.Uuid();
+        Check(u1 == u2 && u1.Length == 36, "fixture uuid");
+        Check(r1.Hex(80) == r2.Hex(80), "fixture hex grow");
+        Check(r1.Digits(10) == r2.Digits(10), "fixture digits");
+        Check(t1.FullName() == t2.FullName(), "fixture fullname");
+        Check(t1.Email() == t2.Email(), "fixture email");
+        Check(t1.Domain() == t2.Domain(), "fixture domain");
+        Check(t1.Url() == t2.Url(), "fixture url");
+        Check(t1.PhoneNumber() == t2.PhoneNumber(), "fixture phone");
+        Check(t1.StreetAddress() == t2.StreetAddress(), "fixture street");
+        Check(t1.City() == t2.City() && t1.Country() == t2.Country(), "fixture geo");
+        Check(t1.Company() == t2.Company(), "fixture company");
+        Check(t1.Sentence() == t2.Sentence(), "fixture sentence");
+        Check(t1.Paragraph(5) == t2.Paragraph(5), "fixture para grow");
+        Check(t1.Words(40) == t2.Words(40), "fixture words grow");
+        Check(t1.Slug() == t2.Slug(), "fixture slug");
+        Check(t1.ColorHex() == t2.ColorHex(), "fixture color");
+        Check(t1.SemanticVersion() == t2.SemanticVersion(), "fixture semver");
+        Check(t1.CreditCardNumber() == t2.CreditCardNumber(), "fixture cc");
+        Console.WriteLine("FIXTURE_OK");
+    }
+
+    static void TestDbValues() {
+        DbValues dv = new DbValues();
+        dv.Set("id", "  +123456789012  ")
+          .Set("neg", " -42 ")
+          .Set("flagT", " true ")
+          .Set("flagF", "\tfalse\n")
+          .Set("price", "  249.50  ")
+          .Set("tiny", " -0.000125 ")
+          .Set("pi", " 3.141592653589793 ")
+          .Set("exact", 12.0)
+          .Set("score", 654321L)
+          .Set("drop_me", "x")
+          .SetNull("deleted_at");
+
+        // In-place overwrite preserves order
+        dv.Set("neg", " -99 ");
+        Check(dv.Count() == 11 && dv.IndexOf("neg") == 1 && dv.NameAt(1) == "neg", "db overwrite order");
+        dv.Remove("drop_me");
+        Check(dv.Count() == 10 && !dv.Has("drop_me"), "db remove");
+
+        DbParams ps = new DbParams();
+        dv.BindAs(ps, 0, DbParams.KindInt);
+        dv.BindAs(ps, 1, DbParams.KindInt);
+        dv.BindAs(ps, 2, DbParams.KindInt);
+        dv.BindAs(ps, 3, DbParams.KindInt);
+        dv.BindAs(ps, 4, DbParams.KindDouble);
+        dv.BindAs(ps, 5, DbParams.KindDouble);
+        dv.BindAs(ps, 6, DbParams.KindDouble);
+        dv.BindAs(ps, 7, DbParams.KindInt);
+        dv.BindAs(ps, 8, DbParams.KindText);
+        dv.BindAs(ps, 9, DbParams.KindText);
+
+        Check(ps.IntAt(0) == 123456789012L, "db int0");
+        Check(ps.IntAt(1) == -99L, "db int1");
+        Check(ps.IntAt(2) == 1L && ps.IntAt(3) == 0L, "db bools");
+        Check(ps.DoubleAt(4) == 249.5, "db dbl4");
+        Check(ps.DoubleAt(5) == -0.000125, "db dbl5");
+        Check(ps.DoubleAt(6) > 3.141592653589 && ps.DoubleAt(6) < 3.141592653590, "db dbl6");
+        Check(ps.IntAt(7) == 12L, "db dbl->int");
+        Check(ps.TextAt(8) == "654321", "db int->text");
+        Check(ps.IsNull(9), "db null");
+
+        int rej = 0;
+        DbValues bad = new DbValues();
+        bad.Set("a", "   ").Set("b", "+").Set("c", "12x").Set("d", 12.5)
+           .Set("e", ".").Set("f", "1.2.3").Set("g", "1e5");
+        DbParams bp = new DbParams();
+        try { bad.BindAs(bp, 0, DbParams.KindInt); } catch (Exception ex) { rej = rej + 1; }
+        try { bad.BindAs(bp, 1, DbParams.KindInt); } catch (Exception ex) { rej = rej + 1; }
+        try { bad.BindAs(bp, 2, DbParams.KindInt); } catch (Exception ex) { rej = rej + 1; }
+        try { bad.BindAs(bp, 3, DbParams.KindInt); } catch (Exception ex) { rej = rej + 1; }
+        try { bad.BindAs(bp, 4, DbParams.KindDouble); } catch (Exception ex) { rej = rej + 1; }
+        try { bad.BindAs(bp, 5, DbParams.KindDouble); } catch (Exception ex) { rej = rej + 1; }
+        try { bad.BindAs(bp, 6, DbParams.KindDouble); } catch (Exception ex) { rej = rej + 1; }
+        Check(rej == 7, "db rejects");
+        Console.WriteLine("DB_OK");
+    }
+
+    static void Main() {
+        TestOssConfig();
+        TestAiEndpoints();
+        TestArpgTemplate();
+        TestArpgFormula();
+        TestFixtures();
+        TestDbValues();
+        Console.WriteLine("WAVE36_ALL_OK");
+    }
+}

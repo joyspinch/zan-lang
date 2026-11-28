@@ -39,33 +39,54 @@ public class ArpgFormula {
 
     // 跳过当前位置的空白字符（空格/制表/换行/回车）。
     public void SkipSpace() {
-        while (this.index < this.text.Length) {
-            int c = this.text[this.index] & 255;
-            if (c != 32 && c != 9 && c != 10 && c != 13) { return; }
-            this.index = this.index + 1;
+        int n = this.text.Length;
+        int idx = this.index;
+        if (idx >= n) { return; }
+        Span<byte> sp = new Span<byte>((nint)this.text, n);
+        while (idx < n) {
+            int c = (int)sp[idx];
+            if (c != 32 && c != 9 && c != 10 && c != 13) { break; }
+            idx = idx + 1;
         }
+        this.index = idx;
     }
 
     // 跳过空白后若当前字符为 expected 则消费之并返回 true。
     public bool Match(int expected) {
-        this.SkipSpace();
-        if (this.Current() != expected) { return false; }
-        this.index = this.index + 1;
+        int n = this.text.Length;
+        Span<byte> sp = new Span<byte>((nint)this.text, n);
+        int idx = this.index;
+        while (idx < n) {
+            int c = (int)sp[idx];
+            if (c != 32 && c != 9 && c != 10 && c != 13) { break; }
+            idx = idx + 1;
+        }
+        this.index = idx;
+        if (idx >= n || (int)sp[idx] != expected) { return false; }
+        this.index = idx + 1;
         return true;
     }
 
     // 解析十进制整数；无数字时置错并返回 0（不识别符号与小数）。
     public int ParseNumber() {
-        this.SkipSpace();
-        int start = this.index;
-        int result = 0;
-        while (this.index < this.text.Length) {
-            int c = this.text[this.index] & 255;
-            if (c < 48 || c > 57) { break; }
-            result = result * 10 + c - 48;
-            this.index = this.index + 1;
+        int n = this.text.Length;
+        Span<byte> sp = new Span<byte>((nint)this.text, n);
+        int idx = this.index;
+        while (idx < n) {
+            int c = (int)sp[idx];
+            if (c != 32 && c != 9 && c != 10 && c != 13) { break; }
+            idx = idx + 1;
         }
-        if (this.index == start) {
+        int start = idx;
+        int result = 0;
+        while (idx < n) {
+            int c = (int)sp[idx];
+            if (c < 48 || c > 57) { break; }
+            result = result * 10 + (c - 48);
+            idx = idx + 1;
+        }
+        this.index = idx;
+        if (idx == start) {
             this.valid = false;
             return 0;
         }
@@ -74,91 +95,160 @@ public class ArpgFormula {
 
     // 判断 c 是否可作为标识符字符（字母/数字/点/下划线/高位字节）。
     public bool IsNameChar(int c) {
-        return c >= 48 && c <= 57
-            || c >= 65 && c <= 90
-            || c >= 97 && c <= 122
+        return (c >= 48 && c <= 57)
+            || (c >= 65 && c <= 90)
+            || (c >= 97 && c <= 122)
             || c == 46 || c == 95
             || c >= 128;
     }
 
     // 解析标识符（属性名或函数名）；无有效字符时置错并返回空串。
     public string ParseName() {
-        this.SkipSpace();
-        int start = this.index;
-        while (this.index < this.text.Length
-            && this.IsNameChar(this.text[this.index] & 255)) {
-            this.index = this.index + 1;
+        int n = this.text.Length;
+        nint tp = (nint)this.text;
+        Span<byte> sp = new Span<byte>(tp, n);
+        int idx = this.index;
+        while (idx < n) {
+            int c = (int)sp[idx];
+            if (c != 32 && c != 9 && c != 10 && c != 13) { break; }
+            idx = idx + 1;
         }
-        if (this.index == start) {
+        int start = idx;
+        while (idx < n) {
+            int c = (int)sp[idx];
+            bool ok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90)
+                || (c >= 97 && c <= 122) || c == 46 || c == 95 || c >= 128;
+            if (!ok) { break; }
+            idx = idx + 1;
+        }
+        this.index = idx;
+        if (idx == start) {
             this.valid = false;
             return "";
         }
-        return this.text.Substring(start, this.index - start);
+        return NativeMemory.GetString(tp, start, idx - start);
     }
 
     // 解析属性引用：a.前缀取左属性表，b.前缀取右属性表（截断取
     // 整）；前缀不符或对应属性表为 null 时置错并返回 0。
     public int Attribute(string name) {
-        if (name.Length > 2
-            && name.Substring(0, 2) == "a."
-            && this.leftAttrs != null) {
-            return (int)this.leftAttrs.Get(
-                name.Substring(2, name.Length - 2));
-        }
-        if (name.Length > 2
-            && name.Substring(0, 2) == "b."
-            && this.rightAttrs != null) {
-            return (int)this.rightAttrs.Get(
-                name.Substring(2, name.Length - 2));
+        int n = name.Length;
+        if (n > 2) {
+            nint np = (nint)name;
+            Span<byte> sp = new Span<byte>(np, n);
+            if (sp[1] == 46) {
+                int c0 = (int)sp[0];
+                if (c0 == 97 && this.leftAttrs != null) {
+                    return (int)this.leftAttrs.GetCustomPtr(np, 2, n - 2);
+                }
+                if (c0 == 98 && this.rightAttrs != null) {
+                    return (int)this.rightAttrs.GetCustomPtr(np, 2, n - 2);
+                }
+            }
         }
         this.valid = false;
         return 0;
     }
 
-    // 解析基础表达式：数字、括号子表达式、属性引用或
-    // min/max/clamp 函数调用；语法不符时置错并返回 0。
-    public int ParsePrimary() {
-        this.SkipSpace();
-        int c = this.Current();
+    private int EvalPrimary(nint tp, Span<byte> sp, int n) {
+        int idx = this.index;
+        while (idx < n) {
+            int c = (int)sp[idx];
+            if (c != 32 && c != 9 && c != 10 && c != 13) { break; }
+            idx = idx + 1;
+        }
+        if (idx >= n) {
+            this.index = idx;
+            this.valid = false;
+            return 0;
+        }
+        int c = (int)sp[idx];
         if (c == 40) {
-            this.index = this.index + 1;
-            int result = this.ParseAddSub();
-            if (!this.Match(41)) { this.valid = false; }
+            this.index = idx + 1;
+            int result = this.EvalAddSub(tp, sp, n);
+            int ci = this.index;
+            while (ci < n) {
+                int ws = (int)sp[ci];
+                if (ws != 32 && ws != 9 && ws != 10 && ws != 13) { break; }
+                ci = ci + 1;
+            }
+            if (ci < n && sp[ci] == 41) { this.index = ci + 1; }
+            else { this.index = ci; this.valid = false; }
             return result;
         }
         if (c >= 48 && c <= 57) {
-            return this.ParseNumber();
+            int result = c - 48;
+            idx = idx + 1;
+            while (idx < n) {
+                int d = (int)sp[idx];
+                if (d < 48 || d > 57) { break; }
+                result = result * 10 + (d - 48);
+                idx = idx + 1;
+            }
+            this.index = idx;
+            return result;
         }
 
-        string name = this.ParseName();
-        if (!this.valid) { return 0; }
-        this.SkipSpace();
-        if (this.Current() != 40) {
-            return this.Attribute(name);
+        // 零分配扫描标识符切片 [nameStart, nameEnd)
+        int nameStart = idx;
+        while (idx < n) {
+            int nc = (int)sp[idx];
+            bool ok = (nc >= 48 && nc <= 57) || (nc >= 65 && nc <= 90)
+                || (nc >= 97 && nc <= 122) || nc == 46 || nc == 95 || nc >= 128;
+            if (!ok) { break; }
+            idx = idx + 1;
+        }
+        if (idx == nameStart) {
+            this.index = idx;
+            this.valid = false;
+            return 0;
+        }
+        int nameEnd = idx;
+        int nameLen = nameEnd - nameStart;
+        while (idx < n) {
+            int ws = (int)sp[idx];
+            if (ws != 32 && ws != 9 && ws != 10 && ws != 13) { break; }
+            idx = idx + 1;
+        }
+        this.index = idx;
+        if (idx >= n || sp[idx] != 40) {
+            if (nameLen > 2 && sp[nameStart + 1] == 46) {
+                int c0 = (int)sp[nameStart];
+                if (c0 == 97 && this.leftAttrs != null) {
+                    return (int)this.leftAttrs.GetCustomPtr(tp, nameStart + 2, nameLen - 2);
+                }
+                if (c0 == 98 && this.rightAttrs != null) {
+                    return (int)this.rightAttrs.GetCustomPtr(tp, nameStart + 2, nameLen - 2);
+                }
+            }
+            this.valid = false;
+            return 0;
         }
 
-        this.index = this.index + 1;
-        int first = this.ParseAddSub();
-        if (name == "min") {
-            if (!this.Match(44)) { this.valid = false; return 0; }
-            int second = this.ParseAddSub();
-            if (!this.Match(41)) { this.valid = false; return 0; }
-            if (first < second) { return first; }
-            return second;
-        }
-        if (name == "max") {
-            if (!this.Match(44)) { this.valid = false; return 0; }
-            int second = this.ParseAddSub();
-            if (!this.Match(41)) { this.valid = false; return 0; }
-            if (first > second) { return first; }
-            return second;
-        }
-        if (name == "clamp") {
-            if (!this.Match(44)) { this.valid = false; return 0; }
-            int minimum = this.ParseAddSub();
-            if (!this.Match(44)) { this.valid = false; return 0; }
-            int maximum = this.ParseAddSub();
-            if (!this.Match(41)) { this.valid = false; return 0; }
+        this.index = idx + 1;
+        int first = this.EvalAddSub(tp, sp, n);
+        if (nameLen == 3 && sp[nameStart] == 109) {
+            int c1 = (int)sp[nameStart + 1];
+            int c2 = (int)sp[nameStart + 2];
+            if (c1 == 105 && c2 == 110) {
+                if (!this.MatchSpan(sp, n, 44)) { this.valid = false; return 0; }
+                int second = this.EvalAddSub(tp, sp, n);
+                if (!this.MatchSpan(sp, n, 41)) { this.valid = false; return 0; }
+                return first < second ? first : second;
+            }
+            if (c1 == 97 && c2 == 120) {
+                if (!this.MatchSpan(sp, n, 44)) { this.valid = false; return 0; }
+                int second = this.EvalAddSub(tp, sp, n);
+                if (!this.MatchSpan(sp, n, 41)) { this.valid = false; return 0; }
+                return first > second ? first : second;
+            }
+        } else if (nameLen == 5 && sp[nameStart] == 99 && sp[nameStart + 1] == 108
+            && sp[nameStart + 2] == 97 && sp[nameStart + 3] == 109 && sp[nameStart + 4] == 112) {
+            if (!this.MatchSpan(sp, n, 44)) { this.valid = false; return 0; }
+            int minimum = this.EvalAddSub(tp, sp, n);
+            if (!this.MatchSpan(sp, n, 44)) { this.valid = false; return 0; }
+            int maximum = this.EvalAddSub(tp, sp, n);
+            if (!this.MatchSpan(sp, n, 41)) { this.valid = false; return 0; }
             if (first < minimum) { return minimum; }
             if (first > maximum) { return maximum; }
             return first;
@@ -168,52 +258,73 @@ public class ArpgFormula {
         return 0;
     }
 
-    // 解析一元 +/- 前缀（可叠加，如 --x）。
-    public int ParseUnary() {
-        this.SkipSpace();
-        if (this.Match(45)) { return -this.ParseUnary(); }
-        if (this.Match(43)) { return this.ParseUnary(); }
-        return this.ParsePrimary();
+    private bool MatchSpan(Span<byte> sp, int n, int expected) {
+        int idx = this.index;
+        while (idx < n) {
+            int c = (int)sp[idx];
+            if (c != 32 && c != 9 && c != 10 && c != 13) { break; }
+            idx = idx + 1;
+        }
+        if (idx >= n || (int)sp[idx] != expected) {
+            this.index = idx;
+            return false;
+        }
+        this.index = idx + 1;
+        return true;
     }
 
-    // 整数幂运算；指数为负置错并返回 0。
-    public int Power(int baseValue, int exponent) {
-        if (exponent < 0) {
-            this.valid = false;
-            return 0;
+    private int EvalUnary(nint tp, Span<byte> sp, int n) {
+        int idx = this.index;
+        while (idx < n) {
+            int c = (int)sp[idx];
+            if (c != 32 && c != 9 && c != 10 && c != 13) { break; }
+            idx = idx + 1;
         }
-        int result = 1;
-        for (int i = 0; i < exponent; i = i + 1) {
-            result = result * baseValue;
+        this.index = idx;
+        if (idx < n) {
+            int c = (int)sp[idx];
+            if (c == 45) { this.index = idx + 1; return -this.EvalUnary(tp, sp, n); }
+            if (c == 43) { this.index = idx + 1; return this.EvalUnary(tp, sp, n); }
         }
-        return result;
+        return this.EvalPrimary(tp, sp, n);
     }
 
-    // 解析 ^ 幂层（右操作数经一元层，支持 2^-3 形式语法）。
-    public int ParsePower() {
-        int result = this.ParseUnary();
+    private int EvalPower(nint tp, Span<byte> sp, int n) {
+        int result = this.EvalUnary(tp, sp, n);
         while (true) {
-            this.SkipSpace();
-            if (this.Current() != 94) { return result; }
-            this.index = this.index + 1;
-            int exponent = this.ParseUnary();
+            int idx = this.index;
+            while (idx < n) {
+                int ws = (int)sp[idx];
+                if (ws != 32 && ws != 9 && ws != 10 && ws != 13) { break; }
+                idx = idx + 1;
+            }
+            this.index = idx;
+            if (idx >= n || sp[idx] != 94) { return result; }
+            this.index = idx + 1;
+            int exponent = this.EvalUnary(tp, sp, n);
             result = this.Power(result, exponent);
         }
         return result;
     }
 
-    // 解析 * / 乘除层；除数为 0 置错且该步结果按 0 计。
-    public int ParseMulDiv() {
-        int result = this.ParsePower();
+    private int EvalMulDiv(nint tp, Span<byte> sp, int n) {
+        int result = this.EvalPower(tp, sp, n);
         while (true) {
-            this.SkipSpace();
-            int c = this.Current();
+            int idx = this.index;
+            while (idx < n) {
+                int ws = (int)sp[idx];
+                if (ws != 32 && ws != 9 && ws != 10 && ws != 13) { break; }
+                idx = idx + 1;
+            }
+            this.index = idx;
+            if (idx >= n) { return result; }
+            int c = (int)sp[idx];
             if (c == 42) {
-                this.index = this.index + 1;
-                result = result * this.ParsePower();
+                this.index = idx + 1;
+                result = result * this.EvalPower(tp, sp, n);
             } else if (c == 47) {
-                this.index = this.index + 1;
-                int divisor = this.ParsePower();
+                this.index = idx + 1;
+                int divisor = this.EvalPower(tp, sp, n);
                 if (divisor == 0) {
                     this.valid = false;
                     result = 0;
@@ -227,18 +338,24 @@ public class ArpgFormula {
         return result;
     }
 
-    // 解析 + - 加减层（优先级最低）。
-    public int ParseAddSub() {
-        int result = this.ParseMulDiv();
+    private int EvalAddSub(nint tp, Span<byte> sp, int n) {
+        int result = this.EvalMulDiv(tp, sp, n);
         while (true) {
-            this.SkipSpace();
-            int c = this.Current();
+            int idx = this.index;
+            while (idx < n) {
+                int ws = (int)sp[idx];
+                if (ws != 32 && ws != 9 && ws != 10 && ws != 13) { break; }
+                idx = idx + 1;
+            }
+            this.index = idx;
+            if (idx >= n) { return result; }
+            int c = (int)sp[idx];
             if (c == 43) {
-                this.index = this.index + 1;
-                result = result + this.ParseMulDiv();
+                this.index = idx + 1;
+                result = result + this.EvalMulDiv(tp, sp, n);
             } else if (c == 45) {
-                this.index = this.index + 1;
-                result = result - this.ParseMulDiv();
+                this.index = idx + 1;
+                result = result - this.EvalMulDiv(tp, sp, n);
             } else {
                 return result;
             }
@@ -246,12 +363,74 @@ public class ArpgFormula {
         return result;
     }
 
+    // 解析基础表达式：数字、括号子表达式、属性引用或
+    // min/max/clamp 函数调用；语法不符时置错并返回 0。
+    public int ParsePrimary() {
+        int n = this.text.Length;
+        nint tp = (nint)this.text;
+        return this.EvalPrimary(tp, new Span<byte>(tp, n), n);
+    }
+
+    // 解析一元 +/- 前缀（可叠加，如 --x）。
+    public int ParseUnary() {
+        int n = this.text.Length;
+        nint tp = (nint)this.text;
+        return this.EvalUnary(tp, new Span<byte>(tp, n), n);
+    }
+
+    // 整数幂运算（二进制快速幂，保持完全一致的 32 位整型乘法语义）；指数为负置错并返回 0。
+    public int Power(int baseValue, int exponent) {
+        if (exponent < 0) {
+            this.valid = false;
+            return 0;
+        }
+        int result = 1;
+        int b = baseValue;
+        int e = exponent;
+        while (e > 0) {
+            if ((e & 1) != 0) { result = result * b; }
+            e = e >> 1;
+            if (e > 0) { b = b * b; }
+        }
+        return result;
+    }
+
+    // 解析 ^ 幂层（右操作数经一元层，支持 2^-3 形式语法）。
+    public int ParsePower() {
+        int n = this.text.Length;
+        nint tp = (nint)this.text;
+        return this.EvalPower(tp, new Span<byte>(tp, n), n);
+    }
+
+    // 解析 * / 乘除层；除数为 0 置错且该步结果按 0 计。
+    public int ParseMulDiv() {
+        int n = this.text.Length;
+        nint tp = (nint)this.text;
+        return this.EvalMulDiv(tp, new Span<byte>(tp, n), n);
+    }
+
+    // 解析 + - 加减层（优先级最低）。
+    public int ParseAddSub() {
+        int n = this.text.Length;
+        nint tp = (nint)this.text;
+        return this.EvalAddSub(tp, new Span<byte>(tp, n), n);
+    }
+
     // 求值整个表达式并返回整数结果；有剩余未消费字符视为语法
     // 错误（置错）。结果是否可信以 IsValid 为准。
     public int Evaluate() {
-        int result = this.ParseAddSub();
-        this.SkipSpace();
-        if (this.index < this.text.Length) { this.valid = false; }
+        int n = this.text.Length;
+        nint tp = (nint)this.text;
+        Span<byte> sp = new Span<byte>(tp, n);
+        int result = this.EvalAddSub(tp, sp, n);
+        int idx = this.index;
+        while (idx < n) {
+            int c = (int)sp[idx];
+            if (c != 32 && c != 9 && c != 10 && c != 13) { break; }
+            idx = idx + 1;
+        }
+        this.index = idx;
+        if (idx < n) { this.valid = false; }
         return result;
     }
 }
