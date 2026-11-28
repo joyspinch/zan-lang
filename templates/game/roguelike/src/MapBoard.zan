@@ -1,0 +1,105 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Backend;
+using Gui.Widget;
+
+// 地图面板：子控件是一行行标准按钮（节点），面板自己在按钮底下画连线与地面纹理。
+//
+// 连线三种：走过的路（熔金实线）、从当前位置出发可走的路（余烬色虚线，缓缓流动）、
+// 其余（暗褐点线）。按钮的位置每帧从布局结果里读，所以窗口缩放后连线照样对齐。
+public class MapBoard : Panel {
+    public override string Kind() { return "Panel"; }
+
+    ActMap map;
+    int pos;
+    List<Button> buttons;
+
+    public MapBoard(ActMap map, int pos) : base("column") {
+        this.style = 3;
+        this.layout = 1;
+        this.flexFlow = 1;
+        this.map = map;
+        this.pos = pos;
+        this.buttons = new List<Button>();
+        for (int i = 0; i < map.nodes.Count; i = i + 1) { this.buttons.Add(null); }
+    }
+
+    public void Bind(int index, Button b) { this.buttons[index] = b; }
+
+    public override void OnPaint(App app) {
+        Canvas c = app.canvas;
+        if (bw <= 0 || bh <= 0) { return; }
+        int now = Window.GetTickMs();
+        c.PushClip(bx, by, bw, bh);
+        // 地面：中间一道暖光，两侧压暗；每一行一条极淡的"楼层线"，读得出自下而上的攀登。
+        c.FillRadial(bx + bw / 2, by + bh / 2, bw * 2 / 3, (int)0xFFFF8A30, 30);
+        c.FillRadial(bx + bw / 2, by + 40, bw / 3, (int)0xFFFF4A20, 34);
+        for (int r = 0; r < ActMap.Rows(); r = r + 1) {
+            List<MapNode> row = this.map.RowNodes(r);
+            if (row.Count == 0 || this.buttons[row[0].index] == null) { continue; }
+            Button rb = this.buttons[row[0].index];
+            int ly = rb.by + rb.bh / 2;
+            c.FillRect(bx + 24, ly, bw - 48, 1, (int)0x10FFD8A0);
+        }
+        bool animate = false;
+        for (int i = 0; i < this.map.nodes.Count; i = i + 1) {
+            MapNode a = this.map.nodes[i];
+            Button ba = this.buttons[i];
+            if (ba == null || ba.bw <= 0) { continue; }
+            for (int j = 0; j < a.next.Count; j = j + 1) {
+                MapNode b = this.map.nodes[a.next[j]];
+                Button bb = this.buttons[b.index];
+                if (bb == null || bb.bw <= 0) { continue; }
+                int x0 = ba.bx + ba.bw / 2;
+                int y0 = ba.by + ba.bh / 2;
+                int x1 = bb.bx + bb.bw / 2;
+                int y1 = bb.by + bb.bh / 2;
+                if (a.visited && b.visited) {
+                    c.DrawLine(x0, y0, x1, y1, (int)0x55FFB040, 9);
+                    c.DrawLine(x0, y0, x1, y1, (int)0xFFE8B04A, 4);
+                } else if (a.index == this.pos) {
+                    this.Dashed(c, x0, y0, x1, y1, (int)0xFFFF8A3A, 4, now / 40);
+                    animate = true;
+                } else {
+                    this.Dashed(c, x0, y0, x1, y1, (int)0x885E4532, 3, 0);
+                }
+            }
+        }
+        // 本幕起点：从底边引出到第 0 行可选节点的余烬虚线。
+        if (this.pos < 0) {
+            List<MapNode> row = this.map.RowNodes(0);
+            for (int i = 0; i < row.Count; i = i + 1) {
+                Button b = this.buttons[row[i].index];
+                if (b == null || b.bw <= 0) { continue; }
+                int x1 = b.bx + b.bw / 2;
+                this.Dashed(c, x1, by + bh - 4, x1, b.by + b.bh / 2, (int)0xFFFF8A3A, 4, now / 40);
+            }
+            animate = true;
+        }
+        c.PopClip();
+        if (animate) { app.RequestAnimationFrame(50); }
+    }
+
+    // 虚线：phase 让虚线沿方向流动。
+    void Dashed(Canvas c, int x0, int y0, int x1, int y1, int color, int thick, int phase) {
+        double dx = (double)(x1 - x0);
+        double dy = (double)(y1 - y0);
+        double len = Math.Sqrt(dx * dx + dy * dy);
+        if (len < 1.0) { return; }
+        double dash = 10.0;
+        double gap = 8.0;
+        double step = dash + gap;
+        double off = (double)(phase % 18);
+        double s = -off;
+        while (s < len) {
+            double a = s < 0.0 ? 0.0 : s;
+            double b = s + dash > len ? len : s + dash;
+            if (b > a) {
+                c.DrawLine(x0 + (int)(dx * a / len), y0 + (int)(dy * a / len),
+                           x0 + (int)(dx * b / len), y0 + (int)(dy * b / len), color, thick);
+            }
+            s = s + step;
+        }
+    }
+}

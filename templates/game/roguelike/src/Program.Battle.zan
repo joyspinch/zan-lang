@@ -1,0 +1,230 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Backend;
+using Gui.Widget;
+using Game.Cards;
+
+// 战斗页：顶栏 / 场景（立绘 + 铭牌 + 意图横幅）/ 能量与牌堆 / 手牌。
+public partial class Program {
+
+    void BuildBattle() {
+        Battle b = this.flow.battle;
+        string tag = b.def.Boss() ? "Boss 战" : (b.def.Elite() ? "精英战" : "战斗");
+        this.BuildTopBar(tag + " · " + b.def.name);
+
+        BattleStage stage = new BattleStage(this.fx, b);
+        stage.Class = "rg-stage";
+        stage.Pad(14);
+        stage.Gap(12);
+        Panel left = this.Col("rg-stage-side");
+        left.With(this.Spacer());
+        Panel heroPlate = this.ActorPlate("攀登者", b.player, false);
+        left.With(heroPlate);
+        stage.With(left);
+        stage.With(this.IntentColumn(b));
+        Panel right = this.Col("rg-stage-side");
+        right.With(this.Spacer());
+        Panel enemyPlate = this.ActorPlate(b.def.name, b.enemy, true);
+        right.With(enemyPlate);
+        stage.With(right);
+        stage.Anchors(heroPlate, enemyPlate);
+        root.With(stage);
+
+        Panel strip = this.Row("rg-strip rg-mid");
+        strip.Gap(14);
+        Panel orb = this.Col(b.energy > 0 ? "rg-energy" : "rg-energy rg-energy-empty");
+        orb.With(this.Txt(b.energy + "/" + b.maxEnergy, "rg-energy-num"));
+        orb.With(this.Txt("能量", "rg-energy-cap"));
+        orb.Tip = "能量：每回合回满 " + b.maxEnergy + " 点，出牌消耗左上角的数字。";
+        strip.With(orb);
+        strip.With(this.PileChip("抽牌堆", b.deck.DrawPile().Count(), "抽完后弃牌堆洗回抽牌堆。"));
+        strip.With(this.PileChip("弃牌堆", b.deck.DiscardPile().Count(), "打出和回合结束弃掉的牌。"));
+        strip.With(this.PileChip("移出", b.deck.ExhaustPile().Count(), "消耗牌与已生效的能力牌，本场不再回来。"));
+        strip.With(this.Spacer());
+        strip.With(this.Txt(this.BattleHint(b), "rg-dim"));
+        Button endTurn = new Button("结束回合 (E)");
+        endTurn.Class = "rg-cta rg-big-btn";
+        endTurn.name = "endturn";
+        if (this.Holding()) { endTurn.Disabled = true; }
+        endTurn.OnClick(() => { this.EndTurn(); });
+        strip.With(endTurn);
+        root.With(strip);
+
+        Panel hand = this.Row("rg-hand");
+        hand.Gap(10);
+        CardZone zone = b.Hand();
+        bool tight = zone.Count() > 6;
+        for (int i = 0; i < zone.Count(); i = i + 1) {
+            CardDefinition d = zone.At(i).Definition();
+            Button card = this.CardTile(d, i, b.CanPlay(i) && !this.Holding(), b);
+            if (tight) { card.Class = card.Class + " rg-card-tight"; }
+            this.handButtons.Add(card);
+            hand.With(card);
+        }
+        if (zone.Count() == 0) { hand.With(this.Txt(this.Holding() ? "" : "没有手牌了——结束回合吧。", "rg-dim")); }
+        root.With(hand);
+    }
+
+    string BattleHint(Battle b) {
+        if (this.Holding()) { return b.winner == 0 ? "胜利！" : "你倒下了……"; }
+        int need = b.IncomingDamage() - b.player.block;
+        if (need > 0) { return "敌人将造成 " + b.IncomingDamage() + " 伤害，还差 " + need + " 格挡"; }
+        if (b.IncomingDamage() > 0) { return "格挡足够——放心进攻"; }
+        return "敌人这回合不攻击——全力输出";
+    }
+
+    Label PileChip(string name, int count, string tip) {
+        Label l = this.Txt(name + " " + count, "rg-pile");
+        l.Tip = name + "：" + tip;
+        return l;
+    }
+
+    // 角色铭牌：名字（+档次）、血条、生命/格挡、状态徽章（每个都有悬停释义）。
+    Panel ActorPlate(string name, Fighter f, bool enemy) {
+        Panel box = this.Col(enemy ? "rg-plate rg-plate-enemy" : "rg-plate rg-plate-hero");
+        box.Pad(10);
+        box.Gap(6);
+        Panel head = this.Row("rg-mid");
+        head.Gap(8);
+        head.With(this.Txt(name, enemy ? "rg-h3s rg-red" : "rg-h3s"));
+        head.With(this.Spacer());
+        if (enemy && this.flow.battle.def.Boss()) { head.With(this.Txt("BOSS", "rg-tag rg-tag-boss")); }
+        if (enemy && this.flow.battle.def.Elite()) { head.With(this.Txt("精英", "rg-tag rg-tag-elite")); }
+        head.With(this.Txt(f.hp + " / " + f.maxHp, enemy ? "rg-text rg-red" : "rg-text rg-green"));
+        box.With(head);
+        box.With(this.Bar(f.hp, f.maxHp, enemy ? "rg-ehp" : "rg-hp"));
+        Panel chips = this.Row("rg-mid");
+        chips.Gap(5);
+        int shown = 0;
+        if (f.block > 0) { shown = shown + 1; chips.With(this.Status("盾 " + f.block, "rg-st-block", "格挡：先于生命吸收伤害，回合开始清零。")); }
+        if (f.strength != 0) { shown = shown + 1; chips.With(this.Status("力 " + f.strength, "rg-st-str", "力量：每段攻击伤害 +" + f.strength + "。")); }
+        if (f.weakness > 0) { shown = shown + 1; chips.With(this.Status("弱 " + f.weakness, "rg-st-weak", "虚弱：造成的攻击伤害 -25%，还剩 " + f.weakness + " 回合。")); }
+        if (f.vulnerable > 0) { shown = shown + 1; chips.With(this.Status("易 " + f.vulnerable, "rg-st-vuln", "易伤：受到的攻击伤害 +50%，还剩 " + f.vulnerable + " 回合。")); }
+        if (f.poison > 0) { shown = shown + 1; chips.With(this.Status("毒 " + f.poison, "rg-st-poison", "中毒：回合开始失去 " + f.poison + " 生命，然后 -1。")); }
+        if (f.thorns > 0) { shown = shown + 1; chips.With(this.Status("棘 " + f.thorns, "rg-st-thorns", "荆棘：每受到一段攻击，反伤 " + f.thorns + "。")); }
+        if (f.strengthPerTurn > 0) { shown = shown + 1; chips.With(this.Status("魔 +" + f.strengthPerTurn, "rg-st-power", "恶魔形态：每回合开始 +" + f.strengthPerTurn + " 力量。")); }
+        if (f.platingPerTurn > 0) { shown = shown + 1; chips.With(this.Status("甲 +" + f.platingPerTurn, "rg-st-power", "金属化：回合结束获得 " + f.platingPerTurn + " 格挡。")); }
+        if (f.poisonPerTurn > 0) { shown = shown + 1; chips.With(this.Status("瘴 +" + f.poisonPerTurn, "rg-st-power", "剧毒：每回合开始给敌人 " + f.poisonPerTurn + " 中毒。")); }
+        if (f.drawPerTurn > 0) { shown = shown + 1; chips.With(this.Status("悟 +" + f.drawPerTurn, "rg-st-power", "灵感：每回合多抽 " + f.drawPerTurn + " 张。")); }
+        if (shown == 0) { chips.With(this.Txt(enemy ? this.flow.battle.def.blurb : "无状态", "rg-dim")); }
+        box.With(chips);
+        return box;
+    }
+
+    Label Status(string text, string cls, string tip) {
+        Label l = this.Txt(text, "rg-status " + cls);
+        l.Tip = tip;
+        return l;
+    }
+
+    // 中间一列：回合数 + 意图横幅（种类、数值、招式名、说明）。
+    Panel IntentColumn(Battle b) {
+        Panel col = this.Col("rg-fill rg-mid");
+        col.Gap(6);
+        col.With(this.Txt("第 " + b.turn + " 回合", "rg-turn"));
+        EnemyMove m = b.intent;
+        if (m == null || this.Holding()) {
+            if (this.Holding()) {
+                col.With(this.Txt(b.winner == 0 ? "胜利" : "倒下", b.winner == 0 ? "rg-victory" : "rg-defeat"));
+            }
+            return col;
+        }
+        string kind = m.Kind();
+        Panel banner = this.Col("rg-intent rg-intent-" + kind);
+        banner.Pad(10);
+        banner.Gap(0);
+        Panel top = this.Row("rg-mid rg-center");
+        top.Gap(10);
+        top.With(this.Txt(this.IntentWord(kind), "rg-intent-kind"));
+        if (m.damage > 0) {
+            int hit = b.IntentHit();
+            top.With(this.Txt(m.hits > 1 ? hit + "×" + m.hits : Convert.ToString(hit), "rg-intent-num"));
+        }
+        banner.With(top);
+        banner.With(this.Txt("「" + m.name + "」" + this.IntentExtra(m), "rg-intent-move"));
+        banner.Tip = "敌人意图：下回合要做的事。攻击数值已算上双方的力量、虚弱与易伤。";
+        col.With(banner);
+        return col;
+    }
+
+    string IntentWord(string kind) {
+        if (kind == "multi") { return "连击"; }
+        if (kind == "attack") { return "攻击"; }
+        if (kind == "debuff") { return "削弱"; }
+        if (kind == "buff") { return "强化"; }
+        return "防御";
+    }
+
+    string IntentExtra(EnemyMove m) {
+        string s = "";
+        if (m.block > 0) { s = s + " 格挡" + m.block; }
+        if (m.strength > 0) { s = s + " 力量+" + m.strength; }
+        if (m.heal > 0) { s = s + " 回复" + m.heal; }
+        if (m.weakness > 0) { s = s + " 虚弱" + m.weakness; }
+        if (m.vulnerable > 0) { s = s + " 易伤" + m.vulnerable; }
+        if (m.poison > 0) { s = s + " 中毒" + m.poison; }
+        return s;
+    }
+
+    // ---- 卡牌 ------------------------------------------------------------------
+
+    // 一张手牌：标准 Button，内容是一列牌面；能量不足 = 禁用态。悬停提示是关键词释义。
+    Button CardTile(CardDefinition def, int index, bool playable, Battle b) {
+        Button card = new Button(this.CardFace(def, playable, b));
+        card.Class = "rg-card rg-card-" + def.Category() + (CardLibrary.IsUpgraded(def.Id()) ? " rg-card-up" : "");
+        card.name = "card" + index;
+        card.Tip = CardLibrary.Glossary(def) + (index < 9 ? "\n快捷键 " + (index + 1) : "");
+        if (playable) {
+            card.OnClick(() => { this.PlayCard(index); });
+        } else {
+            card.Disabled = true;
+        }
+        return card;
+    }
+
+    // 牌面：费用宝石 + 类型 / 卡面 / 名称 / 效果行 / 关键词。战斗中攻击数值按当前状态预览：
+    // 被力量、易伤抬高显示绿色，被虚弱压低显示红色。
+    Panel CardFace(CardDefinition def, bool affordable, Battle b) {
+        Panel face = this.Col("rg-card-body");
+        Panel head = this.Row("rg-card-head");
+        head.With(this.Txt(Convert.ToString(def.Cost()), affordable ? "rg-cost" : "rg-cost rg-cost-off"));
+        head.With(this.Txt(this.CategoryName(def.Category()), "rg-type rg-type-" + def.Category()));
+        face.With(head);
+        Image img = this.Art(def.Art(), def.Name(), "rg-card-art");
+        if (img != null) { face.With(img); }
+        face.With(this.Txt(def.Name(), CardLibrary.IsUpgraded(def.Id()) ? "rg-card-name rg-card-name-up" : "rg-card-name"));
+        List<string> lines = CardLibrary.Describe(def);
+        int dmg0 = this.FirstDamage(def);
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            string text = lines[i];
+            string cls = "rg-card-fx";
+            if (b != null && dmg0 >= 0 && lines[i].StartsWith("造成 " + dmg0 + " ")) {
+                int now = b.PreviewDamage(dmg0);
+                if (now != dmg0) {
+                    text = text.Replace("造成 " + dmg0 + " ", "造成 " + now + " ");
+                    cls = now > dmg0 ? "rg-card-fx rg-fx-up" : "rg-card-fx rg-fx-down";
+                }
+            }
+            face.With(this.Txt(text, cls));
+        }
+        string kw = CardLibrary.Keywords(def);
+        if (kw != "") { face.With(this.Txt(kw, "rg-card-kw")); }
+        return face;
+    }
+
+    // 第一条直伤的数值（没有返回 -1）。
+    int FirstDamage(CardDefinition def) {
+        for (int i = 0; i < def.EffectCount(); i = i + 1) {
+            if (def.EffectAt(i).Kind() == CardFx.Damage()) { return def.EffectAt(i).Amount(); }
+        }
+        return -1;
+    }
+
+    string CategoryName(string category) {
+        if (category == "attack") { return "攻击"; }
+        if (category == "skill") { return "技能"; }
+        if (category == "power") { return "能力"; }
+        return category;
+    }
+}

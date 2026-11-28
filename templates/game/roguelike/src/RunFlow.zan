@@ -3,148 +3,514 @@ using System.Collections.Generic;
 using Game.Cards;
 using Game.Foundation;
 
-// 一局的流程状态机（阶段 0 主菜单 · 1 路线选择 · 2 战斗 · 3 战后奖励 · 4 结算），
-// 不碰界面：Program 调它推进流程、再按 phase 重建控件树；RoguelikeSim 用同一份
-// 流程做无头回放与机器人模糊（docs/ZAN_STANDARD.md S26/S27）。逻辑与表现分离后，
-// 回放验证的就是玩家实际走的那套规则。
+// 一局的流程状态机，不碰界面：Program 调它推进、再按 phase 重建控件树；RoguelikeSim
+// 用同一份流程做无头回放与机器人模糊（docs/ZAN_STANDARD.md S26/S27）。
+//
+// 阶段：0 主菜单 · 1 地图 · 2 战斗 · 3 战利品 · 4 结算 · 5 篝火 · 6 商店 · 7 奇遇 · 8 选牌
+// （选牌 = 从牌组里挑一张来升级或移除，篝火锻造、商店删牌、奇遇净化共用）。
+// 所有方法对"当前阶段不该做的事"都静默忽略，和点不到的按钮一样——回放与模糊
+// 测试因此可以随便喂输入。
 public class RunFlow {
+    public static int Menu() { return 0; }
+    public static int MapPhase() { return 1; }
+    public static int Fight() { return 2; }
+    public static int Loot() { return 3; }
+    public static int Over() { return 4; }
+    public static int Camp() { return 5; }
+    public static int Store() { return 6; }
+    public static int Encounter() { return 7; }
+    public static int Pick() { return 8; }
+    public static int LastAct() { return 3; }
+
     public CardLibrary library;
+    public Bestiary bestiary;
+    public RelicBook relicBook;
+    public RunEvents events;
     public RunState run;
     public int phase;
-    public CardBattle battle;
-    public List<string> rewardChoices;
+    public Battle battle;
+    public MapNode node;
     public bool runWon;
-    public bool bossFight;
     public string lastNote;
-    // 本局累计回合数（各场战斗的回合数之和，用于"最快登顶"）与上一次出牌是否成功。
-    // 两者只给界面层读，不进回放校验和——加它们不改变任何规则。
+    // 本局累计回合数（"最快登顶"用）与上一次出牌是否成功——只给界面读。
     public int turnsTaken;
     public bool lastPlayOk;
 
+    // 战利品
+    public List<string> rewardChoices;
+    public List<string> relicChoices;
+    public string rewardRelic;
+    public int rewardGold;
+    public bool cardDone;
+    public bool relicDone;
+
+    // 商店
+    public List<string> shopCards;
+    public List<int> shopPrices;
+    public List<bool> shopSold;
+    public List<string> shopRelics;
+    public List<int> shopRelicPrices;
+    public List<bool> shopRelicSold;
+    public bool removeUsed;
+
+    // 奇遇
+    public int eventId;
+    public bool eventDone;
+    public string eventResult;
+
+    // 选牌：1 升级 · 2 移除 · 3 移除基础牌；pickList 是可选的牌组下标。
+    public int pickPurpose;
+    public List<int> pickList;
+    public int pickReturn;
+    public int pickPrice;
+
     public RunFlow() {
         this.library = new CardLibrary();
+        this.bestiary = new Bestiary();
+        this.relicBook = new RelicBook();
+        this.events = new RunEvents();
         this.rewardChoices = new List<string>();
+        this.relicChoices = new List<string>();
+        this.shopCards = new List<string>();
+        this.shopPrices = new List<int>();
+        this.shopSold = new List<bool>();
+        this.shopRelics = new List<string>();
+        this.shopRelicPrices = new List<int>();
+        this.shopRelicSold = new List<bool>();
+        this.pickList = new List<int>();
         this.phase = 0;
         this.lastNote = "";
+        this.rewardRelic = "";
+        this.eventResult = "";
     }
 
-    // 开一局：种子决定后面的一切。
-    public void StartRun(int seed) {
+    // 开一局：种子（与进阶）决定后面的一切。
+    public void StartRun(int seed, int ascension) {
         if (seed <= 0) { seed = 1; }
-        this.run = new RunState(seed, this.library);
-        this.run.BuildFloor();
+        if (ascension < 0) { ascension = 0; }
+        this.run = new RunState(seed, ascension, this.library);
+        this.run.NextAct();
+        this.battle = null;
+        this.node = null;
         this.rewardChoices.Clear();
+        this.relicChoices.Clear();
         this.lastNote = "";
         this.runWon = false;
         this.turnsTaken = 0;
         this.lastPlayOk = false;
-        this.phase = 1;
+        this.phase = RunFlow.MapPhase();
     }
 
-    // 进入一个路线节点：宝箱直接开，其余是战斗。
-    public void EnterNode(MapNode node) {
-        if (node.Kind() == 2) {
-            this.OpenChest();
-            return;
+    // ---- 地图 ----------------------------------------------------------------
+
+    // 走到一个节点（必须是当前可选的节点之一）。
+    public void EnterNode(MapNode target) {
+        if (this.phase != RunFlow.MapPhase() || target == null) { return; }
+        List<MapNode> choices = this.run.Choices();
+        bool ok = false;
+        for (int i = 0; i < choices.Count; i = i + 1) {
+            if (choices[i].index == target.index) { ok = true; }
         }
-        this.StartBattle(node);
+        if (!ok) { return; }
+        this.Visit(target);
     }
 
-    // 开一场战斗：按当前牌组建牌堆，交给引擎的 CardBattle 结算。
-    public void StartBattle(MapNode node) {
-        CardDeck deck = new CardDeck(this.BattleSeed(node));
-        for (int i = 0; i < this.run.Deck().Count; i = i + 1) {
-            CardDefinition def = this.library.Find(this.run.Deck()[i]);
-            if (def != null) { deck.Add(def); }
-        }
-        this.bossFight = node.Kind() == 3;
-        this.battle = new CardBattle(
-            new CardActor("hero", this.run.Hp()),
-            new CardActor(node.EnemyName(), node.Hp()),
-            deck);
-        this.battle.SetEnemyDamage(node.Damage());
-        this.battle.Start();
+    void Visit(MapNode target) {
+        this.run.MoveTo(target);
+        this.node = target;
         this.lastNote = "";
-        this.phase = 2;
+        int k = target.kind;
+        if (k == MapNode.Battle() || k == MapNode.Elite() || k == MapNode.Boss()) { this.StartBattle(target); }
+        else if (k == MapNode.Treasure()) { this.OpenTreasure(); }
+        else if (k == MapNode.Campfire()) { this.phase = RunFlow.Camp(); }
+        else if (k == MapNode.Shop()) { this.OpenShop(); }
+        else { this.OpenEvent(); }
     }
 
-    // 出一张牌。
+    // ---- 战斗 ----------------------------------------------------------------
+
+    public void StartBattle(MapNode target) {
+        int tier = target.kind == MapNode.Boss() ? 2 : (target.kind == MapNode.Elite() ? 1 : 0);
+        bool easy = this.run.act == 1 && target.row < 2;
+        EnemyDef def = this.bestiary.Pick(this.run.act, tier, this.run.Roll(16), easy);
+        int hp = this.run.ScaleEnemyHp(def.hp + this.run.Roll(def.hpVar + 1));
+        int seed = this.run.Seed() * 7 + this.run.floors * 131 + this.run.act * 17;
+        this.battle = new Battle(this.library, this.run.relics, def, hp,
+            this.run.hp, this.run.maxHp, this.run.deck, seed);
+        this.battle.Start();
+        this.phase = RunFlow.Fight();
+        this.CheckBattleEnd();
+    }
+
     public void PlayCard(int index) {
         this.lastPlayOk = false;
-        if (this.battle == null) { return; }
-        CardPlayResult result = this.battle.Play(index);
-        if (!result.Success()) { return; }
+        if (this.phase != RunFlow.Fight() || this.battle == null) { return; }
+        if (!this.battle.Play(index)) { return; }
         this.lastPlayOk = true;
-        this.lastNote = "伤害 " + Convert.ToString(result.Damage())
-            + " · 格挡 " + Convert.ToString(result.Blocked())
-            + " · 治疗 " + Convert.ToString(result.Healed())
-            + " · 抽牌 " + Convert.ToString(result.Drawn());
         this.CheckBattleEnd();
     }
 
-    // 结束回合：弃牌、挨打、抽新牌。
     public void EndTurn() {
-        if (this.battle == null || this.battle.Winner() >= 0) { return; }
-        int hurt = this.battle.EndPlayerTurn();
-        this.lastNote = "敌人反击，你受到 " + Convert.ToString(hurt) + " 点伤害";
+        if (this.phase != RunFlow.Fight() || this.battle == null || this.battle.winner >= 0) { return; }
+        this.battle.EndTurn();
         this.CheckBattleEnd();
     }
 
-    // 战斗结束判定：胜则进奖励，败则进结算。
-    public void CheckBattleEnd() {
-        if (this.battle.Winner() < 0) { return; }
-        this.turnsTaken = this.turnsTaken + this.battle.Turn();
-        if (this.battle.Winner() == 0) {
-            // 残留格挡不跨战斗，折进生命。
-            this.run.SetHp(this.battle.Player().Hp() + this.battle.Player().Block());
-            this.run.AddKill(12);
-            if (this.bossFight) {
-                this.runWon = true;
-                this.phase = 4;
-                return;
-            }
-            this.DrawRewards();
-            this.phase = 3;
+    // 战斗结束：胜则结算战利品，败则结算本局。
+    void CheckBattleEnd() {
+        if (this.battle.winner < 0) { return; }
+        this.turnsTaken = this.turnsTaken + this.battle.turn;
+        if (this.battle.winner != 0) {
+            this.run.SetHp(0);
+            this.runWon = false;
+            this.phase = RunFlow.Over();
             return;
         }
-        this.run.SetHp(0);
-        this.runWon = false;
-        this.phase = 4;
-    }
-
-    // 抽三张互不相同的奖励卡（走本局随机源，同种子同结果）。
-    public void DrawRewards() {
-        this.run.DrawRewards(this.library, this.rewardChoices);
-    }
-
-    // 收下奖励，进入下一层。
-    public void TakeReward(string cardId) {
-        this.run.AddCard(cardId);
-        this.AdvanceFloor();
-    }
-
-    // 宝箱：白拿一张牌，回一点血。
-    public void OpenChest() {
-        string id = this.library.RewardAt(this.run.Roll(this.library.RewardCount()));
-        this.run.AddCard(id);
-        this.run.Heal(8);
-        this.lastNote = "宝箱：获得「" + this.library.Find(id).Name() + "」，回复 8 点生命";
-        this.AdvanceFloor();
-    }
-
-    // 层数推进：三层打完即登顶。
-    public void AdvanceFloor() {
-        if (this.run.Floor() >= 3) {
+        this.run.SetHp(this.battle.player.hp);
+        this.run.kills = this.run.kills + 1;
+        if (this.run.HasRelic("ember_blood")) { this.run.Heal(6); }
+        EnemyDef def = this.battle.def;
+        if (def.Boss() && this.run.act >= RunFlow.LastAct()) {
             this.runWon = true;
-            this.phase = 4;
+            this.phase = RunFlow.Over();
             return;
         }
-        this.run.BuildFloor();
-        this.phase = 1;
+        this.ClearLoot();
+        if (def.Boss()) {
+            this.rewardGold = this.run.AddGold(90 + this.run.Roll(21));
+            List<string> pool = this.relicBook.Unowned(RelicBook.BossTier(), this.run.relics);
+            while (pool.Count > 0 && this.relicChoices.Count < 3) {
+                int at = this.run.Roll(pool.Count);
+                this.relicChoices.Add(pool[at]);
+                pool.RemoveAt(at);
+            }
+            this.relicDone = this.relicChoices.Count == 0;
+            this.DrawRewards(100);
+        } else if (def.Elite()) {
+            this.rewardGold = this.run.AddGold(28 + this.run.Roll(11));
+            this.rewardRelic = this.GrantRandomRelic();
+            this.DrawRewards(25);
+        } else {
+            this.rewardGold = this.run.AddGold(12 + this.run.Roll(9));
+            this.DrawRewards(0);
+        }
+        this.phase = RunFlow.Loot();
     }
 
-    // 每场战斗的牌堆种子：由本局种子与节点派生，同种子必然同洗牌。
-    public int BattleSeed(MapNode node) {
-        return this.run.Seed() + this.run.Floor() * 97 + node.Kind();
+    // ---- 战利品 --------------------------------------------------------------
+
+    void ClearLoot() {
+        this.rewardChoices.Clear();
+        this.relicChoices.Clear();
+        this.rewardRelic = "";
+        this.rewardGold = 0;
+        this.cardDone = false;
+        this.relicDone = true;
     }
+
+    // 三张互不相同的奖励牌；bias 抬高稀有度（精英 25、Boss 100 = 必出稀有）。
+    // 第 2、3 幕有概率直接给升级版。
+    public void DrawRewards(int bias) {
+        this.rewardChoices.Clear();
+        int guard = 0;
+        while (this.rewardChoices.Count < 3 && guard < 64) {
+            guard = guard + 1;
+            int roll = this.run.Roll(100) + bias;
+            string id = this.library.PickReward(roll > 99 ? 99 : roll, this.run.Roll(64));
+            bool dup = false;
+            for (int i = 0; i < this.rewardChoices.Count; i = i + 1) {
+                if (CardLibrary.BaseId(this.rewardChoices[i]) == id) { dup = true; }
+            }
+            if (dup) { continue; }
+            int upChance = this.run.act == 2 ? 12 : (this.run.act == 3 ? 25 : 0);
+            if (this.run.Roll(100) < upChance) { id = CardLibrary.UpgradeOf(id); }
+            this.rewardChoices.Add(id);
+        }
+    }
+
+    public void TakeReward(int index) {
+        if (this.phase != RunFlow.Loot() || this.cardDone || index < 0 || index >= this.rewardChoices.Count) { return; }
+        this.run.deck.Add(this.rewardChoices[index]);
+        this.cardDone = true;
+        this.LeaveLootIfDone();
+    }
+
+    public void SkipCards() {
+        if (this.phase != RunFlow.Loot() || this.cardDone) { return; }
+        this.cardDone = true;
+        this.LeaveLootIfDone();
+    }
+
+    public void TakeRelic(int index) {
+        if (this.phase != RunFlow.Loot() || this.relicDone || index < 0 || index >= this.relicChoices.Count) { return; }
+        this.GrantRelic(this.relicChoices[index]);
+        this.rewardRelic = this.relicChoices[index];
+        this.relicDone = true;
+        this.LeaveLootIfDone();
+    }
+
+    void LeaveLootIfDone() {
+        if (this.cardDone && this.relicDone) { this.AfterNode(); }
+    }
+
+    // 一个节点结束：Boss 之后进下一幕，否则回地图。
+    public void AfterNode() {
+        if (this.node != null && this.node.kind == MapNode.Boss()) {
+            this.run.NextAct();
+        }
+        this.phase = RunFlow.MapPhase();
+    }
+
+    // ---- 遗物 ----------------------------------------------------------------
+
+    // 随机一件还没有的普通遗物（没有可给的就给 50 金币）；返回 id（金币时为空串）。
+    public string GrantRandomRelic() {
+        List<string> pool = this.relicBook.Unowned(RelicBook.Normal(), this.run.relics);
+        if (pool.Count == 0) { this.run.AddGold(50); return ""; }
+        string id = pool[this.run.Roll(pool.Count)];
+        this.GrantRelic(id);
+        return id;
+    }
+
+    // 获得遗物：拾取时生效的遗物在这里结算。
+    public void GrantRelic(string id) {
+        if (this.run.HasRelic(id)) { return; }
+        this.run.relics.Add(id);
+        if (id == "whetstone") { this.run.UpgradeRandom(2, this.library, true); }
+        if (id == "titan_heart") { this.run.AddMaxHp(25); this.run.SetHp(this.run.maxHp); }
+    }
+
+    // ---- 宝箱 / 篝火 ---------------------------------------------------------
+
+    void OpenTreasure() {
+        this.ClearLoot();
+        this.rewardGold = this.run.AddGold(20 + this.run.Roll(16));
+        this.rewardRelic = this.GrantRandomRelic();
+        this.phase = RunFlow.Loot();
+    }
+
+    // 篝火休息：回复 30% 生命上限。
+    public void Rest() {
+        if (this.phase != RunFlow.Camp()) { return; }
+        int heal = this.run.maxHp * 3 / 10;
+        this.run.Heal(heal);
+        this.lastNote = "在篝火旁休息，回复 " + heal + " 生命";
+        this.AfterNode();
+    }
+
+    // 篝火锻造：挑一张牌升级（取消回到篝火）。
+    public void Smith() {
+        if (this.phase != RunFlow.Camp()) { return; }
+        this.OpenPicker(1, RunFlow.Camp(), 0);
+    }
+
+    // ---- 商店 ----------------------------------------------------------------
+
+    void OpenShop() {
+        this.shopCards.Clear();
+        this.shopPrices.Clear();
+        this.shopSold.Clear();
+        this.shopRelics.Clear();
+        this.shopRelicPrices.Clear();
+        this.shopRelicSold.Clear();
+        this.removeUsed = false;
+        int guard = 0;
+        while (this.shopCards.Count < 5 && guard < 64) {
+            guard = guard + 1;
+            string id = this.library.PickReward(this.run.Roll(100), this.run.Roll(64));
+            bool dup = false;
+            for (int i = 0; i < this.shopCards.Count; i = i + 1) {
+                if (this.shopCards[i] == id) { dup = true; }
+            }
+            if (dup) { continue; }
+            this.shopCards.Add(id);
+            this.shopPrices.Add(this.library.Price(id) * (90 + this.run.Roll(21)) / 100);
+            this.shopSold.Add(false);
+        }
+        List<string> pool = this.relicBook.Unowned(RelicBook.Normal(), this.run.relics);
+        while (pool.Count > 0 && this.shopRelics.Count < 2) {
+            int at = this.run.Roll(pool.Count);
+            this.shopRelics.Add(pool[at]);
+            this.shopRelicPrices.Add(140 + this.run.Roll(41));
+            this.shopRelicSold.Add(false);
+            pool.RemoveAt(at);
+        }
+        this.phase = RunFlow.Store();
+    }
+
+    public bool CanBuyCard(int i) {
+        return this.phase == RunFlow.Store() && i >= 0 && i < this.shopCards.Count
+            && !this.shopSold[i] && this.run.gold >= this.shopPrices[i];
+    }
+
+    public void BuyCard(int i) {
+        if (!this.CanBuyCard(i)) { return; }
+        this.run.gold = this.run.gold - this.shopPrices[i];
+        this.run.deck.Add(this.shopCards[i]);
+        this.shopSold[i] = true;
+    }
+
+    public bool CanBuyRelic(int i) {
+        return this.phase == RunFlow.Store() && i >= 0 && i < this.shopRelics.Count
+            && !this.shopRelicSold[i] && this.run.gold >= this.shopRelicPrices[i];
+    }
+
+    public void BuyRelic(int i) {
+        if (!this.CanBuyRelic(i)) { return; }
+        this.run.gold = this.run.gold - this.shopRelicPrices[i];
+        this.GrantRelic(this.shopRelics[i]);
+        this.shopRelicSold[i] = true;
+    }
+
+    public bool CanRemove() {
+        return this.phase == RunFlow.Store() && !this.removeUsed
+            && this.run.gold >= this.run.removeCost && this.run.deck.Count > 5;
+    }
+
+    // 删牌服务：先挑牌，挑定了才收钱（取消不收）。
+    public void BuyRemoval() {
+        if (!this.CanRemove()) { return; }
+        this.OpenPicker(2, RunFlow.Store(), this.run.removeCost);
+    }
+
+    public void LeaveShop() {
+        if (this.phase != RunFlow.Store()) { return; }
+        this.AfterNode();
+    }
+
+    // ---- 奇遇 ----------------------------------------------------------------
+
+    void OpenEvent() {
+        int n = this.events.Count();
+        List<int> fresh = new List<int>();
+        for (int i = 0; i < n; i = i + 1) {
+            bool seen = false;
+            for (int j = 0; j < this.run.seenEvents.Count; j = j + 1) {
+                if (this.run.seenEvents[j] == i) { seen = true; }
+            }
+            if (!seen) { fresh.Add(i); }
+        }
+        if (fresh.Count == 0) { this.run.seenEvents.Clear(); for (int i = 0; i < n; i = i + 1) { fresh.Add(i); } }
+        this.eventId = fresh[this.run.Roll(fresh.Count)];
+        this.run.seenEvents.Add(this.eventId);
+        this.eventDone = false;
+        this.eventResult = "";
+        this.phase = RunFlow.Encounter();
+    }
+
+    public void ChooseEvent(int option) {
+        if (this.phase != RunFlow.Encounter() || this.eventDone) { return; }
+        if (option < 0 || option >= this.events.OptionCount(this.eventId)) { return; }
+        if (!this.events.Enabled(this, this.eventId, option)) { return; }
+        this.eventResult = this.events.Apply(this, this.eventId, option);
+        if (this.phase == RunFlow.Encounter()) { this.eventDone = true; }
+        if (this.run.hp <= 0) { this.runWon = false; this.phase = RunFlow.Over(); }
+    }
+
+    public void EventContinue() {
+        if (this.phase != RunFlow.Encounter() || !this.eventDone) { return; }
+        this.AfterNode();
+    }
+
+    // 奇遇"研读"：三选一一张牌（走战利品界面，没有金币）。
+    public void OfferCards(int bias) {
+        this.ClearLoot();
+        this.DrawRewards(bias);
+        this.phase = RunFlow.Loot();
+    }
+
+    // ---- 选牌（升级 / 移除） --------------------------------------------------
+
+    public void OpenPicker(int purpose, int returnPhase, int price) {
+        this.pickList.Clear();
+        for (int i = 0; i < this.run.deck.Count; i = i + 1) {
+            string id = this.run.deck[i];
+            bool ok = true;
+            if (purpose == 1) { ok = !CardLibrary.IsUpgraded(id); }
+            if (purpose == 3) { string b = CardLibrary.BaseId(id); ok = b == "strike" || b == "guard"; }
+            if (ok) { this.pickList.Add(i); }
+        }
+        if (this.pickList.Count == 0) { return; }
+        this.pickPurpose = purpose;
+        this.pickReturn = returnPhase;
+        this.pickPrice = price;
+        this.phase = RunFlow.Pick();
+    }
+
+    // 选定第 i 个候选：升级或移除，然后离开（篝火/奇遇 → 地图；商店 → 回商店）。
+    public void PickCard(int i) {
+        if (this.phase != RunFlow.Pick() || i < 0 || i >= this.pickList.Count) { return; }
+        int at = this.pickList[i];
+        string id = this.run.deck[at];
+        CardDefinition def = this.library.Find(id);
+        if (this.pickPurpose == 1) {
+            this.run.deck[at] = CardLibrary.UpgradeOf(id);
+            this.lastNote = "「" + def.Name() + "」升级了";
+        } else {
+            this.run.deck.RemoveAt(at);
+            this.lastNote = "「" + def.Name() + "」已移出牌组";
+        }
+        if (this.pickPrice > 0) {
+            this.run.gold = this.run.gold - this.pickPrice;
+            this.run.removeCost = this.run.removeCost + 25;
+            this.removeUsed = true;
+        }
+        if (this.pickReturn == RunFlow.Store()) { this.phase = RunFlow.Store(); return; }
+        if (this.pickReturn == RunFlow.Encounter()) {
+            this.phase = RunFlow.Encounter();
+            this.eventDone = true;
+            this.eventResult = this.lastNote + "。";
+            return;
+        }
+        this.AfterNode();
+    }
+
+    public void CancelPick() {
+        if (this.phase != RunFlow.Pick()) { return; }
+        this.phase = this.pickReturn;
+        if (this.pickReturn == RunFlow.Encounter()) {
+            this.eventDone = true;
+            this.eventResult = "你改变了主意，什么也没有发生。";
+        }
+    }
+
+    // ---- 调试跳关（仅界面层在 ROGUE_DEBUG 环境变量下调用；回放从不调用） ----------
+
+    // 跳到第 act 幕的某类节点（截图、试玩后期内容用），顺手给一副像样的牌组与几件遗物。
+    public void DebugWarp(int act, int kind) {
+        if (this.run == null) { return; }
+        while (this.run.act < act && this.run.act < RunFlow.LastAct()) { this.run.NextAct(); }
+        string[] cards = new string[]{ "twin+", "venom", "parry", "noxious", "heavy", "hold", "focus+" };
+        for (int i = 0; i < cards.Length && i < act * 3; i = i + 1) { this.run.deck.Add(cards[i]); }
+        string[] relics = new string[]{ "anchor", "vajra", "lantern", "venom_sac", "orichalcum" };
+        for (int i = 0; i < relics.Length && i < act + 1; i = i + 1) { this.GrantRelic(relics[i]); }
+        this.run.gold = this.run.gold + 150 * act;
+        if (kind >= 9) {
+            // 9 精英战利品 · 10 Boss 战利品（遗物三选一）· 11 登顶结算
+            this.ClearLoot();
+            if (kind == 11) { this.runWon = true; this.phase = RunFlow.Over(); return; }
+            this.rewardGold = this.run.AddGold(30);
+            if (kind == 10) {
+                List<string> pool = this.relicBook.Unowned(RelicBook.BossTier(), this.run.relics);
+                for (int i = 0; i < pool.Count && i < 3; i = i + 1) { this.relicChoices.Add(pool[i]); }
+                this.relicDone = false;
+            } else {
+                this.rewardRelic = this.GrantRandomRelic();
+            }
+            this.DrawRewards(kind == 10 ? 100 : 25);
+            this.phase = RunFlow.Loot();
+            return;
+        }
+        MapNode target = null;
+        for (int i = 0; i < this.run.map.nodes.Count; i = i + 1) {
+            if (target == null && this.run.map.nodes[i].kind == kind) { target = this.run.map.nodes[i]; }
+        }
+        if (target == null) { return; }
+        this.run.floors = this.run.floors + target.row;
+        this.Visit(target);
+    }
+
+    // ---- 只读 ----------------------------------------------------------------
+
+    public int Seed() { return this.run == null ? 0 : this.run.Seed(); }
 }

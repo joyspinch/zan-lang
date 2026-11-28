@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using Game.Cards;
 using Game.Foundation;
 
 // 回放与回归（docs/ZAN_STANDARD.md S26/S27）：用界面走的同一份 RunFlow 无头推进一局。
@@ -6,78 +8,160 @@ using Game.Foundation;
 // 改了规则后回放分叉，就重新录制（见 README）。
 //
 // 输入编码（与当前阶段不符的输入忽略，和点不到的按钮一样）：
-//   1 开局（用回放种子）    10+i 进入第 i 个路线节点    20+i 打出第 i 张手牌
-//   30 结束回合              40+i 收下第 i 张奖励卡      50 回主菜单
+//   1 开局（回放种子，进阶 0）   10+i 走第 i 个可选节点      20+i 打出第 i 张手牌   30 结束回合
+//   40+i 收下第 i 张奖励牌       44 跳过奖励牌              45+i 选第 i 件 Boss 遗物
+//   50 结算页回主菜单            60 篝火休息  61 篝火锻造
+//   70+i 奇遇第 i 个选项         79 奇遇结束继续
+//   80+i 商店买第 i 张牌         86+i 买第 i 件遗物  88 删牌服务  89 离开商店
+//   99 取消选牌                  100+i 选牌第 i 个候选
 public class RoguelikeSim : IReplaySim {
-    RunFlow flow;
+    // 模糊测试时 Bot 读的当前仿真（Bot 是静态函数，只拿得到随机源）。
+    static RoguelikeSim live;
+    public RunFlow flow;
     int seed;
 
     public void Reset(long seed) {
         this.seed = (int)(seed % 999999999);
-        flow = new RunFlow();
+        this.flow = new RunFlow();
+        RoguelikeSim.live = this;
     }
 
     public void Step(int frame, int input) {
-        int p = flow.phase;
-        if (input == 1 && (p == 0 || p == 4)) {
-            flow.StartRun(seed);
-        } else if (input >= 10 && input < 20 && p == 1) {
+        RunFlow f = this.flow;
+        int p = f.phase;
+        if (input == 1 && (p == RunFlow.Menu() || p == RunFlow.Over())) {
+            f.StartRun(this.seed, 0);
+        } else if (input >= 10 && input < 20 && p == RunFlow.MapPhase()) {
+            List<MapNode> choices = f.run.Choices();
             int i = input - 10;
-            if (i < flow.run.Nodes().Count) { flow.EnterNode(flow.run.Nodes()[i]); }
-        } else if (input >= 20 && input < 30 && p == 2) {
-            flow.PlayCard(input - 20);
-        } else if (input == 30 && p == 2) {
-            flow.EndTurn();
-        } else if (input >= 40 && input < 50 && p == 3) {
-            int i = input - 40;
-            if (i < flow.rewardChoices.Count) { flow.TakeReward(flow.rewardChoices[i]); }
-        } else if (input == 50 && p == 4) {
-            flow.phase = 0;
+            if (i < choices.Count) { f.EnterNode(choices[i]); }
+        } else if (input >= 20 && input < 30) {
+            f.PlayCard(input - 20);
+        } else if (input == 30) {
+            f.EndTurn();
+        } else if (input >= 40 && input < 43) {
+            f.TakeReward(input - 40);
+        } else if (input == 44) {
+            f.SkipCards();
+        } else if (input >= 45 && input < 48) {
+            f.TakeRelic(input - 45);
+        } else if (input == 50 && p == RunFlow.Over()) {
+            f.phase = RunFlow.Menu();
+        } else if (input == 60) {
+            f.Rest();
+        } else if (input == 61) {
+            f.Smith();
+        } else if (input >= 70 && input < 79) {
+            f.ChooseEvent(input - 70);
+        } else if (input == 79) {
+            f.EventContinue();
+        } else if (input >= 80 && input < 86) {
+            f.BuyCard(input - 80);
+        } else if (input >= 86 && input < 88) {
+            f.BuyRelic(input - 86);
+        } else if (input == 88) {
+            f.BuyRemoval();
+        } else if (input == 89) {
+            f.LeaveShop();
+        } else if (input == 99) {
+            f.CancelPick();
+        } else if (input >= 100 && input < 200) {
+            f.PickCard(input - 100);
         }
     }
 
     public int StateChecksum() {
+        RunFlow f = this.flow;
         StateHasher h = new StateHasher();
-        h.Int(flow.phase).Bool(flow.runWon);
-        if (flow.run != null) {
-            h.Int(flow.run.Floor()).Int(flow.run.Hp()).Int(flow.run.Gold()).Int(flow.run.Kills());
-            for (int i = 0; i < flow.run.Deck().Count; i = i + 1) { h.Text(flow.run.Deck()[i]); }
+        h.Int(f.phase).Bool(f.runWon);
+        if (f.run != null) {
+            RunState r = f.run;
+            h.Int(r.act).Int(r.floors).Int(r.hp).Int(r.maxHp).Int(r.gold).Int(r.kills).Int(r.pos);
+            for (int i = 0; i < r.deck.Count; i = i + 1) { h.Text(r.deck[i]); }
+            for (int i = 0; i < r.relics.Count; i = i + 1) { h.Text(r.relics[i]); }
         }
-        if (flow.phase == 2 && flow.battle != null) {
-            h.Int(flow.battle.Player().Hp()).Int(flow.battle.Enemy().Hp())
-             .Int(flow.battle.Energy()).Int(flow.battle.Turn()).Int(flow.battle.Deck().Hand().Count());
+        if (f.phase == RunFlow.Fight() && f.battle != null) {
+            Battle b = f.battle;
+            h.Int(b.player.hp).Int(b.player.block).Int(b.player.strength).Int(b.player.poison)
+             .Int(b.enemy.hp).Int(b.enemy.block).Int(b.enemy.strength).Int(b.enemy.poison)
+             .Int(b.energy).Int(b.turn).Int(b.Hand().Count()).Text(b.def.id);
         }
-        for (int i = 0; i < flow.rewardChoices.Count; i = i + 1) { h.Text(flow.rewardChoices[i]); }
+        for (int i = 0; i < f.rewardChoices.Count; i = i + 1) { h.Text(f.rewardChoices[i]); }
+        for (int i = 0; i < f.shopCards.Count; i = i + 1) { h.Text(f.shopCards[i]); }
+        h.Int(f.eventId).Int(f.pickList.Count);
         return h.Value();
     }
 
     [Invariant]
     public bool HpInRange() {
-        return flow.run == null || (flow.run.Hp() >= 0 && flow.run.Hp() <= flow.run.MaxHp());
+        RunState r = this.flow.run;
+        return r == null || (r.hp >= 0 && r.hp <= r.maxHp && r.maxHp > 0);
     }
 
     [Invariant]
-    public bool FloorInRange() {
-        return flow.run == null || (flow.run.Floor() >= 0 && flow.run.Floor() <= 3);
+    public bool ActInRange() {
+        RunState r = this.flow.run;
+        return r == null || (r.act >= 1 && r.act <= RunFlow.LastAct());
     }
 
-    // 战斗阶段一定有一场战斗；奖励阶段一定有三选一
     [Invariant]
-    public bool PhaseConsistent() {
-        if (flow.phase < 0 || flow.phase > 4) { return false; }
-        if (flow.phase == 2 && flow.battle == null) { return false; }
-        if (flow.phase == 3 && flow.rewardChoices.Count == 0) { return false; }
+    public bool GoldNeverNegative() {
+        return this.flow.run == null || this.flow.run.gold >= 0;
+    }
+
+    // 牌组里的每个 id 都有牌面定义；删牌服务不会删到 5 张以下。
+    [Invariant]
+    public bool DeckIntact() {
+        RunState r = this.flow.run;
+        if (r == null) { return true; }
+        if (r.deck.Count < 5) { return false; }
+        for (int i = 0; i < r.deck.Count; i = i + 1) {
+            if (this.flow.library.Find(r.deck[i]) == null) { return false; }
+        }
         return true;
     }
 
-    // 机器人：按比例乱按——出牌最多，其次结束回合、选路线、拿奖励、开局
+    // 战斗中：四区牌数之和 = 牌组张数（牌不会凭空多出或丢失），能量不为负，手牌不超 10。
+    [Invariant]
+    public bool BattleConservesCards() {
+        RunFlow f = this.flow;
+        if (f.phase != RunFlow.Fight() || f.battle == null) { return true; }
+        CardDeck d = f.battle.deck;
+        int total = d.DrawPile().Count() + d.Hand().Count() + d.DiscardPile().Count() + d.ExhaustPile().Count();
+        return total == f.run.deck.Count && f.battle.energy >= 0 && d.Hand().Count() <= 10;
+    }
+
+    // 地图位置合法，走过的节点数 = 层数（每走一步层数 +1）。
+    [Invariant]
+    public bool MapPathConsistent() {
+        RunState r = this.flow.run;
+        if (r == null || r.map == null) { return true; }
+        if (r.pos >= r.map.nodes.Count) { return false; }
+        int visited = 0;
+        for (int i = 0; i < r.map.nodes.Count; i = i + 1) {
+            if (r.map.nodes[i].visited) { visited = visited + 1; }
+        }
+        return visited <= ActMap.Rows() + 1 && r.floors >= visited;
+    }
+
+    // 阶段与数据一致：战斗阶段有一场未分胜负的战斗，战利品阶段有东西可拿，选牌有候选。
+    [Invariant]
+    public bool PhaseConsistent() {
+        RunFlow f = this.flow;
+        if (f.phase < 0 || f.phase > 8) { return false; }
+        if (f.phase == RunFlow.Fight() && (f.battle == null || f.battle.winner >= 0)) { return false; }
+        if (f.phase == RunFlow.Loot() && f.cardDone && f.relicDone) { return false; }
+        if (f.phase == RunFlow.Pick() && f.pickList.Count == 0) { return false; }
+        return true;
+    }
+
+    // 机器人：大多数时候照"会玩的人"出手（RogueBot），掺 15% 乱按测边界。
     public static int Bot(DeterministicRandom rng, int frame) {
-        int roll = rng.NextBelow(100);
-        if (roll < 40) { return 20 + rng.NextBelow(5); }
-        if (roll < 60) { return 30; }
-        if (roll < 75) { return 10 + rng.NextBelow(2); }
-        if (roll < 90) { return 40 + rng.NextBelow(3); }
-        if (roll < 97) { return 1; }
-        return 50;
+        RoguelikeSim sim = RoguelikeSim.live;
+        if (sim != null && rng.NextBelow(100) < 85) {
+            return RogueBot.Decide(sim.flow, rng);
+        }
+        int[] codes = new int[]{ 1, 10, 11, 12, 20, 21, 22, 30, 40, 41, 44, 45, 50, 60, 61, 70, 71, 72, 79, 80, 86, 88, 89, 99, 100, 101 };
+        return codes[rng.NextBelow(codes.Length)];
     }
 }

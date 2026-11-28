@@ -1,0 +1,221 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Backend;
+using Gui.Widget;
+
+// 战斗场景：一块会自己画背景与立绘的面板（世界层），子控件是标准的角色铭牌、
+// 意图横幅——场景先画、控件后画，所以血条、状态、意图都还是标准 Gui 控件。
+//
+// 画什么：地牢拱廊 + 地面 + 两侧火把（火苗摇曳、余烬上飘）→ 角色脚下的光池与影子 →
+// 攀登者与敌人的 SVG 立绘（呼吸起伏；扑击、抖动、闪白由 BattleFx 时间线驱动）→
+// 护盾泡、中毒气泡、增减益光尘、斩痕。立绘站在各自铭牌（锚点控件）正上方。
+public class BattleStage : Panel {
+    public override string Kind() { return "Panel"; }
+
+    BattleFx fx;
+    Battle battle;
+    Control heroAnchor;
+    Control enemyAnchor;
+    string enemyLook;
+    bool boss;
+
+    public BattleStage(BattleFx fx, Battle battle) : base("row") {
+        this.style = 3;
+        this.layout = 2;
+        this.flexFlow = 1;
+        this.fx = fx;
+        this.battle = battle;
+        this.enemyLook = battle.def.look;
+        this.boss = battle.def.Boss();
+    }
+
+    public void Anchors(Control hero, Control enemy) {
+        this.heroAnchor = hero;
+        this.enemyAnchor = enemy;
+    }
+
+    public override void OnPaint(App app) {
+        Canvas c = app.canvas;
+        int x = bx;
+        int y = by;
+        int w = bw;
+        int h = bh;
+        if (w <= 0 || h <= 0) { return; }
+        int now = BattleFx.Now();
+        c.PushClip(x, y, w, h);
+        this.PaintBackdrop(c, x, y, w, h, now);
+
+        int ground = y + h - 18;
+        int hx = x + w / 5;
+        int ex = x + w * 4 / 5;
+        if (this.heroAnchor != null && this.heroAnchor.bw > 0) {
+            hx = this.heroAnchor.bx + this.heroAnchor.bw / 2;
+            ground = this.heroAnchor.by - 2;
+        }
+        if (this.enemyAnchor != null && this.enemyAnchor.bw > 0) {
+            ex = this.enemyAnchor.bx + this.enemyAnchor.bw / 2;
+        }
+        int room = ground - y - 8;
+        int heroH = room < 232 ? room : 232;
+        int enemyH = this.boss ? (room < 262 ? room : 262) : heroH;
+
+        this.PaintActor(c, 0, "hero", hx, ground, heroH, now);
+        this.PaintActor(c, 1, this.enemyLook, ex, ground, enemyH, now);
+        this.fx.heroX = hx;
+        this.fx.heroY = ground - heroH / 2;
+        this.fx.enemyX = ex;
+        this.fx.enemyY = ground - enemyH / 2;
+        c.PopClip();
+        app.RequestAnimationFrame(33);
+    }
+
+    // ---- 背景 ------------------------------------------------------------------
+
+    void PaintBackdrop(Canvas c, int x, int y, int w, int h, int now) {
+        c.FillVGrad(x, y, w, h, (int)0xFF1A1210, (int)0xFF0A0706);
+        // 远处的拱廊：三道深色拱门，中间那道透出余烬色的光。
+        int archW = w / 5;
+        for (int i = 0; i < 3; i = i + 1) {
+            int ax = x + w / 2 - archW * 3 / 2 - archW / 3 + i * (archW + archW / 3);
+            int ah = h * 3 / 4;
+            int ay = y + h - ah - h / 6;
+            int glow = i == 1 ? (int)0x33FF7A28 : (int)0x1AC8502A;
+            c.FillRoundRect(ax - 6, ay - 6, archW + 12, ah + 12, archW / 2 + 6, (int)0xFF241914);
+            c.FillRoundRect(ax, ay, archW, ah, archW / 2, (int)0xFF0C0807);
+            c.FillRadial(ax + archW / 2, ay + ah / 2, archW, glow, 140);
+        }
+        // 石砖缝（横线）。
+        for (int r = 1; r < 6; r = r + 1) {
+            c.FillRect(x, y + r * h / 7, w, 1, (int)0x14FFD8A0);
+        }
+        // 地面：一条渐深的石板带 + 前景暗角。
+        int gy = y + h - h / 4;
+        c.FillVGrad(x, gy, w, h - (gy - y), (int)0xFF2A1E17, (int)0xFF120C0A);
+        c.FillRect(x, gy, w, 2, (int)0x40FFC070);
+        // 两侧火把。
+        this.PaintTorch(c, x + 34, y + h / 3, now, 0);
+        this.PaintTorch(c, x + w - 34, y + h / 3, now, 1);
+        // 余烬：确定性的上飘火星（位置只由序号与时间决定）。
+        for (int i = 0; i < 26; i = i + 1) {
+            int period = 4200 + (i * 733) % 2600;
+            int phase = (now + i * 977) % period;
+            double t = (double)phase / (double)period;
+            int px = x + (i * 211 + (int)(Math.Sin(t * 6.28 + i) * 18.0)) % w;
+            int py = y + h - (int)(t * (double)h);
+            int a = (int)(Math.Sin(t * 3.14) * 200.0);
+            if (a > 0) { c.FillCircle(px, py, 1 + i % 3, (a << 24) | 0xFF9A3A); }
+        }
+        // 暗角：左右两边压暗，视线集中到中间。
+        c.FillRadial(x, y + h / 2, h, (int)0xFF000000, 120);
+        c.FillRadial(x + w, y + h / 2, h, (int)0xFF000000, 120);
+    }
+
+    void PaintTorch(Canvas c, int tx, int ty, int now, int seed) {
+        double flick = Math.Sin((now + seed * 400) * 0.013) * 0.5 + Math.Sin((now + seed * 170) * 0.031) * 0.5;
+        int r = 110 + (int)(flick * 14.0);
+        c.FillRadial(tx, ty, r, (int)0xFFFF8A2A, 70);
+        c.FillRoundRect(tx - 5, ty + 6, 10, 40, 3, (int)0xFF3A2618);
+        c.FillRoundRect(tx - 10, ty + 2, 20, 8, 3, (int)0xFF5A3A20);
+        int fh = 16 + (int)(flick * 4.0);
+        c.FillCircle(tx, ty - 2, 9, (int)0xFFE0501A);
+        c.FillCircle(tx + (int)(flick * 2.0), ty - fh / 2, 7, (int)0xFFFF9A2A);
+        c.FillCircle(tx + (int)(flick * 3.0), ty - fh, 4, (int)0xFFFFE08A);
+    }
+
+    // ---- 角色 ------------------------------------------------------------------
+
+    void PaintActor(Canvas c, int who, string look, int cx, int ground, int height, int now) {
+        Fighter f = who == 0 ? this.battle.player : this.battle.enemy;
+        int width = height * 200 / 220;
+        int breathe = (int)(Math.Sin((now + who * 900) * 0.0028) * 3.0);
+        int dx = this.fx.ShakeX(who, now) + this.fx.LungeX(who, now);
+        int left = cx - width / 2 + dx;
+        int top = ground - height + breathe;
+        if (!f.Alive()) { top = top + height / 6; }
+
+        // 光池与影子。
+        c.FillRadial(cx, ground - height / 3, height * 2 / 3, who == 0 ? (int)0xFFFFB050 : (int)0xFFFF5030, 60);
+        c.FillRoundRect(cx - width / 3 + dx / 2, ground - 9, width * 2 / 3, 16, 8, (int)0x8C000000);
+
+        string key = BattleStage.Sprite(look, false, width, height);
+        if (who == 0) {
+            c.BlitImage(key, left, top, width, height, 0, 0, 0, 0);
+        } else {
+            c.BlitImage(key, left, top, width, height, 0, 0, 0, 0);
+        }
+        int flash = this.fx.Flash(who, now);
+        if (flash > 0 && c.PushLayerOpacity(left, top, width, height, flash)) {
+            c.BlitImage(BattleStage.Sprite(look, true, width, height), 0, 0, width, height, 0, 0, 0, 0);
+            c.PopLayer();
+        }
+
+        // 常驻状态：护盾泡（有格挡时）、中毒气泡。
+        if (f.block > 0) {
+            int pulse = (int)(Math.Sin(now * 0.006) * 3.0);
+            c.DrawCircle(cx + dx, ground - height * 2 / 5, width * 2 / 5 + pulse, (int)0x558FD0FF, 2);
+            c.FillRadial(cx + dx, ground - height * 2 / 5, width * 2 / 5 + 6, (int)0xFF4A9AE0, 22);
+        }
+        if (f.poison > 0) {
+            for (int i = 0; i < 5; i = i + 1) {
+                int period = 1400 + i * 230;
+                double t = (double)((now + i * 311) % period) / (double)period;
+                int bx2 = cx + dx - width / 3 + (i * 37) % (width * 2 / 3);
+                int by2 = ground - (int)(t * (double)height * 0.8);
+                c.FillCircle(bx2, by2, 3 + i % 3, (((int)((1.0 - t) * 200.0)) << 24) | 0x8CFF5A);
+            }
+        }
+
+        // 一次性演出：护盾弹出、斩痕、光尘。
+        for (int i = 0; i < this.fx.items.Count; i = i + 1) {
+            FxItem it = this.fx.items[i];
+            if (it.who != who) { continue; }
+            double t = it.T(now);
+            if (t <= 0.0 || t >= 1.0) { continue; }
+            int mx = cx + dx;
+            int my = ground - height / 2;
+            if (it.kind == "shield") {
+                double s = t < 0.3 ? t / 0.3 : 1.0;
+                int rad = (int)((double)(width * 2 / 5) * (0.6 + 0.5 * s));
+                int a = (int)((1.0 - t) * 230.0);
+                c.DrawCircle(mx, my, rad, (a << 24) | 0x9AD8FF, 5);
+                c.FillRadial(mx, my, rad, (int)0xFF6AB8FF, (int)((1.0 - t) * 90.0));
+                this.PaintShieldGlyph(c, mx, my, (int)(34.0 * (0.7 + 0.5 * s)), a);
+            } else if (it.kind == "slash") {
+                int a = (int)((1.0 - t) * 255.0);
+                int len = width * 3 / 4;
+                int off = (int)(t * 30.0);
+                c.DrawLine(mx - len / 2 + off, my - len / 2, mx + len / 2 + off, my + len / 2, (a << 24) | 0xFFF0D0, 5);
+                c.DrawLine(mx - len / 2 + off + 14, my - len / 2 - 6, mx + len / 2 + off + 14, my + len / 2 - 6, (a << 24) | 0xFF7A3A, 2);
+            } else if (it.kind == "aura") {
+                for (int k = 0; k < 9; k = k + 1) {
+                    double tk = t + (double)k * 0.07;
+                    if (tk > 1.0) { tk = tk - 1.0; }
+                    int px = mx - width / 2 + (k * 53) % width;
+                    int py = ground - (int)(tk * (double)height);
+                    int a = (int)((1.0 - t) * 220.0);
+                    c.FillCircle(px, py, 3 + k % 3, (a << 24) | (it.color & 0xFFFFFF));
+                }
+            }
+        }
+    }
+
+    void PaintShieldGlyph(Canvas c, int cx, int cy, int size, int alpha) {
+        int col = (alpha << 24) | 0xBFE6FF;
+        int half = size / 2;
+        c.FillRoundRect(cx - half, cy - half, size, size * 2 / 3, size / 5, col);
+        for (int r = 0; r < size / 2; r = r + 1) {
+            int hw = half - half * r / (size / 2);
+            c.FillRect(cx - hw, cy - half + size * 2 / 3 + r, hw * 2, 1, col);
+        }
+    }
+
+    // 立绘缓存：同一外形同一尺寸只光栅化一次。
+    public static string Sprite(string look, bool flash, int w, int h) {
+        string key = "mem:rogue-" + look + (flash ? "-f-" : "-") + w + "x" + h;
+        if (Canvas.ImageWidth(key) <= 0) {
+            Canvas.ImageLoadSvg(key, RogueArt.Svg(look, flash), w, h);
+        }
+        return key;
+    }
+}
