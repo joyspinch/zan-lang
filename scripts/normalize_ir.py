@@ -182,6 +182,35 @@ def _write_atomic(path, text):
             os.unlink(temporary)
 
 
+def compute_fnhash_text(text):
+    """Return canonical --fnhash text for LLVM IR (sorted '<sha16> <name>\\n')."""
+    import hashlib
+    lines = text.splitlines()
+    fstarts = [i for i, l in enumerate(lines)
+               if l.strip().startswith("define ")]
+    rows = []
+    names = set()
+    for fi in fstarts:
+        # Match the emitter's one-line, unquoted function-header subset.
+        header = re.fullmatch(
+            r'define\s+[^@\n]+@([A-Za-z_.$][\w.$]*|[0-9]+)\(.*\).*\{\s*',
+            lines[fi].strip())
+        if header is None:
+            raise ValueError("unsupported function header at line %d" % (fi + 1))
+        name = header.group(1)
+        if name in names:
+            raise ValueError("duplicate function: %s" % name)
+        names.add(name)
+        end, _v, _l = _collect_function(lines, fi)
+        body = chr(10).join(lines[fi:end + 1])
+        h = hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
+        rows.append("%s %s" % (h, name))
+    if not rows:
+        raise ValueError("no function definitions found")
+    rows.sort()
+    return chr(10).join(rows) + chr(10)
+
+
 def main():
     args = sys.argv[1:]
     mode = "emit"
@@ -197,31 +226,7 @@ def main():
     with open(args[0], "r", encoding="utf-8") as f:
         text = f.read()
     if mode == "fnhash":
-        import hashlib
-        lines = text.splitlines()
-        fstarts = [i for i, l in enumerate(lines)
-                   if l.strip().startswith("define ")]
-        rows = []
-        names = set()
-        for fi in fstarts:
-            # Match the emitter's one-line, unquoted function-header subset.
-            header = re.fullmatch(
-                r'define\s+[^@\n]+@([A-Za-z_.$][\w.$]*|[0-9]+)\(.*\).*\{\s*',
-                lines[fi].strip())
-            if header is None:
-                raise ValueError("unsupported function header at line %d" % (fi + 1))
-            name = header.group(1)
-            if name in names:
-                raise ValueError("duplicate function: %s" % name)
-            names.add(name)
-            end, _v, _l = _collect_function(lines, fi)
-            body = chr(10).join(lines[fi:end + 1])
-            h = hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
-            rows.append("%s %s" % (h, name))
-        if not rows:
-            raise ValueError("no function definitions found")
-        rows.sort()
-        _write_atomic(args[1], chr(10).join(rows) + chr(10))
+        _write_atomic(args[1], compute_fnhash_text(text))
         return 0
     norm = normalize(text)
     if mode == "check":

@@ -95,79 +95,36 @@ if(NOT SKIP_GEN1_BUILD)
   endif()
 endif()
 
-set(_failures 0)
-set(_blessed 0)
-set(_passed 0)
-
-foreach(_case IN LISTS _cases)
-  set(_src "${CASE_DIR}/${_case}.zan")
-  if(NOT EXISTS ${_src})
-    math(EXPR _failures "${_failures} + 1")
-    message(SEND_ERROR "FAIL ${_case}: case source not found under ${CASE_DIR}")
-    continue()
-  endif()
-  set(_ll "${OUTDIR}/${_case}.ll")
-  file(REMOVE ${_ll})
-  execute_process(
-    COMMAND ${GEN1} ${_ll} ${_src}
-    WORKING_DIRECTORY ${WORKDIR}
-    RESULT_VARIABLE gen_rc
-    OUTPUT_VARIABLE gen_out
-    ERROR_VARIABLE gen_err
-    TIMEOUT 600)
-  if(NOT gen_rc EQUAL 0 OR NOT EXISTS ${_ll})
-    math(EXPR _failures "${_failures} + 1")
-    message(SEND_ERROR "FAIL ${_case}: gen1 failed to compile it (rc=${gen_rc})")
-    continue()
-  endif()
-
-  set(_golden "${GOLDEN_DIR}/${_case}.hashes")
-  if(BLESS)
-    execute_process(
-      COMMAND ${PYTHON} ${NORM} --fnhash ${_ll} ${_golden}
-      RESULT_VARIABLE norm_rc)
-    if(NOT norm_rc EQUAL 0)
-      math(EXPR _failures "${_failures} + 1")
-      message(SEND_ERROR "FAIL ${_case}: normalizer errored (rc=${norm_rc})")
-    else()
-      math(EXPR _blessed "${_blessed} + 1")
-      message(STATUS "BLESS ${_case}")
-    endif()
-    continue()
-  endif()
-
-  if(NOT EXISTS ${_golden})
-    math(EXPR _failures "${_failures} + 1")
-    message(SEND_ERROR "FAIL ${_case}: no golden at ${_golden} (bless it deliberately: rerun with -DBLESS=1 and commit it)")
-    continue()
-  endif()
-  set(_got "${OUTDIR}/${_case}.hashes")
-  execute_process(
-    COMMAND ${PYTHON} ${NORM} --fnhash ${_ll} ${_got}
-    RESULT_VARIABLE norm_rc)
-  if(NOT norm_rc EQUAL 0)
-    math(EXPR _failures "${_failures} + 1")
-    message(SEND_ERROR "FAIL ${_case}: normalizer errored (rc=${norm_rc})")
-    continue()
-  endif()
-  file(READ ${_golden} _exp)
-  file(READ ${_got} _act)
-  string(STRIP "${_exp}" _exp)
-  string(STRIP "${_act}" _act)
-  if(NOT _act STREQUAL _exp)
-    math(EXPR _failures "${_failures} + 1")
-    message(SEND_ERROR "FAIL ${_case}: emitted IR differs from the golden (per-function diff: python scripts/normalize_ir.py --fnhash <ll> then diff vs ${_golden})")
-  else()
-    math(EXPR _passed "${_passed} + 1")
-    message(STATUS "PASS ${_case}")
-  endif()
-endforeach()
-
-if(BLESS)
-  message(STATUS "ir golden bless: ${_blessed} rewritten, ${_failures} errors")
-else()
-  message(STATUS "ir golden gate: ${_passed} passed, ${_failures} failures")
+set(_runner "${WORKDIR}/scripts/run_ir_golden_parallel.py")
+if(NOT EXISTS "${_runner}")
+  get_filename_component(_repo_dir "${CMAKE_SCRIPT_MODE_FILE}" DIRECTORY)
+  get_filename_component(_repo_dir "${_repo_dir}/.." ABSOLUTE)
+  set(_runner "${_repo_dir}/scripts/run_ir_golden_parallel.py")
 endif()
-if(NOT _failures EQUAL 0)
-  message(FATAL_ERROR "selfhost ir golden: ${_failures} case(s) failed")
+
+set(_runner_args
+  -I -B "${_runner}"
+  --gen1 "${GEN1}"
+  --outdir "${OUTDIR}"
+  --case-dir "${CASE_DIR}"
+  --cases "${CASES}"
+  --golden-dir "${GOLDEN_DIR}"
+  --norm "${NORM}"
+  --workdir "${WORKDIR}")
+if(JOBS)
+  list(APPEND _runner_args --jobs "${JOBS}")
+endif()
+if(REPORT_JSON)
+  list(APPEND _runner_args --report-json "${REPORT_JSON}")
+endif()
+if(BLESS)
+  list(APPEND _runner_args --bless --prune-orphans)
+endif()
+
+execute_process(
+  COMMAND ${PYTHON} ${_runner_args}
+  WORKING_DIRECTORY "${WORKDIR}"
+  RESULT_VARIABLE _gate_rc)
+if(NOT _gate_rc EQUAL 0)
+  message(FATAL_ERROR "selfhost ir golden: gate failed (rc=${_gate_rc})")
 endif()
