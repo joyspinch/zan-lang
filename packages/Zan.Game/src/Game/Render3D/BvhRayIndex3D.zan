@@ -1,0 +1,287 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Render3D;
+
+// BVH 空间索引中的包围盒条目（用于 3D 拾取、命中扫描与视线剔除）。
+public class BvhNodeEntry3D {
+    public int Id;
+    public float MinX;
+    public float MinY;
+    public float MinZ;
+    public float MaxX;
+    public float MaxY;
+    public float MaxZ;
+
+    public BvhNodeEntry3D(int id, float minX, float minY, float minZ, float maxX, float maxY, float maxZ) {
+        this.Id = id;
+        this.MinX = minX < maxX ? minX : maxX;
+        this.MinY = minY < maxY ? minY : maxY;
+        this.MinZ = minZ < maxZ ? minZ : maxZ;
+        this.MaxX = maxX > minX ? maxX : minX;
+        this.MaxY = maxY > minY ? maxY : minY;
+        this.MaxZ = maxZ > minZ ? maxZ : minZ;
+    }
+
+    public float CenterX() { return (this.MinX + this.MaxX) * 0.5f; }
+    public float CenterY() { return (this.MinY + this.MaxY) * 0.5f; }
+    public float CenterZ() { return (this.MinZ + this.MaxZ) * 0.5f; }
+}
+
+// BVH 射线最近命中结果。
+public class BvhRayHit3D {
+    public int EntryId;
+    public float Distance;
+
+    public BvhRayHit3D(int entryId, float distance) {
+        this.EntryId = entryId;
+        this.Distance = distance;
+    }
+}
+
+internal class BvhFlatNode3D {
+    public float MinX;
+    public float MinY;
+    public float MinZ;
+    public float MaxX;
+    public float MaxY;
+    public float MaxZ;
+    public int Left;
+    public int Right;
+    public int Start;
+    public int Count;
+
+    public BvhFlatNode3D() {
+        this.Left = -1;
+        this.Right = -1;
+        this.Start = 0;
+        this.Count = 0;
+    }
+}
+
+// 商业 3D 扁平数组二分包围体层次结构（BVH）：最长轴中位划分 + Slab 射线求交，零指针环、零 ARC 泄漏。
+public class BvhRayIndex3D {
+    private List<BvhNodeEntry3D> entries;
+    private List<BvhFlatNode3D> nodes;
+    private int leafCapacity;
+
+    public BvhRayIndex3D(int leafCapacity) {
+        this.entries = new List<BvhNodeEntry3D>();
+        this.nodes = new List<BvhFlatNode3D>();
+        this.leafCapacity = leafCapacity > 1 ? leafCapacity : 2;
+    }
+
+    public int EntryCount() { return this.entries.Count; }
+    public int NodeCount() { return this.nodes.Count; }
+
+    public void Clear() {
+        this.entries.Clear();
+        this.nodes.Clear();
+    }
+
+    public void Add(BvhNodeEntry3D entry) {
+        if (entry != null) {
+            this.entries.Add(entry);
+        }
+    }
+
+    public void Build() {
+        this.nodes.Clear();
+        if (this.entries.Count == 0) { return; }
+        this.BuildRange(0, this.entries.Count);
+    }
+
+    private int BuildRange(int start, int count) {
+        int nodeIdx = this.nodes.Count;
+        BvhFlatNode3D node = new BvhFlatNode3D();
+        this.nodes.Add(node);
+
+        BvhNodeEntry3D first = this.entries[start];
+        float minX = first.MinX; float minY = first.MinY; float minZ = first.MinZ;
+        float maxX = first.MaxX; float maxY = first.MaxY; float maxZ = first.MaxZ;
+        for (int i = 1; i < count; i = i + 1) {
+            BvhNodeEntry3D e = this.entries[start + i];
+            if (e.MinX < minX) { minX = e.MinX; }
+            if (e.MinY < minY) { minY = e.MinY; }
+            if (e.MinZ < minZ) { minZ = e.MinZ; }
+            if (e.MaxX > maxX) { maxX = e.MaxX; }
+            if (e.MaxY > maxY) { maxY = e.MaxY; }
+            if (e.MaxZ > maxZ) { maxZ = e.MaxZ; }
+        }
+        node.MinX = minX; node.MinY = minY; node.MinZ = minZ;
+        node.MaxX = maxX; node.MaxY = maxY; node.MaxZ = maxZ;
+
+        if (count <= this.leafCapacity) {
+            node.Start = start;
+            node.Count = count;
+            return nodeIdx;
+        }
+
+        float dx = maxX - minX;
+        float dy = maxY - minY;
+        float dz = maxZ - minZ;
+        int axis = 0;
+        if (dy > dx && dy >= dz) { axis = 1; }
+        else if (dz > dx && dz > dy) { axis = 2; }
+
+        // 按选定轴中心插入排序，保证构建结果确定性
+        for (int i = start + 1; i < start + count; i = i + 1) {
+            BvhNodeEntry3D key = this.entries[i];
+            float keyPos = AxisCenter(key, axis);
+            int j = i - 1;
+            while (j >= start && AxisCenter(this.entries[j], axis) > keyPos) {
+                this.entries[j + 1] = this.entries[j];
+                j = j - 1;
+            }
+            this.entries[j + 1] = key;
+        }
+
+        int mid = count / 2;
+        node.Left = this.BuildRange(start, mid);
+        node.Right = this.BuildRange(start + mid, count - mid);
+        return nodeIdx;
+    }
+
+    private static float AxisCenter(BvhNodeEntry3D e, int axis) {
+        if (axis == 0) { return e.CenterX(); }
+        if (axis == 1) { return e.CenterY(); }
+        return e.CenterZ();
+    }
+
+    private static float SlabIntersect(
+        float ox, float oy, float oz,
+        float dx, float dy, float dz,
+        float minX, float minY, float minZ,
+        float maxX, float maxY, float maxZ,
+        float maxDist) {
+        float tmin = 0.0f;
+        float tmax = maxDist;
+
+        // X 轴 Slab
+        if (dx > -0.000001f && dx < 0.000001f) {
+            if (ox < minX || ox > maxX) { return -1.0f; }
+        } else {
+            float inv = 1.0f / dx;
+            float t1 = (minX - ox) * inv;
+            float t2 = (maxX - ox) * inv;
+            if (t1 > t2) { float tmp = t1; t1 = t2; t2 = tmp; }
+            if (t1 > tmin) { tmin = t1; }
+            if (t2 < tmax) { tmax = t2; }
+            if (tmin > tmax) { return -1.0f; }
+        }
+
+        // Y 轴 Slab
+        if (dy > -0.000001f && dy < 0.000001f) {
+            if (oy < minY || oy > maxY) { return -1.0f; }
+        } else {
+            float inv = 1.0f / dy;
+            float t1 = (minY - oy) * inv;
+            float t2 = (maxY - oy) * inv;
+            if (t1 > t2) { float tmp = t1; t1 = t2; t2 = tmp; }
+            if (t1 > tmin) { tmin = t1; }
+            if (t2 < tmax) { tmax = t2; }
+            if (tmin > tmax) { return -1.0f; }
+        }
+
+        // Z 轴 Slab
+        if (dz > -0.000001f && dz < 0.000001f) {
+            if (oz < minZ || oz > maxZ) { return -1.0f; }
+        } else {
+            float inv = 1.0f / dz;
+            float t1 = (minZ - oz) * inv;
+            float t2 = (maxZ - oz) * inv;
+            if (t1 > t2) { float tmp = t1; t1 = t2; t2 = tmp; }
+            if (t1 > tmin) { tmin = t1; }
+            if (t2 < tmax) { tmax = t2; }
+            if (tmin > tmax) { return -1.0f; }
+        }
+
+        return tmin;
+    }
+
+    // 射线求交返回最近命中条目（方向不必预先单位化，内部自动归一化）。
+    public BvhRayHit3D RaycastNearest(Vector3 origin, Vector3 direction, float maxDistance) {
+        if (this.nodes.Count == 0 || maxDistance <= 0.0f) { return null; }
+        float len = (float)Math.Sqrt((double)(direction.X * direction.X + direction.Y * direction.Y + direction.Z * direction.Z));
+        if (len < 0.00001f) { return null; }
+        float dx = direction.X / len;
+        float dy = direction.Y / len;
+        float dz = direction.Z / len;
+
+        int bestId = -1;
+        float bestDist = maxDistance;
+        List<int> stack = new List<int>();
+        stack.Add(0);
+
+        while (stack.Count > 0) {
+            int idx = stack[stack.Count - 1];
+            stack.RemoveAt(stack.Count - 1);
+            BvhFlatNode3D n = this.nodes[idx];
+            float hitN = SlabIntersect(origin.X, origin.Y, origin.Z, dx, dy, dz,
+                n.MinX, n.MinY, n.MinZ, n.MaxX, n.MaxY, n.MaxZ, bestDist);
+            if (hitN < 0.0f) { continue; }
+
+            if (n.Count > 0) {
+                for (int i = 0; i < n.Count; i = i + 1) {
+                    BvhNodeEntry3D e = this.entries[n.Start + i];
+                    float t = SlabIntersect(origin.X, origin.Y, origin.Z, dx, dy, dz,
+                        e.MinX, e.MinY, e.MinZ, e.MaxX, e.MaxY, e.MaxZ, bestDist);
+                    if (t >= 0.0f && t < bestDist) {
+                        bestDist = t;
+                        bestId = e.Id;
+                    }
+                }
+            } else {
+                if (n.Left >= 0) { stack.Add(n.Left); }
+                if (n.Right >= 0) { stack.Add(n.Right); }
+            }
+        }
+
+        if (bestId < 0) { return null; }
+        return new BvhRayHit3D(bestId, bestDist);
+    }
+
+    // 球体范围查询（返回所有与球体相交的条目 ID）。
+    public List<int> QuerySphere(Vector3 center, float radius) {
+        List<int> result = new List<int>();
+        if (this.nodes.Count == 0 || radius < 0.0f) { return result; }
+        float rSq = radius * radius;
+        List<int> stack = new List<int>();
+        stack.Add(0);
+
+        while (stack.Count > 0) {
+            int idx = stack[stack.Count - 1];
+            stack.RemoveAt(stack.Count - 1);
+            BvhFlatNode3D n = this.nodes[idx];
+            if (!SphereIntersectsAabb(center.X, center.Y, center.Z, rSq,
+                n.MinX, n.MinY, n.MinZ, n.MaxX, n.MaxY, n.MaxZ)) {
+                continue;
+            }
+            if (n.Count > 0) {
+                for (int i = 0; i < n.Count; i = i + 1) {
+                    BvhNodeEntry3D e = this.entries[n.Start + i];
+                    if (SphereIntersectsAabb(center.X, center.Y, center.Z, rSq,
+                        e.MinX, e.MinY, e.MinZ, e.MaxX, e.MaxY, e.MaxZ)) {
+                        result.Add(e.Id);
+                    }
+                }
+            } else {
+                if (n.Left >= 0) { stack.Add(n.Left); }
+                if (n.Right >= 0) { stack.Add(n.Right); }
+            }
+        }
+        return result;
+    }
+
+    private static bool SphereIntersectsAabb(
+        float cx, float cy, float cz, float rSq,
+        float minX, float minY, float minZ, float maxX, float maxY, float maxZ) {
+        float px = cx < minX ? minX : (cx > maxX ? maxX : cx);
+        float py = cy < minY ? minY : (cy > maxY ? maxY : cy);
+        float pz = cz < minZ ? minZ : (cz > maxZ ? maxZ : cz);
+        float dx = cx - px;
+        float dy = cy - py;
+        float dz = cz - pz;
+        return (dx * dx + dy * dy + dz * dz) <= rSq;
+    }
+}

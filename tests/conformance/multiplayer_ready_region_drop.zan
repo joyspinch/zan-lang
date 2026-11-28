@@ -1,0 +1,72 @@
+using System;
+using Game.Net;
+
+namespace Conf;
+
+class MultiplayerReadyRegionDropTest {
+    static void Main() {
+        // 1. 组队开局全员就绪检查器：全员同意通过、任一拒绝即刻终止、超时自动结束
+        NetPartyReadyCheckSession rcOk = new NetPartyReadyCheckSession(1000L, 15000L);
+        rcOk.AddMember(1);
+        rcOk.AddMember(2);
+        rcOk.AddMember(3);
+        ReadyCheckStatus s1 = rcOk.Respond(1, true, 2000L);
+        ReadyCheckStatus s2 = rcOk.Respond(2, true, 3000L);
+        ReadyCheckStatus s3 = rcOk.Respond(3, true, 4000L);
+
+        NetPartyReadyCheckSession rcDecline = new NetPartyReadyCheckSession(1000L, 15000L);
+        rcDecline.AddMember(1);
+        rcDecline.AddMember(2);
+        rcDecline.Respond(1, true, 2000L);
+        ReadyCheckStatus sDec = rcDecline.Respond(2, false, 3000L);
+
+        NetPartyReadyCheckSession rcTimeout = new NetPartyReadyCheckSession(1000L, 5000L);
+        rcTimeout.AddMember(1);
+        ReadyCheckStatus sTo = rcTimeout.Tick(7000L);
+
+        bool readyOk = s1 == ReadyCheckStatus.Pending && s2 == ReadyCheckStatus.Pending
+            && s3 == ReadyCheckStatus.AllReady
+            && sDec == ReadyCheckStatus.Declined && rcDecline.DeclinedByPlayerId == 2
+            && sTo == ReadyCheckStatus.TimedOut;
+        Console.WriteLine("net-party-ready-check: " + Convert.ToString(readyOk ? 1 : 0));
+
+        // 2. 多区域战斗服智能路由：延迟 EMA + 负载惩罚 + 维护引流无感容灾切服
+        NetDynamicRegionRouter router = new NetDynamicRegionRouter(0.5, 40.0);
+        router.RegisterRegion("ap-shanghai", 25.0, 100);
+        router.RegisterRegion("ap-tokyo", 45.0, 100);
+        router.RegisterRegion("ap-singapore", 65.0, 100);
+
+        router.ReportTelemetry("ap-shanghai", 25.0, 30); // score = 25 + 0.3*40 = 37
+        router.ReportTelemetry("ap-tokyo", 45.0, 10);    // score = 45 + 0.1*40 = 49
+        string pick1 = router.SelectBestRegion();
+
+        // 上海服进入维护引流 -> 自动切东京服
+        router.SetDraining("ap-shanghai", true);
+        string pick2 = router.SelectBestRegion();
+
+        // 东京服满载(98/100 >= 0.95) -> 自动切新加坡服
+        router.ReportTelemetry("ap-tokyo", 45.0, 98);
+        router.ReportTelemetry("ap-singapore", 65.0, 20);
+        string pick3 = router.SelectBestRegion();
+
+        bool routerOk = pick1 == "ap-shanghai" && pick2 == "ap-tokyo" && pick3 == "ap-singapore";
+        Console.WriteLine("net-dynamic-region-router: " + Convert.ToString(routerOk ? 1 : 0));
+
+        // 3. 服务端确定性加权掉落池：稀有保底触发 + 唯一物品绝不重复掉落
+        NetWeightedDropTable table = new NetWeightedDropTable(42L, 4);
+        table.AddEntry("common_coin", 900, false, false);
+        table.AddEntry("mythic_blade", 1, true, true);
+        table.AddEntry("mythic_crown", 1, true, true);
+
+        int bladeCount = 0;
+        int crownCount = 0;
+        for (int i = 0; i < 8; i = i + 1) {
+            string item = table.RollOne();
+            if (item == "mythic_blade") { bladeCount = bladeCount + 1; }
+            if (item == "mythic_crown") { crownCount = crownCount + 1; }
+        }
+        // 保底 4 抽必出稀有，8 抽内两件唯一稀有必各掉且仅掉 1 次
+        bool dropOk = bladeCount == 1 && crownCount == 1;
+        Console.WriteLine("net-weighted-drop-table: " + Convert.ToString(dropOk ? 1 : 0));
+    }
+}

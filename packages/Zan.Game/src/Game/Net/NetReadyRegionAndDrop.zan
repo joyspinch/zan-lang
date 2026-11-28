@@ -1,0 +1,263 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Net;
+
+// 组队/匹配开局就绪检查状态。
+public enum ReadyCheckStatus {
+    Pending = 0,
+    AllReady = 1,
+    Declined = 2,
+    TimedOut = 3
+}
+
+internal class ReadyMemberSlot {
+    public int PlayerId;
+    public int Vote; // 0=pending, 1=accepted, -1=declined
+
+    public ReadyMemberSlot(int playerId) {
+        this.PlayerId = playerId;
+        this.Vote = 0;
+    }
+}
+
+// 商业联机全员就绪检查器：支持超时判定、任意成员拒绝即刻中止、全员确认通过。
+public class NetPartyReadyCheckSession {
+    private List<ReadyMemberSlot> members;
+    public long StartedAtMs;
+    public long TimeoutMs;
+    public ReadyCheckStatus Status;
+    public int DeclinedByPlayerId;
+
+    public NetPartyReadyCheckSession(long startedAtMs, long timeoutMs) {
+        this.members = new List<ReadyMemberSlot>();
+        this.StartedAtMs = startedAtMs;
+        this.TimeoutMs = timeoutMs > 0L ? timeoutMs : 15000L;
+        this.Status = ReadyCheckStatus.Pending;
+        this.DeclinedByPlayerId = 0;
+    }
+
+    public void AddMember(int playerId) {
+        for (int i = 0; i < this.members.Count; i = i + 1) {
+            if (this.members[i].PlayerId == playerId) { return; }
+        }
+        this.members.Add(new ReadyMemberSlot(playerId));
+    }
+
+    public int MemberCount() { return this.members.Count; }
+
+    public int AcceptedCount() {
+        int c = 0;
+        for (int i = 0; i < this.members.Count; i = i + 1) {
+            if (this.members[i].Vote == 1) { c = c + 1; }
+        }
+        return c;
+    }
+
+    public ReadyCheckStatus Respond(int playerId, bool accepted, long nowMs) {
+        this.Tick(nowMs);
+        if (this.Status != ReadyCheckStatus.Pending) { return this.Status; }
+        for (int i = 0; i < this.members.Count; i = i + 1) {
+            ReadyMemberSlot slot = this.members[i];
+            if (slot.PlayerId == playerId) {
+                if (slot.Vote != 0) { return this.Status; }
+                slot.Vote = accepted ? 1 : -1;
+                if (!accepted) {
+                    this.Status = ReadyCheckStatus.Declined;
+                    this.DeclinedByPlayerId = playerId;
+                    return this.Status;
+                }
+                if (this.AcceptedCount() == this.members.Count && this.members.Count > 0) {
+                    this.Status = ReadyCheckStatus.AllReady;
+                }
+                return this.Status;
+            }
+        }
+        return this.Status;
+    }
+
+    public ReadyCheckStatus Tick(long nowMs) {
+        if (this.Status == ReadyCheckStatus.Pending && (nowMs - this.StartedAtMs) >= this.TimeoutMs) {
+            this.Status = ReadyCheckStatus.TimedOut;
+        }
+        return this.Status;
+    }
+}
+
+// 区域战斗服节点遥测（延迟 EMA、容量负载与维护引流状态）。
+public class RegionServerNode {
+    public string RegionId;
+    public double LatencyEmaMs;
+    public int ActivePlayers;
+    public int MaxPlayers;
+    public bool Draining;
+
+    public RegionServerNode(string regionId, double initialLatencyMs, int maxPlayers) {
+        this.RegionId = regionId;
+        this.LatencyEmaMs = initialLatencyMs > 0.0 ? initialLatencyMs : 20.0;
+        this.ActivePlayers = 0;
+        this.MaxPlayers = maxPlayers > 0 ? maxPlayers : 1000;
+        this.Draining = false;
+    }
+
+    public double LoadRatio() {
+        if (this.MaxPlayers <= 0) { return 1.0; }
+        return (double)this.ActivePlayers / (double)this.MaxPlayers;
+    }
+}
+
+// 商业多区域战斗服智能路由器：结合延迟 EMA、负载惩罚、容量上限与维护引流实现无感容灾切服。
+public class NetDynamicRegionRouter {
+    private List<RegionServerNode> nodes;
+    public double EmaAlpha;
+    public double LoadPenaltyMs;
+    public double MaxLoadRatio;
+
+    public NetDynamicRegionRouter(double emaAlpha, double loadPenaltyMs) {
+        this.nodes = new List<RegionServerNode>();
+        this.EmaAlpha = (emaAlpha > 0.0 && emaAlpha <= 1.0) ? emaAlpha : 0.35;
+        this.LoadPenaltyMs = loadPenaltyMs >= 0.0 ? loadPenaltyMs : 40.0;
+        this.MaxLoadRatio = 0.95;
+    }
+
+    public void RegisterRegion(string regionId, double initialLatencyMs, int maxPlayers) {
+        if (this.Find(regionId) != null) { return; }
+        this.nodes.Add(new RegionServerNode(regionId, initialLatencyMs, maxPlayers));
+    }
+
+    public RegionServerNode Find(string regionId) {
+        for (int i = 0; i < this.nodes.Count; i = i + 1) {
+            if (this.nodes[i].RegionId == regionId) { return this.nodes[i]; }
+        }
+        return null;
+    }
+
+    public void ReportTelemetry(string regionId, double sampleLatencyMs, int activePlayers) {
+        RegionServerNode n = this.Find(regionId);
+        if (n == null) { return; }
+        if (sampleLatencyMs >= 0.0) {
+            n.LatencyEmaMs = n.LatencyEmaMs * (1.0 - this.EmaAlpha) + sampleLatencyMs * this.EmaAlpha;
+        }
+        n.ActivePlayers = activePlayers >= 0 ? activePlayers : 0;
+    }
+
+    public void SetDraining(string regionId, bool draining) {
+        RegionServerNode n = this.Find(regionId);
+        if (n != null) { n.Draining = draining; }
+    }
+
+    // 选出综合代价最低的健康区域服；若所有节点过载则退化挑选非引流最低延迟节点。
+    public string SelectBestRegion() {
+        string bestHealthy = "";
+        double bestHealthyScore = 1000000000.0;
+        string bestFallback = "";
+        double bestFallbackScore = 1000000000.0;
+
+        for (int i = 0; i < this.nodes.Count; i = i + 1) {
+            RegionServerNode n = this.nodes[i];
+            if (n.Draining) { continue; }
+            double load = n.LoadRatio();
+            double score = n.LatencyEmaMs + load * this.LoadPenaltyMs;
+            if (score < bestFallbackScore) {
+                bestFallbackScore = score;
+                bestFallback = n.RegionId;
+            }
+            if (load < this.MaxLoadRatio && score < bestHealthyScore) {
+                bestHealthyScore = score;
+                bestHealthy = n.RegionId;
+            }
+        }
+        return bestHealthy != "" ? bestHealthy : bestFallback;
+    }
+}
+
+// 加权掉落条目（支持稀有度标记与一次性防重复保护）。
+public class DropTableEntry {
+    public string ItemId;
+    public int Weight;
+    public bool IsRare;
+    public bool UniqueOnce;
+
+    public DropTableEntry(string itemId, int weight, bool isRare, bool uniqueOnce) {
+        this.ItemId = itemId;
+        this.Weight = weight > 0 ? weight : 1;
+        this.IsRare = isRare;
+        this.UniqueOnce = uniqueOnce;
+    }
+}
+
+// 服务端确定性加权掉落表：线性同余固定种子、稀有保底计数器与唯一物品防重复保护。
+public class NetWeightedDropTable {
+    private List<DropTableEntry> entries;
+    private List<string> claimedUnique;
+    private long rngState;
+    public int PityThreshold;
+    public int MissCount;
+
+    public NetWeightedDropTable(long seed, int pityThreshold) {
+        this.entries = new List<DropTableEntry>();
+        this.claimedUnique = new List<string>();
+        this.rngState = seed != 0L ? seed : 123456789L;
+        this.PityThreshold = pityThreshold > 0 ? pityThreshold : 10;
+        this.MissCount = 0;
+    }
+
+    public void AddEntry(string itemId, int weight, bool isRare, bool uniqueOnce) {
+        this.entries.Add(new DropTableEntry(itemId, weight, isRare, uniqueOnce));
+    }
+
+    private bool IsAlreadyClaimed(string itemId) {
+        for (int i = 0; i < this.claimedUnique.Count; i = i + 1) {
+            if (this.claimedUnique[i] == itemId) { return true; }
+        }
+        return false;
+    }
+
+    private int NextInt(int bound) {
+        if (bound <= 1) { return 0; }
+        this.rngState = (this.rngState * 1103515245L + 12345L) & 2147483647L;
+        return (int)(this.rngState % (long)bound);
+    }
+
+    public string RollOne() {
+        bool forceRare = this.MissCount + 1 >= this.PityThreshold;
+        int totalWeight = 0;
+        for (int i = 0; i < this.entries.Count; i = i + 1) {
+            DropTableEntry e = this.entries[i];
+            if (e.UniqueOnce && this.IsAlreadyClaimed(e.ItemId)) { continue; }
+            if (forceRare && !e.IsRare) { continue; }
+            totalWeight = totalWeight + e.Weight;
+        }
+        // 若稀有唯一项已全部抽空，回退全池抽取
+        if (totalWeight <= 0) {
+            forceRare = false;
+            for (int i = 0; i < this.entries.Count; i = i + 1) {
+                DropTableEntry e = this.entries[i];
+                if (e.UniqueOnce && this.IsAlreadyClaimed(e.ItemId)) { continue; }
+                totalWeight = totalWeight + e.Weight;
+            }
+        }
+        if (totalWeight <= 0) { return ""; }
+
+        int pick = this.NextInt(totalWeight);
+        int acc = 0;
+        for (int i = 0; i < this.entries.Count; i = i + 1) {
+            DropTableEntry e = this.entries[i];
+            if (e.UniqueOnce && this.IsAlreadyClaimed(e.ItemId)) { continue; }
+            if (forceRare && !e.IsRare) { continue; }
+            acc = acc + e.Weight;
+            if (pick < acc) {
+                if (e.IsRare) {
+                    this.MissCount = 0;
+                } else {
+                    this.MissCount = this.MissCount + 1;
+                }
+                if (e.UniqueOnce) {
+                    this.claimedUnique.Add(e.ItemId);
+                }
+                return e.ItemId;
+            }
+        }
+        return "";
+    }
+}

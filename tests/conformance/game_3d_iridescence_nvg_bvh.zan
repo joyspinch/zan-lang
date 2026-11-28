@@ -1,0 +1,161 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Game.Graphics;
+using Game.Render3D;
+
+namespace Conf;
+
+class Game3DIridescenceNvgBvhTest {
+    [DllImport("zan_gui")]
+    private static extern int zan_gui_read_pixel(int surfaceId, int x, int y);
+
+    static int RedOf(int argb) { return (argb >> 16) & 255; }
+    static int GreenOf(int argb) { return (argb >> 8) & 255; }
+    static int BlueOf(int argb) { return argb & 255; }
+
+    static void Main() {
+        Canvas.SetBackend(1);
+        Canvas cv = new Canvas(128, 128);
+        int sid = cv.SurfaceId();
+
+        // 1. GPU 薄膜干涉虹彩珠光：正视面(ndv≈1)偏红，掠射面(ndv≈0.5)移相偏青绿
+        Mesh3D leftQuad = new Mesh3D();
+        leftQuad.Vertex(-2.4f, -2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        leftQuad.Vertex(-0.1f, -2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+        leftQuad.Vertex(-0.1f,  2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        leftQuad.Vertex(-2.4f,  2.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f);
+        leftQuad.Triangle(0, 1, 2);
+        leftQuad.Triangle(0, 2, 3);
+        int leftKey = cv.MeshUpload(leftQuad);
+
+        Mesh3D rightQuad = new Mesh3D();
+        rightQuad.Vertex(0.1f, -2.0f, 0.0f, 0.0f, 0.866f, 0.5f, 0.0f, 0.0f);
+        rightQuad.Vertex(2.4f, -2.0f, 0.0f, 0.0f, 0.866f, 0.5f, 1.0f, 0.0f);
+        rightQuad.Vertex(2.4f,  2.0f, 0.0f, 0.0f, 0.866f, 0.5f, 1.0f, 1.0f);
+        rightQuad.Vertex(0.1f,  2.0f, 0.0f, 0.0f, 0.866f, 0.5f, 0.0f, 1.0f);
+        rightQuad.Triangle(0, 1, 2);
+        rightQuad.Triangle(0, 2, 3);
+        int rightKey = cv.MeshUpload(rightQuad);
+
+        Camera3D cam = new Camera3D();
+        cam.Position = new Vector3(0.0f, 0.0f, 4.0f);
+        cam.Target = new Vector3(0.0f, 0.0f, 0.0f);
+        cam.AspectRatio = 1.0f;
+        cam.FieldOfView = 1.1f;
+
+        Material iriMat = Material.Solid(0.0f, 0.0f, 0.0f);
+        iriMat.EmissiveRed = 0.02f;
+        iriMat.EmissiveGreen = 0.02f;
+        iriMat.EmissiveBlue = 0.02f;
+
+        SceneNode root1 = new SceneNode("root1");
+        SceneNode nLeft = new SceneNode("left");
+        nLeft.MeshKey = leftKey;
+        nLeft.BoundsRadius = 4.0f;
+        nLeft.Material = iriMat;
+        root1.AddChild(nLeft);
+
+        SceneNode nRight = new SceneNode("right");
+        nRight.MeshKey = rightKey;
+        nRight.BoundsRadius = 4.0f;
+        nRight.Material = iriMat;
+        root1.AddChild(nRight);
+
+        Renderer3D ren = new Renderer3D(16);
+        ren.UseCpuLighting = false;
+        RenderPlan plan1 = new RenderPlan(cam);
+
+        cv.Clear(unchecked((int)0xFF000000));
+        plan1.Build(root1);
+        ren.Draw(cv, plan1);
+        int baseL = zan_gui_read_pixel(sid, 36, 64);
+        int baseR = zan_gui_read_pixel(sid, 92, 64);
+
+        iriMat.IridescenceEnabled = true;
+        iriMat.IridescenceFilmThickness = 1.0f;
+        iriMat.IridescencePhaseShift = 0.0f;
+        iriMat.IridescenceStrength = 1.4f;
+
+        cv.Clear(unchecked((int)0xFF000000));
+        plan1.Build(root1);
+        ren.Draw(cv, plan1);
+        int iriL = zan_gui_read_pixel(sid, 36, 64);
+        int iriR = zan_gui_read_pixel(sid, 92, 64);
+
+        bool iriOk = RedOf(baseL) < 20 && GreenOf(baseR) < 20
+            && RedOf(iriL) > GreenOf(iriL) + 35 && RedOf(iriL) > BlueOf(iriL) + 35
+            && GreenOf(iriR) > RedOf(iriR) + 50 && BlueOf(iriR) > RedOf(iriR) + 50;
+        Console.WriteLine("gpu-iridescence: " + Convert.ToString(iriOk ? 1 : 0));
+
+        // 2. GPU 后处理战术夜视仪：微光暗场景放大为 P43 绿磷高亮，屏幕四角目镜遮罩压黑
+        Mesh3D fullQuad = new Mesh3D();
+        fullQuad.Vertex(-3.0f, -3.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        fullQuad.Vertex( 3.0f, -3.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+        fullQuad.Vertex( 3.0f,  3.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        fullQuad.Vertex(-3.0f,  3.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f);
+        fullQuad.Triangle(0, 1, 2);
+        fullQuad.Triangle(0, 2, 3);
+        int fullKey = cv.MeshUpload(fullQuad);
+
+        Material dimMat = Material.Solid(0.0f, 0.0f, 0.0f);
+        dimMat.EmissiveRed = 0.09f;
+        dimMat.EmissiveGreen = 0.09f;
+        dimMat.EmissiveBlue = 0.09f;
+
+        SceneNode root2 = new SceneNode("root2");
+        SceneNode panel = new SceneNode("panel");
+        panel.MeshKey = fullKey;
+        panel.BoundsRadius = 6.0f;
+        panel.Material = dimMat;
+        root2.AddChild(panel);
+
+        RenderPlan plan2 = new RenderPlan(cam);
+
+        cv.Clear(unchecked((int)0xFF000000));
+        plan2.Build(root2);
+        ren.Draw(cv, plan2);
+        int dimCenter = zan_gui_read_pixel(sid, 64, 64);
+
+        PostProcess post = new PostProcess();
+        post.NightVisionStrength = 1.0f;
+        post.NightVisionGain = 5.0f;
+        post.NightVisionNoise = 0.03f;
+        post.NightVisionSeed = 1.0f;
+        ren.PostProcess = post;
+
+        cv.Clear(unchecked((int)0xFF000000));
+        plan2.Build(root2);
+        ren.Draw(cv, plan2);
+        int nvgCenter = zan_gui_read_pixel(sid, 64, 64);
+        int nvgCorner = zan_gui_read_pixel(sid, 4, 4);
+
+        bool nvgOk = GreenOf(dimCenter) < 35
+            && GreenOf(nvgCenter) > 100
+            && GreenOf(nvgCenter) > RedOf(nvgCenter) + 55
+            && GreenOf(nvgCenter) > BlueOf(nvgCenter) + 45
+            && RedOf(nvgCorner) < 10 && GreenOf(nvgCorner) < 10 && BlueOf(nvgCorner) < 10;
+        Console.WriteLine("gpu-post-night-vision: " + Convert.ToString(nvgOk ? 1 : 0));
+
+        ren.Dispose();
+
+        // 3. BVH 3D 空间加速树：最长轴划分、Slab 最近射线命中、空射线与球体查询
+        BvhRayIndex3D bvh = new BvhRayIndex3D(2);
+        bvh.Add(new BvhNodeEntry3D(10, -1.0f, -1.0f, 10.0f, 1.0f, 1.0f, 12.0f));
+        bvh.Add(new BvhNodeEntry3D(20, -1.0f, -1.0f, 4.0f,  1.0f, 1.0f, 6.0f));
+        bvh.Add(new BvhNodeEntry3D(30,  8.0f, -1.0f, 4.0f, 10.0f, 1.0f, 6.0f));
+        bvh.Add(new BvhNodeEntry3D(40,  9.0f, -1.0f, 5.0f, 11.0f, 1.0f, 7.0f));
+        bvh.Add(new BvhNodeEntry3D(50, -9.0f,  5.0f, 5.0f, -7.0f, 7.0f, 7.0f));
+        bvh.Build();
+
+        BvhRayHit3D hit = bvh.RaycastNearest(new Vector3(0.0f, 0.0f, 0.0f), new Vector3(0.0f, 0.0f, 1.0f), 50.0f);
+        BvhRayHit3D miss = bvh.RaycastNearest(new Vector3(0.0f, 20.0f, 0.0f), new Vector3(0.0f, 0.0f, 1.0f), 50.0f);
+        List<int> nearCluster = bvh.QuerySphere(new Vector3(9.5f, 0.0f, 5.5f), 2.0f);
+
+        bool bvhOk = bvh.EntryCount() == 5 && bvh.NodeCount() >= 3
+            && hit != null && hit.EntryId == 20 && hit.Distance > 3.9f && hit.Distance < 4.1f
+            && miss == null
+            && nearCluster.Count == 2;
+        Console.WriteLine("bvh-ray-index-3d: " + Convert.ToString(bvhOk ? 1 : 0));
+    }
+}

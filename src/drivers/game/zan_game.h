@@ -298,6 +298,16 @@ ZAN_GAME_API void zan_game_set_lava_crust3d(int32_t enabled, float scale,
 ZAN_GAME_API void zan_game_set_post_screen_tint_flash3d(float edge_strength,
     float flash_strength, float r, float g, float b);
 
+/* GPU 薄膜干涉虹彩珠光涂层（Thin-Film Iridescence，零贴图零额外 Pass）：
+ * enabled != 0 时按视角法线夹角产生薄膜彩虹干涉色，film_thickness [0.5..6]，strength [0..2]。 */
+ZAN_GAME_API void zan_game_set_iridescence3d(int32_t enabled,
+    float film_thickness, float phase_shift, float strength);
+
+/* GPU 后处理战术夜视仪（NVG P43 绿磷增益 + 圆形目镜遮罩 + 闪烁噪点，单 Pass 零额外 FBO）：
+ * strength [0..1] 控制混入强度，gain [0.5..8] 控制微光增益，noise_amount [0..0.5] 控制噪点幅度。 */
+ZAN_GAME_API void zan_game_set_post_night_vision3d(float strength, float gain,
+    float noise_amount, float seed);
+
 #ifdef __cplusplus
 }
 #endif

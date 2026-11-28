@@ -154,6 +154,7 @@ typedef struct {
     zgl_int u_caustics_params, u_caustics_color;
     zgl_int u_ice_frost_params, u_ice_frost_color;
     zgl_int u_lava_crust_params, u_lava_crust_color;
+    zgl_int u_iridescence_params;
     zgl_int u_light_dir, u_light_color, u_light_count, u_ambient;
     zgl_int u_cam_pos, u_cam_valid, u_material, u_emissive;
     zgl_int u_point_pos, u_point_color, u_point_count;
@@ -242,6 +243,7 @@ static float g_game_ice_frost_params[4] = { 0.0f, 2.0f, 0.0f, 2.5f }; /* enabled
 static float g_game_ice_frost_color[3] = { 0.65f, 0.92f, 1.0f };
 static float g_game_lava_crust_params[4] = { 0.0f, 1.5f, 0.0f, 0.18f }; /* enabled, scale, phase, crack_width */
 static float g_game_lava_crust_color[4] = { 1.0f, 0.35f, 0.04f, 0.0f }; /* r, g, b, strength */
+static float g_game_iridescence_params[4] = { 0.0f, 2.0f, 0.0f, 0.0f }; /* enabled, film_thickness, phase_shift, strength */
 static float g_game_color_grade[2] = { 1.0f, 1.0f }; /* saturation, contrast */
 static float g_game_color_tint[3] = { 1.0f, 1.0f, 1.0f };
 static float g_game_post_lens[2] = { 0.0f, 0.0f }; /* fxaa, chromatic */
@@ -257,6 +259,7 @@ static float g_game_post_outline_color[3] = { 0.0f, 0.0f, 0.0f };
 static float g_game_post_thermal[3] = { 0.0f, 1.0f, 0.0f }; /* strength, sensitivity, cold_shift */
 static float g_game_post_flash_params[2] = { 0.0f, 0.0f }; /* edge_strength, flash_strength */
 static float g_game_post_flash_color[3] = { 1.0f, 0.05f, 0.05f };
+static float g_game_post_night_vision[4] = { 0.0f, 3.0f, 0.06f, 0.0f }; /* strength, gain, noise_amount, seed */
 static uint32_t g_game_light_version = 1;
 
 static zan_game_mesh *g_game_meshes = NULL;
@@ -561,6 +564,7 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
 "uniform vec3 uIceFrostColor;\n" \
 "uniform vec4 uLavaCrustParams;\n" \
 "uniform vec4 uLavaCrustColor;\n" \
+"uniform vec4 uIridescenceParams;\n" \
 "uniform vec3 uCamPos;\n" \
 "uniform int uCamValid;\n" \
 "uniform vec2 uMaterial;\n" \
@@ -785,6 +789,14 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
     "        float lPulse = 0.72 + 0.28 * sin(uLavaCrustParams.z * 2.0 + lp.x + lp.z);\n" \
     "        rgb += uLavaCrustColor.rgb * (lCrack * lPulse * clamp(uLavaCrustColor.w, 0.0, 3.0));\n" \
     "    }\n" \
+    "    if (uIridescenceParams.x > 0.5 && uIridescenceParams.w > 0.0005) {\n" \
+    "        vec3 irV = (uCamValid != 0) ? normalize(uCamPos - v_world_pos) : vec3(0.0, 0.0, 1.0);\n" \
+    "        float irNdv = clamp(dot(N, irV), 0.0, 1.0);\n" \
+    "        float irPhase = (1.0 - irNdv) * max(uIridescenceParams.y, 0.5) * 6.2831853 + uIridescenceParams.z;\n" \
+    "        vec3 irCol = vec3(0.5) + vec3(0.5) * cos(vec3(irPhase, irPhase + 2.0943951, irPhase + 4.1887902));\n" \
+    "        float irFres = 0.25 + 0.75 * pow(1.0 - irNdv, 1.5);\n" \
+    "        rgb += irCol * (irFres * clamp(uIridescenceParams.w, 0.0, 2.0));\n" \
+    "    }\n" \
     "    if (uCamValid != 0) {\n" \
     "        float ndv = clamp(dot(N, V), 0.0, 1.0);\n" \
     "        if (uHemiOn != 0) {\n" \
@@ -926,6 +938,7 @@ static const char *const ZAN_GAME_POST_FS =
 "uniform vec3 uPostThermal;\n"
 "uniform vec2 uPostFlashParams;\n"
 "uniform vec3 uPostFlashColor;\n"
+"uniform vec4 uPostNightVision;\n"
 "in vec2 v_uv;\n"
 "out vec4 frag;\n"
 "vec3 brightPass(vec3 c, float th) {\n"
@@ -1069,6 +1082,15 @@ static const char *const ZAN_GAME_POST_FS =
     "        col = mix(col, uPostFlashColor, fEdge);\n"
     "        col = mix(col, uPostFlashColor, clamp(uPostFlashParams.y, 0.0, 1.0));\n"
     "    }\n"
+    "    if (uPostNightVision.x > 0.0005) {\n"
+    "        float nvLum = clamp(dot(col, vec3(0.299, 0.587, 0.114)) * max(uPostNightVision.y, 0.25), 0.0, 1.0);\n"
+    "        float nvN = (fract(sin(dot(uv * 512.0 + vec2(uPostNightVision.w * 23.1, uPostNightVision.w * 41.7), vec2(12.9898, 78.233))) * 43758.5453) - 0.5) * uPostNightVision.z;\n"
+    "        float nvSig = clamp(nvLum + nvN, 0.0, 1.0);\n"
+    "        vec3 nvPhos = vec3(nvSig * 0.12 + nvSig * nvSig * 0.20, clamp(nvSig * 1.15, 0.0, 1.0), nvSig * 0.24 + nvSig * nvSig * 0.16);\n"
+    "        float nvRad = length((uv - vec2(0.5)) * 2.0);\n"
+    "        float nvMask = smoothstep(0.96, 0.76, nvRad);\n"
+    "        col = mix(col, nvPhos * nvMask, clamp(uPostNightVision.x, 0.0, 1.0));\n"
+    "    }\n"
     "    if (uVignette > 0.001) {\n"
     "        vec2 d = (v_uv - vec2(0.5)) * 2.0;\n"
     "        float vig = clamp(1.0 - uVignette * dot(d, d) * 0.5, 0.0, 1.0);\n"
@@ -1121,6 +1143,7 @@ typedef struct {
     zgl_int u_post_thermal;
     zgl_int u_post_flash_params;
     zgl_int u_post_flash_color;
+    zgl_int u_post_night_vision;
 } zan_game_post_program;
 
 static const char *const ZAN_GAME_SKYBOX_FS =
@@ -1388,6 +1411,8 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
         : g_game_gl->GetUniformLocation(program, "uLavaCrustParams");
     zgl_int lava_crust_color = instanced ? -1
         : g_game_gl->GetUniformLocation(program, "uLavaCrustColor");
+    zgl_int iridescence_params = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uIridescenceParams");
     zgl_int color = instanced ? 0
         : g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
@@ -1472,6 +1497,7 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
     prog->u_ice_frost_color = ice_frost_color;
     prog->u_lava_crust_params = lava_crust_params;
     prog->u_lava_crust_color = lava_crust_color;
+    prog->u_iridescence_params = iridescence_params;
     prog->u_color = color;
     prog->u_light_dir = light_dir;
     prog->u_light_color = light_color;
@@ -1553,6 +1579,7 @@ static zan_game_program *zan_game_skin_program_get(void) {
     zgl_int ice_frost_color = g_game_gl->GetUniformLocation(program, "uIceFrostColor");
     zgl_int lava_crust_params = g_game_gl->GetUniformLocation(program, "uLavaCrustParams");
     zgl_int lava_crust_color = g_game_gl->GetUniformLocation(program, "uLavaCrustColor");
+    zgl_int iridescence_params = g_game_gl->GetUniformLocation(program, "uIridescenceParams");
     zgl_int color = g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
     zgl_int light_color = g_game_gl->GetUniformLocation(program, "uLightColor[0]");
@@ -1625,6 +1652,7 @@ static zan_game_program *zan_game_skin_program_get(void) {
     g_game_skin_prog.u_ice_frost_color = ice_frost_color;
     g_game_skin_prog.u_lava_crust_params = lava_crust_params;
     g_game_skin_prog.u_lava_crust_color = lava_crust_color;
+    g_game_skin_prog.u_iridescence_params = iridescence_params;
     g_game_skin_prog.u_color = color;
     g_game_skin_prog.u_light_dir = light_dir;
     g_game_skin_prog.u_light_color = light_color;
@@ -2137,6 +2165,11 @@ static void zan_game_bind_shadow_uniforms(const zan_gl_api *gl, zan_game_program
         gl->Uniform4f(prog->u_lava_crust_color,
             g_game_lava_crust_color[0], g_game_lava_crust_color[1],
             g_game_lava_crust_color[2], g_game_lava_crust_color[3]);
+    }
+    if (prog->u_iridescence_params >= 0) {
+        gl->Uniform4f(prog->u_iridescence_params,
+            g_game_iridescence_params[0], g_game_iridescence_params[1],
+            g_game_iridescence_params[2], g_game_iridescence_params[3]);
     }
 }
 
@@ -2720,6 +2753,7 @@ static zan_game_post_program *zan_game_post_program_get(void) {
     g_game_post_prog.u_post_thermal = g_game_gl->GetUniformLocation(prog, "uPostThermal");
     g_game_post_prog.u_post_flash_params = g_game_gl->GetUniformLocation(prog, "uPostFlashParams");
     g_game_post_prog.u_post_flash_color = g_game_gl->GetUniformLocation(prog, "uPostFlashColor");
+    g_game_post_prog.u_post_night_vision = g_game_gl->GetUniformLocation(prog, "uPostNightVision");
     return &g_game_post_prog;
 }
 
@@ -2866,6 +2900,11 @@ ZAN_GAME_API int32_t zan_game_postprocess3d(int32_t surface_id, float exposure,
     }
     if (prog->u_post_flash_color >= 0) {
         gl->Uniform3fv(prog->u_post_flash_color, 1, g_game_post_flash_color);
+    }
+    if (prog->u_post_night_vision >= 0) {
+        gl->Uniform4f(prog->u_post_night_vision,
+            g_game_post_night_vision[0], g_game_post_night_vision[1],
+            g_game_post_night_vision[2], g_game_post_night_vision[3]);
     }
     gl->BindVertexArray(g_game_post_vao);
     gl->DrawArrays(ZGL_TRIANGLES, 0, 3);
@@ -3348,4 +3387,30 @@ ZAN_GAME_API void zan_game_set_post_screen_tint_flash3d(float edge_strength,
     g_game_post_flash_color[0] = r > 0.0f ? r : 0.0f;
     g_game_post_flash_color[1] = g > 0.0f ? g : 0.0f;
     g_game_post_flash_color[2] = b > 0.0f ? b : 0.0f;
+}
+
+ZAN_GAME_API void zan_game_set_iridescence3d(int32_t enabled,
+    float film_thickness, float phase_shift, float strength) {
+    g_game_iridescence_params[0] = enabled ? 1.0f : 0.0f;
+    if (film_thickness < 0.5f) film_thickness = 0.5f;
+    if (film_thickness > 6.0f) film_thickness = 6.0f;
+    g_game_iridescence_params[1] = film_thickness;
+    g_game_iridescence_params[2] = phase_shift;
+    if (strength < 0.0f) strength = 0.0f;
+    if (strength > 2.0f) strength = 2.0f;
+    g_game_iridescence_params[3] = strength;
+}
+
+ZAN_GAME_API void zan_game_set_post_night_vision3d(float strength, float gain,
+    float noise_amount, float seed) {
+    if (strength < 0.0f) strength = 0.0f;
+    if (strength > 1.0f) strength = 1.0f;
+    if (gain < 0.25f) gain = 0.25f;
+    if (gain > 8.0f) gain = 8.0f;
+    if (noise_amount < 0.0f) noise_amount = 0.0f;
+    if (noise_amount > 0.5f) noise_amount = 0.5f;
+    g_game_post_night_vision[0] = strength;
+    g_game_post_night_vision[1] = gain;
+    g_game_post_night_vision[2] = noise_amount;
+    g_game_post_night_vision[3] = seed;
 }
