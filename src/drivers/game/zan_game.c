@@ -166,6 +166,7 @@ typedef struct {
     zgl_int u_crosshatch_params, u_crosshatch_color;
     zgl_int u_aniso_brushed_params, u_aniso_brushed_color;
     zgl_int u_velvet_sheen_params, u_velvet_sheen_color;
+    zgl_int u_subsurface_params, u_subsurface_color;
     zgl_int u_light_dir, u_light_color, u_light_count, u_ambient;
     zgl_int u_cam_pos, u_cam_valid, u_material, u_emissive;
     zgl_int u_point_pos, u_point_color, u_point_count;
@@ -277,6 +278,8 @@ static float g_game_aniso_brushed_params[4] = { 0.0f, 12.0f, 16.0f, 0.0f }; /* e
 static float g_game_aniso_brushed_color[3] = { 0.85f, 0.90f, 1.0f };
 static float g_game_velvet_sheen_params[4] = { 0.0f, 0.35f, 16.0f, 0.0f }; /* enabled, roughness, weave_freq, strength */
 static float g_game_velvet_sheen_color[3] = { 0.95f, 0.78f, 1.0f };
+static float g_game_subsurface_params[4] = { 0.0f, 0.5f, 0.0f, 3.0f }; /* enabled, wrap, translucency, power */
+static float g_game_subsurface_color[3] = { 1.0f, 0.35f, 0.20f };
 static float g_game_color_grade[2] = { 1.0f, 1.0f }; /* saturation, contrast */
 static float g_game_color_tint[3] = { 1.0f, 1.0f, 1.0f };
 static float g_game_post_lens[2] = { 0.0f, 0.0f }; /* fxaa, chromatic */
@@ -308,6 +311,7 @@ static float g_game_post_oil_paint[2] = { 0.0f, 2.0f }; /* strength, radius */
 static float g_game_post_scope_blur[2] = { 0.0f, 0.45f }; /* strength, clear_radius */
 static float g_game_post_daltonize[2] = { 0.0f, 0.0f }; /* mode (0..3), strength (0..1) */
 static float g_game_post_lens_distort[2] = { 0.0f, 1.0f }; /* k1 (-0.6..0.6), zoom (0.5..1.5) */
+static float g_game_post_god_rays[4] = { 0.0f, 0.92f, 0.5f, 0.5f }; /* strength, decay, light_x, light_y */
 static uint32_t g_game_light_version = 1;
 
 static zan_game_mesh *g_game_meshes = NULL;
@@ -635,6 +639,8 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
 "uniform vec3 uAnisoBrushedColor;\n" \
 "uniform vec4 uVelvetSheenParams;\n" \
 "uniform vec3 uVelvetSheenColor;\n" \
+"uniform vec4 uSubsurfaceParams;\n" \
+"uniform vec3 uSubsurfaceColor;\n" \
 "uniform vec3 uCamPos;\n" \
 "uniform int uCamValid;\n" \
 "uniform vec2 uMaterial;\n" \
@@ -974,6 +980,16 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
     "        float vsWeave = 0.85 + 0.15 * sin(v_world_pos.x * vsWf * 6.2831853) * sin(v_world_pos.y * vsWf * 6.2831853);\n" \
     "        rgb += uVelvetSheenColor * (vsLobe * vsWeave * clamp(uVelvetSheenParams.w, 0.0, 3.0));\n" \
     "    }\n" \
+    "    if (uSubsurfaceParams.x > 0.5 && (uSubsurfaceParams.y > 0.0005 || uSubsurfaceParams.z > 0.0005)) {\n" \
+    "        vec3 ssL = (uLightCount > 0) ? normalize(-uLightDir[0]) : vec3(0.0, 0.35, -0.936);\n" \
+    "        vec3 ssV = (uCamValid != 0) ? V : vec3(0.0, 0.0, 1.0);\n" \
+    "        float ssW = clamp(uSubsurfaceParams.y, 0.0, 1.0);\n" \
+    "        float ssNdl = dot(N, ssL);\n" \
+    "        float ssWrap = max(0.0, (ssNdl + ssW) / (1.0 + ssW)) - max(0.0, ssNdl);\n" \
+    "        vec3 ssH = normalize(ssL + N * 0.35);\n" \
+    "        float ssBack = pow(clamp(dot(ssV, -ssH), 0.0, 1.0), clamp(uSubsurfaceParams.w, 1.0, 8.0));\n" \
+    "        rgb += uSubsurfaceColor * (max(ssWrap, 0.0) * 0.85 + ssBack * clamp(uSubsurfaceParams.z, 0.0, 2.0));\n" \
+    "    }\n" \
     "    if (uCamValid != 0) {\n" \
     "        float ndv = clamp(dot(N, V), 0.0, 1.0);\n" \
     "        if (uXrayParams.x > 0.5 && uXrayParams.z > 0.0005) {\n" \
@@ -1135,6 +1151,7 @@ static const char *const ZAN_GAME_POST_FS =
 "uniform vec2 uPostScopeBlur;\n"
 "uniform vec2 uPostDaltonize;\n"
 "uniform vec2 uPostLensDistort;\n"
+"uniform vec4 uPostGodRays;\n"
 "in vec2 v_uv;\n"
 "out vec4 frag;\n"
 "vec3 brightPass(vec3 c, float th) {\n"
@@ -1214,6 +1231,21 @@ static const char *const ZAN_GAME_POST_FS =
     "            sbAcc += texture(uScene, clamp(uv + vec2(-sbStep.x, -sbStep.y), vec2(0.0), vec2(1.0))).rgb;\n"
     "            col = mix(col, sbAcc * 0.1, sbAmt);\n"
     "        }\n"
+    "    }\n"
+    "    if (uPostGodRays.x > 0.0005) {\n"
+    "        vec2 grLight = clamp(uPostGodRays.zw, vec2(0.0), vec2(1.0));\n"
+    "        vec2 grDelta = (uv - grLight) * (0.85 / 12.0);\n"
+    "        vec2 grUv = uv;\n"
+    "        float grDecay = clamp(uPostGodRays.y, 0.70, 0.99);\n"
+    "        float grIllum = 1.0;\n"
+    "        vec3 grAcc = vec3(0.0);\n"
+    "        for (int gri = 0; gri < 12; gri = gri + 1) {\n"
+    "            grUv -= grDelta;\n"
+    "            vec3 grS = texture(uScene, clamp(grUv, vec2(0.0), vec2(1.0))).rgb;\n"
+    "            grAcc += brightPass(grS, 0.55) * grIllum;\n"
+    "            grIllum *= grDecay;\n"
+    "        }\n"
+    "        col += grAcc * (clamp(uPostGodRays.x, 0.0, 2.0) / 12.0);\n"
     "    }\n"
     "    if (uPostGlitch.x > 0.0005) {\n"
     "        float gBand = floor(uv.y * max(uPostGlitch.y, 4.0));\n"
@@ -1517,6 +1549,7 @@ typedef struct {
     zgl_int u_post_scope_blur;
     zgl_int u_post_daltonize;
     zgl_int u_post_lens_distort;
+    zgl_int u_post_god_rays;
 } zan_game_post_program;
 
 static const char *const ZAN_GAME_SKYBOX_FS =
@@ -1830,6 +1863,10 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
         : g_game_gl->GetUniformLocation(program, "uVelvetSheenParams");
     zgl_int velvet_sheen_color = instanced ? -1
         : g_game_gl->GetUniformLocation(program, "uVelvetSheenColor");
+    zgl_int subsurface_params = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uSubsurfaceParams");
+    zgl_int subsurface_color = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uSubsurfaceColor");
     zgl_int color = instanced ? 0
         : g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
@@ -1937,6 +1974,8 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
     prog->u_aniso_brushed_color = aniso_brushed_color;
     prog->u_velvet_sheen_params = velvet_sheen_params;
     prog->u_velvet_sheen_color = velvet_sheen_color;
+    prog->u_subsurface_params = subsurface_params;
+    prog->u_subsurface_color = subsurface_color;
     prog->u_color = color;
     prog->u_light_dir = light_dir;
     prog->u_light_color = light_color;
@@ -2041,6 +2080,8 @@ static zan_game_program *zan_game_skin_program_get(void) {
     zgl_int aniso_brushed_color = g_game_gl->GetUniformLocation(program, "uAnisoBrushedColor");
     zgl_int velvet_sheen_params = g_game_gl->GetUniformLocation(program, "uVelvetSheenParams");
     zgl_int velvet_sheen_color = g_game_gl->GetUniformLocation(program, "uVelvetSheenColor");
+    zgl_int subsurface_params = g_game_gl->GetUniformLocation(program, "uSubsurfaceParams");
+    zgl_int subsurface_color = g_game_gl->GetUniformLocation(program, "uSubsurfaceColor");
     zgl_int color = g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
     zgl_int light_color = g_game_gl->GetUniformLocation(program, "uLightColor[0]");
@@ -2136,6 +2177,8 @@ static zan_game_program *zan_game_skin_program_get(void) {
     g_game_skin_prog.u_aniso_brushed_color = aniso_brushed_color;
     g_game_skin_prog.u_velvet_sheen_params = velvet_sheen_params;
     g_game_skin_prog.u_velvet_sheen_color = velvet_sheen_color;
+    g_game_skin_prog.u_subsurface_params = subsurface_params;
+    g_game_skin_prog.u_subsurface_color = subsurface_color;
     g_game_skin_prog.u_color = color;
     g_game_skin_prog.u_light_dir = light_dir;
     g_game_skin_prog.u_light_color = light_color;
@@ -2738,6 +2781,14 @@ static void zan_game_bind_shadow_uniforms(const zan_gl_api *gl, zan_game_program
     if (prog->u_velvet_sheen_color >= 0) {
         gl->Uniform3fv(prog->u_velvet_sheen_color, 1, g_game_velvet_sheen_color);
     }
+    if (prog->u_subsurface_params >= 0) {
+        gl->Uniform4f(prog->u_subsurface_params,
+            g_game_subsurface_params[0], g_game_subsurface_params[1],
+            g_game_subsurface_params[2], g_game_subsurface_params[3]);
+    }
+    if (prog->u_subsurface_color >= 0) {
+        gl->Uniform3fv(prog->u_subsurface_color, 1, g_game_subsurface_color);
+    }
 }
 
 ZAN_GAME_API int32_t zan_game_draw3d_ex(int32_t surface_id, int32_t mesh_id,
@@ -3336,6 +3387,7 @@ static zan_game_post_program *zan_game_post_program_get(void) {
     g_game_post_prog.u_post_scope_blur = g_game_gl->GetUniformLocation(prog, "uPostScopeBlur");
     g_game_post_prog.u_post_daltonize = g_game_gl->GetUniformLocation(prog, "uPostDaltonize");
     g_game_post_prog.u_post_lens_distort = g_game_gl->GetUniformLocation(prog, "uPostLensDistort");
+    g_game_post_prog.u_post_god_rays = g_game_gl->GetUniformLocation(prog, "uPostGodRays");
     return &g_game_post_prog;
 }
 
@@ -3539,6 +3591,11 @@ ZAN_GAME_API int32_t zan_game_postprocess3d(int32_t surface_id, float exposure,
     if (prog->u_post_lens_distort >= 0) {
         gl->Uniform2f(prog->u_post_lens_distort,
             g_game_post_lens_distort[0], g_game_post_lens_distort[1]);
+    }
+    if (prog->u_post_god_rays >= 0) {
+        gl->Uniform4f(prog->u_post_god_rays,
+            g_game_post_god_rays[0], g_game_post_god_rays[1],
+            g_game_post_god_rays[2], g_game_post_god_rays[3]);
     }
     gl->BindVertexArray(g_game_post_vao);
     gl->DrawArrays(ZGL_TRIANGLES, 0, 3);
@@ -4334,5 +4391,40 @@ ZAN_GAME_API void zan_game_set_post_lens_distort3d(float k1, float zoom) {
     g_game_post_lens_distort[0] = k1;
     g_game_post_lens_distort[1] = zoom;
 }
+
+ZAN_GAME_API void zan_game_set_subsurface_wrap3d(int32_t enabled,
+    float wrap, float translucency, float power,
+    float r, float g, float b) {
+    g_game_subsurface_params[0] = enabled ? 1.0f : 0.0f;
+    if (wrap < 0.0f) wrap = 0.0f;
+    if (wrap > 1.0f) wrap = 1.0f;
+    g_game_subsurface_params[1] = wrap;
+    if (translucency < 0.0f) translucency = 0.0f;
+    if (translucency > 2.0f) translucency = 2.0f;
+    g_game_subsurface_params[2] = translucency;
+    if (power < 1.0f) power = 1.0f;
+    if (power > 8.0f) power = 8.0f;
+    g_game_subsurface_params[3] = power;
+    g_game_subsurface_color[0] = r > 0.0f ? r : 0.0f;
+    g_game_subsurface_color[1] = g > 0.0f ? g : 0.0f;
+    g_game_subsurface_color[2] = b > 0.0f ? b : 0.0f;
+}
+
+ZAN_GAME_API void zan_game_set_post_god_rays3d(float strength, float decay,
+    float light_x, float light_y) {
+    if (strength < 0.0f) strength = 0.0f;
+    if (strength > 2.0f) strength = 2.0f;
+    if (decay < 0.70f) decay = 0.70f;
+    if (decay > 0.99f) decay = 0.99f;
+    if (light_x < 0.0f) light_x = 0.0f;
+    if (light_x > 1.0f) light_x = 1.0f;
+    if (light_y < 0.0f) light_y = 0.0f;
+    if (light_y > 1.0f) light_y = 1.0f;
+    g_game_post_god_rays[0] = strength;
+    g_game_post_god_rays[1] = decay;
+    g_game_post_god_rays[2] = light_x;
+    g_game_post_god_rays[3] = light_y;
+}
+
 
 

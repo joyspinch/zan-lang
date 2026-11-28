@@ -423,6 +423,17 @@ ZAN_GAME_API void zan_game_set_velvet_sheen3d(int32_t enabled,
  * k1 [-0.6..0.6] 正值桶形/负值枕形畸变，zoom [0.5..1.5] 光学变焦倍率，越界自动黑边裁剪。 */
 ZAN_GAME_API void zan_game_set_post_lens_distort3d(float k1, float zoom);
 
+/* GPU 3D 跨平台次表面散射包裹光照与逆光透射（Subsurface Wrap & Backlit Translucency，GLSL 330/GLES 3.00）：
+ * enabled != 0 时柔化明暗交界并沿逆光视线叠加暖色次表面透光（皮肤/玉石/植被）。 */
+ZAN_GAME_API void zan_game_set_subsurface_wrap3d(int32_t enabled,
+    float wrap, float translucency, float power,
+    float r, float g, float b);
+
+/* GPU 后处理跨平台屏幕空间径向丁达尔光束（Screen-Space Crepuscular God-Rays，单 Pass 零额外 FBO）：
+ * strength [0..2] 光束曝光强度，decay [0.7..0.99] 步进衰减系数，light_x/light_y [0..1] 屏幕光源坐标。 */
+ZAN_GAME_API void zan_game_set_post_god_rays3d(float strength, float decay,
+    float light_x, float light_y);
+
 #ifdef __cplusplus
 }
 #endif
