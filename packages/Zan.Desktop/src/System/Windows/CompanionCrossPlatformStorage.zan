@@ -1,0 +1,154 @@
+using System;
+
+namespace System.Windows;
+
+// 跨平台桌面伴侣统一路径解析与防目录穿越安全守卫（零 Win32 硬编码）。
+public class CompanionCrossPlatformPathResolver {
+    private DesktopOsFamily osFamily;
+    private string appName;
+
+    public CompanionCrossPlatformPathResolver(DesktopOsFamily osFamily, string appName) {
+        this.osFamily = osFamily;
+        this.appName = (appName == null || appName.Length == 0) ? "ZanCompanion" : appName;
+    }
+
+    public string ResolveBucketRoot(string bucket) {
+        string b = (bucket == null || bucket.Length == 0) ? "config" : bucket;
+        if (this.osFamily == DesktopOsFamily.MacOS) {
+            if (b == "cache") { return "~/Library/Caches/" + this.appName; }
+            if (b == "logs") { return "~/Library/Logs/" + this.appName; }
+            return "~/Library/Application Support/" + this.appName + "/" + b;
+        }
+        if (this.osFamily == DesktopOsFamily.Linux) {
+            if (b == "cache") { return "$XDG_CACHE_HOME/" + this.appName; }
+            if (b == "logs") { return "$XDG_STATE_HOME/" + this.appName + "/logs"; }
+            return "$XDG_CONFIG_HOME/" + this.appName + "/" + b;
+        }
+        if (this.osFamily == DesktopOsFamily.HarmonyOS) {
+            if (b == "cache") { return "/data/storage/el2/base/cache/" + this.appName; }
+            return "/data/storage/el2/base/files/" + this.appName + "/" + b;
+        }
+        if (b == "cache") { return "%LOCALAPPDATA%/" + this.appName + "/cache"; }
+        return "%APPDATA%/" + this.appName + "/" + b;
+    }
+
+    // 统一将反斜杠转为正斜杠并拒绝空路径、绝对根逃逸与 ".." 目录穿越，安全返回拼接路径或 ""。
+    public string SafeJoin(string bucket, string relativePath) {
+        if (relativePath == null || relativePath.Length == 0) { return ""; }
+        string norm = NormalizeSlashes(relativePath);
+        if (norm.Length == 0 || norm[0] == '/' || HasDrivePrefix(norm) || HasParentTraversal(norm)) {
+            return "";
+        }
+        return this.ResolveBucketRoot(bucket) + "/" + norm;
+    }
+
+    private static string NormalizeSlashes(string s) {
+        string outStr = "";
+        bool prevSlash = false;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int ch = s[i] & 255;
+            if (ch == 92 || ch == 47) { // '\' or '/'
+                if (!prevSlash) {
+                    outStr = outStr + "/";
+                    prevSlash = true;
+                }
+            } else {
+                outStr = outStr + s.Substring(i, 1);
+                prevSlash = false;
+            }
+        }
+        return outStr;
+    }
+
+    private static bool HasDrivePrefix(string s) {
+        return s.Length >= 2 && s[1] == ':';
+    }
+
+    private static bool HasParentTraversal(string s) {
+        if (s == "..") { return true; }
+        int n = s.Length;
+        for (int i = 0; i + 1 < n; i = i + 1) {
+            if (s[i] == '.' && s[i + 1] == '.') {
+                bool leftEdge = i == 0 || s[i - 1] == '/';
+                bool rightEdge = (i + 2 == n) || s[i + 2] == '/';
+                if (leftEdge && rightEdge) { return true; }
+            }
+        }
+        return false;
+    }
+}
+
+// 跨平台桌面/笔记本/平板电源与续航功耗治理策略：
+// 在 Windows 笔记本、MacBook、Linux 笔电与 HarmonyOS 平板上统一按供电与电量档位调度帧率与特效开关。
+public class CompanionPowerBatteryPolicy {
+    public int TargetFps;
+    public bool ParticlesEnabled;
+    public bool BackgroundSyncEnabled;
+
+    public CompanionPowerBatteryPolicy() {
+        this.TargetFps = 60;
+        this.ParticlesEnabled = true;
+        this.BackgroundSyncEnabled = true;
+    }
+
+    public int Evaluate(bool onAcPower, int batteryPercent, bool osLowPowerMode, bool userIdle) {
+        int pct = batteryPercent < 0 ? 0 : (batteryPercent > 100 ? 100 : batteryPercent);
+        if (osLowPowerMode || (!onAcPower && pct <= 20)) {
+            this.TargetFps = 10;
+            this.ParticlesEnabled = false;
+            this.BackgroundSyncEnabled = false;
+            return this.TargetFps;
+        }
+        if (!onAcPower) {
+            this.TargetFps = userIdle ? 15 : 30;
+            this.ParticlesEnabled = false;
+            this.BackgroundSyncEnabled = true;
+            return this.TargetFps;
+        }
+        this.TargetFps = userIdle ? 30 : 60;
+        this.ParticlesEnabled = true;
+        this.BackgroundSyncEnabled = true;
+        return this.TargetFps;
+    }
+}
+
+// 跨平台自定义协议深链（zanpet://action?k=v）解析与白名单校验器：
+// 屏蔽 Windows 注册表协议、macOS CFBundleURLTypes、Linux x-scheme-handler 与 HarmonyOS Want URI 差异。
+public class CompanionDeepLinkUriParser {
+    private string allowedScheme;
+    public string LastAction;
+    public string LastQuery;
+
+    public CompanionDeepLinkUriParser(string allowedScheme) {
+        this.allowedScheme = (allowedScheme == null || allowedScheme.Length == 0) ? "zanpet" : allowedScheme;
+        this.LastAction = "";
+        this.LastQuery = "";
+    }
+
+    public bool TryParse(string uri) {
+        this.LastAction = "";
+        this.LastQuery = "";
+        if (uri == null || uri.Length == 0) { return false; }
+        // 拒绝空白、控制字符或脚本注入字符
+        for (int i = 0; i < uri.Length; i = i + 1) {
+            int c = uri[i] & 255;
+            if (c <= 32 || c == 60 || c == 62 || c == 34 || c == 39) { return false; }
+        }
+        string prefix = this.allowedScheme + "://";
+        if (uri.Length <= prefix.Length) { return false; }
+        if (uri.Substring(0, prefix.Length) != prefix) { return false; }
+        string rest = uri.Substring(prefix.Length);
+        int qPos = -1;
+        for (int i = 0; i < rest.Length; i = i + 1) {
+            if (rest[i] == '?') {
+                qPos = i;
+                break;
+            }
+        }
+        string act = qPos >= 0 ? rest.Substring(0, qPos) : rest;
+        if (act.Length == 0) { return false; }
+        this.LastAction = act;
+        this.LastQuery = qPos >= 0 ? rest.Substring(qPos + 1) : "";
+        return true;
+    }
+}

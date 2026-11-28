@@ -1,0 +1,45 @@
+using System;
+using Game.Net;
+
+class Program {
+    static int Main() {
+        // 1. 跨端云存档版本向量与确定性冲突裁决
+        NetCrossPlatformSaveSync sync = new NetCrossPlatformSaveSync("win-pc-01", 10L, 1000L, "hashA");
+        bool staleIgnored = !sync.MergeRemote("ohos-pad-02", 9L, 2000L, "hashOld");
+        bool tieBreakNewer = sync.MergeRemote("mac-book-03", 10L, 1500L, "hashB"); // 同修订号时间戳更新胜出 + 冲突计数=1
+        bool higherRevWins = sync.MergeRemote("android-04", 11L, 1200L, "hashC");
+        bool saveOk = staleIgnored && tieBreakNewer && higherRevWins
+            && sync.Revision == 11L && sync.DeviceId == "android-04"
+            && sync.PayloadHash == "hashC" && sync.ConflictCount == 1;
+        Console.WriteLine("save_sync_ok=" + (saveOk ? "1" : "0"));
+
+        // 2. 跨平台带宽自适应优先级公平调度与防饥饿提权
+        NetBandwidthFairScheduler sched = new NetBandwidthFairScheduler(400);
+        int[] sent = new int[4];
+        sched.Enqueue(3, 200); // 低优外观包
+        for (int t = 0; t < 3; t = t + 1) {
+            sched.Enqueue(0, 400); // 连续 3 帧高优输入填满预算
+            sched.DispatchTick(sent);
+        }
+        bool starvedBefore = sched.PendingBytes(3) == 200;
+        sched.Enqueue(0, 400);
+        int total4 = sched.DispatchTick(sent); // 第 4 帧触发防饥饿保底（25% = 100B 给低优队列 3）
+        bool fairOk = starvedBefore && total4 == 400 && sent[3] == 100 && sent[0] == 300
+            && sched.PendingBytes(3) == 100;
+        Console.WriteLine("bandwidth_fair_ok=" + (fairOk ? "1" : "0"));
+
+        // 3. 跨架构确定性帧同步 64 位 FNV-1a 状态哈希链
+        NetDeterministicFrameHashChain c1 = new NetDeterministicFrameHashChain(0L);
+        NetDeterministicFrameHashChain c2 = new NetDeterministicFrameHashChain(0L);
+        NetDeterministicFrameHashChain c3 = new NetDeterministicFrameHashChain(0L);
+        c1.MixFrameState(1, 7, 1000, -250, 100);
+        c1.MixFrameState(2, 7, 1050, -240, 95);
+        c2.MixFrameState(1, 7, 1000, -250, 100);
+        c2.MixFrameState(2, 7, 1050, -240, 95);
+        c3.MixFrameState(1, 7, 1000, -250, 100);
+        c3.MixFrameState(2, 7, 1051, -240, 95); // 1 单位偏差立即触发分叉
+        bool hashOk = c1.CurrentHash == c2.CurrentHash && c1.CurrentHash != c3.CurrentHash && c1.LastFrame == 2;
+        Console.WriteLine("frame_hash_ok=" + (hashOk ? "1" : "0"));
+        return 0;
+    }
+}

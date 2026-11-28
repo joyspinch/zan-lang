@@ -1,0 +1,175 @@
+using System;
+
+namespace Game.Net;
+
+// 跨平台云存档版本向量与确定性冲突裁决器（PC / macOS / Linux / Android / OHOS 跨端互通）：
+// 规则：高单调修订号胜出；同修订号按较新时间戳胜出；仍相等按设备 ID 字典序确定性收敛，杜绝跨端回档分叉。
+public class NetCrossPlatformSaveSync {
+    public long Revision;
+    public long UpdatedAtMs;
+    public string DeviceId;
+    public string PayloadHash;
+    public int ConflictCount;
+
+    public NetCrossPlatformSaveSync(string deviceId, long revision, long updatedAtMs, string payloadHash) {
+        this.DeviceId = deviceId == null ? "" : deviceId;
+        this.Revision = revision < 0L ? 0L : revision;
+        this.UpdatedAtMs = updatedAtMs < 0L ? 0L : updatedAtMs;
+        this.PayloadHash = payloadHash == null ? "" : payloadHash;
+        this.ConflictCount = 0;
+    }
+
+    // 合并远端快照，返回 true 表示远端胜出并更新本地状态。
+    public bool MergeRemote(string remoteDeviceId, long remoteRevision, long remoteUpdatedAtMs,
+    string remotePayloadHash) {
+        string rDev = remoteDeviceId == null ? "" : remoteDeviceId;
+        string rHash = remotePayloadHash == null ? "" : remotePayloadHash;
+        if (remoteRevision > this.Revision) {
+            this.Revision = remoteRevision;
+            this.UpdatedAtMs = remoteUpdatedAtMs;
+            this.DeviceId = rDev;
+            this.PayloadHash = rHash;
+            return true;
+        }
+        if (remoteRevision < this.Revision) {
+            return false;
+        }
+        // 同修订号不同摘要 -> 并发离线修改冲突
+        if (rHash != this.PayloadHash) {
+            this.ConflictCount = this.ConflictCount + 1;
+        }
+        if (remoteUpdatedAtMs > this.UpdatedAtMs) {
+            this.UpdatedAtMs = remoteUpdatedAtMs;
+            this.DeviceId = rDev;
+            this.PayloadHash = rHash;
+            return true;
+        }
+        if (remoteUpdatedAtMs == this.UpdatedAtMs && CompareAscii(rDev, this.DeviceId) > 0) {
+            this.DeviceId = rDev;
+            this.PayloadHash = rHash;
+            return true;
+        }
+        return false;
+    }
+
+    private static int CompareAscii(string a, string b) {
+        int la = a.Length;
+        int lb = b.Length;
+        int n = la < lb ? la : lb;
+        for (int i = 0; i < n; i = i + 1) {
+            int ca = a[i] & 255;
+            int cb = b[i] & 255;
+            if (ca != cb) { return ca - cb; }
+        }
+        return la - lb;
+    }
+}
+
+// 跨平台带宽自适应优先级公平调度器（4 级队列：0=关键输入/RPC, 1=玩家状态, 2=场景物体, 3=外观特效）：
+// 自动按桌面宽带或移动蜂窝单帧字节预算出队，并对等待帧数累加防饥饿提权，防止低优先级通道永久饿死。
+public class NetBandwidthFairScheduler {
+    private int[] queuedBytes;
+    private int[] waitTicks;
+    private int budgetBytesPerTick;
+
+    public NetBandwidthFairScheduler(int budgetBytesPerTick) {
+        this.queuedBytes = new int[4];
+        this.waitTicks = new int[4];
+        this.budgetBytesPerTick = budgetBytesPerTick < 128 ? 128 : budgetBytesPerTick;
+    }
+
+    public void SetBudgetBytesPerTick(int bytes) {
+        this.budgetBytesPerTick = bytes < 128 ? 128 : bytes;
+    }
+
+    public void Enqueue(int priorityLevel, int bytes) {
+        if (priorityLevel < 0 || priorityLevel > 3 || bytes <= 0) { return; }
+        this.queuedBytes[priorityLevel] = this.queuedBytes[priorityLevel] + bytes;
+    }
+
+    public int PendingBytes(int priorityLevel) {
+        if (priorityLevel < 0 || priorityLevel > 3) { return 0; }
+        return this.queuedBytes[priorityLevel];
+    }
+
+    // 推进一个网络发送帧，返回本帧实际发送总字节数。
+    public int DispatchTick(int[] sentPerLevel) {
+        int remaining = this.budgetBytesPerTick;
+        int totalSent = 0;
+        for (int i = 0; i < 4; i = i + 1) {
+            if (sentPerLevel != null && i < sentPerLevel.Length) {
+                sentPerLevel[i] = 0;
+            }
+        }
+        // 先为等待 >= 3 帧的队列提供防饥饿保底配额（最多 25% 预算）
+        int starveCap = this.budgetBytesPerTick / 4;
+        for (int lv = 3; lv >= 0 && remaining > 0; lv = lv - 1) {
+            if (this.queuedBytes[lv] > 0 && this.waitTicks[lv] >= 3) {
+                int take = this.queuedBytes[lv];
+                if (take > starveCap) { take = starveCap; }
+                if (take > remaining) { take = remaining; }
+                this.queuedBytes[lv] = this.queuedBytes[lv] - take;
+                remaining = remaining - take;
+                totalSent = totalSent + take;
+                this.waitTicks[lv] = 0;
+                if (sentPerLevel != null && lv < sentPerLevel.Length) {
+                    sentPerLevel[lv] = sentPerLevel[lv] + take;
+                }
+            }
+        }
+        // 按 0->3 严格优先级分配剩余预算
+        for (int lv = 0; lv < 4 && remaining > 0; lv = lv + 1) {
+            if (this.queuedBytes[lv] > 0) {
+                int take = this.queuedBytes[lv];
+                if (take > remaining) { take = remaining; }
+                this.queuedBytes[lv] = this.queuedBytes[lv] - take;
+                remaining = remaining - take;
+                totalSent = totalSent + take;
+                this.waitTicks[lv] = 0;
+                if (sentPerLevel != null && lv < sentPerLevel.Length) {
+                    sentPerLevel[lv] = sentPerLevel[lv] + take;
+                }
+            }
+        }
+        // 仍积压未发空的队列累计等待帧
+        for (int lv = 0; lv < 4; lv = lv + 1) {
+            if (this.queuedBytes[lv] > 0) {
+                this.waitTicks[lv] = this.waitTicks[lv] + 1;
+            }
+        }
+        return totalSent;
+    }
+}
+
+// 跨架构确定性帧同步 64 位 FNV-1a 状态哈希链：
+// 仅对整数化实体状态执行无浮点误差的链式摘要，供 x64/arm64 跨平台帧同步首帧定位分叉。
+public class NetDeterministicFrameHashChain {
+    private long currentHash;
+    private int lastFrame;
+
+    public NetDeterministicFrameHashChain(long seed) {
+        this.currentHash = seed == 0L ? -3750763034362895579L : seed;
+        this.lastFrame = -1;
+    }
+
+    public long CurrentHash { get { return this.currentHash; } }
+    public int LastFrame { get { return this.lastFrame; } }
+
+    public long MixFrameState(int frameIndex, int entityId, int fixedX, int fixedY, int hp) {
+        long h = this.currentHash;
+        h = MixLong(h, (long)frameIndex);
+        h = MixLong(h, (long)entityId);
+        h = MixLong(h, (long)fixedX);
+        h = MixLong(h, (long)fixedY);
+        h = MixLong(h, (long)hp);
+        this.currentHash = h;
+        this.lastFrame = frameIndex;
+        return h;
+    }
+
+    private static long MixLong(long h, long value) {
+        long prime = 1099511628211L;
+        long x = h ^ value;
+        return x * prime;
+    }
+}

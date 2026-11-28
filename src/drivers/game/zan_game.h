@@ -413,6 +413,16 @@ ZAN_GAME_API void zan_game_set_aniso_brushed3d(int32_t enabled,
  * strength [0..1] 控制校正混合强度（中性灰保持无偏色）。 */
 ZAN_GAME_API void zan_game_set_post_daltonize3d(float mode, float strength);
 
+/* GPU 3D 跨平台丝绒织物掠射绒毛高光（Charlie/KHR_materials_sheen，GLSL 330/GLES 3.00 统一）：
+ * enabled != 0 时按视线掠射角叠加柔和丝绒包边与细微经纬织物微纹，正面中心保持深沉。 */
+ZAN_GAME_API void zan_game_set_velvet_sheen3d(int32_t enabled,
+    float roughness, float weave_freq, float strength,
+    float r, float g, float b);
+
+/* GPU 后处理跨平台光学桶形/枕形畸变与变焦（Brown-Conrady Lens Distortion，单 Pass 零额外 FBO）：
+ * k1 [-0.6..0.6] 正值桶形/负值枕形畸变，zoom [0.5..1.5] 光学变焦倍率，越界自动黑边裁剪。 */
+ZAN_GAME_API void zan_game_set_post_lens_distort3d(float k1, float zoom);
+
 #ifdef __cplusplus
 }
 #endif
