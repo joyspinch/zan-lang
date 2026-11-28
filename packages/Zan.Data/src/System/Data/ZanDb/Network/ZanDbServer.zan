@@ -30,6 +30,7 @@ public class ZanDbServer {
 
     // 以同步持久化方式打开存储；对外暴露监听并支持执行离线操作。
     public ZanDbServer(ZanDbServerOptions options) {
+        if (options == null) { throw new ArgumentNullException("options"); }
         if (options.path == null || options.path.Length == 0) { throw new ArgumentException("Database path is required."); }
         if (options.host == null || options.host.Length == 0) { throw new ArgumentException("Listener host is required."); }
         if (options.port < 1 || options.port > 65535) { throw new ArgumentException("Port must be in 1..65535."); }
@@ -210,10 +211,11 @@ public class ZanDbServer {
 
     public async void StopAsync() {
         this.RequestStop();
-        List<long> handles = this.DrainSnapshot();
-        TcpListener listener = this.listener;
-        if (listener != null) { await listener.StopAsync(); }
+        TcpListener activeListener = null;
+        lock (this.lifecycleGate) { activeListener = this.listener; }
+        if (activeListener != null) { await activeListener.StopAsync(); }
         while (this.IsAccepting()) { await Task.Delay(1); }
+        List<long> handles = this.DrainSnapshot();
         if (handles.Count > 0) { await Task.WhenAll(handles); }
         lock (this.ownerGate) {
             if (!this.closed) {
@@ -226,10 +228,13 @@ public class ZanDbServer {
     public async void Stop() { await this.StopAsync(); }
 
     private bool Authenticated(string candidate) {
-        if (candidate.Length != this.token.Length) { return false; }
-        int different = 0;
-        for (int i = 0; i < candidate.Length; i = i + 1) {
-            different = different | ((candidate[i] & 255) ^ (this.token[i] & 255));
+        if (candidate == null || this.token == null) { return false; }
+        int tlen = this.token.Length;
+        int clen = candidate.Length;
+        int different = clen ^ tlen;
+        for (int i = 0; i < tlen; i = i + 1) {
+            int cb = i < clen ? (candidate[i] & 255) : 0;
+            different = different | (cb ^ (this.token[i] & 255));
         }
         return different == 0;
     }
@@ -257,7 +262,7 @@ public class ZanDbServer {
     }
 
     private void Validate(JsonValue operation, bool batchStep) {
-        if (!operation.IsObject()) { throw new ZanDbRequestException("invalid_request", "Operation must be an object."); }
+        if (operation == null || !operation.IsObject()) { throw new ZanDbRequestException("invalid_request", "Operation must be an object."); }
         string action = ZanDbProtocol.RequireString(operation, "action");
         if (!ZanDbProtocol.IsAction(action)) { throw new ZanDbRequestException("unknown_action", "Action is not supported."); }
         if (batchStep && action != "insert" && action != "upsert" && action != "update" && action != "delete") {
@@ -305,13 +310,13 @@ public class ZanDbServer {
     }
 
     private static float[] Vector(JsonValue value) {
-        if (!value.IsArray() || value.Count() == 0 || value.Count() > ZanDbProtocol.MAX_VECTOR_DIMENSIONS) {
+        if (value == null || !value.IsArray() || value.Count() == 0 || value.Count() > ZanDbProtocol.MAX_VECTOR_DIMENSIONS) {
             throw new ZanDbRequestException("invalid_request", "vector must be a nonempty numeric array of at most 65536 dimensions.");
         }
         float[] result = new float[value.Count()];
         for (int i = 0; i < value.Count(); i = i + 1) {
             JsonValue component = value.At(i);
-            if (!component.IsNumber()) { throw new ZanDbRequestException("invalid_request", "Vector components must be numbers."); }
+            if (component == null || !component.IsNumber()) { throw new ZanDbRequestException("invalid_request", "Vector components must be numbers."); }
             double n = component.AsDouble(0);
             if (n != n || n > 3.4028234e38 || n < -3.4028234e38) {
                 throw new ZanDbRequestException("invalid_request", "Vector components must be finite float32 values.");
@@ -322,7 +327,7 @@ public class ZanDbServer {
     }
 
     private static VectorIndexOptions VectorOptions(JsonValue value) {
-        if (!value.IsObject()) { throw new ZanDbRequestException("invalid_request", "options must be an object."); }
+        if (value == null || !value.IsObject()) { throw new ZanDbRequestException("invalid_request", "options must be an object."); }
         VectorIndexOptions options = new VectorIndexOptions();
         options.dimensions = ZanDbProtocol.IntOption(value, "dimensions", 0, 1, ZanDbProtocol.MAX_VECTOR_DIMENSIONS);
         if (options.dimensions == 0) { throw new ZanDbRequestException("invalid_request", "Vector dimensions are required."); }

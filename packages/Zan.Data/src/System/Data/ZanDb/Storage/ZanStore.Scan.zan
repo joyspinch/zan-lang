@@ -156,8 +156,13 @@ public int Scan(string fromKey, StoreVisit visit) {
 // [startKey, endKey] 闭区间内的键，上界在归并循环内判定，
 // 调用方无需在回调里逐键比对。返回 visit 接受的键数。
 public int ScanBetween(string startKey, string endKey, StoreVisit visit) {
+    if (visit == null) { throw new ArgumentNullException("visit"); }
+    if (startKey == null) { startKey = ""; }
+    if (endKey == null) { endKey = ""; }
+    if (!this.IsOpen()) { return 0; }
     // 各段游标，段号降序排列 = 新段在前。
     List<SegCursor> cursors = new List<SegCursor>();
+    try {
     for (int i = this.segs.Count - 1; i >= 0; i = i - 1) {
         cursors.Add(SegCursor.Open(this.segs[i].seg, startKey));
     }
@@ -192,7 +197,6 @@ public int ScanBetween(string startKey, string endKey, StoreVisit visit) {
             }
             c.Next();
         }
-        c.Free();
         return accepted;
     }
 
@@ -252,36 +256,44 @@ public int ScanBetween(string startKey, string endKey, StoreVisit visit) {
             else { accepted = accepted + 1; }
         }
     }
-    for (int i = 0; i < cursors.Count; i = i + 1) { cursors[i].Free(); }
     return accepted;
+    } finally {
+        for (int i = 0; i < cursors.Count; i = i + 1) { cursors[i].Free(); }
+    }
 }
 
-// <see cref="ScanBetween"/> 的零拷贝形式：交付
 // <see cref="ScanBetween"/> 的零拷贝形式：交付
 // <see cref="ScanRow"/> 而非字符串——单段且 memtable 无未固化
 // 数据时值不物化、上界与墓碑判定全走块内指针；memtable 有
 // 参与则退化为字符串路径包装。语义与 ScanBetween 完全一致，
 // 行数据仅在回调返回前有效。返回 visit 接受的键数。
 public int ScanRows(string startKey, string endKey, ScanRowVisit visit) {
+    if (visit == null) { throw new ArgumentNullException("visit"); }
+    if (startKey == null) { startKey = ""; }
+    if (endKey == null) { endKey = ""; }
+    if (!this.IsOpen()) { return 0; }
     if (this.segs.Count == 1 && this.memtable.Keys.Count == 0) {
         SegCursor c = SegCursor.Open(this.segs[0].seg, startKey);
-        ScanRow row = new ScanRow();
-        row.Bind(c);
-        bool hasTombs = this.tombstones.Count > 0;
-        bool bounded = endKey.Length > 0;
-        int accepted = 0;
-        while (c.Valid()) {
-            if (c.Op() == 1) {
-                if (bounded && c.CmpKeyRaw(endKey) > 0) { break; }
-                if (!hasTombs || !this.tombstones.ContainsKey(c.Key())) {
-                    if (!visit(row)) { break; }
-                    accepted = accepted + 1;
+        try {
+            ScanRow row = new ScanRow();
+            row.Bind(c);
+            bool hasTombs = this.tombstones.Count > 0;
+            bool bounded = endKey.Length > 0;
+            int accepted = 0;
+            while (c.Valid()) {
+                if (c.Op() == 1) {
+                    if (bounded && c.CmpKeyRaw(endKey) > 0) { break; }
+                    if (!hasTombs || !this.tombstones.ContainsKey(c.Key())) {
+                        if (!visit(row)) { break; }
+                        accepted = accepted + 1;
+                    }
                 }
+                c.Next();
             }
-            c.Next();
+            return accepted;
+        } finally {
+            c.Free();
         }
-        c.Free();
-        return accepted;
     }
     // 多源归并（未固化数据参与）：退化为字符串路径包装交付。
     ScanRow mrow = new ScanRow();
@@ -328,6 +340,9 @@ public int TryScanKernel(string startKey, string endKey, KernelVisit visit) {
 // 这里——每行成本 = varint 解码 + 一次回调，无对象分配；每
 // 跨度成本 = 一次 ReadAt + 逐块 CRC（同会话首遍）。
 public int ScanKernel(SegmentFile seg, string startKey, string endKey, KernelVisit visit) {
+    if (seg == null || visit == null) { return 0; }
+    if (startKey == null) { startKey = ""; }
+    if (endKey == null) { endKey = ""; }
     int blockIdx = seg.BlockFor(startKey);
     int blockTotal = seg.BlockCount();
     int accepted = 0;
@@ -335,6 +350,7 @@ public int ScanKernel(SegmentFile seg, string startKey, string endKey, KernelVis
     bool hasTombs = this.tombstones.Count > 0;
     ByteBuffer buf = null;
     bool stop = false;
+    try {
     while (blockIdx < blockTotal && !stop) {
         // 跨度终点：够 KERNEL_SPAN_BYTES 或到段尾。单块超长时
         // 至少覆盖该块。
@@ -355,7 +371,7 @@ public int ScanKernel(SegmentFile seg, string startKey, string endKey, KernelVis
             if (op != 1 && op != 2) { break; }
             int p = pos + 1;
             long klen = buf.ReadVarIntAt(p, out p);
-            if (klen < 0 || p + (int)klen > len) { break; }
+            if (klen < 0L || klen > (long)(len - p)) { break; }
             int keyOff = p;
             p = p + (int)klen;
             // 下界：定位块里可能有 < startKey 的前缀键（稀疏索
@@ -363,7 +379,7 @@ public int ScanKernel(SegmentFile seg, string startKey, string endKey, KernelVis
             if (buf.CmpRangeRaw(keyOff, (int)klen, startKey) < 0) {
                 if (op == 2) { pos = p; continue; }
                 long skip = buf.ReadVarIntAt(p, out p);
-                if (skip < 0 || p + (int)skip > len) { break; }
+                if (skip < 0L || skip > (long)(len - p)) { break; }
                 pos = p + (int)skip;
                 continue;
             }
@@ -374,7 +390,7 @@ public int ScanKernel(SegmentFile seg, string startKey, string endKey, KernelVis
                 continue;
             }
             long vlen = buf.ReadVarIntAt(p, out p);
-            if (vlen < 0 || p + (int)vlen > len) { break; }
+            if (vlen < 0L || vlen > (long)(len - p)) { break; }
             int valOff = p;
             p = p + (int)vlen;
             // 起始定位之后段内按键序——首条越过上界即整段止步。
@@ -395,22 +411,25 @@ public int ScanKernel(SegmentFile seg, string startKey, string endKey, KernelVis
         }
         blockIdx = endBlock;
     }
-    if (buf != null) { buf.Free(); }
     return accepted;
+    } finally {
+        if (buf != null) { buf.Free(); }
+    }
 }
 
 // 共享锁下的 <see cref="Scan"/>；可与并发写入共存。
 public async int ScanAsync(string fromKey, StoreVisit visit) {
     await this.rw.EnterRead();
-    int n = Scan(fromKey, visit);
-    this.rw.ExitRead();
-    return n;
+    try { return Scan(fromKey, visit); }
+    finally { this.rw.ExitRead(); }
 }
 
 // 物化式范围扫描：startKey（含）到 endKey（含，与
 // 旧引擎 <c>BTree.Scan</c> 语义一致）按键序收集到 output；
 // limit &gt; 0 时至多 limit 条。返回收集的条数。
 public int ScanRange(string startKey, string endKey, int limit, List<KvEntry> output) {
+    if (output == null) { throw new ArgumentNullException("output"); }
+    if (endKey == null) { endKey = ""; }
     int before = output.Count;
     Scan(startKey, delegate(string k, string v) {
         if (endKey.Length > 0 && String.CompareOrdinal(k, endKey) > 0) {
@@ -425,6 +444,8 @@ public int ScanRange(string startKey, string endKey, int limit, List<KvEntry> ou
 // 前缀扫描：所有以 prefix 开头的键值按键序收集；
 // limit &gt; 0 时至多 limit 条。返回收集的条数。
 public int ScanPrefix(string prefix, int limit, List<KvEntry> output) {
+    if (output == null) { throw new ArgumentNullException("output"); }
+    if (prefix == null) { prefix = ""; }
     int before = output.Count;
     Scan(prefix, delegate(string k, string v) {
         if (!k.StartsWith(prefix)) { return false; }
@@ -448,6 +469,9 @@ public int TryScanKeyKernel(string startKey, string endKey, KernelKeyVisit visit
 // <see cref="ScanKernel"/> 的键只读内档：与行版同
 // 跨度整读与上界/墓碑逻辑，只是不读值、交付键区间。
 public int ScanKeyKernel(SegmentFile seg, string startKey, string endKey, KernelKeyVisit visit) {
+    if (seg == null || visit == null) { return 0; }
+    if (startKey == null) { startKey = ""; }
+    if (endKey == null) { endKey = ""; }
     int blockIdx = seg.BlockFor(startKey);
     int blockTotal = seg.BlockCount();
     int accepted = 0;
@@ -455,6 +479,7 @@ public int ScanKeyKernel(SegmentFile seg, string startKey, string endKey, Kernel
     bool hasTombs = this.tombstones.Count > 0;
     ByteBuffer buf = null;
     bool stop = false;
+    try {
     while (blockIdx < blockTotal && !stop) {
         int endBlock = blockIdx + 1;
         long spanLen = seg.BlockLen(blockIdx);
@@ -473,7 +498,7 @@ public int ScanKeyKernel(SegmentFile seg, string startKey, string endKey, Kernel
             if (op != 1 && op != 2) { break; }
             int p = pos + 1;
             long klen = buf.ReadVarIntAt(p, out p);
-            if (klen < 0 || p + (int)klen > len) { break; }
+            if (klen < 0L || klen > (long)(len - p)) { break; }
             int keyOff = p;
             p = p + (int)klen;
             // 下界：定位块里可能有 < startKey 的前缀键（稀疏索
@@ -481,7 +506,7 @@ public int ScanKeyKernel(SegmentFile seg, string startKey, string endKey, Kernel
             if (buf.CmpRangeRaw(keyOff, (int)klen, startKey) < 0) {
                 if (op == 2) { pos = p; continue; }
                 long skip = buf.ReadVarIntAt(p, out p);
-                if (skip < 0 || p + (int)skip > len) { break; }
+                if (skip < 0L || skip > (long)(len - p)) { break; }
                 pos = p + (int)skip;
                 continue;
             }
@@ -494,7 +519,7 @@ public int ScanKeyKernel(SegmentFile seg, string startKey, string endKey, Kernel
                 continue;
             }
             long vlen = buf.ReadVarIntAt(p, out p);
-            if (vlen < 0 || p + (int)vlen > len) { break; }
+            if (vlen < 0L || vlen > (long)(len - p)) { break; }
             p = p + (int)vlen;
             if (bounded && buf.CmpRangeRaw(keyOff, (int)klen, endKey) > 0) {
                 stop = true;
@@ -513,8 +538,10 @@ public int ScanKeyKernel(SegmentFile seg, string startKey, string endKey, Kernel
         }
         blockIdx = endBlock;
     }
-    if (buf != null) { buf.Free(); }
     return accepted;
+    } finally {
+        if (buf != null) { buf.Free(); }
+    }
 }
 
 // 将缓冲与 OS 缓存全部强制落盘。
@@ -787,7 +814,7 @@ public static void SortRange(List<string> a, int lo, int hi) {
             }
             return;
         }
-        int mid = (lo + hi) / 2;
+        int mid = lo + ((hi - lo) >> 1);
         if (String.CompareOrdinal(a[lo], a[mid]) > 0) { ZanStore.Swap(a, lo, mid); }
         if (String.CompareOrdinal(a[lo], a[hi]) > 0) { ZanStore.Swap(a, lo, hi); }
         if (String.CompareOrdinal(a[mid], a[hi]) > 0) { ZanStore.Swap(a, mid, hi); }
@@ -824,9 +851,8 @@ public static void Swap(List<string> a, int i, int j) {
 // 共享锁读取；可安全地与并发写入共存。
 public async string GetAsync(string key) {
     await this.rw.EnterRead();
-    string v = Get(key);
-    this.rw.ExitRead();
-    return v;
+    try { return Get(key); }
+    finally { this.rw.ExitRead(); }
 }
 
 // 独占锁写入并按当前持久化档落盘。
@@ -839,22 +865,22 @@ public async void PutAsync(string key, string val) {
 // 独占锁删除一个键；返回键此前是否存在。
 public async bool DeleteAsync(string key) {
     await this.rw.EnterWrite();
-    bool existed = Delete(key);
-    this.rw.ExitWrite();
-    return existed;
+    try { return Delete(key); }
+    finally { this.rw.ExitWrite(); }
 }
 
 // 独占锁下把 memtable 固化为新段。
 public async void FlushAsync() {
     await this.rw.EnterWrite();
-    FlushToSegment();
-    this.rw.ExitWrite();
+    try { FlushToSegment(); }
+    finally { this.rw.ExitWrite(); }
 }
 
 // 原子读改写：fn 在写临界区内看到最新已提交值
 // （不存在时为 ""），因此同一键上的并发 UpdateAtomic
 // 不会丢失更新。返回最终存储的结果。
 public async string UpdateAtomic(string key, StoreUpdater fn) {
+    if (fn == null) { throw new ArgumentNullException("fn"); }
     await this.rw.EnterWrite();
     try {
         Begin();

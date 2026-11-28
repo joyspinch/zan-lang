@@ -9,8 +9,10 @@ namespace System.Data.ZanDb;
 public partial class RecordTable {
     // 为列构建二级索引
     public void EnsureIndex(string colName) {
+        if (colName == null || colName.Length == 0) { return; }
         this.tlock.EnterWrite();
         try {
+            if (!this.IsOpen() || this.schema == null) { return; }
             RecordColumn col = this.schema.FindColumn(colName);
             if (col != null) { colName = col.name; }
             if (this.indexes.ContainsKey(colName)) { return; }
@@ -224,7 +226,7 @@ public partial class RecordTable {
         int lo = 0;
         int hi = list.Count - 1;
         while (lo <= hi) {
-            int mid = (lo + hi) / 2;
+            int mid = lo + ((hi - lo) >> 1);
             int cmp = String.CompareOrdinal(list[mid], key);
             if (cmp == 0) {
                 list.RemoveAt(mid);
@@ -244,7 +246,7 @@ public partial class RecordTable {
         int hi = list.Count - 1;
         int ins = list.Count;
         while (lo <= hi) {
-            int mid = (lo + hi) / 2;
+            int mid = lo + ((hi - lo) >> 1);
             int cmp = String.CompareOrdinal(list[mid], key);
             if (cmp == 0) { return; }
             if (cmp < 0) {
@@ -356,7 +358,13 @@ public partial class RecordTable {
     }
 
     public bool HasIndex(string colName) {
-        return this.ResolveIndexKey(colName) != null;
+        if (colName == null || this.ioMtx == 0) { return false; }
+        this.tlock.EnterRead();
+        try {
+            return this.ResolveIndexKey(colName) != null;
+        } finally {
+            this.tlock.ExitRead();
+        }
     }
 
     // 二级索引键匹配 ID 列表
@@ -423,7 +431,7 @@ public partial class RecordTable {
                 int hiPos = keys.Count - 1;
                 startIdx = keys.Count;
                 while (loPos <= hiPos) {
-                    int mid = (loPos + hiPos) / 2;
+                    int mid = loPos + ((hiPos - loPos) >> 1);
                     int cmp = String.CompareOrdinal(keys[mid], loKey);
                     if (cmp >= 0) {
                         startIdx = mid;
@@ -439,7 +447,7 @@ public partial class RecordTable {
                 int hiPos = keys.Count - 1;
                 endIdx = 0 - 1;
                 while (loPos <= hiPos) {
-                    int mid = (loPos + hiPos) / 2;
+                    int mid = loPos + ((hiPos - loPos) >> 1);
                     int cmp = String.CompareOrdinal(keys[mid], hiKey);
                     if (cmp <= 0) {
                         endIdx = mid;
@@ -486,69 +494,70 @@ public partial class RecordTable {
             return;
         }
         ByteBuffer b = ByteBuffer.Alloc(1024);
-        b.WriteRaw(MAGIC_IDX, 4);
-        b.WriteU32((long)VERSION);
-        b.WriteU32((long)this.indexes.Count);
-        b.WriteU64((long)this.totalRows);
-        b.WriteU64((long)this.activeRows);
-        b.WriteU32(0L); // reserved
+        string tmpIdx = this.idxPath + ".tmp";
+        PageFile pf = null;
+        try {
+            b.WriteRaw(MAGIC_IDX, 4);
+            b.WriteU32((long)VERSION);
+            b.WriteU32((long)this.indexes.Count);
+            b.WriteU64((long)this.totalRows);
+            b.WriteU64((long)this.activeRows);
+            b.WriteU32(0L); // reserved
 
-        for (int i = 0; i < this.schema.columns.Count; i = i + 1) {
-            string colName = this.schema.columns[i].name;
-            Dictionary<string, List<int>> map = null;
-            if (this.indexes.TryGetValue(colName, out map)) {
-                int nlen = colName != null ? colName.Length : 0;
-                if (nlen > 255) {
-                    b.Free();
-                    throw new InvalidOperationException("index column name exceeds 255 bytes");
-                }
-                b.WriteU8(nlen);
-                if (nlen > 0) { b.WriteRaw(colName, nlen); }
-
-                // 优先按已有序键表持久化，加载时即可保持有序
-                List<string> keys = null;
-                if (this.indexKeysSorted == null || !this.indexKeysSorted.TryGetValue(colName, out keys)) {
-                    keys = map.Keys;
-                }
-                int kCount = keys.Count;
-                b.WriteU32((long)kCount);
-                for (int k = 0; k < kCount; k = k + 1) {
-                    string key = keys[k];
-                    int klen = key != null ? key.Length : 0;
-                    if (klen > 65535) {
-                        b.Free();
-                        throw new InvalidOperationException("index key exceeds 65535 bytes");
+            for (int i = 0; i < this.schema.columns.Count; i = i + 1) {
+                string colName = this.schema.columns[i].name;
+                Dictionary<string, List<int>> map = null;
+                if (this.indexes.TryGetValue(colName, out map)) {
+                    int nlen = colName != null ? colName.Length : 0;
+                    if (nlen > 255) {
+                        throw new InvalidOperationException("index column name exceeds 255 bytes");
                     }
-                    b.WriteU16(klen);
-                    if (klen > 0) { b.WriteRaw(key, klen); }
-                    List<int> idList = null;
-                    map.TryGetValue(key, out idList);
-                    int idCount = idList != null ? idList.Count : 0;
-                    b.WriteU32((long)idCount);
-                    for (int j = 0; j < idCount; j = j + 1) {
-                        b.WriteU32((long)idList[j]);
+                    b.WriteU8(nlen);
+                    if (nlen > 0) { b.WriteRaw(colName, nlen); }
+
+                    // 优先按已有序键表持久化，加载时即可保持有序
+                    List<string> keys = null;
+                    if (this.indexKeysSorted == null || !this.indexKeysSorted.TryGetValue(colName, out keys)) {
+                        keys = map.Keys;
+                    }
+                    int kCount = keys.Count;
+                    b.WriteU32((long)kCount);
+                    for (int k = 0; k < kCount; k = k + 1) {
+                        string key = keys[k];
+                        int klen = key != null ? key.Length : 0;
+                        if (klen > 65535) {
+                            throw new InvalidOperationException("index key exceeds 65535 bytes");
+                        }
+                        b.WriteU16(klen);
+                        if (klen > 0) { b.WriteRaw(key, klen); }
+                        List<int> idList = null;
+                        map.TryGetValue(key, out idList);
+                        int idCount = idList != null ? idList.Count : 0;
+                        b.WriteU32((long)idCount);
+                        for (int j = 0; j < idCount; j = j + 1) {
+                            b.WriteU32((long)idList[j]);
+                        }
                     }
                 }
             }
-        }
 
-        string tmpIdx = this.idxPath + ".tmp";
-        if (File.Exists(tmpIdx)) { File.Delete(tmpIdx); }
-        PageFile pf = PageFile.Open(tmpIdx);
-        try {
+            if (File.Exists(tmpIdx)) { File.Delete(tmpIdx); }
+            pf = PageFile.Open(tmpIdx);
             this.RequireIo(pf != null && pf.IsOpen(), "open index checkpoint", pf);
             this.RequireIo(pf.WriteAt(0, b.Raw(), b.Length()) == b.Length(), "write index checkpoint", pf);
             this.RequireIo(pf.Sync(), "sync index checkpoint", pf);
+            pf.Close();
+            pf = null;
+            if (File.Exists(this.idxPath)) { File.Delete(this.idxPath); }
+            File.Move(tmpIdx, this.idxPath);
         } catch (Exception ex) {
             if (pf != null) { pf.Close(); pf = null; }
             if (File.Exists(tmpIdx)) { File.Delete(tmpIdx); }
+            throw;
+        } finally {
+            if (pf != null) { pf.Close(); }
             b.Free();
-            throw ex;
         }
-        pf.Close();
-        b.Free();
-        if (File.Exists(this.idxPath)) { File.Delete(this.idxPath); }
-        File.Move(tmpIdx, this.idxPath);
     }
 
     // 从 .zidx 文件装载二级索引
@@ -557,85 +566,88 @@ public partial class RecordTable {
         PageFile pf = PageFile.OpenExisting(this.idxPath);
         if (pf == null || !pf.IsOpen()) { return false; }
 
-        int fsize = pf.Size();
-        if (fsize < IDX_HEADER_SIZE) {
-            pf.Close();
-            return false;
-        }
-
-        ByteBuffer b = ByteBuffer.Alloc(fsize);
-        if (pf.ReadAt(0, b, fsize) != fsize) {
-            b.Free();
-            pf.Close();
-            return false;
-        }
-        pf.Close();
-
-        b.SeekRead(0);
-        string magic = b.Str(0, 4);
-        b.SeekRead(4);
-        int ver = (int)b.ReadU32();
-        long idxColCountL = b.ReadU32();
-        long tRows = b.ReadU64();
-        long aRows = b.ReadU64();
-        b.ReadU32(); // reserved
-
-        if (magic != MAGIC_IDX || ver != VERSION || idxColCountL < 0L || idxColCountL > 4096L
-            || (int)tRows != this.totalRows || (int)aRows != this.activeRows) {
-            b.Free();
-            return false;
-        }
-        int idxColCount = (int)idxColCountL;
-
-        Dictionary<string, Dictionary<string, List<int>>> newIndexes = new Dictionary<string, Dictionary<string, List<int>>>();
-        Dictionary<string, List<string>> newSorted = new Dictionary<string, List<string>>();
-        for (int c = 0; c < idxColCount; c = c + 1) {
-            if (!b.CanRead(1)) { b.Free(); return false; }
-            int nlen = b.ReadU8();
-            if (!b.CanRead(nlen + 4)) { b.Free(); return false; }
-            string colName = nlen > 0 ? NativeMemory.GetString(b.data, b.rpos, nlen) : "";
-            b.SeekRead(b.rpos + nlen);
-
-            Dictionary<string, List<int>> map = new Dictionary<string, List<int>>();
-            List<string> sortedKeys = new List<string>();
-            long kCountL = b.ReadU32();
-            if (kCountL < 0L || kCountL > (long)b.Remaining()) { b.Free(); return false; }
-            int kCount = (int)kCountL;
-            sortedKeys.Reserve(kCount);
-            bool alreadySorted = true;
-            string prevKey = null;
-            for (int k = 0; k < kCount; k = k + 1) {
-                if (!b.CanRead(2)) { b.Free(); return false; }
-                int klen = b.ReadU16();
-                if (!b.CanRead(klen + 4)) { b.Free(); return false; }
-                string key = klen > 0 ? NativeMemory.GetString(b.data, b.rpos, klen) : "";
-                b.SeekRead(b.rpos + klen);
-
-                long idCountL = b.ReadU32();
-                if (idCountL < 0L || idCountL * 4L > (long)b.Remaining()) { b.Free(); return false; }
-                int idCount = (int)idCountL;
-                List<int> ids = new List<int>();
-                ids.Reserve(idCount);
-                for (int j = 0; j < idCount; j = j + 1) {
-                    ids.Add((int)b.ReadU32());
-                }
-                map[key] = ids;
-                if (prevKey != null && String.CompareOrdinal(prevKey, key) >= 0) {
-                    alreadySorted = false;
-                }
-                prevKey = key;
-                sortedKeys.Add(key);
+        ByteBuffer b = null;
+        try {
+            long fsizeL = pf.Size();
+            if (fsizeL < (long)IDX_HEADER_SIZE || fsizeL > 268435456L) {
+                return false;
             }
-            if (!alreadySorted && sortedKeys.Count > 1) {
-                RecordTable.SortKeysOrdinal(sortedKeys, 0, sortedKeys.Count - 1);
+            int fsize = (int)fsizeL;
+
+            b = ByteBuffer.Alloc(fsize);
+            if (pf.ReadAt(0, b, fsize) != fsize) {
+                return false;
             }
-            newIndexes[colName] = map;
-            newSorted[colName] = sortedKeys;
+            pf.Close();
+            pf = null;
+
+            b.SeekRead(0);
+            string magic = b.Str(0, 4);
+            b.SeekRead(4);
+            int ver = (int)b.ReadU32();
+            long idxColCountL = b.ReadU32();
+            long tRows = b.ReadU64();
+            long aRows = b.ReadU64();
+            b.ReadU32(); // reserved
+
+            if (magic != MAGIC_IDX || ver != VERSION || idxColCountL < 0L || idxColCountL > 4096L
+                || tRows != (long)this.totalRows || aRows != (long)this.activeRows) {
+                return false;
+            }
+            int idxColCount = (int)idxColCountL;
+
+            Dictionary<string, Dictionary<string, List<int>>> newIndexes = new Dictionary<string, Dictionary<string, List<int>>>();
+            Dictionary<string, List<string>> newSorted = new Dictionary<string, List<string>>();
+            for (int c = 0; c < idxColCount; c = c + 1) {
+                if (!b.CanRead(1)) { return false; }
+                int nlen = b.ReadU8();
+                if (!b.CanRead(nlen + 4)) { return false; }
+                string colName = nlen > 0 ? NativeMemory.GetString(b.data, b.rpos, nlen) : "";
+                b.SeekRead(b.rpos + nlen);
+
+                Dictionary<string, List<int>> map = new Dictionary<string, List<int>>();
+                List<string> sortedKeys = new List<string>();
+                long kCountL = b.ReadU32();
+                if (kCountL < 0L || kCountL > (long)b.Remaining()) { return false; }
+                int kCount = (int)kCountL;
+                sortedKeys.Reserve(kCount);
+                bool alreadySorted = true;
+                string prevKey = null;
+                for (int k = 0; k < kCount; k = k + 1) {
+                    if (!b.CanRead(2)) { return false; }
+                    int klen = b.ReadU16();
+                    if (!b.CanRead(klen + 4)) { return false; }
+                    string key = klen > 0 ? NativeMemory.GetString(b.data, b.rpos, klen) : "";
+                    b.SeekRead(b.rpos + klen);
+
+                    long idCountL = b.ReadU32();
+                    if (idCountL < 0L || idCountL * 4L > (long)b.Remaining()) { return false; }
+                    int idCount = (int)idCountL;
+                    List<int> ids = new List<int>();
+                    ids.Reserve(idCount);
+                    for (int j = 0; j < idCount; j = j + 1) {
+                        ids.Add((int)b.ReadU32());
+                    }
+                    map[key] = ids;
+                    if (prevKey != null && String.CompareOrdinal(prevKey, key) >= 0) {
+                        alreadySorted = false;
+                    }
+                    prevKey = key;
+                    sortedKeys.Add(key);
+                }
+                if (!alreadySorted && sortedKeys.Count > 1) {
+                    RecordTable.SortKeysOrdinal(sortedKeys, 0, sortedKeys.Count - 1);
+                }
+                newIndexes[colName] = map;
+                newSorted[colName] = sortedKeys;
+            }
+            this.indexes = newIndexes;
+            this.indexKeysSorted = newSorted;
+            return true;
+        } finally {
+            if (pf != null) { pf.Close(); }
+            if (b != null) { b.Free(); }
         }
-        this.indexes = newIndexes;
-        this.indexKeysSorted = newSorted;
-        b.Free();
-        return true;
     }
 
     // 批量分块全表顺序扫描（64 KiB 连续块读消除逐行加锁与 OS ReadFile syscall，每行仍保留独立所有权缓冲）

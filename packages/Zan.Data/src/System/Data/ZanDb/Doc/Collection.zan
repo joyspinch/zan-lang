@@ -90,14 +90,24 @@ public partial class Collection {
 
     // 提交或回滚后刷新派生缓存。回滚不推进提交版本，
     // 但必须丢弃事务中分配的字段 id、序列和文档缓存。
+    // 可能在 tlock.EnterRead 读锁下被多读线程并发调用，故用 cacheMtx 串行化元数据刷新。
     public void SyncMeta() {
         long v = this.kv.CacheVersion();
         if (v == this.metaVersion) { return; }
-        this.metaVersion = v;
-        this.nextIdCache = 0;
-        ClearCache();
-        LoadIndexMeta();
-        LoadKeyDict();
+        if (this.cacheMtx != 0) { Mutex.Lock(this.cacheMtx); }
+        try {
+            v = this.kv.CacheVersion();
+            if (v == this.metaVersion) { return; }
+            this.nextIdCache = 0;
+            this.docCache.Clear();
+            this.docCacheOrder.Clear();
+            this.docCacheNodes.Clear();
+            LoadIndexMeta();
+            LoadKeyDict();
+            this.metaVersion = v;
+        } finally {
+            if (this.cacheMtx != 0) { Mutex.Unlock(this.cacheMtx); }
+        }
     }
 
     public void CommitWrite() {
@@ -138,18 +148,21 @@ public partial class Collection {
     // 且不含 0x00、':' 与 '\t'，不破坏 B+Tree 顺序与键分隔。
     public static string PadId(int id) {
         ByteBuffer b = ByteBuffer.Alloc(Collection.ID_DIGITS);
-        int shift = (Collection.ID_DIGITS - 1) * 6;
-        while (shift >= 0) {
-            b.WriteU8(63 + ((id >> shift) & 63));
-            shift = shift - 6;
+        try {
+            int shift = (Collection.ID_DIGITS - 1) * 6;
+            while (shift >= 0) {
+                b.WriteU8(63 + ((id >> shift) & 63));
+                shift = shift - 6;
+            }
+            return b.ToStr();
+        } finally {
+            b.Free();
         }
-        string s = b.ToStr();
-        b.Free();
-        return s;
     }
 
     // PadId 的逆操作。
     public static int UnpadId(string s) {
+        if (s == null || s.Length == 0) { return 0; }
         int v = 0;
         for (int i = 0; i < s.Length; i = i + 1) {
             v = (v << 6) | ((s[i] & 255) - 63);
@@ -227,14 +240,19 @@ public partial class Collection {
 
     // 从元数据键的 JSON 数组加载字段名字典。
     public void LoadKeyDict() {
-        this.keyDict = new List<string>();
+        List<string> loaded = new List<string>();
         this.keyDictDirty = false;
         string meta = this.kv.Get(KeysMetaKey());
-        if (meta.Length == 0) { return; }
-        JsonValue arr = JsonValue.ParseLenient(meta);
-        for (int i = 0; i < arr.Count(); i = i + 1) {
-            this.keyDict.Add(arr.At(i).AsString(""));
+        if (meta != null && meta.Length > 0) {
+            JsonValue arr = JsonValue.ParseLenient(meta);
+            if (arr != null && arr.IsArray()) {
+                for (int i = 0; i < arr.Count(); i = i + 1) {
+                    JsonValue item = arr.At(i);
+                    loaded.Add(item != null ? item.AsString("") : "");
+                }
+            }
         }
+        this.keyDict = loaded;
     }
 
     // 字段名的 1 起始字典 id；首次出现时追加进字典并标记待持久化（须在 kv 事务内）。

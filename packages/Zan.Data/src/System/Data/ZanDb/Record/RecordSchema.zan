@@ -82,6 +82,9 @@ public class RecordSchema {
     }
 
     public void AddFixedStr(string name, int maxBytes) {
+        if (maxBytes <= 0) {
+            throw new ArgumentException("maxBytes must be positive");
+        }
         int rem = maxBytes % 4;
         int aligned = rem == 0 ? maxBytes : maxBytes + (4 - rem);
         int off = this.rowBytes;
@@ -116,6 +119,7 @@ public class RecordSchema {
     }
 
     private static string AsciiLower(string s) {
+        if (s == null) { return ""; }
         int n = s.Length;
         bool hasUpper = false;
         for (int i = 0; i < n; i = i + 1) {
@@ -134,18 +138,22 @@ public class RecordSchema {
 
     private void EnsureColMap() {
         int n = this.columns.Count;
-        if (this.exactMap != null && this.cachedColCount == n) { return; }
-        Dictionary<string, RecordColumn> em = new Dictionary<string, RecordColumn>();
-        Dictionary<string, RecordColumn> lm = new Dictionary<string, RecordColumn>();
-        for (int i = 0; i < n; i = i + 1) {
-            RecordColumn c = this.columns[i];
-            if (!em.ContainsKey(c.name)) { em[c.name] = c; }
-            string low = RecordSchema.AsciiLower(c.name);
-            if (!lm.ContainsKey(low)) { lm[low] = c; }
+        if (this.exactMap != null && this.lowerMap != null && this.cachedColCount == n) { return; }
+        lock (this) {
+            n = this.columns.Count;
+            if (this.exactMap != null && this.lowerMap != null && this.cachedColCount == n) { return; }
+            Dictionary<string, RecordColumn> em = new Dictionary<string, RecordColumn>();
+            Dictionary<string, RecordColumn> lm = new Dictionary<string, RecordColumn>();
+            for (int i = 0; i < n; i = i + 1) {
+                RecordColumn c = this.columns[i];
+                if (!em.ContainsKey(c.name)) { em[c.name] = c; }
+                string low = RecordSchema.AsciiLower(c.name);
+                if (!lm.ContainsKey(low)) { lm[low] = c; }
+            }
+            this.exactMap = em;
+            this.lowerMap = lm;
+            this.cachedColCount = n;
         }
-        this.exactMap = em;
-        this.lowerMap = lm;
-        this.cachedColCount = n;
     }
 
     private static bool EqualsAsciiIgnoreCase(string a, string b) {
@@ -186,36 +194,59 @@ public class RecordSchema {
 
     // 序列化 Schema 为二进制格式
     public ByteBuffer Serialize() {
-        ByteBuffer b = ByteBuffer.Alloc(128);
-        b.WriteU16(this.rowBytes);
-        b.WriteU16(this.columns.Count);
-        for (int i = 0; i < this.columns.Count; i = i + 1) {
-            RecordColumn c = this.columns[i];
-            b.WriteU8(c.dataType);
-            b.WriteU16(c.fixedLen);
-            b.WriteU16(c.offset);
-            byte[] nb = Encoding.GetBytes(c.name);
-            int nlen = nb != null ? nb.Length : 0;
-            if (nlen > 255) { nlen = 255; }
-            b.WriteU8(nlen);
-            for (int j = 0; j < nlen; j = j + 1) {
-                b.WriteU8((int)nb[j]);
-            }
+        if (this.rowBytes < 4 || this.rowBytes > 65535) {
+            throw new InvalidOperationException("RecordSchema rowBytes out of U16 range");
         }
-        return b;
+        if (this.columns.Count > 65535) {
+            throw new InvalidOperationException("RecordSchema column count exceeds U16 limit");
+        }
+        ByteBuffer b = ByteBuffer.Alloc(128);
+        bool ok = false;
+        try {
+            b.WriteU16(this.rowBytes);
+            b.WriteU16(this.columns.Count);
+            for (int i = 0; i < this.columns.Count; i = i + 1) {
+                RecordColumn c = this.columns[i];
+                if (c.fixedLen < 0 || c.fixedLen > 65535 || c.offset < 4 || c.offset > 65535 || c.offset + c.fixedLen > this.rowBytes) {
+                    throw new InvalidOperationException("RecordSchema column layout out of bounds");
+                }
+                b.WriteU8(c.dataType);
+                b.WriteU16(c.fixedLen);
+                b.WriteU16(c.offset);
+                byte[] nb = Encoding.GetBytes(c.name);
+                int nlen = nb != null ? nb.Length : 0;
+                if (nlen > 255) { nlen = 255; }
+                b.WriteU8(nlen);
+                for (int j = 0; j < nlen; j = j + 1) {
+                    b.WriteU8((int)nb[j]);
+                }
+            }
+            ok = true;
+            return b;
+        } finally {
+            if (!ok) { b.Free(); }
+        }
     }
 
     // 从二进制格式反序列化 Schema
     public static RecordSchema Deserialize(ByteBuffer b) {
+        if (b == null || !b.CanRead(4)) { return null; }
         RecordSchema s = new RecordSchema();
         s.columns.Clear();
         s.rowBytes = b.ReadU16();
         int count = b.ReadU16();
+        if (s.rowBytes < 4 || (s.rowBytes % 4) != 0 || count < 0 || count > 4096) {
+            return null;
+        }
         for (int i = 0; i < count; i = i + 1) {
+            if (!b.CanRead(6)) { return null; }
             int dt = b.ReadU8();
             int flen = b.ReadU16();
             int off = b.ReadU16();
             int nlen = b.ReadU8();
+            if (dt < 1 || dt > 8 || off < 4 || flen < 0 || off + flen > s.rowBytes || !b.CanRead(nlen)) {
+                return null;
+            }
             byte[] nb = new byte[nlen];
             for (int j = 0; j < nlen; j = j + 1) {
                 nb[j] = (byte)b.ReadU8();

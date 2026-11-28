@@ -53,10 +53,13 @@ public class ZanDatabase : IDisposable {
     }
 
     // fsync 频率：1 = 每次提交，N = 分组提交。
-    public void SetSyncEvery(int n) { this.kv.SetSyncEvery(n); }
+    public void SetSyncEvery(int n) {
+        if (this.kv != null) { this.kv.SetSyncEvery(n); }
+    }
 
     // 返回指定名称的文档集合（惰性创建）。
     public Collection GetCollection(string name) {
+        if (this.tlock == null || this.kv == null) { throw new InvalidOperationException("ZanDatabase is closed"); }
         this.tlock.EnterWrite();
         try {
         return GetCollectionLocked(name);
@@ -79,6 +82,7 @@ public class ZanDatabase : IDisposable {
     }
 
     public VectorTable GetVectorTable(string name, VectorIndexOptions options) {
+        if (this.tlock == null || this.kv == null) { throw new InvalidOperationException("ZanDatabase is closed"); }
         this.tlock.EnterWrite();
         try {
             return this.GetVectorTableLocked(name, options);
@@ -97,6 +101,7 @@ public class ZanDatabase : IDisposable {
 
     // 返回指定名称的纯二进制结构化表格（RecordTable），零 JsonValue 装箱
     public RecordTable GetRecordTable(string name, RecordSchema schema = null) {
+        if (this.tlock == null || this.kv == null) { throw new InvalidOperationException("ZanDatabase is closed"); }
         this.tlock.EnterWrite();
         try {
             return this.GetRecordTableLocked(name, schema);
@@ -119,6 +124,11 @@ public class ZanDatabase : IDisposable {
     // 全库巡检：内核段 CRC/WAL/清单双槽 + 已加载集合的快照代
     // 审计。只读不修复；返回问题清单，空 = 健康。
     public List<string> IntegrityCheck() {
+        if (this.tlock == null || this.kv == null) {
+            List<string> closedProblems = new List<string>();
+            closedProblems.Add("database is closed");
+            return closedProblems;
+        }
         this.tlock.EnterRead();
         try {
         List<string> problems = this.kv.IntegrityCheck();
@@ -147,6 +157,7 @@ public class ZanDatabase : IDisposable {
 
     // 将后续写入批量合并为一次原子提交（协调底座 KV 与所有已挂载 RecordTable）。
     public void Begin() {
+        if (this.kv == null) { return; }
         this.kv.Begin();
         for (int i = 0; i < this.recordTables.Count; i = i + 1) {
             this.recordTables[i].table.BeginTransaction();
@@ -156,6 +167,7 @@ public class ZanDatabase : IDisposable {
     // 外层非空提交推进修订号；嵌套 true 仅表示仍暂存。
     // 可比较 GetRevision/CacheVersion 的前后值决定是否通知外部缓存。
     public bool Commit() {
+        if (this.kv == null) { return false; }
         bool ok = this.kv.Commit();
         if (!ok) {
             for (int i = 0; i < this.recordTables.Count; i = i + 1) {
@@ -171,17 +183,19 @@ public class ZanDatabase : IDisposable {
 
     // 丢弃最外层批次的全部暂存写入，同时使事务读缓存失效。
     public void Rollback() {
+        if (this.kv == null) { return; }
         this.kv.Rollback();
         for (int i = 0; i < this.recordTables.Count; i = i + 1) {
             this.recordTables[i].table.Rollback();
         }
     }
-    public bool InTransaction() { return this.kv.InTransaction(); }
-    public long GetRevision() { return this.kv.GetRevision(); }
-    public long CacheVersion() { return this.kv.CacheVersion(); }
+    public bool InTransaction() { return this.kv != null && this.kv.InTransaction(); }
+    public long GetRevision() { return this.kv != null ? this.kv.GetRevision() : 0L; }
+    public long CacheVersion() { return this.kv != null ? this.kv.CacheVersion() : 0L; }
 
     // 将迄今写入的内容强制落盘到稳定存储。
     public void Checkpoint() {
+        if (this.tlock == null || this.kv == null) { return; }
         this.tlock.EnterWrite();
         try {
             this.kv.Checkpoint();
@@ -198,6 +212,7 @@ public class ZanDatabase : IDisposable {
     // （不归并）：归并/维护与「稳态查询」前置步骤——memtable
     // 空了聚合与计数才走块级内核，否则退化为归并扫描。见
     public void Flush() {
+        if (this.tlock == null || this.kv == null) { return; }
         this.tlock.EnterWrite();
         try {
             this.kv.FlushToSegment();
@@ -213,6 +228,7 @@ public class ZanDatabase : IDisposable {
     // 把全部已固化段归并为一个段：掉落被新版压住的
     // 旧版本与已无意义的墓碑，回收存储空间。见
     public void MergeSegments() {
+        if (this.tlock == null || this.kv == null) { return; }
         this.tlock.EnterWrite();
         try {
         this.kv.MergeSegments();
@@ -221,6 +237,7 @@ public class ZanDatabase : IDisposable {
 
     // 当前已固化段数（观测/运维用）。
     public int SegCount() {
+        if (this.tlock == null || this.kv == null) { return 0; }
         this.tlock.EnterRead();
         try { return this.kv.SegCount(); }
         finally { this.tlock.ExitRead(); }
@@ -230,6 +247,7 @@ public class ZanDatabase : IDisposable {
     // 写阻塞被归并集规模封顶，反复调用收敛为单段。返回实际归并
     // 的段数（0 = 段不足 2 或在事务中）。见
     public int MergeSomeSegments(int maxMerge) {
+        if (this.tlock == null || this.kv == null) { return 0; }
         this.tlock.EnterWrite();
         try { return this.kv.MergeSomeSegments(maxMerge); }
         finally { this.tlock.ExitWrite(); }
@@ -238,6 +256,7 @@ public class ZanDatabase : IDisposable {
     // 开启自动增量归并：固化新段后段数达 atSegs 就归并
     // 最老 mergeK 段（0 = 关闭，默认）。见
     public void SetAutoMerge(int atSegs, int mergeK) {
+        if (this.tlock == null || this.kv == null) { return; }
         this.tlock.EnterWrite();
         try { this.kv.SetAutoMerge(atSegs, mergeK); }
         finally { this.tlock.ExitWrite(); }
@@ -246,6 +265,9 @@ public class ZanDatabase : IDisposable {
     // 热备份 / 一致快照导出（SQLite backup API 对位）：
     // 锁内原子截取底层 KV 存储与检索检查点，导出到目标路径并执行全库巡检审计。
     public void Backup(string targetPath) {
+        if (this.tlock == null || this.kv == null) {
+            throw new InvalidOperationException("cannot backup closed database: " + this.GetError());
+        }
         this.tlock.EnterWrite();
         try {
             this.BackupLocked(targetPath);
@@ -263,6 +285,10 @@ public class ZanDatabase : IDisposable {
         if (!this.IsOpen()) {
             throw new InvalidOperationException("cannot backup closed database: " + this.GetError());
         }
+        if (targetPath == null || targetPath.Length == 0) {
+            throw new ArgumentException("backup target path must be non-empty");
+        }
+        if (persistence == null) { persistence = new BackupPersistence(); }
         string target = Path.Normalize(targetPath);
         this.kv.BackupWithPersistence(target, persistence);
         long segmentBound = this.kv.man.NextSegId();
@@ -407,17 +433,23 @@ public class ZanDatabase : IDisposable {
 
     // 协程异步热备份（排他写锁保护）
     public async void BackupAsync(string targetPath) {
+        if (this.rw == null || this.tlock == null || this.kv == null) {
+            throw new InvalidOperationException("cannot backup closed database: " + this.GetError());
+        }
         await this.rw.EnterWrite();
-        this.tlock.EnterWrite();
         try {
-            this.BackupLocked(targetPath);
+            this.tlock.EnterWrite();
+            try {
+                this.BackupLocked(targetPath);
+            } finally {
+                this.tlock.ExitWrite();
+            }
         } finally {
-            this.tlock.ExitWrite();
             this.rw.ExitWrite();
         }
     }
 
-    // 关闭底层存储、集合原生锁与读写锁。
+    // 关闭底层存储、集合原生锁与读写锁（幂等防二次释放原生锁句柄）。
     public void Close() {
         for (int i = 0; i < this.entries.Count; i = i + 1) {
             this.entries[i].collection.Close();
@@ -431,9 +463,17 @@ public class ZanDatabase : IDisposable {
             this.recordTables[i].table.Close();
         }
         this.recordTables.Clear();
-        this.kv.Close();
-        this.rw.Close();
-        this.tlock.Close();
+        if (this.kv != null) {
+            this.kv.Close();
+        }
+        if (this.rw != null) {
+            this.rw.Close();
+            this.rw = null;
+        }
+        if (this.tlock != null) {
+            this.tlock.Close();
+            this.tlock = null;
+        }
     }
 
     public void Dispose() {
