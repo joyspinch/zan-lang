@@ -1,0 +1,173 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Net;
+
+// 小队成员记录。
+public class PartyMemberSlot {
+    public int PlayerId;
+    public bool Ready;
+
+    public PartyMemberSlot(int playerId) {
+        this.PlayerId = playerId;
+        this.Ready = false;
+    }
+}
+
+// 商业联机小队权威与房主自动迁移器：人数上限、仅房主可踢人、房主掉线自动移交下一位资历最长成员。
+public class NetPartyLeaderDelegator {
+    private List<PartyMemberSlot> members;
+    public int MaxSize;
+    public int LeaderId;
+
+    public NetPartyLeaderDelegator(int leaderId, int maxSize) {
+        this.members = new List<PartyMemberSlot>();
+        this.MaxSize = maxSize > 1 ? maxSize : 4;
+        this.LeaderId = leaderId;
+        this.members.Add(new PartyMemberSlot(leaderId));
+    }
+
+    public int MemberCount() { return this.members.Count; }
+
+    public bool Join(int playerId) {
+        if (this.members.Count >= this.MaxSize) { return false; }
+        for (int i = 0; i < this.members.Count; i = i + 1) {
+            if (this.members[i].PlayerId == playerId) { return false; }
+        }
+        this.members.Add(new PartyMemberSlot(playerId));
+        if (this.LeaderId <= 0) { this.LeaderId = playerId; }
+        return true;
+    }
+
+    public bool Kick(int actorId, int targetId) {
+        if (actorId != this.LeaderId || actorId == targetId) { return false; }
+        return this.Leave(targetId);
+    }
+
+    public bool Leave(int playerId) {
+        int idx = -1;
+        for (int i = 0; i < this.members.Count; i = i + 1) {
+            if (this.members[i].PlayerId == playerId) { idx = i; break; }
+        }
+        if (idx < 0) { return false; }
+        this.members.RemoveAt(idx);
+        if (this.LeaderId == playerId) {
+            this.LeaderId = this.members.Count > 0 ? this.members[0].PlayerId : 0;
+        }
+        return true;
+    }
+}
+
+// 投降/重开投票结果。
+public enum VoteResolution {
+    Idle = 0,
+    InProgress = 1,
+    Passed = 2,
+    Failed = 3
+}
+
+// 商业竞技提前投降投票机：开局最小时间锁、失败冷却、防重复投票，并在数学结果已定时提前结算。
+public class NetSurrenderVoteBox {
+    private List<int> voters;
+    public int TeamSize;
+    public int RequiredYes;
+    public int YesCount;
+    public int NoCount;
+    public long MinMatchElapsedMs;
+    public long FailCooldownMs;
+    public long NextAllowedMs;
+    public VoteResolution State;
+
+    public NetSurrenderVoteBox(int teamSize, int requiredYes, long minMatchElapsedMs, long failCooldownMs) {
+        this.voters = new List<int>();
+        this.TeamSize = teamSize > 0 ? teamSize : 5;
+        this.RequiredYes = requiredYes > 0 ? requiredYes : 4;
+        this.YesCount = 0;
+        this.NoCount = 0;
+        this.MinMatchElapsedMs = minMatchElapsedMs >= 0L ? minMatchElapsedMs : 180000L;
+        this.FailCooldownMs = failCooldownMs >= 0L ? failCooldownMs : 60000L;
+        this.NextAllowedMs = 0L;
+        this.State = VoteResolution.Idle;
+    }
+
+    public bool StartVote(int initiatorId, long matchElapsedMs) {
+        if (this.State == VoteResolution.InProgress || this.State == VoteResolution.Passed) { return false; }
+        if (matchElapsedMs < this.MinMatchElapsedMs || matchElapsedMs < this.NextAllowedMs) { return false; }
+        this.voters.Clear();
+        this.YesCount = 0;
+        this.NoCount = 0;
+        this.State = VoteResolution.InProgress;
+        return this.CastVote(initiatorId, true, matchElapsedMs);
+    }
+
+    public bool CastVote(int playerId, bool agree, long nowMs) {
+        if (this.State != VoteResolution.InProgress) { return false; }
+        for (int i = 0; i < this.voters.Count; i = i + 1) {
+            if (this.voters[i] == playerId) { return false; }
+        }
+        this.voters.Add(playerId);
+        if (agree) { this.YesCount = this.YesCount + 1; }
+        else { this.NoCount = this.NoCount + 1; }
+
+        if (this.YesCount >= this.RequiredYes) {
+            this.State = VoteResolution.Passed;
+        } else {
+            int remaining = this.TeamSize - (this.YesCount + this.NoCount);
+            if ((this.YesCount + remaining) < this.RequiredYes) {
+                this.State = VoteResolution.Failed;
+                this.NextAllowedMs = nowMs + this.FailCooldownMs;
+            }
+        }
+        return true;
+    }
+}
+
+// 进行中对局空位信息。
+public class BackfillLobbySlot {
+    public int LobbyId;
+    public int OpenSeats;
+    public int AvgMmr;
+
+    public BackfillLobbySlot(int lobbyId, int openSeats, int avgMmr) {
+        this.LobbyId = lobbyId;
+        this.OpenSeats = openSeats > 0 ? openSeats : 1;
+        this.AvgMmr = avgMmr;
+    }
+}
+
+// 商业联机中途热补位队列：按空位人数、MMR 容差与 FIFO 优先级把等待玩家精准塞入缺员对局。
+public class NetMatchmakingBackfillQueue {
+    private List<BackfillLobbySlot> openLobbies;
+    public int MaxMmrDelta;
+
+    public NetMatchmakingBackfillQueue(int maxMmrDelta) {
+        this.openLobbies = new List<BackfillLobbySlot>();
+        this.MaxMmrDelta = maxMmrDelta > 0 ? maxMmrDelta : 250;
+    }
+
+    public void RegisterOpenLobby(int lobbyId, int openSeats, int avgMmr) {
+        if (openSeats <= 0) { return; }
+        this.openLobbies.Add(new BackfillLobbySlot(lobbyId, openSeats, avgMmr));
+    }
+
+    // 返回匹配到的 LobbyId（无合适空位返回 -1），满员对局自动移出队列。
+    public int TryAssignBackfill(int partySize, int partyMmr) {
+        if (partySize <= 0) { return -1; }
+        for (int i = 0; i < this.openLobbies.Count; i = i + 1) {
+            BackfillLobbySlot lob = this.openLobbies[i];
+            int diff = lob.AvgMmr - partyMmr;
+            if (diff < 0) { diff = -diff; }
+            if (lob.OpenSeats >= partySize && diff <= this.MaxMmrDelta) {
+                int matchedId = lob.LobbyId;
+                lob.OpenSeats = lob.OpenSeats - partySize;
+                if (lob.OpenSeats <= 0) {
+                    this.openLobbies.RemoveAt(i);
+                }
+                return matchedId;
+            }
+        }
+        return -1;
+    }
+
+    public int OpenLobbyCount() { return this.openLobbies.Count; }
+}

@@ -340,6 +340,16 @@ ZAN_GAME_API void zan_game_set_rain_ripples3d(int32_t enabled, float scale,
 ZAN_GAME_API void zan_game_set_post_tilt_shift3d(float strength,
     float focus_y, float focus_band);
 
+/* GPU 3D 战术透视轮廓光（X-Ray Silhouette Rim，零贴图零额外 Pass）：
+ * enabled != 0 时按视角 Fresnel 轮廓叠加高亮光边，power [0.5..8] 控制边缘锐度，strength [0..3]。 */
+ZAN_GAME_API void zan_game_set_xray_silhouette3d(int32_t enabled, float power,
+    float strength, float r, float g, float b);
+
+/* GPU 后处理屏幕边缘冰晶霜冻（Edge Frost Vignette，单 Pass 零额外 FBO）：
+ * intensity [0..1] 控制冰霜不透明度，radius [0.15..0.95] 控制中心清晰区半径，r/g/b 为冰晶色。 */
+ZAN_GAME_API void zan_game_set_post_vignette_frost3d(float intensity,
+    float radius, float r, float g, float b);
+
 #ifdef __cplusplus
 }
 #endif

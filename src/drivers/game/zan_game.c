@@ -158,6 +158,7 @@ typedef struct {
     zgl_int u_sonar_origin_radius, u_sonar_style, u_sonar_color;
     zgl_int u_force_field_params, u_force_field_color;
     zgl_int u_rain_ripples_params, u_rain_ripples_color;
+    zgl_int u_xray_params, u_xray_color;
     zgl_int u_light_dir, u_light_color, u_light_count, u_ambient;
     zgl_int u_cam_pos, u_cam_valid, u_material, u_emissive;
     zgl_int u_point_pos, u_point_color, u_point_count;
@@ -254,6 +255,8 @@ static float g_game_force_field_params[4] = { 0.0f, 2.0f, 0.0f, 0.10f }; /* enab
 static float g_game_force_field_color[4] = { 0.1f, 0.75f, 1.0f, 0.0f }; /* r, g, b, strength */
 static float g_game_rain_ripples_params[4] = { 0.0f, 2.0f, 0.0f, 0.0f }; /* enabled, scale, phase, strength */
 static float g_game_rain_ripples_color[3] = { 0.75f, 0.88f, 1.0f };
+static float g_game_xray_params[3] = { 0.0f, 2.5f, 0.0f }; /* enabled, power, strength */
+static float g_game_xray_color[3] = { 0.2f, 0.85f, 1.0f };
 static float g_game_color_grade[2] = { 1.0f, 1.0f }; /* saturation, contrast */
 static float g_game_color_tint[3] = { 1.0f, 1.0f, 1.0f };
 static float g_game_post_lens[2] = { 0.0f, 0.0f }; /* fxaa, chromatic */
@@ -273,6 +276,8 @@ static float g_game_post_night_vision[4] = { 0.0f, 3.0f, 0.06f, 0.0f }; /* stren
 static float g_game_post_halftone[3] = { 0.0f, 6.0f, 1.0f }; /* strength, dot_scale, contrast */
 static float g_game_post_glitch[3] = { 0.0f, 24.0f, 0.0f }; /* intensity, slice_count, seed */
 static float g_game_post_tilt_shift[3] = { 0.0f, 0.5f, 0.15f }; /* strength, focus_y, focus_band */
+static float g_game_post_frost_params[2] = { 0.0f, 0.45f }; /* intensity, radius */
+static float g_game_post_frost_color[3] = { 0.55f, 0.88f, 1.0f };
 static uint32_t g_game_light_version = 1;
 
 static zan_game_mesh *g_game_meshes = NULL;
@@ -585,6 +590,8 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
 "uniform vec4 uForceFieldColor;\n" \
 "uniform vec4 uRainRipplesParams;\n" \
 "uniform vec3 uRainRipplesColor;\n" \
+"uniform vec3 uXrayParams;\n" \
+"uniform vec3 uXrayColor;\n" \
 "uniform vec3 uCamPos;\n" \
 "uniform int uCamValid;\n" \
 "uniform vec2 uMaterial;\n" \
@@ -856,6 +863,10 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
     "    }\n" \
     "    if (uCamValid != 0) {\n" \
     "        float ndv = clamp(dot(N, V), 0.0, 1.0);\n" \
+    "        if (uXrayParams.x > 0.5 && uXrayParams.z > 0.0005) {\n" \
+    "            float xrRim = pow(clamp(1.0 - ndv, 0.0, 1.0), clamp(uXrayParams.y, 0.5, 8.0));\n" \
+    "            rgb += uXrayColor * (xrRim * clamp(uXrayParams.z, 0.0, 3.0));\n" \
+    "        }\n" \
     "        if (uHemiOn != 0) {\n" \
     "            vec3 R = reflect(-V, N);\n" \
     "            vec3 envSpec = mix(uHemiGround, uHemiSky, clamp(R.y * 0.5 + 0.5, 0.0, 1.0));\n" \
@@ -999,6 +1010,8 @@ static const char *const ZAN_GAME_POST_FS =
 "uniform vec3 uPostHalftone;\n"
 "uniform vec3 uPostGlitch;\n"
 "uniform vec3 uPostTiltShift;\n"
+"uniform vec2 uPostFrostParams;\n"
+"uniform vec3 uPostFrostColor;\n"
 "in vec2 v_uv;\n"
 "out vec4 frag;\n"
 "vec3 brightPass(vec3 c, float th) {\n"
@@ -1193,6 +1206,16 @@ static const char *const ZAN_GAME_POST_FS =
     "        vec3 htCol = mix(clamp(col * 1.15 + vec3(0.06), 0.0, 1.0), col * 0.08, htInk);\n"
     "        col = mix(col, htCol, clamp(uPostHalftone.x, 0.0, 1.0));\n"
     "    }\n"
+    "    if (uPostFrostParams.x > 0.0005) {\n"
+    "        vec2 fd = (v_uv - vec2(0.5)) * 2.0;\n"
+    "        float fRad = length(fd);\n"
+    "        float fMask = smoothstep(clamp(uPostFrostParams.y, 0.15, 0.95), 1.35, fRad);\n"
+    "        if (fMask > 0.001) {\n"
+    "            float fCrystal = 0.72 + 0.28 * fract(sin(dot(floor(v_uv * 96.0), vec2(127.1, 311.7))) * 43758.5453);\n"
+    "            float fAmt = clamp(fMask * fCrystal * clamp(uPostFrostParams.x, 0.0, 1.0), 0.0, 1.0);\n"
+    "            col = mix(col, uPostFrostColor, fAmt);\n"
+    "        }\n"
+    "    }\n"
     "    if (uVignette > 0.001) {\n"
     "        vec2 d = (v_uv - vec2(0.5)) * 2.0;\n"
     "        float vig = clamp(1.0 - uVignette * dot(d, d) * 0.5, 0.0, 1.0);\n"
@@ -1249,6 +1272,8 @@ typedef struct {
     zgl_int u_post_halftone;
     zgl_int u_post_glitch;
     zgl_int u_post_tilt_shift;
+    zgl_int u_post_frost_params;
+    zgl_int u_post_frost_color;
 } zan_game_post_program;
 
 static const char *const ZAN_GAME_SKYBOX_FS =
@@ -1532,6 +1557,10 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
         : g_game_gl->GetUniformLocation(program, "uRainRipplesParams");
     zgl_int rain_ripples_color = instanced ? -1
         : g_game_gl->GetUniformLocation(program, "uRainRipplesColor");
+    zgl_int xray_params = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uXrayParams");
+    zgl_int xray_color = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uXrayColor");
     zgl_int color = instanced ? 0
         : g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
@@ -1624,6 +1653,8 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
     prog->u_force_field_color = force_field_color;
     prog->u_rain_ripples_params = rain_ripples_params;
     prog->u_rain_ripples_color = rain_ripples_color;
+    prog->u_xray_params = xray_params;
+    prog->u_xray_color = xray_color;
     prog->u_color = color;
     prog->u_light_dir = light_dir;
     prog->u_light_color = light_color;
@@ -1713,6 +1744,8 @@ static zan_game_program *zan_game_skin_program_get(void) {
     zgl_int force_field_color = g_game_gl->GetUniformLocation(program, "uForceFieldColor");
     zgl_int rain_ripples_params = g_game_gl->GetUniformLocation(program, "uRainRipplesParams");
     zgl_int rain_ripples_color = g_game_gl->GetUniformLocation(program, "uRainRipplesColor");
+    zgl_int xray_params = g_game_gl->GetUniformLocation(program, "uXrayParams");
+    zgl_int xray_color = g_game_gl->GetUniformLocation(program, "uXrayColor");
     zgl_int color = g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
     zgl_int light_color = g_game_gl->GetUniformLocation(program, "uLightColor[0]");
@@ -1793,6 +1826,8 @@ static zan_game_program *zan_game_skin_program_get(void) {
     g_game_skin_prog.u_force_field_color = force_field_color;
     g_game_skin_prog.u_rain_ripples_params = rain_ripples_params;
     g_game_skin_prog.u_rain_ripples_color = rain_ripples_color;
+    g_game_skin_prog.u_xray_params = xray_params;
+    g_game_skin_prog.u_xray_color = xray_color;
     g_game_skin_prog.u_color = color;
     g_game_skin_prog.u_light_dir = light_dir;
     g_game_skin_prog.u_light_color = light_color;
@@ -2339,6 +2374,12 @@ static void zan_game_bind_shadow_uniforms(const zan_gl_api *gl, zan_game_program
     }
     if (prog->u_rain_ripples_color >= 0) {
         gl->Uniform3fv(prog->u_rain_ripples_color, 1, g_game_rain_ripples_color);
+    }
+    if (prog->u_xray_params >= 0) {
+        gl->Uniform3fv(prog->u_xray_params, 1, g_game_xray_params);
+    }
+    if (prog->u_xray_color >= 0) {
+        gl->Uniform3fv(prog->u_xray_color, 1, g_game_xray_color);
     }
 }
 
@@ -2926,6 +2967,8 @@ static zan_game_post_program *zan_game_post_program_get(void) {
     g_game_post_prog.u_post_halftone = g_game_gl->GetUniformLocation(prog, "uPostHalftone");
     g_game_post_prog.u_post_glitch = g_game_gl->GetUniformLocation(prog, "uPostGlitch");
     g_game_post_prog.u_post_tilt_shift = g_game_gl->GetUniformLocation(prog, "uPostTiltShift");
+    g_game_post_prog.u_post_frost_params = g_game_gl->GetUniformLocation(prog, "uPostFrostParams");
+    g_game_post_prog.u_post_frost_color = g_game_gl->GetUniformLocation(prog, "uPostFrostColor");
     return &g_game_post_prog;
 }
 
@@ -3086,6 +3129,13 @@ ZAN_GAME_API int32_t zan_game_postprocess3d(int32_t surface_id, float exposure,
     }
     if (prog->u_post_tilt_shift >= 0) {
         gl->Uniform3fv(prog->u_post_tilt_shift, 1, g_game_post_tilt_shift);
+    }
+    if (prog->u_post_frost_params >= 0) {
+        gl->Uniform2f(prog->u_post_frost_params,
+            g_game_post_frost_params[0], g_game_post_frost_params[1]);
+    }
+    if (prog->u_post_frost_color >= 0) {
+        gl->Uniform3fv(prog->u_post_frost_color, 1, g_game_post_frost_color);
     }
     gl->BindVertexArray(g_game_post_vao);
     gl->DrawArrays(ZGL_TRIANGLES, 0, 3);
@@ -3678,4 +3728,31 @@ ZAN_GAME_API void zan_game_set_post_tilt_shift3d(float strength,
     g_game_post_tilt_shift[0] = strength;
     g_game_post_tilt_shift[1] = focus_y;
     g_game_post_tilt_shift[2] = focus_band;
+}
+
+ZAN_GAME_API void zan_game_set_xray_silhouette3d(int32_t enabled, float power,
+    float strength, float r, float g, float b) {
+    g_game_xray_params[0] = enabled ? 1.0f : 0.0f;
+    if (power < 0.5f) power = 0.5f;
+    if (power > 8.0f) power = 8.0f;
+    g_game_xray_params[1] = power;
+    if (strength < 0.0f) strength = 0.0f;
+    if (strength > 3.0f) strength = 3.0f;
+    g_game_xray_params[2] = strength;
+    g_game_xray_color[0] = r > 0.0f ? r : 0.0f;
+    g_game_xray_color[1] = g > 0.0f ? g : 0.0f;
+    g_game_xray_color[2] = b > 0.0f ? b : 0.0f;
+}
+
+ZAN_GAME_API void zan_game_set_post_vignette_frost3d(float intensity,
+    float radius, float r, float g, float b) {
+    if (intensity < 0.0f) intensity = 0.0f;
+    if (intensity > 1.0f) intensity = 1.0f;
+    if (radius < 0.15f) radius = 0.15f;
+    if (radius > 0.95f) radius = 0.95f;
+    g_game_post_frost_params[0] = intensity;
+    g_game_post_frost_params[1] = radius;
+    g_game_post_frost_color[0] = r > 0.0f ? r : 0.0f;
+    g_game_post_frost_color[1] = g > 0.0f ? g : 0.0f;
+    g_game_post_frost_color[2] = b > 0.0f ? b : 0.0f;
 }
