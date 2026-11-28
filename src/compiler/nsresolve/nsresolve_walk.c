@@ -108,6 +108,7 @@ static void collect_shadows(nr_ctx_t *c, zan_ast_node_t *n) {
   case AST_CAST_EXPR:
   case AST_TYPEOF_EXPR:
   case AST_SIZEOF_EXPR:
+  case AST_STACKALLOC_EXPR:
     collect_shadows(c, n->cast.expr);
     break;
   case AST_IS_EXPR:
@@ -440,6 +441,7 @@ static void nr_walk(nr_ctx_t *c, zan_ast_node_t *n, zan_istr_t ns,
   case AST_CAST_EXPR:
   case AST_TYPEOF_EXPR:
   case AST_SIZEOF_EXPR:
+  case AST_STACKALLOC_EXPR:
     nr_walk(c, n->cast.type, ns, usings);
     nr_walk(c, n->cast.expr, ns, usings);
     break;
@@ -596,6 +598,9 @@ static void nsresolve_run(zan_ast_node_t *unit, zan_arena_t *arena,
   if (!unit || unit->kind != AST_COMPILATION_UNIT)
     return;
   zan_ast_list_t *decls = &unit->comp_unit.decls;
+  if (decls->count == 0)
+    return;
+  zan_macro_expand_unit(unit, arena, diag);
   if (decls->count == 0)
     return;
   /* B-ID102 拓扑表自检（ZANC_TRACE 门控）：经 child_count/child_at 递归数全树，

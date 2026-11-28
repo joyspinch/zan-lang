@@ -1,0 +1,243 @@
+using System;
+
+// Pure-Zan implementation of the embedded-resource runtime API
+// (replaces src/embed/zan_embed_api.c + zan_embed_string.h).
+// Compiled directly by `zanc --freestanding -O2` to zan_embed_api.obj/.o.
+
+struct ZanEmbedEnt {
+    public nint Name;
+    public nint Data;
+    public long Len;
+}
+
+struct ZanEmbedView {
+    public nint Source;
+    public ulong Len;
+    public nint Text;
+    public nint Next;
+}
+
+struct ZanEmptyStr {
+    public ulong W0;
+    public ulong W1;
+    public byte Nul;
+}
+
+class ZanEmbedRuntime {
+    // ZAN_STR_VBASE = 16, ZAN_STR_LEN_OFF = -12
+    // ZAN_STR_LIT_W0(len) = ((len & 0xFFFFFFFFUL) << 32) | 0xFFFFFFFFUL
+    // ZAN_STR_LIT_W1      = (0x5A414E53UL << 32) | 0xFFFFFFFFUL
+    const ulong STR_LIT_W1 = 0x5A414E53FFFFFFFFUL;
+    const ulong STR_LIT_W0_EMPTY = 0x00000000FFFFFFFFUL;
+
+    static nint s_tab = (nint)0;
+    static long s_cnt = 0L;
+    static nint s_views = (nint)0;
+    static int s_gate = 0;
+    static ZanEmptyStr s_empty;
+    static int s_emptyInit = 0;
+
+    [NoAlloc]
+    static nint EmptyStringPtr() {
+        if (Atomic.Load(ref s_emptyInit, MemoryOrder.Acquire) == 0) {
+            s_empty.W0 = STR_LIT_W0_EMPTY;
+            s_empty.W1 = STR_LIT_W1;
+            s_empty.Nul = (byte)0;
+            Atomic.Store(ref s_emptyInit, 1, MemoryOrder.Release);
+        }
+        return NativeMemory.AddressOf(ref s_empty.Nul);
+    }
+
+    [NoAlloc]
+    static long CStrLen(nint s) {
+        if (s == (nint)0) return 0L;
+        long i = 0L;
+        while (NativeMemory.At<byte>(s, i) != (byte)0) {
+            i++;
+        }
+        return i;
+    }
+
+    [NoAlloc]
+    static int CStrEq(nint a, nint b) {
+        long i = 0L;
+        while (true) {
+            byte ca = NativeMemory.At<byte>(a, i);
+            byte cb = NativeMemory.At<byte>(b, i);
+            if (ca != cb) return 0;
+            if (ca == (byte)0) return 1;
+            i++;
+        }
+    }
+
+    [NoAlloc]
+    static int CStrStartsWith(nint s, nint prefix, long prefixLen) {
+        for (long i = 0L; i < prefixLen; i++) {
+            byte cs = NativeMemory.At<byte>(s, i);
+            byte cp = NativeMemory.At<byte>(prefix, i);
+            if (cs != cp) return 0;
+            if (cs == (byte)0) return 0;
+        }
+        return 1;
+    }
+
+    [NoAlloc]
+    static nint FindEntry(nint name) {
+        nint tab = s_tab;
+        long cnt = s_cnt;
+        if (name == (nint)0 || tab == (nint)0) return (nint)0;
+        for (long i = 0L; i < cnt; i++) {
+            ref ZanEmbedEnt e = ref NativeMemory.At<ZanEmbedEnt>(tab, i);
+            if (e.Name != (nint)0 && CStrEq(e.Name, name) != 0) {
+                return NativeMemory.AddressOf(ref e);
+            }
+        }
+        return (nint)0;
+    }
+
+    [NoAlloc]
+    static nint AllocEmbedString(ulong len) {
+        if (len > 0xFFFFFFFFUL) return (nint)0;
+        long total = 16L + (long)len + 1L;
+        nint raw = NativeMemory.Alloc(total);
+        if (raw == (nint)0) return (nint)0;
+        ulong w0 = ((len & 0xFFFFFFFFUL) << 32) | 0xFFFFFFFFUL;
+        NativeMemory.At<ulong>(raw, 0) = w0;
+        NativeMemory.At<ulong>(raw, 1) = STR_LIT_W1;
+        nint data = raw + (nint)16;
+        NativeMemory.At<byte>(data, (long)len) = (byte)0;
+        return data;
+    }
+
+    [NoAlloc]
+    static nint GetOrCreateStringView(nint source, ulong len) {
+        if (len > 0xFFFFFFFFUL || (source == (nint)0 && len != 0UL)) {
+            return EmptyStringPtr();
+        }
+        while (Atomic.Exchange(ref s_gate, 1, MemoryOrder.Acquire) != 0) {
+            Atomic.Pause();
+        }
+        nint cur = s_views;
+        while (cur != (nint)0) {
+            ref ZanEmbedView v = ref NativeMemory.AsRef<ZanEmbedView>(cur);
+            if (v.Source == source && v.Len == len) {
+                nint cached = v.Text;
+                Atomic.Store(ref s_gate, 0, MemoryOrder.Release);
+                return cached;
+            }
+            cur = v.Next;
+        }
+        nint entryPtr = NativeMemory.Alloc((long)sizeof(ZanEmbedView));
+        if (entryPtr == (nint)0) {
+            Atomic.Store(ref s_gate, 0, MemoryOrder.Release);
+            return EmptyStringPtr();
+        }
+        nint text = AllocEmbedString(len);
+        if (text == (nint)0) {
+            NativeMemory.Free(entryPtr);
+            Atomic.Store(ref s_gate, 0, MemoryOrder.Release);
+            return EmptyStringPtr();
+        }
+        if (len != 0UL) {
+            NativeMemory.Copy(text, source, (long)len);
+            ulong visibleLen = len;
+            for (ulong i = 0UL; i < len; i++) {
+                if (NativeMemory.At<byte>(source, (long)i) == (byte)0) {
+                    visibleLen = i;
+                    break;
+                }
+            }
+            // ZAN_STR_LEN_OFF = -12
+            NativeMemory.Write<uint>(text - (nint)12, (uint)visibleLen);
+        }
+        ref ZanEmbedView ent = ref NativeMemory.AsRef<ZanEmbedView>(entryPtr);
+        ent.Source = source;
+        ent.Len = len;
+        ent.Text = text;
+        ent.Next = s_views;
+        s_views = entryPtr;
+        Atomic.Store(ref s_gate, 0, MemoryOrder.Release);
+        return text;
+    }
+
+    [Export("zan_embed_register")]
+    [Visibility("hidden")]
+    [NoAlloc]
+    public static void Register(nint tbl, long n) {
+        s_tab = tbl;
+        s_cnt = n;
+    }
+
+    [Export("zan_embed_read")]
+    [Visibility("hidden")]
+    [NoAlloc]
+    public static nint Read(nint name) {
+        nint ep = FindEntry(name);
+        if (ep == (nint)0) return EmptyStringPtr();
+        ref ZanEmbedEnt e = ref NativeMemory.AsRef<ZanEmbedEnt>(ep);
+        if (e.Len < 0L) return EmptyStringPtr();
+        return GetOrCreateStringView(e.Data, (ulong)e.Len);
+    }
+
+    [Export("zan_embed_has")]
+    [Visibility("hidden")]
+    [NoAlloc]
+    public static int Has(nint name) {
+        return FindEntry(name) != (nint)0 ? 1 : 0;
+    }
+
+    [Export("zan_embed_bytes")]
+    [Visibility("hidden")]
+    [NoAlloc]
+    public static nint Bytes(nint name, nint outLen) {
+        nint ep = FindEntry(name);
+        if (ep == (nint)0) {
+            if (outLen != (nint)0) {
+                NativeMemory.Write<int>(outLen, 0);
+            }
+            return (nint)0;
+        }
+        ref ZanEmbedEnt e = ref NativeMemory.AsRef<ZanEmbedEnt>(ep);
+        if (outLen != (nint)0) {
+            NativeMemory.Write<int>(outLen, (int)e.Len);
+        }
+        return e.Data;
+    }
+
+    [Export("zan_embed_list_alloc")]
+    [Visibility("hidden")]
+    [NoAlloc]
+    public static long ListAlloc(nint prefix) {
+        nint tab = s_tab;
+        long count = s_cnt;
+        if (tab == (nint)0) return 0L;
+        long prefixLen = (prefix != (nint)0) ? CStrLen(prefix) : 0L;
+        long totalLen = 0L;
+        for (long i = 0L; i < count; i++) {
+            ref ZanEmbedEnt e = ref NativeMemory.At<ZanEmbedEnt>(tab, i);
+            nint name = e.Name;
+            if (name == (nint)0) continue;
+            if (prefixLen > 0L && CStrStartsWith(name, prefix, prefixLen) == 0) continue;
+            long nameLen = CStrLen(name);
+            if (nameLen >= 2147483647L - totalLen) return 0L;
+            totalLen += nameLen + 1L;
+        }
+        if (totalLen == 0L) return 0L;
+        nint names = NativeMemory.Alloc(totalLen + 1L);
+        if (names == (nint)0) return 0L;
+        long offset = 0L;
+        for (long i = 0L; i < count; i++) {
+            ref ZanEmbedEnt e = ref NativeMemory.At<ZanEmbedEnt>(tab, i);
+            nint name = e.Name;
+            if (name == (nint)0) continue;
+            if (prefixLen > 0L && CStrStartsWith(name, prefix, prefixLen) == 0) continue;
+            long nameLen = CStrLen(name);
+            NativeMemory.Copy(names + (nint)offset, name, nameLen);
+            offset += nameLen;
+            NativeMemory.At<byte>(names, offset) = (byte)10; // '\n'
+            offset++;
+        }
+        NativeMemory.At<byte>(names, offset) = (byte)0;
+        return (long)names;
+    }
+}

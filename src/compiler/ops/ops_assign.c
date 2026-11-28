@@ -78,6 +78,7 @@ LLVMValueRef emit_expr_assignment(zan_irgen_t *g, zan_ast_node_t *expr,
             right = emit_implicit_box(g, lt, right, expr->binary.right, locals);
         }
 binding_lowered:
+        emit_move_clear_drop_flag(g, expr->binary.right, locals);
         if (expr->binary.left->kind == AST_IDENTIFIER) {
             local_var_t *local = local_find(locals, expr->binary.left->ident.name);
             if (local && local->obj_rc_flag && local_is_dyn_obj(g, local)) {
@@ -90,6 +91,18 @@ binding_lowered:
                     expr->binary.right, locals);
             } else if (local && local_slot_owns_rc(local)) {
                 emit_rc_capture_local(g, local->type, local->alloca, right, expr->binary.right, locals);
+            } else if (local && local->drop_flag) {
+                /* ~Copyable RAII reassignment: drop previous value if alive,
+                 * store incoming value, and re-arm drop flag. */
+                emit_raii_drop_local(g, local);
+                LLVMTypeRef slot_ty = local_slot_type(g, local);
+                LLVMValueRef rv = (LLVMGetTypeKind(slot_ty) == LLVMStructTypeKind)
+                    ? coerce_struct_value(g, right, local->type) : right;
+                LLVMValueRef sv = coerce_int_to(g, rv, slot_ty);
+                zan_store_fit(g, sv, local->alloca);
+                LLVMBuildStore(g->builder,
+                               LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 1, 0),
+                               local->drop_flag);
             } else if (local && local->struct_rc) {
                 /* 结构体按值整体拷贝与字段强引用生命周期转移 */
                 emit_struct_local_capture(g, local->type, local->alloca, right,
@@ -302,10 +315,15 @@ binding_lowered:
                     LLVMValueRef idx = emit_expr(g, expr->binary.left->index.index, locals);
                     LLVMValueRef span_len = LLVMBuildExtractValue(g->builder, span_val,
                         1, "sps.len");
-                    LLVMValueRef sp_oob =
-                        emit_index_bounds_check(g, idx, span_len, expr->loc, "span");
+                    int bce_scope = 0;
+                    bool bce_ok = irgen_bce_check(g, arr_expr,
+                        expr->binary.left->index.index, locals, &bce_scope);
                     LLVMBasicBlockRef sp_do = NULL, sp_end = NULL;
-                    emit_oob_store_split(g, sp_oob, &sp_do, &sp_end);
+                    if (!bce_ok) {
+                        LLVMValueRef sp_oob =
+                            emit_index_bounds_check(g, idx, span_len, expr->loc, "span");
+                        emit_oob_store_split(g, sp_oob, &sp_do, &sp_end);
+                    }
                     if (LLVMGetTypeKind(LLVMTypeOf(idx)) == LLVMIntegerTypeKind &&
                         LLVMGetIntTypeWidth(LLVMTypeOf(idx)) < 64)
                         idx = LLVMBuildSExt(g->builder, idx,
@@ -319,10 +337,96 @@ binding_lowered:
                         else
                             sv = coerce_int_to(g, sv, elem_llvm);
                     }
-                    /* 非对齐内存跨度 (Span) 内存读写支持 */
-                    LLVMSetAlignment(LLVMBuildStore(g->builder, sv, ep), 1);
-                    emit_oob_store_finish(g, sp_do, sp_end);
+                    /* 自然对齐 + 可选 ScopedNoAlias 元数据，释放 LLVM 自动向量化 */
+                    LLVMValueRef st = LLVMBuildStore(g->builder, sv, ep);
+                    LLVMSetAlignment(st, zan_span_elem_align(g, elem_llvm));
+                    int na_scope = bce_scope > 0
+                        ? bce_scope
+                        : zan_local_noalias_scope(arr_expr, locals);
+                    if (na_scope > 0)
+                        zan_attach_noalias_md(g, st, na_scope);
+                    if (!bce_ok)
+                        emit_oob_store_finish(g, sp_do, sp_end);
                     return right;
+                }
+                if (is_inline_array_type(sot)) {
+                    int64_t arr_n = inline_array_len(sot);
+                    zan_type_t *et = inline_array_elem(sot);
+                    LLVMTypeRef elem_llvm = span_elem_storage_type(g, et);
+                    LLVMValueRef ptr = emit_ref_lvalue_ptr(g, arr_expr, locals);
+                    if (ptr) {
+                        LLVMValueRef idx = emit_expr(g, expr->binary.left->index.index, locals);
+                        LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+                        bool safe = false;
+                        if (LLVMIsAConstantInt(idx)) {
+                            long long ci = LLVMConstIntGetSExtValue(idx);
+                            if (ci >= 0 && ci < arr_n)
+                                safe = true;
+                        }
+                        if (!safe) {
+                            int bce_scope = 0;
+                            safe = irgen_bce_check(g, arr_expr,
+                                expr->binary.left->index.index, locals, &bce_scope);
+                        }
+                        LLVMBasicBlockRef ia_do = NULL, ia_end = NULL;
+                        if (!safe) {
+                            LLVMValueRef ia_oob = emit_index_bounds_check(
+                                g, idx,
+                                LLVMConstInt(i64t, (unsigned long long)arr_n, 0),
+                                expr->loc, "InlineArray");
+                            emit_oob_store_split(g, ia_oob, &ia_do, &ia_end);
+                        }
+                        if (LLVMGetTypeKind(LLVMTypeOf(idx)) == LLVMIntegerTypeKind &&
+                            LLVMGetIntTypeWidth(LLVMTypeOf(idx)) < 64)
+                            idx = LLVMBuildSExt(g->builder, idx, i64t, "ias.ix");
+                        LLVMValueRef typed = LLVMBuildBitCast(
+                            g->builder, ptr, LLVMPointerType(elem_llvm, 0), "ias.p");
+                        LLVMValueRef ep = LLVMBuildInBoundsGEP2(
+                            g->builder, elem_llvm, typed, &idx, 1, "ias.ep");
+                        LLVMValueRef sv = right;
+                        if (LLVMTypeOf(sv) != elem_llvm) {
+                            if (LLVMGetTypeKind(elem_llvm) == LLVMStructTypeKind &&
+                                LLVMGetTypeKind(LLVMTypeOf(sv)) == LLVMPointerTypeKind)
+                                sv = LLVMBuildLoad2(g->builder, elem_llvm, sv, "ias.deref");
+                            else
+                                sv = coerce_int_to(g, sv, elem_llvm);
+                        }
+                        LLVMValueRef st = LLVMBuildStore(g->builder, sv, ep);
+                        LLVMSetAlignment(st, zan_span_elem_align(g, elem_llvm));
+                        if (!safe)
+                            emit_oob_store_finish(g, ia_do, ia_end);
+                        return right;
+                    }
+                }
+                if (is_vec_type(sot)) {
+                    int64_t vn = vec_len(sot);
+                    zan_type_t *et = vec_elem(sot);
+                    LLVMTypeRef elem_llvm = span_elem_storage_type(g, et);
+                    LLVMTypeRef vec_llvm = LLVMVectorType(elem_llvm, (unsigned)(vn > 0 ? vn : 1));
+                    LLVMValueRef ptr = emit_ref_lvalue_ptr(g, arr_expr, locals);
+                    if (ptr) {
+                        LLVMValueRef idx = emit_expr(g, expr->binary.left->index.index, locals);
+                        LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+                        if (LLVMGetTypeKind(LLVMTypeOf(idx)) == LLVMIntegerTypeKind &&
+                            LLVMGetIntTypeWidth(LLVMTypeOf(idx)) != 32)
+                            idx = LLVMBuildIntCast2(g->builder, idx, i32t, 1, "vecs.ix");
+                        LLVMValueRef cur = LLVMBuildLoad2(g->builder, vec_llvm, ptr, "vecs.cur");
+                        LLVMValueRef sv = right;
+                        if (LLVMTypeOf(sv) != elem_llvm) {
+                            if (LLVMGetTypeKind(elem_llvm) == LLVMFloatTypeKind ||
+                                LLVMGetTypeKind(elem_llvm) == LLVMDoubleTypeKind) {
+                                if (LLVMGetTypeKind(LLVMTypeOf(sv)) == LLVMIntegerTypeKind)
+                                    sv = LLVMBuildSIToFP(g->builder, sv, elem_llvm, "vecs.fp");
+                                else
+                                    sv = LLVMBuildFPCast(g->builder, sv, elem_llvm, "vecs.fpc");
+                            } else {
+                                sv = coerce_int_to(g, sv, elem_llvm);
+                            }
+                        }
+                        LLVMValueRef upd = LLVMBuildInsertElement(g->builder, cur, sv, idx, "vecs.ins");
+                        LLVMBuildStore(g->builder, upd, ptr);
+                        return right;
+                    }
                 }
             }
             if (arr_expr->kind == AST_IDENTIFIER) {
@@ -934,9 +1038,13 @@ binding_lowered:
                                                           expr->binary.right, locals);
                             } else if (aft && aft->kind == TYPE_STRUCT) {
                                 /* 值结构体字段按值整体赋值（实参可能是构造临时对象的地址） */
-                                zan_store_fit(g, coerce_struct_value(g, right, aft), fptr);
+                                LLVMValueRef sv = coerce_struct_value(g, right, aft);
+                                LLVMValueRef st_i = zan_store_fit(g, sv, fptr);
+                                apply_pack_field_align(g, local->type->sym, st_i, LLVMTypeOf(sv));
                             } else {
-                                zan_store_fit(g, right, fptr);
+                                LLVMValueRef st_i = zan_store_fit(g, right, fptr);
+                                apply_pack_field_align(g, local->type->sym, st_i,
+                                                       aft ? map_type(g, aft) : LLVMTypeOf(right));
                             }
                             stored = true;
                         }
@@ -950,12 +1058,18 @@ binding_lowered:
                     if (fi >= 0) {
                         zan_symbol_t *psym = get_field_sym(cls, expr->binary.left->member.name);
                         zan_symbol_t *setter = property_setter_sym(g, psym);
-                        if (obj_expr->kind == AST_INDEX && cls->kind == SYM_STRUCT) {
-                            /* 集合/数组内结构体元素字段就地赋值 */
+                        if ((obj_expr->kind == AST_INDEX ||
+                             (obj_expr->kind == AST_CALL &&
+                              call_returns_ref(g, obj_expr, locals))) &&
+                            cls->kind == SYM_STRUCT) {
+                            /* 集合/数组/ref 返回值内结构体元素字段就地赋值 */
                             zan_type_t *et = infer_expr_type(g, obj_expr, locals);
                             LLVMTypeRef st = get_struct_llvm_type(g, cls);
                             LLVMValueRef ep = (st && !type_is_binding(et))
-                                ? emit_struct_elem_ptr(g, obj_expr, locals) : NULL;
+                                ? (obj_expr->kind == AST_INDEX
+                                    ? emit_struct_elem_ptr(g, obj_expr, locals)
+                                    : emit_ref_lvalue_ptr(g, obj_expr, locals))
+                                : NULL;
                             if (ep) {
                                 LLVMValueRef sptr = LLVMBuildBitCast(g->builder, ep,
                                     LLVMPointerType(st, 0), "ep.s");
@@ -978,9 +1092,13 @@ binding_lowered:
                                                                   expr->binary.right, locals);
                                     } else if (gft && gft->kind == TYPE_STRUCT) {
                                         /* 值结构体字段按值整体赋值（实参可能是构造临时对象的地址） */
-                                        zan_store_fit(g, coerce_struct_value(g, right, gft), fptr);
+                                        LLVMValueRef sv = coerce_struct_value(g, right, gft);
+                                        LLVMValueRef st_i = zan_store_fit(g, sv, fptr);
+                                        apply_pack_field_align(g, cls, st_i, LLVMTypeOf(sv));
                                     } else {
-                                        zan_store_fit(g, right, fptr);
+                                        LLVMValueRef st_i = zan_store_fit(g, right, fptr);
+                                        apply_pack_field_align(g, cls, st_i,
+                                                               gft ? map_type(g, gft) : LLVMTypeOf(right));
                                     }
                                 }
                                 stored = true;
@@ -1014,9 +1132,13 @@ binding_lowered:
                                                               expr->binary.right, locals);
                                 } else if (gft && gft->kind == TYPE_STRUCT) {
                                     /* 值结构体字段按值整体赋值（实参可能是构造临时对象的地址） */
-                                    zan_store_fit(g, coerce_struct_value(g, right, gft), fptr);
+                                    LLVMValueRef sv = coerce_struct_value(g, right, gft);
+                                    LLVMValueRef st_i = zan_store_fit(g, sv, fptr);
+                                    apply_pack_field_align(g, cls, st_i, LLVMTypeOf(sv));
                                 } else {
-                                    zan_store_fit(g, right, fptr);
+                                    LLVMValueRef st_i = zan_store_fit(g, right, fptr);
+                                    apply_pack_field_align(g, cls, st_i,
+                                                           gft ? map_type(g, gft) : LLVMTypeOf(right));
                                 }
                                 if (cls->kind != SYM_STRUCT)
                                     emit_release_owned_call_temp(g, obj_expr, obj_val, locals);
@@ -1064,6 +1186,43 @@ binding_lowered:
                     zan_diag_emit_code(g->diag, DIAG_ERROR, expr->loc, 3003,
                         "use of undeclared identifier '%.*s'",
                         (int)obj_expr->ident.name.len, obj_expr->ident.name.str);
+                }
+            }
+        } else if (expr->binary.left->kind == AST_CALL &&
+                   call_returns_ref(g, expr->binary.left, locals)) {
+            zan_type_t *lt = infer_expr_type(g, expr->binary.left, locals);
+            LLVMValueRef ref_ptr = emit_ref_lvalue_ptr(g, expr->binary.left, locals);
+            if (ref_ptr && lt) {
+                LLVMTypeRef elem_llvm = map_type(g, lt);
+                if (LLVMTypeOf(ref_ptr) != LLVMPointerType(elem_llvm, 0))
+                    ref_ptr = LLVMBuildBitCast(g->builder, ref_ptr,
+                                               LLVMPointerType(elem_llvm, 0),
+                                               "ref.asg");
+                if (is_rc_managed_type(lt) || lt->kind == TYPE_OBJECT) {
+                    if (!expr_yields_owned_rc_value(g, expr->binary.right, locals)) {
+                        if (is_rc_managed_type(lt))
+                            emit_rc_retain_for_type(g, lt, right);
+                        else if (LLVMGetTypeKind(LLVMTypeOf(right)) == LLVMPointerTypeKind)
+                            emit_arc_retain(g, right);
+                    }
+                    LLVMValueRef old = LLVMBuildLoad2(g->builder, elem_llvm, ref_ptr, "ref.old");
+                    zan_store_fit(g, right, ref_ptr);
+                    if (is_rc_managed_type(lt))
+                        emit_rc_release_for_type(g, lt, old);
+                    else
+                        emit_arc_release_typed(g, lt, old);
+                } else if (lt->kind == TYPE_STRUCT &&
+                           type_contains_collection_rc(g, lt, 0)) {
+                    emit_struct_field_capture(g, lt, ref_ptr, right,
+                                              expr->binary.right, locals);
+                } else {
+                    LLVMValueRef stored = right;
+                    if (lt->kind == TYPE_STRUCT)
+                        stored = coerce_struct_value(g, right, lt);
+                    else if (LLVMGetTypeKind(elem_llvm) == LLVMIntegerTypeKind &&
+                             LLVMGetTypeKind(LLVMTypeOf(stored)) == LLVMIntegerTypeKind)
+                        stored = coerce_int_to(g, stored, elem_llvm);
+                    zan_store_fit(g, stored, ref_ptr);
                 }
             }
         }

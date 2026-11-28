@@ -1,0 +1,847 @@
+// rt_timer_core.zan: Min-heap timer engine, O(1) frame delay cancel index (dix),
+// dispatch mutual exclusion, monotonic us/ms clocks, and epoch/local offset.
+// Replaces src/runtime/timer/rt_timer_core.c in 100% pure Zan.
+
+namespace Zan.Runtime.Timer;
+
+// TimerEntry layout (112 bytes, 8-byte aligned):
+//  0: long DueUs
+//  8: long Id
+// 16: long Interval
+// 24: long ExecMsec
+// 32: long ExecCount
+// 40: long Round
+// 48: ulong Sequence
+// 56: int Kind (0 = DELAY, 1 = PUBLIC)
+// 60: int Removed
+// 64: int Waking
+// 68: int Dead
+// 72: nint Dnext
+// 80: nint Callback
+// 88: nint CallbackCtx
+// 96: nint Frame
+// 104: nint Step
+static class TimerEntryOff {
+    internal const long SIZE = 112L;
+    internal const long DUE_US = 0L;
+    internal const long ID = 8L;
+    internal const long INTERVAL = 16L;
+    internal const long EXEC_MSEC = 24L;
+    internal const long EXEC_COUNT = 32L;
+    internal const long ROUND = 40L;
+    internal const long SEQUENCE = 48L;
+    internal const long KIND = 56L;
+    internal const long REMOVED = 60L;
+    internal const long WAKING = 64L;
+    internal const long DEAD = 68L;
+    internal const long DNEXT = 72L;
+    internal const long CALLBACK = 80L;
+    internal const long CALLBACK_CTX = 88L;
+    internal const long FRAME = 96L;
+    internal const long STEP = 104L;
+
+    internal const int KIND_DELAY = 0;
+    internal const int KIND_PUBLIC = 1;
+}
+
+static class RtTimerCore {
+    static nint s_heap = (nint)0;
+    static ulong s_heapLen = 0UL;
+    static ulong s_heapCap = 0UL;
+    static long s_nextId = 1L;
+    static long s_round = 0L;
+    static ulong s_sequence = 0UL;
+    static int s_initialized = 0;
+    static nint s_readyHook = (nint)0;
+    static nint s_dispatching = (nint)0;
+    static ulong s_dispatchTid = 0UL;
+    static long s_live = 0L;
+
+    // Delay index: array of { nint frame (0), nint head (8) } -> 16 bytes/slot
+    static nint s_dix = (nint)0;
+    static ulong s_dixCap = 0UL;
+    static ulong s_dixLen = 0UL;
+    static ulong s_heapDead = 0UL;
+
+    static int s_dispatchBusy = 0;
+
+    static long s_quantumMs = -1L;
+#if WINDOWS
+    static long s_qpfFreq = 0L;
+#endif
+
+    internal static nint GetReadyHook() {
+        RtPlat.TimerLock();
+        nint hook = s_readyHook;
+        RtPlat.TimerUnlock();
+        return hook;
+    }
+
+    // ---- Clocks ----
+
+    [Export("zan_timer_now_ms")]
+    public static long TimerNowMs() {
+#if WINDOWS
+        return (long)RtPlat.WinGetTickCount64();
+#else
+        Buf32 ts = new Buf32();
+        nint tp = NativeMemory.AddressOf(ref ts);
+        RtPlat.PosixClockGettime(RtPlat.CLOCK_MONOTONIC, tp);
+        long sec = NativeMemory.Read<long>(tp);
+        long nsec = NativeMemory.Read<long>(tp + (nint)8);
+        return sec * 1000L + nsec / 1000000L;
+#endif
+    }
+
+    [Export("zan_co_quantum_ms")]
+    public static long CoQuantumMs() {
+        long q = s_quantumMs;
+        if (q >= 0L) return q;
+        long v = 2L;
+        nint e = RtPlat.CGetenv((nint)"ZAN_CO_QUANTUM_MS");
+        if (e != (nint)0 && NativeMemory.At<byte>(e, 0L) != (byte)0) {
+            v = RtPlat.CStrtoll(e, (nint)0, 10);
+        }
+        if (v < 0L) v = 0L;
+        s_quantumMs = v;
+        return v;
+    }
+
+    [Export("zan_co_precise_us")]
+    public static long CoPreciseUs() {
+#if WINDOWS
+        long c = 0L;
+        RtPlat.WinQueryPerformanceCounter(NativeMemory.AddressOf(ref c));
+        long freq = s_qpfFreq;
+        if (freq == 0L) {
+            long f = 0L;
+            RtPlat.WinQueryPerformanceFrequency(NativeMemory.AddressOf(ref f));
+            freq = f;
+            s_qpfFreq = freq;
+        }
+        if (freq == 10000000L) return c / 10L;
+        if (freq <= 0L) return 0L;
+        return (c / freq) * 1000000L + (c % freq) * 1000000L / freq;
+#else
+        Buf32 ts = new Buf32();
+        nint tp = NativeMemory.AddressOf(ref ts);
+        RtPlat.PosixClockGettime(RtPlat.CLOCK_MONOTONIC, tp);
+        long sec = NativeMemory.Read<long>(tp);
+        long nsec = NativeMemory.Read<long>(tp + (nint)8);
+        return sec * 1000000L + nsec / 1000L;
+#endif
+    }
+
+    // ---- Min-heap helpers (caller holds TimerLock) ----
+
+    static bool TimerLess(nint a, nint b) {
+        long da = NativeMemory.Read<long>(a + (nint)TimerEntryOff.DUE_US);
+        long db = NativeMemory.Read<long>(b + (nint)TimerEntryOff.DUE_US);
+        if (da != db) return da < db;
+        return NativeMemory.Read<ulong>(a + (nint)TimerEntryOff.SEQUENCE) <
+               NativeMemory.Read<ulong>(b + (nint)TimerEntryOff.SEQUENCE);
+    }
+
+    static void HeapSwap(ulong a, ulong b) {
+        nint ea = NativeMemory.At<nint>(s_heap, (long)a);
+        nint eb = NativeMemory.At<nint>(s_heap, (long)b);
+        NativeMemory.At<nint>(s_heap, (long)a) = eb;
+        NativeMemory.At<nint>(s_heap, (long)b) = ea;
+    }
+
+    static int HeapPush(nint entry) {
+        if (s_heapLen == s_heapCap) {
+            ulong cap = s_heapCap != 0UL ? s_heapCap * 2UL : 64UL;
+            nint heap = RtPlat.CRealloc(s_heap, cap * 8UL);
+            if (heap == (nint)0) {
+                NativeMemory.Write<int>(entry + (nint)TimerEntryOff.REMOVED, 1);
+                return -1;
+            }
+            s_heap = heap;
+            s_heapCap = cap;
+        }
+        if (NativeMemory.Read<int>(entry + (nint)TimerEntryOff.REMOVED) == 0) {
+            Atomic.FetchAdd(ref s_live, 1L, MemoryOrder.Relaxed);
+        }
+        ulong idx = s_heapLen;
+        s_heapLen++;
+        NativeMemory.At<nint>(s_heap, (long)idx) = entry;
+        while (idx > 0UL) {
+            ulong parent = (idx - 1UL) / 2UL;
+            if (!TimerLess(entry, NativeMemory.At<nint>(s_heap, (long)parent))) break;
+            HeapSwap(idx, parent);
+            idx = parent;
+        }
+        return 0;
+    }
+
+    static nint HeapPop() {
+        if (s_heapLen == 0UL) return (nint)0;
+        nint root = NativeMemory.At<nint>(s_heap, 0L);
+        if (NativeMemory.Read<int>(root + (nint)TimerEntryOff.REMOVED) == 0) {
+            Atomic.FetchAdd(ref s_live, -1L, MemoryOrder.Relaxed);
+        }
+        s_heapLen--;
+        nint last = NativeMemory.At<nint>(s_heap, (long)s_heapLen);
+        if (s_heapLen == 0UL) return root;
+        NativeMemory.At<nint>(s_heap, 0L) = last;
+        ulong idx = 0UL;
+        while (true) {
+            ulong left = idx * 2UL + 1UL;
+            if (left >= s_heapLen) break;
+            ulong right = left + 1UL;
+            ulong smallest = left;
+            if (right < s_heapLen &&
+                TimerLess(NativeMemory.At<nint>(s_heap, (long)right),
+                          NativeMemory.At<nint>(s_heap, (long)left))) {
+                smallest = right;
+            }
+            if (!TimerLess(NativeMemory.At<nint>(s_heap, (long)smallest),
+                           NativeMemory.At<nint>(s_heap, (long)idx))) {
+                break;
+            }
+            HeapSwap(idx, smallest);
+            idx = smallest;
+        }
+        return root;
+    }
+
+    // ---- O(1) frame delay index (dix) ----
+
+    static ulong DixHash(nint frame) {
+        ulong x = (ulong)frame;
+        x ^= x >> 33;
+        x *= 0xFF51AFD7ED558CCDUL;
+        x ^= x >> 33;
+        return x;
+    }
+
+    static ulong DixFind(nint frame) {
+        if (s_dixCap == 0UL) return 0UL;
+        ulong mask = s_dixCap - 1UL;
+        ulong i = DixHash(frame) & mask;
+        while (true) {
+            nint slot = s_dix + (nint)((long)i * 16L);
+            nint f = NativeMemory.Read<nint>(slot);
+            if (f == (nint)0) return s_dixCap;
+            if (f == frame) return i;
+            i = (i + 1UL) & mask;
+        }
+    }
+
+    static void DixPlace(nint frame, nint head) {
+        ulong mask = s_dixCap - 1UL;
+        ulong i = DixHash(frame) & mask;
+        while (NativeMemory.Read<nint>(s_dix + (nint)((long)i * 16L)) != (nint)0) {
+            i = (i + 1UL) & mask;
+        }
+        nint slot = s_dix + (nint)((long)i * 16L);
+        NativeMemory.Write<nint>(slot, frame);
+        NativeMemory.Write<nint>(slot + (nint)8, head);
+    }
+
+    static int DixReserve() {
+        if ((s_dixLen + 1UL) * 2UL <= s_dixCap) return 0;
+        ulong cap = s_dixCap != 0UL ? s_dixCap * 2UL : 64UL;
+        nint old = s_dix;
+        ulong oldCap = s_dixCap;
+        nint slots = RtPlat.CCalloc(cap, 16UL);
+        if (slots == (nint)0) return -1;
+        s_dix = slots;
+        s_dixCap = cap;
+        for (ulong i = 0UL; i < oldCap; i++) {
+            nint oslot = old + (nint)((long)i * 16L);
+            nint f = NativeMemory.Read<nint>(oslot);
+            if (f != (nint)0) {
+                DixPlace(f, NativeMemory.Read<nint>(oslot + (nint)8));
+            }
+        }
+        RtPlat.CFree(old);
+        return 0;
+    }
+
+    static void DixEraseSlot(ulong i) {
+        ulong mask = s_dixCap - 1UL;
+        ulong j = i;
+        while (true) {
+            nint islot = s_dix + (nint)((long)i * 16L);
+            NativeMemory.Write<nint>(islot, (nint)0);
+            NativeMemory.Write<nint>(islot + (nint)8, (nint)0);
+            while (true) {
+                j = (j + 1UL) & mask;
+                nint jslot = s_dix + (nint)((long)j * 16L);
+                nint jf = NativeMemory.Read<nint>(jslot);
+                if (jf == (nint)0) {
+                    s_dixLen--;
+                    return;
+                }
+                ulong home = DixHash(jf) & mask;
+                bool canMove = (i <= j) ? (home <= i || home > j) : (home <= i && home > j);
+                if (canMove) break;
+            }
+            nint jslot2 = s_dix + (nint)((long)j * 16L);
+            NativeMemory.Write<nint>(islot, NativeMemory.Read<nint>(jslot2));
+            NativeMemory.Write<nint>(islot + (nint)8, NativeMemory.Read<nint>(jslot2 + (nint)8));
+            i = j;
+        }
+    }
+
+    static void DixLink(nint entry) {
+        nint frame = NativeMemory.Read<nint>(entry + (nint)TimerEntryOff.FRAME);
+        ulong i = DixFind(frame);
+        if (i < s_dixCap) {
+            nint slot = s_dix + (nint)((long)i * 16L);
+            NativeMemory.Write<nint>(entry + (nint)TimerEntryOff.DNEXT, NativeMemory.Read<nint>(slot + (nint)8));
+            NativeMemory.Write<nint>(slot + (nint)8, entry);
+            return;
+        }
+        NativeMemory.Write<nint>(entry + (nint)TimerEntryOff.DNEXT, (nint)0);
+        DixPlace(frame, entry);
+        s_dixLen++;
+    }
+
+    static void DixUnlink(nint entry) {
+        nint frame = NativeMemory.Read<nint>(entry + (nint)TimerEntryOff.FRAME);
+        ulong i = DixFind(frame);
+        if (i >= s_dixCap) return;
+        nint slot = s_dix + (nint)((long)i * 16L);
+        nint pp = slot + (nint)8;
+        while (true) {
+            nint cur = NativeMemory.Read<nint>(pp);
+            if (cur == (nint)0) break;
+            if (cur == entry) {
+                NativeMemory.Write<nint>(pp, NativeMemory.Read<nint>(entry + (nint)TimerEntryOff.DNEXT));
+                break;
+            }
+            pp = cur + (nint)TimerEntryOff.DNEXT;
+        }
+        NativeMemory.Write<nint>(entry + (nint)TimerEntryOff.DNEXT, (nint)0);
+        if (NativeMemory.Read<nint>(slot + (nint)8) == (nint)0) {
+            DixEraseSlot(i);
+        }
+    }
+
+    static void HeapDropRemovedTop() {
+        while (s_heapLen > 0UL &&
+               NativeMemory.Read<int>(NativeMemory.At<nint>(s_heap, 0L) + (nint)TimerEntryOff.REMOVED) != 0) {
+            nint entry = HeapPop();
+            if (NativeMemory.Read<int>(entry + (nint)TimerEntryOff.DEAD) != 0 && s_heapDead > 0UL) {
+                s_heapDead--;
+            }
+            RtPlat.CFree(entry);
+        }
+    }
+
+    static void HeapCompactDead() {
+        if (s_heapDead < 64UL || s_heapDead * 2UL < s_heapLen) return;
+        ulong w = 0UL;
+        for (ulong i = 0UL; i < s_heapLen; i++) {
+            nint e = NativeMemory.At<nint>(s_heap, (long)i);
+            if (NativeMemory.Read<int>(e + (nint)TimerEntryOff.DEAD) != 0) {
+                RtPlat.CFree(e);
+            } else {
+                NativeMemory.At<nint>(s_heap, (long)w) = e;
+                w++;
+            }
+        }
+        s_heapLen = w;
+        s_heapDead = 0UL;
+        ulong k = s_heapLen / 2UL;
+        while (k > 0UL) {
+            k--;
+            ulong idx = k;
+            while (true) {
+                ulong left = idx * 2UL + 1UL;
+                if (left >= s_heapLen) break;
+                ulong right = left + 1UL;
+                ulong smallest = left;
+                if (right < s_heapLen &&
+                    TimerLess(NativeMemory.At<nint>(s_heap, (long)right),
+                              NativeMemory.At<nint>(s_heap, (long)left))) {
+                    smallest = right;
+                }
+                if (!TimerLess(NativeMemory.At<nint>(s_heap, (long)smallest),
+                               NativeMemory.At<nint>(s_heap, (long)idx))) {
+                    break;
+                }
+                HeapSwap(idx, smallest);
+                idx = smallest;
+            }
+        }
+    }
+
+    // ---- Public timer API ----
+
+    [Export("zan_timer_set_ready_hook")]
+    public static void SetReadyHook(nint ready) {
+        RtPlat.TimerLock();
+        s_readyHook = ready;
+        RtPlat.TimerUnlock();
+    }
+
+    [Export("zan_timer_runtime_reset")]
+    public static void RuntimeReset() {
+        RtPlat.TimerLock();
+        for (ulong i = 0UL; i < s_heapLen; i++) {
+            RtPlat.CFree(NativeMemory.At<nint>(s_heap, (long)i));
+        }
+        s_heapLen = 0UL;
+        s_heapDead = 0UL;
+        if (s_dix != (nint)0) {
+            RtPlat.CMemset(s_dix, 0, s_dixCap * 16UL);
+        }
+        s_dixLen = 0UL;
+        Atomic.Store(ref s_live, 0L, MemoryOrder.Relaxed);
+        s_nextId = 1L;
+        s_round = 0L;
+        s_sequence = 0UL;
+        s_initialized = 1;
+        RtPlat.TimerUnlock();
+    }
+
+    [Export("zan_timer_saturating_due")]
+    public static long SaturatingDue(long nowMs, long delayMs) {
+        if (delayMs < 0L) return nowMs;
+        if (delayMs > RtAbi.LLONG_MAX_I64 - nowMs) return RtAbi.LLONG_MAX_I64;
+        return nowMs + delayMs;
+    }
+
+    [Export("zan_timer_saturating_due_us")]
+    public static long SaturatingDueUs(long nowUs, long delayUs) {
+        if (delayUs < 0L) return nowUs;
+        if (delayUs > RtAbi.LLONG_MAX_I64 - nowUs) return RtAbi.LLONG_MAX_I64;
+        return nowUs + delayUs;
+    }
+
+    static long DelayMsToUs(long ms) {
+        if (ms < 0L) return 0L;
+        if (ms > RtAbi.LLONG_MAX_I64 / 1000L) return RtAbi.LLONG_MAX_I64;
+        return ms * 1000L;
+    }
+
+    [Export("zan_timer_delay")]
+    public static void TimerDelay(long ms, nint frame, nint step) {
+        if (step == (nint)0) return;
+        nint entry = RtPlat.OomCalloc((nint)"timer.delay_entry", 1UL, (ulong)TimerEntryOff.SIZE);
+        if (entry == (nint)0) {
+            NativeMemory.InvokeVoidWithCC<nint>("c", step, frame);
+            return;
+        }
+        NativeMemory.Write<long>(entry + (nint)TimerEntryOff.DUE_US,
+            SaturatingDueUs(CoPreciseUs(), DelayMsToUs(ms)));
+        NativeMemory.Write<int>(entry + (nint)TimerEntryOff.KIND, TimerEntryOff.KIND_DELAY);
+        NativeMemory.Write<nint>(entry + (nint)TimerEntryOff.FRAME, frame);
+        NativeMemory.Write<nint>(entry + (nint)TimerEntryOff.STEP, step);
+
+        RtPlat.TimerLock();
+        s_initialized = 1;
+        s_sequence++;
+        NativeMemory.Write<ulong>(entry + (nint)TimerEntryOff.SEQUENCE, s_sequence);
+        if (DixReserve() != 0 || HeapPush(entry) != 0) {
+            RtPlat.TimerUnlock();
+            RtPlat.CFree(entry);
+            NativeMemory.InvokeVoidWithCC<nint>("c", step, frame);
+            return;
+        }
+        DixLink(entry);
+        RtPlat.TimerUnlock();
+    }
+
+    [Export("zan_timer_cancel_delay")]
+    public static int TimerCancelDelay(nint frame) {
+        int found = 0;
+        if (frame == (nint)0) return 0;
+        RtPlat.TimerLock();
+        ulong slot = DixFind(frame);
+        if (slot < s_dixCap) {
+            nint entry = NativeMemory.Read<nint>(s_dix + (nint)((long)slot * 16L) + (nint)8);
+            while (entry != (nint)0) {
+                nint next = NativeMemory.Read<nint>(entry + (nint)TimerEntryOff.DNEXT);
+                NativeMemory.Write<nint>(entry + (nint)TimerEntryOff.DNEXT, (nint)0);
+                NativeMemory.Write<int>(entry + (nint)TimerEntryOff.REMOVED, 1);
+                NativeMemory.Write<int>(entry + (nint)TimerEntryOff.DEAD, 1);
+                s_heapDead++;
+                Atomic.FetchAdd(ref s_live, -1L, MemoryOrder.Relaxed);
+                found++;
+                entry = next;
+            }
+            DixEraseSlot(slot);
+        }
+        if (s_dispatching != (nint)0 &&
+            NativeMemory.Read<int>(s_dispatching + (nint)TimerEntryOff.KIND) == TimerEntryOff.KIND_DELAY &&
+            NativeMemory.Read<int>(s_dispatching + (nint)TimerEntryOff.REMOVED) == 0 &&
+            NativeMemory.Read<nint>(s_dispatching + (nint)TimerEntryOff.FRAME) == frame) {
+            NativeMemory.Write<int>(s_dispatching + (nint)TimerEntryOff.REMOVED, 1);
+            found++;
+        }
+        while (s_dispatching != (nint)0 &&
+               NativeMemory.Read<int>(s_dispatching + (nint)TimerEntryOff.KIND) == TimerEntryOff.KIND_DELAY &&
+               NativeMemory.Read<int>(s_dispatching + (nint)TimerEntryOff.WAKING) != 0 &&
+               NativeMemory.Read<nint>(s_dispatching + (nint)TimerEntryOff.FRAME) == frame &&
+               s_dispatchTid != RtPlat.TimerSelfTid()) {
+            RtPlat.TimerUnlock();
+            RtPlat.TimerYield();
+            RtPlat.TimerLock();
+        }
+        HeapCompactDead();
+        RtPlat.TimerUnlock();
+        return found;
+    }
+
+    static long TimerAdd(long ms, nint callback, int repeat) {
+        if (ms < 1L || callback == (nint)0) return 0L;
+        nint entry = RtPlat.CCalloc(1UL, (ulong)TimerEntryOff.SIZE);
+        if (entry == (nint)0) return 0L;
+        NativeMemory.Write<nint>(entry + (nint)TimerEntryOff.CALLBACK, callback);
+        RtPlat.TimerLock();
+        s_initialized = 1;
+        long id = s_nextId;
+        s_nextId++;
+        if (id <= 0L) { id = 1L; s_nextId = 2L; }
+        NativeMemory.Write<long>(entry + (nint)TimerEntryOff.ID, id);
+        NativeMemory.Write<long>(entry + (nint)TimerEntryOff.INTERVAL, repeat != 0 ? ms : 0L);
+        NativeMemory.Write<long>(entry + (nint)TimerEntryOff.DUE_US,
+            SaturatingDueUs(CoPreciseUs(), DelayMsToUs(ms)));
+        s_sequence++;
+        NativeMemory.Write<ulong>(entry + (nint)TimerEntryOff.SEQUENCE, s_sequence);
+        NativeMemory.Write<int>(entry + (nint)TimerEntryOff.KIND, TimerEntryOff.KIND_PUBLIC);
+        if (HeapPush(entry) != 0) {
+            RtPlat.TimerUnlock();
+            RtPlat.CFree(entry);
+            return 0L;
+        }
+        RtPlat.TimerUnlock();
+        return id;
+    }
+
+    [Export("zan_timer_tick")]
+    public static long TimerTick(long interval, nint callback) => TimerAdd(interval, callback, 1);
+
+    [Export("zan_timer_after")]
+    public static long TimerAfter(long delay, nint callback) => TimerAdd(delay, callback, 0);
+
+    [Export("zan_timer_after_ctx")]
+    public static long TimerAfterCtx(long delay, nint callback, nint arg) {
+        if (delay < 1L || callback == (nint)0) return 0L;
+        nint entry = RtPlat.CCalloc(1UL, (ulong)TimerEntryOff.SIZE);
+        if (entry == (nint)0) return 0L;
+        NativeMemory.Write<nint>(entry + (nint)TimerEntryOff.CALLBACK_CTX, callback);
+        NativeMemory.Write<nint>(entry + (nint)TimerEntryOff.FRAME, arg);
+        NativeMemory.Write<int>(entry + (nint)TimerEntryOff.KIND, TimerEntryOff.KIND_PUBLIC);
+        RtPlat.TimerLock();
+        s_initialized = 1;
+        long id = s_nextId;
+        s_nextId++;
+        if (id <= 0L) { id = 1L; s_nextId = 2L; }
+        NativeMemory.Write<long>(entry + (nint)TimerEntryOff.ID, id);
+        NativeMemory.Write<long>(entry + (nint)TimerEntryOff.INTERVAL, 0L);
+        NativeMemory.Write<long>(entry + (nint)TimerEntryOff.DUE_US,
+            SaturatingDueUs(CoPreciseUs(), DelayMsToUs(delay)));
+        s_sequence++;
+        NativeMemory.Write<ulong>(entry + (nint)TimerEntryOff.SEQUENCE, s_sequence);
+        if (HeapPush(entry) != 0) {
+            RtPlat.TimerUnlock();
+            RtPlat.CFree(entry);
+            return 0L;
+        }
+        RtPlat.TimerUnlock();
+        return id;
+    }
+
+    [Export("zan_timer_next_timeout")]
+    public static long TimerNextTimeout() {
+        long timeout = -1L;
+        RtPlat.TimerLock();
+        HeapDropRemovedTop();
+        if (s_heapLen > 0UL) {
+            nint top = NativeMemory.At<nint>(s_heap, 0L);
+            long remUs = NativeMemory.Read<long>(top + (nint)TimerEntryOff.DUE_US) - CoPreciseUs();
+            timeout = remUs <= 0L ? 0L : (remUs + 999L) / 1000L;
+        }
+        RtPlat.TimerUnlock();
+        return timeout;
+    }
+
+    static long TimerDispatchDueLocked() {
+        long dispatched = 0L;
+        while (true) {
+            long now = CoPreciseUs();
+            RtPlat.TimerLock();
+            HeapDropRemovedTop();
+            if (s_heapLen == 0UL ||
+                NativeMemory.Read<long>(NativeMemory.At<nint>(s_heap, 0L) + (nint)TimerEntryOff.DUE_US) > now) {
+                RtPlat.TimerUnlock();
+                Atomic.Store(ref s_dispatchBusy, 0, MemoryOrder.Release);
+                nint tlsDone = RtPlat.TimerTlsPeek();
+                if (tlsDone != (nint)0) NativeMemory.AsRef<TimerTls>(tlsDone).DispatchOwned = 0;
+                return dispatched;
+            }
+            nint entry = HeapPop();
+            int kind = NativeMemory.Read<int>(entry + (nint)TimerEntryOff.KIND);
+            if (kind == TimerEntryOff.KIND_DELAY) {
+                DixUnlink(entry);
+            }
+            if (kind == TimerEntryOff.KIND_PUBLIC) {
+                long ec = NativeMemory.Read<long>(entry + (nint)TimerEntryOff.EXEC_COUNT) + 1L;
+                NativeMemory.Write<long>(entry + (nint)TimerEntryOff.EXEC_COUNT, ec);
+                s_round++;
+                NativeMemory.Write<long>(entry + (nint)TimerEntryOff.ROUND, s_round);
+            }
+            nint prev = s_dispatching;
+            s_dispatching = entry;
+            RtPlat.TimerUnlock();
+
+            long startedUs = CoPreciseUs();
+            if (kind == TimerEntryOff.KIND_DELAY) {
+                RtPlat.TimerLock();
+                nint ready = s_readyHook;
+                int cancelled = NativeMemory.Read<int>(entry + (nint)TimerEntryOff.REMOVED);
+                if (cancelled == 0) {
+                    NativeMemory.Write<int>(entry + (nint)TimerEntryOff.WAKING, 1);
+                    s_dispatchTid = RtPlat.TimerSelfTid();
+                }
+                RtPlat.TimerUnlock();
+                if (cancelled == 0) {
+                    nint frame = NativeMemory.Read<nint>(entry + (nint)TimerEntryOff.FRAME);
+                    nint step = NativeMemory.Read<nint>(entry + (nint)TimerEntryOff.STEP);
+                    if (ready != (nint)0) {
+                        NativeMemory.InvokeVoidWithCC<nint, nint>("c", ready, frame, step);
+                    } else {
+                        NativeMemory.InvokeVoidWithCC<nint>("c", step, frame);
+                    }
+                }
+            } else {
+                nint cbCtx = NativeMemory.Read<nint>(entry + (nint)TimerEntryOff.CALLBACK_CTX);
+                nint cb = NativeMemory.Read<nint>(entry + (nint)TimerEntryOff.CALLBACK);
+                if (cbCtx != (nint)0) {
+                    NativeMemory.InvokeVoidWithCC<nint>("c", cbCtx, NativeMemory.Read<nint>(entry + (nint)TimerEntryOff.FRAME));
+                } else if (cb != (nint)0) {
+                    NativeMemory.InvokeVoidWithCC("c", cb);
+                }
+            }
+            long elapsed = CoPreciseUs() - startedUs;
+            dispatched++;
+
+            RtPlat.TimerLock();
+            NativeMemory.Write<int>(entry + (nint)TimerEntryOff.WAKING, 0);
+            s_dispatching = prev;
+            if (kind == TimerEntryOff.KIND_PUBLIC) {
+                NativeMemory.Write<long>(entry + (nint)TimerEntryOff.EXEC_MSEC, elapsed / 1000L);
+            }
+            long interval = NativeMemory.Read<long>(entry + (nint)TimerEntryOff.INTERVAL);
+            int removed = NativeMemory.Read<int>(entry + (nint)TimerEntryOff.REMOVED);
+            if (kind == TimerEntryOff.KIND_PUBLIC && interval > 0L && removed == 0) {
+                long curNow = CoPreciseUs();
+                long intervalUs = DelayMsToUs(interval);
+                long due = SaturatingDueUs(NativeMemory.Read<long>(entry + (nint)TimerEntryOff.DUE_US), intervalUs);
+                if (due < curNow && (curNow - due) > intervalUs) {
+                    long lag = curNow - due;
+                    long skips = lag / intervalUs;
+                    due = SaturatingDueUs(due, skips * intervalUs);
+                    if (due <= curNow) {
+                        due = SaturatingDueUs(due, intervalUs);
+                    }
+                }
+                NativeMemory.Write<long>(entry + (nint)TimerEntryOff.DUE_US, due);
+                s_sequence++;
+                NativeMemory.Write<ulong>(entry + (nint)TimerEntryOff.SEQUENCE, s_sequence);
+                if (HeapPush(entry) != 0) {
+                    RtPlat.TimerUnlock();
+                    RtPlat.CFree(entry);
+                    continue;
+                }
+                RtPlat.TimerUnlock();
+            } else {
+                RtPlat.TimerUnlock();
+                RtPlat.CFree(entry);
+            }
+        }
+    }
+
+    [Export("zan_timer_dispatch_due")]
+    public static long TimerDispatchDue() {
+        if (!Atomic.CompareExchangeBool(ref s_dispatchBusy, 0, 1, MemoryOrder.AcqRel, MemoryOrder.Acquire)) {
+            return 0L;
+        }
+        nint tls = RtPlat.TimerTlsGet();
+        if (tls != (nint)0) NativeMemory.AsRef<TimerTls>(tls).DispatchOwned = 1;
+        return TimerDispatchDueLocked();
+    }
+
+    [Export("zan_timer_dispatch_due_wait")]
+    public static long TimerDispatchDueWait() {
+        nint tlsPeek = RtPlat.TimerTlsPeek();
+        if (tlsPeek != (nint)0 && NativeMemory.AsRef<TimerTls>(tlsPeek).DispatchOwned != 0) return 0L;
+        while (!Atomic.CompareExchangeBool(ref s_dispatchBusy, 0, 1, MemoryOrder.AcqRel, MemoryOrder.Acquire)) {
+            RtPlat.TimerYield();
+        }
+        nint tls = RtPlat.TimerTlsGet();
+        if (tls != (nint)0) NativeMemory.AsRef<TimerTls>(tls).DispatchOwned = 1;
+        return TimerDispatchDueLocked();
+    }
+
+    [Export("zan_timer_pending")]
+    public static long TimerPending() => Atomic.Load(ref s_live, MemoryOrder.Relaxed);
+
+    [Export("zan_timer_clear")]
+    public static int TimerClear(long id) {
+        int found = 0;
+        RtPlat.TimerLock();
+        for (ulong i = 0UL; i < s_heapLen; i++) {
+            nint entry = NativeMemory.At<nint>(s_heap, (long)i);
+            if (NativeMemory.Read<int>(entry + (nint)TimerEntryOff.KIND) == TimerEntryOff.KIND_PUBLIC &&
+                NativeMemory.Read<long>(entry + (nint)TimerEntryOff.ID) == id &&
+                NativeMemory.Read<int>(entry + (nint)TimerEntryOff.REMOVED) == 0) {
+                NativeMemory.Write<int>(entry + (nint)TimerEntryOff.REMOVED, 1);
+                Atomic.FetchAdd(ref s_live, -1L, MemoryOrder.Relaxed);
+                found = 1;
+                break;
+            }
+        }
+        if (found == 0 && s_dispatching != (nint)0 &&
+            NativeMemory.Read<int>(s_dispatching + (nint)TimerEntryOff.KIND) == TimerEntryOff.KIND_PUBLIC &&
+            NativeMemory.Read<long>(s_dispatching + (nint)TimerEntryOff.ID) == id &&
+            NativeMemory.Read<int>(s_dispatching + (nint)TimerEntryOff.REMOVED) == 0) {
+            NativeMemory.Write<int>(s_dispatching + (nint)TimerEntryOff.REMOVED, 1);
+            found = 1;
+        }
+        RtPlat.TimerUnlock();
+        return found;
+    }
+
+    [Export("zan_timer_clear_all")]
+    public static long TimerClearAll() {
+        long count = 0L;
+        RtPlat.TimerLock();
+        for (ulong i = 0UL; i < s_heapLen; i++) {
+            nint entry = NativeMemory.At<nint>(s_heap, (long)i);
+            if (NativeMemory.Read<int>(entry + (nint)TimerEntryOff.KIND) == TimerEntryOff.KIND_PUBLIC &&
+                NativeMemory.Read<int>(entry + (nint)TimerEntryOff.REMOVED) == 0) {
+                NativeMemory.Write<int>(entry + (nint)TimerEntryOff.REMOVED, 1);
+                Atomic.FetchAdd(ref s_live, -1L, MemoryOrder.Relaxed);
+                count++;
+            }
+        }
+        if (s_dispatching != (nint)0 &&
+            NativeMemory.Read<int>(s_dispatching + (nint)TimerEntryOff.KIND) == TimerEntryOff.KIND_PUBLIC &&
+            NativeMemory.Read<int>(s_dispatching + (nint)TimerEntryOff.REMOVED) == 0) {
+            NativeMemory.Write<int>(s_dispatching + (nint)TimerEntryOff.REMOVED, 1);
+            count++;
+        }
+        RtPlat.TimerUnlock();
+        return count;
+    }
+
+    [Export("zan_timer_info")]
+    public static int TimerInfo(long id, nint execMsecPtr, nint execCountPtr, nint intervalPtr, nint roundPtr, nint removedPtr) {
+        int found = 0;
+        RtPlat.TimerLock();
+        for (ulong i = 0UL; i < s_heapLen; i++) {
+            nint entry = NativeMemory.At<nint>(s_heap, (long)i);
+            if (NativeMemory.Read<int>(entry + (nint)TimerEntryOff.KIND) == TimerEntryOff.KIND_PUBLIC &&
+                NativeMemory.Read<long>(entry + (nint)TimerEntryOff.ID) == id) {
+                if (execMsecPtr != (nint)0) NativeMemory.Write<long>(execMsecPtr, NativeMemory.Read<long>(entry + (nint)TimerEntryOff.EXEC_MSEC));
+                if (execCountPtr != (nint)0) NativeMemory.Write<long>(execCountPtr, NativeMemory.Read<long>(entry + (nint)TimerEntryOff.EXEC_COUNT));
+                if (intervalPtr != (nint)0) NativeMemory.Write<long>(intervalPtr, NativeMemory.Read<long>(entry + (nint)TimerEntryOff.INTERVAL));
+                if (roundPtr != (nint)0) NativeMemory.Write<long>(roundPtr, NativeMemory.Read<long>(entry + (nint)TimerEntryOff.ROUND));
+                if (removedPtr != (nint)0) NativeMemory.Write<int>(removedPtr, NativeMemory.Read<int>(entry + (nint)TimerEntryOff.REMOVED));
+                found = 1;
+                break;
+            }
+        }
+        RtPlat.TimerUnlock();
+        return found;
+    }
+
+    [Export("zan_timer_list_count")]
+    public static long TimerListCount() {
+        long count = 0L;
+        RtPlat.TimerLock();
+        for (ulong i = 0UL; i < s_heapLen; i++) {
+            nint e = NativeMemory.At<nint>(s_heap, (long)i);
+            if (NativeMemory.Read<int>(e + (nint)TimerEntryOff.KIND) == TimerEntryOff.KIND_PUBLIC &&
+                NativeMemory.Read<int>(e + (nint)TimerEntryOff.REMOVED) == 0) {
+                count++;
+            }
+        }
+        RtPlat.TimerUnlock();
+        return count;
+    }
+
+    [Export("zan_timer_list_at")]
+    public static long TimerListAt(long index) {
+        long current = 0L;
+        long id = 0L;
+        RtPlat.TimerLock();
+        for (ulong i = 0UL; i < s_heapLen; i++) {
+            nint e = NativeMemory.At<nint>(s_heap, (long)i);
+            if (NativeMemory.Read<int>(e + (nint)TimerEntryOff.KIND) != TimerEntryOff.KIND_PUBLIC ||
+                NativeMemory.Read<int>(e + (nint)TimerEntryOff.REMOVED) != 0) {
+                continue;
+            }
+            if (current == index) {
+                id = NativeMemory.Read<long>(e + (nint)TimerEntryOff.ID);
+                break;
+            }
+            current++;
+        }
+        RtPlat.TimerUnlock();
+        return id;
+    }
+
+    [Export("zan_timer_stats")]
+    public static void TimerStats(nint initializedPtr, nint numPtr, nint roundPtr) {
+        RtPlat.TimerLock();
+        if (initializedPtr != (nint)0) NativeMemory.Write<long>(initializedPtr, (long)s_initialized);
+        if (numPtr != (nint)0) {
+            long count = 0L;
+            for (ulong i = 0UL; i < s_heapLen; i++) {
+                nint e = NativeMemory.At<nint>(s_heap, (long)i);
+                if (NativeMemory.Read<int>(e + (nint)TimerEntryOff.KIND) == TimerEntryOff.KIND_PUBLIC &&
+                    NativeMemory.Read<int>(e + (nint)TimerEntryOff.REMOVED) == 0) {
+                    count++;
+                }
+            }
+            NativeMemory.Write<long>(numPtr, count);
+        }
+        if (roundPtr != (nint)0) NativeMemory.Write<long>(roundPtr, s_round);
+        RtPlat.TimerUnlock();
+    }
+
+    // ---- Unix epoch ms & local timezone offset ----
+
+    [Export("zan_time_epoch_ms")]
+    public static long TimeEpochMs() {
+#if WINDOWS
+        ulong ft = 0UL;
+        RtPlat.WinGetSystemTimeAsFileTime(NativeMemory.AddressOf(ref ft));
+        return (long)((ft / 10000UL) - 11644473600000UL);
+#else
+        Buf32 ts = new Buf32();
+        nint tp = NativeMemory.AddressOf(ref ts);
+        if (RtPlat.PosixClockGettime(RtPlat.CLOCK_REALTIME, tp) == 0) {
+            long sec = NativeMemory.Read<long>(tp);
+            long nsec = NativeMemory.Read<long>(tp + (nint)8);
+            return sec * 1000L + nsec / 1000000L;
+        }
+        return RtPlat.PosixTime((nint)0) * 1000L;
+#endif
+    }
+
+    [Export("zan_time_local_offset_minutes")]
+    public static int TimeLocalOffsetMinutes(long unixSeconds) {
+        long t = unixSeconds;
+        Buf64 tmBuf = new Buf64();
+        nint tp = NativeMemory.AddressOf(ref tmBuf);
+        RtPlat.CMemset(tp, 0, 64UL);
+#if WINDOWS
+        if (RtPlat.WinLocaltime64S(tp, NativeMemory.AddressOf(ref t)) != 0) return 0;
+        long wall = RtPlat.WinMkgmtime64(tp);
+#else
+        if (RtPlat.PosixLocaltimeR(NativeMemory.AddressOf(ref t), tp) == (nint)0) return 0;
+        long wall = RtPlat.PosixTimegm(tp);
+#endif
+        if (wall == -1L) return 0;
+        return (int)((wall - t) / 60L);
+    }
+}

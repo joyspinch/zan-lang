@@ -101,7 +101,17 @@ static LLVMValueRef emit_expr_impl(zan_irgen_t *g, zan_ast_node_t *expr, local_s
         g->hold_call_expr = expr;
         LLVMValueRef call_v = emit_expr_call(g, expr, locals);
         g->hold_call_expr = saved_call;
-        return promote_loaded(g, call_v, infer_expr_type(g, expr, locals));
+        zan_type_t *cty = infer_expr_type(g, expr, locals);
+        if (call_returns_ref(g, expr, locals) && call_v && cty &&
+            LLVMGetTypeKind(LLVMTypeOf(call_v)) == LLVMPointerTypeKind) {
+            LLVMTypeRef elem_ty = map_type(g, cty);
+            LLVMValueRef typed_p = call_v;
+            if (LLVMTypeOf(typed_p) != LLVMPointerType(elem_ty, 0))
+                typed_p = LLVMBuildBitCast(g->builder, typed_p,
+                                           LLVMPointerType(elem_ty, 0), "ref.p");
+            call_v = LLVMBuildLoad2(g->builder, elem_ty, typed_p, "ref.ld");
+        }
+        return promote_loaded(g, call_v, cty);
     }
 
     case AST_STRING_INTERP:
@@ -137,6 +147,106 @@ static LLVMValueRef emit_expr_impl(zan_irgen_t *g, zan_ast_node_t *expr, local_s
             if (v && llvm_is_nullable(LLVMTypeOf(v)))
                 return nullable_get_payload(g, v);
             return v;
+        }
+        if (expr->unary.op == TK_QUESTION) {
+            /* Pillar 10: Rust-style `?` error propagation on Result<T, E> ADT */
+            zan_type_t *op_t =
+                concretize(g, infer_expr_type(g, expr->unary.operand, locals));
+            LLVMValueRef rv = emit_expr(g, expr->unary.operand, locals);
+            if (!rv || !op_t || op_t->type_arg_count < 2)
+                return rv;
+            LLVMTypeRef op_llvm = map_type(g, op_t);
+            if (LLVMGetTypeKind(LLVMTypeOf(rv)) == LLVMPointerTypeKind &&
+                LLVMGetTypeKind(op_llvm) == LLVMStructTypeKind) {
+                rv = LLVMBuildLoad2(g->builder, op_llvm, rv, "try.load");
+            }
+            LLVMValueRef tag =
+                LLVMBuildExtractValue(g->builder, rv, 0, "try.tag");
+            LLVMValueRef is_ok = zan_icmp(
+                g->builder, LLVMIntEQ, tag,
+                LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0), "try.ok");
+            LLVMBasicBlockRef ok_bb =
+                LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "try.ok");
+            LLVMBasicBlockRef err_bb =
+                LLVMAppendBasicBlockInContext(g->ctx, g->current_fn, "try.err");
+            LLVMBuildCondBr(g->builder, is_ok, ok_bb, err_bb);
+
+            /* Err branch: construct Result<U, E>.Err(err_val) and return */
+            LLVMPositionBuilderAtEnd(g->builder, err_bb);
+            LLVMValueRef err_val =
+                LLVMBuildExtractValue(g->builder, rv, 2, "try.errval");
+            zan_type_t *err_ty = concretize(g, op_t->type_args[1]);
+            bool src_owned =
+                expr_yields_owned_rc_value(g, expr->unary.operand, locals);
+            if (!src_owned && err_ty) {
+                if (is_rc_managed_type(err_ty)) {
+                    emit_rc_retain_for_type(g, err_ty, err_val);
+                } else if (err_ty->kind == TYPE_OBJECT &&
+                           LLVMGetTypeKind(LLVMTypeOf(err_val)) ==
+                               LLVMPointerTypeKind) {
+                    emit_arc_retain(g, err_val);
+                } else if (err_ty->kind == TYPE_STRUCT &&
+                           type_contains_collection_rc(g, err_ty, 0)) {
+                    emit_collection_value_retain(g, err_ty, err_val, 0);
+                }
+            }
+            zan_type_t *ret_zan = g->current_async_frame
+                                      ? g->current_async_ret_type
+                                      : g->current_fn_zan_ret_type;
+            if (ret_zan && ret_zan->kind == TYPE_TASK &&
+                ret_zan->type_arg_count == 1)
+                ret_zan = ret_zan->type_args[0];
+            ret_zan = concretize(g, ret_zan);
+            LLVMTypeRef ret_llvm = g->current_async_frame
+                                       ? map_type(g, ret_zan)
+                                       : g->current_fn_ret_type;
+            LLVMValueRef res = LLVMConstNull(ret_llvm);
+            res = LLVMBuildInsertValue(
+                g->builder, res,
+                LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 1, 0), 0,
+                "try.err.tag");
+            res = LLVMBuildInsertValue(g->builder, res, err_val, 2,
+                                       "try.err.res");
+            if (g->current_async_frame) {
+                LLVMValueRef ri = NULL;
+                if (g->finally_count > 0) {
+                    emit_async_pending_return(g, res);
+                    emit_pending_finallys(g, locals, 0, true);
+                    if (!LLVMGetBasicBlockTerminator(
+                            LLVMGetInsertBlock(g->builder))) {
+                        ri = emit_async_pending_take_return(g);
+                        emit_release_active_catch_excs(g, 0);
+                        emit_async_complete(g, locals, ri);
+                    }
+                } else {
+                    ri = coerce_to_frame_result(g, res, ret_zan);
+                    emit_release_active_catch_excs(g, 0);
+                    emit_async_complete(g, locals, ri);
+                }
+            } else {
+                if (g->finally_count > 0) {
+                    LLVMValueRef v_slot =
+                        emit_entry_alloca(g, ret_llvm, "try.fin.slot");
+                    zan_store_fit(g, res, v_slot);
+                    emit_pending_finallys(g, locals, 0, true);
+                    if (!LLVMGetBasicBlockTerminator(
+                            LLVMGetInsertBlock(g->builder))) {
+                        res = LLVMBuildLoad2(g->builder, ret_llvm, v_slot,
+                                             "try.fin.val");
+                        emit_release_active_catch_excs(g, 0);
+                        emit_release_owned_locals(g, locals);
+                        LLVMBuildRet(g->builder, res);
+                    }
+                } else {
+                    emit_release_active_catch_excs(g, 0);
+                    emit_release_owned_locals(g, locals);
+                    LLVMBuildRet(g->builder, res);
+                }
+            }
+
+            /* Ok branch: yield payload value T */
+            LLVMPositionBuilderAtEnd(g->builder, ok_bb);
+            return LLVMBuildExtractValue(g->builder, rv, 1, "try.okval");
         }
         return emit_incdec_expr(g, expr, locals, 0);
 
@@ -309,11 +419,66 @@ static LLVMValueRef emit_expr_impl(zan_irgen_t *g, zan_ast_node_t *expr, local_s
         return emit_expr_cast_expr(g, expr, locals);
 
     case AST_SIZEOF_EXPR: {
+        int64_t qv = 0;
+        if (zan_irgen_eval_layout_query(g, expr, &qv))
+            return LLVMConstInt(LLVMInt64TypeInContext(g->ctx),
+                                (unsigned long long)qv, 0);
         zan_type_t *t = resolve_type_ctx(g, expr->cast.type);
         LLVMTypeRef mt = t ? map_type(g, t) : NULL;
         if (mt && LLVMGetTypeKind(mt) != LLVMVoidTypeKind)
             return LLVMSizeOf(mt);
         return LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 8, 0);
+    }
+
+    case AST_STACKALLOC_EXPR: {
+        zan_type_t *et = resolve_type_ctx(g, expr->cast.type);
+        LLVMTypeRef elem_ty = et ? map_type(g, et) : LLVMInt8TypeInContext(g->ctx);
+        LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
+        LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+        LLVMTypeRef i8ptr = LLVMPointerType(i8, 0);
+        unsigned long ea = abi_align_of(elem_ty);
+        unsigned align = (ea < 16) ? 16 : (unsigned)ea;
+        unsigned long esz = abi_size_of(elem_ty);
+        if (esz == 0) esz = 1;
+
+        LLVMValueRef raw_ptr = NULL;
+        LLVMValueRef len64 = NULL;
+
+        if (expr->cast.expr && expr->cast.expr->kind == AST_INT_LITERAL &&
+            expr->cast.expr->int_val >= 0) {
+            uint64_t cnt = (uint64_t)expr->cast.expr->int_val;
+            LLVMTypeRef arr_ty = LLVMArrayType(elem_ty, (unsigned)(cnt > 0 ? cnt : 1));
+            LLVMValueRef slot = emit_entry_alloca(g, arr_ty, "stackalloc.buf");
+            LLVMSetAlignment(slot, align);
+            raw_ptr = LLVMBuildBitCast(g->builder, slot, i8ptr, "stackalloc.p");
+            len64 = LLVMConstInt(i64, cnt, 0);
+            if (cnt > 0) {
+                LLVMBuildMemSet(g->builder, raw_ptr, LLVMConstInt(i8, 0, 0),
+                                LLVMConstInt(i64, cnt * esz, 0), align);
+            }
+        } else {
+            LLVMValueRef cv = emit_expr(g, expr->cast.expr, locals);
+            cv = coerce_int_to(g, cv, i64);
+            LLVMValueRef zero = LLVMConstInt(i64, 0, 0);
+            LLVMValueRef neg = LLVMBuildICmp(g->builder, LLVMIntSLT, cv, zero, "sa.neg");
+            len64 = LLVMBuildSelect(g->builder, neg, zero, cv, "sa.len");
+            LLVMValueRef alloc_n = LLVMBuildSelect(
+                g->builder,
+                LLVMBuildICmp(g->builder, LLVMIntEQ, len64, zero, "sa.z"),
+                LLVMConstInt(i64, 1, 0), len64, "sa.n");
+            LLVMValueRef slot = LLVMBuildArrayAlloca(g->builder, elem_ty, alloc_n,
+                                                     "stackalloc.dyn");
+            LLVMSetAlignment(slot, align);
+            raw_ptr = LLVMBuildBitCast(g->builder, slot, i8ptr, "stackalloc.dp");
+            LLVMValueRef bytes = LLVMBuildMul(g->builder, len64,
+                                              LLVMConstInt(i64, esz, 0), "sa.bytes");
+            LLVMBuildMemSet(g->builder, raw_ptr, LLVMConstInt(i8, 0, 0), bytes, align);
+        }
+
+        LLVMValueRef sp = LLVMGetUndef(g->span_struct_type);
+        sp = LLVMBuildInsertValue(g->builder, sp, raw_ptr, 0, "sa.sp0");
+        sp = LLVMBuildInsertValue(g->builder, sp, len64, 1, "sa.sp");
+        return sp;
     }
 
     case AST_TYPEOF_EXPR: {

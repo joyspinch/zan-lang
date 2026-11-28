@@ -22,6 +22,7 @@ typedef enum {
   SYM_ENUM_MEMBER,
   SYM_TYPE_PARAM,
   SYM_DELEGATE,
+  SYM_ASSOC_TYPE,
 } zan_sym_kind_t;
 
 typedef enum {
@@ -50,6 +51,7 @@ typedef enum {
   TYPE_NULLABLE,
   TYPE_TASK,
   TYPE_TYPE_PARAM,
+  TYPE_CONST_INT,
   TYPE_DELEGATE,
   TYPE_ERROR,
 } zan_type_kind_t;
@@ -61,6 +63,7 @@ struct zan_type {
   struct zan_symbol *sym;
   zan_type_t *element_type;
   int array_rank;
+  int64_t const_int_val;
   zan_type_t *base_type;
   int bases_resolved;
   zan_type_t **interfaces;
@@ -268,6 +271,8 @@ zan_type_t *zan_binder_make_tuple_type(zan_binder_t *b, zan_type_t **elems,
 
 zan_type_t *zan_binder_subst_named(zan_binder_t *b, zan_type_t *t,
                                    zan_ast_list_t *tps, zan_type_t **args);
+zan_type_t *zan_binder_lookup_assoc_type(zan_binder_t *b, zan_type_t *owner,
+                                         zan_istr_t assoc_name);
 zan_symbol_t *zan_binder_lookup(zan_binder_t *b, zan_istr_t name);
 /* Explicit qualified receivers retain their type identity across value scopes.
  */

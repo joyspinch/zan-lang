@@ -1,0 +1,69 @@
+using System;
+using System.Runtime.InteropServices;
+
+[StructLayout(LayoutKind.Sequential, Pack = 1)]
+public struct PixelRgba {
+    public byte R;
+    public byte G;
+    public byte B;
+    public byte A;
+}
+
+public class Callbacks {
+    [DllImport("crt", EntryPoint = "qsort")]
+    public static extern void CrtQsort(nint basePtr, long nmemb, long size, nint cmpFn);
+
+    [UnmanagedCallersOnly(EntryPoint = "zan_cmp_i32_asc")]
+    public static int CmpI32(nint pa, nint pb) {
+        int a = NativeMemory.Read<int>(pa);
+        int b = NativeMemory.Read<int>(pb);
+        return a < b ? -1 : (a > b ? 1 : 0);
+    }
+
+    [Export("zan_cb_mul_add")]
+    public static int MulAdd(int a, int b, int c) {
+        return a * b + c;
+    }
+
+    [Export("zan_cb_invert_px")]
+    public static void InvertPx(ref PixelRgba px) {
+        px.R = (byte)(255 - px.R);
+        px.G = (byte)(255 - px.G);
+        px.B = (byte)(255 - px.B);
+    }
+}
+
+public class Program {
+    public static void Main() {
+        // 1. Pass Zan [UnmanagedCallersOnly] function pointer directly into C runtime qsort()
+        nint buf = NativeMemory.AlignedAlloc(24, 16);
+        Span<int> vals = NativeMemory.AsSpan<int>(buf, 6);
+        vals[0] = 42;
+        vals[1] = -7;
+        vals[2] = 19;
+        vals[3] = 0;
+        vals[4] = 99;
+        vals[5] = 3;
+
+        nint cmpPtr = NativeMemory.FunctionPointer(Callbacks.CmpI32);
+        Callbacks.CrtQsort(buf, 6, sizeof(int), cmpPtr);
+        Console.WriteLine($"qsort={vals[0]},{vals[1]},{vals[2]},{vals[3]},{vals[4]},{vals[5]}");
+        NativeMemory.AlignedFree(buf);
+
+        // 2. Indirect C ABI call via NativeMemory.Invoke<TRet> (with scalar literals)
+        nint mulPtr = NativeMemory.FunctionPointer(Callbacks.MulAdd);
+        int res = NativeMemory.Invoke<int>(mulPtr, 6, 7, 100);
+
+        // 3. Indirect C ABI void call via NativeMemory.InvokeVoid (with ref struct pointer)
+        PixelRgba px = new PixelRgba();
+        px.R = 10;
+        px.G = 55;
+        px.B = 200;
+        px.A = 255;
+        nint invPtr = NativeMemory.FunctionPointer(Callbacks.InvertPx);
+        NativeMemory.InvokeVoid(invPtr, ref px);
+
+        Console.WriteLine($"invoke={res}");
+        Console.WriteLine($"invPx={px.R},{px.G},{px.B},{px.A}");
+    }
+}

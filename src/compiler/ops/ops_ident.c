@@ -8,6 +8,12 @@ LLVMValueRef emit_expr_identifier(zan_irgen_t *g, zan_ast_node_t *expr,
                 map_type(g, local->type), local->alloca, "load"),
                 local->type);
         }
+        {
+            int64_t cval = 0;
+            if (resolve_const_param_val(g, expr->ident.name, &cval))
+                return LLVMConstInt(LLVMInt32TypeInContext(g->ctx),
+                                    (unsigned long long)cval, 1);
+        }
         /* 实例方法内省略 this 的成员字段寻址 */
         if (g->current_this && g->current_type_sym) {
             int fi = get_field_index(g->current_type_sym, expr->ident.name);
@@ -40,6 +46,7 @@ LLVMValueRef emit_expr_identifier(zan_irgen_t *g, zan_ast_node_t *expr,
                     LLVMValueRef fval = (fsym && (fsym->modifiers & MOD_WEAK))
                         ? emit_weak_field_load(g, fptr, ft)
                         : LLVMBuildLoad2(g->builder, ft, fptr, "fval");
+                    apply_pack_field_align(g, g->current_type_sym, fval, ft);
                     return promote_loaded(g, fval, fty);
                 }
             }

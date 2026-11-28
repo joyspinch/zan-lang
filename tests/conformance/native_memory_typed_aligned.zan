@@ -1,0 +1,69 @@
+using System;
+using System.Runtime.InteropServices;
+
+[StructLayout(LayoutKind.Sequential, Pack = 1)]
+public struct PixelRgba {
+    public byte R;
+    public byte G;
+    public byte B;
+    public byte A;
+}
+
+public class Program {
+    public static void Main() {
+        // 1. Portable power-of-2 AlignedAlloc (64B cache line + 4096B page)
+        nint p64 = NativeMemory.AlignedAlloc(256, 64);
+        nint p4k = NativeMemory.AlignedAlloc(128, 4096);
+        nint bad = NativeMemory.AlignedAlloc(64, 3); // non-power-of-2 -> 0
+        bool alignedOk = (p64 != 0) && ((p64 & 63) == 0) &&
+                         (p4k != 0) && ((p4k & 4095) == 0) &&
+                         (bad == 0);
+
+        // 2. Typed Read<T> / Write<T> with packed struct
+        PixelRgba px = new PixelRgba();
+        px.R = 12;
+        px.G = 34;
+        px.B = 56;
+        px.A = 255;
+        NativeMemory.Write<PixelRgba>(p64, px);
+        PixelRgba gotPx = NativeMemory.Read<PixelRgba>(p64);
+
+        // 3. Unaligned ReadUnaligned<T> / WriteUnaligned<T> at odd +1 byte offset
+        long magic = 0x1122334455667788L;
+        NativeMemory.WriteUnaligned<long>(p64 + 17, magic);
+        long gotMagic = NativeMemory.ReadUnaligned<long>(p64 + 17);
+
+        // 4. Zero-copy NativeMemory.AsSpan<int> view over aligned buffer
+        Span<int> sp = NativeMemory.AsSpan<int>(p4k, 8);
+        int sum = 0;
+        for (int i = 0; i < sp.Length; i++) {
+            sp[i] = (i + 1) * 10;
+        }
+        for (int i = 0; i < 8; i++) {
+            sum = sum + NativeMemory.Read<int>(p4k + i * 4);
+        }
+
+        // 5. Realloc preserves existing bytes
+        nint grown = NativeMemory.Alloc(16);
+        NativeMemory.Write<int>(grown, 4242);
+        grown = NativeMemory.Realloc(grown, 64);
+        int afterGrow = NativeMemory.Read<int>(grown);
+        NativeMemory.Free(grown);
+
+        // 6. AddressOf(ref local) round-trip
+        int localVal = 77;
+        nint addr = NativeMemory.AddressOf(ref localVal);
+        NativeMemory.Write<int>(addr, 88);
+
+        NativeMemory.AlignedFree(p64);
+        NativeMemory.AlignedFree(p4k);
+        NativeMemory.AlignedFree(0); // null-safe
+
+        Console.WriteLine($"aligned={alignedOk}");
+        Console.WriteLine($"px={gotPx.R},{gotPx.G},{gotPx.B},{gotPx.A}");
+        Console.WriteLine($"unaligned={gotMagic == magic}");
+        Console.WriteLine($"spanSum={sum}");
+        Console.WriteLine($"realloc={afterGrow}");
+        Console.WriteLine($"addrof={localVal}");
+    }
+}

@@ -59,6 +59,20 @@ zan_type_t *subst_method_tp(zan_irgen_t *g, zan_type_t *t, zan_ast_list_t *tps,
   if (!t || !type_mentions_tp(t))
     return t;
   if (t->kind == TYPE_TYPE_PARAM) {
+    if (t->element_type && t->element_type->kind == TYPE_TYPE_PARAM) {
+      zan_type_t *base = subst_method_tp(g, t->element_type, tps, bind);
+      if (base && base != t->element_type) {
+        const char *dot = (const char *)memchr(t->name.str, '.', (size_t)t->name.len);
+        if (dot) {
+          zan_istr_t rhs = {
+              dot + 1, (uint32_t)(t->name.len - (uint32_t)(dot + 1 - t->name.str))};
+          zan_type_t *proj = zan_binder_lookup_assoc_type(g->binder, base, rhs);
+          if (proj)
+            return proj;
+        }
+      }
+      return t;
+    }
     for (int i = 0; i < tps->count; i++) {
       zan_istr_t tn = tps->items[i]->ident.name;
       if (bind[i] && tn.len == t->name.len &&
@@ -530,6 +544,8 @@ LLVMValueRef emit_arg_typed(zan_irgen_t *g, zan_ast_node_t *arg,
       return emit_method_group_conversion(g, arg, ptype, locals);
   }
   LLVMValueRef v = emit_expr(g, arg, locals);
+  if (arg && arg->kind != AST_REF_ARG)
+    emit_move_clear_drop_flag(g, arg, locals);
   if (v && ptype && atype)
     v = emit_user_conversion(g, atype, ptype, "op_implicit", v, arg, locals);
   /* A556-1 隐式装箱：值形状实参流向 object/接口形参 */
@@ -618,7 +634,50 @@ LLVMValueRef emit_ref_lvalue_ptr(zan_irgen_t *g, zan_ast_node_t *tgt,
   if (tgt->kind == AST_INDEX)
     return emit_struct_elem_ptr(g, tgt, locals);
 
+  if (tgt->kind == AST_CALL && call_returns_ref(g, tgt, locals)) {
+    zan_ast_node_t *saved_call = g->hold_call_expr;
+    g->hold_call_expr = tgt;
+    LLVMValueRef ptr = emit_expr_call(g, tgt, locals);
+    g->hold_call_expr = saved_call;
+    return ptr;
+  }
+
   return NULL;
+}
+
+bool call_returns_ref(zan_irgen_t *g, zan_ast_node_t *expr,
+                      local_scope_t *locals) {
+  if (!expr || expr->kind != AST_CALL || !expr->call.callee)
+    return false;
+  zan_ast_node_t *callee = expr->call.callee;
+  zan_symbol_t *ms = NULL;
+  if (callee->kind == AST_IDENTIFIER) {
+    if (g->current_type_sym)
+      ms = resolve_overload_typed(g, g->current_type_sym, callee->ident.name,
+                                  expr, locals);
+    if (!ms)
+      ms = zan_binder_lookup(g->binder, callee->ident.name);
+  } else if (callee->kind == AST_MEMBER_ACCESS && !callee->member.null_cond) {
+    if (callee->member.object &&
+        callee->member.object->kind == AST_IDENTIFIER &&
+        callee->member.object->ident.name.len == 12 &&
+        memcmp(callee->member.object->ident.name.str, "NativeMemory", 12) == 0 &&
+        !local_find(locals, callee->member.object->ident.name) &&
+        ((callee->member.name.len == 5 &&
+          memcmp(callee->member.name.str, "AsRef", 5) == 0) ||
+         (callee->member.name.len == 2 &&
+          memcmp(callee->member.name.str, "At", 2) == 0))) {
+      return true;
+    }
+    zan_symbol_t *cls = expr_class_sym(g, callee->member.object, locals);
+    if (!cls && callee->member.object &&
+        callee->member.object->kind == AST_IDENTIFIER)
+      cls = receiver_type_symbol(g, callee->member.object, locals);
+    if (cls)
+      ms = resolve_overload_typed(g, cls, callee->member.name, expr, locals);
+  }
+  return ms && ms->decl && ms->decl->kind == AST_METHOD_DECL &&
+         ms->decl->method_decl.is_ref_return;
 }
 LLVMValueRef emit_ref_arg(zan_irgen_t *g, zan_ast_node_t *arg,
                           local_scope_t *locals) {

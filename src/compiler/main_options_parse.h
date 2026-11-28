@@ -82,6 +82,11 @@ typedef struct zan_options {
   int pp_define_count;
   const char *target_name;
   const char *cpu_profile; /* NULL preserves historical target defaults */
+  const char *target_cpu_override;
+  const char *target_features_override;
+  const char *code_model;
+  const char *reloc_model;
+  bool no_red_zone;
   bool link_static_drivers;
   const char *driver_dir_override;
   const char *link_subsystem;
@@ -89,7 +94,12 @@ typedef struct zan_options {
   bool no_icon;
   bool default_icon_explicit;
   bool emit_lib;
+  bool emit_obj;
   bool lib_shared;
+  bool freestanding;
+  const char *linker_script;
+  const char *entry_symbol;
+  const char *emit_header_path;
   const char *apk_path;
   const char *apk_package;
   const char *apk_label;

@@ -1,0 +1,624 @@
+// rt_io_dns.zan: Bounded async DNS & blocking-work thread pool with idle worker
+// reuse, timeout scanning, and checked/legacy native blocking dispatch.
+// 100% pure Zan, zero assembly.
+
+namespace Zan.Runtime.Io;
+
+static class IoDns {
+    const long ZAN_DNS_TIMEOUT_MS = 10000L;
+    const int ZAN_BLOCKING_MAX_ACTIVE = 256;
+    const int ZAN_BLOCKING_MAX_QUEUED = 16384;
+    const long ZAN_BLOCKING_IDLE_MS = 2000L;
+
+    const int ZAN_BLOCKING_OK = 0;
+    const int ZAN_BLOCKING_QUEUE_FULL = 1;
+    const int ZAN_BLOCKING_THREAD_FAILED = 2;
+    const int ZAN_BLOCKING_NO_MEMORY = 3;
+    const int ZAN_BLOCKING_INVALID_CALL = 4;
+
+    // BlockingJob base layout (112 bytes)
+    const long J_NEXT = 0L;
+    const long J_QNEXT = 8L;
+    const long J_DEADLINE = 16L;
+    const long J_TIMED_OUT = 24L;
+    const long J_TO_DELIV = 28L;
+    const long J_STARTED = 32L;
+    const long J_STATUS = 36L;
+    const long J_RESULT = 40L;
+    const long J_SABUF = 48L;
+    const long J_SACAP = 56L;
+    const long J_PORT = 60L;
+    const long J_FRAME = 64L;
+    const long J_STEP = 72L;
+    const long J_OUT32 = 80L;
+    const long J_OUT64 = 88L;
+    const long J_OUT_STATUS = 96L;
+    const long J_KIND = 104L; // 0 = DNS, 1 = NativeBlocking
+    const long J_ARGC = 108L;
+
+    // DnsWork extension (total 400 bytes)
+    const long D_HOST = 112L;        // 256 bytes
+    const long D_STAGING = 368L;     // 32 bytes (sockaddr_in6 = 28)
+    const ulong D_SIZE = 400UL;
+
+    // BlockingWork extension (total 152 bytes)
+    const long B_FN = 112L;          // nint
+    const long B_A0 = 120L;          // long
+    const long B_A1 = 128L;          // long
+    const long B_A2 = 136L;          // long
+    const long B_A3 = 144L;          // long
+    const ulong B_SIZE = 152UL;
+
+    internal static int s_inflight = 0;
+#if WINDOWS
+    internal static int s_wakeLost = 0;
+    static ulong s_dnsSrw = 0UL;
+    static ulong s_blockingCv = 0UL;
+#else
+    internal static int s_dnsWakeFd = -1;
+#if MACOS
+    internal static int s_dnsWakeWfd = -1;
+#endif
+    static int s_syncState = 0;
+    static IoBuf64 s_dnsMx;
+    static IoBuf64 s_blockingCv;
+
+    static void EnsureSync() {
+        int st = Atomic.Load(ref s_syncState, MemoryOrder.Acquire);
+        if (st == 2) return;
+        if (Atomic.CompareExchange(ref s_syncState, 0, 1, MemoryOrder.AcqRel, MemoryOrder.Acquire) == 0) {
+            IoPlat.PosixMutexInit(NativeMemory.AddressOf(ref s_dnsMx), (nint)0);
+            IoPlat.PosixCondInit(NativeMemory.AddressOf(ref s_blockingCv), (nint)0);
+            Atomic.Store(ref s_syncState, 2, MemoryOrder.Release);
+            return;
+        }
+        while (Atomic.Load(ref s_syncState, MemoryOrder.Acquire) != 2) {
+            IoPlat.YieldCpu();
+        }
+    }
+#endif
+
+    static nint s_pending = (nint)0;
+    static nint s_done = (nint)0;
+    static nint s_queued = (nint)0;
+    static int s_queuedN = 0;
+    static int s_active = 0;
+    static nint s_handoff = (nint)0;
+    static int s_idle = 0;
+
+    static void Lock() {
+#if WINDOWS
+        IoPlat.WinAcquireSrw(NativeMemory.AddressOf(ref s_dnsSrw));
+#else
+        EnsureSync();
+        IoPlat.PosixMutexLock(NativeMemory.AddressOf(ref s_dnsMx));
+#endif
+    }
+
+    static void Unlock() {
+#if WINDOWS
+        IoPlat.WinReleaseSrw(NativeMemory.AddressOf(ref s_dnsSrw));
+#else
+        IoPlat.PosixMutexUnlock(NativeMemory.AddressOf(ref s_dnsMx));
+#endif
+    }
+
+    static bool ParkLocked(long ms) {
+        if (ms <= 0L) return false;
+#if WINDOWS
+        uint wms = ms > 0x7FFFFFFFL ? 0x7FFFFFFFU : (uint)ms;
+        return IoPlat.WinSleepCvSrw(NativeMemory.AddressOf(ref s_blockingCv),
+                                    NativeMemory.AddressOf(ref s_dnsSrw), wms, 0U) != 0;
+#else
+        IoBuf16 ts = new IoBuf16();
+        nint tsp = NativeMemory.AddressOf(ref ts);
+        IoPlat.PosixClockGetTime(IoConst.CLOCK_REALTIME, tsp);
+        long sec = NativeMemory.AsRef<long>(tsp) + (ms / 1000L);
+        long nsec = NativeMemory.AsRef<long>((tsp) + (nint)(8L)) + (ms % 1000L) * 1000000L;
+        if (nsec >= 1000000000L) {
+            sec += 1L;
+            nsec -= 1000000000L;
+        }
+        NativeMemory.AsRef<long>(tsp) = sec;
+        NativeMemory.AsRef<long>((tsp) + (nint)(8L)) = nsec;
+        return IoPlat.PosixCondTimedWait(NativeMemory.AddressOf(ref s_blockingCv),
+                                         NativeMemory.AddressOf(ref s_dnsMx), tsp) == 0;
+#endif
+    }
+
+    static void WakeParked() {
+#if WINDOWS
+        IoPlat.WinWakeCv(NativeMemory.AddressOf(ref s_blockingCv));
+#else
+        IoPlat.PosixCondSignal(NativeMemory.AddressOf(ref s_blockingCv));
+#endif
+    }
+
+    static nint TakeQueuedLocked() {
+        if (s_active >= ZAN_BLOCKING_MAX_ACTIVE || s_queued == (nint)0) return (nint)0;
+        nint job = s_queued;
+        s_queued = NativeMemory.AsRef<nint>((job) + (nint)(J_QNEXT));
+        NativeMemory.AsRef<nint>((job) + (nint)(J_QNEXT)) = (nint)0;
+        s_queuedN--;
+        NativeMemory.AsRef<int>((job) + (nint)(J_STARTED)) = 1;
+        s_active++;
+        return job;
+    }
+
+    static void NativeStatus(nint outStatus, int status) {
+        if (outStatus != (nint)0) {
+            NativeMemory.AsRef<int>(outStatus) = status;
+        } else if (status != ZAN_BLOCKING_OK) {
+            IoPlat.RtEprintLine((nint)"await extern: blocking dispatch failed");
+            IoPlat.CAbort();
+        }
+    }
+
+    static void Deliver(nint job) {
+        int kind = NativeMemory.AsRef<int>((job) + (nint)(J_KIND));
+        int status = NativeMemory.AsRef<int>((job) + (nint)(J_STATUS));
+        if (kind == 1) {
+            NativeStatus(NativeMemory.AsRef<nint>((job) + (nint)(J_OUT_STATUS)), status);
+        }
+        nint out32 = NativeMemory.AsRef<nint>((job) + (nint)(J_OUT32));
+        nint out64 = NativeMemory.AsRef<nint>((job) + (nint)(J_OUT64));
+        long res = NativeMemory.AsRef<long>((job) + (nint)(J_RESULT));
+        if (status == ZAN_BLOCKING_OK) {
+            if (out32 != (nint)0) NativeMemory.AsRef<int>(out32) = (int)res;
+            if (out64 != (nint)0) NativeMemory.AsRef<long>(out64) = res;
+            nint sabuf = NativeMemory.AsRef<nint>((job) + (nint)(J_SABUF));
+            int sacap = NativeMemory.AsRef<int>((job) + (nint)(J_SACAP));
+            if (sabuf != (nint)0 && res > 0L && res <= (long)sacap) {
+                IoPlat.CMemcpy(sabuf, job + (nint)D_STAGING, (ulong)res);
+            }
+        } else if (out32 != (nint)0) {
+            NativeMemory.AsRef<int>(out32) = 0;
+        }
+        nint frame = NativeMemory.AsRef<nint>((job) + (nint)(J_FRAME));
+        nint step = NativeMemory.AsRef<nint>((job) + (nint)(J_STEP));
+        IoPlat.WakeCo(frame, step);
+        IoPlat.CFree(job);
+    }
+
+    static void RunJob(nint job) {
+        if (NativeMemory.AsRef<int>((job) + (nint)(J_KIND)) == 0) {
+            // DNS job
+            nint sabuf = NativeMemory.AsRef<nint>((job) + (nint)(J_SABUF));
+            if (sabuf != (nint)0) {
+                int cap = NativeMemory.AsRef<int>((job) + (nint)(J_SACAP));
+                if (cap < 0 || cap > 28) cap = 28;
+                int port = NativeMemory.AsRef<int>((job) + (nint)(J_PORT));
+                int r = IoAddr.ResolveSa(job + (nint)D_HOST, port, job + (nint)D_STAGING, cap);
+                NativeMemory.AsRef<long>((job) + (nint)(J_RESULT)) = (long)r;
+            } else {
+                int r = IoAddr.ResolveIpv4(job + (nint)D_HOST);
+                NativeMemory.AsRef<long>((job) + (nint)(J_RESULT)) = (long)r;
+            }
+            return;
+        }
+        // Native blocking job
+        nint fn = NativeMemory.AsRef<nint>((job) + (nint)(B_FN));
+        int argc = NativeMemory.AsRef<int>((job) + (nint)(J_ARGC));
+        long a0 = NativeMemory.AsRef<long>((job) + (nint)(B_A0));
+        long a1 = NativeMemory.AsRef<long>((job) + (nint)(B_A1));
+        long a2 = NativeMemory.AsRef<long>((job) + (nint)(B_A2));
+        long a3 = NativeMemory.AsRef<long>((job) + (nint)(B_A3));
+        if (NativeMemory.AsRef<nint>((job) + (nint)(J_OUT64)) == (nint)0) {
+            if (argc == 0) NativeMemory.InvokeVoidWithCC("c", fn);
+            else if (argc == 1) NativeMemory.InvokeVoidWithCC<long>("c", fn, a0);
+            else if (argc == 2) NativeMemory.InvokeVoidWithCC<long, long>("c", fn, a0, a1);
+            else if (argc == 3) NativeMemory.InvokeVoidWithCC<long, long, long>("c", fn, a0, a1, a2);
+            else if (argc == 4) NativeMemory.InvokeVoidWithCC<long, long, long, long>("c", fn, a0, a1, a2, a3);
+            NativeMemory.AsRef<long>((job) + (nint)(J_RESULT)) = 0L;
+            return;
+        }
+        long rv = 0L;
+        if (argc == 0) rv = NativeMemory.InvokeWithCC<long>("c", fn);
+        else if (argc == 1) rv = NativeMemory.InvokeWithCC<long>("c", fn, a0);
+        else if (argc == 2) rv = NativeMemory.InvokeWithCC<long>("c", fn, a0, a1);
+        else if (argc == 3) rv = NativeMemory.InvokeWithCC<long>("c", fn, a0, a1, a2);
+        else if (argc == 4) rv = NativeMemory.InvokeWithCC<long>("c", fn, a0, a1, a2, a3);
+        NativeMemory.AsRef<long>((job) + (nint)(J_RESULT)) = rv;
+    }
+
+    static nint FinishWorker(nint job) {
+        bool discard = false;
+        bool notify = false;
+        Lock();
+        if (NativeMemory.AsRef<int>((job) + (nint)(J_TIMED_OUT)) != 0) {
+            NativeMemory.AsRef<int>((job) + (nint)(J_STARTED)) = 0;
+            if (s_active > 0) s_active--;
+            discard = NativeMemory.AsRef<int>((job) + (nint)(J_TO_DELIV)) == 0;
+        } else {
+            nint prev = (nint)0;
+            nint cur = s_pending;
+            while (cur != (nint)0 && cur != job) {
+                prev = cur;
+                cur = NativeMemory.AsRef<nint>((cur) + (nint)(J_NEXT));
+            }
+            if (cur == (nint)0) {
+                discard = true;
+            } else {
+                nint next = NativeMemory.AsRef<nint>((job) + (nint)(J_NEXT));
+                if (prev != (nint)0) NativeMemory.AsRef<nint>((prev) + (nint)(J_NEXT)) = next;
+                else s_pending = next;
+                NativeMemory.AsRef<nint>((job) + (nint)(J_NEXT)) = s_done;
+                s_done = job;
+                notify = true;
+                NativeMemory.AsRef<int>((job) + (nint)(J_STARTED)) = 0;
+                if (s_active > 0) s_active--;
+            }
+        }
+        nint nextJob = TakeQueuedLocked();
+        Unlock();
+        if (discard) IoPlat.CFree(job);
+        if (notify) WakeNotify();
+        return nextJob;
+    }
+
+    static bool Handoff(nint job) {
+        bool taken = false;
+        Lock();
+        if (s_idle > 0) {
+            s_idle--;
+            NativeMemory.AsRef<nint>((job) + (nint)(J_QNEXT)) = s_handoff;
+            s_handoff = job;
+            taken = true;
+            WakeParked();
+        }
+        Unlock();
+        return taken;
+    }
+
+    static void WorkerLoop(nint job) {
+        while (job != (nint)0) {
+            RunJob(job);
+            job = FinishWorker(job);
+            if (job != (nint)0) continue;
+            Lock();
+            s_idle++;
+            long deadline = IoPlat.NowMs() + ZAN_BLOCKING_IDLE_MS;
+            for (;;) {
+                if (s_handoff != (nint)0) {
+                    job = s_handoff;
+                    s_handoff = NativeMemory.AsRef<nint>((job) + (nint)(J_QNEXT));
+                    NativeMemory.AsRef<nint>((job) + (nint)(J_QNEXT)) = (nint)0;
+                    break;
+                }
+                long left = deadline - IoPlat.NowMs();
+                if (left <= 0L) {
+                    s_idle--;
+                    break;
+                }
+                _ = ParkLocked(left);
+            }
+            Unlock();
+        }
+    }
+
+#if WINDOWS
+    [Export("__zan_io_blocking_worker_win")]
+    [Visibility("hidden")]
+    static uint BlockingWorkerWin(nint arg) {
+        WorkerLoop(arg);
+        return 0U;
+    }
+#else
+    [Export("__zan_io_blocking_worker_posix")]
+    [Visibility("hidden")]
+    static nint BlockingWorkerPosix(nint arg) {
+        WorkerLoop(arg);
+        return (nint)0;
+    }
+#endif
+
+    static void Spawn(nint job) {
+        while (job != (nint)0) {
+            if (Handoff(job)) return;
+#if WINDOWS
+            if (IoPlat.WinQueueUserWorkItem(NativeMemory.FunctionPointer(BlockingWorkerWin),
+                                            job, IoConst.WT_EXECUTELONGFUNCTION) != 0)
+                return;
+#else
+            ulong tid = 0UL;
+            if (IoPlat.PosixThreadCreate(NativeMemory.AddressOf(ref tid), (nint)0,
+                                         NativeMemory.FunctionPointer(BlockingWorkerPosix), job) == 0) {
+                IoPlat.PosixThreadDetach(tid);
+                return;
+            }
+#endif
+            NativeMemory.AsRef<int>((job) + (nint)(J_STATUS)) = ZAN_BLOCKING_THREAD_FAILED;
+            job = FinishWorker(job);
+        }
+    }
+
+    static void Submit(nint job) {
+        bool start = false;
+        bool oversub = false;
+        Lock();
+        if (s_active >= ZAN_BLOCKING_MAX_ACTIVE && s_queuedN >= ZAN_BLOCKING_MAX_QUEUED) {
+            oversub = true;
+        } else {
+            NativeMemory.AsRef<nint>((job) + (nint)(J_NEXT)) = s_pending;
+            s_pending = job;
+            Atomic.FetchAdd(ref s_inflight, 1, MemoryOrder.AcqRel);
+            if (s_active < ZAN_BLOCKING_MAX_ACTIVE) {
+                NativeMemory.AsRef<int>((job) + (nint)(J_STARTED)) = 1;
+                s_active++;
+                start = true;
+            } else {
+                if (s_queued == (nint)0) {
+                    s_queued = job;
+                } else {
+                    nint tail = s_queued;
+                    while (NativeMemory.AsRef<nint>((tail) + (nint)(J_QNEXT)) != (nint)0) {
+                        tail = NativeMemory.AsRef<nint>((tail) + (nint)(J_QNEXT));
+                    }
+                    NativeMemory.AsRef<nint>((tail) + (nint)(J_QNEXT)) = job;
+                }
+                s_queuedN++;
+            }
+        }
+        Unlock();
+        if (oversub) {
+            NativeMemory.AsRef<int>((job) + (nint)(J_STATUS)) = ZAN_BLOCKING_QUEUE_FULL;
+            Deliver(job);
+            return;
+        }
+        if (start) Spawn(job);
+    }
+
+    internal static long WaitMs(long callerMs) {
+        if (Atomic.Load(ref s_inflight, MemoryOrder.Acquire) <= 0) return callerMs;
+        long now = IoPlat.NowMs();
+        long nearest = -1L;
+        Lock();
+        for (nint j = s_pending; j != (nint)0; j = NativeMemory.AsRef<nint>((j) + (nint)(J_NEXT))) {
+            long dl = NativeMemory.AsRef<long>((j) + (nint)(J_DEADLINE));
+            if (dl > 0L && (nearest < 0L || dl < nearest)) nearest = dl;
+        }
+        Unlock();
+        if (nearest < 0L) return callerMs;
+        long wait = nearest - now;
+        if (wait <= 0L) wait = 0L;
+        if (callerMs < 0L) return wait;
+        return wait < callerMs ? wait : callerMs;
+    }
+
+    internal static int TimeoutScan() {
+        int woke = 0;
+        long now = IoPlat.NowMs();
+        nint timedOut = (nint)0;
+        Lock();
+        nint prev = (nint)0;
+        nint cur = s_pending;
+        while (cur != (nint)0) {
+            nint next = NativeMemory.AsRef<nint>((cur) + (nint)(J_NEXT));
+            long dl = NativeMemory.AsRef<long>((cur) + (nint)(J_DEADLINE));
+            if (dl <= 0L || dl > now) {
+                prev = cur;
+                cur = next;
+                continue;
+            }
+            if (prev != (nint)0) NativeMemory.AsRef<nint>((prev) + (nint)(J_NEXT)) = next;
+            else s_pending = next;
+
+            NativeMemory.AsRef<int>((cur) + (nint)(J_TIMED_OUT)) = 1;
+            NativeMemory.AsRef<int>((cur) + (nint)(J_TO_DELIV)) = 1;
+            if (NativeMemory.AsRef<int>((cur) + (nint)(J_STARTED)) == 0) {
+                nint qprev = (nint)0;
+                nint qcur = s_queued;
+                while (qcur != (nint)0 && qcur != cur) {
+                    qprev = qcur;
+                    qcur = NativeMemory.AsRef<nint>((qcur) + (nint)(J_QNEXT));
+                }
+                if (qcur == cur) {
+                    nint qnext = NativeMemory.AsRef<nint>((cur) + (nint)(J_QNEXT));
+                    if (qprev != (nint)0) NativeMemory.AsRef<nint>((qprev) + (nint)(J_QNEXT)) = qnext;
+                    else s_queued = qnext;
+                    s_queuedN--;
+                }
+                NativeMemory.AsRef<nint>((cur) + (nint)(J_QNEXT)) = (nint)0;
+            }
+            NativeMemory.AsRef<nint>((cur) + (nint)(J_NEXT)) = timedOut;
+            timedOut = cur;
+            cur = next;
+        }
+        Unlock();
+
+        while (timedOut != (nint)0) {
+            nint j = timedOut;
+            timedOut = NativeMemory.AsRef<nint>((j) + (nint)(J_NEXT));
+            nint out32 = NativeMemory.AsRef<nint>((j) + (nint)(J_OUT32));
+            if (out32 != (nint)0) NativeMemory.AsRef<int>(out32) = 0;
+            IoPlat.WakeCo(NativeMemory.AsRef<nint>((j) + (nint)(J_FRAME)), NativeMemory.AsRef<nint>((j) + (nint)(J_STEP)));
+            Lock();
+            NativeMemory.AsRef<int>((j) + (nint)(J_TO_DELIV)) = 0;
+            bool discard = NativeMemory.AsRef<int>((j) + (nint)(J_STARTED)) == 0;
+            Unlock();
+            if (discard) IoPlat.CFree(j);
+            Atomic.FetchAdd(ref s_inflight, -1, MemoryOrder.AcqRel);
+            woke++;
+        }
+        return woke;
+    }
+
+    internal static void WakeNotify() {
+#if WINDOWS
+        IoReactor.PostDnsWakeAll();
+#elif MACOS
+        if (s_dnsWakeWfd >= 0) {
+            byte b = 1;
+            long r = IoPlat.PosixWrite(s_dnsWakeWfd, NativeMemory.AddressOf(ref b), 1UL);
+            _ = r;
+        }
+#else
+        if (s_dnsWakeFd >= 0) {
+            ulong one = 1UL;
+            long r = IoPlat.PosixWrite(s_dnsWakeFd, NativeMemory.AddressOf(ref one), 8UL);
+            _ = r;
+        }
+#endif
+    }
+
+#if !WINDOWS
+    internal static void WakeRead() {
+#if MACOS
+        if (s_dnsWakeFd >= 0) {
+            IoBuf64 tmp = new IoBuf64();
+            nint tp = NativeMemory.AddressOf(ref tmp);
+            while (IoPlat.PosixRead(s_dnsWakeFd, tp, 64UL) > 0L) {}
+        }
+#else
+        if (s_dnsWakeFd >= 0) {
+            ulong v = 0UL;
+            long r = IoPlat.PosixRead(s_dnsWakeFd, NativeMemory.AddressOf(ref v), 8UL);
+            _ = r;
+        }
+#endif
+    }
+#endif
+
+    internal static int Drain() {
+        int woke = 0;
+        Lock();
+        nint j = s_done;
+        s_done = (nint)0;
+        Unlock();
+        while (j != (nint)0) {
+            nint next = NativeMemory.AsRef<nint>((j) + (nint)(J_NEXT));
+            Deliver(j);
+            Atomic.FetchAdd(ref s_inflight, -1, MemoryOrder.AcqRel);
+            woke++;
+            j = next;
+        }
+        return woke;
+    }
+
+    internal static void ShutdownCleanup() {
+        Lock();
+        nint j = s_done;
+        s_done = (nint)0;
+        while (j != (nint)0) {
+            nint n = NativeMemory.AsRef<nint>((j) + (nint)(J_NEXT));
+            IoPlat.CFree(j);
+            j = n;
+        }
+        nint queued = s_queued;
+        s_queued = (nint)0;
+        s_queuedN = 0;
+        while (queued != (nint)0) {
+            nint n = NativeMemory.AsRef<nint>((queued) + (nint)(J_QNEXT));
+            nint prev = (nint)0;
+            nint cur = s_pending;
+            while (cur != (nint)0 && cur != queued) {
+                prev = cur;
+                cur = NativeMemory.AsRef<nint>((cur) + (nint)(J_NEXT));
+            }
+            if (cur == queued) {
+                nint pnext = NativeMemory.AsRef<nint>((queued) + (nint)(J_NEXT));
+                if (prev != (nint)0) NativeMemory.AsRef<nint>((prev) + (nint)(J_NEXT)) = pnext;
+                else s_pending = pnext;
+            }
+            IoPlat.CFree(queued);
+            queued = n;
+        }
+        for (nint p = s_pending; p != (nint)0; p = NativeMemory.AsRef<nint>((p) + (nint)(J_NEXT))) {
+            NativeMemory.AsRef<int>((p) + (nint)(J_TIMED_OUT)) = 1;
+        }
+        s_pending = (nint)0;
+        Atomic.Store(ref s_inflight, 0, MemoryOrder.Release);
+        Unlock();
+    }
+
+    static void CopyHost(nint dst, nint src) {
+        ulong n = IoPlat.CStrLen(src);
+        if (n > 255UL) n = 255UL;
+        IoPlat.CMemcpy(dst, src, n);
+        NativeMemory.AsRef<byte>((dst) + (nint)((long)n)) = 0;
+    }
+
+    [Export("zan_io_resolve_sa_co")]
+    public static void ResolveSaCo(nint name, int port, nint buf, int cap, nint frame, nint step, nint outPtr) {
+        if (name == (nint)0 || NativeMemory.AsRef<byte>(name) == 0) {
+            if (outPtr != (nint)0) NativeMemory.AsRef<int>(outPtr) = 0;
+            IoPlat.WakeCo(frame, step);
+            return;
+        }
+        IoReactor.IoInit();
+        nint w = IoPlat.CCalloc(1UL, D_SIZE);
+        if (w == (nint)0) {
+            if (outPtr != (nint)0) NativeMemory.AsRef<int>(outPtr) = 0;
+            IoPlat.WakeCo(frame, step);
+            return;
+        }
+        CopyHost(w + (nint)D_HOST, name);
+        NativeMemory.AsRef<nint>((w) + (nint)(J_FRAME)) = frame;
+        NativeMemory.AsRef<nint>((w) + (nint)(J_STEP)) = step;
+        NativeMemory.AsRef<nint>((w) + (nint)(J_OUT32)) = outPtr;
+        NativeMemory.AsRef<nint>((w) + (nint)(J_SABUF)) = buf;
+        NativeMemory.AsRef<int>((w) + (nint)(J_SACAP)) = cap;
+        NativeMemory.AsRef<int>((w) + (nint)(J_PORT)) = port;
+        NativeMemory.AsRef<long>((w) + (nint)(J_DEADLINE)) = IoPlat.NowMs() + ZAN_DNS_TIMEOUT_MS;
+        NativeMemory.AsRef<int>((w) + (nint)(J_KIND)) = 0;
+        Submit(w);
+    }
+
+    [Export("zan_io_resolve_co")]
+    public static void ResolveCo(nint hostname, nint frame, nint step, nint outPtr) {
+        if (hostname == (nint)0 || NativeMemory.AsRef<byte>(hostname) == 0) {
+            if (outPtr != (nint)0) NativeMemory.AsRef<int>(outPtr) = 0;
+            IoPlat.WakeCo(frame, step);
+            return;
+        }
+        IoReactor.IoInit();
+        nint w = IoPlat.CCalloc(1UL, D_SIZE);
+        if (w == (nint)0) {
+            if (outPtr != (nint)0) NativeMemory.AsRef<int>(outPtr) = 0;
+            IoPlat.WakeCo(frame, step);
+            return;
+        }
+        CopyHost(w + (nint)D_HOST, hostname);
+        NativeMemory.AsRef<nint>((w) + (nint)(J_FRAME)) = frame;
+        NativeMemory.AsRef<nint>((w) + (nint)(J_STEP)) = step;
+        NativeMemory.AsRef<nint>((w) + (nint)(J_OUT32)) = outPtr;
+        NativeMemory.AsRef<long>((w) + (nint)(J_DEADLINE)) = IoPlat.NowMs() + ZAN_DNS_TIMEOUT_MS;
+        NativeMemory.AsRef<int>((w) + (nint)(J_KIND)) = 0;
+        Submit(w);
+    }
+
+    [Export("zan_rt_blocking_checked_co")]
+    public static void BlockingCheckedCo(nint fn, int argc, long a0, long a1, long a2, long a3,
+                                         nint frame, nint step, nint out64, nint statusPtr) {
+        if (fn == (nint)0 || argc < 0 || argc > 4) {
+            NativeStatus(statusPtr, ZAN_BLOCKING_INVALID_CALL);
+            IoPlat.WakeCo(frame, step);
+            return;
+        }
+        IoReactor.IoInit();
+        nint w = IoPlat.CCalloc(1UL, B_SIZE);
+        if (w == (nint)0) {
+            NativeStatus(statusPtr, ZAN_BLOCKING_NO_MEMORY);
+            IoPlat.WakeCo(frame, step);
+            return;
+        }
+        NativeMemory.AsRef<nint>((w) + (nint)(B_FN)) = fn;
+        NativeMemory.AsRef<int>((w) + (nint)(J_ARGC)) = argc;
+        NativeMemory.AsRef<long>((w) + (nint)(B_A0)) = a0;
+        NativeMemory.AsRef<long>((w) + (nint)(B_A1)) = a1;
+        NativeMemory.AsRef<long>((w) + (nint)(B_A2)) = a2;
+        NativeMemory.AsRef<long>((w) + (nint)(B_A3)) = a3;
+        NativeMemory.AsRef<nint>((w) + (nint)(J_FRAME)) = frame;
+        NativeMemory.AsRef<nint>((w) + (nint)(J_STEP)) = step;
+        NativeMemory.AsRef<nint>((w) + (nint)(J_OUT64)) = out64;
+        NativeMemory.AsRef<nint>((w) + (nint)(J_OUT_STATUS)) = statusPtr;
+        NativeMemory.AsRef<int>((w) + (nint)(J_KIND)) = 1;
+        Submit(w);
+    }
+
+    [Export("zan_rt_blocking_co")]
+    public static void BlockingCo(nint fn, int argc, long a0, long a1, long a2, long a3,
+                                  nint frame, nint step, nint out64) {
+        BlockingCheckedCo(fn, argc, a0, a1, a2, a3, frame, step, out64, (nint)0);
+    }
+}

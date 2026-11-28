@@ -1,0 +1,83 @@
+using System;
+using System.Numerics;
+
+struct Packet {
+    public uint Header;
+    public ulong Payload;
+}
+
+class Program {
+    [Export("k_overlay_sum")]
+    [NoAlloc]
+    static ulong OverlaySum(nint basePtr, int count) {
+        ulong total = 0UL;
+        for (int i = 0; i < count; i++) {
+            ref Packet pkt = ref NativeMemory.At<Packet>(basePtr, i);
+            uint kind = BitOperations.ExtractBits(pkt.Header, 8, 4);
+            total += pkt.Payload + (ulong)kind;
+        }
+        return total;
+    }
+
+    static int Main() {
+        // 1. Allocate 3 Packets and populate via AsRef<T> / At<T> / Add<T>
+        long stride = (long)sizeof(Packet);
+        nint buf = NativeMemory.Alloc(stride * 3L);
+
+        // Zero-copy ref local via AsRef<T>
+        ref Packet p0 = ref NativeMemory.AsRef<Packet>(buf);
+        p0.Header = BitOperations.InsertBits(0U, 0xAU, 8, 4);
+        p0.Header = BitOperations.InsertBits(p0.Header, 0x12U, 0, 8);
+        p0.Payload = 100UL;
+
+        // Direct field mutation on At<T> without copying
+        NativeMemory.At<Packet>(buf, 1).Header = BitOperations.InsertBits(0U, 0x5U, 8, 4);
+        NativeMemory.At<Packet>(buf, 1).Payload = 200UL;
+
+        // Scaled pointer arithmetic via Add<T> (forward + backward)
+        nint p2Addr = NativeMemory.Add<Packet>(buf, 2L);
+        NativeMemory.AsRef<Packet>(p2Addr).Header = BitOperations.InsertBits(0U, 0x3U, 8, 4);
+        NativeMemory.AsRef<Packet>(p2Addr).Payload = 300UL;
+        nint backTo0 = NativeMemory.Add<Packet>(p2Addr, -2L);
+
+        // Scalar direct assignment via At<T>
+        nint u64Buf = NativeMemory.Alloc(24L);
+        NativeMemory.At<ulong>(u64Buf, 0) = 11UL;
+        NativeMemory.At<ulong>(u64Buf, 1) = 22UL;
+        NativeMemory.At<ulong>(u64Buf, 2) = 33UL;
+        ulong scalarSum = NativeMemory.At<ulong>(u64Buf, 0) +
+                          NativeMemory.At<ulong>(u64Buf, 1) +
+                          NativeMemory.At<ulong>(u64Buf, 2);
+
+        // ByteOffset between struct elements & fields
+        ref Packet r0 = ref NativeMemory.At<Packet>(buf, 0);
+        ref Packet r2 = ref NativeMemory.At<Packet>(buf, 2);
+        long elemDist = NativeMemory.ByteOffset(ref r0, ref r2);
+        long fieldDist = NativeMemory.ByteOffset(ref r0.Header, ref r0.Payload);
+
+        ulong sum = OverlaySum(buf, 3); // (100+10) + (200+5) + (300+3) = 618
+
+        // 2. BitOperations.ExtractBits / InsertBits (32-bit, 64-bit, edge cases)
+        uint ex32 = BitOperations.ExtractBits(0xCAFEBABEU, 8, 12); // 0xEBA
+        uint ins32 = BitOperations.InsertBits(0xFF0000FFU, 0x1234U, 8, 16); // 0xFF1234FF
+        ulong ex64 = BitOperations.ExtractBits(0x0123456789ABCDEFUL, 16, 20); // 0x789AB
+        ulong ins64 = BitOperations.InsertBits(0xFFFF00000000FFFFUL, 0xABCDEUL, 16, 20); // 0xFFFF000ABCDEFFFF
+        // Edge cases: bitCount=0, bitCount=64, startBit>=64 (zero UB)
+        ulong exZero = BitOperations.ExtractBits(0x123456789ABCDEF0UL, 4, 0);
+        ulong exFull = BitOperations.ExtractBits(0x123456789ABCDEF0UL, 0, 64);
+        ulong exOob = BitOperations.ExtractBits(0x123456789ABCDEF0UL, 64, 8);
+        ulong insZero = BitOperations.InsertBits(0xDEADBEEFUL, 0xFFFFUL, 4, 0);
+
+        NativeMemory.Free(buf);
+        NativeMemory.Free(u64Buf);
+
+        int ptrOk = (backTo0 == buf && elemDist == stride * 2L && fieldDist == 8L &&
+                     sum == 618UL && scalarSum == 66UL) ? 1 : 0;
+        int bitOk = (ex32 == 0xEBAU && ins32 == 0xFF1234FFU &&
+                     ex64 == 0x789ABUL && ins64 == 0xFFFF000ABCDEFFFFUL &&
+                     exZero == 0UL && exFull == 0x123456789ABCDEF0UL &&
+                     exOob == 0UL && insZero == 0xDEADBEEFUL) ? 1 : 0;
+        Console.WriteLine($"ptr={ptrOk} bit={bitOk}");
+        return 0;
+    }
+}

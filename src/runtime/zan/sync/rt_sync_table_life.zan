@@ -1,0 +1,816 @@
+// rt_sync_table_life.zan: Shared-memory table lifecycle, geometry validation, edit_ints & policy API.
+
+namespace Zan.Runtime.Sync;
+
+static partial class RtSyncTable {
+    // ---- Lifecycle & geometry validation ----
+
+    static void TableFree(nint table) {
+        if (table == (nint)0) return;
+        nint hdr = NativeMemory.Read<nint>(table + (nint)ShmTblOff.T_HEADER);
+#if WINDOWS
+        if (hdr != (nint)0) SyncPlat.WinUnmapViewOfFile(hdr);
+        nint mapping = NativeMemory.Read<nint>(table + (nint)ShmTblOff.T_MAPPING);
+        if (mapping != (nint)0) SyncPlat.WinCloseHandle(mapping);
+#else
+        ulong msz = NativeMemory.Read<ulong>(table + (nint)ShmTblOff.T_MAPPED_SIZE);
+        if (hdr != (nint)0 && msz != 0UL) SyncPlat.PosixMunmap(hdr, msz);
+        int fd = NativeMemory.Read<int>(table + (nint)ShmTblOff.T_FD);
+        if (fd >= 0) SyncPlat.PosixClose(fd);
+        if (NativeMemory.Read<int>(table + (nint)ShmTblOff.T_LOCAL_MX_READY) != 0) {
+            SyncPlat.PosixMutexDestroy(table + (nint)ShmTblOff.T_LOCAL_MX);
+        }
+#endif
+        SyncPlat.CFree(table);
+    }
+
+    static nint TableAlloc() {
+        nint t = SyncPlat.CCalloc(1UL, ShmTblOff.TBL_SIZE);
+        if (t == (nint)0) return (nint)0;
+#if !WINDOWS
+        NativeMemory.Write<int>(t + (nint)ShmTblOff.T_FD, -1);
+        if (SyncPlat.PosixMutexInit(t + (nint)ShmTblOff.T_LOCAL_MX, (nint)0) != 0) {
+            SyncPlat.CFree(t);
+            return (nint)0;
+        }
+        NativeMemory.Write<int>(t + (nint)ShmTblOff.T_LOCAL_MX_READY, 1);
+#endif
+        return t;
+    }
+
+    static bool LayoutCompute(int capVal, int keySizeVal, nint schema, nint hdrTmp) {
+        if (capVal <= 0 || (ulong)capVal > ShmTblOff.MAX_CAPACITY ||
+            keySizeVal <= 0 || (uint)keySizeVal > ShmTblOff.MAX_KEY) {
+            return false;
+        }
+        SyncPlat.CMemset(hdrTmp, 0, ShmTblOff.HDR_SIZE);
+        ulong cap = RoundCapacity((ulong)capVal);
+        uint keySize = (uint)keySizeVal;
+        uint colCnt = 0U;
+        uint stride = 0U;
+        if (!ParseSchema(schema, keySize, hdrTmp + (nint)ShmTblOff.H_COLUMNS, out colCnt, out stride) || stride == 0U) {
+            return false;
+        }
+        ulong rowsOff = ShmTblOff.HDR_SIZE;
+        ulong maxSz = 0xFFFFFFFFFFFFFFFFUL;
+        if (cap > (maxSz - rowsOff) / (ulong)stride) return false;
+        ulong rowsSz = cap * (ulong)stride;
+        if (cap > (maxSz - rowsOff - rowsSz) / 8UL) return false;
+        ulong totalSz = rowsOff + rowsSz + cap * 8UL;
+
+        NativeMemory.Write<ulong>(hdrTmp + (nint)ShmTblOff.H_MAGIC, ShmTblOff.MAGIC);
+        NativeMemory.Write<uint>(hdrTmp + (nint)ShmTblOff.H_VERSION, ShmTblOff.VERSION);
+        NativeMemory.Write<ulong>(hdrTmp + (nint)ShmTblOff.H_TOTAL_SIZE, totalSz);
+        NativeMemory.Write<ulong>(hdrTmp + (nint)ShmTblOff.H_CAPACITY, cap);
+        NativeMemory.Write<uint>(hdrTmp + (nint)ShmTblOff.H_KEY_SIZE, keySize);
+        NativeMemory.Write<uint>(hdrTmp + (nint)ShmTblOff.H_ROW_STRIDE, stride);
+        NativeMemory.Write<uint>(hdrTmp + (nint)ShmTblOff.H_COLUMN_COUNT, colCnt);
+        return true;
+    }
+
+    static bool HeaderGeometryOk(nint hdr) {
+        ulong cap = NativeMemory.Read<ulong>(hdr + (nint)ShmTblOff.H_CAPACITY);
+        uint keySize = NativeMemory.Read<uint>(hdr + (nint)ShmTblOff.H_KEY_SIZE);
+        uint colCnt = NativeMemory.Read<uint>(hdr + (nint)ShmTblOff.H_COLUMN_COUNT);
+        uint stride = NativeMemory.Read<uint>(hdr + (nint)ShmTblOff.H_ROW_STRIDE);
+        ulong totalSz = NativeMemory.Read<ulong>(hdr + (nint)ShmTblOff.H_TOTAL_SIZE);
+
+        if (cap == 0UL || cap > ShmTblOff.MAX_CAPACITY || (cap & (cap - 1UL)) != 0UL) return false;
+        if (keySize == 0U || keySize > ShmTblOff.MAX_KEY) return false;
+        if (colCnt > ShmTblOff.MAX_COLUMNS) return false;
+        ulong minStride = Align8(ShmTblOff.SLOT_PREFIX + (ulong)keySize);
+        if ((ulong)stride < minStride) return false;
+
+        nint cols = hdr + (nint)ShmTblOff.H_COLUMNS;
+        for (uint i = 0U; i < colCnt; i++) {
+            nint c = cols + (nint)((long)i * ShmTblOff.COL_SIZE);
+            uint ct = NativeMemory.Read<uint>(c + (nint)ShmTblOff.COL_TYPE);
+            uint cs = NativeMemory.Read<uint>(c + (nint)ShmTblOff.COL_LEN);
+            uint co = NativeMemory.Read<uint>(c + (nint)ShmTblOff.COL_OFFSET);
+            if (ct == ShmTblOff.COL_INT || ct == ShmTblOff.COL_FLOAT) {
+                if (cs != 8U) return false;
+            } else if (ct == ShmTblOff.COL_STRING) {
+                if (cs < 2U || cs > ShmTblOff.MAX_STRING + 1U) return false;
+            } else {
+                return false;
+            }
+            if ((ulong)co < minStride || (ulong)co + (ulong)cs > (ulong)stride) return false;
+            if (SyncPlat.CMemchr(c + (nint)ShmTblOff.COL_NAME, 0, ShmTblOff.COLUMN_NAME) == (nint)0) return false;
+        }
+        ulong maxU64 = 0xFFFFFFFFFFFFFFFFUL;
+        if (cap > (maxU64 - ShmTblOff.HDR_SIZE) / ((ulong)stride + 8UL)) return false;
+        ulong expected = ShmTblOff.HDR_SIZE + cap * (ulong)stride + cap * 8UL;
+        return expected == totalSz;
+    }
+
+    static bool TableSnapshotValidate(nint table) {
+        nint hdr = NativeMemory.Read<nint>(table + (nint)ShmTblOff.T_HEADER);
+        nint snap = table + (nint)ShmTblOff.T_SNAP;
+        ulong msz = NativeMemory.Read<ulong>(table + (nint)ShmTblOff.T_MAPPED_SIZE);
+        SyncPlat.CMemcpy(snap, hdr, ShmTblOff.HDR_SIZE);
+        if (NativeMemory.Read<uint>(snap + (nint)ShmTblOff.H_READY) != 1U ||
+            NativeMemory.Read<ulong>(snap + (nint)ShmTblOff.H_MAGIC) != ShmTblOff.MAGIC ||
+            NativeMemory.Read<uint>(snap + (nint)ShmTblOff.H_VERSION) != ShmTblOff.VERSION) {
+            return false;
+        }
+        ulong tsz = NativeMemory.Read<ulong>(snap + (nint)ShmTblOff.H_TOTAL_SIZE);
+        if (tsz < ShmTblOff.HDR_SIZE || tsz > msz) return false;
+        return HeaderGeometryOk(snap);
+    }
+
+    static void TableInitHeader(nint table, nint layoutHdr) {
+        nint hdr = NativeMemory.Read<nint>(table + (nint)ShmTblOff.T_HEADER);
+        ulong totalSz = NativeMemory.Read<ulong>(layoutHdr + (nint)ShmTblOff.H_TOTAL_SIZE);
+        NativeMemory.Write<ulong>(table + (nint)ShmTblOff.T_MAPPED_SIZE, totalSz);
+        SyncPlat.CMemcpy(hdr, layoutHdr, ShmTblOff.HDR_SIZE);
+        Atomic.StoreAt<uint>(hdr + (nint)ShmTblOff.H_READY, 1U, MemoryOrder.Release);
+        SyncPlat.CMemcpy(table + (nint)ShmTblOff.T_SNAP, hdr, ShmTblOff.HDR_SIZE);
+    }
+
+    [Export("zan_shared_table_create_anon")]
+    public static long CreateAnon(int capVal, int keySizeVal, nint schema) {
+        nint layout = SyncPlat.CMalloc(ShmTblOff.HDR_SIZE);
+        if (layout == (nint)0) return 0L;
+        if (!LayoutCompute(capVal, keySizeVal, schema, layout)) {
+            SyncPlat.CFree(layout);
+            return 0L;
+        }
+        ulong totalSz = NativeMemory.Read<ulong>(layout + (nint)ShmTblOff.H_TOTAL_SIZE);
+        nint table = TableAlloc();
+        if (table == (nint)0) {
+            SyncPlat.CFree(layout);
+            return 0L;
+        }
+        NativeMemory.Write<int>(table + (nint)ShmTblOff.T_ANONYMOUS, 1);
+
+#if WINDOWS
+        SyncBuf24 sa = new SyncBuf24();
+        nint sap = NativeMemory.AddressOf(ref sa);
+        SyncPlat.CMemset(sap, 0, 24UL);
+        NativeMemory.Write<uint>(sap, 24U);
+        NativeMemory.Write<int>(sap + (nint)16, 1); // bInheritHandle = TRUE
+        uint szHi = (uint)(totalSz >> 32);
+        uint szLo = (uint)(totalSz & 0xFFFFFFFFUL);
+        nint mapping = SyncPlat.WinCreateFileMappingA((nint)(-1), sap, SyncPlat.PAGE_READWRITE, szHi, szLo, (nint)0);
+        if (mapping == (nint)0) {
+            SyncPlat.CFree(layout);
+            TableFree(table);
+            return 0L;
+        }
+        NativeMemory.Write<nint>(table + (nint)ShmTblOff.T_MAPPING, mapping);
+        nint hdr = SyncPlat.WinMapViewOfFile(mapping, SyncPlat.FILE_MAP_ALL_ACCESS, 0U, 0U, totalSz);
+        if (hdr == (nint)0) {
+            SyncPlat.CFree(layout);
+            TableFree(table);
+            return 0L;
+        }
+        NativeMemory.Write<nint>(table + (nint)ShmTblOff.T_HEADER, hdr);
+#else
+        uint seq = Atomic.FetchAdd(ref s_anonSeq, 1U, MemoryOrder.Relaxed);
+        SyncBuf64 nameBuf = new SyncBuf64();
+        nint np = NativeMemory.AddressOf(ref nameBuf);
+        ulong pos = SyncPlat.BufAppendCStr(np, 64UL, 0UL, (nint)"/zan_table_");
+        pos = SyncPlat.BufAppendI64(np, 64UL, pos, (long)SyncPlat.PosixGetpid());
+        pos = SyncPlat.BufAppendChar(np, 64UL, pos, (byte)95);
+        pos = SyncPlat.BufAppendU64(np, 64UL, pos, (ulong)(uint)SyncPlat.PosixTime((nint)0));
+        pos = SyncPlat.BufAppendChar(np, 64UL, pos, (byte)95);
+        SyncPlat.BufAppendU64(np, 64UL, pos, (ulong)seq);
+
+        int fd = SyncPlat.PosixShmOpen(np, SyncPlat.O_RDWR | SyncPlat.O_CREAT | SyncPlat.O_EXCL, 0x180U);
+        if (fd < 0) {
+            SyncPlat.CFree(layout);
+            TableFree(table);
+            return 0L;
+        }
+        SyncPlat.PosixShmUnlink(np);
+        if (SyncPlat.PosixFcntl(fd, SyncPlat.F_SETFD, 0) != 0) {
+            SyncPlat.PosixClose(fd);
+            SyncPlat.CFree(layout);
+            TableFree(table);
+            return 0L;
+        }
+        NativeMemory.Write<int>(table + (nint)ShmTblOff.T_FD, fd);
+        if (SyncPlat.PosixFtruncate(fd, (long)totalSz) != 0) {
+            SyncPlat.CFree(layout);
+            TableFree(table);
+            return 0L;
+        }
+        nint hdr = SyncPlat.PosixMmap((nint)0, totalSz, SyncPlat.PROT_RW, SyncPlat.MAP_SHARED, fd, 0L);
+        if (hdr == (nint)(-1)) {
+            SyncPlat.CFree(layout);
+            TableFree(table);
+            return 0L;
+        }
+        NativeMemory.Write<nint>(table + (nint)ShmTblOff.T_HEADER, hdr);
+#endif
+        TableInitHeader(table, layout);
+        SyncPlat.CFree(layout);
+        return (long)table;
+    }
+
+    [Export("zan_shared_table_handle")]
+    public static long TableHandle(long handle) {
+        nint table = (nint)handle;
+        if (table == (nint)0 || NativeMemory.Read<int>(table + (nint)ShmTblOff.T_ANONYMOUS) == 0) return 0L;
+#if WINDOWS
+        return (long)NativeMemory.Read<nint>(table + (nint)ShmTblOff.T_MAPPING);
+#else
+        return (long)NativeMemory.Read<int>(table + (nint)ShmTblOff.T_FD);
+#endif
+    }
+
+    [Export("zan_shared_table_attach")]
+    public static long TableAttach(long osHandle) {
+        if (osHandle <= 0L) return 0L;
+        nint table = TableAlloc();
+        if (table == (nint)0) return 0L;
+        NativeMemory.Write<int>(table + (nint)ShmTblOff.T_ANONYMOUS, 1);
+        NativeMemory.Write<int>(table + (nint)ShmTblOff.T_ATTACHED, 1);
+
+#if WINDOWS
+        nint mapping = (nint)osHandle;
+        NativeMemory.Write<nint>(table + (nint)ShmTblOff.T_MAPPING, mapping);
+        nint hdr = SyncPlat.WinMapViewOfFile(mapping, SyncPlat.FILE_MAP_ALL_ACCESS, 0U, 0U, 0UL);
+        if (hdr == (nint)0) {
+            TableFree(table);
+            return 0L;
+        }
+        NativeMemory.Write<nint>(table + (nint)ShmTblOff.T_HEADER, hdr);
+        SyncBuf48 mbi = new SyncBuf48();
+        nint mp = NativeMemory.AddressOf(ref mbi);
+        if (SyncPlat.WinVirtualQuery(hdr, mp, 48UL) == 0UL) {
+            TableFree(table);
+            return 0L;
+        }
+        ulong regSz = NativeMemory.Read<ulong>(mp + (nint)24); // RegionSize @ 24
+        if (regSz < ShmTblOff.HDR_SIZE) {
+            TableFree(table);
+            return 0L;
+        }
+        NativeMemory.Write<ulong>(table + (nint)ShmTblOff.T_MAPPED_SIZE, regSz);
+#else
+        int fd = (int)osHandle;
+        NativeMemory.Write<int>(table + (nint)ShmTblOff.T_FD, fd);
+        SyncBuf160 stBuf = new SyncBuf160();
+        nint st = NativeMemory.AddressOf(ref stBuf);
+        if (SyncPlat.PosixFstat(fd, st) != 0) {
+            TableFree(table);
+            return 0L;
+        }
+        long fsz = NativeMemory.Read<long>(st + (nint)SyncPlat.STAT_SIZE_OFF);
+        if (fsz <= 0L) {
+            TableFree(table);
+            return 0L;
+        }
+        NativeMemory.Write<ulong>(table + (nint)ShmTblOff.T_MAPPED_SIZE, (ulong)fsz);
+        nint hdr = SyncPlat.PosixMmap((nint)0, (ulong)fsz, SyncPlat.PROT_RW, SyncPlat.MAP_SHARED, fd, 0L);
+        if (hdr == (nint)(-1)) {
+            TableFree(table);
+            return 0L;
+        }
+        NativeMemory.Write<nint>(table + (nint)ShmTblOff.T_HEADER, hdr);
+#endif
+        Atomic.LoadAt<uint>(hdr + (nint)ShmTblOff.H_READY, MemoryOrder.Acquire);
+        if (!TableSnapshotValidate(table)) {
+            TableFree(table);
+            return 0L;
+        }
+        return (long)table;
+    }
+
+    [Export("zan_shared_table_create")]
+    public static long TableCreate(nint name, int capVal, int keySizeVal, nint schema) {
+        if (name == (nint)0 || NativeMemory.Read<byte>(name) == (byte)0) return 0L;
+        nint layout = SyncPlat.CMalloc(ShmTblOff.HDR_SIZE);
+        if (layout == (nint)0) return 0L;
+        if (!LayoutCompute(capVal, keySizeVal, schema, layout)) {
+            SyncPlat.CFree(layout);
+            return 0L;
+        }
+        ulong totalSz = NativeMemory.Read<ulong>(layout + (nint)ShmTblOff.H_TOTAL_SIZE);
+        nint table = TableAlloc();
+        if (table == (nint)0) {
+            SyncPlat.CFree(layout);
+            return 0L;
+        }
+        nint mapName = table + (nint)ShmTblOff.T_MAP_NAME;
+        MakeNames(name, mapName);
+
+#if WINDOWS
+        uint szHi = (uint)(totalSz >> 32);
+        uint szLo = (uint)(totalSz & 0xFFFFFFFFUL);
+        nint mapping = SyncPlat.WinCreateFileMappingA((nint)(-1), (nint)0, SyncPlat.PAGE_READWRITE, szHi, szLo, mapName);
+        if (mapping == (nint)0 || SyncPlat.WinGetLastError() == SyncPlat.ERROR_ALREADY_EXISTS) {
+            if (mapping != (nint)0) NativeMemory.Write<nint>(table + (nint)ShmTblOff.T_MAPPING, mapping);
+            SyncPlat.CFree(layout);
+            TableFree(table);
+            return 0L;
+        }
+        NativeMemory.Write<nint>(table + (nint)ShmTblOff.T_MAPPING, mapping);
+        nint hdr = SyncPlat.WinMapViewOfFile(mapping, SyncPlat.FILE_MAP_ALL_ACCESS, 0U, 0U, totalSz);
+        if (hdr == (nint)0) {
+            SyncPlat.CFree(layout);
+            TableFree(table);
+            return 0L;
+        }
+        NativeMemory.Write<nint>(table + (nint)ShmTblOff.T_HEADER, hdr);
+#else
+        int fd = SyncPlat.PosixOpen3(mapName, SyncPlat.O_RDWR | SyncPlat.O_CREAT | SyncPlat.O_EXCL | SyncPlat.O_NOFOLLOW, 0x180U);
+        if (fd < 0) {
+            SyncPlat.CFree(layout);
+            TableFree(table);
+            return 0L;
+        }
+        NativeMemory.Write<int>(table + (nint)ShmTblOff.T_FD, fd);
+        if (SyncPlat.PosixFtruncate(fd, (long)totalSz) != 0) {
+            SyncPlat.PosixUnlink(mapName);
+            SyncPlat.CFree(layout);
+            TableFree(table);
+            return 0L;
+        }
+        nint hdr = SyncPlat.PosixMmap((nint)0, totalSz, SyncPlat.PROT_RW, SyncPlat.MAP_SHARED, fd, 0L);
+        if (hdr == (nint)(-1)) {
+            SyncPlat.PosixUnlink(mapName);
+            SyncPlat.CFree(layout);
+            TableFree(table);
+            return 0L;
+        }
+        NativeMemory.Write<nint>(table + (nint)ShmTblOff.T_HEADER, hdr);
+#endif
+        TableInitHeader(table, layout);
+        SyncPlat.CFree(layout);
+        return (long)table;
+    }
+
+    [Export("zan_shared_table_open")]
+    public static long TableOpen(nint name) {
+        if (name == (nint)0 || NativeMemory.Read<byte>(name) == (byte)0) return 0L;
+        nint table = TableAlloc();
+        if (table == (nint)0) return 0L;
+        nint mapName = table + (nint)ShmTblOff.T_MAP_NAME;
+        MakeNames(name, mapName);
+
+#if WINDOWS
+        nint mapping = SyncPlat.WinOpenFileMappingA(SyncPlat.FILE_MAP_ALL_ACCESS, 0, mapName);
+        if (mapping == (nint)0) {
+            TableFree(table);
+            return 0L;
+        }
+        NativeMemory.Write<nint>(table + (nint)ShmTblOff.T_MAPPING, mapping);
+        nint hdr = SyncPlat.WinMapViewOfFile(mapping, SyncPlat.FILE_MAP_ALL_ACCESS, 0U, 0U, 0UL);
+        if (hdr == (nint)0) {
+            TableFree(table);
+            return 0L;
+        }
+        NativeMemory.Write<nint>(table + (nint)ShmTblOff.T_HEADER, hdr);
+        SyncBuf48 mbi = new SyncBuf48();
+        nint mp = NativeMemory.AddressOf(ref mbi);
+        if (SyncPlat.WinVirtualQuery(hdr, mp, 48UL) == 0UL) {
+            TableFree(table);
+            return 0L;
+        }
+        ulong regSz = NativeMemory.Read<ulong>(mp + (nint)24);
+        if (regSz < ShmTblOff.HDR_SIZE) {
+            TableFree(table);
+            return 0L;
+        }
+        NativeMemory.Write<ulong>(table + (nint)ShmTblOff.T_MAPPED_SIZE, regSz);
+#else
+        int fd = SyncPlat.PosixOpen3(mapName, SyncPlat.O_RDWR | SyncPlat.O_NOFOLLOW, 0U);
+        if (fd < 0) {
+            TableFree(table);
+            return 0L;
+        }
+        NativeMemory.Write<int>(table + (nint)ShmTblOff.T_FD, fd);
+        SyncBuf160 stBuf = new SyncBuf160();
+        nint st = NativeMemory.AddressOf(ref stBuf);
+        if (SyncPlat.PosixFstat(fd, st) != 0) {
+            TableFree(table);
+            return 0L;
+        }
+        long fsz = NativeMemory.Read<long>(st + (nint)SyncPlat.STAT_SIZE_OFF);
+        if (fsz <= 0L) {
+            TableFree(table);
+            return 0L;
+        }
+        NativeMemory.Write<ulong>(table + (nint)ShmTblOff.T_MAPPED_SIZE, (ulong)fsz);
+        nint hdr = SyncPlat.PosixMmap((nint)0, (ulong)fsz, SyncPlat.PROT_RW, SyncPlat.MAP_SHARED, fd, 0L);
+        if (hdr == (nint)(-1)) {
+            TableFree(table);
+            return 0L;
+        }
+        NativeMemory.Write<nint>(table + (nint)ShmTblOff.T_HEADER, hdr);
+#endif
+        Atomic.LoadAt<uint>(hdr + (nint)ShmTblOff.H_READY, MemoryOrder.Acquire);
+        if (!TableSnapshotValidate(table)) {
+            TableFree(table);
+            return 0L;
+        }
+#if !WINDOWS
+        if (NativeMemory.Read<ulong>(table + (nint)ShmTblOff.T_SNAP + (nint)ShmTblOff.H_TOTAL_SIZE) !=
+            NativeMemory.Read<ulong>(table + (nint)ShmTblOff.T_MAPPED_SIZE)) {
+            TableFree(table);
+            return 0L;
+        }
+#endif
+        return (long)table;
+    }
+
+    [Export("zan_shared_table_close")]
+    public static void TableClose(long handle) {
+        TableFree((nint)handle);
+    }
+
+    [Export("zan_shared_table_destroy")]
+    public static int TableDestroy(long handle) {
+        nint table = (nint)handle;
+        if (table == (nint)0) return 0;
+        int res = 1;
+#if !WINDOWS
+        if (NativeMemory.Read<int>(table + (nint)ShmTblOff.T_ANONYMOUS) == 0) {
+            if (SyncPlat.PosixUnlink(table + (nint)ShmTblOff.T_MAP_NAME) != 0 &&
+                SyncPlat.GetErrno() != SyncPlat.ENOENT) {
+                res = 0;
+            }
+        }
+#endif
+        TableFree(table);
+        return res;
+    }
+
+    static long TableResidentBytes(nint table) {
+        nint hdr = NativeMemory.Read<nint>(table + (nint)ShmTblOff.T_HEADER);
+        ulong msz = NativeMemory.Read<ulong>(table + (nint)ShmTblOff.T_MAPPED_SIZE);
+        if (hdr == (nint)0 || msz == 0UL) return 0L;
+#if WINDOWS
+        if (Atomic.Load(ref s_queryWsExResolved, MemoryOrder.Acquire) == 0) {
+            nint mod = SyncPlat.WinGetModuleHandleA((nint)"kernel32.dll");
+            if (mod != (nint)0) {
+                s_queryWsExFn = SyncPlat.WinGetProcAddress(mod, (nint)"K32QueryWorkingSetEx");
+            }
+            Atomic.Store(ref s_queryWsExResolved, 1, MemoryOrder.Release);
+        }
+        nint fn = s_queryWsExFn;
+        if (fn == (nint)0) return -1L;
+        SyncBuf48 si = new SyncBuf48();
+        nint sp = NativeMemory.AddressOf(ref si);
+        SyncPlat.CMemset(sp, 0, 48UL);
+        SyncPlat.WinGetSystemInfo(sp);
+        uint psRaw = NativeMemory.Read<uint>(sp + (nint)4);
+        ulong pageSize = psRaw != 0U ? (ulong)psRaw : 4096UL;
+        ulong pages = (msz + pageSize - 1UL) / pageSize;
+        ulong batchCap = 4096UL;
+        nint batch = SyncPlat.CCalloc(batchCap, 16UL);
+        if (batch == (nint)0) return -1L;
+        nint self = SyncPlat.WinGetCurrentProcess();
+        long resident = 0L;
+        for (ulong first = 0UL; first < pages; first += batchCap) {
+            ulong n = pages - first;
+            if (n > batchCap) n = batchCap;
+            for (ulong i = 0UL; i < n; i++) {
+                nint item = batch + (nint)(i * 16UL);
+                NativeMemory.Write<nint>(item, hdr + (nint)((first + i) * pageSize));
+                NativeMemory.Write<ulong>(item + (nint)8, 0UL);
+            }
+            int ok = NativeMemory.InvokeWithCC<int>("c", fn, self, batch, (uint)(n * 16UL));
+            if (ok == 0) {
+                SyncPlat.CFree(batch);
+                return -1L;
+            }
+            for (ulong i = 0UL; i < n; i++) {
+                ulong attrs = NativeMemory.Read<ulong>(batch + (nint)(i * 16UL + 8UL));
+                if ((attrs & 1UL) != 0UL) resident += (long)pageSize;
+            }
+        }
+        SyncPlat.CFree(batch);
+        if (resident > (long)msz) resident = (long)msz;
+        return resident;
+#else
+        long pconf = SyncPlat.PosixSysconf(SyncPlat.SC_PAGESIZE);
+        ulong pageSize = pconf > 0L ? (ulong)pconf : 4096UL;
+        ulong batchCap = 16384UL;
+        nint vec = SyncPlat.CMalloc(batchCap);
+        if (vec == (nint)0) return -1L;
+        ulong pages = (msz + pageSize - 1UL) / pageSize;
+        long resident = 0L;
+        for (ulong first = 0UL; first < pages; first += batchCap) {
+            ulong n = pages - first;
+            if (n > batchCap) n = batchCap;
+            ulong off = first * pageSize;
+            ulong len = n * pageSize;
+            if (off + len > msz) len = msz - off;
+            if (SyncPlat.PosixMincore(hdr + (nint)off, len, vec) != 0) {
+                SyncPlat.CFree(vec);
+                return -1L;
+            }
+            for (ulong i = 0UL; i < n; i++) {
+                if ((NativeMemory.At<byte>(vec, (long)i) & (byte)1) != (byte)0) {
+                    resident += (long)pageSize;
+                }
+            }
+        }
+        SyncPlat.CFree(vec);
+        if (resident > (long)msz) resident = (long)msz;
+        return resident;
+#endif
+    }
+
+    [Export("zan_shared_table_stat")]
+    public static long TableStat(long handle, int what) {
+        nint table = (nint)handle;
+        if (table == (nint)0) return 0L;
+        nint hdr = NativeMemory.Read<nint>(table + (nint)ShmTblOff.T_HEADER);
+        if (hdr == (nint)0) return 0L;
+        if (what == ShmTblOff.STAT_RESERVED) return (long)NativeMemory.Read<ulong>(table + (nint)ShmTblOff.T_MAPPED_SIZE);
+        if (what == ShmTblOff.STAT_RESIDENT) return TableResidentBytes(table);
+        if (what == ShmTblOff.STAT_CAPACITY) return (long)NativeMemory.Read<ulong>(hdr + (nint)ShmTblOff.H_CAPACITY);
+        if (what == ShmTblOff.STAT_COUNT) return (long)NativeMemory.Read<ulong>(hdr + (nint)ShmTblOff.H_COUNT);
+        if (what == ShmTblOff.STAT_ROW_STRIDE) return (long)NativeMemory.Read<uint>(hdr + (nint)ShmTblOff.H_ROW_STRIDE);
+        if (what == ShmTblOff.STAT_KEY_SIZE) return (long)NativeMemory.Read<uint>(hdr + (nint)ShmTblOff.H_KEY_SIZE);
+        if (what == ShmTblOff.STAT_COLUMNS) return (long)NativeMemory.Read<uint>(hdr + (nint)ShmTblOff.H_COLUMN_COUNT);
+        return 0L;
+    }
+
+    [Export("zan_shared_table_expire")]
+    public static int TableExpire(long handle, nint key, long ttlMs) {
+        if (ttlMs < 0L) return 0;
+        long nowMs = SyncPlat.TimeEpochMs();
+        if (ttlMs > 0x7FFFFFFFFFFFFFFFL - nowMs) return 0;
+        return TableExpireAt(handle, key, nowMs + ttlMs);
+    }
+
+    [Export("zan_shared_table_expire_at")]
+    public static int TableExpireAt(long handle, nint key, long expiresAtMs) {
+        nint table = (nint)handle;
+        if (table == (nint)0 || key == (nint)0 || expiresAtMs < 0L) return 0;
+        nint hdr = NativeMemory.Read<nint>(table + (nint)ShmTblOff.T_HEADER);
+        StructLock(hdr);
+        PurgeExpiredLocked(hdr, SyncPlat.TimeEpochMs(), ShmTblOff.PURGE_MAX_BATCH);
+        nint row = FindRow(hdr, key, false);
+        if (row != (nint)0) {
+            RowLock(row);
+            ExpirySet(hdr, RowSlot(hdr, row), row, expiresAtMs);
+            RowUnlock(row);
+        }
+        StructUnlock(hdr);
+        return row != (nint)0 ? 1 : 0;
+    }
+
+    [Export("zan_shared_table_expires_at")]
+    public static long TableExpiresAt(long handle, nint key) {
+        nint table = (nint)handle;
+        if (table == (nint)0 || key == (nint)0) return -1L;
+        nint hdr = NativeMemory.Read<nint>(table + (nint)ShmTblOff.T_HEADER);
+        PurgeExpired(hdr);
+        nint row = FindRow(hdr, key, false);
+        if (row == (nint)0) return -1L;
+        RowLock(row);
+        long exp = -1L;
+        if (RowRevalidate(row, HashBytes(key), key, NativeMemory.Read<uint>(hdr + (nint)ShmTblOff.H_KEY_SIZE))) {
+            exp = NativeMemory.Read<long>(row + (nint)ShmTblOff.R_EXPIRES);
+        }
+        RowUnlock(row);
+        return exp;
+    }
+
+    [Export("zan_shared_table_purge_expired")]
+    public static long TablePurgeExpired(long handle, long nowMs) {
+        nint table = (nint)handle;
+        if (table == (nint)0) return 0L;
+        if (nowMs < 0L) nowMs = SyncPlat.TimeEpochMs();
+        nint hdr = NativeMemory.Read<nint>(table + (nint)ShmTblOff.T_HEADER);
+        StructLock(hdr);
+        ulong before = NativeMemory.Read<ulong>(hdr + (nint)ShmTblOff.H_COUNT);
+        PurgeExpiredLocked(hdr, nowMs, 0xFFFFFFFFFFFFFFFFUL);
+        ulong removed = before - NativeMemory.Read<ulong>(hdr + (nint)ShmTblOff.H_COUNT);
+        StructUnlock(hdr);
+        return (long)removed;
+    }
+
+    [Export("zan_shared_table_edit_ints")]
+    public static int TableEditInts(long handle, nint key, long nowMs, ulong purgeLimit,
+                                    nint columns, uint columnCount, nint editFn, nint context) {
+        nint table = (nint)handle;
+        if (table == (nint)0 || key == (nint)0 || editFn == (nint)0 ||
+            columnCount > ShmTblOff.MAX_COLUMNS || (columnCount != 0U && columns == (nint)0)) {
+            return 0;
+        }
+        nint hdr = NativeMemory.Read<nint>(table + (nint)ShmTblOff.T_HEADER);
+        nint snap = table + (nint)ShmTblOff.T_SNAP;
+        nint snapCols = snap + (nint)ShmTblOff.H_COLUMNS;
+
+        SyncBuf256 offBuf = new SyncBuf256(); // 64 uints = 256 bytes
+        nint offsets = NativeMemory.AddressOf(ref offBuf);
+        ulong selected = 0UL;
+        for (uint i = 0U; i < columnCount; i++) {
+            nint colName = NativeMemory.At<nint>(columns, (long)i);
+            nint col = FindColumn(table, colName, ShmTblOff.COL_INT);
+            if (col == (nint)0) return 0;
+            long colIdx = ((long)col - (long)snapCols) / ShmTblOff.COL_SIZE;
+            ulong bit = 1UL << (int)colIdx;
+            if ((selected & bit) != 0UL) return 0;
+            selected |= bit;
+            NativeMemory.At<uint>(offsets, (long)i) = NativeMemory.Read<uint>(col + (nint)ShmTblOff.COL_OFFSET);
+        }
+
+        uint snapKeySz = NativeMemory.Read<uint>(snap + (nint)ShmTblOff.H_KEY_SIZE);
+        ulong keyLen = SyncPlat.StrNLen(key, (ulong)snapKeySz + 1UL);
+        StructLock(hdr);
+        if (nowMs < 0L) nowMs = SyncPlat.TimeEpochMs();
+        PurgeExpiredLocked(hdr, nowMs, purgeLimit);
+        if (keyLen == 0UL || keyLen > (ulong)snapKeySz) {
+            StructUnlock(hdr);
+            return 0;
+        }
+
+        ulong hash = HashBytes(key);
+        nint row = FindKeySlot(hdr, key, hash, false);
+        int exists = row != (nint)0 ? 1 : 0;
+        SyncBuf512 valBuf = new SyncBuf512(); // 64 longs = 512 bytes
+        nint values = NativeMemory.AddressOf(ref valBuf);
+        long expiresAt = 0L;
+        if (row != (nint)0) {
+            RowLock(row);
+            for (uint i = 0U; i < columnCount; i++) {
+                uint off = NativeMemory.At<uint>(offsets, (long)i);
+                NativeMemory.At<long>(values, (long)i) = NativeMemory.Read<long>(row + (nint)off);
+            }
+            expiresAt = NativeMemory.Read<long>(row + (nint)ShmTblOff.R_EXPIRES);
+        } else if (columnCount > 0U) {
+            SyncPlat.CMemset(values, 0, (ulong)columnCount * 8UL);
+        }
+
+        int committed = 0;
+        int action = NativeMemory.InvokeWithCC<int>("c", editFn, context, exists, values, NativeMemory.AddressOf(ref expiresAt));
+        if (action == ShmTblOff.EDIT_WRITE && expiresAt >= 0L) {
+            if (row == (nint)0) {
+                row = FindKeySlot(hdr, key, hash, true);
+                if (row != (nint)0) RowLock(row);
+            }
+            if (row != (nint)0) {
+                if (exists == 0) PublishKeyRow(hdr, row, key, keyLen, hash);
+                for (uint i = 0U; i < columnCount; i++) {
+                    uint off = NativeMemory.At<uint>(offsets, (long)i);
+                    NativeMemory.Write<long>(row + (nint)off, NativeMemory.At<long>(values, (long)i));
+                }
+                if (expiresAt != NativeMemory.Read<long>(row + (nint)ShmTblOff.R_EXPIRES)) {
+                    ExpirySet(hdr, RowSlot(hdr, row), row, expiresAt);
+                }
+                committed = 1;
+            }
+        } else if (action == ShmTblOff.EDIT_DELETE && row != (nint)0) {
+            DeleteRowLocked(hdr, row);
+            committed = 1;
+        }
+        if (row != (nint)0) RowUnlock(row);
+        StructUnlock(hdr);
+        return committed;
+    }
+
+    [Export("zan_shared_table_delete")]
+    public static int TableDelete(long handle, nint key) {
+        nint table = (nint)handle;
+        if (table == (nint)0) return 0;
+        nint hdr = NativeMemory.Read<nint>(table + (nint)ShmTblOff.T_HEADER);
+        StructLock(hdr);
+        PurgeExpiredLocked(hdr, SyncPlat.TimeEpochMs(), ShmTblOff.PURGE_MAX_BATCH);
+        nint row = FindRow(hdr, key, false);
+        if (row != (nint)0) {
+            RowLock(row);
+            DeleteRowLocked(hdr, row);
+            RowUnlock(row);
+        }
+        StructUnlock(hdr);
+        return row != (nint)0 ? 1 : 0;
+    }
+
+    [Export("zan_shared_table_exists")]
+    public static int TableExists(long handle, nint key) {
+        nint table = (nint)handle;
+        if (table == (nint)0) return 0;
+        nint hdr = NativeMemory.Read<nint>(table + (nint)ShmTblOff.T_HEADER);
+        PurgeExpired(hdr);
+        return FindRow(hdr, key, false) != (nint)0 ? 1 : 0;
+    }
+
+    [Export("zan_shared_table_count")]
+    public static long TableCount(long handle) {
+        nint table = (nint)handle;
+        if (table == (nint)0) return 0L;
+        nint hdr = NativeMemory.Read<nint>(table + (nint)ShmTblOff.T_HEADER);
+        PurgeExpired(hdr);
+        return (long)NativeMemory.Read<ulong>(hdr + (nint)ShmTblOff.H_COUNT);
+    }
+
+    [Export("zan_shared_table_clear")]
+    public static void TableClear(long handle) {
+        nint table = (nint)handle;
+        if (table == (nint)0) return;
+        nint hdr = NativeMemory.Read<nint>(table + (nint)ShmTblOff.T_HEADER);
+        StructLock(hdr);
+        ulong cap = NativeMemory.Read<ulong>(hdr + (nint)ShmTblOff.H_CAPACITY);
+        ulong stride = (ulong)NativeMemory.Read<uint>(hdr + (nint)ShmTblOff.H_ROW_STRIDE);
+        for (ulong i = 0UL; i < cap; i++) {
+            nint row = RowAt(hdr, i);
+            if (LoadState(row) == ShmTblOff.SLOT_EMPTY) continue;
+            RowLock(row);
+            uint st = LoadState(row);
+            if (st != ShmTblOff.SLOT_EMPTY) {
+                if (st == ShmTblOff.SLOT_USED) {
+                    SyncPlat.CMemset(row + (nint)8, 0, stride - 8UL);
+                }
+                PublishState(row, ShmTblOff.SLOT_EMPTY);
+            }
+            RowUnlock(row);
+        }
+        SyncPlat.CMemset(ExpiryHeap(hdr), 0, cap * 8UL);
+        NativeMemory.Write<ulong>(hdr + (nint)ShmTblOff.H_COUNT, 0UL);
+        NativeMemory.Write<ulong>(hdr + (nint)ShmTblOff.H_EXPIRY_COUNT, 0UL);
+        StructUnlock(hdr);
+    }
+
+    // ---- Policy compat entry points (rate_allow / lock_acquire / lock_release) ----
+
+    [Export("__zan_sync_apply_rate_window")]
+    [Visibility("hidden")]
+    static int ApplyRateWindow(nint ctx, int exists, nint values, nint expiresAtPtr) {
+        long nowMs = NativeMemory.Read<long>(ctx);
+        long winMs = NativeMemory.Read<long>(ctx + (nint)8);
+        long limit = NativeMemory.Read<long>(ctx + (nint)16);
+        long start = NativeMemory.At<long>(values, 1L);
+        if (start <= 0L || nowMs - start >= winMs) {
+            NativeMemory.At<long>(values, 0L) = 1L;
+            NativeMemory.At<long>(values, 1L) = nowMs;
+            NativeMemory.Write<long>(expiresAtPtr, nowMs + winMs);
+            return ShmTblOff.EDIT_WRITE;
+        }
+        long cnt = NativeMemory.At<long>(values, 0L);
+        if (cnt >= limit) return ShmTblOff.EDIT_KEEP;
+        NativeMemory.At<long>(values, 0L) = cnt + 1L;
+        return ShmTblOff.EDIT_WRITE;
+    }
+
+    [Export("zan_shared_table_rate_allow")]
+    public static int TableRateAllow(long handle, nint key, long nowMs, long windowMs, long limit) {
+        if (limit <= 0L) return 1;
+        if (handle == 0L || key == (nint)0 || windowMs <= 0L) return 0;
+        if (nowMs < 0L) nowMs = SyncPlat.TimeEpochMs();
+        if (nowMs < 0L || windowMs > 0x7FFFFFFFFFFFFFFFL - nowMs) return 0;
+
+        SyncBuf24 winCtx = new SyncBuf24();
+        nint cp = NativeMemory.AddressOf(ref winCtx);
+        NativeMemory.Write<long>(cp, nowMs);
+        NativeMemory.Write<long>(cp + (nint)8, windowMs);
+        NativeMemory.Write<long>(cp + (nint)16, limit);
+
+        SyncBuf16 cols = new SyncBuf16();
+        nint colp = NativeMemory.AddressOf(ref cols);
+        NativeMemory.At<nint>(colp, 0L) = (nint)"count";
+        NativeMemory.At<nint>(colp, 1L) = (nint)"window_start";
+
+        return TableEditInts(handle, key, nowMs, ShmTblOff.PURGE_MAX_BATCH, colp, 2U,
+                             NativeMemory.FunctionPointer(ApplyRateWindow), cp);
+    }
+
+    [Export("__zan_sync_insert_lease")]
+    [Visibility("hidden")]
+    static int InsertLease(nint ctx, int exists, nint values, nint expiresAtPtr) {
+        if (exists != 0) return ShmTblOff.EDIT_KEEP;
+        NativeMemory.At<long>(values, 0L) = NativeMemory.Read<long>(ctx);
+        NativeMemory.Write<long>(expiresAtPtr, NativeMemory.Read<long>(ctx + (nint)8));
+        return ShmTblOff.EDIT_WRITE;
+    }
+
+    [Export("zan_shared_table_lock_acquire")]
+    public static int TableLockAcquire(long handle, nint key, long owner, long nowMs, long leaseMs) {
+        if (handle == 0L || key == (nint)0 || owner == 0L || leaseMs <= 0L) return 0;
+        if (nowMs < 0L) nowMs = SyncPlat.TimeEpochMs();
+        if (nowMs < 0L || leaseMs > 0x7FFFFFFFFFFFFFFFL - nowMs) return 0;
+
+        SyncBuf16 leaseCtx = new SyncBuf16();
+        nint lp = NativeMemory.AddressOf(ref leaseCtx);
+        NativeMemory.Write<long>(lp, owner);
+        NativeMemory.Write<long>(lp + (nint)8, nowMs + leaseMs);
+
+        nint colOwner = (nint)"owner";
+        return TableEditInts(handle, key, nowMs, 0xFFFFFFFFFFFFFFFFUL,
+                             NativeMemory.AddressOf(ref colOwner), 1U,
+                             NativeMemory.FunctionPointer(InsertLease), lp);
+    }
+
+    [Export("__zan_sync_delete_owned_lease")]
+    [Visibility("hidden")]
+    static int DeleteOwnedLease(nint ctx, int exists, nint values, nint expiresAtPtr) {
+        long owner = NativeMemory.Read<long>(ctx);
+        return (exists != 0 && NativeMemory.At<long>(values, 0L) == owner) ? ShmTblOff.EDIT_DELETE : ShmTblOff.EDIT_KEEP;
+    }
+
+    [Export("zan_shared_table_lock_release")]
+    public static int TableLockRelease(long handle, nint key, long owner) {
+        if (owner == 0L) return 0;
+        nint colOwner = (nint)"owner";
+        return TableEditInts(handle, key, -1L, ShmTblOff.PURGE_MAX_BATCH,
+                             NativeMemory.AddressOf(ref colOwner), 1U,
+                             NativeMemory.FunctionPointer(DeleteOwnedLease), NativeMemory.AddressOf(ref owner));
+    }
+}

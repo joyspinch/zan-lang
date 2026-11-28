@@ -1,0 +1,979 @@
+// rt_mem_alloc.zan: Retired cache harvesting, slab alloc/decommit, fast/slow paths & C ABI exports.
+
+using System;
+using System.Numerics;
+using System.Threading;
+
+partial class ZanMemRuntime {
+    // ---- Harvesting / adopting retired caches & slab allocation ----
+
+    static nint HarvestFreeBlock(nint cPtr, int cls) {
+        if (Atomic.Load(ref s_cachePool, MemoryOrder.Acquire) == (nint)0) return (nint)0;
+        MemLock();
+        nint rcPtr = s_cachePool;
+        while (rcPtr != (nint)0) {
+            DrainRemoteAll(rcPtr);
+            nint rcFl = CacheFreeListAddr(rcPtr, cls);
+            nint p = NativeMemory.AsRef<nint>(rcFl);
+            if (p != (nint)0) {
+                NativeMemory.AsRef<nint>(rcFl) = (nint)0;
+                NativeMemory.AsRef<nint>(CacheFreeListAddr(cPtr, cls)) = NativeMemory.AsRef<nint>(LinkAddr(p, cls));
+                MemUnlock();
+                return p;
+            }
+            rcPtr = NativeMemory.AsRef<MemCache>(rcPtr).NextFree;
+        }
+        MemUnlock();
+        return (nint)0;
+    }
+
+    static bool AdoptRetiredPage(nint cPtr, int cls) {
+        if (Atomic.Load(ref s_cachePool, MemoryOrder.Acquire) == (nint)0) return false;
+        ulong sz = ClassSize(cls);
+        MemLock();
+        nint rcPtr = s_cachePool;
+        while (rcPtr != (nint)0) {
+            nint rcPbAddr = CachePageBumpAddr(rcPtr, cls);
+            nint rcPeAddr = CachePageEndAddr(rcPtr, cls);
+            nint pb = NativeMemory.AsRef<nint>(rcPbAddr);
+            nint pe = NativeMemory.AsRef<nint>(rcPeAddr);
+            if (pb != (nint)0 && ((ulong)pe - (ulong)pb) >= sz) {
+                NativeMemory.AsRef<nint>(CachePageBumpAddr(cPtr, cls)) = pb;
+                NativeMemory.AsRef<nint>(CachePageEndAddr(cPtr, cls)) = pe;
+                NativeMemory.AsRef<nint>(rcPbAddr) = (nint)0;
+                NativeMemory.AsRef<nint>(rcPeAddr) = (nint)0;
+                uint pi = 0U;
+                nint metaPtr = MetaOf(pb, ref pi);
+                NativeMemory.AsRef<MemCache>(cPtr).LastSlab = (ulong)metaPtr;
+                Atomic.StoreAt<nint>(MetaOwnerAddr(metaPtr, pi), cPtr, MemoryOrder.Release);
+                MemUnlock();
+                return true;
+            }
+            rcPtr = NativeMemory.AsRef<MemCache>(rcPtr).NextFree;
+        }
+        MemUnlock();
+        return false;
+    }
+
+    static bool AdoptRetiredBump(nint cPtr, ulong need) {
+        if (Atomic.Load(ref s_cachePool, MemoryOrder.Acquire) == (nint)0) return false;
+        MemLock();
+        nint rcPtr = s_cachePool;
+        while (rcPtr != (nint)0) {
+            ref MemCache rc = ref NativeMemory.AsRef<MemCache>(rcPtr);
+            if ((ulong)rc.BumpEnd >= (ulong)rc.Bump && ((ulong)rc.BumpEnd - (ulong)rc.Bump) >= need) {
+                ref MemCache c = ref NativeMemory.AsRef<MemCache>(cPtr);
+                c.Bump = rc.Bump;
+                c.BumpEnd = rc.BumpEnd;
+                c.BumpCommitted = rc.BumpCommitted;
+                c.BumpDecommitted = rc.BumpDecommitted;
+                rc.Bump = (nint)0;
+                rc.BumpEnd = (nint)0;
+                rc.BumpCommitted = (nint)0;
+                rc.BumpDecommitted = 0;
+                MemUnlock();
+                return true;
+            }
+            rcPtr = rc.NextFree;
+        }
+        MemUnlock();
+        return false;
+    }
+
+    static ulong OsEntropy() {
+        ulong ent = 0UL;
+#if WINDOWS
+        // Query advapi32 SystemFunction036 only if already loaded (never LoadLibrary under alloc path)
+        InlineArray<16, byte> advName = new InlineArray<16, byte>();
+        nint pAdv = NativeMemory.AddressOf(ref advName);
+        // "advapi32.dll\0"
+        NativeMemory.At<byte>(pAdv, 0) = (byte)97;   NativeMemory.At<byte>(pAdv, 1) = (byte)100;
+        NativeMemory.At<byte>(pAdv, 2) = (byte)118;  NativeMemory.At<byte>(pAdv, 3) = (byte)97;
+        NativeMemory.At<byte>(pAdv, 4) = (byte)112;  NativeMemory.At<byte>(pAdv, 5) = (byte)105;
+        NativeMemory.At<byte>(pAdv, 6) = (byte)51;   NativeMemory.At<byte>(pAdv, 7) = (byte)50;
+        NativeMemory.At<byte>(pAdv, 8) = (byte)46;   NativeMemory.At<byte>(pAdv, 9) = (byte)100;
+        NativeMemory.At<byte>(pAdv, 10) = (byte)108; NativeMemory.At<byte>(pAdv, 11) = (byte)108;
+        NativeMemory.At<byte>(pAdv, 12) = (byte)0;
+        nint adv = WinGetModuleHandleA(pAdv);
+        if (adv != (nint)0) {
+            InlineArray<20, byte> fnName = new InlineArray<20, byte>();
+            nint pFn = NativeMemory.AddressOf(ref fnName);
+            // "SystemFunction036\0"
+            NativeMemory.At<byte>(pFn, 0) = (byte)83;  NativeMemory.At<byte>(pFn, 1) = (byte)121;
+            NativeMemory.At<byte>(pFn, 2) = (byte)115; NativeMemory.At<byte>(pFn, 3) = (byte)116;
+            NativeMemory.At<byte>(pFn, 4) = (byte)101; NativeMemory.At<byte>(pFn, 5) = (byte)109;
+            NativeMemory.At<byte>(pFn, 6) = (byte)70;  NativeMemory.At<byte>(pFn, 7) = (byte)117;
+            NativeMemory.At<byte>(pFn, 8) = (byte)110; NativeMemory.At<byte>(pFn, 9) = (byte)99;
+            NativeMemory.At<byte>(pFn, 10) = (byte)116; NativeMemory.At<byte>(pFn, 11) = (byte)105;
+            NativeMemory.At<byte>(pFn, 12) = (byte)111; NativeMemory.At<byte>(pFn, 13) = (byte)110;
+            NativeMemory.At<byte>(pFn, 14) = (byte)48;  NativeMemory.At<byte>(pFn, 15) = (byte)51;
+            NativeMemory.At<byte>(pFn, 16) = (byte)54;  NativeMemory.At<byte>(pFn, 17) = (byte)0;
+            nint fn = WinGetProcAddress(adv, pFn);
+            if (fn != (nint)0) {
+                NativeMemory.InvokeWithCC<byte>("c", fn, NativeMemory.AddressOf(ref ent), 8U);
+            }
+        }
+        long qpc = 0L;
+        WinQueryPerformanceCounter(NativeMemory.AddressOf(ref qpc));
+        ent ^= (ulong)qpc ^ (((ulong)WinGetCurrentProcessId()) << 32) ^ (ulong)WinGetCurrentThreadId();
+#elif MACOS
+        MacArc4RandomBuf(NativeMemory.AddressOf(ref ent), 8UL);
+        ent ^= ((ulong)(uint)PosixGetPid()) << 16;
+#else
+        PosixGetRandom(NativeMemory.AddressOf(ref ent), 8UL, 1U); // GRND_NONBLOCK
+        ent ^= ((ulong)(uint)PosixGetPid()) << 16;
+#endif
+        return ent;
+    }
+
+    static bool PublishSlab(nint cPtr, ulong baseAddr) {
+        ulong ent = 0UL;
+        if (Atomic.Load(ref s_memSecret, MemoryOrder.Relaxed) == 0UL) {
+            ent = OsEntropy();
+        }
+        MemLock();
+        if (s_memSecret == 0UL) {
+            ulong x = ent ^ (ulong)NativeMemory.AddressOf(ref s_memSecret) ^
+                      (baseAddr * 0x9E3779B97F4A7C15UL) ^ (ulong)cPtr;
+            x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9UL;
+            x = (x ^ (x >> 27)) * 0x94D049BB133111EBUL;
+            x = x ^ (x >> 31);
+            Atomic.Store(ref s_memSecret, x | 1UL, MemoryOrder.Release);
+        }
+        if (s_slabTbl == (nint)0) {
+            s_slabInitTbl.Mask = ZAN_MEM_INIT_SET_SIZE - 1U;
+            s_slabInitTbl.Cap = ZAN_MEM_INIT_SET_SIZE;
+            s_slabInitTbl.Slots = NativeMemory.AddressOf(ref s_slabInitSlots);
+            s_slabInitTbl.Prev = (nint)0;
+            Atomic.Store(ref s_slabTbl, NativeMemory.AddressOf(ref s_slabInitTbl), MemoryOrder.Release);
+        }
+
+        uint minCap = 0U;
+        while (true) {
+            nint tblPtr = s_slabTbl;
+            ref SlabTable tbl = ref NativeMemory.AsRef<SlabTable>(tblPtr);
+            uint wantCap = 0U;
+            if (tbl.Cap < minCap) {
+                wantCap = minCap;
+            } else if ((s_slabCount + 1UL) * 2UL > (ulong)tbl.Cap) {
+                wantCap = tbl.Cap * 2U;
+            } else {
+                uint i = SlabHash(baseAddr, tbl.Mask);
+                uint n = 0U;
+                while (n < 64U && NativeMemory.At<ulong>(tbl.Slots, (long)((i + n) & tbl.Mask)) != 0UL) {
+                    n++;
+                }
+                if (n < 64U) {
+                    uint slotIdx = (i + n) & tbl.Mask;
+                    Atomic.StoreAt<ulong>(NativeMemory.Add<ulong>(tbl.Slots, (long)slotIdx), baseAddr, MemoryOrder.Release);
+                    Atomic.Store(ref s_slabCount, s_slabCount + 1UL, MemoryOrder.Release);
+                    break;
+                }
+                wantCap = tbl.Cap * 2U;
+            }
+
+            if (wantCap == 0U || wantCap > 16777216U) { // 1 << 24
+                MemUnlock();
+                return false;
+            }
+            MemUnlock();
+            nint ntPtr = AllocSlabTable(wantCap);
+            if (ntPtr == (nint)0) return false;
+            MemLock();
+            if (NativeMemory.AsRef<SlabTable>(s_slabTbl).Cap >= wantCap) {
+                MemUnlock();
+                RealFree(ntPtr);
+                MemLock();
+                continue;
+            }
+            nint oldPtr = s_slabTbl;
+            ref SlabTable old = ref NativeMemory.AsRef<SlabTable>(oldPtr);
+            ref SlabTable nt = ref NativeMemory.AsRef<SlabTable>(ntPtr);
+            bool ok = true;
+            for (uint k = 0U; k < old.Cap; k++) {
+                ulong v = NativeMemory.At<ulong>(old.Slots, (long)k);
+                if (v == 0UL) continue;
+                uint j = SlabHash(v, nt.Mask);
+                uint m = 0U;
+                while (m < 64U && NativeMemory.At<ulong>(nt.Slots, (long)((j + m) & nt.Mask)) != 0UL) {
+                    m++;
+                }
+                if (m == 64U) { ok = false; break; }
+                NativeMemory.At<ulong>(nt.Slots, (long)((j + m) & nt.Mask)) = v;
+            }
+            if (ok) {
+                uint i = SlabHash(baseAddr, nt.Mask);
+                uint n = 0U;
+                while (n < 64U && NativeMemory.At<ulong>(nt.Slots, (long)((i + n) & nt.Mask)) != 0UL) {
+                    n++;
+                }
+                if (n < 64U) {
+                    NativeMemory.At<ulong>(nt.Slots, (long)((i + n) & nt.Mask)) = baseAddr;
+                    nt.Prev = oldPtr;
+                    Atomic.Store(ref s_slabTbl, ntPtr, MemoryOrder.Release);
+                    Atomic.Store(ref s_slabCount, s_slabCount + 1UL, MemoryOrder.Release);
+                    break;
+                }
+            }
+            minCap = wantCap * 2U;
+            MemUnlock();
+            RealFree(ntPtr);
+            MemLock();
+        }
+        MemUnlock();
+
+        ref MemCache c = ref NativeMemory.AsRef<MemCache>(cPtr);
+        c.Bump = (nint)(baseAddr + ZAN_MEM_PAGE);
+        c.BumpEnd = (nint)(baseAddr + ZAN_MEM_SLAB);
+#if WINDOWS
+        c.BumpCommitted = c.Bump;
+#else
+        c.BumpCommitted = c.BumpEnd;
+#endif
+        c.BumpDecommitted = 0;
+        return true;
+    }
+
+    static bool NewSlab(nint cPtr) {
+        ulong span = ZAN_MEM_SLAB * 2UL;
+#if WINDOWS
+        nint raw = WinVirtualAlloc((nint)0, span, MEM_RESERVE, PAGE_NOACCESS);
+        if (raw == (nint)0) return false;
+        ulong baseAddr = ((ulong)raw + (ZAN_MEM_SLAB - 1UL)) & ~(ZAN_MEM_SLAB - 1UL);
+        if (WinVirtualAlloc((nint)baseAddr, ZAN_MEM_PAGE, MEM_COMMIT, PAGE_READWRITE) == (nint)0) {
+            WinVirtualFree(raw, 0UL, MEM_RELEASE);
+            return false;
+        }
+        if (!PublishSlab(cPtr, baseAddr)) {
+            WinVirtualFree(raw, 0UL, MEM_RELEASE);
+            return false;
+        }
+        return true;
+#else
+#if MACOS
+        MacZoneRegister();
+#endif
+        nint raw = PosixMmap((nint)0, span, PROT_READ_WRITE, MAP_PRIVATE_ANON, -1, 0L);
+        if (raw == (nint)(-1L)) return false;
+        ulong baseAddr = ((ulong)raw + (ZAN_MEM_SLAB - 1UL)) & ~(ZAN_MEM_SLAB - 1UL);
+        ulong head = baseAddr - (ulong)raw;
+        if (head != 0UL) PosixMunmap(raw, head);
+        ulong tail = span - head - ZAN_MEM_SLAB;
+        if (tail != 0UL) PosixMunmap((nint)(baseAddr + ZAN_MEM_SLAB), tail);
+        if (!PublishSlab(cPtr, baseAddr)) {
+            PosixMunmap((nint)baseAddr, ZAN_MEM_SLAB);
+            return false;
+        }
+        return true;
+#endif
+    }
+
+    static nint PopReclaimedPage() {
+        if (Atomic.Load(ref s_reclaimedHead, MemoryOrder.Acquire) == (nint)0) return (nint)0;
+        MemLock();
+        nint mPtr = s_reclaimedHead;
+        while (mPtr != (nint)0 && NativeMemory.AsRef<SlabMeta>(mPtr).ReclaimedMask == 0UL) {
+            ref SlabMeta cur = ref NativeMemory.AsRef<SlabMeta>(mPtr);
+            cur.InReclaimedList = (byte)0;
+            mPtr = cur.ReclaimedNext;
+            Atomic.Store(ref s_reclaimedHead, mPtr, MemoryOrder.Release);
+        }
+        if (mPtr == (nint)0) {
+            MemUnlock();
+            return (nint)0;
+        }
+        ref SlabMeta m = ref NativeMemory.AsRef<SlabMeta>(mPtr);
+        uint pi = (uint)BitOperations.TrailingZeroCount(m.ReclaimedMask);
+        m.ReclaimedMask &= ~(1UL << (int)pi);
+        if (m.ReclaimedMask == 0UL) {
+            m.InReclaimedList = (byte)0;
+            Atomic.Store(ref s_reclaimedHead, m.ReclaimedNext, MemoryOrder.Release);
+            m.ReclaimedNext = (nint)0;
+        }
+        MemUnlock();
+
+        nint page = (nint)((ulong)mPtr + (ulong)pi * ZAN_MEM_PAGE);
+#if WINDOWS
+        if (WinVirtualAlloc(page, ZAN_MEM_PAGE, MEM_COMMIT, PAGE_READWRITE) == (nint)0) {
+            MemLock();
+            ref SlabMeta mr = ref NativeMemory.AsRef<SlabMeta>(mPtr);
+            mr.ReclaimedMask |= (1UL << (int)pi);
+            if (mr.InReclaimedList == (byte)0) {
+                mr.ReclaimedNext = s_reclaimedHead;
+                mr.InReclaimedList = (byte)1;
+                Atomic.Store(ref s_reclaimedHead, mPtr, MemoryOrder.Release);
+            }
+            MemUnlock();
+            return (nint)0;
+        }
+#endif
+        return page;
+    }
+
+    // ---- Allocation fast & slow paths ----
+
+    static nint SmallSlow(nint cPtr, int cls) {
+        nint flAddr = CacheFreeListAddr(cPtr, cls);
+        nint p = NativeMemory.AsRef<nint>(flAddr);
+        if (p == (nint)0) {
+            DrainRemote(cPtr);
+            p = NativeMemory.AsRef<nint>(flAddr);
+        }
+        if (p != (nint)0) {
+            NativeMemory.AsRef<nint>(flAddr) = NativeMemory.AsRef<nint>(LinkAddr(p, cls));
+            NativeMemory.AsRef<ulong>(CookieAddr(p, cls)) = 0UL;
+            CountAlloc(cPtr);
+            return p;
+        }
+        p = HarvestFreeBlock(cPtr, cls);
+        if (p != (nint)0) {
+            NativeMemory.AsRef<ulong>(CookieAddr(p, cls)) = 0UL;
+            CountAlloc(cPtr);
+            return p;
+        }
+
+        ulong sz = ClassSize(cls);
+        nint pbAddr = CachePageBumpAddr(cPtr, cls);
+        nint peAddr = CachePageEndAddr(cPtr, cls);
+        nint pb = NativeMemory.AsRef<nint>(pbAddr);
+        nint pe = NativeMemory.AsRef<nint>(peAddr);
+        if (pb == (nint)0 || ((ulong)pe - (ulong)pb) < sz) {
+            if (!AdoptRetiredPage(cPtr, cls)) {
+                nint page = PopReclaimedPage();
+                if (page == (nint)0) {
+                    ref MemCache c = ref NativeMemory.AsRef<MemCache>(cPtr);
+                    if ((ulong)c.BumpEnd < (ulong)c.Bump || ((ulong)c.BumpEnd - (ulong)c.Bump) < ZAN_MEM_PAGE) {
+                        if (!AdoptRetiredBump(cPtr, ZAN_MEM_PAGE)) {
+                            if (!NewSlab(cPtr)) return (nint)0;
+                        }
+                    }
+#if WINDOWS
+                    if (c.BumpDecommitted != 0 || (ulong)c.BumpCommitted <= (ulong)c.Bump ||
+                        ((ulong)c.BumpCommitted - (ulong)c.Bump) < ZAN_MEM_PAGE) {
+                        ulong avail = (ulong)c.BumpEnd - (ulong)c.Bump;
+                        ulong chunk = (avail < ZAN_MEM_COMMIT_CHUNK) ? avail : ZAN_MEM_COMMIT_CHUNK;
+                        if (WinVirtualAlloc(c.Bump, chunk, MEM_COMMIT, PAGE_READWRITE) == (nint)0) {
+                            return (nint)0;
+                        }
+                        c.BumpCommitted = (nint)((ulong)c.Bump + chunk);
+                        c.BumpDecommitted = 0;
+                    }
+#else
+                    c.BumpDecommitted = 0;
+#endif
+                    page = c.Bump;
+                    c.Bump = (nint)((ulong)c.Bump + ZAN_MEM_PAGE);
+                }
+                uint pi = 0U;
+                nint metaPtr = MetaOf(page, ref pi);
+                NativeMemory.AsRef<MemCache>(cPtr).LastSlab = (ulong)metaPtr;
+                Atomic.StoreAt<nint>(MetaOwnerAddr(metaPtr, pi), cPtr, MemoryOrder.Relaxed);
+                Atomic.StoreAt<byte>(MetaCls1Addr(metaPtr, pi), (byte)(cls + 1), MemoryOrder.Release);
+                NativeMemory.AsRef<nint>(pbAddr) = page;
+                NativeMemory.AsRef<nint>(peAddr) = (nint)((ulong)page + PageSpan(cls));
+            }
+        }
+        p = NativeMemory.AsRef<nint>(pbAddr);
+        NativeMemory.AsRef<nint>(pbAddr) = (nint)((ulong)p + sz);
+        NativeMemory.AsRef<ulong>(CookieAddr(p, cls)) = 0UL;
+        CountAlloc(cPtr);
+        return p;
+    }
+
+    static nint SmallCls(int cls) {
+        nint cPtr = CacheGet();
+        if (cPtr == (nint)0) return (nint)0;
+        nint flAddr = CacheFreeListAddr(cPtr, cls);
+        nint p = NativeMemory.AsRef<nint>(flAddr);
+        if (p != (nint)0) {
+            NativeMemory.AsRef<nint>(flAddr) = NativeMemory.AsRef<nint>(LinkAddr(p, cls));
+            NativeMemory.AsRef<ulong>(CookieAddr(p, cls)) = 0UL;
+            CountAlloc(cPtr);
+            return p;
+        }
+        ref MemCache c = ref NativeMemory.AsRef<MemCache>(cPtr);
+        if (Atomic.Load(ref c.RemoteMask, MemoryOrder.Relaxed) != 0U) {
+            DrainRemote(cPtr);
+            p = NativeMemory.AsRef<nint>(flAddr);
+            if (p != (nint)0) {
+                NativeMemory.AsRef<nint>(flAddr) = NativeMemory.AsRef<nint>(LinkAddr(p, cls));
+                NativeMemory.AsRef<ulong>(CookieAddr(p, cls)) = 0UL;
+                CountAlloc(cPtr);
+                return p;
+            }
+        }
+        nint pbAddr = CachePageBumpAddr(cPtr, cls);
+        nint peAddr = CachePageEndAddr(cPtr, cls);
+        nint pb = NativeMemory.AsRef<nint>(pbAddr);
+        nint pe = NativeMemory.AsRef<nint>(peAddr);
+        ulong sz = ClassSize(cls);
+        if (pb != (nint)0 && ((ulong)pe - (ulong)pb) >= sz) {
+            NativeMemory.AsRef<nint>(pbAddr) = (nint)((ulong)pb + sz);
+            NativeMemory.AsRef<ulong>(CookieAddr(pb, cls)) = 0UL;
+            CountAlloc(cPtr);
+            return pb;
+        }
+        return SmallSlow(cPtr, cls);
+    }
+
+    static nint SmallAlloc(ulong n) {
+        if (Atomic.Load(ref s_classReady, MemoryOrder.Acquire) == 0) {
+            EnsureClasses();
+        }
+        int cls = (int)NativeMemory.At<byte>(NativeMemory.AddressOf(ref s_sizeClass), (long)n);
+        return SmallCls(cls);
+    }
+
+    // ---- Empty-page trimming & decommit ----
+
+    static ulong TrimCachePages(nint cPtr, bool lockHeld) {
+        ulong trimmed = 0UL;
+        DrainRemoteAll(cPtr);
+        for (int cls = 0; cls < ZAN_MEM_NCLASS; cls++) {
+            nint flAddr = CacheFreeListAddr(cPtr, cls);
+            nint head = NativeMemory.AsRef<nint>(flAddr);
+            if (head == (nint)0) continue;
+
+            ulong sz = ClassSize(cls);
+            ushort cap = (ushort)(PageSpan(cls) / sz);
+            nint pbAddr = CachePageBumpAddr(cPtr, cls);
+            nint peAddr = CachePageEndAddr(cPtr, cls);
+            nint pb = NativeMemory.AsRef<nint>(pbAddr);
+            nint pe = NativeMemory.AsRef<nint>(peAddr);
+            ulong partialPage = 0UL;
+            if (pb != (nint)0 && ((ulong)pe - (ulong)pb) >= sz) {
+                partialPage = (ulong)pb & ~(ZAN_MEM_PAGE - 1UL);
+            }
+
+            nint touched = (nint)0;
+            bool foundEmpty = false;
+            nint p = head;
+            while (p != (nint)0) {
+                uint pi = 0U;
+                nint mPtr = MetaOf(p, ref pi);
+                ref SlabMeta m = ref NativeMemory.AsRef<SlabMeta>(mPtr);
+                if (m.TrimTouched == 0UL) {
+                    m.TrimNext = touched;
+                    touched = mPtr;
+                }
+                m.TrimTouched |= (1UL << (int)pi);
+                nint cntAddr = MetaTrimCntAddr(mPtr, pi);
+                ushort cnt = (ushort)(NativeMemory.AsRef<ushort>(cntAddr) + (ushort)1);
+                NativeMemory.AsRef<ushort>(cntAddr) = cnt;
+                if (cnt == cap) {
+                    ulong paddr = (ulong)mPtr + (ulong)pi * ZAN_MEM_PAGE;
+                    if (paddr != partialPage) foundEmpty = true;
+                }
+                p = NativeMemory.AsRef<nint>(LinkAddr(p, cls));
+            }
+
+            if (foundEmpty) {
+                nint pp = flAddr;
+                while (NativeMemory.AsRef<nint>(pp) != (nint)0) {
+                    nint cur = NativeMemory.AsRef<nint>(pp);
+                    uint pi = 0U;
+                    nint mPtr = MetaOf(cur, ref pi);
+                    ulong paddr = (ulong)mPtr + (ulong)pi * ZAN_MEM_PAGE;
+                    ushort cnt = NativeMemory.AsRef<ushort>(MetaTrimCntAddr(mPtr, pi));
+                    if (cnt == cap && paddr != partialPage) {
+                        NativeMemory.AsRef<nint>(pp) = NativeMemory.AsRef<nint>(LinkAddr(cur, cls));
+                    } else {
+                        pp = LinkAddr(cur, cls);
+                    }
+                }
+                if (pb != (nint)0 && partialPage == 0UL) {
+                    uint pi = 0U;
+                    nint mPtr = MetaOf((nint)((ulong)pe - 1UL), ref pi);
+                    if (NativeMemory.AsRef<ushort>(MetaTrimCntAddr(mPtr, pi)) == cap) {
+                        NativeMemory.AsRef<nint>(pbAddr) = (nint)0;
+                        NativeMemory.AsRef<nint>(peAddr) = (nint)0;
+                    }
+                }
+                nint mPtr = touched;
+                while (mPtr != (nint)0) {
+                    ref SlabMeta m = ref NativeMemory.AsRef<SlabMeta>(mPtr);
+                    nint next = m.TrimNext;
+                    ulong mask = m.TrimTouched;
+                    ulong reclaimed = 0UL;
+                    while (mask != 0UL) {
+                        uint pi = (uint)BitOperations.TrailingZeroCount(mask);
+                        mask &= mask - 1UL;
+                        ulong paddr = (ulong)mPtr + (ulong)pi * ZAN_MEM_PAGE;
+                        nint cntAddr = MetaTrimCntAddr(mPtr, pi);
+                        if (NativeMemory.AsRef<ushort>(cntAddr) == cap && paddr != partialPage) {
+                            Atomic.StoreAt<byte>(MetaCls1Addr(mPtr, pi), (byte)0, MemoryOrder.Release);
+                            Atomic.StoreAt<nint>(MetaOwnerAddr(mPtr, pi), (nint)0, MemoryOrder.Release);
+#if WINDOWS
+                            WinVirtualFree((nint)paddr, ZAN_MEM_PAGE, MEM_DECOMMIT);
+#else
+                            PosixMadvise((nint)paddr, ZAN_MEM_PAGE, MADV_DONTNEED);
+#endif
+                            reclaimed |= (1UL << (int)pi);
+                            trimmed += ZAN_MEM_PAGE;
+                        }
+                        NativeMemory.AsRef<ushort>(cntAddr) = (ushort)0;
+                    }
+                    m.TrimTouched = 0UL;
+                    m.TrimNext = (nint)0;
+                    if (reclaimed != 0UL) {
+                        if (!lockHeld) MemLock();
+                        m.ReclaimedMask |= reclaimed;
+                        if (m.InReclaimedList == (byte)0) {
+                            m.ReclaimedNext = s_reclaimedHead;
+                            m.InReclaimedList = (byte)1;
+                            Atomic.Store(ref s_reclaimedHead, mPtr, MemoryOrder.Release);
+                        }
+                        if (!lockHeld) MemUnlock();
+                    }
+                    mPtr = next;
+                }
+            } else {
+                nint mPtr = touched;
+                while (mPtr != (nint)0) {
+                    ref SlabMeta m = ref NativeMemory.AsRef<SlabMeta>(mPtr);
+                    nint next = m.TrimNext;
+                    ulong mask = m.TrimTouched;
+                    while (mask != 0UL) {
+                        uint pi = (uint)BitOperations.TrailingZeroCount(mask);
+                        mask &= mask - 1UL;
+                        NativeMemory.AsRef<ushort>(MetaTrimCntAddr(mPtr, pi)) = (ushort)0;
+                    }
+                    m.TrimTouched = 0UL;
+                    m.TrimNext = (nint)0;
+                    mPtr = next;
+                }
+            }
+        }
+        return trimmed;
+    }
+
+    // ---- Core alloc / free / realloc ----
+
+    static nint WrapMallocImpl(ulong n) {
+        if (n == 0UL) n = 1UL;
+        if (n <= ZAN_MEM_MAX_SMALL) {
+            nint p = SmallAlloc(n);
+            if (p != (nint)0) return p;
+        }
+        return RealMalloc(n);
+    }
+
+    static void WrapFreeImpl(nint p) {
+        if (p == (nint)0) return;
+        nint self = CacheTlsGet();
+        ulong baseAddr = (ulong)p & ~(ZAN_MEM_SLAB - 1UL);
+        if (!(self != (nint)0 && baseAddr == NativeMemory.AsRef<MemCache>(self).LastSlab)) {
+            if (!OwnsPtr(p)) {
+                RealFree(p);
+                return;
+            }
+        }
+        int cls = BlockClass(p);
+        if (cls < 0) {
+            FatalBlock(1, p);
+            return;
+        }
+        uint pi = (uint)(((ulong)p - baseAddr) >> ZAN_MEM_PAGE_SHIFT);
+        nint metaPtr = (nint)baseAddr;
+        ulong ck = ComputeCookie(p);
+        nint wAddr = CookieAddr(p, cls);
+        nint linkAddr = LinkAddr(p, cls);
+        nint owner = Atomic.LoadAt<nint>(MetaOwnerAddr(metaPtr, pi), MemoryOrder.Relaxed);
+
+        if (owner == self && self != (nint)0) {
+            if (Atomic.Load(ref s_multiThread, MemoryOrder.Relaxed) == 0) {
+                if (NativeMemory.AsRef<ulong>(wAddr) == ck) {
+                    FatalBlock(0, p);
+                    return;
+                }
+                NativeMemory.AsRef<ulong>(wAddr) = ck;
+            } else if (Atomic.ExchangeAt<ulong>(wAddr, ck, MemoryOrder.AcqRel) == ck) {
+                FatalBlock(0, p);
+                return;
+            }
+            NativeMemory.AsRef<MemCache>(self).LastSlab = baseAddr;
+            nint flAddr = CacheFreeListAddr(self, cls);
+            NativeMemory.AsRef<nint>(linkAddr) = NativeMemory.AsRef<nint>(flAddr);
+            NativeMemory.AsRef<nint>(flAddr) = p;
+            return;
+        }
+
+        Atomic.Store(ref s_multiThread, 1, MemoryOrder.Release);
+        if (Atomic.ExchangeAt<ulong>(wAddr, ck, MemoryOrder.AcqRel) == ck) {
+            FatalBlock(0, p);
+            return;
+        }
+        owner = Atomic.LoadAt<nint>(MetaOwnerAddr(metaPtr, pi), MemoryOrder.Acquire);
+        if (owner == (nint)0) return;
+
+        int s = 0;
+        if (self != (nint)0) {
+            s = (int)((((ulong)self) >> 4) & (ulong)(ZAN_MEM_REMOTE_STRIPES - 1));
+        } else {
+            s = (int)(Atomic.FetchAdd(ref s_remoteRr, 1U, MemoryOrder.Relaxed) & (uint)(ZAN_MEM_REMOTE_STRIPES - 1));
+        }
+        nint slotAddr = CacheRemoteHeadAddr(owner, s);
+        nint head = Atomic.LoadAt<nint>(slotAddr, MemoryOrder.Relaxed);
+        while (true) {
+            NativeMemory.AsRef<nint>(linkAddr) = head;
+            nint prev = Atomic.CompareExchangeAt<nint>(slotAddr, head, p, MemoryOrder.Release, MemoryOrder.Relaxed);
+            if (prev == head) break;
+            head = prev;
+        }
+        if (head == (nint)0) {
+            ref MemCache ownerRef = ref NativeMemory.AsRef<MemCache>(owner);
+            Atomic.FetchOr(ref ownerRef.RemoteMask, 1U << s, MemoryOrder.Release);
+        }
+        if (self != (nint)0 && self != owner &&
+            Atomic.Load(ref NativeMemory.AsRef<MemCache>(self).RemoteMask, MemoryOrder.Relaxed) != 0U) {
+            DrainRemote(self);
+        }
+    }
+
+    // ---- Exported C ABI Runtime Symbols ----
+
+    [Export("zan_mem_slabs")]
+    [Visibility("hidden")]
+    public static ulong ExportSlabs() {
+        return Atomic.Load(ref s_slabCount, MemoryOrder.Relaxed);
+    }
+
+    [Export("zan_mem_get_stats")]
+    [Visibility("hidden")]
+    public static void ExportGetStats(nint outPtr) {
+        if (outPtr == (nint)0) return;
+        ref ZanMemStats st = ref NativeMemory.AsRef<ZanMemStats>(outPtr);
+        ulong slabs = Atomic.Load(ref s_slabCount, MemoryOrder.Relaxed);
+        st.SlabCount = slabs;
+        st.SlabBytes = slabs * ZAN_MEM_SLAB;
+        ulong cnt = Atomic.Load(ref s_smallAllocCount, MemoryOrder.Relaxed);
+        nint self = CacheTlsGet();
+        if (self != (nint)0) cnt += (ulong)NativeMemory.AsRef<MemCache>(self).AllocBatch;
+        st.SmallAllocCount = cnt;
+        st.TrimmedBytes = Atomic.Load(ref s_trimmedBytes, MemoryOrder.Relaxed);
+    }
+
+    [Export("zan_mem_trim")]
+    [Visibility("hidden")]
+    public static ulong ExportTrim() {
+        if (Atomic.Load(ref s_classReady, MemoryOrder.Acquire) == 0) return 0UL;
+        ulong totalTrimmed = 0UL;
+        // Fixed lock order: TrimLock -> MemLock (no deadlock)
+        TrimLock();
+        MemLock();
+        nint rcPtr = s_cachePool;
+        while (rcPtr != (nint)0) {
+            totalTrimmed += TrimCachePages(rcPtr, true);
+            ref MemCache rc = ref NativeMemory.AsRef<MemCache>(rcPtr);
+            if (rc.Bump != (nint)0 && rc.BumpEnd != (nint)0 && rc.BumpDecommitted == 0) {
+                ulong start = ((ulong)rc.Bump + 4095UL) & ~4095UL;
+#if WINDOWS
+                ulong end = (ulong)rc.BumpCommitted & ~4095UL;
+#else
+                ulong end = (ulong)rc.BumpEnd & ~4095UL;
+#endif
+                if (end > start) {
+                    ulong bytes = end - start;
+#if WINDOWS
+                    WinVirtualFree((nint)start, bytes, MEM_DECOMMIT);
+                    rc.BumpCommitted = rc.Bump;
+#else
+                    PosixMadvise((nint)start, bytes, MADV_DONTNEED);
+#endif
+                    rc.BumpDecommitted = 1;
+                    totalTrimmed += bytes;
+                }
+            }
+            rcPtr = rc.NextFree;
+        }
+        MemUnlock();
+
+        nint self = CacheTlsGet();
+        if (self != (nint)0) {
+            totalTrimmed += TrimCachePages(self, false);
+            ref MemCache sc = ref NativeMemory.AsRef<MemCache>(self);
+            if (sc.Bump != (nint)0 && sc.BumpEnd != (nint)0 && sc.BumpDecommitted == 0) {
+                ulong start = ((ulong)sc.Bump + 4095UL) & ~4095UL;
+#if WINDOWS
+                ulong end = (ulong)sc.BumpCommitted & ~4095UL;
+#else
+                ulong end = (ulong)sc.BumpEnd & ~4095UL;
+#endif
+                if (end > start && (end - start) >= 65536UL) {
+                    ulong bytes = end - start;
+#if WINDOWS
+                    WinVirtualFree((nint)start, bytes, MEM_DECOMMIT);
+                    sc.BumpCommitted = sc.Bump;
+#else
+                    PosixMadvise((nint)start, bytes, MADV_DONTNEED);
+#endif
+                    sc.BumpDecommitted = 1;
+                    totalTrimmed += bytes;
+                }
+            }
+        }
+        TrimUnlock();
+
+        if (totalTrimmed > 0UL) {
+            Atomic.FetchAdd(ref s_trimmedBytes, totalTrimmed, MemoryOrder.Relaxed);
+        }
+        return totalTrimmed;
+    }
+
+#if MACOS
+    [Export("zan_mem_malloc")]
+    [Visibility("hidden")]
+    public static nint ExportWrapMalloc(ulong n) {
+        return WrapMallocImpl(n);
+    }
+#else
+    [Export("__wrap_malloc")]
+    [Visibility("hidden")]
+    public static nint ExportWrapMalloc(ulong n) {
+        return WrapMallocImpl(n);
+    }
+#endif
+
+    [Export("zan_mem_str_malloc")]
+    [Visibility("hidden")]
+    public static nint ExportStrMalloc(ulong n) {
+        if (n <= ZAN_MEM_STR_MAX) {
+            if (Atomic.Load(ref s_classReady, MemoryOrder.Acquire) == 0) EnsureClasses();
+            ulong k = (n <= ZAN_MEM_STR_MIN) ? ZAN_MEM_STR_MIN : ((n + 7UL) & ~7UL);
+            nint p = SmallCls(ZAN_MEM_STR_CLS0 + (int)((k - ZAN_MEM_STR_MIN) / 8UL));
+            if (p != (nint)0) return p;
+        }
+        return WrapMallocImpl(n + ZAN_MEM_STR_SKEW);
+    }
+
+    [Export("zan_mem_obj_malloc")]
+    [Visibility("hidden")]
+    public static nint ExportObjMalloc(ulong n) {
+        if (n <= ZAN_MEM_OBJ_MAX && (n & 15UL) == 8UL) {
+            if (Atomic.Load(ref s_classReady, MemoryOrder.Acquire) == 0) EnsureClasses();
+            nint p = SmallCls(ZAN_MEM_OBJ_CLS0 + (int)(n >> 4) - 1);
+            if (p != (nint)0) return p;
+        }
+        return WrapMallocImpl(n);
+    }
+
+#if MACOS
+    [Export("zan_mem_free")]
+    [Visibility("hidden")]
+    public static void ExportWrapFree(nint p) {
+        WrapFreeImpl(p);
+    }
+
+    [Export("zan_mem_calloc")]
+    [Visibility("hidden")]
+    public static nint ExportWrapCalloc(ulong n, ulong m) {
+        return WrapCallocImpl(n, m);
+    }
+
+    [Export("zan_mem_realloc")]
+    [Visibility("hidden")]
+    public static nint ExportWrapRealloc(nint p, ulong n) {
+        return WrapReallocImpl(p, n);
+    }
+#else
+    [Export("__wrap_free")]
+    [Visibility("hidden")]
+    public static void ExportWrapFree(nint p) {
+        WrapFreeImpl(p);
+    }
+
+    [Export("__wrap_calloc")]
+    [Visibility("hidden")]
+    public static nint ExportWrapCalloc(ulong n, ulong m) {
+        return WrapCallocImpl(n, m);
+    }
+
+    [Export("__wrap_realloc")]
+    [Visibility("hidden")]
+    public static nint ExportWrapRealloc(nint p, ulong n) {
+        return WrapReallocImpl(p, n);
+    }
+#endif
+
+    static nint WrapCallocImpl(ulong n, ulong m) {
+        ulong total = n * m;
+        if (n != 0UL && total / n != m) return (nint)0;
+        if (total <= ZAN_MEM_MAX_SMALL) {
+            nint p = SmallAlloc((total != 0UL) ? total : 1UL);
+            if (p != (nint)0) {
+                CMemset(p, 0, total);
+                return p;
+            }
+        }
+        return RealCalloc(n, m);
+    }
+
+    static nint WrapReallocImpl(nint p, ulong n) {
+        if (p == (nint)0) return WrapMallocImpl(n);
+        if (n == 0UL) {
+            WrapFreeImpl(p);
+            return (nint)0;
+        }
+        if (!OwnsPtr(p)) return RealRealloc(p, n);
+        int cls = BlockClass(p);
+        if (cls < 0) {
+            FatalBlock(1, p);
+            return (nint)0;
+        }
+        if (Atomic.LoadAt<ulong>(CookieAddr(p, cls), MemoryOrder.Acquire) == ComputeCookie(p)) {
+            FatalBlock(2, p);
+            return (nint)0;
+        }
+        ulong old = ClassSize(cls);
+        if (IsStrCls(cls)) {
+            old += ZAN_MEM_STR_SKEW;
+            nint np = WrapMallocImpl(n);
+            if (np == (nint)0) return (nint)0;
+            CMemcpy(np, p, (n < old) ? n : old);
+            WrapFreeImpl(p);
+            return np;
+        }
+        if (n <= old) return p;
+        nint np2 = WrapMallocImpl(n);
+        if (np2 == (nint)0) return (nint)0;
+        CMemcpy(np2, p, old);
+        WrapFreeImpl(p);
+        return np2;
+    }
+
+#if MACOS
+    // Apple libmalloc zone registration: lets libc free()/realloc()/malloc_size()
+    // recognize and route Zan-owned slab pointers back into zan_mem_*.
+    static InlineArray<16, nint> s_macZoneIntrospect; // 128B malloc_introspection_t
+    static InlineArray<20, nint> s_macZone;           // 160B malloc_zone_t (version 9)
+    static int s_macZoneState = 0;                    // 0=uninit, 1=initing, 2=ready
+
+    static ulong MacBlockSize(nint p) {
+        if (p == (nint)0 || !OwnsPtr(p)) return 0UL;
+        int cls = BlockClass(p);
+        if (cls < 0) return 0UL;
+        if (Atomic.LoadAt<ulong>(CookieAddr(p, cls), MemoryOrder.Acquire) == ComputeCookie(p)) return 0UL;
+        return ClassSize(cls) + (IsStrCls(cls) ? ZAN_MEM_STR_SKEW : 0UL);
+    }
+
+    [Export("__zan_zz_size")] [Visibility("hidden")]
+    static ulong ZzSize(nint z, nint p) => MacBlockSize(p);
+
+    [Export("__zan_zz_malloc")] [Visibility("hidden")]
+    static nint ZzMalloc(nint z, ulong n) => WrapMallocImpl(n);
+
+    [Export("__zan_zz_calloc")] [Visibility("hidden")]
+    static nint ZzCalloc(nint z, ulong n, ulong m) => WrapCallocImpl(n, m);
+
+    [Export("__zan_zz_valloc")] [Visibility("hidden")]
+    static nint ZzValloc(nint z, ulong n) => MacValloc(n);
+
+    [Export("__zan_zz_free")] [Visibility("hidden")]
+    static void ZzFree(nint z, nint p) { WrapFreeImpl(p); }
+
+    [Export("__zan_zz_free_definite")] [Visibility("hidden")]
+    static void ZzFreeDefinite(nint z, nint p, ulong n) { WrapFreeImpl(p); }
+
+    [Export("__zan_zz_realloc")] [Visibility("hidden")]
+    static nint ZzRealloc(nint z, nint p, ulong n) => WrapReallocImpl(p, n);
+
+    [Export("__zan_zz_memalign")] [Visibility("hidden")]
+    static nint ZzMemalign(nint z, ulong align, ulong n) {
+        nint p = (nint)0;
+        return MacPosixMemalign(NativeMemory.AddressOf(ref p), align, n) == 0 ? p : (nint)0;
+    }
+
+    [Export("__zan_zz_destroy")] [Visibility("hidden")]
+    static void ZzDestroy(nint z) { }
+
+    [Export("__zan_zz_enumerator")] [Visibility("hidden")]
+    static int ZzEnumerator(uint task, nint ctx, uint type, ulong zone, nint reader, nint recorder) => 0;
+
+    [Export("__zan_zz_good_size")] [Visibility("hidden")]
+    static ulong ZzGoodSize(nint z, ulong n) {
+        if (n == 0UL) n = 1UL;
+        if (n > ZAN_MEM_MAX_SMALL) return n;
+        if (Atomic.Load(ref s_classReady, MemoryOrder.Acquire) == 0) EnsureClasses();
+        int cls = (int)NativeMemory.At<byte>(NativeMemory.AddressOf(ref s_sizeClass), (long)n);
+        return ClassSize(cls);
+    }
+
+    [Export("__zan_zz_check")] [Visibility("hidden")]
+    static int ZzCheck(nint z) => 1;
+
+    [Export("__zan_zz_print")] [Visibility("hidden")]
+    static void ZzPrint(nint z, int verbose) { }
+
+    [Export("__zan_zz_log")] [Visibility("hidden")]
+    static void ZzLog(nint z, nint addr) { }
+
+    [Export("__zan_zz_force_lock")] [Visibility("hidden")]
+    static void ZzForceLock(nint z) { MemLock(); }
+
+    [Export("__zan_zz_force_unlock")] [Visibility("hidden")]
+    static void ZzForceUnlock(nint z) { MemUnlock(); }
+
+    [Export("__zan_zz_reinit_lock")] [Visibility("hidden")]
+    static void ZzReinitLock(nint z) { Atomic.Store(ref s_slabLock, 0, MemoryOrder.Release); }
+
+    [Export("__zan_zz_statistics")] [Visibility("hidden")]
+    static void ZzStatistics(nint z, nint stPtr) {
+        if (stPtr == (nint)0) return;
+        CMemset(stPtr, 0, 32UL);
+        ulong slabs = Atomic.Load(ref s_slabCount, MemoryOrder.Relaxed);
+        NativeMemory.AsRef<ulong>(stPtr + (nint)24) = slabs * ZAN_MEM_SLAB;
+    }
+
+    [Export("__zan_zz_locked")] [Visibility("hidden")]
+    static int ZzLocked(nint z) => Atomic.Load(ref s_slabLock, MemoryOrder.Relaxed) != 0 ? 1 : 0;
+
+    static void MacZoneRegister() {
+        int st = Atomic.Load(ref s_macZoneState, MemoryOrder.Acquire);
+        if (st == 2) return;
+        if (st == 0 && Atomic.CompareExchangeBool(ref s_macZoneState, 0, 1, MemoryOrder.AcqRel, MemoryOrder.Acquire)) {
+            nint ip = NativeMemory.AddressOf(ref s_macZoneIntrospect);
+            CMemset(ip, 0, 128UL);
+            NativeMemory.AsRef<nint>(ip + (nint)0) = NativeMemory.FunctionPointer(ZzEnumerator);
+            NativeMemory.AsRef<nint>(ip + (nint)8) = NativeMemory.FunctionPointer(ZzGoodSize);
+            NativeMemory.AsRef<nint>(ip + (nint)16) = NativeMemory.FunctionPointer(ZzCheck);
+            NativeMemory.AsRef<nint>(ip + (nint)24) = NativeMemory.FunctionPointer(ZzPrint);
+            NativeMemory.AsRef<nint>(ip + (nint)32) = NativeMemory.FunctionPointer(ZzLog);
+            NativeMemory.AsRef<nint>(ip + (nint)40) = NativeMemory.FunctionPointer(ZzForceLock);
+            NativeMemory.AsRef<nint>(ip + (nint)48) = NativeMemory.FunctionPointer(ZzForceUnlock);
+            NativeMemory.AsRef<nint>(ip + (nint)56) = NativeMemory.FunctionPointer(ZzStatistics);
+            NativeMemory.AsRef<nint>(ip + (nint)64) = NativeMemory.FunctionPointer(ZzLocked);
+            NativeMemory.AsRef<nint>(ip + (nint)104) = NativeMemory.FunctionPointer(ZzReinitLock);
+
+            nint zp = NativeMemory.AddressOf(ref s_macZone);
+            CMemset(zp, 0, 160UL);
+            NativeMemory.AsRef<nint>(zp + (nint)16) = NativeMemory.FunctionPointer(ZzSize);
+            NativeMemory.AsRef<nint>(zp + (nint)24) = NativeMemory.FunctionPointer(ZzMalloc);
+            NativeMemory.AsRef<nint>(zp + (nint)32) = NativeMemory.FunctionPointer(ZzCalloc);
+            NativeMemory.AsRef<nint>(zp + (nint)40) = NativeMemory.FunctionPointer(ZzValloc);
+            NativeMemory.AsRef<nint>(zp + (nint)48) = NativeMemory.FunctionPointer(ZzFree);
+            NativeMemory.AsRef<nint>(zp + (nint)56) = NativeMemory.FunctionPointer(ZzRealloc);
+            NativeMemory.AsRef<nint>(zp + (nint)64) = NativeMemory.FunctionPointer(ZzDestroy);
+            NativeMemory.AsRef<nint>(zp + (nint)72) = (nint)"zan_mem";
+            NativeMemory.AsRef<nint>(zp + (nint)96) = ip;
+            NativeMemory.AsRef<uint>(zp + (nint)104) = 9U;
+            NativeMemory.AsRef<nint>(zp + (nint)112) = NativeMemory.FunctionPointer(ZzMemalign);
+            NativeMemory.AsRef<nint>(zp + (nint)120) = NativeMemory.FunctionPointer(ZzFreeDefinite);
+
+            MacMallocZoneRegister(zp);
+            Atomic.Store(ref s_macZoneState, 2, MemoryOrder.Release);
+            return;
+        }
+        while (Atomic.Load(ref s_macZoneState, MemoryOrder.Acquire) == 1) {
+            Atomic.Pause();
+        }
+    }
+#endif
+
+#if LINUX
+    [Export("__wrap___malloc_allzerop")]
+    [Visibility("hidden")]
+    public static int ExportWrapMallocAllZeroP(nint p) {
+        return OwnsPtr(p) ? 0 : 0;
+    }
+#endif
+}

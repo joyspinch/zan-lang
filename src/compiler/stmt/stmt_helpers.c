@@ -281,6 +281,416 @@ static void emit_loop_preheader_list_guards(zan_irgen_t *g,
   }
 }
 
+/* --- Loop Bounds Check Elimination (BCE) & Preheader Span Versioning --- */
+static bool bce_ident_eq(zan_istr_t a, zan_istr_t b) {
+  return a.len > 0 && a.len == b.len && memcmp(a.str, b.str, a.len) == 0;
+}
+
+bool irgen_bce_check(zan_irgen_t *g, zan_ast_node_t *container_expr,
+                     zan_ast_node_t *index_expr, local_scope_t *locals,
+                     int *out_scope_id) {
+  if (!g || !container_expr || !index_expr || !locals || g->loop_bce_count <= 0)
+    return false;
+  if (container_expr->kind != AST_IDENTIFIER)
+    return false;
+  local_var_t *clv = local_find(locals, container_expr->ident.name);
+  if (!clv)
+    return false;
+  local_var_t *ilv = NULL;
+  int64_t off = 0;
+  if (index_expr->kind == AST_IDENTIFIER) {
+    ilv = local_find(locals, index_expr->ident.name);
+    off = 0;
+  } else if (index_expr->kind == AST_BINARY && index_expr->binary.op == TK_PLUS) {
+    zan_ast_node_t *L = index_expr->binary.left;
+    zan_ast_node_t *R = index_expr->binary.right;
+    if (L && R && L->kind == AST_IDENTIFIER && R->kind == AST_INT_LITERAL &&
+        R->int_val >= 0) {
+      ilv = local_find(locals, L->ident.name);
+      off = R->int_val;
+    } else if (L && R && R->kind == AST_IDENTIFIER && L->kind == AST_INT_LITERAL &&
+               L->int_val >= 0) {
+      ilv = local_find(locals, R->ident.name);
+      off = L->int_val;
+    }
+  }
+  if (!ilv)
+    return false;
+  for (int i = g->loop_bce_count - 1; i >= 0; i--) {
+    if (g->loop_bce[i].container_local == clv &&
+        g->loop_bce[i].iv_local == ilv &&
+        off <= g->loop_bce[i].max_offset) {
+      if (out_scope_id)
+        *out_scope_id = g->loop_bce[i].alias_scope_id;
+      return true;
+    }
+  }
+  return false;
+}
+
+typedef struct {
+  zan_istr_t name;
+  bool mutated;
+  bool has_unsafe_cf;
+} bce_mut_scan_t;
+
+static zan_walk_action_t bce_mut_visit(zan_ast_node_t *n, void *u) {
+  bce_mut_scan_t *s = (bce_mut_scan_t *)u;
+  switch (n->kind) {
+  case AST_TRY_STMT:
+  case AST_AWAIT_EXPR:
+  case AST_YIELD_STMT:
+  case AST_GOTO_STMT:
+  case AST_LABEL_STMT:
+    s->has_unsafe_cf = true;
+    break;
+  case AST_LAMBDA:
+  case AST_METHOD_DECL:
+    s->mutated = true;
+    s->has_unsafe_cf = true;
+    return ZAN_WALK_ABORT;
+  case AST_ASSIGNMENT: {
+    zan_ast_node_t *l = n->binary.left;
+    if (l && l->kind == AST_IDENTIFIER && bce_ident_eq(l->ident.name, s->name))
+      s->mutated = true;
+    break;
+  }
+  case AST_UNARY:
+  case AST_POSTFIX_UNARY:
+    if (n->unary.operand && n->unary.operand->kind == AST_IDENTIFIER &&
+        bce_ident_eq(n->unary.operand->ident.name, s->name) &&
+        (n->unary.op == TK_PLUS_PLUS || n->unary.op == TK_MINUS_MINUS))
+      s->mutated = true;
+    break;
+  case AST_REF_ARG:
+    if (n->ref_arg.expr && n->ref_arg.expr->kind == AST_IDENTIFIER &&
+        bce_ident_eq(n->ref_arg.expr->ident.name, s->name))
+      s->mutated = true;
+    break;
+  case AST_VAR_DECL:
+    if (bce_ident_eq(n->var_decl.name, s->name))
+      s->mutated = true;
+    break;
+  default:
+    break;
+  }
+  return ZAN_WALK_CONTINUE;
+}
+
+static bool bce_var_is_invariant(zan_ast_node_t *node, zan_istr_t name,
+                                 bool *out_unsafe_cf) {
+  bce_mut_scan_t s = { name, false, false };
+  if (node)
+    zan_ast_walk(node, bce_mut_visit, NULL, &s);
+  if (out_unsafe_cf && s.has_unsafe_cf)
+    *out_unsafe_cf = true;
+  return !s.mutated;
+}
+
+static bool bce_step_is_unit_inc(zan_ast_node_t *step, zan_istr_t iv_name) {
+  if (!step)
+    return false;
+  if (step->kind == AST_EXPR_STMT)
+    step = step->expr_stmt.expr;
+  if (!step)
+    return false;
+  if ((step->kind == AST_UNARY || step->kind == AST_POSTFIX_UNARY) &&
+      step->unary.op == TK_PLUS_PLUS &&
+      step->unary.operand && step->unary.operand->kind == AST_IDENTIFIER &&
+      bce_ident_eq(step->unary.operand->ident.name, iv_name))
+    return true;
+  if (step->kind == AST_ASSIGNMENT &&
+      step->binary.left && step->binary.left->kind == AST_IDENTIFIER &&
+      bce_ident_eq(step->binary.left->ident.name, iv_name)) {
+    if (step->binary.op == TK_PLUS_EQ &&
+        step->binary.right && step->binary.right->kind == AST_INT_LITERAL &&
+        step->binary.right->int_val == 1)
+      return true;
+    if (step->binary.op == TK_EQ &&
+        step->binary.right && step->binary.right->kind == AST_BINARY &&
+        step->binary.right->binary.op == TK_PLUS) {
+      zan_ast_node_t *L = step->binary.right->binary.left;
+      zan_ast_node_t *R = step->binary.right->binary.right;
+      if (L && R && L->kind == AST_IDENTIFIER &&
+          bce_ident_eq(L->ident.name, iv_name) &&
+          R->kind == AST_INT_LITERAL && R->int_val == 1)
+        return true;
+    }
+  }
+  return false;
+}
+
+static bool bce_extract_len_bound(zan_ast_node_t *rhs, local_scope_t *locals,
+                                  local_var_t **out_clv, int64_t *out_sub) {
+  int64_t sub = 0;
+  zan_ast_node_t *base = rhs;
+  if (rhs && rhs->kind == AST_BINARY && rhs->binary.op == TK_MINUS &&
+      rhs->binary.right && rhs->binary.right->kind == AST_INT_LITERAL &&
+      rhs->binary.right->int_val >= 0) {
+    sub = rhs->binary.right->int_val;
+    base = rhs->binary.left;
+  }
+  if (!base || base->kind != AST_MEMBER_ACCESS ||
+      base->member.name.len != 6 ||
+      memcmp(base->member.name.str, "Length", 6) != 0 ||
+      !base->member.object || base->member.object->kind != AST_IDENTIFIER)
+    return false;
+  local_var_t *clv = local_find(locals, base->member.object->ident.name);
+  if (!clv || !clv->type)
+    return false;
+  if (!is_span_type(clv->type) && !is_inline_array_type(clv->type))
+    return false;
+  *out_clv = clv;
+  *out_sub = sub;
+  return true;
+}
+
+static bool bce_expr_is_pure_int(zan_ast_node_t *e, local_scope_t *locals,
+                                 zan_ast_node_t *body) {
+  if (!e)
+    return false;
+  if (e->kind == AST_INT_LITERAL)
+    return true;
+  if (e->kind == AST_IDENTIFIER) {
+    local_var_t *lv = local_find(locals, e->ident.name);
+    if (!lv || !lv->type || lv->box_cell || lv->byref_slot)
+      return false;
+    return bce_var_is_invariant(body, e->ident.name, NULL);
+  }
+  if (e->kind == AST_MEMBER_ACCESS && e->member.name.len == 6 &&
+      memcmp(e->member.name.str, "Length", 6) == 0 &&
+      e->member.object && e->member.object->kind == AST_IDENTIFIER) {
+    local_var_t *lv = local_find(locals, e->member.object->ident.name);
+    return lv && lv->type &&
+           (is_span_type(lv->type) || is_inline_array_type(lv->type)) &&
+           bce_var_is_invariant(body, lv->name, NULL);
+  }
+  if (e->kind == AST_BINARY &&
+      (e->binary.op == TK_PLUS || e->binary.op == TK_MINUS ||
+       e->binary.op == TK_STAR)) {
+    return bce_expr_is_pure_int(e->binary.left, locals, body) &&
+           bce_expr_is_pure_int(e->binary.right, locals, body);
+  }
+  return false;
+}
+
+typedef struct {
+  local_scope_t *locals;
+  local_var_t *iv_local;
+  zan_ast_node_t *body;
+  local_var_t *spans[8];
+  int64_t max_off[8];
+  bool is_written[8];
+  int count;
+} bce_span_collect_t;
+
+static void bce_note_span_access(bce_span_collect_t *c, zan_ast_node_t *idx_node,
+                                 bool is_write) {
+  if (!idx_node || idx_node->kind != AST_INDEX || !idx_node->index.object ||
+      idx_node->index.object->kind != AST_IDENTIFIER)
+    return;
+  local_var_t *slv = local_find(c->locals, idx_node->index.object->ident.name);
+  if (!slv || !slv->type || !is_span_type(slv->type))
+    return;
+  if (!bce_var_is_invariant(c->body, slv->name, NULL))
+    return;
+  zan_ast_node_t *ix = idx_node->index.index;
+  int64_t off = -1;
+  if (ix && ix->kind == AST_IDENTIFIER &&
+      local_find(c->locals, ix->ident.name) == c->iv_local) {
+    off = 0;
+  } else if (ix && ix->kind == AST_BINARY && ix->binary.op == TK_PLUS) {
+    if (ix->binary.left && ix->binary.left->kind == AST_IDENTIFIER &&
+        local_find(c->locals, ix->binary.left->ident.name) == c->iv_local &&
+        ix->binary.right && ix->binary.right->kind == AST_INT_LITERAL &&
+        ix->binary.right->int_val >= 0)
+      off = ix->binary.right->int_val;
+    else if (ix->binary.right && ix->binary.right->kind == AST_IDENTIFIER &&
+             local_find(c->locals, ix->binary.right->ident.name) == c->iv_local &&
+             ix->binary.left && ix->binary.left->kind == AST_INT_LITERAL &&
+             ix->binary.left->int_val >= 0)
+      off = ix->binary.left->int_val;
+  }
+  if (off < 0)
+    return;
+  for (int i = 0; i < c->count; i++) {
+    if (c->spans[i] == slv) {
+      if (off > c->max_off[i])
+        c->max_off[i] = off;
+      if (is_write)
+        c->is_written[i] = true;
+      return;
+    }
+  }
+  if (c->count < 8) {
+    c->spans[c->count] = slv;
+    c->max_off[c->count] = off;
+    c->is_written[c->count] = is_write;
+    c->count++;
+  }
+}
+
+static zan_walk_action_t bce_collect_spans_visit(zan_ast_node_t *n, void *u) {
+  bce_span_collect_t *c = (bce_span_collect_t *)u;
+  if (n->kind == AST_ASSIGNMENT && n->binary.left &&
+      n->binary.left->kind == AST_INDEX) {
+    bce_note_span_access(c, n->binary.left, true);
+  } else if (n->kind == AST_INDEX) {
+    bce_note_span_access(c, n, false);
+  }
+  return ZAN_WALK_CONTINUE;
+}
+
+typedef struct {
+  local_var_t *iv_local;
+  local_var_t *static_span;
+  int64_t static_max_off;
+  bool can_version;
+  zan_ast_node_t *limit_expr;
+  local_var_t *ver_spans[8];
+  int64_t ver_max_off[8];
+  bool ver_written[8];
+  int ver_count;
+} bce_for_plan_t;
+
+static void bce_plan_for_loop(zan_irgen_t *g, zan_ast_node_t *stmt,
+                              local_scope_t *locals, bce_for_plan_t *plan) {
+  memset(plan, 0, sizeof(*plan));
+  if (!stmt || !stmt->for_stmt.init || !stmt->for_stmt.cond ||
+      !stmt->for_stmt.step || !stmt->for_stmt.body)
+    return;
+  /* 1. Extract canonical non-negative init of induction variable */
+  local_var_t *iv = NULL;
+  zan_ast_node_t *init = stmt->for_stmt.init;
+  if (init->kind == AST_VAR_DECL && init->var_decl.initializer &&
+      init->var_decl.initializer->kind == AST_INT_LITERAL &&
+      init->var_decl.initializer->int_val >= 0) {
+    iv = local_find(locals, init->var_decl.name);
+  } else if (init->kind == AST_EXPR_STMT && init->expr_stmt.expr &&
+             init->expr_stmt.expr->kind == AST_ASSIGNMENT &&
+             init->expr_stmt.expr->binary.op == TK_EQ &&
+             init->expr_stmt.expr->binary.left &&
+             init->expr_stmt.expr->binary.left->kind == AST_IDENTIFIER &&
+             init->expr_stmt.expr->binary.right &&
+             init->expr_stmt.expr->binary.right->kind == AST_INT_LITERAL &&
+             init->expr_stmt.expr->binary.right->int_val >= 0) {
+    iv = local_find(locals, init->expr_stmt.expr->binary.left->ident.name);
+  }
+  if (!iv || !iv->type || iv->box_cell || iv->byref_slot || iv->async_decl)
+    return;
+  if (iv->type->kind != TYPE_INT && iv->type->kind != TYPE_LONG &&
+      iv->type->kind != TYPE_UINT && iv->type->kind != TYPE_ULONG)
+    return;
+  /* 2. Verify step is unit increment and IV is never mutated in body */
+  if (!bce_step_is_unit_inc(stmt->for_stmt.step, iv->name))
+    return;
+  bool unsafe_cf = false;
+  if (!bce_var_is_invariant(stmt->for_stmt.body, iv->name, &unsafe_cf))
+    return;
+  /* 3. Cond must be `iv < rhs` */
+  zan_ast_node_t *cond = stmt->for_stmt.cond;
+  if (cond->kind != AST_BINARY || cond->binary.op != TK_LESS ||
+      !cond->binary.left || cond->binary.left->kind != AST_IDENTIFIER ||
+      local_find(locals, cond->binary.left->ident.name) != iv)
+    return;
+  plan->iv_local = iv;
+  plan->limit_expr = cond->binary.right;
+
+  /* 4. Case A: Static zero-overhead BCE (`i < s.Length` or `i < s.Length - C`) */
+  local_var_t *static_clv = NULL;
+  int64_t static_sub = 0;
+  if (bce_extract_len_bound(cond->binary.right, locals, &static_clv, &static_sub) &&
+      bce_var_is_invariant(stmt->for_stmt.body, static_clv->name, NULL) &&
+      bce_var_is_invariant(stmt->for_stmt.step, static_clv->name, NULL)) {
+    plan->static_span = static_clv;
+    plan->static_max_off = static_sub;
+  }
+
+  /* 5. Case B: Multi-span preheader range + non-overlap fast-path versioning */
+  if (!unsafe_cf && !g->current_async_frame && g->runtime_checks &&
+      zan_ast_subtree_count(stmt->for_stmt.body) <= 160 &&
+      bce_expr_is_pure_int(cond->binary.right, locals, stmt->for_stmt.body)) {
+    bce_span_collect_t col;
+    memset(&col, 0, sizeof(col));
+    col.locals = locals;
+    col.iv_local = iv;
+    col.body = stmt->for_stmt.body;
+    zan_ast_walk(stmt->for_stmt.body, bce_collect_spans_visit, NULL, &col);
+    bool has_extra_span = false;
+    bool has_write_and_pair = false;
+    int any_written = 0;
+    for (int i = 0; i < col.count; i++) {
+      if (col.is_written[i]) any_written++;
+      if (col.spans[i] != plan->static_span ||
+          col.max_off[i] > plan->static_max_off)
+        has_extra_span = true;
+    }
+    if (col.count >= 2 && any_written > 0)
+      has_write_and_pair = true;
+    if (col.count > 0 && (has_extra_span || has_write_and_pair)) {
+      plan->can_version = true;
+      plan->ver_count = col.count;
+      for (int i = 0; i < col.count; i++) {
+        plan->ver_spans[i] = col.spans[i];
+        plan->ver_max_off[i] = col.max_off[i];
+        plan->ver_written[i] = col.is_written[i];
+      }
+    }
+  }
+}
+
+static LLVMValueRef bce_emit_preheader_fast_cond(zan_irgen_t *g,
+                                                 const bce_for_plan_t *plan,
+                                                 local_scope_t *locals) {
+  LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+  LLVMTypeRef i1 = LLVMInt1TypeInContext(g->ctx);
+  LLVMValueRef limit = emit_expr(g, plan->limit_expr, locals);
+  if (LLVMGetTypeKind(LLVMTypeOf(limit)) == LLVMIntegerTypeKind &&
+      LLVMGetIntTypeWidth(LLVMTypeOf(limit)) < 64)
+    limit = LLVMBuildSExt(g->builder, limit, i64, "bce.lim64");
+  LLVMValueRef zero64 = LLVMConstInt(i64, 0, 0);
+  LLVMValueRef le_zero = zan_icmp(g->builder, LLVMIntSLE, limit, zero64, "bce.empty");
+  LLVMValueRef ok = LLVMConstInt(i1, 1, 0);
+
+  LLVMValueRef bases[8], ends[8];
+  for (int i = 0; i < plan->ver_count; i++) {
+    local_var_t *slv = plan->ver_spans[i];
+    LLVMValueRef sv = LLVMBuildLoad2(g->builder, g->span_struct_type, slv->alloca, "bce.sv");
+    LLVMValueRef bptr = LLVMBuildExtractValue(g->builder, sv, 0, "bce.base");
+    LLVMValueRef slen = LLVMBuildExtractValue(g->builder, sv, 1, "bce.len");
+    LLVMValueRef req = (plan->ver_max_off[i] > 0)
+        ? LLVMBuildAdd(g->builder, limit, LLVMConstInt(i64, (unsigned long long)plan->ver_max_off[i], 0), "bce.req")
+        : limit;
+    LLVMValueRef in_rng = zan_icmp(g->builder, LLVMIntSLE, req, slen, "bce.rng");
+    LLVMValueRef no_ovf = zan_icmp(g->builder, LLVMIntSGE, req, limit, "bce.noovf");
+    ok = LLVMBuildAnd(g->builder, ok, LLVMBuildAnd(g->builder, in_rng, no_ovf, "bce.r2"), "bce.ok");
+
+    zan_type_t *et = container_elem_type(slv->type);
+    LLVMTypeRef el_ty = span_elem_storage_type(g, et);
+    LLVMValueRef baddr = LLVMBuildPtrToInt(g->builder, bptr, i64, "bce.baddr");
+    LLVMValueRef bytes = LLVMBuildMul(g->builder, slen, LLVMSizeOf(el_ty), "bce.bytes");
+    bases[i] = baddr;
+    ends[i] = LLVMBuildAdd(g->builder, baddr, bytes, "bce.eaddr");
+  }
+  /* Pairwise non-overlap check whenever at least one span in the pair is written */
+  for (int i = 0; i < plan->ver_count; i++) {
+    for (int j = i + 1; j < plan->ver_count; j++) {
+      if (!plan->ver_written[i] && !plan->ver_written[j])
+        continue;
+      /* If both already have distinct user `noalias` scopes, skip runtime overlap check */
+      if (plan->ver_spans[i]->noalias_scope_id > 0 &&
+          plan->ver_spans[j]->noalias_scope_id > 0 &&
+          plan->ver_spans[i]->noalias_scope_id != plan->ver_spans[j]->noalias_scope_id)
+        continue;
+      LLVMValueRef disj1 = zan_icmp(g->builder, LLVMIntULE, ends[i], bases[j], "bce.dj1");
+      LLVMValueRef disj2 = zan_icmp(g->builder, LLVMIntULE, ends[j], bases[i], "bce.dj2");
+      LLVMValueRef disj = LLVMBuildOr(g->builder, disj1, disj2, "bce.disj");
+      ok = LLVMBuildAnd(g->builder, ok, disj, "bce.ok2");
+    }
+  }
+  return LLVMBuildOr(g->builder, le_zero, ok, "bce.fast");
+}
+
 static zan_irgen_pending_scope_t *goto_label_owner(zan_irgen_t *g,
                                                    zan_istr_t name) {
   for (zan_irgen_pending_scope_t *scope = g->pending.scope; scope;
@@ -784,8 +1194,8 @@ static void emit_shared_pending_finally(zan_irgen_t *g, local_scope_t *locals,
   LLVMPositionBuilderAtEnd(g->builder, cont);
 }
 
-static void emit_pending_finallys(zan_irgen_t *g, local_scope_t *locals,
-                                  int base, bool preserve_return) {
+void emit_pending_finallys(zan_irgen_t *g, local_scope_t *locals,
+                           int base, bool preserve_return) {
   if (base < 0)
     base = 0;
   int saved = g->finally_count;

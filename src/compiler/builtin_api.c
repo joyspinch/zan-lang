@@ -77,18 +77,31 @@ static const zan_builtin_member_t members_console[] = {
 
 static const zan_builtin_member_t members_math[] = {
     {"Abs", 'M', "double Abs(double value)"},
+    {"Abs", 'M', "float Abs(float value)"},
+    {"Abs", 'M', "int Abs(int value)"},
+    {"Abs", 'M', "long Abs(long value)"},
     {"Max", 'M', "int Max(int a, int b)"},
     {"Max", 'M', "long Max(long a, long b)"},
     {"Max", 'M', "uint Max(uint a, uint b)"},
     {"Max", 'M', "ulong Max(ulong a, ulong b)"},
     {"Max", 'M', "nint Max(nint a, nint b)"},
+    {"Max", 'M', "float Max(float a, float b)"},
     {"Max", 'M', "double Max(double a, double b)"},
     {"Min", 'M', "int Min(int a, int b)"},
     {"Min", 'M', "long Min(long a, long b)"},
     {"Min", 'M', "uint Min(uint a, uint b)"},
     {"Min", 'M', "ulong Min(ulong a, ulong b)"},
     {"Min", 'M', "nint Min(nint a, nint b)"},
+    {"Min", 'M', "float Min(float a, float b)"},
     {"Min", 'M', "double Min(double a, double b)"},
+    {"Clamp", 'M', "int Clamp(int value, int min, int max)"},
+    {"Clamp", 'M', "long Clamp(long value, long min, long max)"},
+    {"Clamp", 'M', "uint Clamp(uint value, uint min, uint max)"},
+    {"Clamp", 'M', "ulong Clamp(ulong value, ulong min, ulong max)"},
+    {"Clamp", 'M', "float Clamp(float value, float min, float max)"},
+    {"Clamp", 'M', "double Clamp(double value, double min, double max)"},
+    {"FusedMultiplyAdd", 'M', "float FusedMultiplyAdd(float x, float y, float z)"},
+    {"FusedMultiplyAdd", 'M', "double FusedMultiplyAdd(double x, double y, double z)"},
     {"Pow", 'M', "double Pow(double x, double y)"},
     {"Sqrt", 'M', "double Sqrt(double value)"},
     {"Round", 'M', "double Round(double value)"},
@@ -101,6 +114,26 @@ static const zan_builtin_member_t members_math[] = {
     {"Atan", 'M', "double Atan(double value)"},
     {"Asin", 'M', "double Asin(double value)"},
     {"Acos", 'M', "double Acos(double value)"},
+};
+
+static const zan_builtin_member_t members_mathf[] = {
+    {"Abs", 'M', "float Abs(float value)"},
+    {"Max", 'M', "float Max(float a, float b)"},
+    {"Min", 'M', "float Min(float a, float b)"},
+    {"Clamp", 'M', "float Clamp(float value, float min, float max)"},
+    {"FusedMultiplyAdd", 'M', "float FusedMultiplyAdd(float x, float y, float z)"},
+    {"Pow", 'M', "float Pow(float x, float y)"},
+    {"Sqrt", 'M', "float Sqrt(float value)"},
+    {"Round", 'M', "float Round(float value)"},
+    {"Floor", 'M', "float Floor(float value)"},
+    {"Ceiling", 'M', "float Ceiling(float value)"},
+    {"Sin", 'M', "float Sin(float value)"},
+    {"Cos", 'M', "float Cos(float value)"},
+    {"Tan", 'M', "float Tan(float value)"},
+    {"Atan2", 'M', "float Atan2(float y, float x)"},
+    {"Atan", 'M', "float Atan(float value)"},
+    {"Asin", 'M', "float Asin(float value)"},
+    {"Acos", 'M', "float Acos(float value)"},
 };
 
 static const zan_builtin_member_t members_convert[] = {
@@ -161,12 +194,41 @@ static const zan_builtin_member_t members_env[] = {
 
 static const zan_builtin_member_t members_nativemem[] = {
     {"Alloc", 'M', "nint Alloc(long size)"},
+    {"Realloc", 'M', "nint Realloc(nint ptr, long size)"},
+    {"AlignedAlloc", 'M', "nint AlignedAlloc(long size, long alignment)"},
+    {"AlignedFree", 'M', "void AlignedFree(nint ptr)"},
     {"Free", 'M', "void Free(nint ptr)"},
+    {"AddressOf", 'M', "nint AddressOf(ref T value)"},
+    {"FunctionPointer", 'M', "nint FunctionPointer(method)"},
+    {"Invoke", 'M', "TRet Invoke<TRet>(nint fnPtr, ...)"},
+    {"InvokeVoid", 'M', "void InvokeVoid(nint fnPtr, ...)"},
+    {"InvokeWithCC", 'M', "TRet InvokeWithCC<TRet>(string cc, nint fnPtr, ...)"},
+    {"InvokeVoidWithCC", 'M', "void InvokeVoidWithCC(string cc, nint fnPtr, ...)"},
+    {"InvokeVariadic", 'M', "TRet InvokeVariadic<TRet>(nint fnPtr, int fixedArgCount, ...)"},
+    {"InvokeVariadicVoid", 'M', "void InvokeVariadicVoid(nint fnPtr, int fixedArgCount, ...)"},
+    {"BitCast", 'M', "TTo BitCast<TFrom, TTo>(TFrom value)"},
+    {"ZeroInit", 'M', "void ZeroInit(ref T value)"},
+    {"Read", 'M', "T Read<T>(nint ptr)"},
+    {"Write", 'M', "void Write<T>(nint ptr, T value)"},
+    {"ReadUnaligned", 'M', "T ReadUnaligned<T>(nint ptr)"},
+    {"WriteUnaligned", 'M', "void WriteUnaligned<T>(nint ptr, T value)"},
+    {"StreamLoad", 'M', "T StreamLoad<T>(nint ptr)"},
+    {"StreamStore", 'M', "void StreamStore<T>(nint ptr, T value)"},
+    {"IncludeBytes", 'M', "Span<byte> IncludeBytes(string path)"},
+    {"ReturnAddress", 'M', "nint ReturnAddress(int level)"},
+    {"FrameAddress", 'M', "nint FrameAddress(int level)"},
+    {"AsRef", 'M', "ref T AsRef<T>(nint ptr)"},
+    {"At", 'M', "ref T At<T>(nint ptr, long index)"},
+    {"Add", 'M', "nint Add<T>(nint ptr, long elementCount)"},
+    {"ByteOffset", 'M', "long ByteOffset(ref T origin, ref T target)"},
+    {"AsSpan", 'M', "Span<T> AsSpan<T>(nint ptr, int length)"},
     {"Copy", 'M', "void Copy(nint dst, nint src, long size)"},
     {"Copy2D", 'M',
      "void Copy2D(nint dst, long dstStride, nint src, long srcStride, long "
      "rowBytes, long height)"},
     {"Fill", 'M', "void Fill(nint ptr, int value, long size)"},
+    {"PrefetchRead", 'M', "void PrefetchRead(nint ptr[, int locality])"},
+    {"PrefetchWrite", 'M', "void PrefetchWrite(nint ptr[, int locality])"},
     {"Compare", 'M', "int Compare(nint a, nint b, long size)"},
     {"ScanNotByte", 'M',
      "long ScanNotByte(nint ptr, long offset, int byte, long limit)"},
@@ -259,6 +321,21 @@ static const zan_builtin_member_t members_vector128[] = {
     {"AllBitsSet", 'P', "Vector128 AllBitsSet"},
 };
 
+static const zan_builtin_member_t members_inline_asm[] = {
+    {"Emit", 'M', "void Emit(string asmTemplate, string constraints, ...)"},
+    {"EmitIntel", 'M',
+     "void EmitIntel(string asmTemplate, string constraints, ...)"},
+};
+
+static const zan_builtin_member_t members_hint[] = {
+    {"Likely", 'M', "bool Likely(bool condition)"},
+    {"Unlikely", 'M', "bool Unlikely(bool condition)"},
+    {"Assume", 'M', "void Assume(bool condition)"},
+    {"Unreachable", 'M', "void Unreachable()"},
+    {"Trap", 'M', "void Trap()"},
+    {"BlackBox", 'M', "T BlackBox<T>(T value)"},
+};
+
 static const zan_builtin_member_t members_vector256[] = {
     {"Create", 'M', "Vector256 Create(byte value)"},
     {"Load", 'M', "Vector256 Load(nint address)"},
@@ -308,12 +385,32 @@ static const zan_builtin_member_t members_bitops[] = {
     {"TrailingZeroCount", 'M', "int TrailingZeroCount(int value)"},
     {"RotateLeft", 'M', "int RotateLeft(int value, int offset)"},
     {"RotateRight", 'M', "int RotateRight(int value, int offset)"},
+    {"FunnelShiftLeft", 'M', "ulong FunnelShiftLeft(ulong high, ulong low, int shift)"},
+    {"FunnelShiftRight", 'M', "ulong FunnelShiftRight(ulong high, ulong low, int shift)"},
+    {"ExtractBits", 'M', "ulong ExtractBits(ulong value, int startBit, int bitCount)"},
+    {"InsertBits", 'M', "ulong InsertBits(ulong target, ulong fieldValue, int startBit, int bitCount)"},
     {"ReverseEndianness", 'M', "int ReverseEndianness(int value)"},
+    {"BitReverse", 'M', "int BitReverse(int value)"},
+    {"SaturatingAdd", 'M', "int SaturatingAdd(int left, int right)"},
+    {"SaturatingSub", 'M', "int SaturatingSub(int left, int right)"},
+    {"OverflowAdd", 'M', "int OverflowAdd(int left, int right, ref bool overflow)"},
+    {"OverflowSub", 'M', "int OverflowSub(int left, int right, ref bool overflow)"},
+    {"OverflowMul", 'M', "int OverflowMul(int left, int right, ref bool overflow)"},
+    {"BigMul", 'M', "long BigMul(long left, long right, ref long low)"},
+    {"DivRem128", 'M', "ulong DivRem128(ulong high, ulong low, ulong divisor, ref ulong remainder)"},
+    {"AddWithCarry", 'M', "ulong AddWithCarry(ulong left, ulong right, bool carryIn, ref bool carryOut)"},
+    {"SubWithBorrow", 'M', "ulong SubWithBorrow(ulong left, ulong right, bool borrowIn, ref bool borrowOut)"},
     {"Log2", 'M', "int Log2(int value)"},
     {"IsPow2", 'M', "bool IsPow2(int value)"},
     {"RoundUpToPowerOf2", 'M', "int RoundUpToPowerOf2(int value)"},
     {"ResetLowestSetBit", 'M', "int ResetLowestSetBit(int value)"},
     {"ExtractLowestSetBit", 'M', "int ExtractLowestSetBit(int value)"},
+};
+
+static const zan_builtin_member_t members_parallel[] = {
+    {"For", 'M', "void For(int fromInclusive, int toExclusive, noescape Action<int> body)"},
+    {"ForRange", 'M', "void ForRange(int fromInclusive, int toExclusive, noescape Action<int, int> body)"},
+    {"ProcessorCount", 'P', "int ProcessorCount"},
 };
 
 static const zan_builtin_member_t members_cpu[] = {
@@ -324,6 +421,54 @@ static const zan_builtin_member_t members_cpu[] = {
     {"HasAesNi", 'P', "bool HasAesNi"},
     {"HasNeon", 'P', "bool HasNeon"},
     {"CpuFeature", 'M', "int CpuFeature(int id)"},
+};
+
+static const zan_builtin_member_t members_memory_order[] = {
+    {"Relaxed", 'P', "int Relaxed"},
+    {"Acquire", 'P', "int Acquire"},
+    {"Release", 'P', "int Release"},
+    {"AcqRel", 'P', "int AcqRel"},
+    {"SeqCst", 'P', "int SeqCst"},
+};
+
+static const zan_builtin_member_t members_volatile[] = {
+    {"Read", 'M', "T Read(ref T location)"},
+    {"Write", 'M', "void Write(ref T location, T value)"},
+    {"ReadAt", 'M', "T ReadAt<T>(nint address)"},
+    {"WriteAt", 'M', "void WriteAt<T>(nint address, T value)"},
+    {"CopyBlock", 'M', "void CopyBlock(nint dst, nint src, long byteCount)"},
+    {"InitBlock", 'M', "void InitBlock(nint dst, byte value, long byteCount)"},
+};
+
+static const zan_builtin_member_t members_atomic[] = {
+    {"Load", 'M', "T Load(ref T location[, int order])"},
+    {"Store", 'M', "void Store(ref T location, T value[, int order])"},
+    {"Exchange", 'M', "T Exchange(ref T location, T value[, int order])"},
+    {"CompareExchange", 'M', "T CompareExchange(ref T location, T expected, T desired[, int successOrder[, int failureOrder]])"},
+    {"CompareExchangeBool", 'M', "bool CompareExchangeBool(ref T location, T expected, T desired[, int successOrder[, int failureOrder]])"},
+    {"FetchAdd", 'M', "T FetchAdd(ref T location, T delta[, int order])"},
+    {"FetchSub", 'M', "T FetchSub(ref T location, T delta[, int order])"},
+    {"FetchAnd", 'M', "T FetchAnd(ref T location, T mask[, int order])"},
+    {"FetchOr", 'M', "T FetchOr(ref T location, T mask[, int order])"},
+    {"FetchXor", 'M', "T FetchXor(ref T location, T mask[, int order])"},
+    {"FetchMin", 'M', "T FetchMin(ref T location, T value[, int order])"},
+    {"FetchMax", 'M', "T FetchMax(ref T location, T value[, int order])"},
+    {"LoadAt", 'M', "T LoadAt<T>(nint address[, int order])"},
+    {"StoreAt", 'M', "void StoreAt<T>(nint address, T value[, int order])"},
+    {"ExchangeAt", 'M', "T ExchangeAt<T>(nint address, T value[, int order])"},
+    {"CompareExchangeAt", 'M', "T CompareExchangeAt<T>(nint address, T expected, T desired[, int successOrder[, int failureOrder]])"},
+    {"CompareExchangeBoolAt", 'M', "bool CompareExchangeBoolAt<T>(nint address, T expected, T desired[, int successOrder[, int failureOrder]])"},
+    {"FetchAddAt", 'M', "T FetchAddAt<T>(nint address, T delta[, int order])"},
+    {"FetchSubAt", 'M', "T FetchSubAt<T>(nint address, T delta[, int order])"},
+    {"FetchAndAt", 'M', "T FetchAndAt<T>(nint address, T mask[, int order])"},
+    {"FetchOrAt", 'M', "T FetchOrAt<T>(nint address, T mask[, int order])"},
+    {"FetchXorAt", 'M', "T FetchXorAt<T>(nint address, T mask[, int order])"},
+    {"FetchMinAt", 'M', "T FetchMinAt<T>(nint address, T value[, int order])"},
+    {"FetchMaxAt", 'M', "T FetchMaxAt<T>(nint address, T value[, int order])"},
+    {"CompareExchange128At", 'M', "bool CompareExchange128At(nint address, ref long expectedLo, ref long expectedHi, long desiredLo, long desiredHi[, int successOrder[, int failureOrder]])"},
+    {"Fence", 'M', "void Fence([int order])"},
+    {"CompilerFence", 'M', "void CompilerFence()"},
+    {"Pause", 'M', "void Pause()"},
 };
 
 static const zan_builtin_member_t members_task[] = {
@@ -372,6 +517,7 @@ static const zan_builtin_type_t builtin_types[] = {
     BT("StringBuilder", "StringBuilder", "StringBuilder", 0, members_sb),
     BT("Console", "Console", "Console", 1, members_console),
     BT("Math", "Math", "Math", 1, members_math),
+    BT("MathF", "MathF", "MathF", 1, members_mathf),
     BT("Convert", "Convert", "Convert", 1, members_convert),
     BT("String", "String", "String", 1, members_stringcls),
     BT("Char", "Char", "char", 1, members_charcls),
@@ -380,8 +526,14 @@ static const zan_builtin_type_t builtin_types[] = {
     BT("Environment", "Environment", "Environment", 1, members_env),
     BT("NativeMemory", "NativeMemory", "NativeMemory", 1, members_nativemem),
     BT("Task", "Task", "Task", 1, members_task),
+    BT("Parallel", "Parallel", "Parallel", 1, members_parallel),
     BT("BitOperations", "BitOperations", "BitOperations", 1, members_bitops),
+    BT("InlineAsm", "InlineAsm", "InlineAsm", 1, members_inline_asm),
+    BT("Hint", "Hint", "Hint", 1, members_hint),
     BT("Cpu", "Cpu", "Cpu", 1, members_cpu),
+    BT("MemoryOrder", "MemoryOrder", "MemoryOrder", 1, members_memory_order),
+    BT("Volatile", "Volatile", "Volatile", 1, members_volatile),
+    BT("Atomic", "Atomic", "Atomic", 1, members_atomic),
     BT("Aes", "Aes", "Aes", 1, members_x86_aes),
     BT("Sse2", "Sse2", "Sse2", 1, members_x86_sse2),
     BT("Sse42", "Sse42", "Sse42", 1, members_x86_sse42),
@@ -546,12 +698,17 @@ static int minmax_arg_signed(zan_type_kind_t kind) {
 const char *zan_builtin_minmax_result(const char *type, const char *name,
                                       int name_len, const struct zan_type *a,
                                       const struct zan_type *b) {
-  if (!type || strcmp(type, "Math") != 0 || !name || name_len != 3 ||
+  if (!type || (strcmp(type, "Math") != 0 && strcmp(type, "MathF") != 0) ||
+      !name || name_len != 3 ||
       (memcmp(name, "Min", 3) != 0 && memcmp(name, "Max", 3) != 0))
     return NULL;
   if (!minmax_arg_numeric(a) || !minmax_arg_numeric(b))
     return NULL;
+  if (strcmp(type, "MathF") == 0)
+    return "float";
   zan_type_kind_t ak = a->kind, bk = b->kind;
+  if (ak == TYPE_FLOAT && bk == TYPE_FLOAT)
+    return "float";
   if (ak == TYPE_FLOAT || ak == TYPE_DOUBLE || bk == TYPE_FLOAT ||
       bk == TYPE_DOUBLE)
     return "double";

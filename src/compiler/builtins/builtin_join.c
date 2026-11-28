@@ -301,8 +301,14 @@ LLVMValueRef emit_dict_find(zan_irgen_t *g, zan_type_t *dict_type,
                    (LLVMValueRef[]){draw, key}, 2, "dfind");
 }
 zan_type_t *static_access_inst(zan_irgen_t *g, zan_ast_node_t *obj_expr) {
-  if (!obj_expr || !obj_expr->ident.inst_type_ref)
+  if (!obj_expr)
     return NULL;
+  if (!obj_expr->ident.inst_type_ref) {
+    zan_type_t *tp_ct = resolve_tp_ident_type(g, obj_expr);
+    if (tp_ct && tp_ct->type_arg_count > 0)
+      return tp_ct;
+    return NULL;
+  }
   zan_type_t *t = resolve_type_ctx(g, obj_expr->ident.inst_type_ref);
   return (t && t->type_arg_count > 0) ? t : NULL;
 }
@@ -343,9 +349,20 @@ LLVMValueRef get_static_field_global(zan_irgen_t *g, zan_symbol_t *class_sym,
   suffix[0] = '\0';
   if (inst && inst->sym == class_sym && inst->type_arg_count > 0)
     mangle_inst_suffix(suffix, sizeof(suffix), inst);
+  char c_exp_name[256];
+  char c_ext_name[256];
+  bool is_export = (suffix[0] == '\0') &&
+                   field_c_attr_name(fsym->decl, "Export", c_exp_name, sizeof(c_exp_name));
+  bool is_extern = (suffix[0] == '\0') &&
+                   field_c_attr_name(fsym->decl, "Extern", c_ext_name, sizeof(c_ext_name));
   char name[512];
-  snprintf(name, sizeof(name), "__zan_sf_%.*s_%.*s%s", (int)class_sym->name.len,
-           class_sym->name.str, (int)fsym->name.len, fsym->name.str, suffix);
+  if (is_export)
+    snprintf(name, sizeof(name), "%s", c_exp_name);
+  else if (is_extern)
+    snprintf(name, sizeof(name), "%s", c_ext_name);
+  else
+    snprintf(name, sizeof(name), "__zan_sf_%.*s_%.*s%s", (int)class_sym->name.len,
+             class_sym->name.str, (int)fsym->name.len, fsym->name.str, suffix);
   LLVMValueRef gv = LLVMGetNamedGlobal(g->mod, name);
   if (gv)
     return gv;
@@ -353,9 +370,99 @@ LLVMValueRef get_static_field_global(zan_irgen_t *g, zan_symbol_t *class_sym,
   LLVMTypeRef ft =
       field_type ? map_type(g, field_type) : LLVMInt64TypeInContext(g->ctx);
   gv = LLVMAddGlobal(g->mod, ft, name);
-  LLVMSetLinkage(gv, LLVMInternalLinkage);
-  LLVMSetInitializer(gv, LLVMConstNull(ft));
-  if (field_type &&
+  LLVMSetLinkage(gv, (is_export || is_extern) ? LLVMExternalLinkage
+                                              : LLVMInternalLinkage);
+  bool is_tls = fsym->decl && zan_ast_has_attr(fsym->decl, "ThreadStatic");
+  bool is_used = fsym->decl && zan_ast_has_attr(fsym->decl, "Used");
+  bool is_weak_sym = fsym->decl && zan_ast_has_attr(fsym->decl, "Weak");
+  char sec_buf[128];
+  bool has_sec = fsym->decl &&
+                 zan_ast_attr_string(fsym->decl, "Section", sec_buf, sizeof(sec_buf));
+  int64_t align_req = 0;
+  bool has_align = fsym->decl && zan_ast_attr_int(fsym->decl, "Align", &align_req);
+  if (!has_align && field_type && field_type->kind == TYPE_STRUCT &&
+      field_type->sym && field_type->sym->decl) {
+    has_align = zan_ast_attr_int(field_type->sym->decl, "Align", &align_req);
+  }
+  if (is_extern) {
+    /* External C global or linker-script symbol: declaration only (no initializer). */
+    if (is_tls)
+      LLVMSetThreadLocal(gv, 1);
+    if (has_align && align_req >= 1 && (align_req & (align_req - 1)) == 0)
+      LLVMSetAlignment(gv, (unsigned)align_req);
+    return gv;
+  }
+  LLVMValueRef ctfe_init = NULL;
+  if (is_tls) {
+    if (fsym->decl->field_decl.initializer) {
+      if (zan_ctfe_eval_to_llvm_const(g, class_sym,
+                                      fsym->decl->field_decl.initializer,
+                                      field_type, &ctfe_init) &&
+          ctfe_init && LLVMTypeOf(ctfe_init) == ft) {
+        LLVMSetInitializer(gv, ctfe_init);
+      } else {
+        zan_diag_emit_code(
+            g->diag, DIAG_ERROR, fsym->decl->loc, 3099,
+            "[ThreadStatic] field '%.*s' initializer must be a compile-time constant",
+            (int)fsym->name.len, fsym->name.str);
+        LLVMSetInitializer(gv, LLVMConstNull(ft));
+      }
+    } else {
+      LLVMSetInitializer(gv, LLVMConstNull(ft));
+    }
+    LLVMSetThreadLocal(gv, 1);
+    if (!g->target_is_windows) {
+      LLVMSetThreadLocalMode(gv, g->emit_shared ? LLVMGeneralDynamicTLSModel
+                                                : LLVMInitialExecTLSModel);
+    } else if (g->emit_shared) {
+      LLVMSetThreadLocalMode(gv, LLVMGeneralDynamicTLSModel);
+    }
+  } else if (fsym->decl->field_decl.initializer &&
+             (!field_type || (!is_rc_managed_type(field_type) &&
+                              field_type->kind != TYPE_OBJECT &&
+                              field_type->kind != TYPE_DELEGATE)) &&
+             zan_ctfe_eval_to_llvm_const(g, class_sym,
+                                         fsym->decl->field_decl.initializer,
+                                         field_type, &ctfe_init) &&
+             ctfe_init && LLVMTypeOf(ctfe_init) == ft) {
+    LLVMSetInitializer(gv, ctfe_init);
+    if ((fsym->modifiers & MOD_READONLY) ||
+        (fsym->decl->field_decl.modifiers & MOD_READONLY) ||
+        (has_sec && (strstr(sec_buf, "rodata") != NULL ||
+                     strstr(sec_buf, "rdata") != NULL))) {
+      LLVMSetGlobalConstant(gv, 1);
+      if (!has_sec && !is_used && !is_export)
+        LLVMSetUnnamedAddr(gv, LLVMGlobalUnnamedAddr);
+    }
+  } else {
+    LLVMSetInitializer(gv, LLVMConstNull(ft));
+  }
+  if (has_sec)
+    LLVMSetSection(gv, sec_buf);
+  if (has_align && align_req >= 1 && (align_req & (align_req - 1)) == 0)
+    LLVMSetAlignment(gv, (unsigned)align_req);
+  if (is_weak_sym)
+    LLVMSetLinkage(gv, LLVMWeakAnyLinkage);
+  else if (is_used || is_export)
+    LLVMSetLinkage(gv, LLVMExternalLinkage);
+  if (!is_weak_sym && is_export && g->emit_lib && g->emit_shared && g->target_is_windows)
+    LLVMSetDLLStorageClass(gv, LLVMDLLExportStorageClass);
+  {
+    char vis_buf[64];
+    if (fsym->decl && zan_ast_attr_string(fsym->decl, "Visibility", vis_buf, sizeof(vis_buf))) {
+      for (char *p = vis_buf; *p; p++)
+        if (*p >= 'A' && *p <= 'Z') *p = (char)(*p - 'A' + 'a');
+      if (strcmp(vis_buf, "hidden") == 0) {
+        LLVMSetDLLStorageClass(gv, LLVMDefaultStorageClass);
+        LLVMSetVisibility(gv, LLVMHiddenVisibility);
+      } else if (strcmp(vis_buf, "protected") == 0) {
+        LLVMSetVisibility(gv, LLVMProtectedVisibility);
+      } else if (strcmp(vis_buf, "default") == 0) {
+        LLVMSetVisibility(gv, LLVMDefaultVisibility);
+      }
+    }
+  }
+  if (!is_tls && field_type &&
       (is_rc_managed_type(field_type) || field_type->kind == TYPE_OBJECT)) {
     if (g->static_field_count >= g->static_field_cap) {
       g->static_field_cap = g->static_field_cap ? g->static_field_cap * 2 : 16;

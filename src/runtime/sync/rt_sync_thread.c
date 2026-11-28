@@ -704,3 +704,321 @@ int64_t zan_atomic_int_add(int64_t handle, int64_t delta) {
   return __atomic_add_fetch(&atomic->value, delta, __ATOMIC_SEQ_CST);
 #endif
 }
+
+/* ---- Scoped zero-copy Parallel.For / Parallel.ForRange worker pool ---- */
+
+typedef struct zan_par_job {
+  void *fn_ptr;
+  void *clo_rec;
+  int32_t from;
+  int32_t to;
+  int32_t chunk;
+  int32_t is_range;
+#ifdef _WIN32
+  volatile LONG next_idx;
+#else
+  int32_t next_idx;
+#endif
+} zan_par_job_t;
+
+#define ZAN_PAR_MAX_WORKERS 31
+
+static _Thread_local int t_in_parallel_for = 0;
+
+static struct {
+#ifdef _WIN32
+  INIT_ONCE init_once;
+  SRWLOCK lock;
+  CONDITION_VARIABLE cv_work;
+  CONDITION_VARIABLE cv_done;
+#else
+  pthread_once_t init_once;
+  pthread_mutex_t lock;
+  pthread_cond_t cv_work;
+  pthread_cond_t cv_done;
+#endif
+  int32_t num_workers;
+  uint64_t generation;
+  zan_par_job_t *active_job;
+  int32_t active_workers;
+  int32_t workers_finished;
+  int32_t dispatch_busy;
+} g_par_pool = {
+#ifdef _WIN32
+    INIT_ONCE_STATIC_INIT,
+    SRWLOCK_INIT,
+    CONDITION_VARIABLE_INIT,
+    CONDITION_VARIABLE_INIT,
+#else
+    PTHREAD_ONCE_INIT,
+    PTHREAD_MUTEX_INITIALIZER,
+    PTHREAD_COND_INITIALIZER,
+    PTHREAD_COND_INITIALIZER,
+#endif
+    0, 0, NULL, 0, 0, 0
+};
+
+int32_t zan_parallel_processor_count(void) {
+#ifdef _WIN32
+  SYSTEM_INFO si;
+  GetSystemInfo(&si);
+  int32_t n = (int32_t)si.dwNumberOfProcessors;
+  return n > 0 ? n : 1;
+#else
+  long n = sysconf(_SC_NPROCESSORS_ONLN);
+  return n > 0 ? (int32_t)n : 1;
+#endif
+}
+
+static void zan_par_decode_delegate(void *body, void **out_fn, void **out_rec) {
+  uintptr_t v = (uintptr_t)body;
+  if (v & (uintptr_t)ZAN_CLOSURE_TAG) {
+    void *rec = (void *)(v & ~(uintptr_t)ZAN_CLOSURE_TAG);
+    *out_rec = rec;
+    *out_fn = *(void **)rec;
+  } else {
+    *out_rec = NULL;
+    *out_fn = body;
+  }
+}
+
+static void zan_par_run_job(zan_par_job_t *job) {
+  int32_t to = job->to;
+  int32_t chunk = job->chunk;
+  void *fn_ptr = job->fn_ptr;
+  void *clo_rec = job->clo_rec;
+  int32_t is_range = job->is_range;
+  for (;;) {
+#ifdef _WIN32
+    int32_t s = (int32_t)InterlockedExchangeAdd(&job->next_idx, (LONG)chunk);
+#else
+    int32_t s = __atomic_fetch_add(&job->next_idx, chunk, __ATOMIC_RELAXED);
+#endif
+    if (s >= to)
+      break;
+    int32_t e = s + chunk;
+    if (e > to)
+      e = to;
+    if (is_range) {
+      if (clo_rec)
+        ((void (*)(void *, int32_t, int32_t))fn_ptr)(clo_rec, s, e);
+      else
+        ((void (*)(int32_t, int32_t))fn_ptr)(s, e);
+    } else {
+      if (clo_rec) {
+        void (*f)(void *, int32_t) = (void (*)(void *, int32_t))fn_ptr;
+        for (int32_t i = s; i < e; i++)
+          f(clo_rec, i);
+      } else {
+        void (*f)(int32_t) = (void (*)(int32_t))fn_ptr;
+        for (int32_t i = s; i < e; i++)
+          f(i);
+      }
+    }
+  }
+}
+
+#ifdef _WIN32
+static DWORD WINAPI zan_par_worker_main(LPVOID unused) {
+  (void)unused;
+  uint64_t my_gen = 0;
+  for (;;) {
+    AcquireSRWLockExclusive(&g_par_pool.lock);
+    while (g_par_pool.generation == my_gen)
+      SleepConditionVariableSRW(&g_par_pool.cv_work, &g_par_pool.lock, INFINITE, 0);
+    my_gen = g_par_pool.generation;
+    zan_par_job_t *job = g_par_pool.active_job;
+    ReleaseSRWLockExclusive(&g_par_pool.lock);
+
+    if (job) {
+      t_in_parallel_for = 1;
+      zan_par_run_job(job);
+      t_in_parallel_for = 0;
+    }
+
+    AcquireSRWLockExclusive(&g_par_pool.lock);
+    g_par_pool.workers_finished++;
+    if (g_par_pool.workers_finished == g_par_pool.active_workers)
+      WakeAllConditionVariable(&g_par_pool.cv_done);
+    ReleaseSRWLockExclusive(&g_par_pool.lock);
+  }
+  return 0;
+}
+
+static BOOL CALLBACK zan_par_init_cb(PINIT_ONCE once, PVOID param, PVOID *ctx) {
+  (void)once; (void)param; (void)ctx;
+  int32_t procs = zan_parallel_processor_count();
+  int32_t nw = procs > 1 ? procs - 1 : 0;
+  if (nw > ZAN_PAR_MAX_WORKERS)
+    nw = ZAN_PAR_MAX_WORKERS;
+  int32_t spawned = 0;
+  for (int32_t i = 0; i < nw; i++) {
+    HANDLE h = CreateThread(NULL, 0, zan_par_worker_main, NULL, 0, NULL);
+    if (h) {
+      CloseHandle(h);
+      spawned++;
+    }
+  }
+  g_par_pool.num_workers = spawned;
+  return TRUE;
+}
+#else
+static void *zan_par_worker_main(void *unused) {
+  (void)unused;
+  uint64_t my_gen = 0;
+  for (;;) {
+    pthread_mutex_lock(&g_par_pool.lock);
+    while (g_par_pool.generation == my_gen)
+      pthread_cond_wait(&g_par_pool.cv_work, &g_par_pool.lock);
+    my_gen = g_par_pool.generation;
+    zan_par_job_t *job = g_par_pool.active_job;
+    pthread_mutex_unlock(&g_par_pool.lock);
+
+    if (job) {
+      t_in_parallel_for = 1;
+      zan_par_run_job(job);
+      t_in_parallel_for = 0;
+    }
+
+    pthread_mutex_lock(&g_par_pool.lock);
+    g_par_pool.workers_finished++;
+    if (g_par_pool.workers_finished == g_par_pool.active_workers)
+      pthread_cond_broadcast(&g_par_pool.cv_done);
+    pthread_mutex_unlock(&g_par_pool.lock);
+  }
+  return NULL;
+}
+
+static void zan_par_init_cb(void) {
+  int32_t procs = zan_parallel_processor_count();
+  int32_t nw = procs > 1 ? procs - 1 : 0;
+  if (nw > ZAN_PAR_MAX_WORKERS)
+    nw = ZAN_PAR_MAX_WORKERS;
+  int32_t spawned = 0;
+  for (int32_t i = 0; i < nw; i++) {
+    pthread_t th;
+    if (pthread_create(&th, NULL, zan_par_worker_main, NULL) == 0) {
+      pthread_detach(th);
+      spawned++;
+    }
+  }
+  g_par_pool.num_workers = spawned;
+}
+#endif
+
+static void zan_par_dispatch(int32_t from, int32_t to, void *body,
+                             int32_t is_range) {
+  if (!body || to <= from)
+    return;
+  void *fn_ptr = NULL;
+  void *clo_rec = NULL;
+  zan_par_decode_delegate(body, &fn_ptr, &clo_rec);
+  if (!fn_ptr)
+    return;
+
+  int32_t total = to - from;
+  if (t_in_parallel_for || total <= 1) {
+    if (is_range) {
+      if (clo_rec)
+        ((void (*)(void *, int32_t, int32_t))fn_ptr)(clo_rec, from, to);
+      else
+        ((void (*)(int32_t, int32_t))fn_ptr)(from, to);
+    } else {
+      if (clo_rec) {
+        void (*f)(void *, int32_t) = (void (*)(void *, int32_t))fn_ptr;
+        for (int32_t i = from; i < to; i++)
+          f(clo_rec, i);
+      } else {
+        void (*f)(int32_t) = (void (*)(int32_t))fn_ptr;
+        for (int32_t i = from; i < to; i++)
+          f(i);
+      }
+    }
+    return;
+  }
+
+#ifdef _WIN32
+  InitOnceExecuteOnce(&g_par_pool.init_once, zan_par_init_cb, NULL, NULL);
+#else
+  pthread_once(&g_par_pool.init_once, zan_par_init_cb);
+#endif
+
+  int32_t nw = g_par_pool.num_workers;
+  if (nw <= 0) {
+    t_in_parallel_for = 1;
+    zan_par_dispatch(from, to, body, is_range);
+    t_in_parallel_for = 0;
+    return;
+  }
+
+  int32_t nthreads = nw + 1;
+  int32_t denom = is_range ? (nthreads * 4) : (nthreads * 8);
+  int32_t chunk = total / denom;
+  if (chunk < 1)
+    chunk = 1;
+
+  zan_par_job_t job;
+  job.fn_ptr = fn_ptr;
+  job.clo_rec = clo_rec;
+  job.from = from;
+  job.to = to;
+  job.chunk = chunk;
+  job.is_range = is_range;
+  job.next_idx = from;
+
+#ifdef _WIN32
+  AcquireSRWLockExclusive(&g_par_pool.lock);
+  while (g_par_pool.dispatch_busy)
+    SleepConditionVariableSRW(&g_par_pool.cv_done, &g_par_pool.lock, INFINITE, 0);
+  g_par_pool.dispatch_busy = 1;
+  g_par_pool.active_job = &job;
+  g_par_pool.workers_finished = 0;
+  g_par_pool.active_workers = nw;
+  g_par_pool.generation++;
+  WakeAllConditionVariable(&g_par_pool.cv_work);
+  ReleaseSRWLockExclusive(&g_par_pool.lock);
+
+  t_in_parallel_for = 1;
+  zan_par_run_job(&job);
+  t_in_parallel_for = 0;
+
+  AcquireSRWLockExclusive(&g_par_pool.lock);
+  while (g_par_pool.workers_finished < g_par_pool.active_workers)
+    SleepConditionVariableSRW(&g_par_pool.cv_done, &g_par_pool.lock, INFINITE, 0);
+  g_par_pool.active_job = NULL;
+  g_par_pool.dispatch_busy = 0;
+  WakeAllConditionVariable(&g_par_pool.cv_done);
+  ReleaseSRWLockExclusive(&g_par_pool.lock);
+#else
+  pthread_mutex_lock(&g_par_pool.lock);
+  while (g_par_pool.dispatch_busy)
+    pthread_cond_wait(&g_par_pool.cv_done, &g_par_pool.lock);
+  g_par_pool.dispatch_busy = 1;
+  g_par_pool.active_job = &job;
+  g_par_pool.workers_finished = 0;
+  g_par_pool.active_workers = nw;
+  g_par_pool.generation++;
+  pthread_cond_broadcast(&g_par_pool.cv_work);
+  pthread_mutex_unlock(&g_par_pool.lock);
+
+  t_in_parallel_for = 1;
+  zan_par_run_job(&job);
+  t_in_parallel_for = 0;
+
+  pthread_mutex_lock(&g_par_pool.lock);
+  while (g_par_pool.workers_finished < g_par_pool.active_workers)
+    pthread_cond_wait(&g_par_pool.cv_done, &g_par_pool.lock);
+  g_par_pool.active_job = NULL;
+  g_par_pool.dispatch_busy = 0;
+  pthread_cond_broadcast(&g_par_pool.cv_done);
+  pthread_mutex_unlock(&g_par_pool.lock);
+#endif
+}
+
+void zan_parallel_for(int32_t from, int32_t to, void *body) {
+  zan_par_dispatch(from, to, body, 0);
+}
+
+void zan_parallel_for_range(int32_t from, int32_t to, void *body) {
+  zan_par_dispatch(from, to, body, 1);
+}

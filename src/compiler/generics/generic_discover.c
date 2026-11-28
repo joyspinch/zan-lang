@@ -36,6 +36,7 @@ static zan_ast_list_t *disc_tps;
 static zan_type_t **disc_bind;
 typedef struct {
     zan_symbol_t *m;
+    zan_type_t *owner_inst;
     zan_type_t *bind[8];
 } disc_mspec_t;
 static disc_mspec_t *disc_specs;
@@ -65,16 +66,22 @@ static int disc_type_depth(zan_type_t *t, int d) {
     return m;
 }
 
-static void disc_queue_spec(zan_symbol_t *m, zan_type_t **bind, int n) {
+static void disc_queue_spec(zan_symbol_t *m, zan_type_t *owner_inst,
+                            zan_type_t **bind, int n) {
     if (!m || !m->decl || m->decl->kind != AST_METHOD_DECL) return;
     if (!m->decl->method_decl.body) return;
-    /* 只排非泛型类里的泛型方法（Enumerable 这类静态工具类）：泛型类里的
-     * 泛型方法还需叠加类实例上下文，交给原有的类实例扫描。 */
-    if (m->parent && is_user_generic_sym(m->parent)) return;
+    if (m->parent && is_user_generic_sym(m->parent) &&
+        (!owner_inst || !type_is_concrete(owner_inst)))
+        return;
     for (int i = 0; i < n; i++)
         if (!bind[i] || disc_type_depth(bind[i], 0) > 6) return;  /* 防递归膨胀 */
+    if (owner_inst && disc_type_depth(owner_inst, 0) > 6) return;
     for (int k = 0; k < disc_spec_n; k++) {
         if (disc_specs[k].m != m) continue;
+        if (disc_specs[k].owner_inst != owner_inst &&
+            (!disc_specs[k].owner_inst || !owner_inst ||
+             !types_equal(disc_specs[k].owner_inst, owner_inst)))
+            continue;
         bool same = true;
         for (int i = 0; i < n && same; i++)
             same = types_equal(disc_specs[k].bind[i], bind[i]);
@@ -92,6 +99,7 @@ static void disc_queue_spec(zan_symbol_t *m, zan_type_t **bind, int n) {
     disc_mspec_t *sp = &disc_specs[disc_spec_n++];
     memset(sp, 0, sizeof(*sp));
     sp->m = m;
+    sp->owner_inst = owner_inst;
     for (int i = 0; i < n; i++) sp->bind[i] = bind[i];
 }
 
@@ -132,7 +140,8 @@ static void collect_inst_typeref(zan_irgen_t *g, zan_ast_node_t *tref) {
  * 且接收者类型须与第 0 形参同一泛型定义）、类型名接收者的静态方法、实例
  * 接收者的方法、当前类里的裸名调用。 */
 static void disc_try_method(zan_irgen_t *g, zan_ast_node_t *call,
-                            zan_symbol_t *m, zan_ast_node_t *recv_for_infer) {
+                            zan_symbol_t *m, zan_ast_node_t *recv_for_infer,
+                            zan_type_t *owner_inst) {
     if (!m || !m->decl || m->decl->kind != AST_METHOD_DECL) return;
     zan_ast_list_t *tps = &m->decl->method_decl.type_params;
     int n = tps->count;
@@ -140,7 +149,7 @@ static void disc_try_method(zan_irgen_t *g, zan_ast_node_t *call,
     if (call->call.type_args.count != 0 && call->call.type_args.count != n) return;
     zan_type_t *bind[8] = { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL };
     zan_type_t *saved_cur = g->cur_inst;
-    g->cur_inst = g->collect_inst_ctx;
+    g->cur_inst = owner_inst ? owner_inst : g->collect_inst_ctx;
     infer_method_tp_bindings(g, m, call, recv_for_infer, disc_scope, bind);
     g->cur_inst = saved_cur;
     for (int i = 0; i < n; i++) {
@@ -148,8 +157,10 @@ static void disc_try_method(zan_irgen_t *g, zan_ast_node_t *call,
         if (!bind[i] || !type_is_concrete(bind[i])) return;
     }
     zan_type_t *ret = m->type ? subst_method_tp(g, m->type, tps, bind) : NULL;
+    if (ret && owner_inst && !type_is_concrete(ret))
+        ret = subst_type_param_deep(g, ret, owner_inst);
     if (ret && type_is_concrete(ret)) collect_inst_type(g, ret);
-    disc_queue_spec(m, bind, n);
+    disc_queue_spec(m, owner_inst, bind, n);
 }
 
 static void disc_collect_call(zan_irgen_t *g, zan_ast_node_t *e) {
@@ -166,17 +177,54 @@ static void disc_collect_call(zan_irgen_t *g, zan_ast_node_t *e) {
     if (!recv_obj) {
         if (g->current_type_sym && !local_find(disc_scope, mname)) {
             zan_symbol_t *m = get_method_sym(g->current_type_sym, mname);
-            disc_try_method(g, e, m, NULL);
+            disc_try_method(g, e, m, NULL, g->collect_inst_ctx);
         }
         return;
     }
     zan_symbol_t *ts = NULL;
+    zan_type_t *tp_sinst = NULL;
     if (recv_obj->kind == AST_IDENTIFIER && !local_find(disc_scope, recv_obj->ident.name)) {
-        ts = zan_binder_lookup(g->binder, recv_obj->ident.name);
-        if (ts && ts->kind != SYM_CLASS && ts->kind != SYM_STRUCT) ts = NULL;
+        zan_istr_t rn = recv_obj->ident.name;
+        zan_type_t *tp_ct = NULL;
+        if (disc_tps && disc_bind) {
+            for (int ti = 0; ti < disc_tps->count; ti++) {
+                zan_ast_node_t *tp = disc_tps->items[ti];
+                if (tp && tp->kind == AST_IDENTIFIER &&
+                    tp->ident.name.len == rn.len &&
+                    memcmp(tp->ident.name.str, rn.str, (size_t)rn.len) == 0) {
+                    tp_ct = disc_bind[ti];
+                    break;
+                }
+            }
+        }
+        if (!tp_ct && g->collect_inst_ctx && g->collect_inst_ctx->sym &&
+            g->collect_inst_ctx->sym->decl) {
+            zan_ast_list_t *ctps = &g->collect_inst_ctx->sym->decl->type_decl.type_params;
+            for (int ti = 0; ti < ctps->count && ti < g->collect_inst_ctx->type_arg_count; ti++) {
+                zan_ast_node_t *tp = ctps->items[ti];
+                if (tp && tp->kind == AST_IDENTIFIER &&
+                    tp->ident.name.len == rn.len &&
+                    memcmp(tp->ident.name.str, rn.str, (size_t)rn.len) == 0) {
+                    tp_ct = g->collect_inst_ctx->type_args[ti];
+                    break;
+                }
+            }
+        }
+        if (tp_ct && tp_ct->sym &&
+            (tp_ct->kind == TYPE_CLASS || tp_ct->kind == TYPE_STRUCT)) {
+            ts = tp_ct->sym;
+            if (tp_ct->type_arg_count > 0) tp_sinst = tp_ct;
+        } else {
+            ts = zan_binder_lookup(g->binder, rn);
+            if (ts && ts->kind != SYM_CLASS && ts->kind != SYM_STRUCT) ts = NULL;
+        }
     }
     if (ts) {
-        disc_try_method(g, e, get_method_sym(ts, mname), NULL);
+        zan_type_t *sinst = tp_sinst ? tp_sinst
+            : (recv_obj->ident.inst_type_ref
+                ? disc_subst(g, zan_binder_resolve_type(g->binder, recv_obj->ident.inst_type_ref))
+                : NULL);
+        disc_try_method(g, e, get_method_sym(ts, mname), NULL, sinst);
         return;
     }
     zan_type_t *rt = disc_subst(g, infer_expr_type(g, recv_obj, disc_scope));
@@ -185,7 +233,7 @@ static void disc_collect_call(zan_irgen_t *g, zan_ast_node_t *e) {
         zan_symbol_t *im = get_method_sym(rt->sym, mname);
         if (im && im->decl && im->decl->kind == AST_METHOD_DECL &&
             im->decl->method_decl.type_params.count > 0) {
-            disc_try_method(g, e, im, recv_obj);
+            disc_try_method(g, e, im, recv_obj, rt->type_arg_count > 0 ? rt : NULL);
             return;
         }
     }
@@ -217,7 +265,7 @@ static void disc_collect_call(zan_irgen_t *g, zan_ast_node_t *e) {
                                             (size_t)p0->name.len) != 0)) continue;
             }
         }
-        disc_try_method(g, e, m, recv_obj);
+        disc_try_method(g, e, m, recv_obj, NULL);
     }
 }
 
@@ -314,6 +362,25 @@ void collect_inst_expr(zan_irgen_t *g, zan_ast_node_t *e) {
         collect_inst_stmt(g, e->lambda.body);
         collect_inst_expr(g, e->lambda.body);
         break;
+    case AST_TUPLE_EXPR:
+        for (int i = 0; i < e->tuple_expr.items.count; i++)
+            collect_inst_expr(g, e->tuple_expr.items.items[i]);
+        break;
+    case AST_SWITCH_EXPR:
+        collect_inst_expr(g, e->switch_expr.expr);
+        for (int i = 0; i < e->switch_expr.arms.count; i++) {
+            zan_ast_node_t *arm = e->switch_expr.arms.items[i];
+            collect_inst_typeref(g, arm->switch_arm.type_pattern);
+            collect_inst_expr(g, arm->switch_arm.pattern);
+            collect_inst_expr(g, arm->switch_arm.when_cond);
+            collect_inst_expr(g, arm->switch_arm.result);
+        }
+        break;
+    case AST_WITH_EXPR:
+        collect_inst_expr(g, e->with_expr.expr);
+        for (int i = 0; i < e->with_expr.assigns.count; i++)
+            collect_inst_expr(g, e->with_expr.assigns.items[i]);
+        break;
     default:
         break;
     }
@@ -342,6 +409,11 @@ static void collect_inst_stmt(zan_irgen_t *g, zan_ast_node_t *st) {
             vt = disc_subst(g, vt);
             if (vt) local_add(disc_scope, st->var_decl.name, NULL, vt);
         }
+        break;
+    case AST_TUPLE_DECON:
+        for (int i = 0; i < st->tuple_decon.types.count; i++)
+            collect_inst_typeref(g, st->tuple_decon.types.items[i]);
+        collect_inst_expr(g, st->tuple_decon.initializer);
         break;
     case AST_EXPR_STMT:
         collect_inst_expr(g, st->expr_stmt.expr);
@@ -490,9 +562,10 @@ void discover_generic_insts(zan_irgen_t *g, zan_ast_node_t *unit) {
             disc_mspec_t sp = disc_specs[disc_spec_done];
             disc_tps = &sp.m->decl->method_decl.type_params;
             disc_bind = sp.bind;
-            g->collect_inst_ctx = NULL;
+            g->collect_inst_ctx = sp.owner_inst;
             g->current_type_sym = sp.m->parent;
             collect_inst_member(g, sp.m->decl);
+            g->collect_inst_ctx = NULL;
             disc_tps = NULL;
             disc_bind = NULL;
         }

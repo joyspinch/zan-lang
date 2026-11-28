@@ -705,3 +705,162 @@ LLVMValueRef abi_extern_thunk(zan_irgen_t *g, const char *name,
   free(zan_params);
   return thunk;
 }
+
+static bool abi_can_adapt_scalar_ptr(LLVMTypeRef src, LLVMTypeRef dst) {
+  if (src == dst)
+    return true;
+  LLVMTypeKind sk = LLVMGetTypeKind(src);
+  LLVMTypeKind dk = LLVMGetTypeKind(dst);
+  if ((sk == LLVMIntegerTypeKind && dk == LLVMPointerTypeKind) ||
+      (sk == LLVMPointerTypeKind && dk == LLVMIntegerTypeKind))
+    return true;
+  return false;
+}
+
+static LLVMValueRef abi_build_scalar_ptr_cast(LLVMBuilderRef b, LLVMValueRef v,
+                                              LLVMTypeRef dst,
+                                              const char *name) {
+  LLVMTypeRef src = LLVMTypeOf(v);
+  if (src == dst)
+    return v;
+  LLVMTypeKind sk = LLVMGetTypeKind(src);
+  LLVMTypeKind dk = LLVMGetTypeKind(dst);
+  if (sk == LLVMIntegerTypeKind && dk == LLVMPointerTypeKind)
+    return LLVMBuildIntToPtr(b, v, dst, name);
+  if (sk == LLVMPointerTypeKind && dk == LLVMIntegerTypeKind)
+    return LLVMBuildPtrToInt(b, v, dst, name);
+  return v;
+}
+
+/* When a [DllImport] binds an extern symbol already declared in the module
+ * (e.g. pre-declared libc `strlen(ptr)` bound via `nint` -> `i64`), calling
+ * the declaration with a mismatched function type breaks LLVM's TLI/MemorySSA
+ * argmem analysis (e.g. `memory(argmem: read)` on `strlen(ptr)` treats a call
+ * with an `i64` arg as reading no memory, allowing LICM to hoist it out of
+ * loops). Emit an internal alwaysinline adapter thunk that converts ptr<->int
+ * and invokes the declaration with its true LLVM signature. */
+LLVMValueRef abi_extern_sig_adapt_thunk(zan_irgen_t *g, const char *name,
+                                        LLVMValueRef existing_fn,
+                                        LLVMTypeRef zan_ft) {
+  if (!existing_fn || !zan_ft)
+    return NULL;
+  LLVMTypeRef ex_ft = LLVMGlobalGetValueType(existing_fn);
+  if (!ex_ft || ex_ft == zan_ft ||
+      LLVMGetTypeKind(ex_ft) != LLVMFunctionTypeKind)
+    return NULL;
+
+  unsigned ex_pc = LLVMCountParamTypes(ex_ft);
+  unsigned zan_pc = LLVMCountParamTypes(zan_ft);
+  bool ex_vararg = LLVMIsFunctionVarArg(ex_ft) != 0;
+  if ((!ex_vararg && ex_pc != zan_pc) || (ex_vararg && zan_pc < ex_pc))
+    return NULL;
+
+  LLVMTypeRef ex_ret = LLVMGetReturnType(ex_ft);
+  LLVMTypeRef zan_ret = LLVMGetReturnType(zan_ft);
+  bool ret_void_discard =
+      LLVMGetTypeKind(zan_ret) == LLVMVoidTypeKind &&
+      LLVMGetTypeKind(ex_ret) != LLVMVoidTypeKind;
+  if (!ret_void_discard && !abi_can_adapt_scalar_ptr(ex_ret, zan_ret))
+    return NULL;
+
+  LLVMTypeRef *ex_params =
+      (LLVMTypeRef *)calloc(ex_pc ? ex_pc : 1, sizeof(LLVMTypeRef));
+  LLVMTypeRef *zan_params =
+      (LLVMTypeRef *)calloc(zan_pc ? zan_pc : 1, sizeof(LLVMTypeRef));
+  if (!ex_params || !zan_params) {
+    free(ex_params);
+    free(zan_params);
+    return NULL;
+  }
+  if (ex_pc)
+    LLVMGetParamTypes(ex_ft, ex_params);
+  if (zan_pc)
+    LLVMGetParamTypes(zan_ft, zan_params);
+
+  bool ok = true;
+  for (unsigned i = 0; i < ex_pc; i++) {
+    if (!abi_can_adapt_scalar_ptr(zan_params[i], ex_params[i])) {
+      ok = false;
+      break;
+    }
+  }
+  if (!ok) {
+    free(ex_params);
+    free(zan_params);
+    return NULL;
+  }
+
+  char tname[320];
+  LLVMValueRef thunk = NULL;
+  for (unsigned idx = 0; idx < 64; idx++) {
+    if (idx == 0)
+      snprintf(tname, sizeof(tname), "zan.extadapt.%s", name);
+    else
+      snprintf(tname, sizeof(tname), "zan.extadapt.%s.%u", name, idx);
+    LLVMValueRef prev = LLVMGetNamedFunction(g->mod, tname);
+    if (!prev)
+      break;
+    if (LLVMGlobalGetValueType(prev) == zan_ft) {
+      free(ex_params);
+      free(zan_params);
+      return prev;
+    }
+  }
+  if (LLVMGetNamedFunction(g->mod, tname)) {
+    free(ex_params);
+    free(zan_params);
+    return NULL;
+  }
+
+  thunk = LLVMAddFunction(g->mod, tname, zan_ft);
+  LLVMSetLinkage(thunk, LLVMInternalLinkage);
+  unsigned ai_kind = LLVMGetEnumAttributeKindForName("alwaysinline", 12);
+  if (ai_kind) {
+    LLVMAttributeRef ai_attr = LLVMCreateEnumAttribute(g->ctx, ai_kind, 0);
+    LLVMAddAttributeAtIndex(thunk, LLVMAttributeFunctionIndex, ai_attr);
+  }
+
+  LLVMBasicBlockRef saved = LLVMGetInsertBlock(g->builder);
+  LLVMBasicBlockRef entry =
+      LLVMAppendBasicBlockInContext(g->ctx, thunk, "entry");
+  LLVMPositionBuilderAtEnd(g->builder, entry);
+
+  LLVMValueRef *call_args =
+      (LLVMValueRef *)calloc(zan_pc ? zan_pc : 1, sizeof(LLVMValueRef));
+  if (!call_args) {
+    if (saved)
+      LLVMPositionBuilderAtEnd(g->builder, saved);
+    LLVMDeleteFunction(thunk);
+    free(ex_params);
+    free(zan_params);
+    return NULL;
+  }
+  for (unsigned i = 0; i < zan_pc; i++) {
+    LLVMValueRef p = LLVMGetParam(thunk, i);
+    if (i < ex_pc)
+      call_args[i] =
+          abi_build_scalar_ptr_cast(g->builder, p, ex_params[i], "ext.arg");
+    else
+      call_args[i] = p;
+  }
+
+  LLVMValueRef call = LLVMBuildCall2(
+      g->builder, ex_ft, existing_fn, call_args, zan_pc,
+      LLVMGetTypeKind(ex_ret) == LLVMVoidTypeKind ? "" : "ext.call");
+  LLVMSetInstructionCallConv(call, LLVMGetFunctionCallConv(existing_fn));
+
+  if (LLVMGetTypeKind(zan_ret) == LLVMVoidTypeKind) {
+    LLVMBuildRetVoid(g->builder);
+  } else {
+    LLVMValueRef r =
+        abi_build_scalar_ptr_cast(g->builder, call, zan_ret, "ext.ret");
+    LLVMBuildRet(g->builder, r);
+  }
+
+  if (saved)
+    LLVMPositionBuilderAtEnd(g->builder, saved);
+  free(call_args);
+  free(ex_params);
+  free(zan_params);
+  return thunk;
+}

@@ -372,6 +372,9 @@ LLVMValueRef zan_call2(LLVMBuilderRef b, LLVMTypeRef ty, LLVMValueRef fn,
   }
   LLVMValueRef call = LLVMBuildCall2(b, ty, fn, args, n, nm);
   if (callee && LLVMIsAFunction(callee)) {
+    unsigned cc = LLVMGetFunctionCallConv(callee);
+    if (cc != LLVMCCallConv)
+      LLVMSetInstructionCallConv(call, cc);
     static const char *ext[2] = {"signext", "zeroext"};
     for (int e = 0; e < 2; e++) {
       unsigned kind = LLVMGetEnumAttributeKindForName(ext[e], strlen(ext[e]));
@@ -585,6 +588,9 @@ LLVMValueRef zan_call_or_invoke(zan_irgen_t *g, LLVMBuilderRef b,
       LLVMValueRef inv =
           LLVMBuildInvoke2(b, ty, fn, args, n, norm_bb, lpad_bb, nm);
       if (callee && LLVMIsAFunction(callee)) {
+        unsigned cc = LLVMGetFunctionCallConv(callee);
+        if (cc != LLVMCCallConv)
+          LLVMSetInstructionCallConv(inv, cc);
         static const char *ext[2] = {"signext", "zeroext"};
         for (int e = 0; e < 2; e++) {
           unsigned kind =

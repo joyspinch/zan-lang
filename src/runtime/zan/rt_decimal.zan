@@ -1,0 +1,1097 @@
+using System;
+using System.Numerics;
+
+// Pure-Zan 128-bit Decimal runtime (replaces target zanrt_decimal.obj from src/runtime/rt_decimal.c).
+// Compiled directly by `zanc -c -O2` into zanrt_decimal.obj/.o.
+// Uses hardware BigMul / AddWithCarry / SubWithBorrow / DivRem128 / BitCast / InvokeVariadic.
+
+struct ZanDecimal {
+    public uint Flags;  // bit 31 = sign (0x80000000), bits 16..23 = scale (0..28)
+    public uint Hi32;   // upper 32 bits of 96-bit mantissa
+    public ulong Lo64;  // lower 64 bits of 96-bit mantissa
+}
+
+struct U128 {
+    public ulong Lo;
+    public ulong Hi;
+}
+
+struct DecBuf64 {
+    public InlineArray<64, byte> Data;
+}
+
+struct DecU64x6 {
+    public InlineArray<6, ulong> Data;
+}
+
+class ZanDecimalRuntime {
+    const uint DECIMAL_SIGN_MASK = 0x80000000U;
+    const uint DECIMAL_SCALE_MASK = 0x00FF0000U;
+    const int DECIMAL_SCALE_SHIFT = 16;
+    const int MAX_SCALE = 28;
+    const int SIGFPE_NUM = 8;
+
+    [DllImport("crt", EntryPoint = "raise")]
+    static extern int CRaise(int sig);
+
+    [DllImport("crt", EntryPoint = "snprintf")]
+    static extern int CSnprintf(nint buf, long cap, nint fmt);
+
+    // ---- 128-bit unsigned arithmetic built on hardware intrinsics ----
+
+    [NoAlloc]
+    static U128 MakeU128(ulong hi, ulong lo) {
+        U128 r;
+        r.Lo = lo;
+        r.Hi = hi;
+        return r;
+    }
+
+    [NoAlloc]
+    static U128 U128FromU64(ulong v) {
+        U128 r;
+        r.Lo = v;
+        r.Hi = 0UL;
+        return r;
+    }
+
+    [NoAlloc]
+    static bool U128IsZero(U128 a) {
+        return a.Lo == 0UL && a.Hi == 0UL;
+    }
+
+    [NoAlloc]
+    static int U128Cmp(U128 a, U128 b) {
+        if (a.Hi != b.Hi) return (a.Hi > b.Hi) ? 1 : -1;
+        if (a.Lo != b.Lo) return (a.Lo > b.Lo) ? 1 : -1;
+        return 0;
+    }
+
+    [NoAlloc]
+    static bool U128GtM96Max(U128 a) {
+        return a.Hi > 0xFFFFFFFFUL;
+    }
+
+    [NoAlloc]
+    static bool U128LtM96Max(U128 a) {
+        return a.Hi < 0xFFFFFFFFUL || (a.Hi == 0xFFFFFFFFUL && a.Lo < 0xFFFFFFFFFFFFFFFFUL);
+    }
+
+    [NoAlloc]
+    static U128 U128Add(U128 a, U128 b) {
+        bool c = false;
+        ulong lo = BitOperations.AddWithCarry(a.Lo, b.Lo, false, ref c);
+        ulong hi = a.Hi + b.Hi + (c ? 1UL : 0UL);
+        return MakeU128(hi, lo);
+    }
+
+    [NoAlloc]
+    static U128 U128AddU64(U128 a, ulong b) {
+        bool c = false;
+        ulong lo = BitOperations.AddWithCarry(a.Lo, b, false, ref c);
+        ulong hi = a.Hi + (c ? 1UL : 0UL);
+        return MakeU128(hi, lo);
+    }
+
+    [NoAlloc]
+    static U128 U128Sub(U128 a, U128 b) {
+        bool bw = false;
+        ulong lo = BitOperations.SubWithBorrow(a.Lo, b.Lo, false, ref bw);
+        ulong hi = a.Hi - b.Hi - (bw ? 1UL : 0UL);
+        return MakeU128(hi, lo);
+    }
+
+    [NoAlloc]
+    static U128 U128Mul(U128 a, U128 b) {
+        ulong lo = 0UL;
+        ulong hi = BitOperations.BigMul(a.Lo, b.Lo, ref lo);
+        hi += a.Lo * b.Hi + a.Hi * b.Lo;
+        return MakeU128(hi, lo);
+    }
+
+    [NoAlloc]
+    static U128 U128MulU64(U128 a, ulong b) {
+        ulong lo = 0UL;
+        ulong hi = BitOperations.BigMul(a.Lo, b, ref lo);
+        hi += a.Hi * b;
+        return MakeU128(hi, lo);
+    }
+
+    [NoAlloc]
+    static U128 U128Shl1(U128 a) {
+        return MakeU128((a.Hi << 1) | (a.Lo >> 63), a.Lo << 1);
+    }
+
+    [NoAlloc]
+    static U128 U128ShrSmall(U128 a, int s) {
+        if (s <= 0) return a;
+        if (s >= 64) return MakeU128(0UL, a.Hi >> (s - 64));
+        return MakeU128(a.Hi >> s, (a.Lo >> s) | (a.Hi << (64 - s)));
+    }
+
+    [NoAlloc]
+    static U128 U128Shl32Or(U128 a, ulong limb) {
+        return MakeU128((a.Hi << 32) | (a.Lo >> 32), (a.Lo << 32) | (limb & 0xFFFFFFFFUL));
+    }
+
+    [NoAlloc]
+    static ulong U128GetLimb32(U128 a, int idx) {
+        if (idx == 0) return a.Lo & 0xFFFFFFFFUL;
+        if (idx == 1) return a.Lo >> 32;
+        if (idx == 2) return a.Hi & 0xFFFFFFFFUL;
+        return a.Hi >> 32;
+    }
+
+    [NoAlloc]
+    static ulong Pow10U64(int n) {
+        if (n == 0) return 1UL;
+        if (n == 1) return 10UL;
+        if (n == 2) return 100UL;
+        if (n == 3) return 1000UL;
+        if (n == 4) return 10000UL;
+        if (n == 5) return 100000UL;
+        if (n == 6) return 1000000UL;
+        if (n == 7) return 10000000UL;
+        if (n == 8) return 100000000UL;
+        if (n == 9) return 1000000000UL;
+        if (n == 10) return 10000000000UL;
+        if (n == 11) return 100000000000UL;
+        if (n == 12) return 1000000000000UL;
+        if (n == 13) return 10000000000000UL;
+        if (n == 14) return 100000000000000UL;
+        if (n == 15) return 1000000000000000UL;
+        if (n == 16) return 10000000000000000UL;
+        if (n == 17) return 100000000000000000UL;
+        if (n == 18) return 1000000000000000000UL;
+        return 10000000000000000000UL;
+    }
+
+    [NoAlloc]
+    static U128 Pow10_128(int n) {
+        if (n <= 19) return U128FromU64(Pow10U64(n));
+        return U128MulU64(U128FromU64(10000000000000000000UL), Pow10U64(n - 19));
+    }
+
+    [NoAlloc]
+    static double Pow10Dbl(int n) {
+        if (n <= 9) {
+            if (n == 0) return 1.0;
+            if (n == 1) return 1e1;
+            if (n == 2) return 1e2;
+            if (n == 3) return 1e3;
+            if (n == 4) return 1e4;
+            if (n == 5) return 1e5;
+            if (n == 6) return 1e6;
+            if (n == 7) return 1e7;
+            if (n == 8) return 1e8;
+            return 1e9;
+        }
+        if (n <= 19) {
+            if (n == 10) return 1e10;
+            if (n == 11) return 1e11;
+            if (n == 12) return 1e12;
+            if (n == 13) return 1e13;
+            if (n == 14) return 1e14;
+            if (n == 15) return 1e15;
+            if (n == 16) return 1e16;
+            if (n == 17) return 1e17;
+            if (n == 18) return 1e18;
+            return 1e19;
+        }
+        if (n == 20) return 1e20;
+        if (n == 21) return 1e21;
+        if (n == 22) return 1e22;
+        if (n == 23) return 1e23;
+        if (n == 24) return 1e24;
+        if (n == 25) return 1e25;
+        if (n == 26) return 1e26;
+        if (n == 27) return 1e27;
+        return 1e28;
+    }
+
+    // M96_MAX = (1 << 96) - 1 = { Hi = 0xFFFFFFFFUL, Lo = 0xFFFFFFFFFFFFFFFFUL }
+    // M96_MAX / 10      = { Hi = 0x19999999UL, Lo = 0x9999999999999999UL }
+    // M96_MAX / 10000   = { Hi = 0x00068DB8UL, Lo = 0xBAC710CB295E9E1BUL }
+    // M96_MAX / 10^9    = { Hi = 0x00000004UL, Lo = 0x4B82FA09B5A52CB9UL }
+    [NoAlloc]
+    static U128 M96Max() { return MakeU128(0xFFFFFFFFUL, 0xFFFFFFFFFFFFFFFFUL); }
+    [NoAlloc]
+    static U128 M96Div10() { return MakeU128(0x19999999UL, 0x9999999999999999UL); }
+    [NoAlloc]
+    static U128 M96Div1e4() { return MakeU128(0x00068DB8UL, 0xBAC710CB295E9E1BUL); }
+    [NoAlloc]
+    static U128 M96Div1e9() { return MakeU128(0x00000004UL, 0x4B82FA09B5A52CB9UL); }
+
+    [NoAlloc]
+    static U128 U128DivRemU32(U128 num, uint d, ref uint remOut) {
+        ulong du = (ulong)d;
+        if (num.Hi == 0UL) {
+            ulong q = num.Lo / du;
+            remOut = (uint)(num.Lo - q * du);
+            return U128FromU64(q);
+        }
+        ulong qHi = num.Hi / du;
+        ulong r = num.Hi - qHi * du;
+        ulong mid = (r << 32) | (num.Lo >> 32);
+        ulong qMid = mid / du;
+        r = mid - qMid * du;
+        ulong low = (r << 32) | (num.Lo & 0xFFFFFFFFUL);
+        ulong qLo = low / du;
+        remOut = (uint)(low - qLo * du);
+        return MakeU128(qHi, (qMid << 32) | qLo);
+    }
+
+    // 128-bit / 128-bit division: hardware 64-bit / 32-bit / DivRem128 fast paths + Knuth Algorithm D
+    [NoAlloc]
+    static U128 U128DivRem(U128 num, U128 den, ref U128 remOut) {
+        if (U128IsZero(den)) {
+            remOut = U128FromU64(0UL);
+            return U128FromU64(0UL);
+        }
+        int cmp = U128Cmp(num, den);
+        if (cmp < 0) {
+            remOut = num;
+            return U128FromU64(0UL);
+        }
+        if (cmp == 0) {
+            remOut = U128FromU64(0UL);
+            return U128FromU64(1UL);
+        }
+        if (num.Hi == 0UL) {
+            ulong q = num.Lo / den.Lo;
+            remOut = U128FromU64(num.Lo - q * den.Lo);
+            return U128FromU64(q);
+        }
+        if (den.Hi == 0UL && den.Lo <= 0xFFFFFFFFUL) {
+            uint r32 = 0U;
+            U128 q = U128DivRemU32(num, (uint)den.Lo, ref r32);
+            remOut = U128FromU64((ulong)r32);
+            return q;
+        }
+        if (den.Hi == 0UL) {
+            ulong d = den.Lo;
+            ulong hi = num.Hi;
+            ulong lo = num.Lo;
+            ulong qHi = 0UL;
+            if (hi >= d) {
+                qHi = hi / d;
+                hi -= qHi * d;
+            }
+            ulong r64 = 0UL;
+            ulong qLo = BitOperations.DivRem128(hi, lo, d, ref r64);
+            remOut = U128FromU64(r64);
+            return MakeU128(qHi, qLo);
+        }
+
+        // Knuth Algorithm D in base B = 2^32
+        const ulong BASE32 = 0x100000000UL;
+        DecU64x6 uArr = new DecU64x6();
+        DecU64x6 vArr = new DecU64x6();
+        DecU64x6 qArr = new DecU64x6();
+        nint uPtr = NativeMemory.AddressOf(ref uArr);
+        nint vPtr = NativeMemory.AddressOf(ref vArr);
+        nint qPtr = NativeMemory.AddressOf(ref qArr);
+
+        int vn = 4;
+        while (vn > 1 && U128GetLimb32(den, vn - 1) == 0UL) vn--;
+        for (int i = 0; i < 4; i++) {
+            NativeMemory.At<ulong>(vPtr, i) = U128GetLimb32(den, i);
+            NativeMemory.At<ulong>(uPtr, i) = U128GetLimb32(num, i);
+        }
+
+        uint topV = (uint)NativeMemory.At<ulong>(vPtr, vn - 1);
+        int s = BitOperations.LeadingZeroCount((int)topV);
+        const int mn = 5;
+        if (s != 0) {
+            ulong carry = 0UL;
+            for (int i = 0; i < mn; i++) {
+                ulong cur = NativeMemory.At<ulong>(uPtr, i);
+                NativeMemory.At<ulong>(uPtr, i) = ((cur << s) | carry) & 0xFFFFFFFFUL;
+                carry = cur >> (32 - s);
+            }
+            ulong vc = 0UL;
+            for (int i = 0; i < vn; i++) {
+                ulong cur = NativeMemory.At<ulong>(vPtr, i);
+                NativeMemory.At<ulong>(vPtr, i) = ((cur << s) | vc) & 0xFFFFFFFFUL;
+                vc = cur >> (32 - s);
+            }
+        }
+
+        int m = mn - vn;
+        ulong vTop = NativeMemory.At<ulong>(vPtr, vn - 1);
+        ulong vSecond = (vn > 1) ? NativeMemory.At<ulong>(vPtr, vn - 2) : 0UL;
+        for (int j = m; j >= 0; j--) {
+            ulong numHi = (NativeMemory.At<ulong>(uPtr, j + vn) << 32) | NativeMemory.At<ulong>(uPtr, j + vn - 1);
+            ulong qhat = numHi / vTop;
+            ulong rhat = numHi % vTop;
+            while (qhat >= BASE32 ||
+                   (vn > 1 && qhat * vSecond > (rhat << 32) + NativeMemory.At<ulong>(uPtr, j + vn - 2))) {
+                qhat--;
+                rhat += vTop;
+                if (rhat >= BASE32) break;
+            }
+            long borrow = 0L;
+            for (int i = 0; i < vn; i++) {
+                ulong p = qhat * NativeMemory.At<ulong>(vPtr, i);
+                long t = (long)NativeMemory.At<ulong>(uPtr, i + j) - borrow - (long)(p & 0xFFFFFFFFUL);
+                NativeMemory.At<ulong>(uPtr, i + j) = (ulong)t & 0xFFFFFFFFUL;
+                borrow = (long)(p >> 32) - (t >> 32);
+            }
+            long tLast = (long)NativeMemory.At<ulong>(uPtr, j + vn) - borrow;
+            NativeMemory.At<ulong>(uPtr, j + vn) = (ulong)tLast & 0xFFFFFFFFUL;
+            if (tLast < 0L) {
+                qhat--;
+                ulong carry = 0UL;
+                for (int i = 0; i < vn; i++) {
+                    ulong cur = NativeMemory.At<ulong>(uPtr, i + j) + NativeMemory.At<ulong>(vPtr, i) + carry;
+                    NativeMemory.At<ulong>(uPtr, i + j) = cur & 0xFFFFFFFFUL;
+                    carry = cur >> 32;
+                }
+                NativeMemory.At<ulong>(uPtr, j + vn) = (NativeMemory.At<ulong>(uPtr, j + vn) + carry) & 0xFFFFFFFFUL;
+            }
+            NativeMemory.At<ulong>(qPtr, j) = qhat;
+        }
+
+        U128 rem = U128FromU64(0UL);
+        for (int i = vn - 1; i >= 0; i--) {
+            rem = U128Shl32Or(rem, NativeMemory.At<ulong>(uPtr, i));
+        }
+        remOut = U128ShrSmall(rem, s);
+
+        U128 quo = U128FromU64(0UL);
+        for (int i = m; i >= 0; i--) {
+            quo = U128Shl32Or(quo, NativeMemory.At<ulong>(qPtr, i));
+        }
+        return quo;
+    }
+
+    [NoAlloc]
+    static U128 M96DivPow10(int n) {
+        if (n <= 0) return M96Max();
+        U128 dummy = U128FromU64(0UL);
+        return U128DivRem(M96Max(), Pow10_128(n), ref dummy);
+    }
+
+    // ---- Decimal helpers ----
+
+    [NoAlloc]
+    static bool DecIsNeg(ZanDecimal d) {
+        return (d.Flags & DECIMAL_SIGN_MASK) != 0U;
+    }
+
+    [NoAlloc]
+    static int DecScale(ZanDecimal d) {
+        return (int)((d.Flags & DECIMAL_SCALE_MASK) >> DECIMAL_SCALE_SHIFT);
+    }
+
+    [NoAlloc]
+    static ZanDecimal MakeDec(uint hi, ulong lo, bool neg, int scale) {
+        ZanDecimal d;
+        d.Flags = (((uint)scale) << DECIMAL_SCALE_SHIFT) | (neg ? DECIMAL_SIGN_MASK : 0U);
+        d.Hi32 = hi;
+        d.Lo64 = lo;
+        return d;
+    }
+
+    [NoAlloc]
+    static U128 GetM128(ZanDecimal d) {
+        return MakeU128((ulong)d.Hi32, d.Lo64);
+    }
+
+    [NoAlloc]
+    static ZanDecimal FromM128(U128 m, bool neg, int scale) {
+        uint rem32 = 0U;
+        if (U128GtM96Max(m) && scale > 0) {
+            while (U128GtM96Max(m) && scale >= 9) {
+                U128 q = U128DivRemU32(m, 1000000000U, ref rem32);
+                if (!U128GtM96Max(q)) break;
+                m = q;
+                scale -= 9;
+            }
+            while (U128GtM96Max(m) && scale > 0) {
+                m = U128DivRemU32(m, 10U, ref rem32);
+                scale--;
+            }
+        }
+        return MakeDec((uint)m.Hi, m.Lo, neg, scale);
+    }
+
+    [NoAlloc]
+    static void AlignScale(ref U128 ma, ref int sa, ref U128 mb, ref int sb) {
+        if (sa == sb) return;
+        U128 dummy = U128FromU64(0UL);
+        uint r32 = 0U;
+        if (sa < sb) {
+            if (U128IsZero(ma)) {
+                sa = sb;
+                return;
+            }
+            int diff = sb - sa;
+            if (diff <= MAX_SCALE && U128Cmp(ma, M96DivPow10(diff)) <= 0) {
+                ma = U128Mul(ma, Pow10_128(diff));
+                sa = sb;
+                return;
+            }
+            U128 d10 = M96Div10();
+            while (sa < sb && U128Cmp(ma, d10) <= 0) {
+                ma = U128MulU64(ma, 10UL);
+                sa++;
+            }
+            if (sa < sb) {
+                int remD = sb - sa;
+                if (remD <= MAX_SCALE) {
+                    mb = U128DivRem(mb, Pow10_128(remD), ref dummy);
+                    sb = sa;
+                } else {
+                    while (sa < sb) {
+                        mb = U128DivRemU32(mb, 10U, ref r32);
+                        sb--;
+                    }
+                }
+            }
+        } else {
+            if (U128IsZero(mb)) {
+                sb = sa;
+                return;
+            }
+            int diff = sa - sb;
+            if (diff <= MAX_SCALE && U128Cmp(mb, M96DivPow10(diff)) <= 0) {
+                mb = U128Mul(mb, Pow10_128(diff));
+                sb = sa;
+                return;
+            }
+            U128 d10 = M96Div10();
+            while (sb < sa && U128Cmp(mb, d10) <= 0) {
+                mb = U128MulU64(mb, 10UL);
+                sb++;
+            }
+            if (sb < sa) {
+                int remD = sa - sb;
+                if (remD <= MAX_SCALE) {
+                    ma = U128DivRem(ma, Pow10_128(remD), ref dummy);
+                    sa = sb;
+                } else {
+                    while (sb < sa) {
+                        ma = U128DivRemU32(ma, 10U, ref r32);
+                        sa--;
+                    }
+                }
+            }
+        }
+    }
+
+    [NoAlloc]
+    static void StripTrailingZeros(ref U128 quo, ref int scale) {
+        U128 q = quo;
+        int s = scale;
+        if (U128IsZero(q)) { scale = 0; return; }
+        if ((q.Lo & 1UL) != 0UL) return;
+        uint rem = 0U;
+        while (s >= 9 && q.Hi != 0UL) {
+            U128 next = U128DivRemU32(q, 1000000000U, ref rem);
+            if (rem != 0U) break;
+            q = next;
+            s -= 9;
+        }
+        while (s > 0 && q.Hi != 0UL) {
+            U128 next = U128DivRemU32(q, 10U, ref rem);
+            if (rem != 0U) break;
+            q = next;
+            s--;
+        }
+        if (q.Hi == 0UL) {
+            ulong q64 = q.Lo;
+            if ((q64 & 1UL) == 0UL) {
+                while (s >= 4 && (q64 % 10000UL) == 0UL) { q64 /= 10000UL; s -= 4; }
+                while (s >= 2 && (q64 % 100UL) == 0UL) { q64 /= 100UL; s -= 2; }
+                if (s > 0 && (q64 % 10UL) == 0UL) { q64 /= 10UL; s--; }
+            }
+            q = U128FromU64(q64);
+        }
+        quo = q;
+        scale = s;
+    }
+
+    // Round-to-nearest-even right shift for u128 by shift in [1, 66]
+    [NoAlloc]
+    static ulong U128ShrRneU64(U128 num, int shift) {
+        if (shift < 64) {
+            ulong q = (num.Lo >> shift) | (num.Hi << (64 - shift));
+            ulong half = 1UL << (shift - 1);
+            ulong mask = (half << 1) - 1UL;
+            ulong rem = num.Lo & mask;
+            if (rem > half || (rem == half && (q & 1UL) != 0UL)) q++;
+            return q;
+        }
+        if (shift == 64) {
+            ulong q = num.Hi;
+            ulong half = 0x8000000000000000UL;
+            if (num.Lo > half || (num.Lo == half && (q & 1UL) != 0UL)) q++;
+            return q;
+        }
+        // shift in [65, 66]
+        int s2 = shift - 64;
+        ulong q2 = num.Hi >> s2;
+        ulong halfHi = 1UL << (s2 - 1);
+        ulong maskHi = (halfHi << 1) - 1UL;
+        ulong remHi = num.Hi & maskHi;
+        bool gt = (remHi > halfHi) || (remHi == halfHi && num.Lo != 0UL);
+        bool eq = (remHi == halfHi && num.Lo == 0UL);
+        if (gt || (eq && (q2 & 1UL) != 0UL)) q2++;
+        return q2;
+    }
+
+    // ---- Core Decimal Operations ----
+
+    [NoAlloc]
+    static ZanDecimal DecNeg(ZanDecimal a) {
+        a.Flags = a.Flags ^ DECIMAL_SIGN_MASK;
+        return a;
+    }
+
+    [NoAlloc]
+    static int DecCmp(ZanDecimal a, ZanDecimal b) {
+        bool negA = DecIsNeg(a);
+        bool negB = DecIsNeg(b);
+        U128 ma = GetM128(a);
+        U128 mb = GetM128(b);
+        if (U128IsZero(ma) && U128IsZero(mb)) return 0;
+        if (negA && !negB) return -1;
+        if (!negA && negB) return 1;
+        int sa = DecScale(a);
+        int sb = DecScale(b);
+        if (sa != sb) AlignScale(ref ma, ref sa, ref mb, ref sb);
+        int cmp = U128Cmp(ma, mb);
+        return negA ? -cmp : cmp;
+    }
+
+    [NoAlloc]
+    static ZanDecimal DecAdd(ZanDecimal a, ZanDecimal b) {
+        bool negA = DecIsNeg(a);
+        bool negB = DecIsNeg(b);
+        U128 ma = GetM128(a);
+        U128 mb = GetM128(b);
+        int sa = DecScale(a);
+        int sb = DecScale(b);
+        if (sa != sb) AlignScale(ref ma, ref sa, ref mb, ref sb);
+        if (negA == negB) {
+            return FromM128(U128Add(ma, mb), negA, sa);
+        }
+        if (U128Cmp(ma, mb) >= 0) {
+            return FromM128(U128Sub(ma, mb), negA, sa);
+        }
+        return FromM128(U128Sub(mb, ma), negB, sa);
+    }
+
+    [NoAlloc]
+    static ZanDecimal DecMul(ZanDecimal a, ZanDecimal b) {
+        bool neg = DecIsNeg(a) != DecIsNeg(b);
+        U128 ma = GetM128(a);
+        U128 mb = GetM128(b);
+        int scale = DecScale(a) + DecScale(b);
+        U128 prod = U128Mul(ma, mb);
+        if (scale > MAX_SCALE) {
+            int drop = scale - MAX_SCALE;
+            if (drop <= MAX_SCALE) {
+                U128 dummy = U128FromU64(0UL);
+                prod = U128DivRem(prod, Pow10_128(drop), ref dummy);
+                scale = MAX_SCALE;
+            } else {
+                uint r32 = 0U;
+                while (scale > MAX_SCALE) {
+                    prod = U128DivRemU32(prod, 10U, ref r32);
+                    scale--;
+                }
+            }
+        }
+        return FromM128(prod, neg, scale);
+    }
+
+    [NoAlloc]
+    static ZanDecimal DecDiv(ZanDecimal a, ZanDecimal b) {
+        U128 mb = GetM128(b);
+        if (U128IsZero(mb)) {
+            CRaise(SIGFPE_NUM);
+            return MakeDec(0U, 0UL, false, 0);
+        }
+        bool neg = DecIsNeg(a) != DecIsNeg(b);
+        U128 ma = GetM128(a);
+        if (U128IsZero(ma)) return MakeDec(0U, 0UL, neg, 0);
+
+        int scale = DecScale(a) - DecScale(b);
+
+        if (mb.Hi == 0UL && mb.Lo == 1UL) {
+            if (scale < 0) {
+                int grow = -scale;
+                if (grow <= MAX_SCALE) {
+                    ma = U128Mul(ma, Pow10_128(grow));
+                    scale = 0;
+                } else {
+                    while (scale < 0) { ma = U128MulU64(ma, 10UL); scale++; }
+                }
+            } else if (scale > 0) {
+                StripTrailingZeros(ref ma, ref scale);
+            }
+            return FromM128(ma, neg, scale);
+        }
+
+        if (ma.Hi == 0UL && mb.Hi == 0UL) {
+            ulong a64 = ma.Lo;
+            ulong b64 = mb.Lo;
+            ulong q64 = a64 / b64;
+            if (q64 * b64 == a64) {
+                U128 q128 = U128FromU64(q64);
+                if (scale < 0) {
+                    int grow = -scale;
+                    if (grow <= MAX_SCALE && U128Cmp(q128, M96DivPow10(grow)) <= 0) {
+                        q128 = U128Mul(q128, Pow10_128(grow));
+                        return MakeDec((uint)q128.Hi, q128.Lo, neg, 0);
+                    }
+                } else {
+                    if (scale > 0) StripTrailingZeros(ref q128, ref scale);
+                    return FromM128(q128, neg, scale);
+                }
+            }
+        }
+
+        U128 d1e9 = M96Div1e9();
+        U128 d1e4 = M96Div1e4();
+        U128 d10 = M96Div10();
+        while (scale + 9 <= MAX_SCALE && U128Cmp(ma, d1e9) <= 0) {
+            ma = U128MulU64(ma, 1000000000UL);
+            scale += 9;
+        }
+        while (scale + 4 <= MAX_SCALE && U128Cmp(ma, d1e4) <= 0) {
+            ma = U128MulU64(ma, 10000UL);
+            scale += 4;
+        }
+        while (scale < MAX_SCALE && U128Cmp(ma, d10) <= 0) {
+            ma = U128MulU64(ma, 10UL);
+            scale++;
+        }
+        while (scale < 0) {
+            ma = U128MulU64(ma, 10UL);
+            scale++;
+        }
+
+        U128 rem = U128FromU64(0UL);
+        U128 quo = U128DivRem(ma, mb, ref rem);
+        bool rounded = false;
+        if (!U128IsZero(rem) && U128Cmp(U128Shl1(rem), mb) >= 0 && U128LtM96Max(quo)) {
+            quo = U128AddU64(quo, 1UL);
+            rounded = true;
+        }
+        if (!rounded && scale > 0) {
+            StripTrailingZeros(ref quo, ref scale);
+        }
+        return FromM128(quo, neg, scale);
+    }
+
+    [NoAlloc]
+    static ZanDecimal DecRem(ZanDecimal a, ZanDecimal b) {
+        U128 mb = GetM128(b);
+        if (U128IsZero(mb)) {
+            CRaise(SIGFPE_NUM);
+            return MakeDec(0U, 0UL, false, 0);
+        }
+        U128 ma = GetM128(a);
+        int sa = DecScale(a);
+        int sb = DecScale(b);
+        if (sa != sb) AlignScale(ref ma, ref sa, ref mb, ref sb);
+        U128 rem = U128FromU64(0UL);
+        U128DivRem(ma, mb, ref rem);
+        return FromM128(rem, DecIsNeg(a), sa);
+    }
+
+    [NoAlloc]
+    static bool DecParse(nint str, long len, ref ZanDecimal outDec) {
+        if (str == (nint)0 || len <= 0L) return false;
+        long i = 0L;
+        while (i < len) {
+            byte ch = NativeMemory.At<byte>(str, i);
+            if (ch == (byte)32 || ch == (byte)9 || ch == (byte)10 ||
+                ch == (byte)13 || ch == (byte)11 || ch == (byte)12) {
+                i++;
+            } else {
+                break;
+            }
+        }
+        if (i >= len) return false;
+
+        bool neg = false;
+        byte first = NativeMemory.At<byte>(str, i);
+        if (first == (byte)45) { neg = true; i++; }      // '-'
+        else if (first == (byte)43) { i++; }             // '+'
+
+        ulong m64 = 0UL;
+        U128 m = U128FromU64(0UL);
+        bool wide = false;
+        int scale = 0;
+        bool hasDot = false;
+        bool hasDigit = false;
+        U128 d10 = M96Div10();
+
+        for (; i < len; i++) {
+            byte c = NativeMemory.At<byte>(str, i);
+            if (c == (byte)46) { // '.'
+                if (hasDot) break;
+                hasDot = true;
+            } else if (c >= (byte)48 && c <= (byte)57) {
+                hasDigit = true;
+                ulong d = (ulong)(c - (byte)48);
+                if (!wide) {
+                    if (m64 <= 1844674407370955160UL) {
+                        m64 = m64 * 10UL + d;
+                        if (hasDot) scale++;
+                    } else {
+                        wide = true;
+                        m = U128AddU64(U128MulU64(U128FromU64(m64), 10UL), d);
+                        if (hasDot) scale++;
+                    }
+                } else if (U128Cmp(m, d10) <= 0) {
+                    m = U128AddU64(U128MulU64(m, 10UL), d);
+                    if (hasDot) scale++;
+                }
+            } else {
+                break;
+            }
+        }
+        if (!hasDigit) return false;
+        if (scale > MAX_SCALE) scale = MAX_SCALE;
+        if (!wide) {
+            outDec = MakeDec(0U, m64, neg, scale);
+        } else {
+            outDec = FromM128(m, neg, scale);
+        }
+        return true;
+    }
+
+    [NoAlloc]
+    static ZanDecimal DecFromDouble(double val) {
+        ulong rawBits = NativeMemory.BitCast<double, ulong>(val);
+        ulong expBits = (rawBits >> 52) & 0x7FFUL;
+        if (expBits == 0x7FFUL) return MakeDec(0U, 0UL, false, 0); // NaN / Inf
+        bool neg = (rawBits >> 63) != 0UL;
+        if (neg) val = -val;
+        if (val == 0.0) return MakeDec(0U, 0UL, false, 0);
+
+        // Fast path 1: exact integer < 1e16
+        if (val < 1e16) {
+            ulong iv = (ulong)val;
+            if ((double)iv == val) {
+                return MakeDec(0U, iv, neg, 0);
+            }
+        }
+
+        // Fast path 2: [1e-4, 1e16) exact 128-bit binary-to-decimal extraction
+        if (val >= 1e-4 && val < 1e16) {
+            ulong bits = NativeMemory.BitCast<double, ulong>(val);
+            int e2 = (int)((bits >> 52) & 0x7FFUL) - 1023;
+            ulong sig = (bits & 0x000FFFFFFFFFFFFFUL) | 0x0010000000000000UL;
+            int shift = 52 - e2;
+            if (shift >= 1 && shift <= 66) {
+                int k = (e2 * 1233) >> 12;
+                int scale = 15 - k;
+                if (scale < 0) scale = 0;
+                if (scale > 19) scale = 19;
+                U128 p1 = U128MulU64(U128FromU64(sig), Pow10U64(scale));
+                ulong q = U128ShrRneU64(p1, shift);
+                if (q >= 10000000000000000UL) {
+                    if (scale > 0) {
+                        scale--;
+                        U128 p2 = U128MulU64(U128FromU64(sig), Pow10U64(scale));
+                        q = U128ShrRneU64(p2, shift);
+                        if (q >= 10000000000000000UL) {
+                            q /= 10UL;
+                            if (scale > 0) scale--;
+                        }
+                    }
+                } else if (q < 1000000000000000UL && scale < 19) {
+                    int s2 = scale + 1;
+                    U128 p3 = U128MulU64(U128FromU64(sig), Pow10U64(s2));
+                    ulong q2 = U128ShrRneU64(p3, shift);
+                    if (q2 < 10000000000000000UL) {
+                        q = q2;
+                        scale = s2;
+                    }
+                }
+                if ((q & 1UL) == 0UL) {
+                    while (scale >= 4 && (q % 10000UL) == 0UL) { q /= 10000UL; scale -= 4; }
+                    while (scale >= 2 && (q % 100UL) == 0UL) { q /= 100UL; scale -= 2; }
+                    if (scale > 0 && (q % 10UL) == 0UL) { q /= 10UL; scale--; }
+                }
+                return MakeDec(0U, q, neg, scale);
+            }
+        }
+
+        // Fallback for extreme magnitudes: snprintf("%.16g", val) via true C varargs ABI
+        DecBuf64 buf = new DecBuf64();
+        DecBuf64 fmt = new DecBuf64();
+        nint bufPtr = NativeMemory.AddressOf(ref buf);
+        nint fmtPtr = NativeMemory.AddressOf(ref fmt);
+        // "%.16g\0"
+        NativeMemory.At<byte>(fmtPtr, 0) = (byte)37;  // '%'
+        NativeMemory.At<byte>(fmtPtr, 1) = (byte)46;  // '.'
+        NativeMemory.At<byte>(fmtPtr, 2) = (byte)49;  // '1'
+        NativeMemory.At<byte>(fmtPtr, 3) = (byte)54;  // '6'
+        NativeMemory.At<byte>(fmtPtr, 4) = (byte)103; // 'g'
+        NativeMemory.At<byte>(fmtPtr, 5) = (byte)0;
+        nint fnSn = NativeMemory.FunctionPointer(CSnprintf);
+        int written = NativeMemory.InvokeVariadic<int>(fnSn, 3, bufPtr, 64L, fmtPtr, val);
+        if (written > 0) {
+            long slen = (written < 64) ? (long)written : 63L;
+            ZanDecimal parsed = MakeDec(0U, 0UL, false, 0);
+            if (DecParse(bufPtr, slen, ref parsed)) {
+                if (neg) parsed = DecNeg(parsed);
+                return parsed;
+            }
+        }
+        return MakeDec(0U, 0UL, false, 0);
+    }
+
+    [NoAlloc]
+    static long DecToInt64(ZanDecimal d) {
+        int scale = DecScale(d);
+        if (scale > MAX_SCALE) scale = MAX_SCALE;
+        U128 m = GetM128(d);
+        if (scale == 0) {
+            return DecIsNeg(d) ? -(long)m.Lo : (long)m.Lo;
+        }
+        U128 div = Pow10_128(scale);
+        U128 r = U128FromU64(0UL);
+        U128 q = U128DivRem(m, div, ref r);
+        U128 r2 = U128Shl1(r);
+        int rc = U128Cmp(r2, div);
+        if (rc > 0 || (rc == 0 && (q.Lo & 1UL) != 0UL)) {
+            q = U128AddU64(q, 1UL);
+        }
+        return DecIsNeg(d) ? -(long)q.Lo : (long)q.Lo;
+    }
+
+    [NoAlloc]
+    static double DecToDouble(ZanDecimal d) {
+        double res = (double)d.Hi32 * 18446744073709551616.0 + (double)d.Lo64;
+        int scale = DecScale(d);
+        if (scale > 0) {
+            if (scale <= MAX_SCALE) {
+                res /= Pow10Dbl(scale);
+            } else {
+                while (scale > 0) { res /= 10.0; scale--; }
+            }
+        }
+        return DecIsNeg(d) ? -res : res;
+    }
+
+    [NoAlloc]
+    static int DecToString(ZanDecimal d, nint buf, long bufSize) {
+        if (buf == (nint)0 || bufSize <= 0L) return 0;
+        int scale = DecScale(d);
+        bool neg = DecIsNeg(d);
+        U128 m = GetM128(d);
+
+        DecBuf64 digits = new DecBuf64();
+        nint digPtr = NativeMemory.AddressOf(ref digits);
+        int dpos = 0;
+
+        if (U128IsZero(m)) {
+            NativeMemory.At<byte>(digPtr, dpos++) = (byte)48; // '0'
+        } else {
+            uint chunk = 0U;
+            while (m.Hi != 0UL) {
+                m = U128DivRemU32(m, 1000000000U, ref chunk);
+                for (int k = 0; k < 4; k++) {
+                    uint q = chunk / 100U;
+                    uint pair = chunk - q * 100U;
+                    NativeMemory.At<byte>(digPtr, dpos++) = (byte)(48U + (pair % 10U));
+                    NativeMemory.At<byte>(digPtr, dpos++) = (byte)(48U + (pair / 10U));
+                    chunk = q;
+                }
+                NativeMemory.At<byte>(digPtr, dpos++) = (byte)(48U + chunk);
+            }
+            ulong m64 = m.Lo;
+            while (m64 > 0xFFFFFFFFUL) {
+                ulong q = m64 / 100UL;
+                uint pair = (uint)(m64 - q * 100UL);
+                NativeMemory.At<byte>(digPtr, dpos++) = (byte)(48U + (pair % 10U));
+                NativeMemory.At<byte>(digPtr, dpos++) = (byte)(48U + (pair / 10U));
+                m64 = q;
+            }
+            uint m32 = (uint)m64;
+            while (m32 >= 100U) {
+                uint q = m32 / 100U;
+                uint pair = m32 - q * 100U;
+                NativeMemory.At<byte>(digPtr, dpos++) = (byte)(48U + (pair % 10U));
+                NativeMemory.At<byte>(digPtr, dpos++) = (byte)(48U + (pair / 10U));
+                m32 = q;
+            }
+            if (m32 >= 10U) {
+                NativeMemory.At<byte>(digPtr, dpos++) = (byte)(48U + (m32 % 10U));
+                NativeMemory.At<byte>(digPtr, dpos++) = (byte)(48U + (m32 / 10U));
+            } else if (m32 > 0U || dpos == 0) {
+                NativeMemory.At<byte>(digPtr, dpos++) = (byte)(48U + m32);
+            }
+        }
+
+        long outPos = 0L;
+        if (neg && (outPos + 1L < bufSize)) {
+            NativeMemory.At<byte>(buf, outPos++) = (byte)45; // '-'
+        }
+
+        int totalDigits = dpos;
+        if (scale >= totalDigits) {
+            if (outPos + 2L < bufSize) {
+                NativeMemory.At<byte>(buf, outPos++) = (byte)48; // '0'
+                NativeMemory.At<byte>(buf, outPos++) = (byte)46; // '.'
+            }
+            int zeros = scale - totalDigits;
+            for (int z = 0; z < zeros && outPos + 1L < bufSize; z++) {
+                NativeMemory.At<byte>(buf, outPos++) = (byte)48; // '0'
+            }
+            for (int k = totalDigits - 1; k >= 0 && outPos + 1L < bufSize; k--) {
+                NativeMemory.At<byte>(buf, outPos++) = NativeMemory.At<byte>(digPtr, k);
+            }
+        } else {
+            int dotAfter = totalDigits - scale;
+            for (int k = totalDigits - 1; k >= 0 && outPos + 1L < bufSize; k--) {
+                NativeMemory.At<byte>(buf, outPos++) = NativeMemory.At<byte>(digPtr, k);
+                if (scale > 0 && (totalDigits - k) == dotAfter && outPos + 1L < bufSize) {
+                    NativeMemory.At<byte>(buf, outPos++) = (byte)46; // '.'
+                }
+            }
+        }
+        NativeMemory.At<byte>(buf, outPos) = (byte)0;
+        return (int)outPos;
+    }
+
+    // ---- Exported C ABI Runtime Symbols (exact match with rt_decimal.h) ----
+
+    [Export("__zan_decimal_add")]
+    [Visibility("hidden")]
+    [NoAlloc]
+    public static void ExportAdd(nint a, nint b, nint outPtr) {
+        if (outPtr != (nint)0) {
+            NativeMemory.AsRef<ZanDecimal>(outPtr) =
+                DecAdd(NativeMemory.AsRef<ZanDecimal>(a), NativeMemory.AsRef<ZanDecimal>(b));
+        }
+    }
+
+    [Export("__zan_decimal_sub")]
+    [Visibility("hidden")]
+    [NoAlloc]
+    public static void ExportSub(nint a, nint b, nint outPtr) {
+        if (outPtr != (nint)0) {
+            NativeMemory.AsRef<ZanDecimal>(outPtr) =
+                DecAdd(NativeMemory.AsRef<ZanDecimal>(a), DecNeg(NativeMemory.AsRef<ZanDecimal>(b)));
+        }
+    }
+
+    [Export("__zan_decimal_mul")]
+    [Visibility("hidden")]
+    [NoAlloc]
+    public static void ExportMul(nint a, nint b, nint outPtr) {
+        if (outPtr != (nint)0) {
+            NativeMemory.AsRef<ZanDecimal>(outPtr) =
+                DecMul(NativeMemory.AsRef<ZanDecimal>(a), NativeMemory.AsRef<ZanDecimal>(b));
+        }
+    }
+
+    [Export("__zan_decimal_div")]
+    [Visibility("hidden")]
+    [NoAlloc]
+    public static void ExportDiv(nint a, nint b, nint outPtr) {
+        if (outPtr != (nint)0) {
+            NativeMemory.AsRef<ZanDecimal>(outPtr) =
+                DecDiv(NativeMemory.AsRef<ZanDecimal>(a), NativeMemory.AsRef<ZanDecimal>(b));
+        }
+    }
+
+    [Export("__zan_decimal_rem")]
+    [Visibility("hidden")]
+    [NoAlloc]
+    public static void ExportRem(nint a, nint b, nint outPtr) {
+        if (outPtr != (nint)0) {
+            NativeMemory.AsRef<ZanDecimal>(outPtr) =
+                DecRem(NativeMemory.AsRef<ZanDecimal>(a), NativeMemory.AsRef<ZanDecimal>(b));
+        }
+    }
+
+    [Export("__zan_decimal_neg")]
+    [Visibility("hidden")]
+    [NoAlloc]
+    public static void ExportNeg(nint a, nint outPtr) {
+        if (outPtr != (nint)0) {
+            NativeMemory.AsRef<ZanDecimal>(outPtr) = DecNeg(NativeMemory.AsRef<ZanDecimal>(a));
+        }
+    }
+
+    [Export("__zan_decimal_cmp")]
+    [Visibility("hidden")]
+    [NoAlloc]
+    public static int ExportCmp(nint a, nint b) {
+        return DecCmp(NativeMemory.AsRef<ZanDecimal>(a), NativeMemory.AsRef<ZanDecimal>(b));
+    }
+
+    [Export("__zan_decimal_from_int64")]
+    [Visibility("hidden")]
+    [NoAlloc]
+    public static void ExportFromInt64(long val, nint outPtr) {
+        if (outPtr != (nint)0) {
+            if (val < 0L) {
+                ulong u = (ulong)(-(val + 1L)) + 1UL;
+                NativeMemory.AsRef<ZanDecimal>(outPtr) = MakeDec(0U, u, true, 0);
+            } else {
+                NativeMemory.AsRef<ZanDecimal>(outPtr) = MakeDec(0U, (ulong)val, false, 0);
+            }
+        }
+    }
+
+    [Export("__zan_decimal_from_uint64")]
+    [Visibility("hidden")]
+    [NoAlloc]
+    public static void ExportFromUInt64(ulong val, nint outPtr) {
+        if (outPtr != (nint)0) {
+            NativeMemory.AsRef<ZanDecimal>(outPtr) = MakeDec(0U, val, false, 0);
+        }
+    }
+
+    [Export("__zan_decimal_from_double")]
+    [Visibility("hidden")]
+    [NoAlloc]
+    public static void ExportFromDouble(double val, nint outPtr) {
+        if (outPtr != (nint)0) {
+            NativeMemory.AsRef<ZanDecimal>(outPtr) = DecFromDouble(val);
+        }
+    }
+
+    [Export("__zan_decimal_to_int64")]
+    [Visibility("hidden")]
+    [NoAlloc]
+    public static long ExportToInt64(nint a) {
+        return (a != (nint)0) ? DecToInt64(NativeMemory.AsRef<ZanDecimal>(a)) : 0L;
+    }
+
+    [Export("__zan_decimal_to_double")]
+    [Visibility("hidden")]
+    [NoAlloc]
+    public static double ExportToDouble(nint a) {
+        return (a != (nint)0) ? DecToDouble(NativeMemory.AsRef<ZanDecimal>(a)) : 0.0;
+    }
+
+    [Export("__zan_decimal_to_string")]
+    [Visibility("hidden")]
+    [NoAlloc]
+    public static int ExportToString(nint a, nint buf, long bufSize) {
+        return (a != (nint)0) ? DecToString(NativeMemory.AsRef<ZanDecimal>(a), buf, bufSize) : 0;
+    }
+
+    [Export("__zan_decimal_parse")]
+    [Visibility("hidden")]
+    [NoAlloc]
+    public static bool ExportParse(nint str, long len, nint outPtr) {
+        if (outPtr == (nint)0) return false;
+        ZanDecimal res = MakeDec(0U, 0UL, false, 0);
+        if (!DecParse(str, len, ref res)) return false;
+        NativeMemory.AsRef<ZanDecimal>(outPtr) = res;
+        return true;
+    }
+}

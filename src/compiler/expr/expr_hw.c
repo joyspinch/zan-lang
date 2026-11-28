@@ -351,9 +351,19 @@ bool emit_bit_operations_call(zan_irgen_t *g, zan_ast_node_t *expr,
   if (method.len == 17 && memcmp(method.str, "ReverseEndianness", 17) == 0 &&
       expr->call.args.count == 1) {
     zan_ast_node_t *arg0 = expr->call.args.items[0];
+    zan_type_t *t0 = infer_expr_type(g, arg0, locals);
     LLVMValueRef v = emit_expr(g, arg0, locals);
-    bool is64 = is_64bit_int_arg(g, arg0, v, locals);
-    if (is64) {
+    bool is16 = t0 && (t0->kind == TYPE_SHORT || t0->kind == TYPE_USHORT);
+    bool is64 = !is16 && is_64bit_int_arg(g, arg0, v, locals);
+    if (is16) {
+      LLVMTypeRef i16t = LLVMInt16TypeInContext(g->ctx);
+      v = coerce_int_to(g, v, i16t);
+      LLVMTypeRef fty = LLVMFunctionType(i16t, (LLVMTypeRef[]){i16t}, 1, 0);
+      LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "llvm.bswap.i16");
+      if (!fn)
+        fn = LLVMAddFunction(g->mod, "llvm.bswap.i16", fty);
+      *out = zan_call2(g->builder, fty, fn, &v, 1, "bswap16");
+    } else if (is64) {
       v = coerce_int_to(g, v, i64t);
       LLVMTypeRef fty = LLVMFunctionType(i64t, (LLVMTypeRef[]){i64t}, 1, 0);
       LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "llvm.bswap.i64");
@@ -368,6 +378,345 @@ bool emit_bit_operations_call(zan_irgen_t *g, zan_ast_node_t *expr,
         fn = LLVMAddFunction(g->mod, "llvm.bswap.i32", fty);
       *out = zan_call2(g->builder, fty, fn, &v, 1, "bswap");
     }
+    return true;
+  }
+
+  if (method.len == 11 && memcmp(method.str, "ExtractBits", 11) == 0 &&
+      expr->call.args.count == 3) {
+    zan_ast_node_t *arg0 = expr->call.args.items[0];
+    LLVMValueRef val = emit_expr(g, arg0, locals);
+    LLVMValueRef start = emit_expr(g, expr->call.args.items[1], locals);
+    LLVMValueRef count = emit_expr(g, expr->call.args.items[2], locals);
+    bool is64 = is_64bit_int_arg(g, arg0, val, locals);
+    LLVMTypeRef wt = is64 ? i64t : i32t;
+    unsigned bits = is64 ? 64u : 32u;
+    val = coerce_int_to(g, val, wt);
+    start = coerce_int_to(g, start, wt);
+    count = coerce_int_to(g, count, wt);
+    LLVMValueRef zero = LLVMConstInt(wt, 0, 0);
+    LLVMValueRef one = LLVMConstInt(wt, 1, 0);
+    LLVMValueRef all1 = LLVMConstAllOnes(wt);
+    LLVMValueRef wconst = LLVMConstInt(wt, bits, 0);
+    LLVMValueRef start_ok = LLVMBuildICmp(g->builder, LLVMIntULT, start, wconst, "bfx.sok");
+    LLVMValueRef cnt_pos = LLVMBuildICmp(g->builder, LLVMIntSGT, count, zero, "bfx.cpos");
+    LLVMValueRef valid = LLVMBuildAnd(g->builder, start_ok, cnt_pos, "bfx.ok");
+    LLVMValueRef safe_start = LLVMBuildSelect(g->builder, start_ok, start, zero, "bfx.s");
+    LLVMValueRef shifted = LLVMBuildLShr(g->builder, val, safe_start, "bfx.shr");
+    LLVMValueRef cnt_lt_w = LLVMBuildICmp(g->builder, LLVMIntULT, count, wconst, "bfx.cltw");
+    LLVMValueRef safe_cnt = LLVMBuildSelect(g->builder, cnt_lt_w, count, zero, "bfx.c");
+    LLVMValueRef partial_mask = LLVMBuildSub(
+        g->builder, LLVMBuildShl(g->builder, one, safe_cnt, "bfx.p2"), one, "bfx.pm");
+    LLVMValueRef mask = LLVMBuildSelect(g->builder, cnt_lt_w, partial_mask, all1, "bfx.m");
+    LLVMValueRef res = LLVMBuildAnd(g->builder, shifted, mask, "bfx.res");
+    *out = LLVMBuildSelect(g->builder, valid, res, zero, "bfx");
+    return true;
+  }
+
+  if (method.len == 10 && memcmp(method.str, "InsertBits", 10) == 0 &&
+      expr->call.args.count == 4) {
+    zan_ast_node_t *arg0 = expr->call.args.items[0];
+    LLVMValueRef dst = emit_expr(g, arg0, locals);
+    LLVMValueRef fld = emit_expr(g, expr->call.args.items[1], locals);
+    LLVMValueRef start = emit_expr(g, expr->call.args.items[2], locals);
+    LLVMValueRef count = emit_expr(g, expr->call.args.items[3], locals);
+    bool is64 = is_64bit_int_arg(g, arg0, dst, locals);
+    LLVMTypeRef wt = is64 ? i64t : i32t;
+    unsigned bits = is64 ? 64u : 32u;
+    dst = coerce_int_to(g, dst, wt);
+    fld = coerce_int_to(g, fld, wt);
+    start = coerce_int_to(g, start, wt);
+    count = coerce_int_to(g, count, wt);
+    LLVMValueRef zero = LLVMConstInt(wt, 0, 0);
+    LLVMValueRef one = LLVMConstInt(wt, 1, 0);
+    LLVMValueRef all1 = LLVMConstAllOnes(wt);
+    LLVMValueRef wconst = LLVMConstInt(wt, bits, 0);
+    LLVMValueRef start_ok = LLVMBuildICmp(g->builder, LLVMIntULT, start, wconst, "bfi.sok");
+    LLVMValueRef cnt_pos = LLVMBuildICmp(g->builder, LLVMIntSGT, count, zero, "bfi.cpos");
+    LLVMValueRef valid = LLVMBuildAnd(g->builder, start_ok, cnt_pos, "bfi.ok");
+    LLVMValueRef safe_start = LLVMBuildSelect(g->builder, start_ok, start, zero, "bfi.s");
+    LLVMValueRef cnt_lt_w = LLVMBuildICmp(g->builder, LLVMIntULT, count, wconst, "bfi.cltw");
+    LLVMValueRef safe_cnt = LLVMBuildSelect(g->builder, cnt_lt_w, count, zero, "bfi.c");
+    LLVMValueRef partial_mask = LLVMBuildSub(
+        g->builder, LLVMBuildShl(g->builder, one, safe_cnt, "bfi.p2"), one, "bfi.pm");
+    LLVMValueRef mask = LLVMBuildSelect(g->builder, cnt_lt_w, partial_mask, all1, "bfi.m");
+    LLVMValueRef shifted_mask = LLVMBuildShl(g->builder, mask, safe_start, "bfi.sm");
+    LLVMValueRef clear_mask = LLVMBuildXor(g->builder, shifted_mask, all1, "bfi.cm");
+    LLVMValueRef cleared = LLVMBuildAnd(g->builder, dst, clear_mask, "bfi.clr");
+    LLVMValueRef placed = LLVMBuildShl(
+        g->builder, LLVMBuildAnd(g->builder, fld, mask, "bfi.f"), safe_start, "bfi.pl");
+    LLVMValueRef merged = LLVMBuildOr(g->builder, cleared, placed, "bfi.or");
+    *out = LLVMBuildSelect(g->builder, valid, merged, dst, "bfi");
+    return true;
+  }
+
+  if (((method.len == 15 && memcmp(method.str, "FunnelShiftLeft", 15) == 0) ||
+       (method.len == 16 && memcmp(method.str, "FunnelShiftRight", 16) == 0)) &&
+      expr->call.args.count == 3) {
+    bool is_left = (method.len == 15);
+    zan_ast_node_t *arg0 = expr->call.args.items[0];
+    zan_ast_node_t *arg1 = expr->call.args.items[1];
+    zan_ast_node_t *arg2 = expr->call.args.items[2];
+    LLVMValueRef hi = emit_expr(g, arg0, locals);
+    LLVMValueRef lo = emit_expr(g, arg1, locals);
+    LLVMValueRef sh = emit_expr(g, arg2, locals);
+    bool is64 = is_64bit_int_arg(g, arg0, hi, locals) ||
+                is_64bit_int_arg(g, arg1, lo, locals);
+    LLVMTypeRef it = is64 ? i64t : i32t;
+    const char *iname = is_left
+                            ? (is64 ? "llvm.fshl.i64" : "llvm.fshl.i32")
+                            : (is64 ? "llvm.fshr.i64" : "llvm.fshr.i32");
+    hi = coerce_int_to(g, hi, it);
+    lo = coerce_int_to(g, lo, it);
+    sh = coerce_int_to(g, sh, it);
+    LLVMTypeRef fty = LLVMFunctionType(it, (LLVMTypeRef[]){it, it, it}, 3, 0);
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, iname);
+    if (!fn)
+      fn = LLVMAddFunction(g->mod, iname, fty);
+    LLVMValueRef args[] = {hi, lo, sh};
+    *out = zan_call2(g->builder, fty, fn, args, 3, is_left ? "fshl" : "fshr");
+    return true;
+  }
+
+  if (method.len == 10 && memcmp(method.str, "BitReverse", 10) == 0 &&
+      expr->call.args.count == 1) {
+    zan_ast_node_t *arg0 = expr->call.args.items[0];
+    LLVMValueRef v = emit_expr(g, arg0, locals);
+    bool is64 = is_64bit_int_arg(g, arg0, v, locals);
+    LLVMTypeRef it = is64 ? i64t : i32t;
+    const char *iname = is64 ? "llvm.bitreverse.i64" : "llvm.bitreverse.i32";
+    v = coerce_int_to(g, v, it);
+    LLVMTypeRef fty = LLVMFunctionType(it, (LLVMTypeRef[]){it}, 1, 0);
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, iname);
+    if (!fn)
+      fn = LLVMAddFunction(g->mod, iname, fty);
+    *out = zan_call2(g->builder, fty, fn, &v, 1, "bitrev");
+    return true;
+  }
+
+  if (((method.len == 13 && memcmp(method.str, "SaturatingAdd", 13) == 0) ||
+       (method.len == 13 && memcmp(method.str, "SaturatingSub", 13) == 0)) &&
+      expr->call.args.count == 2) {
+    bool is_add = (method.str[10] == 'A');
+    zan_ast_node_t *arg0 = expr->call.args.items[0];
+    zan_ast_node_t *arg1 = expr->call.args.items[1];
+    zan_type_t *t0 = infer_expr_type(g, arg0, locals);
+    zan_type_t *t1 = infer_expr_type(g, arg1, locals);
+    bool is_unsigned = (t0 && (t0->kind == TYPE_UINT || t0->kind == TYPE_ULONG)) ||
+                       (t1 && (t1->kind == TYPE_UINT || t1->kind == TYPE_ULONG));
+    LLVMValueRef a = emit_expr(g, arg0, locals);
+    LLVMValueRef b = emit_expr(g, arg1, locals);
+    bool is64 = is_64bit_int_arg(g, arg0, a, locals) ||
+                is_64bit_int_arg(g, arg1, b, locals);
+    LLVMTypeRef it = is64 ? i64t : i32t;
+    const char *iname = NULL;
+    if (is_add) {
+      if (is64) iname = is_unsigned ? "llvm.uadd.sat.i64" : "llvm.sadd.sat.i64";
+      else      iname = is_unsigned ? "llvm.uadd.sat.i32" : "llvm.sadd.sat.i32";
+    } else {
+      if (is64) iname = is_unsigned ? "llvm.usub.sat.i64" : "llvm.ssub.sat.i64";
+      else      iname = is_unsigned ? "llvm.usub.sat.i32" : "llvm.ssub.sat.i32";
+    }
+    a = coerce_int_to(g, a, it);
+    b = coerce_int_to(g, b, it);
+    LLVMTypeRef fty = LLVMFunctionType(it, (LLVMTypeRef[]){it, it}, 2, 0);
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, iname);
+    if (!fn)
+      fn = LLVMAddFunction(g->mod, iname, fty);
+    LLVMValueRef args[] = {a, b};
+    *out = zan_call2(g->builder, fty, fn, args, 2, is_add ? "sat.add" : "sat.sub");
+    return true;
+  }
+
+  if (((method.len == 11 && memcmp(method.str, "OverflowAdd", 11) == 0) ||
+       (method.len == 11 && memcmp(method.str, "OverflowSub", 11) == 0) ||
+       (method.len == 11 && memcmp(method.str, "OverflowMul", 11) == 0)) &&
+      expr->call.args.count == 3) {
+    char op = method.str[8]; /* 'A', 'S', or 'M' */
+    zan_ast_node_t *arg0 = expr->call.args.items[0];
+    zan_ast_node_t *arg1 = expr->call.args.items[1];
+    zan_ast_node_t *arg2 = expr->call.args.items[2];
+    zan_type_t *t0 = infer_expr_type(g, arg0, locals);
+    zan_type_t *t1 = infer_expr_type(g, arg1, locals);
+    bool is_unsigned = (t0 && (t0->kind == TYPE_UINT || t0->kind == TYPE_ULONG)) ||
+                       (t1 && (t1->kind == TYPE_UINT || t1->kind == TYPE_ULONG));
+    LLVMValueRef a = emit_expr(g, arg0, locals);
+    LLVMValueRef b = emit_expr(g, arg1, locals);
+    bool is64 = is_64bit_int_arg(g, arg0, a, locals) ||
+                is_64bit_int_arg(g, arg1, b, locals);
+    LLVMTypeRef it = is64 ? i64t : i32t;
+    const char *iname = NULL;
+    if (op == 'A') {
+      iname = is64 ? (is_unsigned ? "llvm.uadd.with.overflow.i64" : "llvm.sadd.with.overflow.i64")
+                   : (is_unsigned ? "llvm.uadd.with.overflow.i32" : "llvm.sadd.with.overflow.i32");
+    } else if (op == 'S') {
+      iname = is64 ? (is_unsigned ? "llvm.usub.with.overflow.i64" : "llvm.ssub.with.overflow.i64")
+                   : (is_unsigned ? "llvm.usub.with.overflow.i32" : "llvm.ssub.with.overflow.i32");
+    } else {
+      iname = is64 ? (is_unsigned ? "llvm.umul.with.overflow.i64" : "llvm.smul.with.overflow.i64")
+                   : (is_unsigned ? "llvm.umul.with.overflow.i32" : "llvm.smul.with.overflow.i32");
+    }
+    a = coerce_int_to(g, a, it);
+    b = coerce_int_to(g, b, it);
+    LLVMTypeRef ret_st = LLVMStructTypeInContext(g->ctx, (LLVMTypeRef[]){it, i1t}, 2, 0);
+    LLVMTypeRef fty = LLVMFunctionType(ret_st, (LLVMTypeRef[]){it, it}, 2, 0);
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, iname);
+    if (!fn)
+      fn = LLVMAddFunction(g->mod, iname, fty);
+    LLVMValueRef args[] = {a, b};
+    LLVMValueRef tup = zan_call2(g->builder, fty, fn, args, 2, "ov.op");
+    LLVMValueRef val = LLVMBuildExtractValue(g->builder, tup, 0, "ov.val");
+    LLVMValueRef flag = LLVMBuildExtractValue(g->builder, tup, 1, "ov.flag");
+    LLVMValueRef ov_ptr = (arg2 && arg2->kind == AST_REF_ARG && arg2->ref_arg.expr)
+                              ? emit_ref_lvalue_ptr(g, arg2->ref_arg.expr, locals)
+                              : NULL;
+    if (ov_ptr) {
+      LLVMTypeRef bt = map_type(g, g->binder->type_bool);
+      if (bt && bt != i1t)
+        flag = LLVMBuildZExt(g->builder, flag, bt, "ov.b");
+      LLVMBuildStore(g->builder, flag, ov_ptr);
+    }
+    *out = val;
+    return true;
+  }
+
+  if (method.len == 6 && memcmp(method.str, "BigMul", 6) == 0 &&
+      expr->call.args.count == 3) {
+    zan_ast_node_t *arg0 = expr->call.args.items[0];
+    zan_ast_node_t *arg1 = expr->call.args.items[1];
+    zan_ast_node_t *arg2 = expr->call.args.items[2];
+    zan_type_t *t0 = infer_expr_type(g, arg0, locals);
+    zan_type_t *t1 = infer_expr_type(g, arg1, locals);
+    bool is_unsigned = (t0 && t0->kind == TYPE_ULONG) ||
+                       (t1 && t1->kind == TYPE_ULONG);
+    LLVMValueRef a = coerce_int_to(g, emit_expr(g, arg0, locals), i64t);
+    LLVMValueRef b = coerce_int_to(g, emit_expr(g, arg1, locals), i64t);
+    LLVMTypeRef i128t = LLVMInt128TypeInContext(g->ctx);
+    LLVMValueRef a128 = is_unsigned ? LLVMBuildZExt(g->builder, a, i128t, "bm.a")
+                                    : LLVMBuildSExt(g->builder, a, i128t, "bm.a");
+    LLVMValueRef b128 = is_unsigned ? LLVMBuildZExt(g->builder, b, i128t, "bm.b")
+                                    : LLVMBuildSExt(g->builder, b, i128t, "bm.b");
+    LLVMValueRef prod = LLVMBuildMul(g->builder, a128, b128, "bm.prod");
+    LLVMValueRef lo = LLVMBuildTrunc(g->builder, prod, i64t, "bm.lo");
+    LLVMValueRef hi128 = LLVMBuildLShr(g->builder, prod, LLVMConstInt(i128t, 64, 0), "bm.hi128");
+    LLVMValueRef hi = LLVMBuildTrunc(g->builder, hi128, i64t, "bm.hi");
+    LLVMValueRef lo_ptr = (arg2 && arg2->kind == AST_REF_ARG && arg2->ref_arg.expr)
+                              ? emit_ref_lvalue_ptr(g, arg2->ref_arg.expr, locals)
+                              : NULL;
+    if (lo_ptr)
+      LLVMBuildStore(g->builder, lo, lo_ptr);
+    *out = hi;
+    return true;
+  }
+
+  if (method.len == 9 && memcmp(method.str, "DivRem128", 9) == 0 &&
+      expr->call.args.count == 4) {
+    zan_ast_node_t *arg0 = expr->call.args.items[0];
+    zan_ast_node_t *arg1 = expr->call.args.items[1];
+    zan_ast_node_t *arg2 = expr->call.args.items[2];
+    zan_ast_node_t *arg3 = expr->call.args.items[3];
+    zan_type_t *t0 = infer_expr_type(g, arg0, locals);
+    zan_type_t *t1 = infer_expr_type(g, arg1, locals);
+    zan_type_t *t2 = infer_expr_type(g, arg2, locals);
+    bool is_unsigned = (t0 && t0->kind == TYPE_ULONG) ||
+                       (t1 && t1->kind == TYPE_ULONG) ||
+                       (t2 && t2->kind == TYPE_ULONG);
+    LLVMValueRef hi = coerce_int_to(g, emit_expr(g, arg0, locals), i64t);
+    LLVMValueRef lo = coerce_int_to(g, emit_expr(g, arg1, locals), i64t);
+    LLVMValueRef dv = coerce_int_to(g, emit_expr(g, arg2, locals), i64t);
+    LLVMValueRef rem_ptr = (arg3 && arg3->kind == AST_REF_ARG && arg3->ref_arg.expr)
+                               ? emit_ref_lvalue_ptr(g, arg3->ref_arg.expr, locals)
+                               : NULL;
+#if defined(__x86_64__) || defined(_M_X64)
+    bool is_x86_64 = (!g->target_triple[0]) || (strstr(g->target_triple, "x86_64") != NULL);
+#else
+    bool is_x86_64 = (g->target_triple[0] && strstr(g->target_triple, "x86_64") != NULL);
+#endif
+    LLVMValueRef quot = NULL, rem = NULL;
+    if (is_x86_64) {
+      LLVMTypeRef ret_st = LLVMStructTypeInContext(g->ctx, (LLVMTypeRef[]){i64t, i64t}, 2, 0);
+      LLVMTypeRef fty = LLVMFunctionType(ret_st, (LLVMTypeRef[]){i64t, i64t, i64t}, 3, 0);
+      const char *tmpl = is_unsigned ? "divq $4" : "idivq $4";
+      const char *cons = "={ax},={dx},{ax},{dx},r,~{cc},~{dirflag},~{fpsr},~{flags}";
+      LLVMValueRef asm_fn = LLVMGetInlineAsm(
+          fty, (char *)tmpl, strlen(tmpl), (char *)cons, strlen(cons),
+          1, 0, LLVMInlineAsmDialectATT, 0);
+      LLVMValueRef pair = LLVMBuildCall2(
+          g->builder, fty, asm_fn, (LLVMValueRef[]){lo, hi, dv}, 3, "div128");
+      quot = LLVMBuildExtractValue(g->builder, pair, 0, "div128.q");
+      rem = LLVMBuildExtractValue(g->builder, pair, 1, "div128.r");
+    } else {
+      LLVMTypeRef i128t = LLVMInt128TypeInContext(g->ctx);
+      LLVMValueRef hi128 = LLVMBuildShl(
+          g->builder,
+          is_unsigned ? LLVMBuildZExt(g->builder, hi, i128t, "d.hiz")
+                      : LLVMBuildSExt(g->builder, hi, i128t, "d.his"),
+          LLVMConstInt(i128t, 64, 0), "d.hishl");
+      LLVMValueRef num = LLVMBuildOr(g->builder, hi128,
+                                     LLVMBuildZExt(g->builder, lo, i128t, "d.loz"), "d.num");
+      LLVMValueRef den = is_unsigned ? LLVMBuildZExt(g->builder, dv, i128t, "d.dz")
+                                     : LLVMBuildSExt(g->builder, dv, i128t, "d.ds");
+      LLVMValueRef q128 = is_unsigned ? LLVMBuildUDiv(g->builder, num, den, "d.q128")
+                                      : LLVMBuildSDiv(g->builder, num, den, "d.q128");
+      LLVMValueRef r128 = is_unsigned ? LLVMBuildURem(g->builder, num, den, "d.r128")
+                                      : LLVMBuildSRem(g->builder, num, den, "d.r128");
+      quot = LLVMBuildTrunc(g->builder, q128, i64t, "d.q");
+      rem = LLVMBuildTrunc(g->builder, r128, i64t, "d.r");
+    }
+    if (rem_ptr)
+      LLVMBuildStore(g->builder, rem, rem_ptr);
+    *out = quot;
+    return true;
+  }
+
+  if (((method.len == 12 && memcmp(method.str, "AddWithCarry", 12) == 0) ||
+       (method.len == 13 && memcmp(method.str, "SubWithBorrow", 13) == 0)) &&
+      expr->call.args.count == 4) {
+    bool is_add = (method.str[0] == 'A');
+    zan_ast_node_t *arg0 = expr->call.args.items[0];
+    zan_ast_node_t *arg1 = expr->call.args.items[1];
+    zan_ast_node_t *arg2 = expr->call.args.items[2];
+    zan_ast_node_t *arg3 = expr->call.args.items[3];
+    LLVMValueRef a = emit_expr(g, arg0, locals);
+    LLVMValueRef b = emit_expr(g, arg1, locals);
+    LLVMValueRef cin_raw = emit_expr(g, arg2, locals);
+    bool is64 = is_64bit_int_arg(g, arg0, a, locals) ||
+                is_64bit_int_arg(g, arg1, b, locals);
+    LLVMTypeRef it = is64 ? i64t : i32t;
+    const char *iname = is_add
+                            ? (is64 ? "llvm.uadd.with.overflow.i64"
+                                    : "llvm.uadd.with.overflow.i32")
+                            : (is64 ? "llvm.usub.with.overflow.i64"
+                                    : "llvm.usub.with.overflow.i32");
+    a = coerce_int_to(g, a, it);
+    b = coerce_int_to(g, b, it);
+    LLVMValueRef cin1 = LLVMTypeOf(cin_raw) == i1t
+                            ? cin_raw
+                            : LLVMBuildICmp(g->builder, LLVMIntNE, cin_raw,
+                                            LLVMConstInt(LLVMTypeOf(cin_raw), 0, 0),
+                                            "cb.in1");
+    LLVMValueRef cin = LLVMBuildZExt(g->builder, cin1, it, "cb.in");
+    LLVMTypeRef ret_st = LLVMStructTypeInContext(g->ctx, (LLVMTypeRef[]){it, i1t}, 2, 0);
+    LLVMTypeRef fty = LLVMFunctionType(ret_st, (LLVMTypeRef[]){it, it}, 2, 0);
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, iname);
+    if (!fn)
+      fn = LLVMAddFunction(g->mod, iname, fty);
+    LLVMValueRef r1 = zan_call2(g->builder, fty, fn, (LLVMValueRef[]){a, b}, 2, "cb.1");
+    LLVMValueRef s1 = LLVMBuildExtractValue(g->builder, r1, 0, "cb.s1");
+    LLVMValueRef o1 = LLVMBuildExtractValue(g->builder, r1, 1, "cb.o1");
+    LLVMValueRef r2 = zan_call2(g->builder, fty, fn, (LLVMValueRef[]){s1, cin}, 2, "cb.2");
+    LLVMValueRef s2 = LLVMBuildExtractValue(g->builder, r2, 0, "cb.s2");
+    LLVMValueRef o2 = LLVMBuildExtractValue(g->builder, r2, 1, "cb.o2");
+    LLVMValueRef cout = LLVMBuildOr(g->builder, o1, o2, "cb.out");
+    LLVMValueRef cout_ptr = (arg3 && arg3->kind == AST_REF_ARG && arg3->ref_arg.expr)
+                                ? emit_ref_lvalue_ptr(g, arg3->ref_arg.expr, locals)
+                                : NULL;
+    if (cout_ptr) {
+      LLVMTypeRef bt = map_type(g, g->binder->type_bool);
+      if (bt && bt != i1t)
+        cout = LLVMBuildZExt(g->builder, cout, bt, "cb.outb");
+      LLVMBuildStore(g->builder, cout, cout_ptr);
+    }
+    *out = s2;
     return true;
   }
 

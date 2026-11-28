@@ -1,0 +1,454 @@
+// rt_file_api.zan: Shared app_dir resolution, generational handle table, file locks & 23 C ABI exports.
+
+using System;
+using System.Threading;
+
+partial class ZanFileRuntime {
+    // ---- Shared app_dir & alt-path resolution ----
+
+    static nint GetAppDirInternal() {
+        nint dirPtr = NativeMemory.AddressOf(ref s_appDir);
+        if (AppDirIsResolved()) return dirPtr;
+        AppDirAcquire();
+        if (AppDirIsResolved()) return dirPtr;
+
+        nint env = GetEnvAppDir();
+        PathBuf4096 local = new PathBuf4096();
+        nint localPtr = NativeMemory.AddressOf(ref local);
+        NativeMemory.At<byte>(localPtr, 0) = (byte)0;
+
+        if (env != (nint)0 && NativeMemory.At<byte>(env, 0) != (byte)0) {
+            long n = CStrLen(env);
+            if (n < 4096L) {
+                CMemcpy(localPtr, env, n + 1L);
+            } else {
+                WarnAppDirTooLong();
+            }
+        } else {
+            PathBuf4096 exe = new PathBuf4096();
+            nint exePtr = NativeMemory.AddressOf(ref exe);
+            NativeMemory.At<byte>(exePtr, 0) = (byte)0;
+            PlatGetExecutablePath(exePtr, 4096L);
+            if (NativeMemory.At<byte>(exePtr, 0) != (byte)0) {
+                long fwd = CStrLastIndexOf(exePtr, (byte)47);  // '/'
+                long back = CStrLastIndexOf(exePtr, (byte)92); // '\\'
+                long sep = (fwd > back) ? fwd : back;
+                if (sep > 0L) {
+                    NativeMemory.At<byte>(exePtr, sep) = (byte)0;
+                    long elen = sep;
+                    if (elen < 4096L) {
+                        CMemcpy(localPtr, exePtr, elen + 1L);
+                    }
+                }
+            }
+        }
+        long copyLen = CStrLen(localPtr);
+        CMemcpy(dirPtr, localPtr, copyLen + 1L);
+        AppDirRelease();
+        return dirPtr;
+    }
+
+    static nint BuildAltPath(nint path, int which, nint outBuf, long cap) {
+        if (path == (nint)0) return (nint)0;
+        byte c0 = NativeMemory.At<byte>(path, 0);
+        if (c0 == (byte)0 || c0 == (byte)47 || c0 == (byte)92) return (nint)0;
+        if (NativeMemory.At<byte>(path, 1) == (byte)58) return (nint)0; // ':'
+        nint basePtr = (which == 0) ? GetEnvPkgDir() : GetAppDirInternal();
+        if (basePtr == (nint)0 || NativeMemory.At<byte>(basePtr, 0) == (byte)0) return (nint)0;
+        long bl = CStrLen(basePtr);
+        long pl = CStrLen(path);
+        if (bl + pl + 2L > cap) return (nint)0;
+        CMemcpy(outBuf, basePtr, bl);
+        NativeMemory.At<byte>(outBuf, bl) = (byte)47; // '/'
+        CMemcpy(NativeMemory.Add<byte>(outBuf, bl + 1L), path, pl + 1L);
+        return outBuf;
+    }
+
+    // ---- Thread-safe Generational File Handle Table ----
+
+    static void FhEnsure() {
+        if (s_fhTable != (nint)0) return;
+        nint tbl = CCalloc((long)ZAN_FH_CAP0, (long)sizeof(FileHandleSlot));
+        if (tbl == (nint)0) return;
+        s_fhTable = tbl;
+        s_fhCap = ZAN_FH_CAP0;
+    }
+
+    static bool FhGrow() {
+        if (s_fhCap == 0U) return false;
+        uint ncap = s_fhCap * 2U;
+        if (ncap > ZAN_FH_CAP_MAX || ncap < s_fhCap) return false;
+        nint ntab = CCalloc((long)ncap, (long)sizeof(FileHandleSlot));
+        if (ntab == (nint)0) return false;
+        CMemcpy(ntab, s_fhTable, (long)s_fhCap * (long)sizeof(FileHandleSlot));
+        CFree(s_fhTable);
+        s_fhTable = ntab;
+        s_fhCap = ncap;
+        return true;
+    }
+
+    static long FhIndex(long handle) {
+        ulong h = (ulong)handle;
+        uint idx = (uint)(h & 0xFFFFFFFFUL);
+        uint gen = (uint)(h >> 32);
+        if (s_fhTable == (nint)0 || idx >= s_fhCap) return -1L;
+        ref FileHandleSlot s = ref NativeMemory.At<FileHandleSlot>(s_fhTable, (long)idx);
+        if (s.Open == 0 || s.Fp == (nint)0 || s.Gen != gen) return -1L;
+        return (long)idx;
+    }
+
+    static nint FhPin(long handle, ref long idxOut) {
+        FhLock();
+        FhEnsure();
+        long idx = FhIndex(handle);
+        nint f = (nint)0;
+        if (idx >= 0L) {
+            ref FileHandleSlot s = ref NativeMemory.At<FileHandleSlot>(s_fhTable, idx);
+            f = s.Fp;
+            s.InUse++;
+        }
+        idxOut = idx;
+        FhUnlock();
+        return f;
+    }
+
+    static void FhUnpin(long idx) {
+        if (idx < 0L) return;
+        nint dying = (nint)0;
+        FhLock();
+        if (s_fhTable != (nint)0 && (uint)idx < s_fhCap) {
+            ref FileHandleSlot s = ref NativeMemory.At<FileHandleSlot>(s_fhTable, idx);
+            if (s.InUse > 0) {
+                s.InUse--;
+                if (s.InUse == 0 && s.Dying != (nint)0) {
+                    dying = s.Dying;
+                    s.Dying = (nint)0;
+                }
+            }
+        }
+        FhUnlock();
+        if (dying != (nint)0) CFclose(dying);
+    }
+
+    // ---- Cross-process File Lock Table ----
+
+    static long LkIndex(long handle) {
+        if (handle <= 0L) return -1L;
+        ulong h = (ulong)handle;
+        uint gen = (uint)(h >> 32);
+        ulong slot = h & 0xFFFFFFFFUL;
+        if (slot >= (ulong)ZAN_LK_CAP) return -1L;
+        nint basePtr = NativeMemory.AddressOf(ref s_lkTable);
+        ref FileLockSlot s = ref NativeMemory.At<FileLockSlot>(basePtr, (long)slot);
+        if (s.Used != 1 || s.Gen != gen) return -1L;
+        return (long)slot;
+    }
+
+    // ---- 23 Exported C ABI Runtime Symbols ----
+
+    [Export("zan_file_fopen")]
+    [Visibility("hidden")]
+    public static nint ExportFopen(nint path, nint mode) {
+        return PlatFopen(path, mode);
+    }
+
+    [Export("zan_file_remove")]
+    [Visibility("hidden")]
+    public static int ExportRemove(nint path) {
+        return PlatRemove(path);
+    }
+
+    [Export("zan_file_rename")]
+    [Visibility("hidden")]
+    public static int ExportRename(nint source, nint dest) {
+        return PlatRename(source, dest);
+    }
+
+    [Export("zan_file_flush_to_disk")]
+    [Visibility("hidden")]
+    public static int ExportFlushToDisk(nint path) {
+        return PlatFlushToDisk(path);
+    }
+
+    [Export("zan_file_flush_directory_to_disk")]
+    [Visibility("hidden")]
+    public static int ExportFlushDirectoryToDisk(nint path) {
+        return PlatFlushDirToDisk(path);
+    }
+
+    [Export("zan_file_time")]
+    [Visibility("hidden")]
+    public static long ExportFileTime(nint path, int which) {
+        return PlatFileTime(path, which);
+    }
+
+    [Export("zan_file_length")]
+    [Visibility("hidden")]
+    public static long ExportFileLength(nint path) {
+        return PlatFileLength(path);
+    }
+
+    [Export("zan_file_set_readonly")]
+    [Visibility("hidden")]
+    public static long ExportFileSetReadOnly(nint path, int on) {
+        return PlatFileSetReadOnly(path, on);
+    }
+
+    [Export("zan_file_set_time")]
+    [Visibility("hidden")]
+    public static long ExportFileSetTime(nint path, int which, long unixSec) {
+        return PlatFileSetTime(path, which, unixSec);
+    }
+
+    [Export("zan_file_app_dir")]
+    [Visibility("hidden")]
+    public static nint ExportAppDir() {
+        return GetAppDirInternal();
+    }
+
+    [Export("zan_file_read_path")]
+    [Visibility("hidden")]
+    public static nint ExportReadPath(nint path) {
+        nint emptyPtr = NativeMemory.AddressOf(ref s_emptyStr);
+        if (PlatFileAttributesAt(path) >= 0L) return emptyPtr;
+        nint altPtr = GetAltBuf();
+        if (altPtr == (nint)0) return emptyPtr;
+        for (int which = 0; which < ZAN_ALT_BASES; which++) {
+            nint p = BuildAltPath(path, which, altPtr, 4096L);
+            if (p != (nint)0 && PlatFileAttributesAt(p) >= 0L) return p;
+        }
+        return emptyPtr;
+    }
+
+    [Export("zan_pkg_fopen")]
+    [Visibility("hidden")]
+    public static nint ExportPkgFopen(nint path, nint mode) {
+        nint f = PlatFopen(path, mode);
+        if (f != (nint)0) return f;
+        if (mode == (nint)0 || NativeMemory.At<byte>(mode, 0) != (byte)114) return (nint)0; // 'r'
+        if (CStrContains(mode, (byte)43)) return (nint)0; // '+'
+        PathBuf4096 alt = new PathBuf4096();
+        nint altPtr = NativeMemory.AddressOf(ref alt);
+        for (int which = 0; which < ZAN_ALT_BASES; which++) {
+            nint p = BuildAltPath(path, which, altPtr, 4096L);
+            if (p == (nint)0) continue;
+            f = PlatFopen(p, mode);
+            if (f != (nint)0) return f;
+        }
+        return (nint)0;
+    }
+
+    [Export("zan_file_attributes")]
+    [Visibility("hidden")]
+    public static long ExportFileAttributes(nint path) {
+        long r = PlatFileAttributesAt(path);
+        if (r >= 0L) return r;
+        PathBuf4096 alt = new PathBuf4096();
+        nint altPtr = NativeMemory.AddressOf(ref alt);
+        for (int which = 0; which < ZAN_ALT_BASES; which++) {
+            nint p = BuildAltPath(path, which, altPtr, 4096L);
+            if (p == (nint)0) continue;
+            r = PlatFileAttributesAt(p);
+            if (r >= 0L) return r;
+        }
+        return -1L;
+    }
+
+    [Export("zan_file_open")]
+    [Visibility("hidden")]
+    public static long ExportFileOpen(nint path, nint mode) {
+        if (path == (nint)0 || NativeMemory.At<byte>(path, 0) == (byte)0 ||
+            mode == (nint)0 || NativeMemory.At<byte>(mode, 0) == (byte)0) return 0L;
+        nint f = PlatFopen(path, mode);
+        if (f == (nint)0) return 0L;
+
+        FhLock();
+        FhEnsure();
+        long handle = 0L;
+        if (s_fhTable != (nint)0) {
+            while (true) {
+                uint i = 0U;
+                while (i < s_fhCap) {
+                    ref FileHandleSlot s = ref NativeMemory.At<FileHandleSlot>(s_fhTable, (long)i);
+                    if (s.Open == 0 && s.Dying == (nint)0 && s.Gen != 0xFFFFFFFFU) {
+                        if (s.Gen == 0U) s.Gen = 1U;
+                        s.Fp = f;
+                        s.Open = 1;
+                        handle = (long)((((ulong)s.Gen) << 32) | (ulong)i);
+                        break;
+                    }
+                    i++;
+                }
+                if (i < s_fhCap) break;
+                if (!FhGrow()) break;
+            }
+        }
+        FhUnlock();
+        if (handle == 0L) {
+            CFclose(f);
+            return 0L;
+        }
+        return handle;
+    }
+
+    [Export("zan_file_read")]
+    [Visibility("hidden")]
+    public static long ExportFileRead(long handle, long buf, long count) {
+        if (buf == 0L || count <= 0L) return 0L;
+        long idx = -1L;
+        nint f = FhPin(handle, ref idx);
+        if (f == (nint)0) return 0L;
+        long n = CFread((nint)buf, 1L, count, f);
+        FhUnpin(idx);
+        return n;
+    }
+
+    [Export("zan_file_write")]
+    [Visibility("hidden")]
+    public static long ExportFileWrite(long handle, long buf, long count) {
+        if (buf == 0L || count <= 0L) return 0L;
+        long idx = -1L;
+        nint f = FhPin(handle, ref idx);
+        if (f == (nint)0) return 0L;
+        long n = CFwrite((nint)buf, 1L, count, f);
+        FhUnpin(idx);
+        return n;
+    }
+
+    [Export("zan_file_seek")]
+    [Visibility("hidden")]
+    public static long ExportFileSeek(long handle, long offset, int origin) {
+        long idx = -1L;
+        nint f = FhPin(handle, ref idx);
+        if (f == (nint)0) return -1L;
+        int whence = (origin == 1) ? SEEK_CUR : ((origin == 2) ? SEEK_END : SEEK_SET);
+        long r = PlatSeekRaw(f, offset, whence);
+        FhUnpin(idx);
+        return r;
+    }
+
+    [Export("zan_file_tell")]
+    [Visibility("hidden")]
+    public static long ExportFileTell(long handle) {
+        long idx = -1L;
+        nint f = FhPin(handle, ref idx);
+        if (f == (nint)0) return -1L;
+        long r = PlatTellRaw(f);
+        FhUnpin(idx);
+        return r;
+    }
+
+    [Export("zan_file_flush")]
+    [Visibility("hidden")]
+    public static long ExportFileFlush(long handle) {
+        long idx = -1L;
+        nint f = FhPin(handle, ref idx);
+        if (f == (nint)0) return -1L;
+        int rc = CFflush(f);
+        FhUnpin(idx);
+        return (rc == 0) ? 1L : 0L;
+    }
+
+    [Export("zan_file_close")]
+    [Visibility("hidden")]
+    public static long ExportFileClose(long handle) {
+        FhLock();
+        FhEnsure();
+        long idx = FhIndex(handle);
+        nint f = (nint)0;
+        bool deferred = false;
+        if (idx >= 0L) {
+            ref FileHandleSlot s = ref NativeMemory.At<FileHandleSlot>(s_fhTable, idx);
+            s.Open = 0;
+            if (s.InUse > 0) {
+                s.Dying = s.Fp;
+                s.Fp = (nint)0;
+                deferred = true;
+            } else {
+                f = s.Fp;
+                s.Fp = (nint)0;
+            }
+            uint nextGen = s.Gen + 1U;
+            if (nextGen != 0U) s.Gen = nextGen;
+        }
+        FhUnlock();
+        if (deferred) return 1L;
+        if (f == (nint)0) return 0L;
+        return (CFclose(f) == 0) ? 1L : 0L;
+    }
+
+    [Export("zan_file_eof")]
+    [Visibility("hidden")]
+    public static long ExportFileEof(long handle) {
+        long idx = -1L;
+        nint f = FhPin(handle, ref idx);
+        if (f == (nint)0) return 1L;
+        long e = (CFeof(f) != 0) ? 1L : 0L;
+        FhUnpin(idx);
+        return e;
+    }
+
+    [Export("zan_file_try_lock")]
+    [Visibility("hidden")]
+    public static long ExportFileTryLock(nint path) {
+        if (path == (nint)0 || NativeMemory.At<byte>(path, 0) == (byte)0) return 0L;
+        nint basePtr = NativeMemory.AddressOf(ref s_lkTable);
+        FhLock();
+        long slot = -1L;
+        for (long i = 0L; i < (long)ZAN_LK_CAP; i++) {
+            ref FileLockSlot s = ref NativeMemory.At<FileLockSlot>(basePtr, i);
+            if (s.Used == 0) {
+                slot = i;
+                s.Used = 1;
+                break;
+            }
+        }
+        FhUnlock();
+        if (slot < 0L) return 0L;
+
+        long lk = PlatLockOpen(path);
+        if (lk == PLAT_LOCK_INVALID) {
+            FhLock();
+            NativeMemory.At<FileLockSlot>(basePtr, slot).Used = 0;
+            FhUnlock();
+            return 0L;
+        }
+
+        FhLock();
+        ref FileLockSlot claimed = ref NativeMemory.At<FileLockSlot>(basePtr, slot);
+        claimed.LockVal = lk;
+        uint nextGen = claimed.Gen + 1U;
+        if (nextGen == 0U) {
+            claimed.LockVal = PLAT_LOCK_INVALID;
+            claimed.Used = 2;
+            FhUnlock();
+            PlatLockClose(lk);
+            return 0L;
+        }
+        claimed.Gen = nextGen;
+        ulong lkHandle = (((ulong)claimed.Gen) << 32) | (ulong)slot;
+        FhUnlock();
+        return (long)lkHandle;
+    }
+
+    [Export("zan_file_unlock")]
+    [Visibility("hidden")]
+    public static long ExportFileUnlock(long handle) {
+        nint basePtr = NativeMemory.AddressOf(ref s_lkTable);
+        FhLock();
+        long slot = LkIndex(handle);
+        if (slot < 0L) {
+            FhUnlock();
+            return 0L;
+        }
+        ref FileLockSlot s = ref NativeMemory.At<FileLockSlot>(basePtr, slot);
+        long lk = s.LockVal;
+        s.LockVal = PLAT_LOCK_INVALID;
+        s.Used = 0;
+        s.Gen = s.Gen + 1U;
+        if (s.Gen == 0U) s.Used = 2;
+        FhUnlock();
+        PlatLockClose(lk);
+        return 1L;
+    }
+}

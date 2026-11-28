@@ -1,0 +1,518 @@
+// rt_io_addr.zan: Socket address formatting, SSRF safety checks, synchronous
+// DNS resolution, and Windows CryptoAPI SSL chain verification.
+// 100% pure Zan, zero assembly.
+
+namespace Zan.Runtime.Io;
+
+static class IoAddr {
+    // Empty C string literal helper
+    static nint EmptyStr() {
+        return (nint)"";
+    }
+
+    static int ReadSaFamily(nint sa) {
+#if MACOS
+        return (int)NativeMemory.AsRef<byte>(sa + (nint)1);
+#else
+        return (int)NativeMemory.AsRef<ushort>(sa);
+#endif
+    }
+
+    static void WriteSaFamily(nint sa, int fam, byte saLen) {
+#if MACOS
+        NativeMemory.AsRef<byte>(sa) = saLen;
+        NativeMemory.AsRef<byte>(sa + (nint)1) = (byte)fam;
+#else
+        _ = saLen;
+        NativeMemory.AsRef<ushort>(sa) = (ushort)fam;
+#endif
+    }
+
+    [Export("zan_io_sockaddr_ip_str")]
+    public static nint SockaddrIpStr(nint sa) {
+        if (sa == (nint)0) return EmptyStr();
+        nint dst = IoPlat.GetTlsIpBuf();
+        if (dst == (nint)0) return EmptyStr();
+        int fam = ReadSaFamily(sa);
+        if (fam == IoConst.AF_INET) {
+            // sockaddr_in.sin_addr is at offset 4
+#if WINDOWS
+            nint r = IoPlat.SockInetNtop(IoConst.AF_INET, sa + (nint)4, dst, 46UL);
+#else
+            nint r = IoPlat.SockInetNtop(IoConst.AF_INET, sa + (nint)4, dst, 46U);
+#endif
+            return r != (nint)0 ? dst : EmptyStr();
+        }
+        if (fam == IoConst.AF_INET6) {
+            // sockaddr_in6.sin6_addr is at offset 8
+#if WINDOWS
+            nint r = IoPlat.SockInetNtop(IoConst.AF_INET6, sa + (nint)8, dst, 46UL);
+#else
+            nint r = IoPlat.SockInetNtop(IoConst.AF_INET6, sa + (nint)8, dst, 46U);
+#endif
+            return r != (nint)0 ? dst : EmptyStr();
+        }
+        return EmptyStr();
+    }
+
+    static int CopyOut(nint text, nint buf, int cap) {
+        if (buf == (nint)0 || cap <= 0) return -1;
+        ulong n = IoPlat.CStrLen(text);
+        if ((ulong)cap <= n) return -1;
+        IoPlat.CMemcpy(buf, text, n + 1UL);
+        return (int)n;
+    }
+
+    [Export("zan_io_socket_peer_ip")]
+    public static nint SocketPeerIp(nint fd) {
+        IoBuf128 peer = new IoBuf128();
+        nint pp = NativeMemory.AddressOf(ref peer);
+#if WINDOWS
+        int len = 128;
+        if (IoPlat.SockGetPeerName((ulong)fd, pp, NativeMemory.AddressOf(ref len)) != 0)
+            return EmptyStr();
+#else
+        uint len = 128U;
+        if (IoPlat.SockGetPeerName((int)fd, pp, NativeMemory.AddressOf(ref len)) != 0)
+            return EmptyStr();
+#endif
+        return SockaddrIpStr(pp);
+    }
+
+    [Export("zan_io_socket_peer_ip_into")]
+    public static int SocketPeerIpInto(nint fd, nint buf, int cap) {
+        IoBuf128 peer = new IoBuf128();
+        nint pp = NativeMemory.AddressOf(ref peer);
+#if WINDOWS
+        int len = 128;
+        if (IoPlat.SockGetPeerName((ulong)fd, pp, NativeMemory.AddressOf(ref len)) != 0)
+            return -1;
+#else
+        uint len = 128U;
+        if (IoPlat.SockGetPeerName((int)fd, pp, NativeMemory.AddressOf(ref len)) != 0)
+            return -1;
+#endif
+        return CopyOut(SockaddrIpStr(pp), buf, cap);
+    }
+
+    [Export("zan_io_sockaddr_ip_str_into")]
+    public static int SockaddrIpStrInto(nint sa, nint buf, int cap) {
+        return CopyOut(SockaddrIpStr(sa), buf, cap);
+    }
+
+    [Export("zan_io_sockaddr_family")]
+    public static int SockaddrFamily(nint sa, int len) {
+        if (sa == (nint)0 || len < 2) return 0;
+        int fam = ReadSaFamily(sa);
+        if (fam == IoConst.AF_INET && len >= (int)IoConst.SOCKADDR_IN_SIZE) return IoConst.AF_INET;
+        if (fam == IoConst.AF_INET6 && len >= (int)IoConst.SOCKADDR_IN6_SIZE) return IoConst.AF_INET6;
+        return 0;
+    }
+
+    [Export("zan_io_sockaddr_is_safe_ex")]
+    public static int SockaddrIsSafeEx(nint sa, int len, int allowLoopback, int allowPrivate) {
+        int family = SockaddrFamily(sa, len);
+        if (family == IoConst.AF_INET) {
+            uint raw = NativeMemory.AsRef<uint>((sa) + (nint)(4L));
+            uint a = IoPlat.Ntohl(raw);
+            uint first = a >> 24;
+            uint second = (a >> 16) & 255U;
+            if (first == 127U) return allowLoopback != 0 ? 1 : 0;
+            if (first == 0U || first >= 224U) return 0;
+            if (first == 10U) return allowPrivate != 0 ? 1 : 0;
+            if (first == 169U && second == 254U) return allowPrivate != 0 ? 1 : 0;
+            if (first == 172U && second >= 16U && second <= 31U) return allowPrivate != 0 ? 1 : 0;
+            if (first == 192U && second == 168U) return allowPrivate != 0 ? 1 : 0;
+            if (first == 100U && second >= 64U && second <= 127U) return allowPrivate != 0 ? 1 : 0;
+            if (first == 192U && second == 0U) return 0;
+            uint third = (a >> 8) & 255U;
+            if (first == 192U && second == 2U) return 0;
+            if (first == 192U && second == 88U && third == 99U) return 0;
+            if (first == 198U && second >= 18U && second <= 19U) return 0;
+            if (first == 198U && second == 51U && third == 100U) return 0;
+            if (first == 203U && second == 0U && third == 113U) return 0;
+            if (a == 0xFFFFFFFFU) return 0;
+            return 1;
+        }
+        if (family == IoConst.AF_INET6) {
+            nint b = sa + (nint)8;
+            bool allZero = true;
+            for (int i = 0; i < 16; i++) {
+                if (NativeMemory.AsRef<byte>((b) + (nint)((long)i)) != 0) {
+                    allZero = false;
+                    break;
+                }
+            }
+            if (allZero) return 0;
+            bool loop = true;
+            for (int i = 0; i < 15; i++) {
+                if (NativeMemory.AsRef<byte>((b) + (nint)((long)i)) != 0) {
+                    loop = false;
+                    break;
+                }
+            }
+            byte b0 = NativeMemory.AsRef<byte>(b);
+            byte b1 = NativeMemory.AsRef<byte>((b) + (nint)(1L));
+            byte b2 = NativeMemory.AsRef<byte>((b) + (nint)(2L));
+            byte b3 = NativeMemory.AsRef<byte>((b) + (nint)(3L));
+            if (loop && NativeMemory.AsRef<byte>((b) + (nint)(15L)) == 1) return allowLoopback != 0 ? 1 : 0;
+            if ((b0 & 0xFE) == 0xFC) return allowPrivate != 0 ? 1 : 0; // ULA fc00::/7
+            if ((b0 & 0xFE) == 0xFE && (b1 & 0xC0) == 0x80) return allowPrivate != 0 ? 1 : 0; // link-local fe80::/10
+            if (b0 == 0xFF) return 0; // multicast
+            if (b0 == 0x20 && b1 == 0x01 && b2 == 0x0D && b3 == 0xB8) return 0; // documentation
+            bool mapped = true;
+            for (int i = 0; i < 10; i++) {
+                if (NativeMemory.AsRef<byte>((b) + (nint)((long)i)) != 0) {
+                    mapped = false;
+                    break;
+                }
+            }
+            if (mapped && NativeMemory.AsRef<byte>((b) + (nint)(10L)) == 0xFF && NativeMemory.AsRef<byte>((b) + (nint)(11L)) == 0xFF) {
+                IoBuf16 m4 = new IoBuf16();
+                nint mp = NativeMemory.AddressOf(ref m4);
+                WriteSaFamily(mp, IoConst.AF_INET, (byte)16);
+                IoPlat.CMemcpy(mp + (nint)4, b + (nint)12, 4UL);
+                return SockaddrIsSafeEx(mp, 16, allowLoopback, allowPrivate);
+            }
+            // Teredo 2001:0000::/32
+            if (b0 == 0x20 && b1 == 0x01 && b2 == 0x00 && b3 == 0x00) {
+                IoBuf16 t4 = new IoBuf16();
+                nint tp = NativeMemory.AddressOf(ref t4);
+                WriteSaFamily(tp, IoConst.AF_INET, (byte)16);
+                IoPlat.CMemcpy(tp + (nint)4, b + (nint)4, 4UL);
+                if (SockaddrIsSafeEx(tp, 16, allowLoopback, allowPrivate) == 0) return 0;
+                for (int i = 0; i < 4; i++) {
+                    NativeMemory.AsRef<byte>((tp) + (nint)(4L + (long)i)) = (byte)(NativeMemory.AsRef<byte>((b) + (nint)(12L + (long)i)) ^ 0xFF);
+                }
+                return SockaddrIsSafeEx(tp, 16, allowLoopback, allowPrivate);
+            }
+            int v4Off = -1;
+            if (b0 == 0x20 && b1 == 0x02) v4Off = 2; // 6to4
+            else if (b0 == 0x00 && b1 == 0x64 && b2 == 0xFF && b3 == 0x9B) v4Off = 12; // NAT64
+            else if (mapped) v4Off = 12; // IPv4-compatible
+            if (v4Off >= 0) {
+                IoBuf16 e4 = new IoBuf16();
+                nint ep = NativeMemory.AddressOf(ref e4);
+                WriteSaFamily(ep, IoConst.AF_INET, (byte)16);
+                IoPlat.CMemcpy(ep + (nint)4, b + (nint)v4Off, 4UL);
+                return SockaddrIsSafeEx(ep, 16, allowLoopback, allowPrivate);
+            }
+            return 1;
+        }
+        return 0;
+    }
+
+    [Export("zan_io_sockaddr_is_safe")]
+    public static int SockaddrIsSafe(nint sa, int len, int allowLoopback) {
+        return SockaddrIsSafeEx(sa, len, allowLoopback, 0);
+    }
+
+    static ulong AddrInfoLen(nint ai) {
+#if WINDOWS
+        return NativeMemory.AsRef<ulong>((ai) + (nint)(IoConst.AI_ADDRLEN_OFF));
+#else
+        return (ulong)NativeMemory.AsRef<uint>((ai) + (nint)(IoConst.AI_ADDRLEN_OFF));
+#endif
+    }
+
+    [Export("zan_io_resolve_sa")]
+    public static int ResolveSa(nint name, int port, nint buf, int cap) {
+        if (name == (nint)0 || NativeMemory.AsRef<byte>(name) == 0) return 0;
+        IoBuf16 portBuf = new IoBuf16();
+        nint pp = NativeMemory.AddressOf(ref portBuf);
+        IoPlat.FormatInt32(port, pp, 16);
+
+        IoBuf48 hints = new IoBuf48();
+        nint hp = NativeMemory.AddressOf(ref hints);
+        int fam = IoPlat.CStrChr(name, 58) != (nint)0 ? IoConst.AF_UNSPEC : IoConst.AF_INET; // ':'
+        NativeMemory.AsRef<int>((hp) + (nint)(4L)) = fam;
+        NativeMemory.AsRef<int>((hp) + (nint)(8L)) = IoConst.SOCK_STREAM;
+
+        nint res = (nint)0;
+        if (IoPlat.SockGetAddrInfo(name, pp, hp, NativeMemory.AddressOf(ref res)) != 0 || res == (nint)0) {
+            if (fam == IoConst.AF_INET) {
+                NativeMemory.AsRef<int>((hp) + (nint)(4L)) = IoConst.AF_UNSPEC;
+                res = (nint)0;
+                if (IoPlat.SockGetAddrInfo(name, pp, hp, NativeMemory.AddressOf(ref res)) != 0 || res == (nint)0)
+                    return 0;
+            } else {
+                return 0;
+            }
+        }
+        int aiFam = NativeMemory.AsRef<int>((res) + (nint)(4L));
+        int len = aiFam == IoConst.AF_INET6 ? (int)IoConst.SOCKADDR_IN6_SIZE
+                : (aiFam == IoConst.AF_INET ? (int)IoConst.SOCKADDR_IN_SIZE : 0);
+        int r = 0;
+        ulong aiLen = AddrInfoLen(res);
+        nint aiAddr = NativeMemory.AsRef<nint>((res) + (nint)(IoConst.AI_ADDR_OFF));
+        if (len != 0 && len <= cap && aiLen == (ulong)len && aiAddr != (nint)0) {
+            IoPlat.CMemcpy(buf, aiAddr, (ulong)len);
+            r = len;
+        }
+        IoPlat.SockFreeAddrInfo(res);
+        return r;
+    }
+
+    [Export("zan_io_resolve_ipv4")]
+    public static int ResolveIpv4(nint hostname) {
+        if (hostname == (nint)0 || NativeMemory.AsRef<byte>(hostname) == 0) return 0;
+        IoBuf48 hints = new IoBuf48();
+        nint hp = NativeMemory.AddressOf(ref hints);
+        NativeMemory.AsRef<int>((hp) + (nint)(4L)) = IoConst.AF_INET;
+        NativeMemory.AsRef<int>((hp) + (nint)(8L)) = IoConst.SOCK_STREAM;
+        nint res = (nint)0;
+        if (IoPlat.SockGetAddrInfo(hostname, (nint)0, hp, NativeMemory.AddressOf(ref res)) != 0 || res == (nint)0)
+            return 0;
+        uint bits = 0U;
+        int aiFam = NativeMemory.AsRef<int>((res) + (nint)(4L));
+        nint aiAddr = NativeMemory.AsRef<nint>((res) + (nint)(IoConst.AI_ADDR_OFF));
+        if (aiFam == IoConst.AF_INET && aiAddr != (nint)0 &&
+            ReadSaFamily(aiAddr) == IoConst.AF_INET) {
+            bits = NativeMemory.AsRef<uint>((aiAddr) + (nint)(4L));
+        }
+        IoPlat.SockFreeAddrInfo(res);
+        return (int)bits;
+    }
+
+    [Export("zan_io_resolve_all")]
+    public static int ResolveAll(nint name, int port, nint buf, int cap) {
+        if (buf == (nint)0 || cap <= 0) return 0;
+        if (name == (nint)0 || NativeMemory.AsRef<byte>(name) == 0 || cap < IoConst.ZAN_IO_SA_STRIDE) {
+            IoPlat.CMemset(buf, 0, (ulong)cap);
+            return 0;
+        }
+
+        // Fast path 1: IPv4 literal
+        IoBuf16 sin4 = new IoBuf16();
+        nint s4 = NativeMemory.AddressOf(ref sin4);
+        WriteSaFamily(s4, IoConst.AF_INET, (byte)16);
+        NativeMemory.AsRef<ushort>((s4) + (nint)(2L)) = IoPlat.Htons((ushort)port);
+        if (IoPlat.SockInetPton(IoConst.AF_INET, name, s4 + (nint)4) == 1) {
+            IoPlat.CMemset(buf, 0, (ulong)cap);
+            IoPlat.CMemcpy(buf, s4, IoConst.SOCKADDR_IN_SIZE);
+            return 1;
+        }
+
+        // Fast path 2: IPv6 literal (including [::1])
+        nint v6name = name;
+        IoBuf64 v6strip = new IoBuf64();
+        if (NativeMemory.AsRef<byte>(name) == 91) { // '['
+            ulong l = IoPlat.CStrLen(name);
+            if (l > 2UL && l < 64UL && NativeMemory.AsRef<byte>((name) + (nint)((long)(l - 1UL))) == 93) { // ']'
+                nint vp = NativeMemory.AddressOf(ref v6strip);
+                IoPlat.CMemcpy(vp, name + (nint)1, l - 2UL);
+                NativeMemory.AsRef<byte>((vp) + (nint)((long)(l - 2UL))) = 0;
+                v6name = vp;
+            }
+        }
+        IoBuf32 sin6 = new IoBuf32();
+        nint s6 = NativeMemory.AddressOf(ref sin6);
+        WriteSaFamily(s6, IoConst.AF_INET6, (byte)28);
+        NativeMemory.AsRef<ushort>((s6) + (nint)(2L)) = IoPlat.Htons((ushort)port);
+        if (IoPlat.SockInetPton(IoConst.AF_INET6, v6name, s6 + (nint)8) == 1) {
+            IoPlat.CMemset(buf, 0, (ulong)cap);
+            IoPlat.CMemcpy(buf, s6, IoConst.SOCKADDR_IN6_SIZE);
+            return 1;
+        }
+
+        IoBuf16 portBuf = new IoBuf16();
+        nint pp = NativeMemory.AddressOf(ref portBuf);
+        IoPlat.FormatInt32(port, pp, 16);
+
+        IoBuf48 hints = new IoBuf48();
+        nint hp = NativeMemory.AddressOf(ref hints);
+        NativeMemory.AsRef<int>((hp) + (nint)(4L)) = IoConst.AF_UNSPEC;
+        NativeMemory.AsRef<int>((hp) + (nint)(8L)) = IoConst.SOCK_STREAM;
+
+        nint res = (nint)0;
+        if (IoPlat.SockGetAddrInfo(name, pp, hp, NativeMemory.AddressOf(ref res)) != 0 || res == (nint)0) {
+            IoPlat.CMemset(buf, 0, (ulong)cap);
+            return 0;
+        }
+
+        int capacity = cap >> 5; // / 32 (ZAN_IO_SA_STRIDE)
+        int count = 0;
+        for (nint p = res; p != (nint)0; p = NativeMemory.AsRef<nint>((p) + (nint)(IoConst.AI_NEXT_OFF))) {
+            nint aiAddr = NativeMemory.AsRef<nint>((p) + (nint)(IoConst.AI_ADDR_OFF));
+            ulong aiLen = AddrInfoLen(p);
+            int family = SockaddrFamily(aiAddr, (int)aiLen);
+            int len = family == IoConst.AF_INET6 ? (int)IoConst.SOCKADDR_IN6_SIZE
+                    : (family == IoConst.AF_INET ? (int)IoConst.SOCKADDR_IN_SIZE : 0);
+            if (len == 0 || aiLen < (ulong)len) continue;
+            bool dup = false;
+            for (int i = 0; i < count; i++) {
+                nint old = buf + (nint)((long)i * (long)IoConst.ZAN_IO_SA_STRIDE);
+                if (SockaddrFamily(old, len) == family && IoPlat.CMemcmp(old, aiAddr, (ulong)len) == 0) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) continue;
+            if (count >= capacity) {
+                IoPlat.CMemset(buf, 0, (ulong)cap);
+                IoPlat.SockFreeAddrInfo(res);
+                return 0;
+            }
+            nint dst = buf + (nint)((long)count * (long)IoConst.ZAN_IO_SA_STRIDE);
+            IoPlat.CMemset(dst, 0, (ulong)IoConst.ZAN_IO_SA_STRIDE);
+            IoPlat.CMemcpy(dst, aiAddr, (ulong)len);
+            count++;
+        }
+        IoPlat.SockFreeAddrInfo(res);
+        return count;
+    }
+
+    [Export("zan_io_resolve_all_async")]
+    public static long ResolveAllAsync(nint namePtr, int port, nint bufPtr, int cap) {
+        return (long)ResolveAll(namePtr, port, bufPtr, cap);
+    }
+
+#if WINDOWS
+    [Export("zan_crypto_cert_encoded")]
+    public static nint CryptoCertEncoded(nint cert, nint outLen) {
+        if (cert == (nint)0 || outLen == (nint)0) return (nint)0;
+        // CERT_CONTEXT: pbCertEncoded @ 8, cbCertEncoded (uint) @ 16
+        NativeMemory.AsRef<int>(outLen) = (int)NativeMemory.AsRef<uint>((cert) + (nint)(16L));
+        return NativeMemory.AsRef<nint>((cert) + (nint)(8L));
+    }
+
+    [Export("zan_io_crypto_windows_ssl_policy")]
+    public static int CryptoWindowsSslPolicy(nint certs, int totalLen, int count, nint host, int hostLen) {
+        if (certs == (nint)0 || host == (nint)0 || totalLen < 5 || totalLen > 524288 ||
+            count < 1 || count > 8 || hostLen < 1 || hostLen > 253)
+            return 0;
+
+        IoBuf512 wideHost = new IoBuf512();
+        nint whp = NativeMemory.AddressOf(ref wideHost);
+        for (int i = 0; i < hostLen; i++) {
+            byte ch = NativeMemory.AsRef<byte>((host) + (nint)((long)i));
+            if (ch <= 32 || ch >= 127 || ch == 47 || ch == 92 || ch == 58) return 0; // '/', '\\', ':'
+            NativeMemory.AsRef<ushort>((whp) + (nint)((long)i * 2L)) = (ushort)ch;
+        }
+        NativeMemory.AsRef<ushort>((whp) + (nint)((long)hostLen * 2L)) = 0;
+
+        // L"crypt32.dll" on stack
+        IoBuf32 libName = new IoBuf32();
+        nint lnp = NativeMemory.AddressOf(ref libName);
+        nint ascii = (nint)"crypt32.dll";
+        for (int i = 0; i < 11; i++) {
+            NativeMemory.AsRef<ushort>((lnp) + (nint)((long)i * 2L)) = (ushort)NativeMemory.AsRef<byte>((ascii) + (nint)((long)i));
+        }
+        NativeMemory.AsRef<ushort>((lnp) + (nint)(22L)) = 0;
+
+        nint lib = IoPlat.WinLoadLibraryW(lnp);
+        if (lib == (nint)0) return -1;
+
+        nint fnCreateCert = IoPlat.WinGetProcAddress(lib, (nint)"CertCreateCertificateContext");
+        nint fnOpenStore = IoPlat.WinGetProcAddress(lib, (nint)"CertOpenStore");
+        nint fnAddCert = IoPlat.WinGetProcAddress(lib, (nint)"CertAddEncodedCertificateToStore");
+        nint fnGetChain = IoPlat.WinGetProcAddress(lib, (nint)"CertGetCertificateChain");
+        nint fnVerifyPolicy = IoPlat.WinGetProcAddress(lib, (nint)"CertVerifyCertificateChainPolicy");
+        nint fnCloseStore = IoPlat.WinGetProcAddress(lib, (nint)"CertCloseStore");
+        nint fnFreeCert = IoPlat.WinGetProcAddress(lib, (nint)"CertFreeCertificateContext");
+        nint fnFreeChain = IoPlat.WinGetProcAddress(lib, (nint)"CertFreeCertificateChain");
+
+        if (fnCreateCert == (nint)0 || fnOpenStore == (nint)0 || fnAddCert == (nint)0 ||
+            fnGetChain == (nint)0 || fnVerifyPolicy == (nint)0 || fnCloseStore == (nint)0 ||
+            fnFreeCert == (nint)0 || fnFreeChain == (nint)0) {
+            IoPlat.WinFreeLibrary(lib);
+            return -1;
+        }
+
+        nint store = (nint)0;
+        nint leaf = (nint)0;
+        nint chain = (nint)0;
+        int result = 0;
+
+        // CERT_STORE_PROV_MEMORY = 2, CERT_STORE_CREATE_NEW_FLAG = 0x2000
+        store = NativeMemory.InvokeWithCC<nint>("c", fnOpenStore, (nint)2, 0U, (nint)0, 0x2000U, (nint)0);
+        if (store != (nint)0) {
+            int pos = 0;
+            bool parseOk = true;
+            for (int i = 0; i < count; i++) {
+                if (totalLen - pos < 4) { parseOk = false; break; }
+                uint n = (uint)NativeMemory.AsRef<byte>((certs) + (nint)((long)pos))
+                       | ((uint)NativeMemory.AsRef<byte>((certs) + (nint)((long)pos + 1L)) << 8)
+                       | ((uint)NativeMemory.AsRef<byte>((certs) + (nint)((long)pos + 2L)) << 16)
+                       | ((uint)NativeMemory.AsRef<byte>((certs) + (nint)((long)pos + 3L)) << 24);
+                pos += 4;
+                if (n < 1U || n > 65536U || n > (uint)(totalLen - pos)) { parseOk = false; break; }
+                // X509_ASN_ENCODING | PKCS_7_ASN_ENCODING = 0x10001
+                if (i == 0) {
+                    leaf = NativeMemory.InvokeWithCC<nint>("c", fnCreateCert, 0x10001U, certs + (nint)pos, n);
+                    if (leaf == (nint)0) { parseOk = false; break; }
+                } else {
+                    int added = NativeMemory.InvokeWithCC<int>("c", fnAddCert, store, 0x10001U, certs + (nint)pos, n, 4U, (nint)0);
+                    if (added == 0) { parseOk = false; break; }
+                }
+                pos += (int)n;
+            }
+            if (parseOk && pos == totalLen && leaf != (nint)0) {
+                // CERT_CHAIN_PARA (32 bytes): cbSize@0, dwType@8=0, cUsageIdentifier@16=1, rgpszUsageIdentifier@24
+                IoBuf32 chainPara = new IoBuf32();
+                nint cp = NativeMemory.AddressOf(ref chainPara);
+                nint serverAuthOid = (nint)"1.3.6.1.5.5.7.3.1";
+                NativeMemory.AsRef<uint>(cp) = 32U;
+                NativeMemory.AsRef<uint>((cp) + (nint)(8L)) = 0U; // USAGE_MATCH_TYPE_AND
+                NativeMemory.AsRef<uint>((cp) + (nint)(16L)) = 1U;
+                NativeMemory.AsRef<nint>((cp) + (nint)(24L)) = NativeMemory.AddressOf(ref serverAuthOid);
+
+                // REV_EXCL (0x40000000) | CACHE_ONLY (0x4) | DIS_AIA (0x2000) = 0x40002004
+                int gotChain = NativeMemory.InvokeWithCC<int>("c", fnGetChain, (nint)0, leaf, (nint)0, store,
+                                                              cp, 0x40002004U, (nint)0, NativeMemory.AddressOf(ref chain));
+                if (gotChain == 0 || chain == (nint)0) {
+                    result = -2;
+                } else {
+                    // CERT_CHAIN_CONTEXT.TrustStatus.dwErrorStatus @ 4
+                    uint trustErr = NativeMemory.AsRef<uint>((chain) + (nint)(4L));
+                    if (trustErr != 0U) {
+                        if ((trustErr & 0x10000U) != 0U) result = -3;      // PARTIAL_CHAIN
+                        else if ((trustErr & 0x20U) != 0U) result = -4;    // UNTRUSTED_ROOT
+                        else if ((trustErr & 0x4U) != 0U) result = -10;    // REVOKED
+                        else if ((trustErr & 0x1U) != 0U) result = -5;     // NOT_TIME_VALID
+                        else if ((trustErr & 0x40U) != 0U) result = -6;    // REVOCATION_STATUS_UNKNOWN
+                        else result = -7;
+                    } else {
+                        // SSL_EXTRA_CERT_CHAIN_POLICY_PARA (24B): cbSize@0, dwAuthType@4=2, pwszServerName@16
+                        IoBuf32 sslPara = new IoBuf32();
+                        nint sp = NativeMemory.AddressOf(ref sslPara);
+                        NativeMemory.AsRef<uint>(sp) = 24U;
+                        NativeMemory.AsRef<uint>((sp) + (nint)(4L)) = 2U; // AUTHTYPE_SERVER
+                        NativeMemory.AsRef<nint>((sp) + (nint)(16L)) = whp;
+
+                        // CERT_CHAIN_POLICY_PARA (16B): cbSize@0, pvExtraPolicyPara@8
+                        IoBuf16 polPara = new IoBuf16();
+                        nint polp = NativeMemory.AddressOf(ref polPara);
+                        NativeMemory.AsRef<uint>(polp) = 16U;
+                        NativeMemory.AsRef<nint>((polp) + (nint)(8L)) = sp;
+
+                        // CERT_CHAIN_POLICY_STATUS (24B): cbSize@0, dwError@4
+                        IoBuf32 polStatus = new IoBuf32();
+                        nint stp = NativeMemory.AddressOf(ref polStatus);
+                        NativeMemory.AsRef<uint>(stp) = 24U;
+
+                        // CERT_CHAIN_POLICY_SSL = (LPCSTR)4
+                        int okPol = NativeMemory.InvokeWithCC<int>("c", fnVerifyPolicy, (nint)4, chain, polp, stp);
+                        if (okPol == 0) {
+                            result = -9;
+                        } else {
+                            uint dwErr = NativeMemory.AsRef<uint>((stp) + (nint)(4L));
+                            if (dwErr != 0U) {
+                                result = (dwErr == 0x800B010FU) ? -8 : -9; // CERT_E_CN_NO_MATCH
+                            } else {
+                                result = 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (chain != (nint)0) NativeMemory.InvokeVoidWithCC<nint>("c", fnFreeChain, chain);
+        if (leaf != (nint)0) NativeMemory.InvokeWithCC<int>("c", fnFreeCert, leaf);
+        if (store != (nint)0) NativeMemory.InvokeWithCC<int>("c", fnCloseStore, store, 0U);
+        IoPlat.WinFreeLibrary(lib);
+        return result;
+    }
+#endif
+}

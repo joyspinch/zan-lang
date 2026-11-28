@@ -1,0 +1,1129 @@
+// rt_crash.zan -- Pure-Zan (zero-assembly) crash reporter & thread-level recovery runtime.
+// Replaces src/runtime/rt_crash.c + crash/rt_crash_win_{io,sym,guard}.c + crash/rt_crash_posix.c.
+//
+// Exports exact C ABI defined in src/runtime/rt_crash.h:
+//   void zan__crash_install(void);
+//   int  zan__guard_call(void (*fn)(void *), void *arg);
+//   long zan__guard_recovered_count(void);
+// Plus [ModuleInitializer] (internal __zan_static_init -> llvm.global_ctors) for automatic startup install.
+//
+// Discipline:
+//   - 100% pure Zan, zero assembly, zero heap allocation, zero CRT stdio locks.
+//   - Windows: Win32 HANDLE + stack-buffer formatting + frozen extended-length UTF-16 log paths +
+//     1 MiB rotation + VEH + SetUnhandledExceptionFilter + RtlCaptureContext recovery (no setjmp/asm).
+//   - Linux: async-signal-safe write(fd) + sigaltstack(64 KiB) + sigaction (glibc & musl layout aware) +
+//     UTC civil-date formatter + ucontext_t x64 frame-pointer walk + dladdr.
+
+using System;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Threading;
+
+namespace ZanCrashRuntime {
+
+#if WINDOWS
+    // Fixed stack/static buffers (zero heap allocation)
+    struct Buf16   { public InlineArray<16, byte> Data; }
+    struct Buf32   { public InlineArray<32, byte> Data; }
+    struct Buf64   { public InlineArray<64, byte> Data; }
+    struct Buf128  { public InlineArray<128, byte> Data; }
+    struct Buf260  { public InlineArray<260, byte> Data; }
+    struct Buf1024 { public InlineArray<1024, byte> Data; }
+    struct Buf2048 { public InlineArray<2048, byte> Data; }
+    struct Buf3200 { public InlineArray<3200, byte> Data; }
+    struct Buf4096 { public InlineArray<4096, byte> Data; }
+    struct Buf8192 { public InlineArray<8192, byte> Data; }
+    struct WBuf32   { public InlineArray<32, ushort> Data; }
+    struct WBuf4096 { public InlineArray<4096, ushort> Data; }
+    struct CtxBuf1248 { public InlineArray<1248, byte> Data; }
+    struct ErBuf152 { public InlineArray<152, byte> Data; }
+    struct PtrBuf62 { public InlineArray<62, nint> Data; }
+    struct PtrBuf64 { public InlineArray<64, nint> Data; }
+    struct UlongBuf24 { public InlineArray<24, ulong> Data; }
+
+    struct ThreadSlot {
+        public int Tid;
+        public int Ready;
+        public int Busy;
+        public int Pad;
+        public nint Top;
+    }
+
+    struct SlotTable64 {
+        public InlineArray<64, ThreadSlot> Slots;
+    }
+
+    struct GuardFrame {
+        public CtxBuf1248 SavedCtxBuf;
+        public nint SavedCtxPtr;
+        public nint Prev;
+        public int Armed;
+        public int Resumed;
+        public ErBuf152 FaultEr;
+        public CtxBuf1248 FaultCtxBuf;
+        public nint FaultCtxPtr;
+        public PtrBuf62 Bt;
+        public uint Btn;
+        public int Have;
+    }
+
+    // Stack-buffered lock-free writer (never uses CRT stdio locks or heap)
+    struct LineWriter {
+        public nint Handle;
+        public Buf1024 Buf;
+        public int Pos;
+    }
+
+    static partial class CrashRt {
+        const int ZAN_CRASH_PATH_CAP = 4096;
+        const int ZAN_GUARD_SLOTS = 64;
+        const int ZAN_GUARD_LOG_FULL = 20;
+        const int ZAN_GUARD_LOG_EVERY = 100;
+        const long ZAN_CRASH_LOG_MAX_BYTES = 1048576L;
+        const ulong WIN64_CTX_SIZE = 1232UL;
+        const ulong WIN64_ER_SIZE = 152UL;
+
+        // Win32 constants (verified against x86_64-w64-windows-gnu headers)
+        const int EXCEPTION_CONTINUE_EXECUTION = -1;
+        const int EXCEPTION_CONTINUE_SEARCH = 0;
+        const int EXCEPTION_EXECUTE_HANDLER = 1;
+
+        const uint FILE_APPEND_DATA = 0x00000004U;
+        const uint GENERIC_READ = 0x80000000U;
+        const uint GENERIC_WRITE = 0x40000000U;
+        const uint FILE_SHARE_READ = 0x00000001U;
+        const uint FILE_SHARE_WRITE = 0x00000002U;
+        const uint FILE_SHARE_DELETE = 0x00000004U;
+        const uint CREATE_NEW = 1U;
+        const uint OPEN_EXISTING = 3U;
+        const uint OPEN_ALWAYS = 4U;
+        const uint FILE_ATTRIBUTE_DIRECTORY = 0x00000010U;
+        const uint FILE_ATTRIBUTE_NORMAL = 0x00000080U;
+        const uint FILE_ATTRIBUTE_TEMPORARY = 0x00000100U;
+        const uint INVALID_FILE_ATTRIBUTES = 0xFFFFFFFFU;
+        const uint ERROR_ALREADY_EXISTS = 183U;
+        const uint CP_UTF8 = 65001U;
+        const uint MB_ERR_INVALID_CHARS = 8U;
+        const uint WC_ERR_INVALID_CHARS = 0x80U;
+        const uint GMHEX_PIN = 0x1U;
+        const uint GMHEX_UNCHANGED_REFCOUNT = 0x2U;
+        const uint GMHEX_FROM_ADDRESS = 0x4U;
+        const uint MEM_COMMIT = 0x1000U;
+        const uint PAGE_NOACCESS = 0x1U;
+        const uint PAGE_GUARD = 0x100U;
+        const uint STARTF_USESTDHANDLES = 0x100U;
+        const uint CREATE_NO_WINDOW = 0x08000000U;
+
+        const uint EX_ACCESS_VIOLATION = 0xC0000005U;
+        const uint EX_IN_PAGE_ERROR = 0xC0000006U;
+        const uint EX_ARRAY_BOUNDS = 0xC000008CU;
+        const uint EX_DATATYPE_MISALIGN = 0x80000002U;
+        const uint EX_ILLEGAL_INSTR = 0xC000001DU;
+        const uint EX_PRIV_INSTR = 0xC0000096U;
+        const uint EX_INT_DIV_ZERO = 0xC0000094U;
+        const uint EX_INT_OVERFLOW = 0xC0000095U;
+        const uint EX_FLT_DIV_ZERO = 0xC000008EU;
+        const uint EX_FLT_INVALID_OP = 0xC0000090U;
+        const uint EX_STACK_OVERFLOW = 0xC00000FDU;
+        const uint EX_HEAP_CORRUPTION = 0xC0000374U;
+        const uint EX_FAIL_FAST = 0xC0000409U;
+
+        // Win32 kernel32 imports
+        [DllImport("kernel32", EntryPoint = "AddVectoredExceptionHandler")]
+        static extern nint WinAddVeh(uint first, nint handler);
+
+        [DllImport("kernel32", EntryPoint = "SetUnhandledExceptionFilter")]
+        static extern nint WinSetUnhandledFilter(nint filter);
+
+        [DllImport("kernel32", EntryPoint = "SetThreadStackGuarantee")]
+        static extern int WinSetThreadStackGuarantee(nint stackSizeInBytes);
+
+        [DllImport("kernel32", EntryPoint = "RtlCaptureContext")]
+        static extern void WinRtlCaptureContext(nint ctx);
+
+        [DllImport("kernel32", EntryPoint = "RtlCaptureStackBackTrace")]
+        static extern ushort WinCaptureBackTrace(uint framesToSkip, uint framesToCapture, nint backTrace, nint hash);
+
+        [DllImport("kernel32", EntryPoint = "GetCurrentProcessId")]
+        static extern uint WinGetCurrentProcessId();
+
+        [DllImport("kernel32", EntryPoint = "GetCurrentThreadId")]
+        static extern uint WinGetCurrentThreadId();
+
+        [DllImport("kernel32", EntryPoint = "GetLocalTime")]
+        static extern void WinGetLocalTime(nint st);
+
+        [DllImport("kernel32", EntryPoint = "GetTickCount64")]
+        static extern ulong WinGetTickCount64();
+
+        [DllImport("kernel32", EntryPoint = "QueryPerformanceCounter")]
+        static extern int WinQueryPerformanceCounter(nint lpCount);
+
+        [DllImport("kernel32", EntryPoint = "GetModuleHandleA")]
+        static extern nint WinGetModuleHandleA(nint name);
+
+        [DllImport("kernel32", EntryPoint = "GetModuleHandleW")]
+        static extern nint WinGetModuleHandleW(nint name);
+
+        [DllImport("kernel32", EntryPoint = "GetModuleHandleExA")]
+        static extern int WinGetModuleHandleExA(uint flags, nint name, nint outMod);
+
+        [DllImport("kernel32", EntryPoint = "GetModuleFileNameA")]
+        static extern uint WinGetModuleFileNameA(nint mod, nint buf, uint size);
+
+        [DllImport("kernel32", EntryPoint = "GetEnvironmentVariableW")]
+        static extern uint WinGetEnvW(nint name, nint buf, uint size);
+
+        [DllImport("kernel32", EntryPoint = "GetTempPathW")]
+        static extern uint WinGetTempPathW(uint bufLen, nint buf);
+
+        [DllImport("kernel32", EntryPoint = "GetFullPathNameW")]
+        static extern uint WinGetFullPathNameW(nint fileName, uint bufLen, nint buf, nint filePart);
+
+        [DllImport("kernel32", EntryPoint = "CreateDirectoryW")]
+        static extern int WinCreateDirectoryW(nint path, nint sa);
+
+        [DllImport("kernel32", EntryPoint = "GetLastError")]
+        static extern uint WinGetLastError();
+
+        [DllImport("kernel32", EntryPoint = "GetFileAttributesA")]
+        static extern uint WinGetFileAttributesA(nint path);
+
+        [DllImport("kernel32", EntryPoint = "GetFileAttributesW")]
+        static extern uint WinGetFileAttributesW(nint path);
+
+        [DllImport("kernel32", EntryPoint = "CreateFileA")]
+        static extern nint WinCreateFileA(nint path, uint access, uint share, nint sa, uint disp, uint flags, nint tmpl);
+
+        [DllImport("kernel32", EntryPoint = "CreateFileW")]
+        static extern nint WinCreateFileW(nint path, uint access, uint share, nint sa, uint disp, uint flags, nint tmpl);
+
+        [DllImport("kernel32", EntryPoint = "WriteFile")]
+        static extern int WinWriteFile(nint h, nint buf, uint n, nint written, nint ov);
+
+        [DllImport("kernel32", EntryPoint = "ReadFile")]
+        static extern int WinReadFile(nint h, nint buf, uint n, nint read, nint ov);
+
+        [DllImport("kernel32", EntryPoint = "GetFileSizeEx")]
+        static extern int WinGetFileSizeEx(nint h, nint outSize);
+
+        [DllImport("kernel32", EntryPoint = "CloseHandle")]
+        static extern int WinCloseHandle(nint h);
+
+        [DllImport("kernel32", EntryPoint = "DeleteFileA")]
+        static extern int WinDeleteFileA(nint path);
+
+        [DllImport("kernel32", EntryPoint = "DeleteFileW")]
+        static extern int WinDeleteFileW(nint path);
+
+        [DllImport("kernel32", EntryPoint = "MoveFileW")]
+        static extern int WinMoveFileW(nint src, nint dst);
+
+        [DllImport("kernel32", EntryPoint = "MultiByteToWideChar")]
+        static extern int WinMbToWc(uint cp, uint flags, nint src, int srcLen, nint dst, int dstCap);
+
+        [DllImport("kernel32", EntryPoint = "WideCharToMultiByte")]
+        static extern int WinWcToMb(uint cp, uint flags, nint src, int srcLen, nint dst, int dstCap, nint defChar, nint usedDef);
+
+        [DllImport("kernel32", EntryPoint = "VirtualQuery")]
+        static extern ulong WinVirtualQuery(nint addr, nint mbi, ulong len);
+
+        [DllImport("kernel32", EntryPoint = "CreateProcessA")]
+        static extern int WinCreateProcessA(nint app, nint cmd, nint pa, nint ta, int inherit, uint flags, nint env, nint cwd, nint si, nint pi);
+
+        [DllImport("kernel32", EntryPoint = "WaitForSingleObject")]
+        static extern uint WinWaitForSingleObject(nint h, uint ms);
+
+        [DllImport("kernel32", EntryPoint = "ExitProcess")]
+        static extern void WinExitProcess(uint code);
+
+        [DllImport("crt", EntryPoint = "atexit")]
+        static extern int CAtexit(nint fn);
+
+        [DllImport("crt", EntryPoint = "memcpy")]
+        static extern nint CMemcpy(nint dst, nint src, ulong n);
+
+        [DllImport("crt", EntryPoint = "memset")]
+        static extern nint CMemset(nint dst, int c, ulong n);
+
+        [DllImport("crt", EntryPoint = "strlen")]
+        static extern ulong CStrlen(nint s);
+
+        [DllImport("crt", EntryPoint = "strstr")]
+        static extern nint CStrstr(nint hay, nint needle);
+
+        [DllImport("crt", EntryPoint = "strrchr")]
+        static extern nint CStrrchr(nint s, int c);
+
+        // Shared process state (unmanaged static value fields, zero heap allocation)
+        static int s_installed = 0;
+        static int s_busyShared = 0;
+        static int s_recovered = 0;
+        static int s_logged = 0;
+        static int s_firstChance = 0;
+        static SlotTable64 s_slots;
+        static Buf4096 s_cachedLog;
+        static Buf4096 s_cachedTemp;
+
+        // ---- Low-level raw buffer & lock-free Win32 IO helpers ----
+
+        static void WriteRaw(nint h, nint p, ulong n) {
+            if (h == (nint)0 || p == (nint)0) return;
+            ulong cur = (ulong)p;
+            while (n > 0UL) {
+                uint chunk = (n > 0x7FFFFFF0UL) ? 0x7FFFFFF0U : (uint)n;
+                uint written = 0U;
+                if (WinWriteFile(h, (nint)cur, chunk, NativeMemory.AddressOf(ref written), (nint)0) == 0 || written == 0U) {
+                    return;
+                }
+                cur += (ulong)written;
+                n -= (ulong)written;
+            }
+        }
+
+        static void LwInit(ref LineWriter lw, nint h) {
+            lw.Handle = h;
+            lw.Pos = 0;
+        }
+
+        static void LwFlush(ref LineWriter lw) {
+            if (lw.Pos > 0) {
+                WriteRaw(lw.Handle, NativeMemory.AddressOf(ref lw.Buf), (ulong)lw.Pos);
+                lw.Pos = 0;
+            }
+        }
+
+        static void LwByte(ref LineWriter lw, byte b) {
+            if (lw.Pos >= 1024) LwFlush(ref lw);
+            nint dst = NativeMemory.AddressOf(ref lw.Buf);
+            NativeMemory.At<byte>(dst, lw.Pos) = b;
+            lw.Pos++;
+        }
+
+        static void LwBytes(ref LineWriter lw, nint p, ulong n) {
+            if (p == (nint)0 || n == 0UL) return;
+            if (n >= 512UL) {
+                LwFlush(ref lw);
+                WriteRaw(lw.Handle, p, n);
+                return;
+            }
+            if ((ulong)lw.Pos + n > 1024UL) LwFlush(ref lw);
+            nint dst = (nint)((ulong)NativeMemory.AddressOf(ref lw.Buf) + (ulong)lw.Pos);
+            CMemcpy(dst, p, n);
+            lw.Pos += (int)n;
+        }
+
+        static void LwCStr(ref LineWriter lw, nint s) {
+            if (s == (nint)0) s = (nint)("(null)");
+            LwBytes(ref lw, s, CStrlen(s));
+        }
+
+        static void LwUIntDec(ref LineWriter lw, ulong v, int minWidth, byte padChar) {
+            Buf32 tmp = new Buf32();
+            nint baseP = NativeMemory.AddressOf(ref tmp);
+            int idx = 31;
+            if (v == 0UL) {
+                NativeMemory.At<byte>(baseP, idx) = (byte)48;
+                idx--;
+            } else {
+                while (v != 0UL) {
+                    ulong q = v / 10UL;
+                    ulong r = v - q * 10UL;
+                    NativeMemory.At<byte>(baseP, idx) = (byte)(48UL + r);
+                    idx--;
+                    v = q;
+                }
+            }
+            int len = 31 - idx;
+            for (int p = len; p < minWidth; p++) LwByte(ref lw, padChar);
+            LwBytes(ref lw, (nint)((ulong)baseP + (ulong)(idx + 1)), (ulong)len);
+        }
+
+        static void LwUIntDecLeft(ref LineWriter lw, ulong v, int minWidth) {
+            Buf32 tmp = new Buf32();
+            nint baseP = NativeMemory.AddressOf(ref tmp);
+            int idx = 31;
+            if (v == 0UL) {
+                NativeMemory.At<byte>(baseP, idx) = (byte)48;
+                idx--;
+            } else {
+                while (v != 0UL) {
+                    ulong q = v / 10UL;
+                    ulong r = v - q * 10UL;
+                    NativeMemory.At<byte>(baseP, idx) = (byte)(48UL + r);
+                    idx--;
+                    v = q;
+                }
+            }
+            int len = 31 - idx;
+            LwBytes(ref lw, (nint)((ulong)baseP + (ulong)(idx + 1)), (ulong)len);
+            for (int p = len; p < minWidth; p++) LwByte(ref lw, (byte)32);
+        }
+
+        static void LwIntDec(ref LineWriter lw, long v) {
+            ulong uv = 0UL;
+            if (v < 0L) {
+                LwByte(ref lw, (byte)45);
+                uv = (ulong)(-(v + 1L)) + 1UL;
+            } else {
+                uv = (ulong)v;
+            }
+            LwUIntDec(ref lw, uv, 0, (byte)32);
+        }
+
+        static void LwHex(ref LineWriter lw, ulong v, int minWidth, bool upper) {
+            Buf32 tmp = new Buf32();
+            nint baseP = NativeMemory.AddressOf(ref tmp);
+            int idx = 31;
+            byte aBase = upper ? (byte)55 : (byte)87; // 'A'-10 or 'a'-10
+            if (v == 0UL) {
+                NativeMemory.At<byte>(baseP, idx) = (byte)48;
+                idx--;
+            } else {
+                while (v != 0UL) {
+                    uint d = (uint)(v & 15UL);
+                    NativeMemory.At<byte>(baseP, idx) = (d < 10U) ? (byte)(48U + d) : (byte)((uint)aBase + d);
+                    idx--;
+                    v >>= 4;
+                }
+            }
+            int len = 31 - idx;
+            for (int p = len; p < minWidth; p++) LwByte(ref lw, (byte)48);
+            LwBytes(ref lw, (nint)((ulong)baseP + (ulong)(idx + 1)), (ulong)len);
+        }
+
+        static void LwPtr(ref LineWriter lw, ulong v) {
+            LwHex(ref lw, v, 16, true);
+        }
+
+        // Stack C-string builder helpers (zero CRT snprintf)
+        static int SBAppendCStr(nint dst, int pos, int cap, nint s) {
+            if (s == (nint)0 || pos >= cap - 1) return pos;
+            ulong n = CStrlen(s);
+            ulong avail = (ulong)(cap - 1 - pos);
+            if (n > avail) n = avail;
+            if (n > 0UL) {
+                CMemcpy((nint)((ulong)dst + (ulong)pos), s, n);
+                pos += (int)n;
+            }
+            NativeMemory.At<byte>(dst, pos) = (byte)0;
+            return pos;
+        }
+
+        static int SBAppendByte(nint dst, int pos, int cap, byte b) {
+            if (pos >= cap - 1) return pos;
+            NativeMemory.At<byte>(dst, pos) = b;
+            pos++;
+            NativeMemory.At<byte>(dst, pos) = (byte)0;
+            return pos;
+        }
+
+        static int SBAppendUInt(nint dst, int pos, int cap, ulong v) {
+            Buf32 tmp = new Buf32();
+            nint baseP = NativeMemory.AddressOf(ref tmp);
+            int idx = 31;
+            if (v == 0UL) {
+                NativeMemory.At<byte>(baseP, idx) = (byte)48;
+                idx--;
+            } else {
+                while (v != 0UL) {
+                    ulong q = v / 10UL;
+                    ulong r = v - q * 10UL;
+                    NativeMemory.At<byte>(baseP, idx) = (byte)(48UL + r);
+                    idx--;
+                    v = q;
+                }
+            }
+            for (int i = idx + 1; i <= 31 && pos < cap - 1; i++) {
+                NativeMemory.At<byte>(dst, pos) = NativeMemory.At<byte>(baseP, i);
+                pos++;
+            }
+            NativeMemory.At<byte>(dst, pos) = (byte)0;
+            return pos;
+        }
+
+        static int SBAppendInt(nint dst, int pos, int cap, long v) {
+            ulong uv = 0UL;
+            if (v < 0L) {
+                pos = SBAppendByte(dst, pos, cap, (byte)45);
+                uv = (ulong)(-(v + 1L)) + 1UL;
+            } else {
+                uv = (ulong)v;
+            }
+            return SBAppendUInt(dst, pos, cap, uv);
+        }
+
+        static int SBAppendHex(nint dst, int pos, int cap, ulong v, int minWidth, bool upper) {
+            Buf32 tmp = new Buf32();
+            nint baseP = NativeMemory.AddressOf(ref tmp);
+            int idx = 31;
+            byte aBase = upper ? (byte)55 : (byte)87;
+            if (v == 0UL) {
+                NativeMemory.At<byte>(baseP, idx) = (byte)48;
+                idx--;
+            } else {
+                while (v != 0UL) {
+                    uint d = (uint)(v & 15UL);
+                    NativeMemory.At<byte>(baseP, idx) = (d < 10U) ? (byte)(48U + d) : (byte)((uint)aBase + d);
+                    idx--;
+                    v >>= 4;
+                }
+            }
+            int len = 31 - idx;
+            for (int p = len; p < minWidth && pos < cap - 1; p++) {
+                NativeMemory.At<byte>(dst, pos) = (byte)48;
+                pos++;
+            }
+            for (int i = idx + 1; i <= 31 && pos < cap - 1; i++) {
+                NativeMemory.At<byte>(dst, pos) = NativeMemory.At<byte>(baseP, i);
+                pos++;
+            }
+            NativeMemory.At<byte>(dst, pos) = (byte)0;
+            return pos;
+        }
+
+        // UTF-16 helpers (ASCII literals -> stack UTF-16, zero heap)
+        static int WStrLen(nint w) {
+            int n = 0;
+            while (NativeMemory.At<ushort>(w, n) != (ushort)0) n++;
+            return n;
+        }
+
+        static void AsciiToWide(nint ascii, nint dstW, int cap) {
+            int i = 0;
+            while (i < cap - 1) {
+                byte b = NativeMemory.At<byte>(ascii, i);
+                NativeMemory.At<ushort>(dstW, i) = (ushort)b;
+                if (b == (byte)0) return;
+                i++;
+            }
+            NativeMemory.At<ushort>(dstW, cap - 1) = (ushort)0;
+        }
+
+        static bool WPathAppendAscii(nint dstW, int cap, nint suffixAscii) {
+            int a = WStrLen(dstW);
+            int b = (int)CStrlen(suffixAscii);
+            if (a + b >= cap) return false;
+            for (int i = 0; i <= b; i++) {
+                NativeMemory.At<ushort>(dstW, a + i) = (ushort)NativeMemory.At<byte>(suffixAscii, i);
+            }
+            return true;
+        }
+
+        static bool WPathAppendWide(nint dstW, int cap, nint srcW) {
+            int a = WStrLen(dstW);
+            int b = WStrLen(srcW);
+            if (a + b >= cap) return false;
+            CMemcpy((nint)((ulong)dstW + (ulong)a * 2UL), srcW, (ulong)(b + 1) * 2UL);
+            return true;
+        }
+
+        static bool WStartsWithAscii(nint w, nint prefixAscii, int count) {
+            for (int i = 0; i < count; i++) {
+                if (NativeMemory.At<ushort>(w, i) != (ushort)NativeMemory.At<byte>(prefixAscii, i)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        static bool Utf8ToWPath(nint utf8, nint outW, int cap) {
+            if (utf8 == (nint)0 || NativeMemory.At<byte>(utf8, 0) == (byte)0) return false;
+            return WinMbToWc(CP_UTF8, MB_ERR_INVALID_CHARS, utf8, -1, outW, cap) > 0;
+        }
+
+        static nint CfOpenAppend(nint utf8Path) {
+            WBuf4096 wide = new WBuf4096();
+            nint wPtr = NativeMemory.AddressOf(ref wide);
+            if (!Utf8ToWPath(utf8Path, wPtr, ZAN_CRASH_PATH_CAP)) return (nint)0;
+            nint h = WinCreateFileW(wPtr, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                    (nint)0, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, (nint)0);
+            if (h == (nint)(-1L)) return (nint)0;
+            return h;
+        }
+
+        static void CfClose(nint h) {
+            if (h != (nint)0) WinCloseHandle(h);
+        }
+
+        // ---- Log path resolution & 1 MiB rotation ----
+
+        static bool EnvPathW(nint asciiName, nint outW) {
+            WBuf32 nameW = new WBuf32();
+            nint namePtr = NativeMemory.AddressOf(ref nameW);
+            AsciiToWide(asciiName, namePtr, 32);
+            uint n = WinGetEnvW(namePtr, outW, (uint)ZAN_CRASH_PATH_CAP);
+            if (n == 0U || n >= (uint)ZAN_CRASH_PATH_CAP) {
+                NativeMemory.At<ushort>(outW, 0) = (ushort)0;
+                return false;
+            }
+            return true;
+        }
+
+        static bool IsAbsoluteW(nint pathW) {
+            ushort c0 = NativeMemory.At<ushort>(pathW, 0);
+            ushort c1 = NativeMemory.At<ushort>(pathW, 1);
+            ushort c2 = NativeMemory.At<ushort>(pathW, 2);
+            if (c0 == (ushort)92 && c1 == (ushort)92) return true; // "\\"
+            if (c0 != (ushort)0 && c1 == (ushort)58 && (c2 == (ushort)92 || c2 == (ushort)47)) return true; // "X:\" or "X:/"
+            return false;
+        }
+
+        static bool PrepareLogDir(nint dirW, nint outUtf8) {
+            WBuf4096 full = new WBuf4096();
+            WBuf4096 wide = new WBuf4096();
+            nint fullP = NativeMemory.AddressOf(ref full);
+            nint wideP = NativeMemory.AddressOf(ref wide);
+            NativeMemory.At<byte>(outUtf8, 0) = (byte)0;
+
+            uint n = WinGetFullPathNameW(dirW, (uint)ZAN_CRASH_PATH_CAP, fullP, (nint)0);
+            if (n == 0U || n >= (uint)ZAN_CRASH_PATH_CAP) return false;
+            for (uint i = 0U; i < n; i++) {
+                if (NativeMemory.At<ushort>(fullP, (int)i) == (ushort)47) {
+                    NativeMemory.At<ushort>(fullP, (int)i) = (ushort)92;
+                }
+            }
+            if (WStartsWithAscii(fullP, (nint)("\\\\?\\"), 4)) {
+                CMemcpy(wideP, fullP, (ulong)(n + 1U) * 2UL);
+            } else {
+                bool isUnc = NativeMemory.At<ushort>(fullP, 0) == (ushort)92 &&
+                             NativeMemory.At<ushort>(fullP, 1) == (ushort)92;
+                NativeMemory.At<ushort>(wideP, 0) = (ushort)0;
+                if (isUnc) {
+                    if (!WPathAppendAscii(wideP, ZAN_CRASH_PATH_CAP, (nint)("\\\\?\\UNC\\"))) return false;
+                    if (!WPathAppendWide(wideP, ZAN_CRASH_PATH_CAP, (nint)((ulong)fullP + 4UL))) return false;
+                } else {
+                    if (!WPathAppendAscii(wideP, ZAN_CRASH_PATH_CAP, (nint)("\\\\?\\"))) return false;
+                    if (!WPathAppendWide(wideP, ZAN_CRASH_PATH_CAP, fullP)) return false;
+                }
+            }
+
+            int start = 7;
+            if (WStartsWithAscii(wideP, (nint)("\\\\?\\UNC\\"), 8)) {
+                start = 8;
+                for (int part = 0; part < 2; part++) {
+                    while (NativeMemory.At<ushort>(wideP, start) != (ushort)0 &&
+                           NativeMemory.At<ushort>(wideP, start) != (ushort)92) {
+                        start++;
+                    }
+                    if (NativeMemory.At<ushort>(wideP, start) != (ushort)0) start++;
+                }
+            }
+
+            for (int i = start; NativeMemory.At<ushort>(wideP, i) != (ushort)0; i++) {
+                if (NativeMemory.At<ushort>(wideP, i) != (ushort)92) continue;
+                NativeMemory.At<ushort>(wideP, i) = (ushort)0;
+                int made = WinCreateDirectoryW(wideP, (nint)0);
+                uint err = WinGetLastError();
+                NativeMemory.At<ushort>(wideP, i) = (ushort)92;
+                if (made == 0 && err != ERROR_ALREADY_EXISTS) return false;
+            }
+            if (WinCreateDirectoryW(wideP, (nint)0) == 0 && WinGetLastError() != ERROR_ALREADY_EXISTS) return false;
+            uint attr = WinGetFileAttributesW(wideP);
+            if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY) == 0U) return false;
+
+            if (!WPathAppendAscii(wideP, ZAN_CRASH_PATH_CAP, (nint)("\\zan_crash.log"))) return false;
+            if (WinWcToMb(CP_UTF8, WC_ERR_INVALID_CHARS, wideP, -1, outUtf8, ZAN_CRASH_PATH_CAP, (nint)0, (nint)0) == 0) {
+                NativeMemory.At<byte>(outUtf8, 0) = (byte)0;
+                return false;
+            }
+            return true;
+        }
+
+        static void ResolvePaths() {
+            WBuf4096 dir = new WBuf4096();
+            nint dirP = NativeMemory.AddressOf(ref dir);
+            nint cachedLog = NativeMemory.AddressOf(ref s_cachedLog);
+            nint cachedTemp = NativeMemory.AddressOf(ref s_cachedTemp);
+            NativeMemory.At<byte>(cachedLog, 0) = (byte)0;
+            NativeMemory.At<byte>(cachedTemp, 0) = (byte)0;
+
+            uint n = WinGetTempPathW((uint)ZAN_CRASH_PATH_CAP, dirP);
+            if (n > 0U && n < (uint)ZAN_CRASH_PATH_CAP &&
+                WPathAppendAscii(dirP, ZAN_CRASH_PATH_CAP, (nint)("Zan\\logs"))) {
+                PrepareLogDir(dirP, cachedTemp);
+            }
+            if (EnvPathW((nint)("ZAN_LOG_DIR"), dirP)) {
+                PrepareLogDir(dirP, cachedLog);
+            } else if (EnvPathW((nint)("LOCALAPPDATA"), dirP) && IsAbsoluteW(dirP)) {
+                if (WPathAppendAscii(dirP, ZAN_CRASH_PATH_CAP, (nint)("\\Zan\\logs"))) {
+                    PrepareLogDir(dirP, cachedLog);
+                }
+            } else if (EnvPathW((nint)("USERPROFILE"), dirP) && IsAbsoluteW(dirP)) {
+                if (WPathAppendAscii(dirP, ZAN_CRASH_PATH_CAP, (nint)("\\AppData\\Local\\Zan\\logs"))) {
+                    PrepareLogDir(dirP, cachedLog);
+                }
+            }
+        }
+
+        static void GetLogAndExeDir(nint logPath, int logCap, nint exeDir) {
+            NativeMemory.At<byte>(logPath, 0) = (byte)0;
+            SBAppendCStr(logPath, 0, logCap, NativeMemory.AddressOf(ref s_cachedLog));
+            NativeMemory.At<byte>(exeDir, 0) = (byte)0;
+            uint n = WinGetModuleFileNameA((nint)0, exeDir, 260U);
+            if (n == 0U || n >= 260U) {
+                NativeMemory.At<byte>(exeDir, 0) = (byte)0;
+                return;
+            }
+            nint slash = CStrrchr(exeDir, 92);
+            if (slash != (nint)0) {
+                NativeMemory.At<byte>(slash, 1) = (byte)0;
+            } else {
+                NativeMemory.At<byte>(exeDir, 0) = (byte)0;
+            }
+        }
+
+        static void GetTempLogPath(nint logPath, int logCap) {
+            NativeMemory.At<byte>(logPath, 0) = (byte)0;
+            SBAppendCStr(logPath, 0, logCap, NativeMemory.AddressOf(ref s_cachedTemp));
+        }
+
+        static nint OpenLogWithRotate(nint logPath) {
+            nint h = CfOpenAppend(logPath);
+            if (h == (nint)0) return (nint)0;
+            long sz = 0L;
+            if (WinGetFileSizeEx(h, NativeMemory.AddressOf(ref sz)) != 0 && sz >= ZAN_CRASH_LOG_MAX_BYTES) {
+                CfClose(h);
+                Buf4096 oldPath = new Buf4096();
+                WBuf4096 wide = new WBuf4096();
+                WBuf4096 wideOld = new WBuf4096();
+                nint oldP = NativeMemory.AddressOf(ref oldPath);
+                if (CStrlen(logPath) + 3UL > (ulong)ZAN_CRASH_PATH_CAP) return (nint)0;
+                int p = SBAppendCStr(oldP, 0, ZAN_CRASH_PATH_CAP, logPath);
+                SBAppendCStr(oldP, p, ZAN_CRASH_PATH_CAP, (nint)(".1"));
+                nint wP = NativeMemory.AddressOf(ref wide);
+                nint wOldP = NativeMemory.AddressOf(ref wideOld);
+                if (!Utf8ToWPath(logPath, wP, ZAN_CRASH_PATH_CAP) ||
+                    !Utf8ToWPath(oldP, wOldP, ZAN_CRASH_PATH_CAP)) {
+                    return (nint)0;
+                }
+                WinDeleteFileW(wOldP);
+                WinMoveFileW(wP, wOldP);
+                h = CfOpenAppend(logPath);
+            }
+            return h;
+        }
+
+        static void WriteTimestamp(ref LineWriter lw) {
+            Buf16 st = new Buf16();
+            nint stP = NativeMemory.AddressOf(ref st);
+            WinGetLocalTime(stP);
+            ushort year = NativeMemory.AsRef<ushort>(stP);
+            ushort month = NativeMemory.AsRef<ushort>((nint)((ulong)stP + 2UL));
+            ushort day = NativeMemory.AsRef<ushort>((nint)((ulong)stP + 6UL));
+            ushort hour = NativeMemory.AsRef<ushort>((nint)((ulong)stP + 8UL));
+            ushort min = NativeMemory.AsRef<ushort>((nint)((ulong)stP + 10UL));
+            ushort sec = NativeMemory.AsRef<ushort>((nint)((ulong)stP + 12UL));
+            ushort ms = NativeMemory.AsRef<ushort>((nint)((ulong)stP + 14UL));
+            LwUIntDec(ref lw, (ulong)year, 4, (byte)48);
+            LwByte(ref lw, (byte)45);
+            LwUIntDec(ref lw, (ulong)month, 2, (byte)48);
+            LwByte(ref lw, (byte)45);
+            LwUIntDec(ref lw, (ulong)day, 2, (byte)48);
+            LwByte(ref lw, (byte)32);
+            LwUIntDec(ref lw, (ulong)hour, 2, (byte)48);
+            LwByte(ref lw, (byte)58);
+            LwUIntDec(ref lw, (ulong)min, 2, (byte)48);
+            LwByte(ref lw, (byte)58);
+            LwUIntDec(ref lw, (ulong)sec, 2, (byte)48);
+            LwByte(ref lw, (byte)46);
+            LwUIntDec(ref lw, (ulong)ms, 3, (byte)48);
+        }
+
+        static void WriteCrashNote(nint what, nint detail) {
+            Buf4096 logPath = new Buf4096();
+            Buf260 exeDir = new Buf260();
+            nint logP = NativeMemory.AddressOf(ref logPath);
+            nint exeDirP = NativeMemory.AddressOf(ref exeDir);
+            GetLogAndExeDir(logP, ZAN_CRASH_PATH_CAP, exeDirP);
+            nint h = OpenLogWithRotate(logP);
+            if (h == (nint)0) {
+                GetTempLogPath(logP, ZAN_CRASH_PATH_CAP);
+                if (NativeMemory.At<byte>(logP, 0) != (byte)0) h = OpenLogWithRotate(logP);
+            }
+            if (h == (nint)0) return;
+
+            LineWriter lw = new LineWriter();
+            LwInit(ref lw, h);
+            LwCStr(ref lw, (nint)("---- "));
+            LwCStr(ref lw, what);
+            LwByte(ref lw, (byte)32);
+            WriteTimestamp(ref lw);
+            LwCStr(ref lw, (nint)(" pid="));
+            LwUIntDec(ref lw, (ulong)WinGetCurrentProcessId(), 0, (byte)32);
+            LwCStr(ref lw, (nint)(" tid="));
+            LwUIntDec(ref lw, (ulong)WinGetCurrentThreadId(), 0, (byte)32);
+            LwByte(ref lw, (byte)32);
+            if (detail != (nint)0) LwCStr(ref lw, detail);
+            LwByte(ref lw, (byte)10);
+            LwFlush(ref lw);
+            CfClose(h);
+        }
+
+        // ---- Module resolution, PE stack scan, and addr2line/llvm-symbolizer ----
+
+        static void WriteModLine(ref LineWriter lw, nint addr, nint tag) {
+            nint mod = (nint)0;
+            Buf260 mp = new Buf260();
+            nint mpP = NativeMemory.AddressOf(ref mp);
+            LwCStr(ref lw, tag);
+            LwPtr(ref lw, (ulong)addr);
+            if (addr != (nint)0 &&
+                WinGetModuleHandleExA(GMHEX_FROM_ADDRESS | GMHEX_UNCHANGED_REFCOUNT, addr, NativeMemory.AddressOf(ref mod)) != 0 &&
+                mod != (nint)0 &&
+                WinGetModuleFileNameA(mod, mpP, 260U) != 0U) {
+                LwCStr(ref lw, (nint)("  "));
+                LwCStr(ref lw, mpP);
+                LwCStr(ref lw, (nint)("+0x"));
+                LwHex(ref lw, (ulong)addr - (ulong)mod, 0, true);
+                LwByte(ref lw, (byte)10);
+            } else {
+                LwCStr(ref lw, (nint)("  <unknown>\n"));
+            }
+        }
+
+        static ulong ReadPeImageBase(nint exe) {
+            nint h = WinCreateFileA(exe, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                    (nint)0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, (nint)0);
+            if (h == (nint)(-1L)) return 0UL;
+            Buf1024 buf = new Buf1024();
+            nint bPtr = NativeMemory.AddressOf(ref buf);
+            uint got = 0U;
+            int ok = WinReadFile(h, bPtr, 1024U, NativeMemory.AddressOf(ref got), (nint)0);
+            WinCloseHandle(h);
+            if (ok == 0 || got < 0x120U) return 0UL;
+            if (NativeMemory.At<byte>(bPtr, 0) != (byte)77 || NativeMemory.At<byte>(bPtr, 1) != (byte)90) return 0UL; // 'M','Z'
+            uint lfanew = NativeMemory.AsRef<uint>((nint)((ulong)bPtr + 0x3CUL));
+            if ((ulong)lfanew + 0x40UL > (ulong)got) return 0UL;
+            nint nt = (nint)((ulong)bPtr + (ulong)lfanew);
+            if (NativeMemory.At<byte>(nt, 0) != (byte)80 || NativeMemory.At<byte>(nt, 1) != (byte)69 ||
+                NativeMemory.At<byte>(nt, 2) != (byte)0  || NativeMemory.At<byte>(nt, 3) != (byte)0) return 0UL; // "PE\0\0"
+            nint opt = (nint)((ulong)nt + 24UL);
+            ushort magic = NativeMemory.AsRef<ushort>(opt);
+            if (magic == (ushort)0x20B) {
+                return NativeMemory.AsRef<ulong>((nint)((ulong)opt + 24UL));
+            }
+            if (magic == (ushort)0x10B) {
+                return (ulong)NativeMemory.AsRef<uint>((nint)((ulong)opt + 28UL));
+            }
+            return 0UL;
+        }
+
+        static bool IsInMainModule(nint addr, ulong exeBase) {
+            nint m = (nint)0;
+            if (addr != (nint)0 &&
+                WinGetModuleHandleExA(GMHEX_FROM_ADDRESS | GMHEX_UNCHANGED_REFCOUNT, addr, NativeMemory.AddressOf(ref m)) != 0) {
+                return (ulong)m == exeBase;
+            }
+            return false;
+        }
+
+        static int FindSymbolizer(nint exeDir, nint outPath, int outCap) {
+            Buf260 cand = new Buf260();
+            nint candP = NativeMemory.AddressOf(ref cand);
+            int p = SBAppendCStr(candP, 0, 260, exeDir);
+            SBAppendCStr(candP, p, 260, (nint)("addr2line.exe"));
+            if (WinGetFileAttributesA(candP) != INVALID_FILE_ATTRIBUTES) {
+                SBAppendCStr(outPath, 0, outCap, candP);
+                return 1;
+            }
+            p = SBAppendCStr(candP, 0, 260, exeDir);
+            SBAppendCStr(candP, p, 260, (nint)("llvm-symbolizer.exe"));
+            if (WinGetFileAttributesA(candP) != INVALID_FILE_ATTRIBUTES) {
+                SBAppendCStr(outPath, 0, outCap, candP);
+                return 2;
+            }
+            return 0;
+        }
+
+        static bool LineIsNoise(nint line) {
+            if (NativeMemory.At<byte>(line, 0) == (byte)63 && NativeMemory.At<byte>(line, 1) == (byte)63) return true; // "??"
+            if (CStrstr(line, (nint)("cygming-crtbegin.c")) != (nint)0) return true;
+            if (CStrstr(line, (nint)("__tmainCRTStartup")) != (nint)0) return true;
+            if (CStrstr(line, (nint)("WinMainCRTStartup")) != (nint)0) return true;
+            if (CStrstr(line, (nint)("mainCRTStartup")) != (nint)0) return true;
+            if (CStrstr(line, (nint)("__mingw_")) != (nint)0) return true;
+            if (CStrstr(line, (nint)("pre_c_init")) != (nint)0) return true;
+            if (CStrstr(line, (nint)("pre_cpp_init")) != (nint)0) return true;
+            if (CStrstr(line, (nint)("mingw-w64-crt")) != (nint)0) return true;
+            if (CStrstr(line, (nint)("crtexe.c")) != (nint)0) return true;
+            if (CStrstr(line, (nint)("crtdll.c")) != (nint)0) return true;
+            if (CStrstr(line, (nint)("crt_handler.c")) != (nint)0) return true;
+            return false;
+        }
+
+        static int AppendFilteredSym(nint logPath, nint tmpPath, bool keepAll) {
+            nint inH = WinCreateFileA(tmpPath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                      (nint)0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, (nint)0);
+            if (inH == (nint)(-1L)) return 0;
+            nint outH = CfOpenAppend(logPath);
+            if (outH == (nint)0) {
+                WinCloseHandle(inH);
+                return 0;
+            }
+            Buf8192 chunk = new Buf8192();
+            Buf2048 line = new Buf2048();
+            nint chunkP = NativeMemory.AddressOf(ref chunk);
+            nint lineP = NativeMemory.AddressOf(ref line);
+            int lp = 0;
+            int kept = 0;
+            while (true) {
+                uint got = 0U;
+                if (WinReadFile(inH, chunkP, 8192U, NativeMemory.AddressOf(ref got), (nint)0) == 0 || got == 0U) break;
+                for (uint i = 0U; i < got; i++) {
+                    byte c = NativeMemory.At<byte>(chunkP, (int)i);
+                    if (lp + 1 < 2048) {
+                        NativeMemory.At<byte>(lineP, lp) = c;
+                        lp++;
+                    }
+                    if (c == (byte)10) {
+                        NativeMemory.At<byte>(lineP, lp) = (byte)0;
+                        if (keepAll || !LineIsNoise(lineP)) {
+                            WriteRaw(outH, lineP, (ulong)lp);
+                            kept++;
+                        }
+                        lp = 0;
+                    }
+                }
+            }
+            if (lp > 0) {
+                NativeMemory.At<byte>(lineP, lp) = (byte)0;
+                if (keepAll || !LineIsNoise(lineP)) {
+                    WriteRaw(outH, lineP, (ulong)lp);
+                    kept++;
+                }
+            }
+            CfClose(outH);
+            WinCloseHandle(inH);
+            return kept;
+        }
+
+        static void SymbolizeFrames(nint logPath, nint exe, nint exeDir, ulong exeBase,
+                                    nint fault, nint framesPtr, int nFrames, bool keepAll) {
+            ulong imageBase = ReadPeImageBase(exe);
+            if (imageBase == 0UL) return;
+            Buf260 sym = new Buf260();
+            nint symP = NativeMemory.AddressOf(ref sym);
+            int mode = FindSymbolizer(exeDir, symP, 260);
+            if (mode == 0) return;
+
+            Buf3200 addrs = new Buf3200();
+            nint addrsP = NativeMemory.AddressOf(ref addrs);
+            NativeMemory.At<byte>(addrsP, 0) = (byte)0;
+            int ap = 0;
+            int count = 0;
+
+            PtrBuf64 seq = new PtrBuf64();
+            nint seqP = NativeMemory.AddressOf(ref seq);
+            int nseq = 0;
+            if (IsInMainModule(fault, exeBase)) {
+                NativeMemory.At<nint>(seqP, nseq) = fault;
+                nseq++;
+            }
+            for (int i = 0; i < nFrames && nseq < 64; i++) {
+                nint fr = NativeMemory.At<nint>(framesPtr, i);
+                if (IsInMainModule(fr, exeBase)) {
+                    NativeMemory.At<nint>(seqP, nseq) = fr;
+                    nseq++;
+                }
+            }
+            for (int i = 0; i < nseq; i++) {
+                ulong vma = imageBase + ((ulong)NativeMemory.At<nint>(seqP, i) - exeBase);
+                if (ap + 24 >= 3200) break;
+                ap = SBAppendCStr(addrsP, ap, 3200, (nint)(" 0x"));
+                ap = SBAppendHex(addrsP, ap, 3200, vma, 0, true);
+                count++;
+            }
+            if (count == 0) return;
+
+            Buf4096 cmd = new Buf4096();
+            nint cmdP = NativeMemory.AddressOf(ref cmd);
+            int cp = 0;
+            cp = SBAppendByte(cmdP, cp, 4096, (byte)34);
+            cp = SBAppendCStr(cmdP, cp, 4096, symP);
+            if (mode == 1) {
+                cp = SBAppendCStr(cmdP, cp, 4096, (nint)("\" -e \""));
+                cp = SBAppendCStr(cmdP, cp, 4096, exe);
+                cp = SBAppendCStr(cmdP, cp, 4096, (nint)("\" -f -C -i -p"));
+                SBAppendCStr(cmdP, cp, 4096, addrsP);
+            } else {
+                cp = SBAppendCStr(cmdP, cp, 4096, (nint)("\" --obj=\""));
+                cp = SBAppendCStr(cmdP, cp, 4096, exe);
+                cp = SBAppendCStr(cmdP, cp, 4096, (nint)("\" --demangle --functions=linkage --inlines"));
+                SBAppendCStr(cmdP, cp, 4096, addrsP);
+            }
+
+            Buf260 tmpPath = new Buf260();
+            nint tmpP = NativeMemory.AddressOf(ref tmpPath);
+            nint h = (nint)(-1L);
+            for (int attempt = 0; attempt < 8 && h == (nint)(-1L); attempt++) {
+                ulong salt = WinGetTickCount64()
+                    ^ ((ulong)NativeMemory.AddressOf(ref attempt) << 17)
+                    ^ ((ulong)WinGetCurrentProcessId() << 33)
+                    ^ ((ulong)attempt * 0x9E3779B97F4A7C15UL);
+                long qpc = 0L;
+                if (WinQueryPerformanceCounter(NativeMemory.AddressOf(ref qpc)) != 0) {
+                    salt ^= ((ulong)qpc << 19);
+                }
+                int tp = 0;
+                tp = SBAppendCStr(tmpP, tp, 260, exeDir);
+                tp = SBAppendCStr(tmpP, tp, 260, (nint)("zan_crash.sym."));
+                tp = SBAppendUInt(tmpP, tp, 260, (ulong)WinGetCurrentProcessId());
+                tp = SBAppendByte(tmpP, tp, 260, (byte)46);
+                tp = SBAppendHex(tmpP, tp, 260, salt, 16, false);
+                SBAppendCStr(tmpP, tp, 260, (nint)(".tmp"));
+
+                Buf32 sa = new Buf32();
+                nint saP = NativeMemory.AddressOf(ref sa);
+                CMemset(saP, 0, 24UL);
+                NativeMemory.AsRef<uint>(saP) = 24U; // nLength
+                NativeMemory.AsRef<int>((nint)((ulong)saP + 16UL)) = 1; // bInheritHandle = TRUE
+                h = WinCreateFileA(tmpP, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE,
+                                   saP, CREATE_NEW, FILE_ATTRIBUTE_NORMAL | FILE_ATTRIBUTE_TEMPORARY, (nint)0);
+            }
+            if (h == (nint)(-1L)) return;
+
+            Buf128 si = new Buf128();
+            nint siP = NativeMemory.AddressOf(ref si);
+            CMemset(siP, 0, 104UL);
+            NativeMemory.AsRef<uint>(siP) = 104U; // cb
+            NativeMemory.AsRef<uint>((nint)((ulong)siP + 60UL)) = STARTF_USESTDHANDLES;
+            NativeMemory.AsRef<nint>((nint)((ulong)siP + 80UL)) = (nint)0; // hStdInput
+            NativeMemory.AsRef<nint>((nint)((ulong)siP + 88UL)) = h;       // hStdOutput
+            NativeMemory.AsRef<nint>((nint)((ulong)siP + 96UL)) = h;       // hStdError
+
+            Buf32 pi = new Buf32();
+            nint piP = NativeMemory.AddressOf(ref pi);
+            CMemset(piP, 0, 24UL);
+            if (WinCreateProcessA((nint)0, cmdP, (nint)0, (nint)0, 1, CREATE_NO_WINDOW,
+                                  (nint)0, (nint)0, siP, piP) != 0) {
+                nint hProc = NativeMemory.AsRef<nint>(piP);
+                nint hTh = NativeMemory.AsRef<nint>((nint)((ulong)piP + 8UL));
+                WinWaitForSingleObject(hProc, 8000U);
+                WinCloseHandle(hProc);
+                WinCloseHandle(hTh);
+            }
+            WinCloseHandle(h);
+
+            nint hf = CfOpenAppend(logPath);
+            if (hf != (nint)0) {
+                LineWriter lw = new LineWriter();
+                LwInit(ref lw, hf);
+                LwCStr(ref lw, (nint)("resolved source locations ("));
+                LwIntDec(ref lw, (long)count);
+                LwCStr(ref lw, (nint)(" in-module frame(s), top first"));
+                if (!keepAll) LwCStr(ref lw, (nint)(", CRT frames omitted"));
+                LwCStr(ref lw, (nint)("):\n"));
+                LwFlush(ref lw);
+                CfClose(hf);
+            }
+            if (AppendFilteredSym(logPath, tmpP, keepAll) == 0) {
+                nint nf = CfOpenAppend(logPath);
+                if (nf != (nint)0) {
+                    nint msg = (nint)("  <no source locations: build with `zanc -g` to get file:line; the module+offset backtrace above still resolves offline via scripts\\symbolize_crash.ps1>\n");
+                    WriteRaw(nf, msg, CStrlen(msg));
+                    CfClose(nf);
+                }
+            }
+            WinDeleteFileA(tmpP);
+            nint tf = CfOpenAppend(logPath);
+            if (tf != (nint)0) {
+                WriteRaw(tf, (nint)("\n"), 1UL);
+                CfClose(tf);
+            }
+        }
+
+        static void SymbolizeOne(nint logPath, nint exe, nint exeDir, ulong exeBase, nint addr) {
+            nint hf = CfOpenAppend(logPath);
+            if (hf != (nint)0) {
+                nint msg = (nint)("released (arc.freed_by) at:\n");
+                WriteRaw(hf, msg, CStrlen(msg));
+                CfClose(hf);
+            }
+            SymbolizeFrames(logPath, exe, exeDir, exeBase, addr, (nint)0, 0, true);
+        }
+
+        static void ImageRange(ulong baseAddr, out ulong lo, out ulong hi) {
+            lo = baseAddr;
+            hi = baseAddr;
+            if (baseAddr == 0UL) return;
+            if (NativeMemory.AsRef<ushort>((nint)baseAddr) != (ushort)0x5A4D) return; // IMAGE_DOS_SIGNATURE
+            uint lfanew = NativeMemory.AsRef<uint>((nint)(baseAddr + 0x3CUL));
+            ulong nt = baseAddr + (ulong)lfanew;
+            if (NativeMemory.AsRef<uint>((nint)nt) != 0x00004550U) return; // IMAGE_NT_SIGNATURE
+            // OptionalHeader starts at nt + 24; SizeOfImage is at OptionalHeader + 56 (= nt + 80)
+            uint sizeOfImage = NativeMemory.AsRef<uint>((nint)(nt + 80UL));
+            hi = baseAddr + (ulong)sizeOfImage;
+        }
+
+        static void StackScan(ref LineWriter lw, ulong rsp, ulong exeBase) {
+            ulong lo = 0UL;
+            ulong hi = 0UL;
+            ImageRange(exeBase, out lo, out hi);
+            if (hi <= lo) return;
+
+            ulong start = rsp + 131072UL; // rsp + 128 KiB
+            Buf64 mbi = new Buf64();
+            nint mbiP = NativeMemory.AddressOf(ref mbi);
+            if (WinVirtualQuery((nint)start, mbiP, 48UL) == 0UL) return;
+            uint state = NativeMemory.AsRef<uint>((nint)((ulong)mbiP + 32UL));
+            uint prot = NativeMemory.AsRef<uint>((nint)((ulong)mbiP + 36UL));
+            if (state != MEM_COMMIT) return;
+            if ((prot & (PAGE_GUARD | PAGE_NOACCESS)) != 0U) return;
+            ulong regBase = (ulong)NativeMemory.AsRef<nint>(mbiP);
+            ulong regSize = NativeMemory.AsRef<ulong>((nint)((ulong)mbiP + 24UL));
+            ulong regionEnd = regBase + regSize;
+
+            ulong end = start + 524288UL; // 512 KiB
+            if (end > regionEnd) end = regionEnd;
+
+            UlongBuf24 addrs = new UlongBuf24();
+            UlongBuf24 hits = new UlongBuf24();
+            nint addrsP = NativeMemory.AddressOf(ref addrs);
+            nint hitsP = NativeMemory.AddressOf(ref hits);
+            int used = 0;
+            ulong total = 0UL;
+
+            for (ulong p = (start + 7UL) & ~7UL; p + 8UL <= end; p += 8UL) {
+                ulong v = NativeMemory.AsRef<ulong>((nint)p);
+                if (v < lo || v >= hi) continue;
+                total++;
+                int i = 0;
+                for (; i < used; i++) {
+                    if (NativeMemory.At<ulong>(addrsP, i) == v) {
+                        NativeMemory.At<ulong>(hitsP, i) = NativeMemory.At<ulong>(hitsP, i) + 1UL;
+                        break;
+                    }
+                }
+                if (i == used && used < 24) {
+                    NativeMemory.At<ulong>(addrsP, used) = v;
+                    NativeMemory.At<ulong>(hitsP, used) = 1UL;
+                    used++;
+                }
+            }
+            if (used == 0) return;
+
+            LwCStr(ref lw, (nint)("stack-scan ("));
+            LwUIntDec(ref lw, total, 0, (byte)32);
+            LwCStr(ref lw, (nint)(" in-image addresses, most frequent first -- a repeated address is the recursion):\n"));
+            for (int n = 0; n < used && n < 12; n++) {
+                int best = n;
+                for (int i = n + 1; i < used; i++) {
+                    if (NativeMemory.At<ulong>(hitsP, i) > NativeMemory.At<ulong>(hitsP, best)) best = i;
+                }
+                ulong ta = NativeMemory.At<ulong>(addrsP, best);
+                ulong th = NativeMemory.At<ulong>(hitsP, best);
+                NativeMemory.At<ulong>(addrsP, best) = NativeMemory.At<ulong>(addrsP, n);
+                NativeMemory.At<ulong>(hitsP, best) = NativeMemory.At<ulong>(hitsP, n);
+                NativeMemory.At<ulong>(addrsP, n) = ta;
+                NativeMemory.At<ulong>(hitsP, n) = th;
+
+                LwCStr(ref lw, (nint)("  x"));
+                LwUIntDecLeft(ref lw, th, 6);
+                WriteModLine(ref lw, (nint)ta, (nint)(" "));
+            }
+        }
+
+    }
+#endif
+}

@@ -1,0 +1,652 @@
+// rt_crash_posix.zan: Linux & macOS alt-stack signal crash reporter, backtrace, and C ABI exports.
+
+using System;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Threading;
+
+namespace ZanCrashRuntime {
+#if !WINDOWS
+
+    struct Buf24   { public InlineArray<24, byte> Data; }
+    struct Buf32   { public InlineArray<32, byte> Data; }
+    struct Buf4096 { public InlineArray<4096, byte> Data; }
+    struct AltStack64K { public InlineArray<65536, byte> Data; }
+    struct StatBuf144 { public InlineArray<144, byte> Data; }
+    struct SigActionBuf152 { public InlineArray<152, byte> Data; }
+    struct StackTBuf24 { public InlineArray<24, byte> Data; }
+    struct DlInfoBuf32 { public InlineArray<32, byte> Data; }
+
+    static class CrashRt {
+        const int STDERR_FILENO = 2;
+        const int SIGILL = 4;
+        const int SIGABRT = 6;
+        const int SIGFPE = 8;
+        const int SIGSEGV = 11;
+        const int F_DUPFD = 0;
+        const int F_GETFL = 3;
+        const int F_SETFL = 4;
+        const int O_WRONLY = 1;
+        const int W_OK = 2;
+        const int EEXIST = 17;
+        const uint S_IFMT = 0xF000U;
+        const uint S_IFDIR = 0x4000U;
+#if MACOS
+        const int SIGBUS = 10;
+        const int SA_SIGINFO = 0x0040;
+        const int SA_ONSTACK = 0x0001;
+        const uint SA_RESETHAND = 0x0004U;
+        const int SS_DISABLE = 4;
+        const int F_DUPFD_CLOEXEC = 67;
+        const int O_CREAT = 0x0200;
+        const int O_APPEND = 0x0008;
+        const int O_NONBLOCK = 0x0004;
+#else
+        const int SIGBUS = 7;
+        const int SA_SIGINFO = 4;
+        const int SA_ONSTACK = 0x08000000;
+        const uint SA_RESETHAND = 0x80000000U;
+        const int SS_DISABLE = 2;
+        const int F_DUPFD_CLOEXEC = 1030;
+        const int O_CREAT = 64;
+        const int O_APPEND = 1024;
+        const int O_NONBLOCK = 2048;
+#endif
+
+        [DllImport("crt", EntryPoint = "write")]
+        static extern long PosixWrite(int fd, nint buf, ulong n);
+
+        [DllImport("crt", EntryPoint = "open")]
+        static extern int PosixOpen3(nint path, int flags, uint mode);
+
+        [DllImport("crt", EntryPoint = "close")]
+        static extern int PosixClose(int fd);
+
+        [DllImport("crt", EntryPoint = "readlink")]
+        static extern long PosixReadlink(nint path, nint buf, ulong size);
+
+        [DllImport("crt", EntryPoint = "mkdir")]
+        static extern int PosixMkdir(nint path, uint mode);
+
+        [DllImport("crt", EntryPoint = "stat")]
+        static extern int PosixStat(nint path, nint st);
+
+        [DllImport("crt", EntryPoint = "fstat")]
+        static extern int PosixFstat(int fd, nint st);
+
+        [DllImport("crt", EntryPoint = "access")]
+        static extern int PosixAccess(nint path, int mode);
+
+        [DllImport("crt", EntryPoint = "fcntl")]
+        static extern int PosixFcntl2(int fd, int cmd);
+
+        [DllImport("crt", EntryPoint = "fcntl")]
+        static extern int PosixFcntl3(int fd, int cmd, int arg);
+
+        [DllImport("crt", EntryPoint = "getpid")]
+        static extern int PosixGetpid();
+
+        [DllImport("crt", EntryPoint = "getuid")]
+        static extern uint PosixGetuid();
+
+        [DllImport("crt", EntryPoint = "getenv")]
+        static extern nint PosixGetenv(nint name);
+
+        [DllImport("crt", EntryPoint = "time")]
+        static extern long PosixTime(nint tloc);
+
+        [DllImport("crt", EntryPoint = "sigaction")]
+        static extern int PosixSigaction(int sig, nint act, nint oldact);
+
+        [DllImport("crt", EntryPoint = "sigaltstack")]
+        static extern int PosixSigaltstack(nint ss, nint oldss);
+
+        [DllImport("crt", EntryPoint = "sigemptyset")]
+        static extern int PosixSigemptyset(nint sigMask);
+
+        [DllImport("crt", EntryPoint = "signal")]
+        static extern nint PosixSignal(int sig, nint handler);
+
+        [DllImport("crt", EntryPoint = "raise")]
+        static extern int PosixRaise(int sig);
+
+        [DllImport("crt", EntryPoint = "dladdr")]
+        static extern int PosixDladdr(nint addr, nint info);
+
+        [DllImport("crt", EntryPoint = "memcpy")]
+        static extern nint CMemcpy(nint dst, nint src, ulong n);
+
+        [DllImport("crt", EntryPoint = "memset")]
+        static extern nint CMemset(nint dst, int c, ulong n);
+
+        [DllImport("crt", EntryPoint = "strlen")]
+        static extern ulong CStrlen(nint s);
+
+#if MACOS
+        [DllImport("crt", EntryPoint = "__error")]
+        static extern nint PosixErrnoPtr();
+
+        [DllImport("crt", EntryPoint = "_NSGetExecutablePath")]
+        static extern int MacGetExecutablePath(nint buf, nint bufSizePtr);
+
+        [DllImport("crt", EntryPoint = "backtrace")]
+        static extern int MacBacktrace(nint frames, int maxFrames);
+#elif MUSL
+        [DllImport("crt", EntryPoint = "__errno_location")]
+        static extern nint PosixErrnoPtr();
+#else
+        [DllImport("crt", EntryPoint = "__errno_location")]
+        static extern nint PosixErrnoPtr();
+#endif
+
+        static int s_installed = 0;
+        static int s_errFd = -1;
+        static Buf4096 s_exe;
+        static Buf4096 s_logDir;
+        static Buf32 s_wid;
+        static AltStack64K s_altStack;
+
+        static int GetErrno() {
+            nint p = PosixErrnoPtr();
+            return (p != (nint)0) ? NativeMemory.AsRef<int>(p) : 0;
+        }
+
+        static void WrStr(int fd, nint s) {
+            if (s == (nint)0) return;
+            ulong n = CStrlen(s);
+            ulong cur = (ulong)s;
+            while (n > 0UL) {
+                long w = PosixWrite(fd, (nint)cur, n);
+                if (w <= 0L) return;
+                cur += (ulong)w;
+                n -= (ulong)w;
+            }
+        }
+
+        static void WrDec(int fd, ulong v) {
+            Buf24 tmp = new Buf24();
+            nint baseP = NativeMemory.AddressOf(ref tmp);
+            int idx = 22;
+            NativeMemory.At<byte>(baseP, 23) = (byte)0;
+            if (v == 0UL) {
+                NativeMemory.At<byte>(baseP, idx) = (byte)48;
+                idx--;
+            } else {
+                while (v != 0UL) {
+                    ulong q = v / 10UL;
+                    ulong r = v - q * 10UL;
+                    NativeMemory.At<byte>(baseP, idx) = (byte)(48UL + r);
+                    idx--;
+                    v = q;
+                }
+            }
+            WrStr(fd, (nint)((ulong)baseP + (ulong)(idx + 1)));
+        }
+
+        static void WrHex(int fd, ulong v, bool withPrefix) {
+            Buf24 tmp = new Buf24();
+            nint baseP = NativeMemory.AddressOf(ref tmp);
+            int idx = 22;
+            NativeMemory.At<byte>(baseP, 23) = (byte)0;
+            if (v == 0UL) {
+                NativeMemory.At<byte>(baseP, idx) = (byte)48;
+                idx--;
+            } else {
+                while (v != 0UL) {
+                    uint d = (uint)(v & 15UL);
+                    NativeMemory.At<byte>(baseP, idx) = (d < 10U) ? (byte)(48U + d) : (byte)(87U + d);
+                    idx--;
+                    v >>= 4;
+                }
+            }
+            if (withPrefix) {
+                NativeMemory.At<byte>(baseP, idx) = (byte)120; idx--; // 'x'
+                NativeMemory.At<byte>(baseP, idx) = (byte)48;  idx--; // '0'
+            }
+            WrStr(fd, (nint)((ulong)baseP + (ulong)(idx + 1)));
+        }
+
+        static int SBAppendCStr(nint dst, int pos, int cap, nint s) {
+            if (s == (nint)0 || pos >= cap - 1) return pos;
+            ulong n = CStrlen(s);
+            ulong avail = (ulong)(cap - 1 - pos);
+            if (n > avail) n = avail;
+            if (n > 0UL) {
+                CMemcpy((nint)((ulong)dst + (ulong)pos), s, n);
+                pos += (int)n;
+            }
+            NativeMemory.At<byte>(dst, pos) = (byte)0;
+            return pos;
+        }
+
+        static int SBAppendByte(nint dst, int pos, int cap, byte b) {
+            if (pos >= cap - 1) return pos;
+            NativeMemory.At<byte>(dst, pos) = b;
+            pos++;
+            NativeMemory.At<byte>(dst, pos) = (byte)0;
+            return pos;
+        }
+
+        static int SBAppendUInt(nint dst, int pos, int cap, ulong v) {
+            Buf24 tmp = new Buf24();
+            nint baseP = NativeMemory.AddressOf(ref tmp);
+            int idx = 22;
+            if (v == 0UL) {
+                NativeMemory.At<byte>(baseP, idx) = (byte)48;
+                idx--;
+            } else {
+                while (v != 0UL) {
+                    ulong q = v / 10UL;
+                    ulong r = v - q * 10UL;
+                    NativeMemory.At<byte>(baseP, idx) = (byte)(48UL + r);
+                    idx--;
+                    v = q;
+                }
+            }
+            for (int i = idx + 1; i <= 22 && pos < cap - 1; i++) {
+                NativeMemory.At<byte>(dst, pos) = NativeMemory.At<byte>(baseP, i);
+                pos++;
+            }
+            NativeMemory.At<byte>(dst, pos) = (byte)0;
+            return pos;
+        }
+
+        static void Put2(nint dst, int off, uint v) {
+            NativeMemory.At<byte>(dst, off) = (byte)(48U + ((v / 10U) % 10U));
+            NativeMemory.At<byte>(dst, off + 1) = (byte)(48U + (v % 10U));
+        }
+
+        static void CivilFromDays(long z, out int y, out uint m, out uint d) {
+            z += 719468L;
+            long era = ((z >= 0L) ? z : (z - 146096L)) / 146097L;
+            ulong doe = (ulong)(z - era * 146097L);
+            ulong yoe = (doe - doe / 1460UL + doe / 36524UL - doe / 146096UL) / 365UL;
+            long yy = (long)yoe + era * 400L;
+            ulong doy = doe - (365UL * yoe + yoe / 4UL - yoe / 100UL);
+            ulong mp = (5UL * doy + 2UL) / 153UL;
+            ulong dd = doy - (153UL * mp + 2UL) / 5UL + 1UL;
+            d = (uint)dd;
+            m = (uint)((mp < 10UL) ? (mp + 3UL) : (mp - 9UL));
+            y = (int)(yy + ((m <= 2U) ? 1L : 0L));
+        }
+
+        static nint SigName(int sig) {
+            if (sig == SIGSEGV) return (nint)("SIGSEGV");
+            if (sig == SIGBUS) return (nint)("SIGBUS");
+            if (sig == SIGFPE) return (nint)("SIGFPE");
+            if (sig == SIGILL) return (nint)("SIGILL");
+            if (sig == SIGABRT) return (nint)("SIGABRT");
+            return (nint)("signal");
+        }
+
+        static void WriteFrame(int fd, nint pc) {
+            WrStr(fd, (nint)("  # "));
+            DlInfoBuf32 di = new DlInfoBuf32();
+            nint diP = NativeMemory.AddressOf(ref di);
+            CMemset(diP, 0, 32UL);
+            if (PosixDladdr(pc, diP) != 0) {
+                nint fname = NativeMemory.AsRef<nint>(diP);
+                nint fbase = NativeMemory.AsRef<nint>((nint)((ulong)diP + 8UL));
+                nint sname = NativeMemory.AsRef<nint>((nint)((ulong)diP + 16UL));
+                if (fname != (nint)0) {
+                    WrStr(fd, fname);
+                    WrStr(fd, (nint)("+0x"));
+                    WrHex(fd, (ulong)pc - (ulong)fbase, false);
+                    if (sname != (nint)0) {
+                        WrStr(fd, (nint)(" ("));
+                        WrStr(fd, sname);
+                        WrStr(fd, (nint)(")"));
+                    }
+                    WrStr(fd, (nint)("\n"));
+                    return;
+                }
+            }
+            WrHex(fd, (ulong)pc, true);
+            WrStr(fd, (nint)("\n"));
+        }
+
+        static void WalkFrames(int fd, ulong fp) {
+            int n = 0;
+            while (fp != 0UL && n < 48) {
+                if ((fp & 7UL) != 0UL) break;
+                ulong next = NativeMemory.AsRef<ulong>((nint)fp);
+                nint ret = NativeMemory.AsRef<nint>((nint)(fp + 8UL));
+                if (ret == (nint)0) break;
+                WriteFrame(fd, ret);
+                n++;
+                if ((next & 7UL) != 0UL) break;
+                if (next <= fp) break;
+                if (next - fp > 1048576UL) break;
+                fp = next;
+            }
+        }
+
+        static bool PrepareDir(nint dir) {
+            if (NativeMemory.At<byte>(dir, 0) == (byte)0) return false;
+            for (int i = 1; NativeMemory.At<byte>(dir, i) != (byte)0; i++) {
+                if (NativeMemory.At<byte>(dir, i) != (byte)47) continue;
+                NativeMemory.At<byte>(dir, i) = (byte)0;
+                int made = PosixMkdir(dir, 0x1C0U); // 0700
+                int err = GetErrno();
+                NativeMemory.At<byte>(dir, i) = (byte)47;
+                if (made != 0 && err != EEXIST) return false;
+            }
+            if (PosixMkdir(dir, 0x1C0U) != 0 && GetErrno() != EEXIST) return false;
+            StatBuf144 st = new StatBuf144();
+            nint stP = NativeMemory.AddressOf(ref st);
+            if (PosixStat(dir, stP) != 0) return false;
+#if MACOS
+            uint mode = (uint)NativeMemory.AsRef<ushort>((nint)((ulong)stP + 4UL));
+#elif X86_64
+            uint mode = NativeMemory.AsRef<uint>((nint)((ulong)stP + 24UL));
+#else
+            uint mode = NativeMemory.AsRef<uint>((nint)((ulong)stP + 16UL));
+#endif
+            return (mode & S_IFMT) == S_IFDIR && PosixAccess(dir, W_OK) == 0;
+        }
+
+        static void ResolvePaths() {
+            nint exeP = NativeMemory.AddressOf(ref s_exe);
+#if MACOS
+            uint cap = 4095U;
+            if (MacGetExecutablePath(exeP, NativeMemory.AddressOf(ref cap)) != 0 || NativeMemory.At<byte>(exeP, 0) == (byte)0) {
+                CMemcpy(exeP, (nint)("<unknown>"), 10UL);
+            }
+#else
+            long n = PosixReadlink((nint)("/proc/self/exe"), exeP, 4095UL);
+            if (n <= 0L) {
+                CMemcpy(exeP, (nint)("<unknown>"), 10UL);
+            } else {
+                NativeMemory.At<byte>(exeP, (int)n) = (byte)0;
+            }
+#endif
+
+            nint wid = PosixGetenv((nint)("ZAN_WORKER_ID"));
+            if (wid != (nint)0 && NativeMemory.At<byte>(wid, 0) != (byte)0) {
+                ulong wl = CStrlen(wid);
+                if (wl < 32UL) CMemcpy(NativeMemory.AddressOf(ref s_wid), wid, wl + 1UL);
+            }
+
+            nint logDir = NativeMemory.AddressOf(ref s_logDir);
+            NativeMemory.At<byte>(logDir, 0) = (byte)0;
+            nint env = PosixGetenv((nint)("ZAN_LOG_DIR"));
+            nint home = PosixGetenv((nint)("HOME"));
+            bool haveDir = false;
+            if (env != (nint)0 && NativeMemory.At<byte>(env, 0) != (byte)0) {
+                SBAppendCStr(logDir, 0, 4096, env);
+                haveDir = true;
+            } else {
+#if MACOS
+                if (home != (nint)0 && NativeMemory.At<byte>(home, 0) == (byte)47) {
+                    int p = SBAppendCStr(logDir, 0, 4096, home);
+                    SBAppendCStr(logDir, p, 4096, (nint)("/Library/Caches/Zan/logs"));
+                    haveDir = true;
+                }
+#else
+                nint cache = PosixGetenv((nint)("XDG_CACHE_HOME"));
+                if (cache != (nint)0 && NativeMemory.At<byte>(cache, 0) == (byte)47) {
+                    int p = SBAppendCStr(logDir, 0, 4096, cache);
+                    SBAppendCStr(logDir, p, 4096, (nint)("/zan/logs"));
+                    haveDir = true;
+                } else if (home != (nint)0 && NativeMemory.At<byte>(home, 0) == (byte)47) {
+                    int p = SBAppendCStr(logDir, 0, 4096, home);
+                    SBAppendCStr(logDir, p, 4096, (nint)("/.cache/zan/logs"));
+                    haveDir = true;
+                }
+#endif
+            }
+            if (haveDir && PrepareDir(logDir)) return;
+
+            nint tmp = PosixGetenv((nint)("TMPDIR"));
+            if (tmp == (nint)0 || NativeMemory.At<byte>(tmp, 0) != (byte)47) {
+                tmp = (nint)("/tmp");
+            }
+            int tp = SBAppendCStr(logDir, 0, 4096, tmp);
+            tp = SBAppendCStr(logDir, tp, 4096, (nint)("/zan-"));
+            tp = SBAppendUInt(logDir, tp, 4096, (ulong)PosixGetuid());
+            SBAppendCStr(logDir, tp, 4096, (nint)("/logs"));
+            if (!PrepareDir(logDir)) {
+                NativeMemory.At<byte>(logDir, 0) = (byte)0;
+            }
+        }
+
+        static void CacheErrFd() {
+            int fd = PosixFcntl3(STDERR_FILENO, F_DUPFD_CLOEXEC, 100);
+            if (fd < 0) fd = PosixFcntl3(STDERR_FILENO, F_DUPFD, 100);
+            if (fd >= 0) {
+                int fl = PosixFcntl2(fd, F_GETFL);
+                if (fl >= 0) PosixFcntl3(fd, F_SETFL, fl | O_NONBLOCK);
+                s_errFd = fd;
+            }
+        }
+
+        static bool BuildLogPath(int y, uint mo, uint da, nint outPath, int cap) {
+            nint logDir = NativeMemory.AddressOf(ref s_logDir);
+            if (NativeMemory.At<byte>(logDir, 0) == (byte)0) return false;
+            if (y < 0 || y > 9999) y = 1970;
+            if (mo > 12U) mo = 1U;
+            if (da > 31U) da = 1U;
+            Buf24 ym = new Buf24();
+            nint ymP = NativeMemory.AddressOf(ref ym);
+            NativeMemory.At<byte>(ymP, 0) = (byte)(48 + ((y / 1000) % 10));
+            NativeMemory.At<byte>(ymP, 1) = (byte)(48 + ((y / 100) % 10));
+            Put2(ymP, 2, (uint)(y % 100));
+            Put2(ymP, 4, mo);
+            NativeMemory.At<byte>(ymP, 6) = (byte)0;
+
+            Buf24 dd = new Buf24();
+            nint ddP = NativeMemory.AddressOf(ref dd);
+            Put2(ddP, 0, da);
+            NativeMemory.At<byte>(ddP, 2) = (byte)0;
+
+            Buf4096 dir = new Buf4096();
+            nint dirP = NativeMemory.AddressOf(ref dir);
+            int p = SBAppendCStr(dirP, 0, 4096, logDir);
+            p = SBAppendByte(dirP, p, 4096, (byte)47);
+            p = SBAppendCStr(dirP, p, 4096, ymP);
+            if (p >= 4090) return false;
+
+            PosixMkdir(logDir, 0x1EDU); // 0755
+            PosixMkdir(dirP, 0x1EDU);
+            int op = SBAppendCStr(outPath, 0, cap, dirP);
+            op = SBAppendByte(outPath, op, cap, (byte)47);
+            op = SBAppendCStr(outPath, op, cap, ddP);
+            op = SBAppendCStr(outPath, op, cap, (nint)(".log"));
+            return op < cap - 1;
+        }
+
+        static void WritePosixRecord(int fd, int sig, nint addr, nint stamp, nint uctx) {
+            WrStr(fd, (nint)("==== ZAN CRASH "));
+            WrStr(fd, stamp);
+            WrStr(fd, (nint)(" ====\nexe="));
+            WrStr(fd, NativeMemory.AddressOf(ref s_exe));
+            WrStr(fd, (nint)(" pid="));
+            WrDec(fd, (ulong)PosixGetpid());
+            nint widP = NativeMemory.AddressOf(ref s_wid);
+            if (NativeMemory.At<byte>(widP, 0) != (byte)0) {
+                WrStr(fd, (nint)(" worker="));
+                WrStr(fd, widP);
+            }
+            WrStr(fd, (nint)("\nsignal="));
+            WrStr(fd, SigName(sig));
+            WrStr(fd, (nint)("("));
+            WrDec(fd, (ulong)sig);
+            WrStr(fd, (nint)(") addr="));
+            WrHex(fd, (ulong)addr, true);
+            WrStr(fd, (nint)("\n"));
+#if MACOS
+            InlineArray<48, nint> btFrames = new InlineArray<48, nint>();
+            nint btP = NativeMemory.AddressOf(ref btFrames);
+            int btN = MacBacktrace(btP, 48);
+            WrStr(fd, (nint)("backtrace:\n"));
+            for (int i = 0; i < btN; i++) {
+                WriteFrame(fd, NativeMemory.At<nint>(btP, i));
+            }
+#elif X86_64
+            if (uctx != (nint)0) {
+                // Linux x86_64 ucontext_t: uc_mcontext.gregs starts at offset 40; REG_RBP=10 (120), REG_RIP=16 (168)
+                nint rip = NativeMemory.AsRef<nint>((nint)((ulong)uctx + 168UL));
+                ulong rbp = NativeMemory.AsRef<ulong>((nint)((ulong)uctx + 120UL));
+                WrStr(fd, (nint)("faulting ip:\n"));
+                WriteFrame(fd, rip);
+                WrStr(fd, (nint)("backtrace (frame-pointer walk):\n"));
+                if ((rbp & 7UL) == 0UL) WalkFrames(fd, rbp);
+                else WrStr(fd, (nint)("  # <frame pointer not preserved>\n"));
+            }
+#endif
+            WrStr(fd, (nint)("\n"));
+        }
+
+        [Export("__zan_crash_sig_handler")]
+        [Visibility("hidden")]
+        static void CrashSigHandler(int sig, nint info, nint uctx) {
+#if MACOS
+            nint addr = (info != (nint)0) ? NativeMemory.AsRef<nint>((nint)((ulong)info + 24UL)) : (nint)0;
+#else
+            nint addr = (info != (nint)0) ? NativeMemory.AsRef<nint>((nint)((ulong)info + 16UL)) : (nint)0;
+#endif
+            long now = PosixTime((nint)0);
+            long days = now / 86400L;
+            long secs = now % 86400L;
+            if (secs < 0L) { secs += 86400L; days -= 1L; }
+            int y = 1970;
+            uint mo = 1U;
+            uint da = 1U;
+            CivilFromDays(days, out y, out mo, out da);
+            uint hh = (uint)(secs / 3600L);
+            uint mi = (uint)((secs / 60L) % 60L);
+            uint ss = (uint)(secs % 60L);
+
+            Buf32 stamp = new Buf32();
+            nint sp = NativeMemory.AddressOf(ref stamp);
+            int yy = (y < 0 || y > 9999) ? 1970 : y;
+            NativeMemory.At<byte>(sp, 0) = (byte)(48 + ((yy / 1000) % 10));
+            NativeMemory.At<byte>(sp, 1) = (byte)(48 + ((yy / 100) % 10));
+            Put2(sp, 2, (uint)(yy % 100));
+            NativeMemory.At<byte>(sp, 4) = (byte)45;
+            Put2(sp, 5, mo);
+            NativeMemory.At<byte>(sp, 7) = (byte)45;
+            Put2(sp, 8, da);
+            NativeMemory.At<byte>(sp, 10) = (byte)32;
+            Put2(sp, 11, hh);
+            NativeMemory.At<byte>(sp, 13) = (byte)58;
+            Put2(sp, 14, mi);
+            NativeMemory.At<byte>(sp, 16) = (byte)58;
+            Put2(sp, 17, ss);
+            CMemcpy((nint)((ulong)sp + 19UL), (nint)(" UTC"), 5UL);
+
+            int errFd = (s_errFd >= 0) ? s_errFd : STDERR_FILENO;
+            WritePosixRecord(errFd, sig, addr, sp, uctx);
+
+            Buf4096 path = new Buf4096();
+            nint pathP = NativeMemory.AddressOf(ref path);
+            if (BuildLogPath(y, mo, da, pathP, 4096)) {
+                int fd = PosixOpen3(pathP, O_WRONLY | O_CREAT | O_APPEND, 0x1A4U); // 0644
+                if (fd >= 0) {
+                    StatBuf144 a = new StatBuf144();
+                    StatBuf144 b = new StatBuf144();
+                    nint aP = NativeMemory.AddressOf(ref a);
+                    nint bP = NativeMemory.AddressOf(ref b);
+                    bool same = PosixFstat(STDERR_FILENO, aP) == 0 && PosixFstat(fd, bP) == 0 &&
+#if MACOS
+                                NativeMemory.AsRef<int>(aP) == NativeMemory.AsRef<int>(bP) &&
+#else
+                                NativeMemory.AsRef<ulong>(aP) == NativeMemory.AsRef<ulong>(bP) &&
+#endif
+                                NativeMemory.AsRef<ulong>((nint)((ulong)aP + 8UL)) == NativeMemory.AsRef<ulong>((nint)((ulong)bP + 8UL));
+                    if (!same) WritePosixRecord(fd, sig, addr, sp, uctx);
+                    PosixClose(fd);
+                }
+            }
+            PosixSignal(sig, (nint)0); // SIG_DFL
+            PosixRaise(sig);
+        }
+
+        [ModuleInitializer]
+        static void AutoInstall() {
+            Install();
+        }
+
+        [Export("zan__crash_install")]
+        public static void Install() {
+            if (!Atomic.CompareExchangeBool(ref s_installed, 0, 1, MemoryOrder.AcqRel, MemoryOrder.Acquire)) {
+                return;
+            }
+            ResolvePaths();
+            CacheErrFd();
+
+            StackTBuf24 curStack = new StackTBuf24();
+            nint curP = NativeMemory.AddressOf(ref curStack);
+            if (PosixSigaltstack((nint)0, curP) == 0) {
+#if MACOS
+                // Darwin stack_t: ss_sp @ 0 (8B), ss_size @ 8 (8B), ss_flags @ 16 (4B)
+                ulong sz = NativeMemory.AsRef<ulong>((nint)((ulong)curP + 8UL));
+                int flags = NativeMemory.AsRef<int>((nint)((ulong)curP + 16UL));
+#else
+                int flags = NativeMemory.AsRef<int>((nint)((ulong)curP + 8UL));
+                ulong sz = NativeMemory.AsRef<ulong>((nint)((ulong)curP + 16UL));
+#endif
+                if ((flags & SS_DISABLE) != 0 || sz == 0UL) {
+                    StackTBuf24 ss = new StackTBuf24();
+                    nint ssP = NativeMemory.AddressOf(ref ss);
+                    CMemset(ssP, 0, 24UL);
+                    NativeMemory.AsRef<nint>(ssP) = NativeMemory.AddressOf(ref s_altStack);
+#if MACOS
+                    NativeMemory.AsRef<ulong>((nint)((ulong)ssP + 8UL)) = 65536UL;
+                    NativeMemory.AsRef<int>((nint)((ulong)ssP + 16UL)) = 0;
+#else
+                    NativeMemory.AsRef<int>((nint)((ulong)ssP + 8UL)) = 0;
+                    NativeMemory.AsRef<ulong>((nint)((ulong)ssP + 16UL)) = 65536UL;
+#endif
+                    PosixSigaltstack(ssP, (nint)0);
+                }
+            }
+
+            SigActionBuf152 sa = new SigActionBuf152();
+            nint saP = NativeMemory.AddressOf(ref sa);
+            CMemset(saP, 0, 152UL);
+            NativeMemory.AsRef<nint>(saP) = NativeMemory.FunctionPointer(CrashSigHandler);
+            uint saFlags = (uint)SA_SIGINFO | (uint)SA_ONSTACK | SA_RESETHAND;
+#if MACOS
+            // Darwin struct sigaction: sa_sigaction @ 0 (8B), sa_mask @ 8 (4B), sa_flags @ 12 (4B)
+            NativeMemory.AsRef<uint>((nint)((ulong)saP + 8UL)) = 0U;
+            NativeMemory.AsRef<uint>((nint)((ulong)saP + 12UL)) = saFlags;
+#elif MUSL
+            NativeMemory.AsRef<ulong>((nint)((ulong)saP + 8UL)) = (ulong)saFlags;
+            PosixSigemptyset((nint)((ulong)saP + 24UL));
+#else
+            PosixSigemptyset((nint)((ulong)saP + 8UL));
+            NativeMemory.AsRef<uint>((nint)((ulong)saP + 136UL)) = saFlags;
+#endif
+            InstallOneSig(SIGSEGV, saP);
+            InstallOneSig(SIGBUS, saP);
+            InstallOneSig(SIGFPE, saP);
+            InstallOneSig(SIGILL, saP);
+            InstallOneSig(SIGABRT, saP);
+        }
+
+        static void InstallOneSig(int sig, nint saP) {
+            SigActionBuf152 cur = new SigActionBuf152();
+            nint curP = NativeMemory.AddressOf(ref cur);
+            if (PosixSigaction(sig, (nint)0, curP) == 0 && NativeMemory.AsRef<nint>(curP) != (nint)0) {
+                return;
+            }
+            PosixSigaction(sig, saP, (nint)0);
+        }
+
+        [Export("zan__guard_call")]
+        public static int GuardCall(nint fn, nint arg) {
+            if (fn != (nint)0) {
+                NativeMemory.InvokeVoidWithCC<nint>("c", fn, arg);
+            }
+            return 1;
+        }
+
+        [Export("zan__guard_recovered_count")]
+        public static long GuardRecoveredCount() {
+            return 0L;
+        }
+    }
+
+#endif
+}

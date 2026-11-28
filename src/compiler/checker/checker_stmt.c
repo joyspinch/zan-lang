@@ -129,6 +129,12 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
   }
 
   case AST_VAR_DECL: {
+    if (stmt->var_decl.is_ref && !stmt->var_decl.initializer) {
+      zan_diag_emit_code(c->diag, DIAG_ERROR, stmt->loc, 2161,
+                         "ref local variable '%.*s' must be initialized",
+                         (int)stmt->var_decl.name.len,
+                         stmt->var_decl.name.str);
+    }
     zan_type_t *dt =
         stmt->var_decl.type
             ? zan_binder_resolve_type(c->binder, stmt->var_decl.type)
@@ -198,6 +204,19 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
   }
 
   case AST_RETURN_STMT:
+    if (c->current_method_decl &&
+        c->current_method_decl->kind == AST_METHOD_DECL) {
+      bool fn_ref = c->current_method_decl->method_decl.is_ref_return;
+      if (fn_ref && !stmt->ret.is_ref) {
+        zan_diag_emit_code(
+            c->diag, DIAG_ERROR, stmt->loc, 2161,
+            "by-ref returning method must return a reference using 'return ref'");
+      } else if (!fn_ref && stmt->ret.is_ref) {
+        zan_diag_emit_code(
+            c->diag, DIAG_ERROR, stmt->loc, 2161,
+            "'return ref' can only be used in a method declared with a 'ref' return type");
+      }
+    }
     if (stmt->ret.value) {
       /* 返回值有 current_return_type 做委托目标裁决：方法组在此
        * 静默，合法性由 check_assignable 判（B-ID151）。 */
@@ -208,6 +227,13 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
       if (c->current_return_type && c->current_return_type->kind != TYPE_VOID)
         checker_check_assignable(c, c->current_return_type, rv, stmt->ret.value,
                                  stmt->loc, "return statement");
+      zan_istr_t ne_name = {NULL, 0};
+      if (checker_expr_is_noescape_param(c, stmt->ret.value, &ne_name)) {
+        zan_diag_emit_code(
+            c->diag, DIAG_ERROR, stmt->loc, 2142,
+            "non-escaping parameter '%.*s' cannot escape via return",
+            (int)ne_name.len, ne_name.str);
+      }
       if (c->current_type_sym && c->current_type_sym->kind == SYM_CLASS) {
         if (has_closure_capturing_this(c, stmt->ret.value)) {
           zan_diag_emit_code(
@@ -389,10 +415,17 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
 
   case AST_SWITCH_STMT: {
     zan_type_t *sw_type = zan_checker_check_expr(c, stmt->switch_stmt.expr);
-    bool has_patterns = false;
+    zan_adt_info_t *adt_info = checker_type_adt_info(sw_type);
+    bool *adt_covered = NULL;
+    if (adt_info && adt_info->variant_count > 0) {
+      adt_covered = (bool *)zan_arena_alloc(
+          c->arena, sizeof(bool) * (size_t)adt_info->variant_count);
+      memset(adt_covered, 0, sizeof(bool) * (size_t)adt_info->variant_count);
+    }
+    bool has_patterns = (adt_info != NULL);
     for (int i = 0; i < stmt->switch_stmt.cases.count && !has_patterns; i++) {
       zan_ast_node_t *sc = stmt->switch_stmt.cases.items[i];
-      if (sc->switch_case.type_pattern ||
+      if (sc->switch_case.type_pattern || sc->switch_case.adt_pat ||
           (sc->switch_case.pattern &&
            sc->switch_case.pattern->kind == AST_NULL_LITERAL))
         has_patterns = true;
@@ -409,8 +442,10 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
     bool seen_wildcard = false;
     for (int i = 0; i < stmt->switch_stmt.cases.count; i++) {
       zan_ast_node_t *sc = stmt->switch_stmt.cases.items[i];
+      struct checker_local *saved_locals = c->locals;
       bool is_default = (sc->switch_case.pattern == NULL &&
                          sc->switch_case.type_pattern == NULL &&
+                         sc->switch_case.adt_pat == NULL &&
                          sc->switch_case.var_name.len == 0);
 
       if (seen_wildcard) {
@@ -420,7 +455,19 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
             "all remaining values");
       }
 
-      if (sc->switch_case.pattern) {
+      if (adt_info && (sc->switch_case.adt_pat || sc->switch_case.pattern)) {
+        int tag = checker_bind_adt_pattern(
+            c, sw_type, sc->loc, sc->switch_case.adt_pat,
+            sc->switch_case.pattern);
+        if (tag >= 0 && tag < adt_info->variant_count &&
+            sc->switch_case.when_cond == NULL) {
+          if (adt_covered[tag]) {
+            zan_diag_emit_code(c->diag, DIAG_ERROR, sc->loc, 2077,
+                               "duplicate case label in switch statement");
+          }
+          adt_covered[tag] = true;
+        }
+      } else if (sc->switch_case.pattern) {
         zan_checker_check_expr(c, sc->switch_case.pattern);
         if (sc->switch_case.when_cond == NULL) {
           for (int prev = 0; prev < i; prev++) {
@@ -440,6 +487,7 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
           zan_ast_node_t *prev_sc = stmt->switch_stmt.cases.items[prev];
           bool prev_is_default = (prev_sc->switch_case.pattern == NULL &&
                                   prev_sc->switch_case.type_pattern == NULL &&
+                                  prev_sc->switch_case.adt_pat == NULL &&
                                   prev_sc->switch_case.var_name.len == 0);
           if (prev_is_default) {
             zan_diag_emit_code(c->diag, DIAG_ERROR, sc->loc, 2078,
@@ -464,6 +512,21 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
         zan_checker_check_expr(c, sc->switch_case.when_cond);
       }
       zan_checker_check_stmt(c, sc->switch_case.body);
+      c->locals = saved_locals;
+    }
+
+    if (adt_info && adt_covered && !seen_wildcard) {
+      for (int vi = 0; vi < adt_info->variant_count; vi++) {
+        if (!adt_covered[vi]) {
+          zan_diag_emit_code(
+              c->diag, DIAG_ERROR, stmt->loc, 2146,
+              "non-exhaustive switch statement on ADT '%.*s': missing variant "
+              "'%.*s'; handle all variants or add default label",
+              (int)sw_type->sym->name.len, sw_type->sym->name.str,
+              (int)adt_info->variants[vi].name.len,
+              adt_info->variants[vi].name.str);
+        }
+      }
     }
 
     if (sw_type && sw_type->kind == TYPE_ENUM && sw_type->sym &&

@@ -1,0 +1,76 @@
+// rt_timer_defer.zan: B-ID78 deep-tree iterative deferred release queue.
+// Replaces src/runtime/timer/rt_timer_defer.c in 100% pure Zan.
+
+namespace Zan.Runtime.Timer;
+
+struct DeferNode {
+    public nint Next;
+    public nint Fn;
+    public nint Obj;
+}
+
+static class RtTimerDefer {
+    static OsMutex s_deferLock;
+    static nint s_deferHead = (nint)0;
+    static int s_deferCount = 0;
+    static int s_deferExitHooked = 0;
+
+    [Export("__zan_defer_at_exit")]
+    [Visibility("hidden")]
+    static void DeferAtExit() {
+        DeferDrain();
+    }
+
+    [Export("zan_rt_defer_push")]
+    public static void DeferPush(nint fn, nint obj) {
+        nint node = RtPlat.CMalloc(24UL);
+        if (node == (nint)0) {
+            if (fn != (nint)0) {
+                NativeMemory.InvokeVoidWithCC<nint>("c", fn, obj);
+            }
+            return;
+        }
+        NativeMemory.Write<nint>(node, (nint)0);
+        NativeMemory.Write<nint>(node + (nint)8, fn);
+        NativeMemory.Write<nint>(node + (nint)16, obj);
+
+        nint lk = NativeMemory.AddressOf(ref s_deferLock);
+        RtPlat.MutexLock(lk);
+        if (s_deferExitHooked == 0) {
+            s_deferExitHooked = 1;
+            RtPlat.CAtexit(NativeMemory.FunctionPointer(DeferAtExit));
+        }
+        NativeMemory.Write<nint>(node, s_deferHead);
+        s_deferHead = node;
+        Atomic.FetchAdd(ref s_deferCount, 1, MemoryOrder.Release);
+        RtPlat.MutexUnlock(lk);
+    }
+
+    [Export("zan_rt_defer_pending")]
+    public static int DeferPending() {
+        return Atomic.Load(ref s_deferCount, MemoryOrder.Acquire) > 0 ? 1 : 0;
+    }
+
+    [Export("zan_rt_defer_drain")]
+    public static void DeferDrain() {
+        nint lk = NativeMemory.AddressOf(ref s_deferLock);
+        while (true) {
+            RtPlat.MutexLock(lk);
+            nint node = s_deferHead;
+            if (node == (nint)0) {
+                RtPlat.MutexUnlock(lk);
+                return;
+            }
+            s_deferHead = NativeMemory.Read<nint>(node);
+            Atomic.FetchAdd(ref s_deferCount, -1, MemoryOrder.Release);
+            RtPlat.MutexUnlock(lk);
+
+            nint fn = NativeMemory.Read<nint>(node + (nint)8);
+            nint obj = NativeMemory.Read<nint>(node + (nint)16);
+            RtPlat.CFree(node);
+            if (fn != (nint)0) {
+                NativeMemory.InvokeVoidWithCC<nint>("c", fn, obj);
+            }
+        }
+    }
+}

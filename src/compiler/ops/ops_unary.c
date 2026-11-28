@@ -131,6 +131,12 @@ LLVMValueRef emit_expr_unary(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMGetTypeKind(t) == LLVMFloatTypeKind) {
                 return LLVMBuildFNeg(g->builder, operand, "neg");
             }
+            if (LLVMGetTypeKind(t) == LLVMVectorTypeKind) {
+                LLVMTypeKind ek = LLVMGetTypeKind(LLVMGetElementType(t));
+                if (ek == LLVMFloatTypeKind || ek == LLVMDoubleTypeKind)
+                    return LLVMBuildFNeg(g->builder, operand, "vneg");
+                return LLVMBuildNeg(g->builder, operand, "vneg");
+            }
             if (g->irgen_checked_depth > 0 &&
                 LLVMGetTypeKind(t) == LLVMIntegerTypeKind &&
                 LLVMGetIntTypeWidth(t) > 1 &&

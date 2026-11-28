@@ -152,6 +152,14 @@ static zan_type_t *builtin_call_result_type(zan_checker_t *c, zan_type_t *recv,
     if (name.len == 14 && memcmp(name.str, "AsReadOnlySpan", 14) == 0)
       return zan_binder_make_readonly_span_type(c->binder, recv->element_type);
   }
+  if (recv->kind == TYPE_STRUCT && recv->name.len == 11 &&
+      memcmp(recv->name.str, "InlineArray", 11) == 0 &&
+      recv->type_args && recv->type_arg_count >= 2 && recv->type_args[1]) {
+    if (name.len == 6 && memcmp(name.str, "AsSpan", 6) == 0)
+      return zan_binder_make_span_type(c->binder, recv->type_args[1]);
+    if (name.len == 14 && memcmp(name.str, "AsReadOnlySpan", 14) == 0)
+      return zan_binder_make_readonly_span_type(c->binder, recv->type_args[1]);
+  }
 
   if (recv->kind == TYPE_STRUCT &&
       ((recv->name.len == 4 && memcmp(recv->name.str, "Span", 4) == 0) ||
@@ -277,7 +285,10 @@ static void checker_bind_call_intrinsic(zan_checker_t *c, zan_ast_node_t *expr,
     if (recv->name.str &&
         ((recv->name.len == 4 && memcmp(recv->name.str, "Span", 4) == 0) ||
          (recv->name.len == 12 &&
-          memcmp(recv->name.str, "ReadOnlySpan", 12) == 0))) {
+          memcmp(recv->name.str, "ReadOnlySpan", 12) == 0) ||
+         (recv->name.len == 11 &&
+          memcmp(recv->name.str, "InlineArray", 11) == 0) ||
+         (recv->name.len == 3 && memcmp(recv->name.str, "Vec", 3) == 0))) {
       expr->call.is_intrinsic = 1;
       return;
     }
@@ -301,6 +312,14 @@ static void no_runtime_reject(zan_checker_t *c, zan_loc_t loc,
     return;
   zan_diag_emit_code(c->diag, DIAG_ERROR, loc, 2000,
                      "%s is not allowed in a [NoRuntime] method", what);
+}
+
+static void no_alloc_reject(zan_checker_t *c, zan_loc_t loc,
+                            const char *what) {
+  if (!c->in_noalloc)
+    return;
+  zan_diag_emit_code(c->diag, DIAG_ERROR, loc, 3100,
+                     "%s is not allowed in a [NoAlloc] method", what);
 }
 
 static bool no_runtime_arc_return_type(zan_type_t *type) {
@@ -479,6 +498,7 @@ struct checker_local {
   zan_type_t *type;
   zan_symbol_t *null_src;
   const zan_ast_node_t *decl;
+  int lambda_depth;
   struct checker_local *next;
 };
 
@@ -500,6 +520,116 @@ static struct checker_local *checker_find_local_slot(zan_checker_t *c,
 static zan_type_t *checker_find_local(zan_checker_t *c, zan_istr_t name) {
   struct checker_local *l = checker_find_local_slot(c, name);
   return l ? l->type : NULL;
+}
+
+static bool checker_expr_is_noescape_param(zan_checker_t *c,
+                                           zan_ast_node_t *expr,
+                                           zan_istr_t *out_name) {
+  if (!expr || expr->kind != AST_IDENTIFIER)
+    return false;
+  struct checker_local *l = checker_find_local_slot(c, expr->ident.name);
+  if (l && l->decl && l->decl->kind == AST_PARAM && l->decl->param.is_noescape) {
+    if (out_name)
+      *out_name = expr->ident.name;
+    return true;
+  }
+  return false;
+}
+
+static zan_adt_info_t *checker_type_adt_info(const zan_type_t *t) {
+  if (!t || t->kind != TYPE_STRUCT || !t->sym || !t->sym->decl ||
+      t->sym->decl->kind != AST_STRUCT_DECL || !t->sym->decl->meta)
+    return NULL;
+  return t->sym->decl->meta->adt_info;
+}
+
+static zan_adt_variant_t *checker_find_adt_variant(zan_adt_info_t *info,
+                                                   zan_istr_t name) {
+  if (!info || name.len == 0)
+    return NULL;
+  for (int i = 0; i < info->variant_count; i++) {
+    if (info->variants[i].name.len == name.len &&
+        memcmp(info->variants[i].name.str, name.str, (size_t)name.len) == 0)
+      return &info->variants[i];
+  }
+  return NULL;
+}
+
+static void checker_add_local(zan_checker_t *c, zan_istr_t name,
+                              zan_type_t *type, const zan_ast_node_t *decl);
+
+static int checker_bind_adt_pattern(zan_checker_t *c, zan_type_t *disc_type,
+                                    zan_loc_t pat_loc, zan_adt_pat_t *adt_pat,
+                                    zan_ast_node_t *pattern) {
+  zan_adt_info_t *info = checker_type_adt_info(disc_type);
+  if (!info)
+    return -1;
+  zan_istr_t vname = {0};
+  zan_ast_list_t *binds = NULL;
+  zan_ast_list_t empty_binds;
+  zan_ast_list_init(&empty_binds);
+
+  if (adt_pat) {
+    vname = adt_pat->variant;
+    binds = &adt_pat->bindings;
+  } else if (pattern) {
+    if (pattern->kind == AST_CALL) {
+      if (pattern->call.callee && pattern->call.callee->kind == AST_MEMBER_ACCESS)
+        vname = pattern->call.callee->member.name;
+      else if (pattern->call.callee && pattern->call.callee->kind == AST_IDENTIFIER)
+        vname = pattern->call.callee->ident.name;
+      binds = &pattern->call.args;
+    } else if (pattern->kind == AST_MEMBER_ACCESS) {
+      vname = pattern->member.name;
+      binds = &empty_binds;
+    } else if (pattern->kind == AST_IDENTIFIER) {
+      vname = pattern->ident.name;
+      binds = &empty_binds;
+    }
+  }
+  if (vname.len == 0)
+    return -1;
+
+  zan_adt_variant_t *var = checker_find_adt_variant(info, vname);
+  if (!var) {
+    zan_diag_emit_code(c->diag, DIAG_ERROR, pat_loc, 2148,
+                       "ADT '%.*s' has no variant named '%.*s'",
+                       (int)disc_type->sym->name.len, disc_type->sym->name.str,
+                       (int)vname.len, vname.str);
+    return -1;
+  }
+
+  int bc = binds ? binds->count : 0;
+  int expected = var->params.count;
+  if (bc != expected) {
+    zan_diag_emit_code(c->diag, DIAG_ERROR, pat_loc, 2147,
+                       "ADT variant '%.*s.%.*s' expects %d payload binding(s), "
+                       "got %d",
+                       (int)disc_type->sym->name.len, disc_type->sym->name.str,
+                       (int)vname.len, vname.str, expected, bc);
+    return var->tag;
+  }
+
+  for (int bi = 0; bi < bc; bi++) {
+    zan_ast_node_t *bn = binds->items[bi];
+    if (!bn || bn->kind != AST_IDENTIFIER)
+      continue;
+    zan_istr_t bname = bn->ident.name;
+    if (bname.len == 1 && bname.str[0] == '_')
+      continue;
+    zan_symbol_t *fs = checker_find_field(disc_type->sym,
+                                          var->struct_field_names[bi]);
+    zan_type_t *ft = fs ? fs->type : c->binder->type_error;
+    if (ft && disc_type->type_arg_count > 0 && disc_type->sym->decl &&
+        disc_type->sym->decl->type_decl.type_params.count ==
+            disc_type->type_arg_count) {
+      ft = zan_binder_subst_named(c->binder, ft,
+                                  &disc_type->sym->decl->type_decl.type_params,
+                                  disc_type->type_args);
+    }
+    checker_add_local(c, bname, ft, bn);
+  }
+  return var->tag;
 }
 
 static zan_loc_t checker_local_name_loc(const zan_ast_node_t *decl) {
@@ -530,6 +660,7 @@ static void checker_push_local(zan_checker_t *c, zan_istr_t name,
   l->type = type;
   l->decl = decl;
   l->null_src = NULL;
+  l->lambda_depth = c->lambda_depth;
   l->next = c->locals;
   c->locals = l;
 
@@ -1122,6 +1253,27 @@ static void check_closure_cycle_warning(zan_checker_t *c, zan_ast_node_t *lhs,
   }
 }
 
+static bool type_is_builtin_inumber(zan_type_t *arg) {
+  if (!arg)
+    return false;
+  switch (arg->kind) {
+  case TYPE_BYTE:
+  case TYPE_SBYTE:
+  case TYPE_SHORT:
+  case TYPE_USHORT:
+  case TYPE_INT:
+  case TYPE_UINT:
+  case TYPE_LONG:
+  case TYPE_ULONG:
+  case TYPE_NINT:
+  case TYPE_FLOAT:
+  case TYPE_DOUBLE:
+    return true;
+  default:
+    return false;
+  }
+}
+
 static bool type_satisfies_constraint_depth(zan_type_t *arg, zan_type_t *cons,
                                             int depth) {
   if (!arg || !cons)
@@ -1129,6 +1281,10 @@ static bool type_satisfies_constraint_depth(zan_type_t *arg, zan_type_t *cons,
   if (depth > CHECKER_DERIVES_MAX_DEPTH)
     return false;
   if (arg == cons)
+    return true;
+  if (cons->name.str && cons->name.len == 7 &&
+      memcmp(cons->name.str, "INumber", 7) == 0 &&
+      type_is_builtin_inumber(arg))
     return true;
   if (arg->sym && cons->sym && arg->sym == cons->sym)
     return true;
@@ -1143,6 +1299,167 @@ static bool type_satisfies_constraint_depth(zan_type_t *arg, zan_type_t *cons,
 
 static bool type_satisfies_constraint(zan_type_t *arg, zan_type_t *cons) {
   return type_satisfies_constraint_depth(arg, cons, 0);
+}
+
+static void collect_iface_hierarchy(zan_checker_t *c, zan_type_t *iface,
+                                    zan_type_t **out, int *cnt, int max,
+                                    int depth) {
+  if (!iface || !iface->sym || depth > 8 || *cnt >= max)
+    return;
+  for (int i = 0; i < *cnt; i++) {
+    if (out[i] == iface)
+      return;
+  }
+  out[(*cnt)++] = iface;
+  zan_type_t *base_src = iface->sym->type;
+  if (base_src) {
+    for (int i = 0; i < base_src->interface_count; i++) {
+      zan_type_t *bi = base_src->interfaces[i];
+      if (bi && iface->type_arg_count > 0 && iface->sym->decl &&
+          iface->sym->decl->type_decl.type_params.count == iface->type_arg_count) {
+        bi = zan_binder_subst_named(c->binder, bi,
+                                    &iface->sym->decl->type_decl.type_params,
+                                    iface->type_args);
+      }
+      collect_iface_hierarchy(c, bi, out, cnt, max, depth + 1);
+    }
+  }
+}
+
+static int checker_collect_tp_constraints(zan_checker_t *c, zan_type_t *tp,
+                                          zan_type_t **out, int max) {
+  if (!tp || tp->kind != TYPE_TYPE_PARAM || tp->element_type)
+    return 0;
+  int cnt = 0;
+  zan_istr_t name = tp->name;
+  zan_ast_list_t *lists[2] = {NULL, NULL};
+  if (c->current_method_decl)
+    lists[0] = zan_ast_method_where_clauses(c->current_method_decl);
+  if (c->current_type_sym && c->current_type_sym->decl)
+    lists[1] = zan_ast_type_where_clauses(c->current_type_sym->decl);
+  for (int li = 0; li < 2; li++) {
+    zan_ast_list_t *wcs = lists[li];
+    if (!wcs)
+      continue;
+    for (int w = 0; w < wcs->count; w++) {
+      zan_ast_node_t *wc = wcs->items[w];
+      if (!wc || wc->kind != AST_WHERE_CLAUSE)
+        continue;
+      if (wc->where_clause.param_name.len != name.len ||
+          memcmp(wc->where_clause.param_name.str, name.str, (size_t)name.len) !=
+              0)
+        continue;
+      for (int k = 0; k < wc->where_clause.constraints.count; k++) {
+        zan_type_t *ct =
+            zan_binder_resolve_type(c->binder, wc->where_clause.constraints.items[k]);
+        if (ct && ct->kind != TYPE_ERROR)
+          collect_iface_hierarchy(c, ct, out, &cnt, max, 0);
+      }
+    }
+  }
+  return cnt;
+}
+
+static zan_type_t *checker_subst_iface_member_type(zan_checker_t *c,
+                                                   zan_type_t *tp,
+                                                   zan_type_t *iface,
+                                                   zan_type_t *mtype) {
+  if (!mtype)
+    return NULL;
+  if (iface && iface->sym && iface->sym->decl &&
+      iface->sym->decl->kind == AST_INTERFACE_DECL) {
+    zan_ast_list_t *itps = &iface->sym->decl->type_decl.type_params;
+    if (itps->count > 0 && iface->type_arg_count == itps->count) {
+      mtype = zan_binder_subst_named(c->binder, mtype, itps, iface->type_args);
+    }
+    /* Substitute interface associated types `Item` -> projection `T.Item` */
+    if (mtype && mtype->kind == TYPE_TYPE_PARAM && !mtype->element_type && tp) {
+      for (int i = 0; i < iface->sym->member_count; i++) {
+        zan_symbol_t *am = iface->sym->members[i];
+        if (am && am->kind == SYM_ASSOC_TYPE &&
+            am->name.len == mtype->name.len &&
+            memcmp(am->name.str, mtype->name.str, (size_t)am->name.len) == 0) {
+          size_t plen = (size_t)tp->name.len + 1 + (size_t)am->name.len;
+          char *pbuf = (char *)zan_arena_alloc(c->arena, plen + 1);
+          memcpy(pbuf, tp->name.str, tp->name.len);
+          pbuf[tp->name.len] = '.';
+          memcpy(pbuf + tp->name.len + 1, am->name.str, am->name.len);
+          pbuf[plen] = '\0';
+          zan_type_t *proj =
+              (zan_type_t *)zan_arena_alloc(c->arena, sizeof(zan_type_t));
+          memset(proj, 0, sizeof(*proj));
+          proj->kind = TYPE_TYPE_PARAM;
+          proj->name = (zan_istr_t){pbuf, (uint32_t)plen};
+          proj->element_type = tp;
+          return proj;
+        }
+      }
+    }
+  }
+  return mtype;
+}
+
+static bool checker_tp_find_constrained_member(zan_checker_t *c, zan_type_t *tp,
+                                             zan_istr_t name, bool want_static,
+                                             bool want_method, int arg_count,
+                                             zan_type_t **out_type,
+                                             zan_symbol_t **out_sym) {
+  zan_type_t *ifaces[32];
+  int nif = checker_collect_tp_constraints(c, tp, ifaces, 32);
+  for (int i = 0; i < nif; i++) {
+    zan_type_t *ifc = ifaces[i];
+    if (!ifc || !ifc->sym)
+      continue;
+    for (int j = 0; j < ifc->sym->member_count; j++) {
+      zan_symbol_t *m = ifc->sym->members[j];
+      if (!m || m->name.len != name.len ||
+          memcmp(m->name.str, name.str, (size_t)name.len) != 0)
+        continue;
+      bool m_static = (m->modifiers & MOD_STATIC) != 0;
+      if (m_static != want_static)
+        continue;
+      if (want_method) {
+        if (m->kind != SYM_METHOD)
+          continue;
+        if (arg_count >= 0 && m->decl && m->decl->kind == AST_METHOD_DECL &&
+            m->decl->method_decl.params.count != arg_count)
+          continue;
+        if (out_sym)
+          *out_sym = m;
+        if (out_type)
+          *out_type = checker_subst_iface_member_type(c, tp, ifc, m->type);
+        return true;
+      } else {
+        if (m->kind != SYM_PROPERTY && m->kind != SYM_FIELD)
+          continue;
+        if (out_sym)
+          *out_sym = m;
+        if (out_type)
+          *out_type = checker_subst_iface_member_type(c, tp, ifc, m->type);
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+static bool checker_tp_has_operator(zan_checker_t *c, zan_type_t *tp,
+                                    const char *op_name, int arity,
+                                    zan_type_t **out_ret) {
+  if (!tp || tp->kind != TYPE_TYPE_PARAM || !op_name)
+    return false;
+  zan_istr_t nm = {(char *)op_name, (uint32_t)strlen(op_name)};
+  return checker_tp_find_constrained_member(c, tp, nm, true, true, arity,
+                                            out_ret, NULL);
+}
+
+static bool checker_is_tp_type_receiver(zan_checker_t *c, zan_ast_node_t *obj) {
+  if (!obj || obj->kind != AST_IDENTIFIER)
+    return false;
+  if (checker_find_local(c, obj->ident.name))
+    return false;
+  zan_symbol_t *sym = zan_binder_lookup(c->binder, obj->ident.name);
+  return sym && sym->kind == SYM_TYPE_PARAM;
 }
 
 static const char *type_name(zan_type_t *t);

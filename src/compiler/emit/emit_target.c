@@ -172,7 +172,10 @@ static void erase_calls_to_fn(LLVMValueRef fn, bool erase_dead_loads) {
 
 static void delete_fn_if_unused(LLVMModuleRef mod, const char *name) {
   LLVMValueRef fn = LLVMGetNamedFunction(mod, name);
-  if (fn && LLVMGetFirstUse(fn) == NULL) {
+  if (fn && LLVMGetFirstUse(fn) == NULL &&
+      (LLVMIsDeclaration(fn) ||
+       LLVMGetLinkage(fn) == LLVMWeakAnyLinkage ||
+       LLVMGetLinkage(fn) == LLVMInternalLinkage)) {
     LLVMDeleteFunction(fn);
   }
 }
@@ -275,7 +278,7 @@ static void prune_unused_heap_diag(zan_irgen_t *g, bool need_heap_diag) {
       }
     }
   }
-  if (g->emit_lib)
+  if (g->emit_lib || g->emit_obj)
     return;
   static const char *const diag_weak[] = {
       "zan_gc_detect_cycles", "zan_gc_collect_cycles",
@@ -628,6 +631,12 @@ done:;
           ((g->emit_lib && is_user_decl && !work[w].cur_inst &&
             ((member->method_decl.modifiers & MOD_PUBLIC) ||
              member->kind == AST_CONSTRUCTOR_DECL)) ||
+           (!work[w].cur_inst && method_c_export_name(member, NULL, 0)) ||
+           (!work[w].cur_inst && is_user_decl &&
+            (zan_ast_has_attr(member, "Used") ||
+             zan_ast_has_attr(member, "Init") ||
+             zan_ast_has_attr(member, "Fini") ||
+             zan_ast_has_attr(member, "Alias"))) ||
            is_refl_root);
       if (!root)
         root = body_has_live_use(work[w].fn, live, &work_ix) &&
@@ -635,6 +644,31 @@ done:;
       if (root) {
         live[w] = 1;
         pending++;
+        char alias_tgt[256];
+        if (!work[w].cur_inst &&
+            zan_ast_attr_string(member, "Alias", alias_tgt, sizeof(alias_tgt))) {
+          int tw = -1;
+          LLVMValueRef tfn = LLVMGetNamedFunction(g->mod, alias_tgt);
+          if (tfn)
+            tw = work_fn_index_lookup(&work_ix, tfn);
+          if (tw < 0) {
+            size_t tlen = strlen(alias_tgt);
+            for (int k = 0; k < work_count; k++) {
+              if (!work[k].cur_inst && work[k].type_sym == work[w].type_sym &&
+                  work[k].member && work[k].member->kind == AST_METHOD_DECL &&
+                  (work[k].member->method_decl.modifiers & MOD_STATIC) &&
+                  work[k].member->method_decl.name.len == tlen &&
+                  memcmp(work[k].member->method_decl.name.str, alias_tgt, tlen) == 0) {
+                tw = k;
+                break;
+              }
+            }
+          }
+          if (tw >= 0 && live[tw] == 0) {
+            live[tw] = 1;
+            pending++;
+          }
+        }
       }
     }
     sinit_graph_dispose(&static_graph);
@@ -664,6 +698,50 @@ done:;
   } while (pending);
   if (!zan_diag_has_errors(g->diag)) {
     finalize_static_initializers(g, unit, work, work_count, live, &work_ix);
+    /* Materialize [Used] static fields & emit llvm.compiler.used so GlobalDCE
+     * never strips boot headers, vector tables, or [Used] entry points. */
+    LLVMTypeRef u_i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMValueRef used_items[128];
+    int used_cnt = 0;
+    for (int w = 0; w < work_count && used_cnt < 128; w++) {
+      if (live[w] && work[w].fn && work[w].member &&
+          zan_ast_has_attr(work[w].member, "Used")) {
+        used_items[used_cnt++] = LLVMConstBitCast(work[w].fn, u_i8ptr);
+      }
+    }
+    if (unit && unit->kind == AST_COMPILATION_UNIT) {
+      for (int di = 0; di < unit->comp_unit.decls.count && used_cnt < 128; di++) {
+        zan_ast_node_t *d = unit->comp_unit.decls.items[di];
+        if (!d || d->from_stdlib || d->from_package ||
+            (d->kind != AST_CLASS_DECL && d->kind != AST_STRUCT_DECL))
+          continue;
+        zan_symbol_t *tsym = zan_binder_lookup(g->binder, d->type_decl.name);
+        if (!tsym) continue;
+        for (int mi = 0; mi < d->type_decl.members.count && used_cnt < 128; mi++) {
+          zan_ast_node_t *m = d->type_decl.members.items[mi];
+          bool is_used_f = m && m->kind == AST_FIELD_DECL &&
+                           (m->field_decl.modifiers & MOD_STATIC) &&
+                           zan_ast_has_attr(m, "Used");
+          bool is_exp_f = m && m->kind == AST_FIELD_DECL &&
+                          (m->field_decl.modifiers & MOD_STATIC) &&
+                          zan_ast_has_attr(m, "Export");
+          if (!is_used_f && !is_exp_f)
+            continue;
+          zan_symbol_t *fsym = get_field_sym(tsym, m->field_decl.name);
+          if (!fsym) continue;
+          LLVMValueRef gv = get_static_field_global(g, tsym, fsym, NULL);
+          if (gv && is_used_f)
+            used_items[used_cnt++] = LLVMConstBitCast(gv, u_i8ptr);
+        }
+      }
+    }
+    if (used_cnt > 0 && !LLVMGetNamedGlobal(g->mod, "llvm.compiler.used")) {
+      LLVMTypeRef arr_ty = LLVMArrayType(u_i8ptr, (unsigned)used_cnt);
+      LLVMValueRef ugv = LLVMAddGlobal(g->mod, arr_ty, "llvm.compiler.used");
+      LLVMSetLinkage(ugv, LLVMAppendingLinkage);
+      LLVMSetSection(ugv, "llvm.metadata");
+      LLVMSetInitializer(ugv, LLVMConstArray(u_i8ptr, used_items, (unsigned)used_cnt));
+    }
   }
   free(work_ix.slots);
   /* Preserve ordinary/debug codegen diagnostics on user declarations after
@@ -716,16 +794,97 @@ done:;
       continue;
     free(work[w].param_types);
     LLVMValueRef fn = work[w].fn;
-    if (LLVMIsDeclaration(fn)) {
+    if (LLVMIsDeclaration(fn) && !g->freestanding && !g->emit_obj) {
       LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "dead");
       LLVMPositionBuilderAtEnd(g->builder, bb);
       LLVMBuildUnreachable(g->builder);
     }
     fn = work[w].resume_fn;
-    if (fn && LLVMIsDeclaration(fn)) {
+    if (fn && LLVMIsDeclaration(fn) && !g->freestanding && !g->emit_obj) {
       LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "dead");
       LLVMPositionBuilderAtEnd(g->builder, bb);
       LLVMBuildUnreachable(g->builder);
+    }
+  }
+  typedef struct {
+    LLVMValueRef fn;
+    uint32_t priority;
+    bool is_dtor;
+  } user_ctor_dtor_t;
+  user_ctor_dtor_t user_lifecycle[128];
+  int user_lifecycle_cnt = 0;
+
+  /* Materialize [Alias("target")] into LLVM GlobalAlias and collect [Init]/[Fini]. */
+  for (int w = 0; w < work_count; w++) {
+    if (!live[w] || !work[w].member || work[w].cur_inst)
+      continue;
+    zan_ast_node_t *m = work[w].member;
+    if (m->kind != AST_METHOD_DECL)
+      continue;
+    for (int lf = 0; lf < 2; lf++) {
+      const char *lfname = lf == 0 ? "Init" : "Fini";
+      if (!zan_ast_has_attr(m, lfname) || user_lifecycle_cnt >= 128)
+        continue;
+      uint32_t prio = 65535;
+      zan_ast_list_t *al = zan_ast_attributes(m);
+      for (int ai = 0; al && ai < al->count; ai++) {
+        zan_ast_node_t *at = al->items[ai];
+        if (at && at->kind == AST_ATTRIBUTE && at->attribute.name &&
+            at->attribute.name->ident.name.len == 4 &&
+            memcmp(at->attribute.name->ident.name.str, lfname, 4) == 0 &&
+            at->attribute.args.count == 1 &&
+            at->attribute.args.items[0] &&
+            at->attribute.args.items[0]->kind == AST_INT_LITERAL) {
+          prio = (uint32_t)at->attribute.args.items[0]->int_val;
+          break;
+        }
+      }
+      user_lifecycle[user_lifecycle_cnt].fn = work[w].fn;
+      user_lifecycle[user_lifecycle_cnt].priority = prio;
+      user_lifecycle[user_lifecycle_cnt].is_dtor = (lf == 1);
+      user_lifecycle_cnt++;
+    }
+    char alias_tgt[256];
+    if (zan_ast_attr_string(m, "Alias", alias_tgt, sizeof(alias_tgt))) {
+      LLVMValueRef tfn = LLVMGetNamedFunction(g->mod, alias_tgt);
+      if (!tfn) {
+        size_t tlen = strlen(alias_tgt);
+        for (int k = 0; k < work_count; k++) {
+          if (!work[k].cur_inst && work[k].type_sym == work[w].type_sym &&
+              work[k].member && work[k].member->kind == AST_METHOD_DECL &&
+              (work[k].member->method_decl.modifiers & MOD_STATIC) &&
+              work[k].member->method_decl.name.len == tlen &&
+              memcmp(work[k].member->method_decl.name.str, alias_tgt, tlen) == 0) {
+            tfn = work[k].fn;
+            break;
+          }
+        }
+      }
+      if (!tfn || tfn == work[w].fn || LLVMIsDeclaration(tfn)) {
+        zan_diag_emit_code(g->diag, DIAG_ERROR, m->loc, 3107,
+                           "[Alias(\"%s\")] target must be a defined function in the same module",
+                           alias_tgt);
+      } else {
+        LLVMValueRef old_fn = work[w].fn;
+        size_t nm_len = 0;
+        const char *old_nm = LLVMGetValueName2(old_fn, &nm_len);
+        char alias_nm[512];
+        snprintf(alias_nm, sizeof(alias_nm), "%.*s", (int)nm_len, old_nm ? old_nm : "");
+        LLVMTypeRef fty = LLVMGlobalGetValueType(old_fn);
+        LLVMVisibility vis = LLVMGetVisibility(old_fn);
+        LLVMLinkage lnk = zan_ast_has_attr(m, "Weak")
+                              ? LLVMWeakAnyLinkage
+                              : LLVMExternalLinkage;
+        LLVMSetValueName2(old_fn, "", 0);
+        LLVMValueRef alias = LLVMAddAlias2(g->mod, fty, 0, tfn, alias_nm);
+        LLVMSetLinkage(alias, lnk);
+        LLVMSetVisibility(alias, vis);
+        if (lnk == LLVMWeakAnyLinkage || vis == LLVMHiddenVisibility)
+          LLVMSetDLLStorageClass(alias, LLVMDefaultStorageClass);
+        LLVMReplaceAllUsesWith(old_fn, alias);
+        LLVMDeleteFunction(old_fn);
+        work[w].fn = alias;
+      }
     }
   }
   free(live);
@@ -771,25 +930,41 @@ done:;
    * （live/dtor/tyname/meta/desc）。反射 ctor thunk 的分配点原本在
    * finalize 才登记，名表早已冻结——反射造出的对象过不了任何
    * is/下转（MapRow (T)obj 全军覆没）。 */
-  if (!prune_stdlib_bodies)
-    emit_vtables(g);
-  do {
-    refl_reserve_thunk_sites(g);
-  } while (materialize_pending_gctx(g));
-  emit_site_live_tables(g);
-  emit_site_dtor_table(g);
-  emit_site_tyname_table(g);
-  emit_site_meta_table(g);
-  if (need_heap_diag)
-    emit_site_field_graph_table(g);
-  zan_irgen_emit_arc_desc_init(g, need_heap_diag);
-  emit_all_class_releases(g);
-  refl_finalize_mtabs(g);
-  while (materialize_pending_gctx(g)) {
+  if (!g->freestanding && !g->emit_obj) {
+    if (!prune_stdlib_bodies)
+      emit_vtables(g);
+    do {
+      refl_reserve_thunk_sites(g);
+    } while (materialize_pending_gctx(g));
+    emit_site_live_tables(g);
+    emit_site_dtor_table(g);
+    emit_site_tyname_table(g);
+    emit_site_meta_table(g);
+    if (need_heap_diag)
+      emit_site_field_graph_table(g);
+    zan_irgen_emit_arc_desc_init(g, need_heap_diag);
+    emit_all_class_releases(g);
+    refl_finalize_mtabs(g);
+    while (materialize_pending_gctx(g)) {
+    }
+    if (g->emit_lib && g->emit_shared && g->target_is_windows)
+      emit_windows_dll_main(g);
+    zan_irgen_emit_string_deobf(g);
+  } else {
+    if (g->builder)
+      LLVMClearInsertionPosition(g->builder);
+    LLVMValueRef ctors = LLVMGetNamedGlobal(g->mod, "llvm.global_ctors");
+    if (ctors)
+      LLVMDeleteGlobal(ctors);
+    LLVMValueRef stdio_init = LLVMGetNamedFunction(g->mod, "__zan_stdio_init");
+    if (stdio_init && !LLVMGetFirstUse(stdio_init))
+      LLVMDeleteFunction(stdio_init);
   }
-  if (g->emit_lib && g->emit_shared && g->target_is_windows)
-    emit_windows_dll_main(g);
-  zan_irgen_emit_string_deobf(g);
+  for (int li = 0; li < user_lifecycle_cnt; li++) {
+    zan_append_global_ctor_dtor(g, user_lifecycle[li].is_dtor,
+                                user_lifecycle[li].fn,
+                                user_lifecycle[li].priority);
+  }
   if (g->tid_name_reg_global) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     unsigned n = (unsigned)g->tid_name_count;
@@ -1015,6 +1190,8 @@ int zan_irgen_prune_extern_libs(zan_irgen_t *g) {
   g->uses_decimal_runtime = false;
   g->has_async_work = false;
   LLVMValueRef legacy_pump = LLVMGetNamedFunction(g->mod, "zan_io_pump");
+  if (legacy_pump && LLVMGetLinkage(legacy_pump) != LLVMWeakAnyLinkage)
+    legacy_pump = NULL;
   bool legacy_pump_dead = legacy_pump && LLVMGetFirstUse(legacy_pump) == NULL;
   if (legacy_pump_dead && (!g->emit_lib || g->emit_shared)) {
     LLVMDeleteFunction(legacy_pump);
@@ -1042,6 +1219,7 @@ int zan_irgen_prune_extern_libs(zan_irgen_t *g) {
                strncmp(nm, "zan_mmap_", 9) == 0 ||
                strncmp(nm, "zan_monitor_", 12) == 0 ||
                strncmp(nm, "zan_monotonic_", 14) == 0 ||
+               strncmp(nm, "zan_parallel_", 13) == 0 ||
                strncmp(nm, "zan_plat_", 9) == 0 ||
                strncmp(nm, "zan_proc_", 9) == 0 ||
                strncmp(nm, "zan_shared_", 11) == 0 ||
@@ -1331,12 +1509,12 @@ zan_status_t zan_bind_target_layout(zan_irgen_t *g,
                     "-fma,-bmi,-bmi2,-popcnt";
     else if (g->cpu_profile && strcmp(g->cpu_profile, "avx2") == 0)
       tm_features =
-          "+sse3,+ssse3,+sse4.1,+sse4.2,+crc32,+aes,+avx,+avx2,+fma,+bmi";
+          "+sse3,+ssse3,+sse4.1,+sse4.2,+crc32,+aes,+avx,+avx2,+fma,+bmi,+cx16";
     else
       tm_features =
           strstr(triple, "android")
               ? "+sse4.2,+crc32,+popcnt,+cx16"
-              : "+sse3,+ssse3,+sse4.1,+sse4.2,+crc32,+aes,+avx,+avx2,+fma,+bmi";
+              : "+sse3,+ssse3,+sse4.1,+sse4.2,+crc32,+aes,+avx,+avx2,+fma,+bmi,+cx16";
   } else if (strncmp(triple, "aarch64", 7) == 0 ||
              strncmp(triple, "arm64", 5) == 0) {
     tm_features = "+aes";
@@ -1363,10 +1541,23 @@ zan_status_t zan_bind_target_layout(zan_irgen_t *g,
     cg = LLVMCodeGenLevelDefault;
   else if (clvl == 3)
     cg = LLVMCodeGenLevelAggressive;
+  if (g->target_cpu_override && g->target_cpu_override[0])
+    tm_cpu = g->target_cpu_override;
+  if (g->target_features_override)
+    tm_features = g->target_features_override;
   /* 记下后端选用的 CPU/特性：--emit-ir 的产物要靠它自述目标特性，
      否则消费方（llc 等）用 generic CPU 拿到 256 位向量路径会合法化失败。 */
   snprintf(g->target_cpu, sizeof(g->target_cpu), "%s", tm_cpu);
   snprintf(g->target_features, sizeof(g->target_features), "%s", tm_features);
+  LLVMRelocMode reloc_mode = LLVMRelocPIC;
+  if (g->reloc_model_kind == 1) reloc_mode = LLVMRelocStatic;
+  else if (g->reloc_model_kind == 2) reloc_mode = LLVMRelocPIC;
+  else if (g->reloc_model_kind == 3) reloc_mode = LLVMRelocDynamicNoPic;
+  LLVMCodeModel code_model = LLVMCodeModelDefault;
+  if (g->code_model_kind == 1) code_model = LLVMCodeModelSmall;
+  else if (g->code_model_kind == 2) code_model = LLVMCodeModelKernel;
+  else if (g->code_model_kind == 3) code_model = LLVMCodeModelMedium;
+  else if (g->code_model_kind == 4) code_model = LLVMCodeModelLarge;
   /* Android's API 28 floor predates ELF TLS. Match the NDK's codegen.
    * Wasm catchpads require the target's native exception model. */
   bool emulated_tls = strstr(triple, "android") != NULL;
@@ -1375,7 +1566,7 @@ zan_status_t zan_bind_target_layout(zan_irgen_t *g,
           ? zan_create_target_machine_with_options(
                 target, triple, tm_cpu, tm_features, cg, emulated_tls, wasm)
           : LLVMCreateTargetMachine(target, triple, tm_cpu, tm_features, cg,
-                                    LLVMRelocPIC, LLVMCodeModelDefault);
+                                    reloc_mode, code_model);
   if (!tm) {
     zan_diag_emit_code(g->diag, DIAG_ERROR, zan_loc(0, 0, 0, 0), 3091,
                        "failed to create target machine for '%s'", triple);

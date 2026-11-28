@@ -1,0 +1,1180 @@
+// rt_io_plat.zan: Platform FFI, opaque stack buffers, cross-platform locks,
+// zero-ThreadStatic FLS/pthread_key TLS, socket helpers, cpu_count, eprint.
+// 100% pure Zan, zero assembly.
+
+namespace Zan.Runtime.Io;
+
+struct IoBuf16 { public ulong A; public ulong B; }
+struct IoBuf32 { public IoBuf16 A; public IoBuf16 B; }
+struct IoBuf48 { public IoBuf32 A; public IoBuf16 B; }
+struct IoBuf64 { public IoBuf32 A; public IoBuf32 B; }
+struct IoBuf128 { public IoBuf64 A; public IoBuf64 B; }
+struct IoBuf256 { public IoBuf128 A; public IoBuf128 B; }
+struct IoBuf512 { public IoBuf256 A; public IoBuf256 B; }
+struct IoBuf1024 { public IoBuf512 A; public IoBuf512 B; }
+struct IoBuf2048 { public IoBuf1024 A; public IoBuf1024 B; }
+struct IoBuf4096 { public IoBuf2048 A; public IoBuf2048 B; }
+
+static class IoConst {
+    internal const int ZAN_IO_READ = 1;
+    internal const int ZAN_IO_WRITE = 2;
+    internal const int ZAN_IO_SA_STRIDE = 32;
+    internal const int ZAN_IO_FAST_BURST = 64;
+    internal const int ZAN_IO_MAXSHARD = 256;
+    internal const int ZAN_OP_TLS_CAP = 32;
+    internal const int ZAN_CO_FRAME_CLASSES = 4;
+    internal const int ZAN_CO_FRAME_POOL_CAP = 32;
+
+    // IoTls byte offsets (total 1424 bytes)
+    internal const long TLS_IP_BUF = 0L;           // 64 bytes
+    internal const long TLS_CO_SELF = 64L;         // nint
+    internal const long TLS_PEND_RBUF = 72L;       // nint
+    internal const long TLS_PEND_OUTN = 80L;       // nint
+    internal const long TLS_PEND_ACCEPT = 88L;     // nint
+    internal const long TLS_PEND_RLEN = 96L;       // int
+    internal const long TLS_FAST_BUDGET = 100L;    // int
+    internal const long TLS_STUCK_SINCE = 104L;    // uint
+    internal const long TLS_OP_CNT = 108L;         // int
+    internal const long TLS_OP_ITEMS = 112L;       // 32 * 8 = 256
+    internal const long TLS_FRM_CNT = 368L;        // 4 * 8 = 32
+    internal const long TLS_FRM_ITEMS = 400L;      // 4 * 32 * 8 = 1024
+    internal const ulong TLS_SIZE = 1424UL;
+
+#if WINDOWS
+    internal const int AF_UNSPEC = 0;
+    internal const int AF_INET = 2;
+    internal const int AF_INET6 = 23;
+    internal const int SOCK_STREAM = 1;
+    internal const int SOCK_DGRAM = 2;
+    internal const int IPPROTO_TCP = 6;
+    internal const int SOL_SOCKET = 65535;
+    internal const int SO_ACCEPTCONN = 0x2;
+    internal const int SO_ERROR = 0x1007;
+    internal const int SO_TYPE = 0x1008;
+    internal const int SO_UPDATE_ACCEPT_CONTEXT = 0x700b;
+    internal const uint FIONBIO = 0x8004667eU;
+    internal const int MSG_PEEK = 2;
+    internal const uint WSA_FLAG_OVERLAPPED = 1U;
+    internal const int WSAEINTR = 10004;
+    internal const int WSAEWOULDBLOCK = 10035;
+    internal const int WSAEINPROGRESS = 10036;
+    internal const int WSAEALREADY = 10037;
+    internal const int WSA_IO_PENDING = 997;
+    internal const uint ERROR_INVALID_PARAMETER = 87U;
+    internal const byte FILE_SKIP_COMPLETION_PORT_ON_SUCCESS = 1;
+    internal const uint WT_EXECUTELONGFUNCTION = 0x10U;
+    internal const uint SIO_GET_EXTENSION_FUNCTION_POINTER = 0xc8000006U;
+    internal const uint INFINITE_WAIT = 0xFFFFFFFFU;
+    internal const uint FLS_OUT_OF_INDEXES = 0xFFFFFFFFU;
+    internal const long AI_ADDRLEN_OFF = 16L;
+    internal const long AI_ADDR_OFF = 32L;
+    internal const long AI_NEXT_OFF = 40L;
+    internal const ulong SOCKADDR_IN_SIZE = 16UL;
+    internal const ulong SOCKADDR_IN6_SIZE = 28UL;
+#elif MACOS
+    internal const int AF_UNSPEC = 0;
+    internal const int AF_INET = 2;
+    internal const int AF_INET6 = 30;
+    internal const int SOCK_STREAM = 1;
+    internal const int SOCK_DGRAM = 2;
+    internal const int SOL_SOCKET = 0xFFFF;
+    internal const int SO_ERROR = 0x1007;
+    internal const int SO_NOSIGPIPE = 0x1022;
+    internal const int MSG_NOSIGNAL = 0;
+    internal const int MSG_DONTWAIT = 0x80;
+    internal const int O_NONBLOCK = 0x4;
+    internal const int F_GETFD = 1;
+    internal const int F_SETFD = 2;
+    internal const int F_GETFL = 3;
+    internal const int F_SETFL = 4;
+    internal const int FD_CLOEXEC = 1;
+    internal const short EVFILT_READ = (short)(-1);
+    internal const short EVFILT_WRITE = (short)(-2);
+    internal const ushort EV_ADD = 0x0001;
+    internal const ushort EV_DELETE = 0x0002;
+    internal const ushort EV_ONESHOT = 0x0010;
+    internal const ushort EV_ERROR = 0x4000;
+    internal const ushort EV_EOF = 0x8000;
+    internal const long KEVENT_SIZE = 32L;
+    internal const int EINTR = 4;
+    internal const int EAGAIN = 35;
+    internal const int EWOULDBLOCK = 35;
+    internal const int EEXIST = 17;
+    internal const int ENOENT = 2;
+    internal const int EINPROGRESS = 36;
+    internal const int EALREADY = 37;
+    internal const int SIGPIPE = 13;
+    internal const int SC_NPROCESSORS_ONLN = 58;
+    internal const int CLOCK_REALTIME = 0;
+    internal const int CLOCK_MONOTONIC = 6;
+    internal const int FD_SETSIZE = 1024;
+    internal const long AI_ADDRLEN_OFF = 16L;
+    internal const long AI_ADDR_OFF = 32L;
+    internal const long AI_NEXT_OFF = 40L;
+    internal const ulong SOCKADDR_IN_SIZE = 16UL;
+    internal const ulong SOCKADDR_IN6_SIZE = 28UL;
+#else
+    internal const int AF_UNSPEC = 0;
+    internal const int AF_INET = 2;
+    internal const int AF_INET6 = 10;
+    internal const int SOCK_STREAM = 1;
+    internal const int SOCK_DGRAM = 2;
+    internal const int SOL_SOCKET = 1;
+    internal const int SO_ERROR = 4;
+    internal const int MSG_NOSIGNAL = 0x4000;
+    internal const int MSG_DONTWAIT = 0x40;
+    internal const int O_NONBLOCK = 0x800;
+    internal const int F_GETFD = 1;
+    internal const int F_SETFD = 2;
+    internal const int F_GETFL = 3;
+    internal const int F_SETFL = 4;
+    internal const int FD_CLOEXEC = 1;
+    internal const int EPOLL_CLOEXEC = 0x80000;
+    internal const int EFD_NONBLOCK = 0x800;
+    internal const int EFD_CLOEXEC = 0x80000;
+    internal const int EPOLL_CTL_ADD = 1;
+    internal const int EPOLL_CTL_DEL = 2;
+    internal const int EPOLL_CTL_MOD = 3;
+    internal const uint EPOLLIN = 1U;
+    internal const uint EPOLLOUT = 4U;
+    internal const uint EPOLLERR = 8U;
+    internal const uint EPOLLHUP = 0x10U;
+    internal const uint EPOLLONESHOT = 0x40000000U;
+    internal const int SOCK_NONBLOCK = 0x800;
+    internal const int SOCK_CLOEXEC = 0x80000;
+    internal const int EINTR = 4;
+    internal const int EAGAIN = 11;
+    internal const int EWOULDBLOCK = 11;
+    internal const int EEXIST = 17;
+    internal const int ENOENT = 2;
+    internal const int EINPROGRESS = 115;
+    internal const int EALREADY = 114;
+    internal const int SIGPIPE = 13;
+    internal const int SC_NPROCESSORS_ONLN = 84;
+    internal const int CLOCK_REALTIME = 0;
+    internal const int CLOCK_MONOTONIC = 1;
+    internal const int FD_SETSIZE = 1024;
+    internal const long AI_ADDRLEN_OFF = 16L;
+    internal const long AI_ADDR_OFF = 24L;
+    internal const long AI_NEXT_OFF = 40L;
+    internal const ulong SOCKADDR_IN_SIZE = 16UL;
+    internal const ulong SOCKADDR_IN6_SIZE = 28UL;
+#endif
+}
+
+static class IoPlat {
+    // ---- Runtime imports ----
+    [DllImport("crt", EntryPoint = "zan_rt_fatal")]
+    internal static extern void RtFatal(nint cat, nint msg);
+
+    [DllImport("crt", EntryPoint = "zan_co_precise_us")]
+    internal static extern long CoPreciseUs();
+
+    [DllImport("crt", EntryPoint = "zan_timer_after_ctx")]
+    internal static extern ulong TimerAfterCtx(long ms, nint cb, nint ctx);
+
+    [DllImport("crt", EntryPoint = "zan_timer_dispatch_due_wait")]
+    internal static extern void TimerDispatchDueWait();
+
+    [DllImport("crt", EntryPoint = "zan_timer_next_timeout")]
+    internal static extern long TimerNextTimeout();
+
+#if WINDOWS
+    [DllImport("crt", EntryPoint = "zan__crash_install")]
+    internal static extern void CrashInstall();
+#endif
+
+#if ZAN_CO_DRIVER
+    [DllImport("crt", EntryPoint = "zan_async_cfg_io_shards")]
+    internal static extern int AsyncCfgIoShards();
+
+    [DllImport("crt", EntryPoint = "zan_async_cfg_workers")]
+    internal static extern int AsyncCfgWorkers();
+
+#if WINDOWS
+    [DllImport("crt", EntryPoint = "zan_async_cfg_sync_fast")]
+    internal static extern int AsyncCfgSyncFast();
+#endif
+
+    [DllImport("crt", EntryPoint = "zan_co_live_count")]
+    internal static extern long CoLiveCount();
+
+    [DllImport("crt", EntryPoint = "zan_co_quantum_ms")]
+    internal static extern long CoQuantumMs();
+
+    [DllImport("crt", EntryPoint = "zan_task_frame_allocator")]
+    internal static extern void TaskFrameAllocator(nint frame, nint releaseFn);
+
+    [DllImport("crt", EntryPoint = "zan_task_retire")]
+    internal static extern void TaskRetire(nint frame, nint releaseFn);
+
+    [DllImport("crt", EntryPoint = "zan_task_run_profiled")]
+    internal static extern void TaskRunProfiled(nint frame, nint step);
+
+    [DllImport("crt", EntryPoint = "zan_timer_delay")]
+    internal static extern void TimerDelay(long ms, nint frame, nint step);
+
+    [DllImport("crt", EntryPoint = "zan_timer_dispatch_due")]
+    internal static extern void TimerDispatchDue();
+
+    [DllImport("crt", EntryPoint = "zan_timer_pending")]
+    internal static extern int TimerPending();
+
+    [DllImport("crt", EntryPoint = "zan_timer_runtime_reset")]
+    internal static extern void TimerRuntimeReset();
+
+    [DllImport("crt", EntryPoint = "zan_timer_set_ready_hook")]
+    internal static extern void TimerSetReadyHook(nint hookFn);
+#else
+    [DllImport("crt", EntryPoint = "zan_co_ready")]
+    internal static extern void ExtCoReady(nint frame, nint step);
+#endif
+
+    internal static void WakeCo(nint frame, nint step) {
+#if ZAN_CO_DRIVER
+        IoSched.CoReady(frame, step);
+#else
+        ExtCoReady(frame, step);
+#endif
+    }
+
+    // ---- Standard C library ----
+    [DllImport("crt", EntryPoint = "malloc")]
+    internal static extern nint CMalloc(ulong sz);
+
+    [DllImport("crt", EntryPoint = "calloc")]
+    internal static extern nint CCalloc(ulong cnt, ulong sz);
+
+    [DllImport("crt", EntryPoint = "realloc")]
+    internal static extern nint CRealloc(nint p, ulong sz);
+
+    [DllImport("crt", EntryPoint = "free")]
+    internal static extern void CFree(nint p);
+
+    [DllImport("crt", EntryPoint = "memcpy")]
+    internal static extern nint CMemcpy(nint dst, nint src, ulong n);
+
+    [DllImport("crt", EntryPoint = "memset")]
+    internal static extern nint CMemset(nint dst, int c, ulong n);
+
+    [DllImport("crt", EntryPoint = "memcmp")]
+    internal static extern int CMemcmp(nint a, nint b, ulong n);
+
+    [DllImport("crt", EntryPoint = "strlen")]
+    internal static extern ulong CStrLen(nint s);
+
+    [DllImport("crt", EntryPoint = "strchr")]
+    internal static extern nint CStrChr(nint s, int c);
+
+    [DllImport("crt", EntryPoint = "strcmp")]
+    internal static extern int CStrCmp(nint a, nint b);
+
+    [DllImport("crt", EntryPoint = "getenv")]
+    internal static extern nint CGetEnv(nint name);
+
+    [DllImport("crt", EntryPoint = "atoi")]
+    internal static extern int CAtoi(nint s);
+
+    [DllImport("crt", EntryPoint = "abort")]
+    internal static extern void CAbort();
+
+    [DllImport("crt", EntryPoint = "atexit")]
+    internal static extern int CAtExit(nint fn);
+
+    // ---- Platform FFI ----
+#if WINDOWS
+    [DllImport("crt", EntryPoint = "__acrt_iob_func")]
+    internal static extern nint WinAcrtIobFunc(uint index);
+
+    [DllImport("crt", EntryPoint = "fputs")]
+    internal static extern int CFputs(nint s, nint stream);
+
+    [DllImport("crt", EntryPoint = "fputc")]
+    internal static extern int CFputc(int c, nint stream);
+
+    [DllImport("crt", EntryPoint = "fflush")]
+    internal static extern int CFflush(nint stream);
+
+    [DllImport("kernel32", EntryPoint = "GetSystemInfo")]
+    internal static extern void WinGetSystemInfo(nint siPtr);
+
+    [DllImport("kernel32", EntryPoint = "GetTickCount64")]
+    internal static extern ulong WinGetTickCount64();
+
+    [DllImport("kernel32", EntryPoint = "GetTickCount")]
+    internal static extern uint WinGetTickCount();
+
+    [DllImport("kernel32", EntryPoint = "GetCurrentThreadId")]
+    internal static extern uint WinGetCurrentThreadId();
+
+    [DllImport("kernel32", EntryPoint = "Sleep")]
+    internal static extern void WinSleep(uint ms);
+
+    [DllImport("kernel32", EntryPoint = "SwitchToThread")]
+    internal static extern int WinSwitchToThread();
+
+    [DllImport("kernel32", EntryPoint = "GetLastError")]
+    internal static extern uint WinGetLastError();
+
+    [DllImport("kernel32", EntryPoint = "CloseHandle")]
+    internal static extern int WinCloseHandle(nint h);
+
+    [DllImport("kernel32", EntryPoint = "CreateThread")]
+    internal static extern nint WinCreateThread(nint sec, ulong stack, nint fn, nint arg, uint flags, nint tidOut);
+
+    [DllImport("kernel32", EntryPoint = "WaitForSingleObject")]
+    internal static extern uint WinWaitForSingleObject(nint h, uint ms);
+
+    [DllImport("kernel32", EntryPoint = "QueueUserWorkItem")]
+    internal static extern int WinQueueUserWorkItem(nint fn, nint ctx, uint flags);
+
+    [DllImport("kernel32", EntryPoint = "GetEnvironmentVariableA")]
+    internal static extern uint WinGetEnvA(nint name, nint buf, uint sz);
+
+    [DllImport("kernel32", EntryPoint = "LoadLibraryA")]
+    internal static extern nint WinLoadLibraryA(nint name);
+
+    [DllImport("kernel32", EntryPoint = "LoadLibraryW")]
+    internal static extern nint WinLoadLibraryW(nint name);
+
+    [DllImport("kernel32", EntryPoint = "FreeLibrary")]
+    internal static extern int WinFreeLibrary(nint mod);
+
+    [DllImport("kernel32", EntryPoint = "GetProcAddress")]
+    internal static extern nint WinGetProcAddress(nint mod, nint name);
+
+    [DllImport("kernel32", EntryPoint = "InitializeCriticalSection")]
+    internal static extern void WinInitCs(nint cs);
+
+    [DllImport("kernel32", EntryPoint = "DeleteCriticalSection")]
+    internal static extern void WinDeleteCs(nint cs);
+
+    [DllImport("kernel32", EntryPoint = "EnterCriticalSection")]
+    internal static extern void WinEnterCs(nint cs);
+
+    [DllImport("kernel32", EntryPoint = "TryEnterCriticalSection")]
+    internal static extern int WinTryEnterCs(nint cs);
+
+    [DllImport("kernel32", EntryPoint = "LeaveCriticalSection")]
+    internal static extern void WinLeaveCs(nint cs);
+
+    [DllImport("kernel32", EntryPoint = "AcquireSRWLockExclusive")]
+    internal static extern void WinAcquireSrw(nint lk);
+
+    [DllImport("kernel32", EntryPoint = "ReleaseSRWLockExclusive")]
+    internal static extern void WinReleaseSrw(nint lk);
+
+    [DllImport("kernel32", EntryPoint = "SleepConditionVariableSRW")]
+    internal static extern int WinSleepCvSrw(nint cv, nint srw, uint ms, uint flags);
+
+    [DllImport("kernel32", EntryPoint = "WakeConditionVariable")]
+    internal static extern void WinWakeCv(nint cv);
+
+    [DllImport("kernel32", EntryPoint = "WakeAllConditionVariable")]
+    internal static extern void WinWakeAllCv(nint cv);
+
+    [DllImport("kernel32", EntryPoint = "FlsAlloc")]
+    internal static extern uint WinFlsAlloc(nint cb);
+
+    [DllImport("kernel32", EntryPoint = "FlsGetValue")]
+    internal static extern nint WinFlsGetValue(uint idx);
+
+    [DllImport("kernel32", EntryPoint = "FlsSetValue")]
+    internal static extern int WinFlsSetValue(uint idx, nint val);
+
+    [DllImport("kernel32", EntryPoint = "CreateIoCompletionPort")]
+    internal static extern nint WinCreateIoCompletionPort(nint fileHandle, nint existingPort, ulong key, uint threads);
+
+    [DllImport("kernel32", EntryPoint = "GetQueuedCompletionStatusEx")]
+    internal static extern int WinGetQueuedCompletionStatusEx(nint port, nint entries, uint count, nint removedOut, uint ms, int alertable);
+
+    [DllImport("kernel32", EntryPoint = "PostQueuedCompletionStatus")]
+    internal static extern int WinPostQueuedCompletionStatus(nint port, uint bytes, ulong key, nint ov);
+
+    [DllImport("kernel32", EntryPoint = "CancelIoEx")]
+    internal static extern int WinCancelIoEx(nint handle, nint ov);
+
+    [DllImport("kernel32", EntryPoint = "SetFileCompletionNotificationModes")]
+    internal static extern int WinSetFileCompletionNotificationModes(nint handle, byte flags);
+
+    // Winsock2
+    [DllImport("ws2_32", EntryPoint = "WSAStartup")]
+    internal static extern int WsaStartup(ushort ver, nint wsaData);
+
+    [DllImport("ws2_32", EntryPoint = "WSACleanup")]
+    internal static extern int WsaCleanup();
+
+    [DllImport("ws2_32", EntryPoint = "WSAGetLastError")]
+    internal static extern int WsaGetLastError();
+
+    [DllImport("ws2_32", EntryPoint = "WSASocketW")]
+    internal static extern ulong WsaSocketW(int af, int type, int proto, nint protoInfo, uint group, uint flags);
+
+    [DllImport("ws2_32", EntryPoint = "WSARecv")]
+    internal static extern int WsaRecv(ulong s, nint bufs, uint bufCnt, nint bytesOut, nint flagsInOut, nint ov, nint comp);
+
+    [DllImport("ws2_32", EntryPoint = "WSASend")]
+    internal static extern int WsaSend(ulong s, nint bufs, uint bufCnt, nint bytesOut, uint flags, nint ov, nint comp);
+
+    [DllImport("ws2_32", EntryPoint = "WSAIoctl")]
+    internal static extern int WsaIoctl(ulong s, uint code, nint inBuf, uint inLen, nint outBuf, uint outLen, nint bytesOut, nint ov, nint comp);
+
+    [DllImport("ws2_32", EntryPoint = "closesocket")]
+    internal static extern int WsaCloseSocket(ulong s);
+
+    [DllImport("ws2_32", EntryPoint = "ioctlsocket")]
+    internal static extern int WsaIoctlSocket(ulong s, uint cmd, nint argp);
+
+    [DllImport("ws2_32", EntryPoint = "send")]
+    internal static extern int SockSend(ulong s, nint buf, int len, int flags);
+
+    [DllImport("ws2_32", EntryPoint = "recv")]
+    internal static extern int SockRecv(ulong s, nint buf, int len, int flags);
+
+    [DllImport("ws2_32", EntryPoint = "connect")]
+    internal static extern int SockConnect(ulong s, nint addr, int namelen);
+
+    [DllImport("ws2_32", EntryPoint = "select")]
+    internal static extern int SockSelect(int nfds, nint rfds, nint wfds, nint efds, nint tv);
+
+    [DllImport("ws2_32", EntryPoint = "getsockopt")]
+    internal static extern int SockGetOpt(ulong s, int level, int optname, nint optval, nint optlen);
+
+    [DllImport("ws2_32", EntryPoint = "setsockopt")]
+    internal static extern int SockSetOpt(ulong s, int level, int optname, nint optval, int optlen);
+
+    [DllImport("ws2_32", EntryPoint = "getpeername")]
+    internal static extern int SockGetPeerName(ulong s, nint name, nint namelen);
+
+    [DllImport("ws2_32", EntryPoint = "getsockname")]
+    internal static extern int SockGetSockName(ulong s, nint name, nint namelen);
+
+    [DllImport("ws2_32", EntryPoint = "getaddrinfo")]
+    internal static extern int SockGetAddrInfo(nint node, nint service, nint hints, nint resOut);
+
+    [DllImport("ws2_32", EntryPoint = "freeaddrinfo")]
+    internal static extern void SockFreeAddrInfo(nint res);
+
+    [DllImport("ws2_32", EntryPoint = "inet_ntop")]
+    internal static extern nint SockInetNtop(int af, nint src, nint dst, ulong size);
+
+    [DllImport("ws2_32", EntryPoint = "inet_pton")]
+    internal static extern int SockInetPton(int af, nint src, nint dst);
+#else
+#if MACOS
+    [DllImport("crt", EntryPoint = "__error")]
+    internal static extern nint ErrnoLocation();
+#else
+    [DllImport("crt", EntryPoint = "__errno_location")]
+    internal static extern nint ErrnoLocation();
+#endif
+
+    internal static int GetErrno() {
+        return NativeMemory.AsRef<int>(ErrnoLocation());
+    }
+
+    [DllImport("crt", EntryPoint = "sysconf")]
+    internal static extern long PosixSysconf(int name);
+
+    [DllImport("crt", EntryPoint = "clock_gettime")]
+    internal static extern int PosixClockGetTime(int clkId, nint tsPtr);
+
+    [DllImport("crt", EntryPoint = "nanosleep")]
+    internal static extern int PosixNanosleep(nint req, nint rem);
+
+    [DllImport("crt", EntryPoint = "sched_yield")]
+    internal static extern int PosixSchedYield();
+
+    [DllImport("crt", EntryPoint = "read")]
+    internal static extern long PosixRead(int fd, nint buf, ulong n);
+
+    [DllImport("crt", EntryPoint = "write")]
+    internal static extern long PosixWrite(int fd, nint buf, ulong n);
+
+    [DllImport("crt", EntryPoint = "close")]
+    internal static extern int PosixClose(int fd);
+
+    [DllImport("crt", EntryPoint = "fcntl")]
+    internal static extern int PosixFcntl2(int fd, int cmd);
+
+    [DllImport("crt", EntryPoint = "fcntl")]
+    internal static extern int PosixFcntl3(int fd, int cmd, int arg);
+
+    [DllImport("crt", EntryPoint = "signal")]
+    internal static extern nint PosixSignal(int sig, nint handler);
+
+#if MACOS
+    [DllImport("crt", EntryPoint = "kqueue")]
+    internal static extern int MacKqueue();
+
+    [DllImport("crt", EntryPoint = "kevent")]
+    internal static extern int MacKevent(int kq, nint changelist, int nchanges, nint eventlist, int nevents, nint timeout);
+
+    [DllImport("crt", EntryPoint = "pipe")]
+    internal static extern int PosixPipe(nint fds);
+
+    [DllImport("crt", EntryPoint = "accept")]
+    internal static extern int SockAccept(int fd, nint addr, nint addrlen);
+
+    [DllImport("crt", EntryPoint = "setsockopt")]
+    internal static extern int SockSetOpt(int s, int level, int optname, nint optval, uint optlen);
+#else
+    [DllImport("crt", EntryPoint = "epoll_create1")]
+    internal static extern int PosixEpollCreate1(int flags);
+
+    [DllImport("crt", EntryPoint = "epoll_ctl")]
+    internal static extern int PosixEpollCtl(int epfd, int op, int fd, nint ev);
+
+    [DllImport("crt", EntryPoint = "epoll_wait")]
+    internal static extern int PosixEpollWait(int epfd, nint events, int maxevents, int timeout);
+
+    [DllImport("crt", EntryPoint = "eventfd")]
+    internal static extern int PosixEventfd(uint initval, int flags);
+
+    [DllImport("crt", EntryPoint = "accept4")]
+    internal static extern int SockAccept4(int fd, nint addr, nint addrlen, int flags);
+#endif
+
+    [DllImport("crt", EntryPoint = "send")]
+    internal static extern long SockSend(int s, nint buf, ulong len, int flags);
+
+    [DllImport("crt", EntryPoint = "recv")]
+    internal static extern long SockRecv(int s, nint buf, ulong len, int flags);
+
+    [DllImport("crt", EntryPoint = "connect")]
+    internal static extern int SockConnect(int s, nint addr, uint namelen);
+
+    [DllImport("crt", EntryPoint = "select")]
+    internal static extern int SockSelect(int nfds, nint rfds, nint wfds, nint efds, nint tv);
+
+    [DllImport("crt", EntryPoint = "getsockopt")]
+    internal static extern int SockGetOpt(int s, int level, int optname, nint optval, nint optlen);
+
+    [DllImport("crt", EntryPoint = "getpeername")]
+    internal static extern int SockGetPeerName(int s, nint name, nint namelen);
+
+    [DllImport("crt", EntryPoint = "getaddrinfo")]
+    internal static extern int SockGetAddrInfo(nint node, nint service, nint hints, nint resOut);
+
+    [DllImport("crt", EntryPoint = "freeaddrinfo")]
+    internal static extern void SockFreeAddrInfo(nint res);
+
+    [DllImport("crt", EntryPoint = "inet_ntop")]
+    internal static extern nint SockInetNtop(int af, nint src, nint dst, uint size);
+
+    [DllImport("crt", EntryPoint = "inet_pton")]
+    internal static extern int SockInetPton(int af, nint src, nint dst);
+
+    [DllImport("crt", EntryPoint = "pthread_self")]
+    internal static extern ulong PosixThreadSelf();
+
+    [DllImport("crt", EntryPoint = "pthread_create")]
+    internal static extern int PosixThreadCreate(nint tidOut, nint attr, nint fn, nint arg);
+
+    [DllImport("crt", EntryPoint = "pthread_detach")]
+    internal static extern int PosixThreadDetach(ulong tid);
+
+    [DllImport("crt", EntryPoint = "pthread_join")]
+    internal static extern int PosixThreadJoin(ulong tid, nint retOut);
+
+    [DllImport("crt", EntryPoint = "pthread_mutex_init")]
+    internal static extern int PosixMutexInit(nint mx, nint attr);
+
+    [DllImport("crt", EntryPoint = "pthread_mutex_destroy")]
+    internal static extern int PosixMutexDestroy(nint mx);
+
+    [DllImport("crt", EntryPoint = "pthread_mutex_lock")]
+    internal static extern int PosixMutexLock(nint mx);
+
+    [DllImport("crt", EntryPoint = "pthread_mutex_trylock")]
+    internal static extern int PosixMutexTryLock(nint mx);
+
+    [DllImport("crt", EntryPoint = "pthread_mutex_unlock")]
+    internal static extern int PosixMutexUnlock(nint mx);
+
+    [DllImport("crt", EntryPoint = "pthread_cond_init")]
+    internal static extern int PosixCondInit(nint cv, nint attr);
+
+    [DllImport("crt", EntryPoint = "pthread_cond_destroy")]
+    internal static extern int PosixCondDestroy(nint cv);
+
+    [DllImport("crt", EntryPoint = "pthread_cond_signal")]
+    internal static extern int PosixCondSignal(nint cv);
+
+    [DllImport("crt", EntryPoint = "pthread_cond_broadcast")]
+    internal static extern int PosixCondBroadcast(nint cv);
+
+    [DllImport("crt", EntryPoint = "pthread_cond_timedwait")]
+    internal static extern int PosixCondTimedWait(nint cv, nint mx, nint ts);
+
+    [DllImport("crt", EntryPoint = "pthread_key_create")]
+    internal static extern int PosixKeyCreate(nint keyOut, nint dtor);
+
+#if MACOS
+    [DllImport("crt", EntryPoint = "pthread_getspecific")]
+    internal static extern nint PosixGetSpecific(ulong key);
+
+    [DllImport("crt", EntryPoint = "pthread_setspecific")]
+    internal static extern int PosixSetSpecific(ulong key, nint val);
+#else
+    [DllImport("crt", EntryPoint = "pthread_getspecific")]
+    internal static extern nint PosixGetSpecific(uint key);
+
+    [DllImport("crt", EntryPoint = "pthread_setspecific")]
+    internal static extern int PosixSetSpecific(uint key, nint val);
+#endif
+#endif
+
+    // ---- Cross-platform helpers ----
+    internal static long NowMs() {
+#if WINDOWS
+        return (long)WinGetTickCount64();
+#else
+        IoBuf16 ts = new IoBuf16();
+        PosixClockGetTime(IoConst.CLOCK_MONOTONIC, NativeMemory.AddressOf(ref ts));
+        long sec = NativeMemory.AsRef<long>(NativeMemory.AddressOf(ref ts));
+        long nsec = NativeMemory.AsRef<long>((NativeMemory.AddressOf(ref ts)) + (nint)(8L));
+        return sec * 1000L + nsec / 1000000L;
+#endif
+    }
+
+    internal static void SleepMs(long ms) {
+        if (ms <= 0L) return;
+        if (ms > 0x7FFFFFFFL) ms = 0x7FFFFFFFL;
+#if WINDOWS
+        WinSleep((uint)ms);
+#else
+        IoBuf16 ts = new IoBuf16();
+        nint p = NativeMemory.AddressOf(ref ts);
+        NativeMemory.AsRef<long>(p) = ms / 1000L;
+        NativeMemory.AsRef<long>((p) + (nint)(8L)) = (ms % 1000L) * 1000000L;
+        PosixNanosleep(p, (nint)0);
+#endif
+    }
+
+    internal static void YieldCpu() {
+#if WINDOWS
+        WinSwitchToThread();
+#else
+        PosixSchedYield();
+#endif
+    }
+
+    internal static ulong CurrentTid() {
+#if WINDOWS
+        return (ulong)WinGetCurrentThreadId();
+#else
+        return PosixThreadSelf();
+#endif
+    }
+
+    // Cross-platform mutex (40 bytes fits both Win64 CRITICAL_SECTION=40 and Linux pthread_mutex_t=40)
+    internal static void MutexInit(nint m) {
+#if WINDOWS
+        WinInitCs(m);
+#else
+        PosixMutexInit(m, (nint)0);
+#endif
+    }
+
+    internal static void MutexDestroy(nint m) {
+#if WINDOWS
+        WinDeleteCs(m);
+#else
+        PosixMutexDestroy(m);
+#endif
+    }
+
+    internal static void MutexLock(nint m) {
+#if WINDOWS
+        WinEnterCs(m);
+#else
+        PosixMutexLock(m);
+#endif
+    }
+
+    internal static int MutexTryLock(nint m) {
+#if WINDOWS
+        return WinTryEnterCs(m) != 0 ? 1 : 0;
+#else
+        return PosixMutexTryLock(m) == 0 ? 1 : 0;
+#endif
+    }
+
+    internal static void MutexUnlock(nint m) {
+#if WINDOWS
+        WinLeaveCs(m);
+#else
+        PosixMutexUnlock(m);
+#endif
+    }
+
+    // Endian helpers (little-endian x86_64)
+    internal static ushort Htons(ushort v) {
+        return (ushort)(((v & 0xFFU) << 8) | ((v >> 8) & 0xFFU));
+    }
+
+    internal static uint Ntohl(uint v) {
+        return ((v & 0x000000FFU) << 24) |
+               ((v & 0x0000FF00U) << 8) |
+               ((v & 0x00FF0000U) >> 8) |
+               ((v & 0xFF000000U) >> 24);
+    }
+
+    // Division-free deterministic shard hash (0..n-1) and wrap helper
+    internal static int ShardHash(ulong key, int n) {
+        if (n <= 1) return 0;
+        uint h = (uint)(((key >> 2) ^ (key >> 18)) * 2654435761UL);
+        return (int)(((ulong)h * (ulong)(uint)n) >> 32);
+    }
+
+    internal static int FastModSmall(int val, int n) {
+        if (n <= 1) return 0;
+        int v = val;
+        if (v < 0) v = 0;
+        while (v >= n) v -= n;
+        return v;
+    }
+
+    // Decimal int32 -> NUL-terminated ASCII (no snprintf dependency)
+    internal static void FormatInt32(int v, nint buf, int cap) {
+        if (buf == (nint)0 || cap <= 1) return;
+        int pos = 0;
+        uint uv = 0U;
+        if (v < 0) {
+            NativeMemory.AsRef<byte>((buf) + (nint)((long)pos)) = 45; // '-'
+            pos++;
+            uv = (uint)(0L - (long)v);
+        } else {
+            uv = (uint)v;
+        }
+        IoBuf16 tmp = new IoBuf16();
+        nint tp = NativeMemory.AddressOf(ref tmp);
+        int tn = 0;
+        if (uv == 0U) {
+            NativeMemory.AsRef<byte>(tp) = 48;
+            tn = 1;
+        } else {
+            while (uv > 0U && tn < 15) {
+                uint q = uv / 10U;
+                uint r = uv - q * 10U;
+                NativeMemory.AsRef<byte>((tp) + (nint)((long)tn)) = (byte)(48U + r);
+                tn++;
+                uv = q;
+            }
+        }
+        while (tn > 0 && pos < cap - 1) {
+            tn--;
+            NativeMemory.AsRef<byte>((buf) + (nint)((long)pos)) = NativeMemory.AsRef<byte>((tp) + (nint)((long)tn));
+            pos++;
+        }
+        NativeMemory.AsRef<byte>((buf) + (nint)((long)pos)) = 0;
+    }
+
+    // ---- Zero-ThreadStatic per-thread IoTls via FLS / pthread_key ----
+    static int s_tlsState = 0;
+#if MACOS
+    static ulong s_tlsKey = 0UL;
+#else
+    static uint s_tlsKey = 0xFFFFFFFFU;
+#endif
+
+    [Export("__zan_io_tls_dtor")]
+    [Visibility("hidden")]
+    static void TlsDestructor(nint p) {
+        if (p == (nint)0) return;
+#if WINDOWS && ZAN_CO_DRIVER
+        int opCnt = NativeMemory.AsRef<int>((p) + (nint)(IoConst.TLS_OP_CNT));
+        for (int i = 0; i < opCnt; i++) {
+            nint op = NativeMemory.AsRef<nint>((p) + (nint)(IoConst.TLS_OP_ITEMS + (long)i * 8L));
+            if (op != (nint)0) CFree(op);
+        }
+#endif
+#if ZAN_CO_DRIVER
+        for (int c = 0; c < IoConst.ZAN_CO_FRAME_CLASSES; c++) {
+            ulong cnt = NativeMemory.AsRef<ulong>((p) + (nint)(IoConst.TLS_FRM_CNT + (long)c * 8L));
+            long baseOff = IoConst.TLS_FRM_ITEMS + (long)c * (long)IoConst.ZAN_CO_FRAME_POOL_CAP * 8L;
+            for (ulong i = 0UL; i < cnt && i < (ulong)IoConst.ZAN_CO_FRAME_POOL_CAP; i++) {
+                nint fp = NativeMemory.AsRef<nint>((p) + (nint)(baseOff + (long)i * 8L));
+                if (fp != (nint)0) CFree(fp);
+            }
+        }
+#endif
+        CFree(p);
+    }
+
+    static bool EnsureTlsKey() {
+        int st = Atomic.Load(ref s_tlsState, MemoryOrder.Acquire);
+        if (st == 2) return true;
+        if (st == 3) return false;
+        if (Atomic.CompareExchange(ref s_tlsState, 0, 1, MemoryOrder.AcqRel, MemoryOrder.Acquire) == 0) {
+            bool ok = false;
+#if WINDOWS
+            uint k = WinFlsAlloc(NativeMemory.FunctionPointer(TlsDestructor));
+            if (k != IoConst.FLS_OUT_OF_INDEXES) {
+                s_tlsKey = k;
+                ok = true;
+            }
+#elif MACOS
+            ulong k = 0UL;
+            if (PosixKeyCreate(NativeMemory.AddressOf(ref k), NativeMemory.FunctionPointer(TlsDestructor)) == 0) {
+                s_tlsKey = k;
+                ok = true;
+            }
+#else
+            uint k = 0U;
+            if (PosixKeyCreate(NativeMemory.AddressOf(ref k), NativeMemory.FunctionPointer(TlsDestructor)) == 0) {
+                s_tlsKey = k;
+                ok = true;
+            }
+#endif
+            Atomic.Store(ref s_tlsState, ok ? 2 : 3, MemoryOrder.Release);
+            return ok;
+        }
+        while (Atomic.Load(ref s_tlsState, MemoryOrder.Acquire) == 1) {
+            YieldCpu();
+        }
+        return Atomic.Load(ref s_tlsState, MemoryOrder.Acquire) == 2;
+    }
+
+    internal static nint GetTls(bool create) {
+        if (!EnsureTlsKey()) return (nint)0;
+#if WINDOWS
+        nint p = WinFlsGetValue(s_tlsKey);
+#else
+        nint p = PosixGetSpecific(s_tlsKey);
+#endif
+        if (p != (nint)0 || !create) return p;
+        p = CCalloc(1UL, IoConst.TLS_SIZE);
+        if (p == (nint)0) return (nint)0;
+        NativeMemory.AsRef<int>((p) + (nint)(IoConst.TLS_FAST_BUDGET)) = IoConst.ZAN_IO_FAST_BURST;
+#if WINDOWS
+        if (WinFlsSetValue(s_tlsKey, p) == 0) {
+            CFree(p);
+            return (nint)0;
+        }
+#else
+        if (PosixSetSpecific(s_tlsKey, p) != 0) {
+            CFree(p);
+            return (nint)0;
+        }
+#endif
+        return p;
+    }
+
+    internal static nint GetTlsIpBuf() {
+        nint tls = GetTls(true);
+        return tls != (nint)0 ? tls + (nint)IoConst.TLS_IP_BUF : (nint)0;
+    }
+
+    // ---- Exported utilities & socket helpers ----
+    [Export("zan_cpu_count")]
+    public static int CpuCount() {
+#if WINDOWS
+        IoBuf48 si = new IoBuf48();
+        nint p = NativeMemory.AddressOf(ref si);
+        WinGetSystemInfo(p);
+        uint n = NativeMemory.AsRef<uint>((p) + (nint)(32L));
+        return n > 0U ? (int)n : 1;
+#else
+        long n = PosixSysconf(IoConst.SC_NPROCESSORS_ONLN);
+        return n > 0L ? (int)n : 1;
+#endif
+    }
+
+    [Export("zan_rt_eprint_line")]
+    public static void RtEprintLine(nint text) {
+#if WINDOWS
+        nint err = WinAcrtIobFunc(2U);
+        if (text != (nint)0 && NativeMemory.AsRef<byte>(text) != 0) {
+            CFputs(text, err);
+        }
+        CFputc(13, err);
+        CFputc(10, err);
+        CFflush(err);
+#else
+        if (text != (nint)0 && NativeMemory.AsRef<byte>(text) != 0) {
+            ulong n = CStrLen(text);
+            if (n > 0UL) {
+                long wr = PosixWrite(2, text, n);
+                _ = wr;
+            }
+        }
+        byte nl = 10;
+        long wr2 = PosixWrite(2, NativeMemory.AddressOf(ref nl), 1UL);
+        _ = wr2;
+#endif
+    }
+
+#if WINDOWS
+    internal static int s_socketCleanupRequested = 0;
+#endif
+
+    [Export("zan_io_socket_cleanup")]
+    public static void SocketCleanup() {
+#if WINDOWS
+#if ZAN_CO_DRIVER
+        Atomic.FetchAdd(ref s_socketCleanupRequested, 1, MemoryOrder.AcqRel);
+#else
+        WsaCleanup();
+#endif
+#endif
+    }
+
+    [Export("zan_io_set_nonblocking")]
+    public static int SetNonblocking(nint fd) {
+#if WINDOWS
+        uint mode = 1U;
+        return WsaIoctlSocket((ulong)fd, IoConst.FIONBIO, NativeMemory.AddressOf(ref mode));
+#else
+        int flags = PosixFcntl2((int)fd, IoConst.F_GETFL);
+        if (flags < 0) return -1;
+        return PosixFcntl3((int)fd, IoConst.F_SETFL, flags | IoConst.O_NONBLOCK);
+#endif
+    }
+
+    [Export("zan_io_socket_send")]
+    public static long SocketSend(nint fd, nint buf, long len, int flags) {
+        if (len <= 0L) return len == 0L ? 0L : -2L;
+        if (len > 0x7FFFFFFFL) len = 0x7FFFFFFFL;
+#if WINDOWS
+        for (;;) {
+            int sr = SockSend((ulong)fd, buf, (int)len, flags);
+            if (sr != -1) return (long)sr;
+            int e = WsaGetLastError();
+            if (e == IoConst.WSAEWOULDBLOCK) return -1L;
+            if (e == IoConst.WSAEINTR) continue;
+            return -2L;
+        }
+#else
+        int fl = flags | IoConst.MSG_NOSIGNAL;
+        for (;;) {
+            long r = SockSend((int)fd, buf, (ulong)len, fl);
+            if (r >= 0L) return r;
+            int e = GetErrno();
+            if (e == IoConst.EAGAIN || e == IoConst.EWOULDBLOCK) return -1L;
+            if (e == IoConst.EINTR) continue;
+            return -2L;
+        }
+#endif
+    }
+
+    [Export("zan_io_socket_recv")]
+    public static long SocketRecv(nint fd, nint buf, long len, int flags) {
+        if (len < 0L) return -2L;
+        if (len > 0x7FFFFFFFL) len = 0x7FFFFFFFL;
+#if WINDOWS
+        for (;;) {
+            int rr = SockRecv((ulong)fd, buf, (int)len, flags);
+            if (rr != -1) return (long)rr;
+            int e = WsaGetLastError();
+            if (e == IoConst.WSAEWOULDBLOCK) return -1L;
+            if (e == IoConst.WSAEINTR) continue;
+            return -2L;
+        }
+#else
+        for (;;) {
+            long r = SockRecv((int)fd, buf, (ulong)len, flags);
+            if (r >= 0L) return r;
+            int e = GetErrno();
+            if (e == IoConst.EAGAIN || e == IoConst.EWOULDBLOCK) return -1L;
+            if (e == IoConst.EINTR) continue;
+            return -2L;
+        }
+#endif
+    }
+
+    [Export("zan_io_socket_alive")]
+    public static int SocketAlive(nint fd) {
+#if WINDOWS
+        if ((ulong)fd == 0xFFFFFFFFFFFFFFFFUL) return 0;
+        int type = 0;
+        int tlen = 4;
+        return SockGetOpt((ulong)fd, IoConst.SOL_SOCKET, IoConst.SO_TYPE,
+                          NativeMemory.AddressOf(ref type), NativeMemory.AddressOf(ref tlen)) == 0 ? 1 : 0;
+#else
+        if ((long)fd < 0L) return 0;
+        return PosixFcntl2((int)fd, IoConst.F_GETFD) != -1 ? 1 : 0;
+#endif
+    }
+
+    // fd_set helpers:
+    // Win64 fd_set (520B): uint fd_count@0, ulong fd_array[64]@8
+    // Linux fd_set (128B): ulong fds_bits[16]@0
+    static void FdSetSingle(nint fdset, nint fd) {
+#if WINDOWS
+        NativeMemory.AsRef<uint>(fdset) = 1U;
+        NativeMemory.AsRef<ulong>((fdset) + (nint)(8L)) = (ulong)fd;
+#else
+        CMemset(fdset, 0, 128UL);
+        int s = (int)fd;
+        if (s >= 0 && s < IoConst.FD_SETSIZE) {
+            long wordIdx = (long)(s >> 6);
+            int bit = s & 63;
+            NativeMemory.AsRef<ulong>((fdset) + (nint)(wordIdx * 8L)) = (1UL << bit);
+        }
+#endif
+    }
+
+    static bool FdIsSetSingle(nint fdset, nint fd) {
+#if WINDOWS
+        uint cnt = NativeMemory.AsRef<uint>(fdset);
+        return cnt > 0U && NativeMemory.AsRef<ulong>((fdset) + (nint)(8L)) == (ulong)fd;
+#else
+        int s = (int)fd;
+        if (s < 0 || s >= IoConst.FD_SETSIZE) return false;
+        long wordIdx = (long)(s >> 6);
+        int bit = s & 63;
+        return (NativeMemory.AsRef<ulong>((fdset) + (nint)(wordIdx * 8L)) & (1UL << bit)) != 0UL;
+#endif
+    }
+
+    [Export("zan_io_socket_ready")]
+    public static int SocketReady(nint fd, int writeReady) {
+#if WINDOWS
+        if ((ulong)fd == 0xFFFFFFFFFFFFFFFFUL) return -1;
+        IoBuf16 fds = new IoBuf16();
+        nint fp = NativeMemory.AddressOf(ref fds);
+        FdSetSingle(fp, fd);
+        ulong tv = 0UL; // {0, 0} (8 bytes on Win64)
+        return SockSelect(0,
+                          writeReady != 0 ? (nint)0 : fp,
+                          writeReady != 0 ? fp : (nint)0,
+                          (nint)0, NativeMemory.AddressOf(ref tv));
+#else
+        if ((long)fd < 0L || (long)fd >= (long)IoConst.FD_SETSIZE) return -1;
+        IoBuf128 fds = new IoBuf128();
+        nint fp = NativeMemory.AddressOf(ref fds);
+        FdSetSingle(fp, fd);
+        IoBuf16 tv = new IoBuf16(); // {0, 0} (16 bytes on Linux x86_64)
+        return SockSelect((int)fd + 1,
+                          writeReady != 0 ? (nint)0 : fp,
+                          writeReady != 0 ? fp : (nint)0,
+                          (nint)0, NativeMemory.AddressOf(ref tv));
+#endif
+    }
+
+    [Export("zan_io_connect_status")]
+    public static int ConnectStatus(nint fd) {
+        int err = 0;
+        int elen = 4;
+#if WINDOWS
+        if ((ulong)fd == 0xFFFFFFFFFFFFFFFFUL) return -1;
+        IoBuf16 wfds = new IoBuf16();
+        IoBuf16 efds = new IoBuf16();
+        nint wp = NativeMemory.AddressOf(ref wfds);
+        nint ep = NativeMemory.AddressOf(ref efds);
+        FdSetSingle(wp, fd);
+        FdSetSingle(ep, fd);
+        ulong tv = 0UL;
+        if (SockSelect(0, (nint)0, wp, ep, NativeMemory.AddressOf(ref tv)) < 0) return -1;
+        if (FdIsSetSingle(ep, fd)) {
+            if (SockGetOpt((ulong)fd, IoConst.SOL_SOCKET, IoConst.SO_ERROR,
+                           NativeMemory.AddressOf(ref err), NativeMemory.AddressOf(ref elen)) != 0) return -1;
+            return err != 0 ? err : -1;
+        }
+        if (FdIsSetSingle(wp, fd)) {
+            if (SockGetOpt((ulong)fd, IoConst.SOL_SOCKET, IoConst.SO_ERROR,
+                           NativeMemory.AddressOf(ref err), NativeMemory.AddressOf(ref elen)) != 0) return -1;
+            return err;
+        }
+        return -2;
+#else
+        if ((long)fd < 0L || (long)fd >= (long)IoConst.FD_SETSIZE) return -1;
+        IoBuf128 wfds = new IoBuf128();
+        IoBuf128 efds = new IoBuf128();
+        nint wp = NativeMemory.AddressOf(ref wfds);
+        nint ep = NativeMemory.AddressOf(ref efds);
+        FdSetSingle(wp, fd);
+        FdSetSingle(ep, fd);
+        IoBuf16 tv = new IoBuf16();
+        if (SockSelect((int)fd + 1, (nint)0, wp, ep, NativeMemory.AddressOf(ref tv)) < 0) return -1;
+        uint ulen = 4U;
+        if (FdIsSetSingle(ep, fd)) {
+            if (SockGetOpt((int)fd, IoConst.SOL_SOCKET, IoConst.SO_ERROR,
+                           NativeMemory.AddressOf(ref err), NativeMemory.AddressOf(ref ulen)) != 0) return -1;
+            return err != 0 ? err : -1;
+        }
+        if (FdIsSetSingle(wp, fd)) {
+            if (SockGetOpt((int)fd, IoConst.SOL_SOCKET, IoConst.SO_ERROR,
+                           NativeMemory.AddressOf(ref err), NativeMemory.AddressOf(ref ulen)) != 0) return -1;
+            return err;
+        }
+        return -2;
+#endif
+    }
+
+    [Export("zan_io_connect_sa_start")]
+    public static int ConnectSaStart(nint fd, nint sa, int salen) {
+        if (sa == (nint)0 || IoAddr.SockaddrFamily(sa, salen) == 0) return -1;
+        if (SetNonblocking(fd) != 0) return -1;
+#if WINDOWS
+        int r = SockConnect((ulong)fd, sa, salen);
+        if (r == 0) return 0;
+        int e = WsaGetLastError();
+        if (e == IoConst.WSAEINPROGRESS || e == IoConst.WSAEWOULDBLOCK || e == IoConst.WSAEALREADY) return -2;
+        return e > 0 ? e : -1;
+#else
+        int r = SockConnect((int)fd, sa, (uint)salen);
+        if (r == 0) return 0;
+        int e = GetErrno();
+        if (e == IoConst.EINPROGRESS || e == IoConst.EWOULDBLOCK || e == IoConst.EALREADY) return -2;
+        return e > 0 ? e : -1;
+#endif
+    }
+
+    [Export("zan_io_connect_sa")]
+    public static long ConnectSa(nint fd, nint sa, int salen, int timeoutMs) {
+        int r = ConnectSaStart(fd, sa, salen);
+        if (r == 0 || r != -2) return (long)r;
+#if WINDOWS
+        IoBuf16 wfds = new IoBuf16();
+        IoBuf16 efds = new IoBuf16();
+        nint wp = NativeMemory.AddressOf(ref wfds);
+        nint ep = NativeMemory.AddressOf(ref efds);
+        FdSetSingle(wp, fd);
+        FdSetSingle(ep, fd);
+        ulong tv = 0UL;
+        nint ptv = (nint)0;
+        if (timeoutMs >= 0) {
+            nint tvp = NativeMemory.AddressOf(ref tv);
+            NativeMemory.AsRef<int>(tvp) = timeoutMs / 1000;
+            NativeMemory.AsRef<int>((tvp) + (nint)(4L)) = (timeoutMs % 1000) * 1000;
+            ptv = tvp;
+        }
+        if (SockSelect(0, (nint)0, wp, ep, ptv) <= 0) return -3L;
+        int err = 0;
+        int elen = 4;
+        if (SockGetOpt((ulong)fd, IoConst.SOL_SOCKET, IoConst.SO_ERROR,
+                       NativeMemory.AddressOf(ref err), NativeMemory.AddressOf(ref elen)) != 0) return -1L;
+        return (long)err;
+#else
+        if ((long)fd < 0L || (long)fd >= (long)IoConst.FD_SETSIZE) return -1L;
+        IoBuf128 wfds = new IoBuf128();
+        IoBuf128 efds = new IoBuf128();
+        nint wp = NativeMemory.AddressOf(ref wfds);
+        nint ep = NativeMemory.AddressOf(ref efds);
+        FdSetSingle(wp, fd);
+        FdSetSingle(ep, fd);
+        IoBuf16 tv = new IoBuf16();
+        nint ptv = (nint)0;
+        if (timeoutMs >= 0) {
+            nint tvp = NativeMemory.AddressOf(ref tv);
+            NativeMemory.AsRef<long>(tvp) = (long)(timeoutMs / 1000);
+            NativeMemory.AsRef<long>((tvp) + (nint)(8L)) = (long)((timeoutMs % 1000) * 1000);
+            ptv = tvp;
+        }
+        int sr = 0;
+        for (;;) {
+            sr = SockSelect((int)fd + 1, (nint)0, wp, ep, ptv);
+            if (sr >= 0 || GetErrno() != IoConst.EINTR) break;
+        }
+        if (sr <= 0) return sr == 0 ? -3L : -1L;
+        int err = 0;
+        uint elen = 4U;
+        if (SockGetOpt((int)fd, IoConst.SOL_SOCKET, IoConst.SO_ERROR,
+                       NativeMemory.AddressOf(ref err), NativeMemory.AddressOf(ref elen)) != 0) return -1L;
+        return (long)err;
+#endif
+    }
+}

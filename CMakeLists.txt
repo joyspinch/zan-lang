@@ -362,32 +362,66 @@ else()
     set(ZAN_RT_OBJ_CC ${ZAN_RT_IO_CC})
     set(ZAN_RT_OBJ_SECTIONS -ffunction-sections -fdata-sections)
 endif()
+# Pure-Zan runtime objects compiled directly by `zanc -c -O2 --no-runtime-checks`
+# (zero C compiler needed for migrated runtime modules; falls back to C when
+# cross-compiling or explicitly disabled).
+option(ZAN_PURE_ZAN_RUNTIME "Build migrated runtime objects in pure Zan via zanc -c" ON)
+
+set(ZAN_RT_IO_ZAN_SRCS
+    ${CMAKE_SOURCE_DIR}/src/runtime/zan/io/rt_io_plat.zan
+    ${CMAKE_SOURCE_DIR}/src/runtime/zan/io/rt_io_addr.zan
+    ${CMAKE_SOURCE_DIR}/src/runtime/zan/io/rt_io_gate.zan
+    ${CMAKE_SOURCE_DIR}/src/runtime/zan/io/rt_io_dns.zan
+    ${CMAKE_SOURCE_DIR}/src/runtime/zan/io/rt_io_reactor.zan
+    ${CMAKE_SOURCE_DIR}/src/runtime/zan/io/rt_io_reactor_posix.zan
+    ${CMAKE_SOURCE_DIR}/src/runtime/zan/io/rt_io_sched.zan
+    ${CMAKE_SOURCE_DIR}/src/runtime/zan/io/rt_io_sched_worker.zan)
+
 set(ZAN_RT_IO_OBJ "${CMAKE_BINARY_DIR}/zanrt_io${CMAKE_C_OUTPUT_EXTENSION}")
-add_custom_command(
-    OUTPUT ${ZAN_RT_IO_OBJ}
-    COMMAND ${ZAN_RT_OBJ_CC} ${ZAN_RT_OBJ_FLAGS} ${ZAN_RT_OBJ_DEFS} -DZAN_IO_STACKLESS_ONLY
-            -I ${CMAKE_SOURCE_DIR}/src/runtime ${ZAN_RT_OBJ_OPT} ${ZAN_RT_OBJ_SECTIONS}
-            -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_io.c -o ${ZAN_RT_IO_OBJ}
-    DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_io.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/rt_io.h
-            ${CMAKE_SOURCE_DIR}/src/runtime/rt_co.h
-            ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.h
-            ${CMAKE_SOURCE_DIR}/src/common/host_oom.h
-            ${CMAKE_SOURCE_DIR}/src/runtime/rt_crash.h
-            ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_addr.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_dns.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_co_pool.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_co_sched.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_gate.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_epoll.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_kqueue.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_iocp.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_select.c
-    COMMENT "Building socket-async reactor object (zanrt_io)"
-    VERBATIM)
-add_custom_target(zanrt_io ALL DEPENDS ${ZAN_RT_IO_OBJ})
-add_dependencies(zanc zanrt_io)
-target_compile_definitions(zanc PRIVATE ZAN_RT_IO_OBJ="${ZAN_RT_IO_OBJ}")
+if(ZAN_PURE_ZAN_RUNTIME AND NOT CMAKE_CROSSCOMPILING AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux" OR APPLE))
+    add_custom_command(
+        OUTPUT ${ZAN_RT_IO_OBJ}
+        COMMAND $<TARGET_FILE:zanc> -c -O2 --no-runtime-checks
+                ${ZAN_RT_IO_ZAN_SRCS}
+                -o ${ZAN_RT_IO_OBJ}
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${ZAN_RT_IO_OBJ} $<TARGET_FILE_DIR:zanc>/zanrt_io${CMAKE_C_OUTPUT_EXTENSION}
+        DEPENDS zanc ${ZAN_RT_IO_ZAN_SRCS}
+        COMMENT "Building socket-async reactor object in pure Zan (zanrt_io)"
+        VERBATIM)
+    add_custom_target(zanrt_io ALL DEPENDS ${ZAN_RT_IO_OBJ})
+    target_compile_definitions(zanc PRIVATE ZAN_RT_IO_OBJ="${ZAN_RT_IO_OBJ}")
+else()
+    add_custom_command(
+        OUTPUT ${ZAN_RT_IO_OBJ}
+        COMMAND ${ZAN_RT_OBJ_CC} ${ZAN_RT_OBJ_FLAGS} ${ZAN_RT_OBJ_DEFS} -DZAN_IO_STACKLESS_ONLY
+                -I ${CMAKE_SOURCE_DIR}/src/runtime ${ZAN_RT_OBJ_OPT} ${ZAN_RT_OBJ_SECTIONS}
+                -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_io.c -o ${ZAN_RT_IO_OBJ}
+        DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_io.c
+                ${CMAKE_SOURCE_DIR}/src/runtime/rt_io.h
+                ${CMAKE_SOURCE_DIR}/src/runtime/rt_co.h
+                ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.h
+                ${CMAKE_SOURCE_DIR}/src/common/host_oom.h
+                ${CMAKE_SOURCE_DIR}/src/runtime/rt_crash.h
+                ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_addr.c
+                ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_dns.c
+                ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_co_pool.c
+                ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_co_sched.c
+                ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_gate.c
+                ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_epoll.c
+                ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_kqueue.c
+                ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_iocp.c
+                ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_select.c
+        COMMENT "Building socket-async reactor object (zanrt_io)"
+        VERBATIM)
+    add_custom_target(zanrt_io ALL DEPENDS ${ZAN_RT_IO_OBJ})
+    add_dependencies(zanc zanrt_io)
+    target_compile_definitions(zanc PRIVATE ZAN_RT_IO_OBJ="${ZAN_RT_IO_OBJ}")
+    add_custom_command(TARGET zanc POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${ZAN_RT_IO_OBJ} $<TARGET_FILE_DIR:zanc>/zanrt_io${CMAKE_C_OUTPUT_EXTENSION}
+        VERBATIM)
+endif()
 
 # ---- Unified timer runtime (S4b-2: Task.Delay / Timer min-heap) ----
 # irgen emits zan_timer_* calls from every program's inline coroutine driver
@@ -396,33 +430,59 @@ target_compile_definitions(zanc PRIVATE ZAN_RT_IO_OBJ="${ZAN_RT_IO_OBJ}")
 # Compiled with the same compiler as the reactor so the object matches the
 # ABI of zanc's emitted objects.
 set(ZAN_RT_TIMER_OBJ "${CMAKE_BINARY_DIR}/zanrt_timer${CMAKE_C_OUTPUT_EXTENSION}")
-add_custom_command(
-    OUTPUT ${ZAN_RT_TIMER_OBJ}
-    COMMAND ${ZAN_RT_OBJ_CC} ${ZAN_RT_OBJ_FLAGS} ${ZAN_RT_OBJ_DEFS} -std=c11
-            -I ${CMAKE_SOURCE_DIR}/src/runtime ${ZAN_RT_OBJ_OPT} ${ZAN_RT_OBJ_SECTIONS}
-            -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.c -o ${ZAN_RT_TIMER_OBJ}
-    DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.h
-            ${CMAKE_SOURCE_DIR}/src/common/host_oom.h
-            ${CMAKE_SOURCE_DIR}/src/runtime/rt_crash.h
-            ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_diag.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_core.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_co.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_task.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_misc.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_gc.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_leak.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_defer.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/rt_siphash.h
-    COMMENT "Building unified timer runtime object (zanrt_timer)"
-    VERBATIM)
-add_custom_target(zanrt_timer ALL DEPENDS ${ZAN_RT_TIMER_OBJ})
-add_dependencies(zanc zanrt_timer)
-target_compile_definitions(zanc PRIVATE ZAN_RT_TIMER_OBJ="${ZAN_RT_TIMER_OBJ}")
-add_custom_command(TARGET zanc POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            ${ZAN_RT_TIMER_OBJ} $<TARGET_FILE_DIR:zanc>/zanrt_timer${CMAKE_C_OUTPUT_EXTENSION}
-    VERBATIM)
+if(ZAN_PURE_ZAN_RUNTIME AND NOT CMAKE_CROSSCOMPILING AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux" OR APPLE))
+    set(ZAN_RT_TIMER_ZAN_SRCS
+        ${CMAKE_SOURCE_DIR}/src/runtime/zan/timer/rt_timer_plat.zan
+        ${CMAKE_SOURCE_DIR}/src/runtime/zan/timer/rt_timer_defer.zan
+        ${CMAKE_SOURCE_DIR}/src/runtime/zan/timer/rt_timer_diag.zan
+        ${CMAKE_SOURCE_DIR}/src/runtime/zan/timer/rt_timer_core.zan
+        ${CMAKE_SOURCE_DIR}/src/runtime/zan/timer/rt_timer_co.zan
+        ${CMAKE_SOURCE_DIR}/src/runtime/zan/timer/rt_timer_misc.zan
+        ${CMAKE_SOURCE_DIR}/src/runtime/zan/timer/rt_timer_task.zan
+        ${CMAKE_SOURCE_DIR}/src/runtime/zan/timer/rt_timer_gc.zan
+        ${CMAKE_SOURCE_DIR}/src/runtime/zan/timer/rt_timer_gc_collect.zan
+        ${CMAKE_SOURCE_DIR}/src/runtime/zan/timer/rt_timer_leak.zan)
+    add_custom_command(
+        OUTPUT ${ZAN_RT_TIMER_OBJ}
+        COMMAND $<TARGET_FILE:zanc> -c -O2 --no-runtime-checks
+                ${ZAN_RT_TIMER_ZAN_SRCS}
+                -o ${ZAN_RT_TIMER_OBJ}
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${ZAN_RT_TIMER_OBJ} $<TARGET_FILE_DIR:zanc>/zanrt_timer${CMAKE_C_OUTPUT_EXTENSION}
+        DEPENDS zanc ${ZAN_RT_TIMER_ZAN_SRCS}
+        COMMENT "Building unified timer runtime object in pure Zan (zanrt_timer)"
+        VERBATIM)
+    add_custom_target(zanrt_timer ALL DEPENDS ${ZAN_RT_TIMER_OBJ})
+    target_compile_definitions(zanc PRIVATE ZAN_RT_TIMER_OBJ="${ZAN_RT_TIMER_OBJ}")
+else()
+    add_custom_command(
+        OUTPUT ${ZAN_RT_TIMER_OBJ}
+        COMMAND ${ZAN_RT_OBJ_CC} ${ZAN_RT_OBJ_FLAGS} ${ZAN_RT_OBJ_DEFS} -std=c11
+                -I ${CMAKE_SOURCE_DIR}/src/runtime ${ZAN_RT_OBJ_OPT} ${ZAN_RT_OBJ_SECTIONS}
+                -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.c -o ${ZAN_RT_TIMER_OBJ}
+        DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.c
+                ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.h
+                ${CMAKE_SOURCE_DIR}/src/common/host_oom.h
+                ${CMAKE_SOURCE_DIR}/src/runtime/rt_crash.h
+                ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_diag.c
+                ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_core.c
+                ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_co.c
+                ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_task.c
+                ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_misc.c
+                ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_gc.c
+                ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_leak.c
+                ${CMAKE_SOURCE_DIR}/src/runtime/timer/rt_timer_defer.c
+                ${CMAKE_SOURCE_DIR}/src/runtime/rt_siphash.h
+        COMMENT "Building unified timer runtime object (zanrt_timer)"
+        VERBATIM)
+    add_custom_target(zanrt_timer ALL DEPENDS ${ZAN_RT_TIMER_OBJ})
+    add_dependencies(zanc zanrt_timer)
+    target_compile_definitions(zanc PRIVATE ZAN_RT_TIMER_OBJ="${ZAN_RT_TIMER_OBJ}")
+    add_custom_command(TARGET zanc POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${ZAN_RT_TIMER_OBJ} $<TARGET_FILE_DIR:zanc>/zanrt_timer${CMAKE_C_OUTPUT_EXTENSION}
+        VERBATIM)
+endif()
 
 # ---- Crash reporter / guard-recovery runtime (B-ID106: rt_crash.h 拆出) ----
 # rt_io.c calls zan__crash_install and gui_runtime.c calls zan__guard_call /
@@ -430,26 +490,45 @@ add_custom_command(TARGET zanc POST_BUILD
 # builds) and every zan_gui consumer needs this object next to zanrt_timer.o.
 # Compiled with the same compiler/flags as the reactor for ABI match.
 set(ZAN_RT_CRASH_OBJ "${CMAKE_BINARY_DIR}/zanrt_crash${CMAKE_C_OUTPUT_EXTENSION}")
-add_custom_command(
-    OUTPUT ${ZAN_RT_CRASH_OBJ}
-    COMMAND ${ZAN_RT_OBJ_CC} ${ZAN_RT_OBJ_FLAGS} ${ZAN_RT_OBJ_DEFS} -std=c11
-            -I ${CMAKE_SOURCE_DIR}/src/runtime ${ZAN_RT_OBJ_OPT} ${ZAN_RT_OBJ_SECTIONS}
-            -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_crash.c -o ${ZAN_RT_CRASH_OBJ}
-    DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_crash.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/rt_crash.h
-            ${CMAKE_SOURCE_DIR}/src/runtime/crash/rt_crash_win_io.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/crash/rt_crash_win_sym.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/crash/rt_crash_win_guard.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/crash/rt_crash_posix.c
-    COMMENT "Building crash reporter runtime object (zanrt_crash)"
-    VERBATIM)
-add_custom_target(zanrt_crash ALL DEPENDS ${ZAN_RT_CRASH_OBJ})
-add_dependencies(zanc zanrt_crash)
-target_compile_definitions(zanc PRIVATE ZAN_RT_CRASH_OBJ="${ZAN_RT_CRASH_OBJ}")
-add_custom_command(TARGET zanc POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            ${ZAN_RT_CRASH_OBJ} $<TARGET_FILE_DIR:zanc>/zanrt_crash${CMAKE_C_OUTPUT_EXTENSION}
-    VERBATIM)
+if(ZAN_PURE_ZAN_RUNTIME AND NOT CMAKE_CROSSCOMPILING AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux" OR APPLE))
+    set(ZAN_RT_CRASH_ZAN_SRCS
+        ${CMAKE_SOURCE_DIR}/src/runtime/zan/crash/rt_crash_win_io.zan
+        ${CMAKE_SOURCE_DIR}/src/runtime/zan/crash/rt_crash_win_guard.zan
+        ${CMAKE_SOURCE_DIR}/src/runtime/zan/crash/rt_crash_posix.zan)
+    add_custom_command(
+        OUTPUT ${ZAN_RT_CRASH_OBJ}
+        COMMAND $<TARGET_FILE:zanc> -c -Os --no-runtime-checks
+                ${ZAN_RT_CRASH_ZAN_SRCS}
+                -o ${ZAN_RT_CRASH_OBJ}
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${ZAN_RT_CRASH_OBJ} $<TARGET_FILE_DIR:zanc>/zanrt_crash${CMAKE_C_OUTPUT_EXTENSION}
+        DEPENDS zanc ${ZAN_RT_CRASH_ZAN_SRCS}
+        COMMENT "Building crash reporter runtime object in pure Zan (zanrt_crash)"
+        VERBATIM)
+    add_custom_target(zanrt_crash ALL DEPENDS ${ZAN_RT_CRASH_OBJ})
+    target_compile_definitions(zanc PRIVATE ZAN_RT_CRASH_OBJ="${ZAN_RT_CRASH_OBJ}")
+else()
+    add_custom_command(
+        OUTPUT ${ZAN_RT_CRASH_OBJ}
+        COMMAND ${ZAN_RT_OBJ_CC} ${ZAN_RT_OBJ_FLAGS} ${ZAN_RT_OBJ_DEFS} -std=c11
+                -I ${CMAKE_SOURCE_DIR}/src/runtime ${ZAN_RT_OBJ_OPT} ${ZAN_RT_OBJ_SECTIONS}
+                -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_crash.c -o ${ZAN_RT_CRASH_OBJ}
+        DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_crash.c
+                ${CMAKE_SOURCE_DIR}/src/runtime/rt_crash.h
+                ${CMAKE_SOURCE_DIR}/src/runtime/crash/rt_crash_win_io.c
+                ${CMAKE_SOURCE_DIR}/src/runtime/crash/rt_crash_win_sym.c
+                ${CMAKE_SOURCE_DIR}/src/runtime/crash/rt_crash_win_guard.c
+                ${CMAKE_SOURCE_DIR}/src/runtime/crash/rt_crash_posix.c
+        COMMENT "Building crash reporter runtime object (zanrt_crash)"
+        VERBATIM)
+    add_custom_target(zanrt_crash ALL DEPENDS ${ZAN_RT_CRASH_OBJ})
+    add_dependencies(zanc zanrt_crash)
+    target_compile_definitions(zanc PRIVATE ZAN_RT_CRASH_OBJ="${ZAN_RT_CRASH_OBJ}")
+    add_custom_command(TARGET zanc POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${ZAN_RT_CRASH_OBJ} $<TARGET_FILE_DIR:zanc>/zanrt_crash${CMAKE_C_OUTPUT_EXTENSION}
+        VERBATIM)
+endif()
 
 # ---- Hardware/SIMD runtime: one archive member per feature family ----
 # JSON scanning must not load SHA/AES/SM4 just because all exports once lived
@@ -506,55 +585,85 @@ add_custom_command(TARGET zanc POST_BUILD
             $<TARGET_FILE_DIR:zanc>/libzancrypto${CMAKE_C_STATIC_LIBRARY_SUFFIX}
     VERBATIM)
 
-# Generic embedded-resource read API (src/embed/zan_embed_api.c). The data
+# Generic embedded-resource read API (src/runtime/zan/zan_embed_api.zan). The data
 # table is registered by a generated object (scripts/gen_embed.ps1) when a
 # program embeds resources; the API object itself is injected whenever a
 # program *references* the zan_embed_* functions (e.g. any GUI program calling
 # Skin.EmbedRead), so linking succeeds even with nothing embedded (reads return
-# empty). Mirrors the zanrt_io object pattern; compiled with the same MinGW C
-# compiler so the object matches the ABI of zanc's emitted objects.
+# empty).
 set(ZAN_EMBED_OBJ "${CMAKE_BINARY_DIR}/zan_embed_api${CMAKE_C_OUTPUT_EXTENSION}")
-add_custom_command(
-    OUTPUT ${ZAN_EMBED_OBJ}
-    COMMAND ${ZAN_RT_OBJ_CC} ${ZAN_RT_OBJ_FLAGS} ${ZAN_RT_OBJ_OPT} ${ZAN_RT_OBJ_SECTIONS}
-            -I ${CMAKE_SOURCE_DIR}/src/embed -I ${CMAKE_SOURCE_DIR}/src/runtime
-            -c ${CMAKE_SOURCE_DIR}/src/embed/zan_embed_api.c
-            -o ${ZAN_EMBED_OBJ}
-    DEPENDS ${CMAKE_SOURCE_DIR}/src/embed/zan_embed_api.c
-            ${CMAKE_SOURCE_DIR}/src/embed/zan_embed_string.h
-            ${CMAKE_SOURCE_DIR}/src/common/zan_abi.h
-            ${CMAKE_SOURCE_DIR}/src/common/host_oom.h
-    COMMENT "Building embedded-resource API object (zan_embed_api)"
-    VERBATIM)
-add_custom_target(zan_embed_api ALL DEPENDS ${ZAN_EMBED_OBJ})
-add_dependencies(zanc zan_embed_api)
+if(ZAN_PURE_ZAN_RUNTIME AND NOT CMAKE_CROSSCOMPILING)
+    add_custom_command(
+        OUTPUT ${ZAN_EMBED_OBJ}
+        COMMAND $<TARGET_FILE:zanc> -c -O2 --no-runtime-checks
+                ${CMAKE_SOURCE_DIR}/src/runtime/zan/zan_embed_api.zan
+                -o ${ZAN_EMBED_OBJ}
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${ZAN_EMBED_OBJ} $<TARGET_FILE_DIR:zanc>/zan_embed_api${CMAKE_C_OUTPUT_EXTENSION}
+        DEPENDS zanc
+                ${CMAKE_SOURCE_DIR}/src/runtime/zan/zan_embed_api.zan
+        COMMENT "Building embedded-resource API object in pure Zan (zan_embed_api)"
+        VERBATIM)
+    add_custom_target(zan_embed_api ALL DEPENDS ${ZAN_EMBED_OBJ})
+else()
+    add_custom_command(
+        OUTPUT ${ZAN_EMBED_OBJ}
+        COMMAND ${ZAN_RT_OBJ_CC} ${ZAN_RT_OBJ_FLAGS} ${ZAN_RT_OBJ_OPT} ${ZAN_RT_OBJ_SECTIONS}
+                -I ${CMAKE_SOURCE_DIR}/src/embed -I ${CMAKE_SOURCE_DIR}/src/runtime
+                -c ${CMAKE_SOURCE_DIR}/src/embed/zan_embed_api.c
+                -o ${ZAN_EMBED_OBJ}
+        DEPENDS ${CMAKE_SOURCE_DIR}/src/embed/zan_embed_api.c
+                ${CMAKE_SOURCE_DIR}/src/embed/zan_embed_string.h
+                ${CMAKE_SOURCE_DIR}/src/common/zan_abi.h
+                ${CMAKE_SOURCE_DIR}/src/common/host_oom.h
+        COMMENT "Building embedded-resource API object (zan_embed_api)"
+        VERBATIM)
+    add_custom_target(zan_embed_api ALL DEPENDS ${ZAN_EMBED_OBJ})
+    add_dependencies(zanc zan_embed_api)
+endif()
 target_compile_definitions(zanc PRIVATE ZAN_EMBED_OBJ="${ZAN_EMBED_OBJ}")
 
-# Compressed-resource decoder (src/embed/zan_inflate.c + vendored miniz).
+# Compressed-resource decoder (src/runtime/zan/zan_inflate.zan; C fallback in
+# src/embed/zan_inflate.c + vendored miniz).
 # zanc's --embed bakes deflate-compressed payloads and the inline read API it
-# emits calls zan_embed_decode/rawlen here; the object is linked next to zanc
-# like ZAN_EMBED_OBJ and injected whenever a program embeds resources
-# (irgen.uses_inflate). Decompress-only: archive/zip/stdio APIs compiled out.
+# emits calls zan_embed_decode/rawlen/uncrypt here; the object is linked next to
+# zanc like ZAN_EMBED_OBJ and injected whenever a program embeds resources
+# (irgen.uses_inflate).
 set(ZAN_INFLATE_OBJ "${CMAKE_BINARY_DIR}/zan_inflate${CMAKE_C_OUTPUT_EXTENSION}")
-add_custom_command(
-    OUTPUT ${ZAN_INFLATE_OBJ}
-    COMMAND ${ZAN_RT_OBJ_CC} ${ZAN_RT_OBJ_FLAGS} ${ZAN_RT_OBJ_OPT} ${ZAN_RT_OBJ_SECTIONS}
-            -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_ZIP_APIS -DMINIZ_NO_STDIO
-            -DMINIZ_NO_TIME -DMINIZ_NO_ARCHIVE_WRITERS
-            -I ${CMAKE_SOURCE_DIR}/src/common
-            -c ${CMAKE_SOURCE_DIR}/src/embed/zan_inflate.c
-            -o ${ZAN_INFLATE_OBJ}
-    DEPENDS ${CMAKE_SOURCE_DIR}/src/embed/zan_inflate.c
-            ${CMAKE_SOURCE_DIR}/src/embed/zan_embed_string.h
-            ${CMAKE_SOURCE_DIR}/src/common/zan_abi.h
-            ${CMAKE_SOURCE_DIR}/src/common/miniz.c
-            ${CMAKE_SOURCE_DIR}/src/common/miniz_tinfl.c
-            ${CMAKE_SOURCE_DIR}/src/common/miniz_tdef.c
-            ${CMAKE_SOURCE_DIR}/src/common/miniz.h
-    COMMENT "Building embedded-resource inflate object (zan_inflate)"
-    VERBATIM)
-add_custom_target(zan_inflate ALL DEPENDS ${ZAN_INFLATE_OBJ})
-add_dependencies(zanc zan_inflate)
+if(ZAN_PURE_ZAN_RUNTIME AND NOT CMAKE_CROSSCOMPILING)
+    add_custom_command(
+        OUTPUT ${ZAN_INFLATE_OBJ}
+        COMMAND $<TARGET_FILE:zanc> -c -O2 --no-runtime-checks
+                ${CMAKE_SOURCE_DIR}/src/runtime/zan/zan_inflate.zan
+                -o ${ZAN_INFLATE_OBJ}
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${ZAN_INFLATE_OBJ} $<TARGET_FILE_DIR:zanc>/zan_inflate${CMAKE_C_OUTPUT_EXTENSION}
+        DEPENDS zanc
+                ${CMAKE_SOURCE_DIR}/src/runtime/zan/zan_inflate.zan
+        COMMENT "Building embedded-resource inflate object in pure Zan (zan_inflate)"
+        VERBATIM)
+    add_custom_target(zan_inflate ALL DEPENDS ${ZAN_INFLATE_OBJ})
+else()
+    add_custom_command(
+        OUTPUT ${ZAN_INFLATE_OBJ}
+        COMMAND ${ZAN_RT_OBJ_CC} ${ZAN_RT_OBJ_FLAGS} ${ZAN_RT_OBJ_OPT} ${ZAN_RT_OBJ_SECTIONS}
+                -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_ZIP_APIS -DMINIZ_NO_STDIO
+                -DMINIZ_NO_TIME -DMINIZ_NO_ARCHIVE_WRITERS
+                -I ${CMAKE_SOURCE_DIR}/src/common
+                -c ${CMAKE_SOURCE_DIR}/src/embed/zan_inflate.c
+                -o ${ZAN_INFLATE_OBJ}
+        DEPENDS ${CMAKE_SOURCE_DIR}/src/embed/zan_inflate.c
+                ${CMAKE_SOURCE_DIR}/src/embed/zan_embed_string.h
+                ${CMAKE_SOURCE_DIR}/src/common/zan_abi.h
+                ${CMAKE_SOURCE_DIR}/src/common/miniz.c
+                ${CMAKE_SOURCE_DIR}/src/common/miniz_tinfl.c
+                ${CMAKE_SOURCE_DIR}/src/common/miniz_tdef.c
+                ${CMAKE_SOURCE_DIR}/src/common/miniz.h
+        COMMENT "Building embedded-resource inflate object (zan_inflate)"
+        VERBATIM)
+    add_custom_target(zan_inflate ALL DEPENDS ${ZAN_INFLATE_OBJ})
+    add_dependencies(zanc zan_inflate)
+endif()
 target_compile_definitions(zanc PRIVATE ZAN_INFLATE_OBJ="${ZAN_INFLATE_OBJ}")
 
 # zanc itself hosts the compressor side (embed_maybe_compress in embedres.c):
@@ -569,40 +678,50 @@ target_sources(zanc PRIVATE
 # this object (instead of the single-thread zanrt_io) when a program is built
 # with --async-workers; the emitted program then omits its inline driver.
 set(ZAN_RT_IO_MT_OBJ "${CMAKE_BINARY_DIR}/zanrt_io_mt${CMAKE_C_OUTPUT_EXTENSION}")
-add_custom_command(
-    OUTPUT ${ZAN_RT_IO_MT_OBJ}
-    COMMAND ${ZAN_RT_OBJ_CC} ${ZAN_RT_OBJ_FLAGS} ${ZAN_RT_OBJ_DEFS} -DZAN_IO_STACKLESS_ONLY -DZAN_CO_DRIVER
-            -I ${CMAKE_SOURCE_DIR}/src/runtime ${ZAN_RT_OBJ_OPT} ${ZAN_RT_OBJ_SECTIONS}
-            -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_io.c -o ${ZAN_RT_IO_MT_OBJ}
-    DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_io.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/rt_io.h
-            ${CMAKE_SOURCE_DIR}/src/runtime/rt_co.h
-            ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.h
-            ${CMAKE_SOURCE_DIR}/src/common/host_oom.h
-            ${CMAKE_SOURCE_DIR}/src/runtime/rt_crash.h
-            ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_addr.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_dns.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_co_pool.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_co_sched.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_gate.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_epoll.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_kqueue.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_iocp.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_select.c
-    COMMENT "Building multi-worker reactor object (zanrt_io_mt)"
-    VERBATIM)
-add_custom_target(zanrt_io_mt ALL DEPENDS ${ZAN_RT_IO_MT_OBJ})
-add_dependencies(zanc zanrt_io_mt)
-target_compile_definitions(zanc PRIVATE ZAN_RT_IO_MT_OBJ="${ZAN_RT_IO_MT_OBJ}")
-add_custom_command(TARGET zanc POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            ${ZAN_RT_IO_MT_OBJ} $<TARGET_FILE_DIR:zanc>/zanrt_io_mt${CMAKE_C_OUTPUT_EXTENSION}
-    VERBATIM)
-# Also keep a copy next to the zanc binary so a shipped compiler can find it.
-add_custom_command(TARGET zanc POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            ${ZAN_RT_IO_OBJ} $<TARGET_FILE_DIR:zanc>/zanrt_io${CMAKE_C_OUTPUT_EXTENSION}
-    VERBATIM)
+if(ZAN_PURE_ZAN_RUNTIME AND NOT CMAKE_CROSSCOMPILING AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux" OR APPLE))
+    add_custom_command(
+        OUTPUT ${ZAN_RT_IO_MT_OBJ}
+        COMMAND $<TARGET_FILE:zanc> -c -O2 --no-runtime-checks -DZAN_CO_DRIVER
+                ${ZAN_RT_IO_ZAN_SRCS}
+                -o ${ZAN_RT_IO_MT_OBJ}
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${ZAN_RT_IO_MT_OBJ} $<TARGET_FILE_DIR:zanc>/zanrt_io_mt${CMAKE_C_OUTPUT_EXTENSION}
+        DEPENDS zanc ${ZAN_RT_IO_ZAN_SRCS}
+        COMMENT "Building multi-worker reactor object in pure Zan (zanrt_io_mt)"
+        VERBATIM)
+    add_custom_target(zanrt_io_mt ALL DEPENDS ${ZAN_RT_IO_MT_OBJ})
+    target_compile_definitions(zanc PRIVATE ZAN_RT_IO_MT_OBJ="${ZAN_RT_IO_MT_OBJ}")
+else()
+    add_custom_command(
+        OUTPUT ${ZAN_RT_IO_MT_OBJ}
+        COMMAND ${ZAN_RT_OBJ_CC} ${ZAN_RT_OBJ_FLAGS} ${ZAN_RT_OBJ_DEFS} -DZAN_IO_STACKLESS_ONLY -DZAN_CO_DRIVER
+                -I ${CMAKE_SOURCE_DIR}/src/runtime ${ZAN_RT_OBJ_OPT} ${ZAN_RT_OBJ_SECTIONS}
+                -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_io.c -o ${ZAN_RT_IO_MT_OBJ}
+        DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_io.c
+                ${CMAKE_SOURCE_DIR}/src/runtime/rt_io.h
+                ${CMAKE_SOURCE_DIR}/src/runtime/rt_co.h
+                ${CMAKE_SOURCE_DIR}/src/runtime/rt_timer.h
+                ${CMAKE_SOURCE_DIR}/src/common/host_oom.h
+                ${CMAKE_SOURCE_DIR}/src/runtime/rt_crash.h
+                ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_addr.c
+                ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_dns.c
+                ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_co_pool.c
+                ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_co_sched.c
+                ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_gate.c
+                ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_epoll.c
+                ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_kqueue.c
+                ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_iocp.c
+                ${CMAKE_SOURCE_DIR}/src/runtime/io/rt_io_select.c
+        COMMENT "Building multi-worker reactor object (zanrt_io_mt)"
+        VERBATIM)
+    add_custom_target(zanrt_io_mt ALL DEPENDS ${ZAN_RT_IO_MT_OBJ})
+    add_dependencies(zanc zanrt_io_mt)
+    target_compile_definitions(zanc PRIVATE ZAN_RT_IO_MT_OBJ="${ZAN_RT_IO_MT_OBJ}")
+    add_custom_command(TARGET zanc POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${ZAN_RT_IO_MT_OBJ} $<TARGET_FILE_DIR:zanc>/zanrt_io_mt${CMAKE_C_OUTPUT_EXTENSION}
+        VERBATIM)
+endif()
 
 # ---- Small-object allocator (--fast-alloc) ----
 # Per-thread caches, size-class free lists and owner-directed cross-thread
@@ -610,51 +729,94 @@ add_custom_command(TARGET zanc POST_BUILD
 # object -- with --wrap=malloc/free/calloc/realloc -- only for a program built
 # with --fast-alloc, because the wrap applies to the whole image.
 set(ZAN_RT_MEM_OBJ "${CMAKE_BINARY_DIR}/zanrt_mem${CMAKE_C_OUTPUT_EXTENSION}")
-add_custom_command(
-    OUTPUT ${ZAN_RT_MEM_OBJ}
-    COMMAND ${ZAN_RT_OBJ_CC} ${ZAN_RT_OBJ_FLAGS} ${ZAN_RT_OBJ_DEFS} -std=c11
-            -I ${CMAKE_SOURCE_DIR}/src/runtime ${ZAN_RT_OBJ_OPT} ${ZAN_RT_OBJ_SECTIONS}
-            -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_mem.c -o ${ZAN_RT_MEM_OBJ}
-    DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_mem.c
-    COMMENT "Building small-object allocator object (zanrt_mem)"
-    VERBATIM)
-add_custom_target(zanrt_mem ALL DEPENDS ${ZAN_RT_MEM_OBJ})
-add_dependencies(zanc zanrt_mem)
-target_compile_definitions(zanc PRIVATE ZAN_RT_MEM_OBJ="${ZAN_RT_MEM_OBJ}")
-add_custom_command(TARGET zanc POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            ${ZAN_RT_MEM_OBJ} $<TARGET_FILE_DIR:zanc>/zanrt_mem${CMAKE_C_OUTPUT_EXTENSION}
-    VERBATIM)
+if(ZAN_PURE_ZAN_RUNTIME AND NOT CMAKE_CROSSCOMPILING AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux" OR APPLE))
+    set(ZAN_RT_MEM_ZAN_SRCS
+        ${CMAKE_SOURCE_DIR}/src/runtime/zan/mem/rt_mem_slab.zan
+        ${CMAKE_SOURCE_DIR}/src/runtime/zan/mem/rt_mem_alloc.zan)
+    add_custom_command(
+        OUTPUT ${ZAN_RT_MEM_OBJ}
+        COMMAND $<TARGET_FILE:zanc> -c -O2 --no-runtime-checks
+                ${ZAN_RT_MEM_ZAN_SRCS}
+                -o ${ZAN_RT_MEM_OBJ}
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${ZAN_RT_MEM_OBJ} $<TARGET_FILE_DIR:zanc>/zanrt_mem${CMAKE_C_OUTPUT_EXTENSION}
+        DEPENDS zanc ${ZAN_RT_MEM_ZAN_SRCS}
+        COMMENT "Building small-object allocator object in pure Zan (zanrt_mem)"
+        VERBATIM)
+    add_custom_target(zanrt_mem ALL DEPENDS ${ZAN_RT_MEM_OBJ})
+    target_compile_definitions(zanc PRIVATE ZAN_RT_MEM_OBJ="${ZAN_RT_MEM_OBJ}")
+else()
+    add_custom_command(
+        OUTPUT ${ZAN_RT_MEM_OBJ}
+        COMMAND ${ZAN_RT_OBJ_CC} ${ZAN_RT_OBJ_FLAGS} ${ZAN_RT_OBJ_DEFS} -std=c11
+                -I ${CMAKE_SOURCE_DIR}/src/runtime ${ZAN_RT_OBJ_OPT} ${ZAN_RT_OBJ_SECTIONS}
+                -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_mem.c -o ${ZAN_RT_MEM_OBJ}
+        DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_mem.c
+        COMMENT "Building small-object allocator object (zanrt_mem)"
+        VERBATIM)
+    add_custom_target(zanrt_mem ALL DEPENDS ${ZAN_RT_MEM_OBJ})
+    add_dependencies(zanc zanrt_mem)
+    target_compile_definitions(zanc PRIVATE ZAN_RT_MEM_OBJ="${ZAN_RT_MEM_OBJ}")
+    add_custom_command(TARGET zanc POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${ZAN_RT_MEM_OBJ} $<TARGET_FILE_DIR:zanc>/zanrt_mem${CMAKE_C_OUTPUT_EXTENSION}
+        VERBATIM)
+endif()
 
 # ---- Atomics and cross-process shared-memory table runtime ----
 set(ZAN_RT_SYNC_OBJ "${CMAKE_BINARY_DIR}/zanrt_sync${CMAKE_C_OUTPUT_EXTENSION}")
-add_custom_command(
-    OUTPUT ${ZAN_RT_SYNC_OBJ}
-    COMMAND ${ZAN_RT_OBJ_CC} ${ZAN_RT_OBJ_FLAGS} -std=c11
-            -I ${CMAKE_SOURCE_DIR}/src/runtime ${ZAN_RT_OBJ_OPT} ${ZAN_RT_OBJ_SECTIONS}
-            -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_sync.c -o ${ZAN_RT_SYNC_OBJ}
-    DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_sync.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/rt_sync.h
-            ${CMAKE_SOURCE_DIR}/src/runtime/sync/rt_sync_time.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/sync/rt_sync_shm.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/sync/rt_sync_thread.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/sync/rt_sync_table.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/sync/rt_sync_table_life.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/sync/rt_sync_table_compat.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/sync/rt_sync_table_edit.h
-            ${CMAKE_SOURCE_DIR}/src/runtime/sync/rt_sync_table_ops.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/sync/rt_sync_net.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/sync/rt_sync_proc.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/sync/rt_sync_proc_sandbox.c
-    COMMENT "Building atomic/shared-memory runtime object (zanrt_sync)"
-    VERBATIM)
-add_custom_target(zanrt_sync ALL DEPENDS ${ZAN_RT_SYNC_OBJ})
-add_dependencies(zanc zanrt_sync)
-target_compile_definitions(zanc PRIVATE ZAN_RT_SYNC_OBJ="${ZAN_RT_SYNC_OBJ}")
-add_custom_command(TARGET zanc POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            ${ZAN_RT_SYNC_OBJ} $<TARGET_FILE_DIR:zanc>/zanrt_sync${CMAKE_C_OUTPUT_EXTENSION}
-    VERBATIM)
+if(ZAN_PURE_ZAN_RUNTIME AND NOT CMAKE_CROSSCOMPILING AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux" OR APPLE))
+    set(ZAN_RT_SYNC_ZAN_SRCS
+        ${CMAKE_SOURCE_DIR}/src/runtime/zan/sync/rt_sync_plat.zan
+        ${CMAKE_SOURCE_DIR}/src/runtime/zan/sync/rt_sync_time.zan
+        ${CMAKE_SOURCE_DIR}/src/runtime/zan/sync/rt_sync_shm.zan
+        ${CMAKE_SOURCE_DIR}/src/runtime/zan/sync/rt_sync_thread.zan
+        ${CMAKE_SOURCE_DIR}/src/runtime/zan/sync/rt_sync_table.zan
+        ${CMAKE_SOURCE_DIR}/src/runtime/zan/sync/rt_sync_table_life.zan
+        ${CMAKE_SOURCE_DIR}/src/runtime/zan/sync/rt_sync_table_ops.zan
+        ${CMAKE_SOURCE_DIR}/src/runtime/zan/sync/rt_sync_net_sandbox.zan
+        ${CMAKE_SOURCE_DIR}/src/runtime/zan/sync/rt_sync_proc.zan)
+    add_custom_command(
+        OUTPUT ${ZAN_RT_SYNC_OBJ}
+        COMMAND $<TARGET_FILE:zanc> -c -O2 --no-runtime-checks
+                ${ZAN_RT_SYNC_ZAN_SRCS}
+                -o ${ZAN_RT_SYNC_OBJ}
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${ZAN_RT_SYNC_OBJ} $<TARGET_FILE_DIR:zanc>/zanrt_sync${CMAKE_C_OUTPUT_EXTENSION}
+        DEPENDS zanc ${ZAN_RT_SYNC_ZAN_SRCS}
+        COMMENT "Building atomic/shared-memory runtime object in pure Zan (zanrt_sync)"
+        VERBATIM)
+    add_custom_target(zanrt_sync ALL DEPENDS ${ZAN_RT_SYNC_OBJ})
+    target_compile_definitions(zanc PRIVATE ZAN_RT_SYNC_OBJ="${ZAN_RT_SYNC_OBJ}")
+else()
+    add_custom_command(
+        OUTPUT ${ZAN_RT_SYNC_OBJ}
+        COMMAND ${ZAN_RT_OBJ_CC} ${ZAN_RT_OBJ_FLAGS} -std=c11
+                -I ${CMAKE_SOURCE_DIR}/src/runtime ${ZAN_RT_OBJ_OPT} ${ZAN_RT_OBJ_SECTIONS}
+                -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_sync.c -o ${ZAN_RT_SYNC_OBJ}
+        DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_sync.c
+                ${CMAKE_SOURCE_DIR}/src/runtime/rt_sync.h
+                ${CMAKE_SOURCE_DIR}/src/runtime/sync/rt_sync_time.c
+                ${CMAKE_SOURCE_DIR}/src/runtime/sync/rt_sync_shm.c
+                ${CMAKE_SOURCE_DIR}/src/runtime/sync/rt_sync_thread.c
+                ${CMAKE_SOURCE_DIR}/src/runtime/sync/rt_sync_table.c
+                ${CMAKE_SOURCE_DIR}/src/runtime/sync/rt_sync_table_life.c
+                ${CMAKE_SOURCE_DIR}/src/runtime/sync/rt_sync_table_compat.c
+                ${CMAKE_SOURCE_DIR}/src/runtime/sync/rt_sync_table_edit.h
+                ${CMAKE_SOURCE_DIR}/src/runtime/sync/rt_sync_table_ops.c
+                ${CMAKE_SOURCE_DIR}/src/runtime/sync/rt_sync_net.c
+                ${CMAKE_SOURCE_DIR}/src/runtime/sync/rt_sync_proc.c
+                ${CMAKE_SOURCE_DIR}/src/runtime/sync/rt_sync_proc_sandbox.c
+        COMMENT "Building atomic/shared-memory runtime object (zanrt_sync)"
+        VERBATIM)
+    add_custom_target(zanrt_sync ALL DEPENDS ${ZAN_RT_SYNC_OBJ})
+    add_dependencies(zanc zanrt_sync)
+    target_compile_definitions(zanc PRIVATE ZAN_RT_SYNC_OBJ="${ZAN_RT_SYNC_OBJ}")
+    add_custom_command(TARGET zanc POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${ZAN_RT_SYNC_OBJ} $<TARGET_FILE_DIR:zanc>/zanrt_sync${CMAKE_C_OUTPUT_EXTENSION}
+        VERBATIM)
+endif()
 
 # ---- File metadata + stream-IO runtime (System.IO.FileInfo/FileStream) ----
 # Split out of rt_sync.c so a file-IO program links this small object instead
@@ -663,42 +825,76 @@ add_custom_command(TARGET zanc POST_BUILD
 # pure libc + a mutex (see toolchain/wasm32/zanrt_file.o), while rt_sync.c
 # cannot be built for wasm (no pthread/shm).
 set(ZAN_RT_FILE_OBJ "${CMAKE_BINARY_DIR}/zanrt_file${CMAKE_C_OUTPUT_EXTENSION}")
-add_custom_command(
-    OUTPUT ${ZAN_RT_FILE_OBJ}
-    COMMAND ${ZAN_RT_OBJ_CC} ${ZAN_RT_OBJ_FLAGS} -std=c11
-            -I ${CMAKE_SOURCE_DIR}/src/runtime ${ZAN_RT_OBJ_OPT} ${ZAN_RT_OBJ_SECTIONS}
-            -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_file.c -o ${ZAN_RT_FILE_OBJ}
-    DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_file.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/file/rt_file_win.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/file/rt_file_posix.c
-    COMMENT "Building file IO runtime object (zanrt_file)"
-    VERBATIM)
-add_custom_target(zanrt_file ALL DEPENDS ${ZAN_RT_FILE_OBJ})
-add_dependencies(zanc zanrt_file)
-target_compile_definitions(zanc PRIVATE ZAN_RT_FILE_OBJ="${ZAN_RT_FILE_OBJ}")
-add_custom_command(TARGET zanc POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            ${ZAN_RT_FILE_OBJ} $<TARGET_FILE_DIR:zanc>/zanrt_file${CMAKE_C_OUTPUT_EXTENSION}
-    VERBATIM)
+if(ZAN_PURE_ZAN_RUNTIME AND NOT CMAKE_CROSSCOMPILING AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux" OR APPLE))
+    set(ZAN_RT_FILE_ZAN_SRCS
+        ${CMAKE_SOURCE_DIR}/src/runtime/zan/file/rt_file_plat.zan
+        ${CMAKE_SOURCE_DIR}/src/runtime/zan/file/rt_file_api.zan)
+    add_custom_command(
+        OUTPUT ${ZAN_RT_FILE_OBJ}
+        COMMAND $<TARGET_FILE:zanc> -c -O2 --no-runtime-checks
+                ${ZAN_RT_FILE_ZAN_SRCS}
+                -o ${ZAN_RT_FILE_OBJ}
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${ZAN_RT_FILE_OBJ} $<TARGET_FILE_DIR:zanc>/zanrt_file${CMAKE_C_OUTPUT_EXTENSION}
+        DEPENDS zanc ${ZAN_RT_FILE_ZAN_SRCS}
+        COMMENT "Building file IO runtime object in pure Zan (zanrt_file)"
+        VERBATIM)
+    add_custom_target(zanrt_file ALL DEPENDS ${ZAN_RT_FILE_OBJ})
+    target_compile_definitions(zanc PRIVATE ZAN_RT_FILE_OBJ="${ZAN_RT_FILE_OBJ}")
+else()
+    add_custom_command(
+        OUTPUT ${ZAN_RT_FILE_OBJ}
+        COMMAND ${ZAN_RT_OBJ_CC} ${ZAN_RT_OBJ_FLAGS} -std=c11
+                -I ${CMAKE_SOURCE_DIR}/src/runtime ${ZAN_RT_OBJ_OPT} ${ZAN_RT_OBJ_SECTIONS}
+                -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_file.c -o ${ZAN_RT_FILE_OBJ}
+        DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_file.c
+                ${CMAKE_SOURCE_DIR}/src/runtime/file/rt_file_win.c
+                ${CMAKE_SOURCE_DIR}/src/runtime/file/rt_file_posix.c
+        COMMENT "Building file IO runtime object (zanrt_file)"
+        VERBATIM)
+    add_custom_target(zanrt_file ALL DEPENDS ${ZAN_RT_FILE_OBJ})
+    add_dependencies(zanc zanrt_file)
+    target_compile_definitions(zanc PRIVATE ZAN_RT_FILE_OBJ="${ZAN_RT_FILE_OBJ}")
+    add_custom_command(TARGET zanc POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${ZAN_RT_FILE_OBJ} $<TARGET_FILE_DIR:zanc>/zanrt_file${CMAKE_C_OUTPUT_EXTENSION}
+        VERBATIM)
+endif()
 
 # ---- 128-bit Decimal runtime (System.Decimal) ----
 set(ZAN_RT_DECIMAL_OBJ "${CMAKE_BINARY_DIR}/zanrt_decimal${CMAKE_C_OUTPUT_EXTENSION}")
-add_custom_command(
-    OUTPUT ${ZAN_RT_DECIMAL_OBJ}
-    COMMAND ${ZAN_RT_OBJ_CC} ${ZAN_RT_OBJ_FLAGS} -std=c11
-            -I ${CMAKE_SOURCE_DIR}/src/runtime ${ZAN_RT_OBJ_OPT} ${ZAN_RT_OBJ_SECTIONS}
-            -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_decimal.c -o ${ZAN_RT_DECIMAL_OBJ}
-    DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_decimal.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/rt_decimal.h
-    COMMENT "Building 128-bit decimal runtime object (zanrt_decimal)"
-    VERBATIM)
-add_custom_target(zanrt_decimal ALL DEPENDS ${ZAN_RT_DECIMAL_OBJ})
-add_dependencies(zanc zanrt_decimal)
-target_compile_definitions(zanc PRIVATE ZAN_RT_DECIMAL_OBJ="${ZAN_RT_DECIMAL_OBJ}")
-add_custom_command(TARGET zanc POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            ${ZAN_RT_DECIMAL_OBJ} $<TARGET_FILE_DIR:zanc>/zanrt_decimal${CMAKE_C_OUTPUT_EXTENSION}
-    VERBATIM)
+if(ZAN_PURE_ZAN_RUNTIME AND NOT CMAKE_CROSSCOMPILING)
+    add_custom_command(
+        OUTPUT ${ZAN_RT_DECIMAL_OBJ}
+        COMMAND $<TARGET_FILE:zanc> -c -O2 --no-runtime-checks
+                ${CMAKE_SOURCE_DIR}/src/runtime/zan/rt_decimal.zan
+                -o ${ZAN_RT_DECIMAL_OBJ}
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${ZAN_RT_DECIMAL_OBJ} $<TARGET_FILE_DIR:zanc>/zanrt_decimal${CMAKE_C_OUTPUT_EXTENSION}
+        DEPENDS zanc
+                ${CMAKE_SOURCE_DIR}/src/runtime/zan/rt_decimal.zan
+        COMMENT "Building 128-bit decimal runtime object in pure Zan (zanrt_decimal)"
+        VERBATIM)
+    add_custom_target(zanrt_decimal ALL DEPENDS ${ZAN_RT_DECIMAL_OBJ})
+    target_compile_definitions(zanc PRIVATE ZAN_RT_DECIMAL_OBJ="${ZAN_RT_DECIMAL_OBJ}")
+else()
+    add_custom_command(
+        OUTPUT ${ZAN_RT_DECIMAL_OBJ}
+        COMMAND ${ZAN_RT_OBJ_CC} ${ZAN_RT_OBJ_FLAGS} -std=c11
+                -I ${CMAKE_SOURCE_DIR}/src/runtime ${ZAN_RT_OBJ_OPT} ${ZAN_RT_OBJ_SECTIONS}
+                -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_decimal.c -o ${ZAN_RT_DECIMAL_OBJ}
+        DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_decimal.c
+                ${CMAKE_SOURCE_DIR}/src/runtime/rt_decimal.h
+        COMMENT "Building 128-bit decimal runtime object (zanrt_decimal)"
+        VERBATIM)
+    add_custom_target(zanrt_decimal ALL DEPENDS ${ZAN_RT_DECIMAL_OBJ})
+    add_dependencies(zanc zanrt_decimal)
+    target_compile_definitions(zanc PRIVATE ZAN_RT_DECIMAL_OBJ="${ZAN_RT_DECIMAL_OBJ}")
+    add_custom_command(TARGET zanc POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${ZAN_RT_DECIMAL_OBJ} $<TARGET_FILE_DIR:zanc>/zanrt_decimal${CMAKE_C_OUTPUT_EXTENSION}
+        VERBATIM)
+endif()
 
 # ---- Self-contained linking toolchain (Windows) ----
 # Bundle a small GNU ld + the redistributable MinGW-w64 runtime next to zanc so

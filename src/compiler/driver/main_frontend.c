@@ -534,6 +534,7 @@ probe_phase_mem("bind");
 
 zan_checker_t checker;
 zan_checker_init(&checker, &binder, arena, diag);
+checker.freestanding = opts.freestanding;
 if (binder.symbol_reference) {
   checker.lexical_ref = semantic_refs_record;
   checker.lexical_ref_context = &semantic_refs.refs;
@@ -817,7 +818,28 @@ if (site_map_path && site_map_path[0]) {
 }
 irgen.fast_codegen = false;
 irgen.emit_lib = emit_lib;
+irgen.emit_obj = opts.emit_obj;
 irgen.emit_shared = lib_shared;
+irgen.freestanding = opts.freestanding;
+irgen.target_cpu_override = opts.target_cpu_override;
+irgen.target_features_override = opts.target_features_override;
+if (opts.code_model) {
+  if (strcmp(opts.code_model, "small") == 0) irgen.code_model_kind = 1;
+  else if (strcmp(opts.code_model, "kernel") == 0) irgen.code_model_kind = 2;
+  else if (strcmp(opts.code_model, "medium") == 0) irgen.code_model_kind = 3;
+  else if (strcmp(opts.code_model, "large") == 0) irgen.code_model_kind = 4;
+}
+if (opts.reloc_model) {
+  if (strcmp(opts.reloc_model, "static") == 0) irgen.reloc_model_kind = 1;
+  else if (strcmp(opts.reloc_model, "pic") == 0) irgen.reloc_model_kind = 2;
+  else if (strcmp(opts.reloc_model, "dynamic-no-pic") == 0) irgen.reloc_model_kind = 3;
+}
+irgen.no_red_zone = opts.no_red_zone;
+if (opts.freestanding) {
+  irgen.check_leaks = false;
+  irgen.arc_guard = false;
+  irgen.runtime_checks = false;
+}
 
 const char *shard_env = getenv("ZAN_SHARD");
 const char *no_shard_env = getenv("ZAN_NO_SHARD");
@@ -832,7 +854,8 @@ bool shard_opt_out = (shard_env && shard_env[0] == '0') ||
 bool want_shard = native_arch && !cross_compiling && !shard_opt_out &&
                   shard_env && shard_env[0] == '1';
 
-irgen.split_codegen_ok = native_arch && !cross_compiling;
+irgen.split_codegen_ok =
+    native_arch && !cross_compiling && !opts.freestanding && !opts.emit_obj;
 zan_irgen_bind_target(&irgen);
 if (zan_irgen_emit(&irgen, ast) != ZAN_OK) {
   fprintf(stderr, "error: code generation failed\n");

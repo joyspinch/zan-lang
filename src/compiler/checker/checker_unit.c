@@ -1,3 +1,6 @@
+static zan_type_t *signature_base(zan_symbol_t *owner);
+static int checker_method_param_count(zan_symbol_t *sym);
+
 static void check_method_body(zan_checker_t *c, zan_ast_node_t *method) {
   checker_check_goto_regions(c, method);
   if (!method->method_decl.body)
@@ -25,11 +28,117 @@ static void check_method_body(zan_checker_t *c, zan_ast_node_t *method) {
   zan_ast_node_t *saved_method = c->current_method_decl;
   c->current_method_decl = method;
   bool saved_nrt = c->in_no_runtime;
-  c->in_no_runtime = zan_ast_has_attr(method, "NoRuntime");
+  bool saved_noalloc = c->in_noalloc;
+  bool owner_is_lib = c->current_type_sym && c->current_type_sym->decl &&
+                      (c->current_type_sym->decl->from_stdlib ||
+                       c->current_type_sym->decl->from_package);
+  bool user_fs = c->freestanding && !owner_is_lib && !method->from_stdlib &&
+                 !method->from_package;
+  c->in_no_runtime = user_fs || zan_ast_has_attr(method, "NoRuntime");
+  c->in_noalloc = user_fs || zan_ast_has_attr(method, "NoAlloc");
+  /* Transitive [NoAlloc] override contract: overriding a [NoAlloc] base/interface
+   * method without [NoAlloc] / [NoRuntime] breaks dynamic dispatch safety. */
+  if (method->kind == AST_METHOD_DECL && c->current_type_sym &&
+      !zan_ast_has_attr(method, "NoAlloc") &&
+      !zan_ast_has_attr(method, "NoRuntime")) {
+    zan_symbol_t *self_sym =
+        checker_find_method(c->current_type_sym, method->method_decl.name);
+    if (self_sym) {
+      for (zan_type_t *bt = signature_base(c->current_type_sym); bt && bt->sym;
+           bt = signature_base(bt->sym)) {
+        for (int bi = 0; bi < bt->sym->member_count; bi++) {
+          zan_symbol_t *bm = bt->sym->members[bi];
+          if (bm && bm->kind == SYM_METHOD && bm->decl &&
+              zan_ast_has_attr(bm->decl, "NoAlloc") &&
+              zan_checker_virtual_signature_equal(self_sym, bm)) {
+            zan_diag_emit_code(
+                c->diag, DIAG_ERROR, method->loc, 3100,
+                "override '%.*s' of [NoAlloc] method must also be marked [NoAlloc]",
+                (int)method->method_decl.name.len,
+                method->method_decl.name.str);
+            break;
+          }
+        }
+      }
+      if (c->current_type_sym->type && c->current_type_sym->type->interfaces) {
+        for (int ii = 0; ii < c->current_type_sym->type->interface_count; ii++) {
+          zan_type_t *it = c->current_type_sym->type->interfaces[ii];
+          if (!it || !it->sym) continue;
+          for (int mi = 0; mi < it->sym->member_count; mi++) {
+            zan_symbol_t *im = it->sym->members[mi];
+            if (im && im->kind == SYM_METHOD && im->decl &&
+                zan_ast_has_attr(im->decl, "NoAlloc") &&
+                im->name.len == self_sym->name.len &&
+                memcmp(im->name.str, self_sym->name.str, im->name.len) == 0 &&
+                checker_method_param_count(self_sym) ==
+                    checker_method_param_count(im)) {
+              zan_diag_emit_code(
+                  c->diag, DIAG_ERROR, method->loc, 3100,
+                  "implementation '%.*s' of [NoAlloc] interface method must also be marked [NoAlloc]",
+                  (int)method->method_decl.name.len,
+                  method->method_decl.name.str);
+              break;
+            }
+          }
+        }
+      }
+    }
+  }
   zan_type_t *saved = c->current_return_type;
   c->current_return_type =
       zan_binder_resolve_type(c->binder, method->method_decl.return_type);
   check_generic_constraints(c, c->current_return_type, method->loc);
+  /* [Export] / [UnmanagedCallersOnly] C ABI validation */
+  if (method->kind == AST_METHOD_DECL &&
+      (zan_ast_has_attr(method, "Export") ||
+       zan_ast_has_attr(method, "UnmanagedCallersOnly"))) {
+    if (!(method->method_decl.modifiers & MOD_STATIC)) {
+      zan_diag_emit_code(c->diag, DIAG_ERROR, method->loc, 3098,
+                         "C ABI exported method '%.*s' must be static",
+                         (int)method->method_decl.name.len,
+                         method->method_decl.name.str);
+    }
+    if (method->method_decl.modifiers & MOD_ASYNC) {
+      zan_diag_emit_code(c->diag, DIAG_ERROR, method->loc, 3098,
+                         "C ABI exported method '%.*s' cannot be async",
+                         (int)method->method_decl.name.len,
+                         method->method_decl.name.str);
+    }
+    if (method->method_decl.type_params.count > 0) {
+      zan_diag_emit_code(c->diag, DIAG_ERROR, method->loc, 3098,
+                         "C ABI exported method '%.*s' cannot be generic",
+                         (int)method->method_decl.name.len,
+                         method->method_decl.name.str);
+    }
+    zan_type_t *rt = c->current_return_type;
+    if (rt && rt->kind != TYPE_VOID && rt->kind != TYPE_ERROR &&
+        (rt->kind == TYPE_STRING || rt->kind == TYPE_CLASS ||
+         rt->kind == TYPE_INTERFACE || rt->kind == TYPE_DELEGATE ||
+         rt->kind == TYPE_ARRAY || rt->kind == TYPE_OBJECT ||
+         rt->kind == TYPE_TASK)) {
+      zan_diag_emit_code(
+          c->diag, DIAG_ERROR, method->loc, 3098,
+          "C ABI exported method '%.*s' cannot return managed type '%s'",
+          (int)method->method_decl.name.len, method->method_decl.name.str,
+          type_name(rt));
+    }
+    for (int pj = 0; pj < method->method_decl.params.count; pj++) {
+      zan_ast_node_t *pp = method->method_decl.params.items[pj];
+      if (!pp || pp->kind != AST_PARAM) continue;
+      zan_type_t *pt = zan_binder_resolve_type(c->binder, pp->param.type);
+      if (pt && pt->kind != TYPE_ERROR &&
+          (pt->kind == TYPE_STRING || pt->kind == TYPE_CLASS ||
+           pt->kind == TYPE_INTERFACE || pt->kind == TYPE_DELEGATE ||
+           pt->kind == TYPE_ARRAY || pt->kind == TYPE_OBJECT ||
+           pt->kind == TYPE_TASK)) {
+        zan_diag_emit_code(
+            c->diag, DIAG_ERROR, pp->loc, 3098,
+            "C ABI exported method '%.*s' parameter '%.*s' cannot have managed type '%s'",
+            (int)method->method_decl.name.len, method->method_decl.name.str,
+            (int)pp->param.name.len, pp->param.name.str, type_name(pt));
+      }
+    }
+  }
   struct checker_local *saved_locals = c->locals;
   struct checker_byref_parameter *saved_byref = c->byref_parameters;
   int saved_lambda_depth = c->lambda_depth;
@@ -58,12 +167,14 @@ static void check_method_body(zan_checker_t *c, zan_ast_node_t *method) {
   }
   zan_checker_check_stmt(c, method->method_decl.body);
   zan_definite_check(c->diag, method);
+  checker_check_method_ownership(c, method);
   c->current_body = saved_body;
   c->locals = saved_locals;
   c->byref_parameters = saved_byref;
   c->lambda_depth = saved_lambda_depth;
   c->current_return_type = saved;
   c->in_no_runtime = saved_nrt;
+  c->in_noalloc = saved_noalloc;
   c->current_method_decl = saved_method;
   c->binder->current_scope = saved_scope;
   c->in_ctor = saved_ctor;
@@ -446,6 +557,11 @@ static void check_abstract_members(zan_checker_t *c, zan_ast_node_t *decl) {
   for (int j = 0; j < decl->type_decl.members.count; j++) {
     zan_ast_node_t *member = decl->type_decl.members.items[j];
     if (member->kind != AST_METHOD_DECL) {
+      if (member->kind == AST_PROPERTY_DECL && is_interface &&
+          (member->field_decl.modifiers & (MOD_STATIC | MOD_ABSTRACT)) ==
+              (MOD_STATIC | MOD_ABSTRACT)) {
+        continue;
+      }
       if (((member->kind == AST_FIELD_DECL ||
             member->kind == AST_PROPERTY_DECL) &&
            (member->field_decl.modifiers & MOD_ABSTRACT)) ||
@@ -468,7 +584,7 @@ static void check_abstract_members(zan_checker_t *c, zan_ast_node_t *decl) {
           "abstract method '%.*s' must be declared in a class or interface",
           (int)name.len, name.str);
     }
-    if (mm & MOD_STATIC) {
+    if ((mm & MOD_STATIC) && !is_interface) {
       zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 2094,
                          "an abstract method cannot be static: '%.*s'",
                          (int)name.len, name.str);
@@ -559,7 +675,19 @@ static void check_unit(zan_checker_t *c, zan_ast_node_t *unit,
         zan_binder_push_type_params(c->binder, &decl->type_decl.type_params);
     if (decl->kind == AST_CLASS_DECL)
       check_virtual_shadows_base(c, decl);
+    if (zan_ast_has_attr(decl, "Align")) {
+      int64_t al = 0;
+      if (decl->kind != AST_STRUCT_DECL) {
+        zan_diag_emit_code(c->diag, DIAG_ERROR, decl->loc, 3103,
+                           "[Align] on types can only be applied to struct declarations");
+      } else if (!zan_ast_attr_int(decl, "Align", &al) || al < 1 || al > 65536 ||
+                 (al & (al - 1)) != 0) {
+        zan_diag_emit_code(c->diag, DIAG_ERROR, decl->loc, 3103,
+                           "[Align] requires a power-of-2 integer literal between 1 and 65536");
+      }
+    }
     check_abstract_members(c, decl);
+    checker_check_type_ownership_decls(c, decl);
     for (int j = 0; j < decl->type_decl.members.count; j++) {
       zan_ast_node_t *member = decl->type_decl.members.items[j];
       if (only_file_id >= 0 && member->loc.file_id != only_file_id)
@@ -567,6 +695,337 @@ static void check_unit(zan_checker_t *c, zan_ast_node_t *unit,
       check_weak_member(c, decl, member);
       check_extern_static(c, member);
       check_module_initializer(c, decl, member);
+      if (zan_ast_has_attr(member, "Section")) {
+        char sec_chk[128];
+        bool ok_target = (member->kind == AST_METHOD_DECL) ||
+                         (member->kind == AST_FIELD_DECL &&
+                          (member->field_decl.modifiers & MOD_STATIC));
+        if (!ok_target) {
+          zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 3103,
+                             "[Section] can only be applied to methods or static fields");
+        } else if (!zan_ast_attr_string(member, "Section", sec_chk, sizeof(sec_chk))) {
+          zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 3103,
+                             "[Section] requires a non-empty string literal section name");
+        }
+      }
+      if (zan_ast_has_attr(member, "Align")) {
+        int64_t al = 0;
+        if (member->kind != AST_FIELD_DECL ||
+            !(member->field_decl.modifiers & MOD_STATIC)) {
+          zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 3103,
+                             "[Align] on members can only be applied to static fields");
+        } else if (!zan_ast_attr_int(member, "Align", &al) || al < 1 || al > 65536 ||
+                   (al & (al - 1)) != 0) {
+          zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 3103,
+                             "[Align] requires a power-of-2 integer literal between 1 and 65536");
+        }
+      }
+      if (zan_ast_has_attr(member, "Used")) {
+        bool ok_target = (member->kind == AST_METHOD_DECL) ||
+                         (member->kind == AST_FIELD_DECL &&
+                          (member->field_decl.modifiers & MOD_STATIC));
+        if (!ok_target) {
+          zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 3103,
+                             "[Used] can only be applied to methods or static fields");
+        }
+      }
+      {
+        bool has_exp = zan_ast_has_attr(member, "Export");
+        bool has_ext = zan_ast_has_attr(member, "Extern");
+        if (has_exp && member->kind != AST_METHOD_DECL) {
+          if (member->kind != AST_FIELD_DECL ||
+              !(member->field_decl.modifiers & MOD_STATIC)) {
+            zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 3104,
+                               "[Export] can only be applied to static methods or static fields");
+          } else {
+            if (has_ext) {
+              zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 3104,
+                                 "static field '%.*s' cannot have both [Export] and [Extern]",
+                                 (int)member->field_decl.name.len,
+                                 member->field_decl.name.str);
+            }
+            zan_type_t *ft = zan_binder_resolve_type(c->binder, member->field_decl.type);
+            if (ft && ft->kind != TYPE_ERROR &&
+                (ft->kind == TYPE_STRING || ft->kind == TYPE_CLASS ||
+                 ft->kind == TYPE_INTERFACE || ft->kind == TYPE_DELEGATE ||
+                 ft->kind == TYPE_ARRAY || ft->kind == TYPE_OBJECT ||
+                 ft->kind == TYPE_TASK)) {
+              zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 3104,
+                                 "[Export] static field '%.*s' must be an unmanaged value type, not '%s'",
+                                 (int)member->field_decl.name.len,
+                                 member->field_decl.name.str, type_name(ft));
+            }
+          }
+        }
+        if (has_ext) {
+          if (member->kind != AST_FIELD_DECL ||
+              !(member->field_decl.modifiers & MOD_STATIC)) {
+            zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 3104,
+                               "[Extern] can only be applied to static fields");
+          } else {
+            if (member->field_decl.initializer) {
+              zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 3104,
+                                 "[Extern] static field '%.*s' cannot have an initializer",
+                                 (int)member->field_decl.name.len,
+                                 member->field_decl.name.str);
+            }
+            zan_type_t *ft = zan_binder_resolve_type(c->binder, member->field_decl.type);
+            if (ft && ft->kind != TYPE_ERROR &&
+                (ft->kind == TYPE_STRING || ft->kind == TYPE_CLASS ||
+                 ft->kind == TYPE_INTERFACE || ft->kind == TYPE_DELEGATE ||
+                 ft->kind == TYPE_ARRAY || ft->kind == TYPE_OBJECT ||
+                 ft->kind == TYPE_TASK)) {
+              zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 3104,
+                                 "[Extern] static field '%.*s' must be an unmanaged value type, not '%s'",
+                                 (int)member->field_decl.name.len,
+                                 member->field_decl.name.str, type_name(ft));
+            }
+          }
+        }
+        if (zan_ast_has_attr(member, "CallingConvention")) {
+          char cc_buf[64];
+          if (member->kind != AST_METHOD_DECL) {
+            zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 3105,
+                               "[CallingConvention] can only be applied to methods");
+          } else if (!zan_ast_attr_string(member, "CallingConvention", cc_buf, sizeof(cc_buf))) {
+            zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 3105,
+                               "[CallingConvention] requires a string literal calling convention name");
+          } else {
+            for (char *p = cc_buf; *p; p++) {
+              if (*p >= 'A' && *p <= 'Z') *p = (char)(*p - 'A' + 'a');
+            }
+            bool is_intr_cc = (strcmp(cc_buf, "interrupt") == 0 ||
+                               strcmp(cc_buf, "x86-interrupt") == 0);
+            bool ok_cc = (strcmp(cc_buf, "c") == 0 || strcmp(cc_buf, "cdecl") == 0 ||
+                          strcmp(cc_buf, "stdcall") == 0 || strcmp(cc_buf, "fastcall") == 0 ||
+                          strcmp(cc_buf, "win64") == 0 || strcmp(cc_buf, "sysv64") == 0 ||
+                          strcmp(cc_buf, "aapcs") == 0 || strcmp(cc_buf, "vectorcall") == 0 ||
+                          strcmp(cc_buf, "preserve_most") == 0 || strcmp(cc_buf, "preserve_all") == 0 ||
+                          is_intr_cc);
+            if (!ok_cc) {
+              zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 3105,
+                                 "unsupported [CallingConvention(\"%s\")]; expected c, cdecl, stdcall, fastcall, win64, sysv64, aapcs, vectorcall, preserve_most, preserve_all, or interrupt",
+                                 cc_buf);
+            } else if (is_intr_cc) {
+              if (!(member->method_decl.modifiers & MOD_STATIC)) {
+                zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 3105,
+                                   "[CallingConvention(\"%s\")] method must be static", cc_buf);
+              }
+              zan_type_t *irt = member->method_decl.return_type
+                                    ? zan_binder_resolve_type(c->binder, member->method_decl.return_type)
+                                    : c->binder->type_void;
+              if (irt && irt->kind != TYPE_VOID && irt->kind != TYPE_ERROR) {
+                zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 3105,
+                                   "[CallingConvention(\"%s\")] method must return void", cc_buf);
+              }
+              int ipc = member->method_decl.params.count;
+              if (ipc < 1 || ipc > 2) {
+                zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 3105,
+                                   "[CallingConvention(\"%s\")] method must take 1 parameter (ref InterruptFrame) or 2 parameters (ref InterruptFrame, ulong errorCode)",
+                                   cc_buf);
+              } else {
+                zan_ast_node_t *p0 = member->method_decl.params.items[0];
+                zan_type_t *p0t = (p0 && p0->param.type)
+                                      ? zan_binder_resolve_type(c->binder, p0->param.type)
+                                      : NULL;
+                if (!p0 || !p0->param.by_ref || !p0t ||
+                    (p0t->kind != TYPE_STRUCT && p0t->kind != TYPE_ULONG &&
+                     p0t->kind != TYPE_LONG && p0t->kind != TYPE_NINT)) {
+                  zan_diag_emit_code(c->diag, DIAG_ERROR, p0 ? p0->loc : member->loc, 3105,
+                                     "[CallingConvention(\"%s\")] first parameter must be 'ref <struct>' interrupt stack frame",
+                                     cc_buf);
+                }
+                if (ipc == 2) {
+                  zan_ast_node_t *p1 = member->method_decl.params.items[1];
+                  zan_type_t *p1t = (p1 && p1->param.type)
+                                        ? zan_binder_resolve_type(c->binder, p1->param.type)
+                                        : NULL;
+                  if (!p1 || p1->param.by_ref || !p1t ||
+                      (p1t->kind != TYPE_ULONG && p1t->kind != TYPE_LONG &&
+                       p1t->kind != TYPE_UINT && p1t->kind != TYPE_INT &&
+                       p1t->kind != TYPE_NINT)) {
+                    zan_diag_emit_code(c->diag, DIAG_ERROR, p1 ? p1->loc : member->loc, 3105,
+                                       "[CallingConvention(\"%s\")] second parameter must be an integer error code",
+                                       cc_buf);
+                  }
+                }
+              }
+            }
+          }
+        }
+        if (zan_ast_has_attr(member, "Naked")) {
+          if (member->kind != AST_METHOD_DECL ||
+              !(member->method_decl.modifiers & MOD_STATIC)) {
+            zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 3105,
+                               "[Naked] can only be applied to static methods");
+          } else if (member->method_decl.modifiers &
+                     (MOD_ASYNC | MOD_VIRTUAL | MOD_OVERRIDE | MOD_ABSTRACT)) {
+            zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 3105,
+                               "[Naked] method cannot be async, virtual, override, or abstract");
+          }
+        }
+        if (zan_ast_has_attr(member, "Weak")) {
+          bool ok_target = (member->kind == AST_METHOD_DECL &&
+                            (member->method_decl.modifiers & MOD_STATIC)) ||
+                           (member->kind == AST_FIELD_DECL &&
+                            (member->field_decl.modifiers & MOD_STATIC));
+          if (!ok_target) {
+            zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 3105,
+                               "[Weak] can only be applied to static methods or static fields");
+          } else if (has_ext) {
+            zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 3105,
+                               "[Weak] cannot be combined with [Extern]");
+          } else if (member->kind == AST_FIELD_DECL) {
+            zan_type_t *ft = zan_binder_resolve_type(c->binder, member->field_decl.type);
+            if (ft && ft->kind != TYPE_ERROR &&
+                (ft->kind == TYPE_STRING || ft->kind == TYPE_CLASS ||
+                 ft->kind == TYPE_INTERFACE || ft->kind == TYPE_DELEGATE ||
+                 ft->kind == TYPE_ARRAY || ft->kind == TYPE_OBJECT ||
+                 ft->kind == TYPE_TASK)) {
+              zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 3105,
+                                 "[Weak] static field '%.*s' must be an unmanaged value type, not '%s'",
+                                 (int)member->field_decl.name.len,
+                                 member->field_decl.name.str, type_name(ft));
+            }
+          }
+        }
+        if (zan_ast_has_attr(member, "Visibility")) {
+          char vis_buf[64];
+          bool ok_target = (member->kind == AST_METHOD_DECL &&
+                            (member->method_decl.modifiers & MOD_STATIC)) ||
+                           (member->kind == AST_FIELD_DECL &&
+                            (member->field_decl.modifiers & MOD_STATIC));
+          if (!ok_target) {
+            zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 3106,
+                               "[Visibility] can only be applied to static methods or static fields");
+          } else if (!zan_ast_attr_string(member, "Visibility", vis_buf, sizeof(vis_buf))) {
+            zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 3106,
+                               "[Visibility] requires a string literal: default, hidden, or protected");
+          } else {
+            for (char *p = vis_buf; *p; p++) {
+              if (*p >= 'A' && *p <= 'Z') *p = (char)(*p - 'A' + 'a');
+            }
+            if (strcmp(vis_buf, "default") != 0 &&
+                strcmp(vis_buf, "hidden") != 0 &&
+                strcmp(vis_buf, "protected") != 0) {
+              zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 3106,
+                                 "unsupported [Visibility(\"%s\")]; expected default, hidden, or protected",
+                                 vis_buf);
+            }
+          }
+        }
+        if (zan_ast_has_attr(member, "NoReturn")) {
+          if (member->kind != AST_METHOD_DECL) {
+            zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 3107,
+                               "[NoReturn] can only be applied to methods");
+          } else {
+            zan_type_t *rt = member->method_decl.return_type
+                                 ? zan_binder_resolve_type(c->binder, member->method_decl.return_type)
+                                 : c->binder->type_void;
+            if (rt && rt->kind != TYPE_VOID && rt->kind != TYPE_ERROR) {
+              zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 3107,
+                                 "[NoReturn] method '%.*s' must return void, not '%s'",
+                                 (int)member->method_decl.name.len,
+                                 member->method_decl.name.str, type_name(rt));
+            }
+          }
+        }
+        if (zan_ast_has_attr(member, "Cold") && zan_ast_has_attr(member, "Hot")) {
+          zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 3107,
+                             "[Cold] and [Hot] cannot both be applied to the same method");
+        }
+        for (int lf = 0; lf < 2; lf++) {
+          const char *lfname = lf == 0 ? "Init" : "Fini";
+          if (!zan_ast_has_attr(member, lfname))
+            continue;
+          if (member->kind != AST_METHOD_DECL ||
+              !(member->method_decl.modifiers & MOD_STATIC)) {
+            zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 3107,
+                               "[%s] can only be applied to static methods", lfname);
+          } else {
+            zan_type_t *rt = member->method_decl.return_type
+                                 ? zan_binder_resolve_type(c->binder, member->method_decl.return_type)
+                                 : c->binder->type_void;
+            if ((rt && rt->kind != TYPE_VOID && rt->kind != TYPE_ERROR) ||
+                member->method_decl.params.count != 0 ||
+                (member->method_decl.modifiers & (MOD_ASYNC | MOD_ABSTRACT))) {
+              zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 3107,
+                                 "[%s] method '%.*s' must be a parameterless static void method",
+                                 lfname, (int)member->method_decl.name.len,
+                                 member->method_decl.name.str);
+            }
+            zan_ast_list_t *al = zan_ast_attributes(member);
+            for (int ai = 0; al && ai < al->count; ai++) {
+              zan_ast_node_t *at = al->items[ai];
+              if (!at || at->kind != AST_ATTRIBUTE || !at->attribute.name)
+                continue;
+              zan_istr_t an = at->attribute.name->ident.name;
+              if (an.len != 4 || memcmp(an.str, lfname, 4) != 0)
+                continue;
+              if (at->attribute.args.count > 1) {
+                zan_diag_emit_code(c->diag, DIAG_ERROR, at->loc, 3107,
+                                   "[%s] accepts at most one integer priority argument (0..65535)",
+                                   lfname);
+              } else if (at->attribute.args.count == 1) {
+                zan_ast_node_t *pa = at->attribute.args.items[0];
+                if (!pa || pa->kind != AST_INT_LITERAL ||
+                    pa->int_val < 0 || pa->int_val > 65535) {
+                  zan_diag_emit_code(c->diag, DIAG_ERROR, at->loc, 3107,
+                                     "[%s] priority must be an integer literal in 0..65535",
+                                     lfname);
+                }
+              }
+            }
+          }
+        }
+        if (zan_ast_has_attr(member, "Alias")) {
+          char alias_tgt[256];
+          if (member->kind != AST_METHOD_DECL ||
+              !(member->method_decl.modifiers & MOD_STATIC)) {
+            zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 3107,
+                               "[Alias] can only be applied to static methods");
+          } else if (!zan_ast_attr_string(member, "Alias", alias_tgt, sizeof(alias_tgt)) ||
+                     alias_tgt[0] == '\0') {
+            zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 3107,
+                               "[Alias] requires a non-empty target symbol name string");
+          } else if (member->method_decl.body &&
+                     member->method_decl.body->kind == AST_BLOCK &&
+                     member->method_decl.body->block.stmts.count > 0) {
+            zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 3107,
+                               "[Alias] method '%.*s' must have an empty body '{}'",
+                               (int)member->method_decl.name.len,
+                               member->method_decl.name.str);
+          }
+        }
+        if (zan_ast_has_attr(member, "NoRedZone")) {
+          if (member->kind != AST_METHOD_DECL) {
+            zan_diag_emit_code(c->diag, DIAG_ERROR, member->loc, 3108,
+                               "[NoRedZone] can only be applied to methods");
+          }
+        }
+      }
+      if (zan_ast_has_attr(member, "ThreadStatic")) {
+        if (member->kind != AST_FIELD_DECL ||
+            !(member->field_decl.modifiers & MOD_STATIC)) {
+          zan_diag_emit_code(
+              c->diag, DIAG_ERROR, member->loc, 3099,
+              "[ThreadStatic] can only be applied to static fields");
+        } else {
+          zan_type_t *tft =
+              zan_binder_resolve_type(c->binder, member->field_decl.type);
+          if (tft && tft->kind != TYPE_ERROR &&
+              (tft->kind == TYPE_STRING || tft->kind == TYPE_CLASS ||
+               tft->kind == TYPE_INTERFACE || tft->kind == TYPE_DELEGATE ||
+               tft->kind == TYPE_ARRAY || tft->kind == TYPE_OBJECT ||
+               tft->kind == TYPE_TASK)) {
+            zan_diag_emit_code(
+                c->diag, DIAG_ERROR, member->loc, 3099,
+                "[ThreadStatic] field '%.*s' must be an unmanaged value type, not '%s'",
+                (int)member->field_decl.name.len,
+                member->field_decl.name.str, type_name(tft));
+          }
+        }
+      }
       if ((member->kind == AST_FIELD_DECL ||
            member->kind == AST_PROPERTY_DECL) &&
           member->field_decl.initializer) {

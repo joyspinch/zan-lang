@@ -1,0 +1,861 @@
+// rt_io_sched.zan: Multi-worker work-stealing M:N coroutine scheduler,
+// TLS+slab frame allocator, park/unpark, preemption poll, and MT sync_sleep.
+// Active only when compiled with -DZAN_CO_DRIVER (zanrt_io_mt).
+// 100% pure Zan, zero assembly.
+
+namespace Zan.Runtime.Io;
+
+#if ZAN_CO_DRIVER
+static partial class IoSched {
+    const int ZAN_CO_MAXW = 256;
+    const uint ZAN_LQ_CAP = 256U;
+    const uint ZAN_LQ_MASK = 255U;
+    const int ZAN_LIFO_BUDGET = 3;
+    const uint ZAN_GLOBAL_TICK = 61U;
+    const uint ZAN_POLL_GATE = 256U;
+    const int ZAN_STEAL_ROUNDS = 2;
+    const int ZAN_INJ_BATCH = 64;
+    const ulong ZAN_WAKE_KEY = 0xFFFFFFFFFFFFFFFDUL; // (ULONG_PTR)-3
+
+    const long CO_QUEUED = 1L;
+    const long CO_RUNNING = 2L;
+    const long CO_NOTIFIED = 4L;
+    const long CO_DEAD = 8L;
+    const long CO_SELFQ = 16L;
+
+    const uint ZAN_CO_FRAME_MAGIC = 0x5A434F46U; // "ZCOF"
+    const int ZAN_CO_EXT_SLOTS = 8;
+    const ulong ZAN_CO_EXT_DONE_SPAN = 64UL;
+    const int ZAN_CO_EXT_SPIN = 2048;
+    const long ZAN_CO_EXT_BACKSTOP_MS = 20L;
+
+    // Frame header (at frame + 0)
+    const long FH_SCHED = 0L;   // long
+    const long FH_PENDING = 8L; // nint (zan_co_step_t)
+
+    // Frame allocator prefix (16 bytes immediately before frame)
+    const long PFX_MAGIC = 0L;   // uint
+    const long PFX_CLASS = 4L;   // uint
+    const long PFX_ACTUAL = 8L;  // ulong
+    const ulong PFX_SIZE = 16UL;
+
+    // Injector node (24 bytes)
+    const long ND_NEXT = 0L;
+    const long ND_FRAME = 8L;
+    const long ND_STEP = 16L;
+    const ulong ND_SIZE = 24UL;
+
+    // Worker layout (4480 bytes, cache-line padded; WK_QLOCK 64B covers all platforms including macOS)
+    const long WK_HEAD = 0L;        // long
+    const long WK_TAIL = 64L;       // long
+    const long WK_QLOCK = 128L;     // 64 bytes
+    const long WK_BUF = 192L;       // 256 * 16 = 4096 bytes (192..4287)
+    const long WK_LIFO_F = 4288L;   // nint
+    const long WK_LIFO_S = 4296L;   // nint
+    const long WK_LIFO_FULL = 4304L;// int
+    const long WK_LIFO_BUD = 4308L; // int
+    const long WK_INDEX = 4312L;    // int
+    const long WK_BGGEN = 4316L;    // int
+    const long WK_SEARCHING = 4320L;// int
+    const long WK_PARKED = 4324L;   // int
+    const long WK_SLICE_US = 4328L; // long
+    const long WK_CUR = 4336L;      // nint
+    const long WK_TICK = 4344L;     // uint
+    const long WK_POLL_TICK = 4348L;// uint
+    const long WK_RNG = 4352L;      // uint
+    const long WK_RAN = 4360L;      // ulong
+    const long WK_CNT_ACT = 4368L;  // int
+    const long WK_CNT_OUT = 4372L;  // int
+    const ulong WK_SIZE = 4480UL;
+
+    // Scheduler globals
+    static IoBuf64 s_coLock;
+    static IoBuf64 s_injLock;
+    static int s_coInited = 0;
+    static int s_coWorkers = 0;
+    static nint s_wk = (nint)0;
+    static int s_wkCap = 0;
+
+    static int s_coRunning = 0;
+    static int s_coParked = 0;
+    static int s_coSearching = 0;
+    static int s_coStop = 0;
+    static int s_poolLive = 0;
+    static int s_poolFg = 0;
+    static int s_poolGen = 0;
+    static int s_poolOut = 0;
+
+    static nint s_injHead = (nint)0;
+    static nint s_injTail = (nint)0;
+    static nint s_injFree = (nint)0;
+    static int s_injLen = 0;
+    static int s_injPushExt = 0;
+
+    static ulong s_nonempty0 = 0UL;
+    static ulong s_nonempty1 = 0UL;
+    static ulong s_nonempty2 = 0UL;
+    static ulong s_nonempty3 = 0UL;
+
+    static int s_timerOwner = 0;
+    static long s_timerPumpedUs = 0L;
+    static long s_timerNextMs = -1L;
+
+    static int s_extAct = 0;
+    static int s_extOut = 0;
+
+    // External waiter notification (zan_co_sched_run_until)
+    static int s_extWaiters = 0;
+    static int s_extOverflow = 0;
+    static IoBuf64 s_extSlots; // 8 * nint
+#if WINDOWS
+    static ulong s_extSrw = 0UL;
+    static ulong s_extCv = 0UL;
+    static int s_timePeriodDone = 0;
+#else
+    static int s_extSyncState = 0;
+    static IoBuf64 s_extMx;
+    static IoBuf64 s_extCv;
+
+    static void EnsureExtSync() {
+        int st = Atomic.Load(ref s_extSyncState, MemoryOrder.Acquire);
+        if (st == 2) return;
+        if (Atomic.CompareExchange(ref s_extSyncState, 0, 1, MemoryOrder.AcqRel, MemoryOrder.Acquire) == 0) {
+            IoPlat.PosixMutexInit(NativeMemory.AddressOf(ref s_extMx), (nint)0);
+            IoPlat.PosixCondInit(NativeMemory.AddressOf(ref s_extCv), (nint)0);
+            Atomic.Store(ref s_extSyncState, 2, MemoryOrder.Release);
+            return;
+        }
+        while (Atomic.Load(ref s_extSyncState, MemoryOrder.Acquire) != 2) IoPlat.YieldCpu();
+    }
+#endif
+
+#if !ZAN_IO_NO_WEAK_EH_RELEASE
+    // Optional compiler-provided EH teardown (weak fallback matching rt_sync_thread)
+    [Export("__zan_eh_release")]
+    [Weak]
+    public static void EhRelease() {}
+#endif
+
+    [Export("__zan_io_c_free")]
+    [Visibility("hidden")]
+    static void FreeWrapper(nint p) {
+        IoPlat.CFree(p);
+    }
+
+    static nint WorkerAt(int idx) {
+        return s_wk + (nint)((long)idx * (long)WK_SIZE);
+    }
+
+    static nint CoSelf() {
+        nint tls = IoPlat.GetTls(false);
+        return tls != (nint)0 ? NativeMemory.AsRef<nint>((tls) + (nint)(IoConst.TLS_CO_SELF)) : (nint)0;
+    }
+
+    static void SetCoSelf(nint w) {
+        nint tls = IoPlat.GetTls(w != (nint)0);
+        if (tls != (nint)0) NativeMemory.AsRef<nint>((tls) + (nint)(IoConst.TLS_CO_SELF)) = w;
+    }
+
+    static int WorkerShard(int worker) {
+        return IoPlat.FastModSmall(worker, IoReactor.ShardCount());
+    }
+
+#if !WINDOWS
+    internal static int ThreadShardIndex() {
+        nint w = CoSelf();
+        int idx = w != (nint)0 ? NativeMemory.AsRef<int>((w) + (nint)(WK_INDEX)) : 0;
+        return WorkerShard(idx);
+    }
+#endif
+
+    static void MarkNonempty(int idx) {
+        int w = idx >> 6;
+        ulong bit = 1UL << (idx & 63);
+        if (w == 0) {
+            if ((Atomic.Load(ref s_nonempty0, MemoryOrder.Relaxed) & bit) == 0UL)
+                Atomic.FetchOr(ref s_nonempty0, bit, MemoryOrder.Release);
+        } else if (w == 1) {
+            if ((Atomic.Load(ref s_nonempty1, MemoryOrder.Relaxed) & bit) == 0UL)
+                Atomic.FetchOr(ref s_nonempty1, bit, MemoryOrder.Release);
+        } else if (w == 2) {
+            if ((Atomic.Load(ref s_nonempty2, MemoryOrder.Relaxed) & bit) == 0UL)
+                Atomic.FetchOr(ref s_nonempty2, bit, MemoryOrder.Release);
+        } else if (w == 3) {
+            if ((Atomic.Load(ref s_nonempty3, MemoryOrder.Relaxed) & bit) == 0UL)
+                Atomic.FetchOr(ref s_nonempty3, bit, MemoryOrder.Release);
+        }
+    }
+
+    static void ClearEmpty(int idx) {
+        int w = idx >> 6;
+        ulong bit = 1UL << (idx & 63);
+        if (w == 0) {
+            if ((Atomic.Load(ref s_nonempty0, MemoryOrder.Relaxed) & bit) != 0UL)
+                Atomic.FetchAnd(ref s_nonempty0, ~bit, MemoryOrder.Release);
+        } else if (w == 1) {
+            if ((Atomic.Load(ref s_nonempty1, MemoryOrder.Relaxed) & bit) != 0UL)
+                Atomic.FetchAnd(ref s_nonempty1, ~bit, MemoryOrder.Release);
+        } else if (w == 2) {
+            if ((Atomic.Load(ref s_nonempty2, MemoryOrder.Relaxed) & bit) != 0UL)
+                Atomic.FetchAnd(ref s_nonempty2, ~bit, MemoryOrder.Release);
+        } else if (w == 3) {
+            if ((Atomic.Load(ref s_nonempty3, MemoryOrder.Relaxed) & bit) != 0UL)
+                Atomic.FetchAnd(ref s_nonempty3, ~bit, MemoryOrder.Release);
+        }
+    }
+
+    static bool WorkerHasWork(int idx) {
+        int w = idx >> 6;
+        ulong bit = 1UL << (idx & 63);
+        if (w == 0) return (Atomic.Load(ref s_nonempty0, MemoryOrder.Acquire) & bit) != 0UL;
+        if (w == 1) return (Atomic.Load(ref s_nonempty1, MemoryOrder.Acquire) & bit) != 0UL;
+        if (w == 2) return (Atomic.Load(ref s_nonempty2, MemoryOrder.Acquire) & bit) != 0UL;
+        if (w == 3) return (Atomic.Load(ref s_nonempty3, MemoryOrder.Acquire) & bit) != 0UL;
+        return false;
+    }
+
+    static bool AnyNonemptyOther(int selfIdx) {
+        int sw = selfIdx >> 6;
+        ulong sbit = 1UL << (selfIdx & 63);
+        ulong m0 = Atomic.Load(ref s_nonempty0, MemoryOrder.Acquire);
+        if (sw == 0) m0 &= ~sbit;
+        if (m0 != 0UL) return true;
+        ulong m1 = Atomic.Load(ref s_nonempty1, MemoryOrder.Acquire);
+        if (sw == 1) m1 &= ~sbit;
+        if (m1 != 0UL) return true;
+        ulong m2 = Atomic.Load(ref s_nonempty2, MemoryOrder.Acquire);
+        if (sw == 2) m2 &= ~sbit;
+        if (m2 != 0UL) return true;
+        ulong m3 = Atomic.Load(ref s_nonempty3, MemoryOrder.Acquire);
+        if (sw == 3) m3 &= ~sbit;
+        return m3 != 0UL;
+    }
+
+    static void WakeShard(int shard) {
+#if WINDOWS
+        nint p = IoReactor.IoShard(shard);
+        if (p != (nint)0) {
+            IoPlat.WinPostQueuedCompletionStatus(p, 0U, ZAN_WAKE_KEY, (nint)0);
+        }
+#else
+        if (IoReactor.s_shardArr != (nint)0 && shard >= 0 && shard < IoReactor.ShardCount()) {
+            int wfd = NativeMemory.AsRef<int>((IoReactor.ShardAt(shard)) + (nint)(IoReactor.SH_WAKEW));
+            if (wfd >= 0) {
+#if MACOS
+                byte one = 1;
+                long r = IoPlat.PosixWrite(wfd, NativeMemory.AddressOf(ref one), 1UL);
+                _ = r;
+#else
+                ulong one = 1UL;
+                long r = IoPlat.PosixWrite(wfd, NativeMemory.AddressOf(ref one), 8UL);
+                _ = r;
+#endif
+            }
+        }
+#endif
+    }
+
+    static void ParkBegin(nint w) {
+        Atomic.FetchAdd(ref s_coParked, 1, MemoryOrder.SeqCst);
+        Atomic.StoreAt<int>(w + (nint)WK_PARKED, 1, MemoryOrder.SeqCst);
+    }
+
+    static void ParkEnd(nint w) {
+        if (Atomic.ExchangeAt<int>(w + (nint)WK_PARKED, 0, MemoryOrder.SeqCst) != 0) {
+            Atomic.FetchAdd(ref s_coParked, -1, MemoryOrder.SeqCst);
+        }
+    }
+
+    static void CoNotify() {
+        if (Atomic.Load(ref s_coSearching, MemoryOrder.SeqCst) > 0) return;
+        if (Atomic.Load(ref s_coParked, MemoryOrder.SeqCst) <= 0) return;
+        nint self = CoSelf();
+        int n = s_coWorkers;
+        if (n <= 0 || s_wk == (nint)0) return;
+        int start = self != (nint)0 ? NativeMemory.AsRef<int>((self) + (nint)(WK_INDEX)) + 1 : 0;
+        if (start >= n) start = 0;
+        for (int k = 0; k < n; k++) {
+            int i = start + k;
+            if (i >= n) i -= n;
+            nint wp = WorkerAt(i);
+            if (Atomic.LoadAt<int>(wp + (nint)WK_PARKED, MemoryOrder.Relaxed) == 0) continue;
+            if (Atomic.CompareExchangeBoolAt<int>(wp + (nint)WK_PARKED, 1, 0, MemoryOrder.SeqCst, MemoryOrder.Relaxed)) {
+                Atomic.FetchAdd(ref s_coParked, -1, MemoryOrder.SeqCst);
+                WakeShard(WorkerShard(i));
+                return;
+            }
+        }
+    }
+
+    static uint CoRand(nint w) {
+        uint x = NativeMemory.AsRef<uint>((w) + (nint)(WK_RNG));
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        if (x == 0U) x = 0x9E3779B9U;
+        NativeMemory.AsRef<uint>((w) + (nint)(WK_RNG)) = x;
+        return x;
+    }
+
+    // ---- Global Injector ----
+    static void InjPush(nint frame, nint step) {
+        IoPlat.MutexLock(NativeMemory.AddressOf(ref s_injLock));
+        nint n = s_injFree;
+        if (n != (nint)0) {
+            s_injFree = NativeMemory.AsRef<nint>((n) + (nint)(ND_NEXT));
+        } else {
+            n = IoPlat.CMalloc(ND_SIZE);
+            if (n == (nint)0) IoPlat.RtFatal((nint)"oom", (nint)"io: injection node alloc failed");
+        }
+        NativeMemory.AsRef<nint>((n) + (nint)(ND_NEXT)) = (nint)0;
+        NativeMemory.AsRef<nint>((n) + (nint)(ND_FRAME)) = frame;
+        NativeMemory.AsRef<nint>((n) + (nint)(ND_STEP)) = step;
+        if (s_injTail != (nint)0) NativeMemory.AsRef<nint>((s_injTail) + (nint)(ND_NEXT)) = n;
+        else s_injHead = n;
+        s_injTail = n;
+        Atomic.FetchAdd(ref s_injLen, 1, MemoryOrder.AcqRel);
+        IoPlat.MutexUnlock(NativeMemory.AddressOf(ref s_injLock));
+    }
+
+    static void InjPushBatch(nint tasks, ulong count) {
+        if (tasks == (nint)0 || count == 0UL) return;
+        IoPlat.MutexLock(NativeMemory.AddressOf(ref s_injLock));
+        nint hBatch = (nint)0;
+        nint tBatch = (nint)0;
+        for (ulong i = 0UL; i < count; i++) {
+            nint n = s_injFree;
+            if (n != (nint)0) {
+                s_injFree = NativeMemory.AsRef<nint>((n) + (nint)(ND_NEXT));
+            } else {
+                n = IoPlat.CMalloc(ND_SIZE);
+                if (n == (nint)0) IoPlat.RtFatal((nint)"oom", (nint)"io: injection node alloc failed");
+            }
+            NativeMemory.AsRef<nint>((n) + (nint)(ND_NEXT)) = (nint)0;
+            NativeMemory.AsRef<nint>((n) + (nint)(ND_FRAME)) = NativeMemory.AsRef<nint>((tasks) + (nint)((long)i * 16L));
+            NativeMemory.AsRef<nint>((n) + (nint)(ND_STEP)) = NativeMemory.AsRef<nint>((tasks) + (nint)((long)i * 16L + 8L));
+            if (tBatch != (nint)0) NativeMemory.AsRef<nint>((tBatch) + (nint)(ND_NEXT)) = n;
+            else hBatch = n;
+            tBatch = n;
+        }
+        if (s_injTail != (nint)0) NativeMemory.AsRef<nint>((s_injTail) + (nint)(ND_NEXT)) = hBatch;
+        else s_injHead = hBatch;
+        s_injTail = tBatch;
+        Atomic.FetchAdd(ref s_injLen, (int)count, MemoryOrder.AcqRel);
+        IoPlat.MutexUnlock(NativeMemory.AddressOf(ref s_injLock));
+    }
+
+    static bool InjPop(ref nint outFrame, ref nint outStep) {
+        if (Atomic.Load(ref s_injLen, MemoryOrder.SeqCst) <= 0) return false;
+        IoPlat.MutexLock(NativeMemory.AddressOf(ref s_injLock));
+        nint n = s_injHead;
+        if (n != (nint)0) {
+            s_injHead = NativeMemory.AsRef<nint>((n) + (nint)(ND_NEXT));
+            if (s_injHead == (nint)0) s_injTail = (nint)0;
+            outFrame = NativeMemory.AsRef<nint>((n) + (nint)(ND_FRAME));
+            outStep = NativeMemory.AsRef<nint>((n) + (nint)(ND_STEP));
+            NativeMemory.AsRef<nint>((n) + (nint)(ND_NEXT)) = s_injFree;
+            s_injFree = n;
+            Atomic.FetchAdd(ref s_injLen, -1, MemoryOrder.AcqRel);
+        }
+        IoPlat.MutexUnlock(NativeMemory.AddressOf(ref s_injLock));
+        return n != (nint)0;
+    }
+
+    static int InjPopBatch(nint outArr, int max) {
+        if (Atomic.Load(ref s_injLen, MemoryOrder.SeqCst) <= 0) return 0;
+        IoPlat.MutexLock(NativeMemory.AddressOf(ref s_injLock));
+        int n = 0;
+        while (n < max && s_injHead != (nint)0) {
+            nint nd = s_injHead;
+            s_injHead = NativeMemory.AsRef<nint>((nd) + (nint)(ND_NEXT));
+            if (s_injHead == (nint)0) s_injTail = (nint)0;
+            NativeMemory.AsRef<nint>((outArr) + (nint)((long)n * 16L)) = NativeMemory.AsRef<nint>((nd) + (nint)(ND_FRAME));
+            NativeMemory.AsRef<nint>((outArr) + (nint)((long)n * 16L + 8L)) = NativeMemory.AsRef<nint>((nd) + (nint)(ND_STEP));
+            NativeMemory.AsRef<nint>((nd) + (nint)(ND_NEXT)) = s_injFree;
+            s_injFree = nd;
+            n++;
+        }
+        if (n > 0) Atomic.FetchAdd(ref s_injLen, -n, MemoryOrder.AcqRel);
+        IoPlat.MutexUnlock(NativeMemory.AddressOf(ref s_injLock));
+        return n;
+    }
+
+    // ---- Per-Worker Local Ring Queue ----
+    static void LqSpill(nint w) {
+        IoBuf2048 tmp = new IoBuf2048(); // 128 * 16 = 2048 bytes
+        nint tp = NativeMemory.AddressOf(ref tmp);
+        IoPlat.MutexLock(w + (nint)WK_QLOCK);
+        long h = Atomic.LoadAt<long>(w + (nint)WK_HEAD, MemoryOrder.Relaxed);
+        long t = Atomic.LoadAt<long>(w + (nint)WK_TAIL, MemoryOrder.Relaxed);
+        long n = (t - h) >> 1;
+        if (n > 128L) n = 128L;
+        for (long i = 0L; i < n; i++) {
+            long slotOff = WK_BUF + (long)(((ulong)(h + i) & (ulong)ZAN_LQ_MASK) * 16UL);
+            NativeMemory.AsRef<nint>((tp) + (nint)(i * 16L)) = NativeMemory.AsRef<nint>((w) + (nint)(slotOff));
+            NativeMemory.AsRef<nint>((tp) + (nint)(i * 16L + 8L)) = NativeMemory.AsRef<nint>((w) + (nint)(slotOff + 8L));
+        }
+        if (n > 0L) Atomic.StoreAt<long>(w + (nint)WK_HEAD, h + n, MemoryOrder.Release);
+        IoPlat.MutexUnlock(w + (nint)WK_QLOCK);
+        if (n <= 0L) return;
+        InjPushBatch(tp, (ulong)n);
+    }
+
+    static void LqPush(nint w, nint frame, nint step) {
+        IoPlat.MutexLock(w + (nint)WK_QLOCK);
+        long tail = Atomic.LoadAt<long>(w + (nint)WK_TAIL, MemoryOrder.Relaxed);
+        long head = Atomic.LoadAt<long>(w + (nint)WK_HEAD, MemoryOrder.Relaxed);
+        if (tail - head >= (long)ZAN_LQ_CAP) {
+            IoPlat.MutexUnlock(w + (nint)WK_QLOCK);
+            LqSpill(w);
+            IoPlat.MutexLock(w + (nint)WK_QLOCK);
+            tail = Atomic.LoadAt<long>(w + (nint)WK_TAIL, MemoryOrder.Relaxed);
+            head = Atomic.LoadAt<long>(w + (nint)WK_HEAD, MemoryOrder.Relaxed);
+            if (tail - head >= (long)ZAN_LQ_CAP) {
+                IoPlat.MutexUnlock(w + (nint)WK_QLOCK);
+                InjPush(frame, step);
+                return;
+            }
+        }
+        long slotOff = WK_BUF + (long)(((ulong)tail & (ulong)ZAN_LQ_MASK) * 16UL);
+        NativeMemory.AsRef<nint>((w) + (nint)(slotOff)) = frame;
+        NativeMemory.AsRef<nint>((w) + (nint)(slotOff + 8L)) = step;
+        Atomic.StoreAt<long>(w + (nint)WK_TAIL, tail + 1L, MemoryOrder.Release);
+        MarkNonempty(NativeMemory.AsRef<int>((w) + (nint)(WK_INDEX)));
+        IoPlat.MutexUnlock(w + (nint)WK_QLOCK);
+    }
+
+    static void LqPushBatch(nint w, nint tasks, long count) {
+        if (count <= 0L) return;
+        IoPlat.MutexLock(w + (nint)WK_QLOCK);
+        long tail = Atomic.LoadAt<long>(w + (nint)WK_TAIL, MemoryOrder.Relaxed);
+        long head = Atomic.LoadAt<long>(w + (nint)WK_HEAD, MemoryOrder.Relaxed);
+        long avail = (long)ZAN_LQ_CAP - (tail - head);
+        long fit = avail > 0L ? (count < avail ? count : avail) : 0L;
+        for (long i = 0L; i < fit; i++) {
+            long slotOff = WK_BUF + (long)(((ulong)(tail + i) & (ulong)ZAN_LQ_MASK) * 16UL);
+            NativeMemory.AsRef<nint>((w) + (nint)(slotOff)) = NativeMemory.AsRef<nint>((tasks) + (nint)(i * 16L));
+            NativeMemory.AsRef<nint>((w) + (nint)(slotOff + 8L)) = NativeMemory.AsRef<nint>((tasks) + (nint)(i * 16L + 8L));
+        }
+        if (fit > 0L) {
+            Atomic.StoreAt<long>(w + (nint)WK_TAIL, tail + fit, MemoryOrder.Release);
+            MarkNonempty(NativeMemory.AsRef<int>((w) + (nint)(WK_INDEX)));
+        }
+        IoPlat.MutexUnlock(w + (nint)WK_QLOCK);
+        if (fit < count) {
+            InjPushBatch(tasks + (nint)(fit * 16L), (ulong)(count - fit));
+        }
+    }
+
+    static bool LqPop(nint w, ref nint outFrame, ref nint outStep) {
+        if (Atomic.LoadAt<long>(w + (nint)WK_TAIL, MemoryOrder.Relaxed) <=
+            Atomic.LoadAt<long>(w + (nint)WK_HEAD, MemoryOrder.Relaxed))
+            return false;
+        IoPlat.MutexLock(w + (nint)WK_QLOCK);
+        long h = Atomic.LoadAt<long>(w + (nint)WK_HEAD, MemoryOrder.Relaxed);
+        long t = Atomic.LoadAt<long>(w + (nint)WK_TAIL, MemoryOrder.Relaxed);
+        int idx = NativeMemory.AsRef<int>((w) + (nint)(WK_INDEX));
+        if (h >= t) {
+            ClearEmpty(idx);
+            IoPlat.MutexUnlock(w + (nint)WK_QLOCK);
+            return false;
+        }
+        long slotOff = WK_BUF + (long)(((ulong)h & (ulong)ZAN_LQ_MASK) * 16UL);
+        outFrame = NativeMemory.AsRef<nint>((w) + (nint)(slotOff));
+        outStep = NativeMemory.AsRef<nint>((w) + (nint)(slotOff + 8L));
+        Atomic.StoreAt<long>(w + (nint)WK_HEAD, h + 1L, MemoryOrder.Release);
+        if (h + 1L >= t) ClearEmpty(idx);
+        IoPlat.MutexUnlock(w + (nint)WK_QLOCK);
+        return true;
+    }
+
+    static bool LqSteal(nint v, nint w, ref nint outFrame, ref nint outStep) {
+        int vIdx = NativeMemory.AsRef<int>((v) + (nint)(WK_INDEX));
+        if (!WorkerHasWork(vIdx)) return false;
+        if (IoPlat.MutexTryLock(v + (nint)WK_QLOCK) == 0) return false;
+        long h = Atomic.LoadAt<long>(v + (nint)WK_HEAD, MemoryOrder.Relaxed);
+        long t = Atomic.LoadAt<long>(v + (nint)WK_TAIL, MemoryOrder.Relaxed);
+        long n = t - h;
+        if (n <= 0L) {
+            ClearEmpty(vIdx);
+            IoPlat.MutexUnlock(v + (nint)WK_QLOCK);
+            return false;
+        }
+        IoBuf2048 tmp = new IoBuf2048(); // 128 * 16
+        nint tp = NativeMemory.AddressOf(ref tmp);
+        long take = n - (n >> 1);
+        if (take > 128L) take = 128L;
+        for (long i = 0L; i < take; i++) {
+            long slotOff = WK_BUF + (long)(((ulong)(h + i) & (ulong)ZAN_LQ_MASK) * 16UL);
+            NativeMemory.AsRef<nint>((tp) + (nint)(i * 16L)) = NativeMemory.AsRef<nint>((v) + (nint)(slotOff));
+            NativeMemory.AsRef<nint>((tp) + (nint)(i * 16L + 8L)) = NativeMemory.AsRef<nint>((v) + (nint)(slotOff + 8L));
+        }
+        Atomic.StoreAt<long>(v + (nint)WK_HEAD, h + take, MemoryOrder.Release);
+        if (h + take >= t) ClearEmpty(vIdx);
+        IoPlat.MutexUnlock(v + (nint)WK_QLOCK);
+        outFrame = NativeMemory.AsRef<nint>(tp);
+        outStep = NativeMemory.AsRef<nint>((tp) + (nint)(8L));
+        if (take > 1L) LqPushBatch(w, tp + (nint)16, take - 1L);
+        return true;
+    }
+
+    // ---- Activity & Outstanding Counters ----
+    static int CntActivity() {
+        long s = (long)Atomic.Load(ref s_extAct, MemoryOrder.SeqCst);
+        if (s_wk != (nint)0) {
+            for (int i = 0; i < s_coWorkers; i++) {
+                s += (long)Atomic.LoadAt<int>(WorkerAt(i) + (nint)WK_CNT_ACT, MemoryOrder.SeqCst);
+            }
+        }
+        return (int)s;
+    }
+
+    static int CntOutstanding() {
+        long s = (long)Atomic.Load(ref s_extOut, MemoryOrder.SeqCst);
+        if (s_wk != (nint)0) {
+            for (int i = 0; i < s_coWorkers; i++) {
+                s += (long)Atomic.LoadAt<int>(WorkerAt(i) + (nint)WK_CNT_OUT, MemoryOrder.SeqCst);
+            }
+        }
+        return (int)s;
+    }
+
+    static void CntAdd(nint w, int act, int outDelta) {
+        if (w != (nint)0) {
+            if (act != 0) Atomic.FetchAddAt<int>(w + (nint)WK_CNT_ACT, act, MemoryOrder.AcqRel);
+            if (outDelta != 0) Atomic.FetchAddAt<int>(w + (nint)WK_CNT_OUT, outDelta, MemoryOrder.AcqRel);
+        } else {
+            if (act != 0) Atomic.FetchAdd(ref s_extAct, act, MemoryOrder.AcqRel);
+            if (outDelta != 0) Atomic.FetchAdd(ref s_extOut, outDelta, MemoryOrder.AcqRel);
+        }
+    }
+
+    // ---- Submission ----
+    static void CoSubmit(nint frame, nint step) {
+        nint w = CoSelf();
+        CntAdd(w, 1, 1);
+        if (w == (nint)0) {
+            InjPush(frame, step);
+            Atomic.FetchAdd(ref s_injPushExt, 1, MemoryOrder.Relaxed);
+            CoNotify();
+            return;
+        }
+        if (Atomic.LoadAt<int>(w + (nint)WK_LIFO_FULL, MemoryOrder.Acquire) == 0) {
+            NativeMemory.AsRef<nint>((w) + (nint)(WK_LIFO_F)) = frame;
+            NativeMemory.AsRef<nint>((w) + (nint)(WK_LIFO_S)) = step;
+            Atomic.StoreAt<int>(w + (nint)WK_LIFO_FULL, 1, MemoryOrder.Release);
+            return;
+        }
+        LqPush(w, frame, step);
+        CoNotify();
+    }
+
+    static void CoSubmitBatch(nint tasks, ulong count) {
+        if (tasks == (nint)0 || count == 0UL) return;
+        nint w = CoSelf();
+        if (w == (nint)0) {
+            CntAdd((nint)0, (int)count, (int)count);
+            InjPushBatch(tasks, count);
+            Atomic.FetchAdd(ref s_injPushExt, (int)count, MemoryOrder.Relaxed);
+            CoNotify();
+            return;
+        }
+        CntAdd(w, (int)count, (int)count);
+        ulong i = 0UL;
+        if (Atomic.LoadAt<int>(w + (nint)WK_LIFO_FULL, MemoryOrder.Acquire) == 0 && i < count) {
+            NativeMemory.AsRef<nint>((w) + (nint)(WK_LIFO_F)) = NativeMemory.AsRef<nint>(tasks);
+            NativeMemory.AsRef<nint>((w) + (nint)(WK_LIFO_S)) = NativeMemory.AsRef<nint>((tasks) + (nint)(8L));
+            Atomic.StoreAt<int>(w + (nint)WK_LIFO_FULL, 1, MemoryOrder.Release);
+            i++;
+        }
+        if (i < count) {
+            LqPushBatch(w, tasks + (nint)((long)i * 16L), (long)(count - i));
+        }
+        CoNotify();
+    }
+
+    [Export("zan_co_ready_batch")]
+    public static void CoReadyBatch(nint tasks, ulong count) {
+        if (tasks == (nint)0 || count == 0UL) return;
+        IoBuf1024 runnable = new IoBuf1024(); // 64 * 16 bytes
+        nint rbp = NativeMemory.AddressOf(ref runnable);
+        ulong nRun = 0UL;
+
+        for (ulong i = 0UL; i < count; i++) {
+            nint frame = NativeMemory.AsRef<nint>((tasks) + (nint)((long)i * 16L));
+            nint step = NativeMemory.AsRef<nint>((tasks) + (nint)((long)i * 16L + 8L));
+            if (step == (nint)0 || frame == (nint)0) continue;
+
+            bool queued = false;
+            for (;;) {
+                long s = Atomic.LoadAt<long>(frame + (nint)FH_SCHED, MemoryOrder.Acquire);
+                if ((s & CO_DEAD) != 0L) break;
+                if ((s & CO_QUEUED) != 0L) break;
+                if ((s & CO_RUNNING) != 0L) {
+                    nint sw = CoSelf();
+                    long selfq = (sw != (nint)0 && NativeMemory.AsRef<nint>((sw) + (nint)(WK_CUR)) == frame) ? CO_SELFQ : 0L;
+                    Atomic.StoreAt<nint>(frame + (nint)FH_PENDING, step, MemoryOrder.Relaxed);
+                    if (Atomic.CompareExchangeBoolAt<long>(frame + (nint)FH_SCHED, s, s | CO_NOTIFIED | selfq,
+                                                           MemoryOrder.AcqRel, MemoryOrder.Acquire))
+                        break;
+                    continue;
+                }
+                if (Atomic.CompareExchangeBoolAt<long>(frame + (nint)FH_SCHED, s, s | CO_QUEUED,
+                                                       MemoryOrder.AcqRel, MemoryOrder.Acquire)) {
+                    queued = true;
+                    break;
+                }
+            }
+            if (queued) {
+                NativeMemory.AsRef<nint>((rbp) + (nint)((long)nRun * 16L)) = frame;
+                NativeMemory.AsRef<nint>((rbp) + (nint)((long)nRun * 16L + 8L)) = step;
+                nRun++;
+                if (nRun == 64UL) {
+                    CoSubmitBatch(rbp, nRun);
+                    nRun = 0UL;
+                }
+            }
+        }
+        if (nRun > 0UL) CoSubmitBatch(rbp, nRun);
+        PoolEnsure();
+    }
+
+    [Export("zan_co_ready")]
+    public static void CoReady(nint frame, nint step) {
+        if (step == (nint)0 || frame == (nint)0) return;
+        IoBuf16 t = new IoBuf16();
+        nint tp = NativeMemory.AddressOf(ref t);
+        NativeMemory.AsRef<nint>(tp) = frame;
+        NativeMemory.AsRef<nint>((tp) + (nint)(8L)) = step;
+        CoReadyBatch(tp, 1UL);
+    }
+
+    // ---- TLS Frame Pool ----
+    static uint FrameSizeClass(ulong sz) {
+        if (sz <= 256UL) return 0U;
+        if (sz <= 512UL) return 1U;
+        if (sz <= 1024UL) return 2U;
+        if (sz <= 2048UL) return 3U;
+        return 99U;
+    }
+
+    static ulong ClassAllocSize(uint c, ulong req) {
+        if (c == 0U) return 256UL;
+        if (c == 1U) return 512UL;
+        if (c == 2U) return 1024UL;
+        if (c == 3U) return 2048UL;
+        return req;
+    }
+
+    [Export("__zan_co_frame_recycle")]
+    [Visibility("hidden")]
+    static void FrameRecycle(nint frame) {
+        if (frame == (nint)0) return;
+        nint pfx = frame - (nint)PFX_SIZE;
+        if (NativeMemory.AsRef<uint>((pfx) + (nint)(PFX_MAGIC)) != ZAN_CO_FRAME_MAGIC) {
+            IoPlat.CAbort();
+        }
+        uint c = NativeMemory.AsRef<uint>((pfx) + (nint)(PFX_CLASS));
+        nint tls = IoPlat.GetTls(false);
+        if (c < (uint)IoConst.ZAN_CO_FRAME_CLASSES && tls != (nint)0) {
+            long cntOff = IoConst.TLS_FRM_CNT + (long)c * 8L;
+            ulong cnt = NativeMemory.AsRef<ulong>((tls) + (nint)(cntOff));
+            if (cnt < (ulong)IoConst.ZAN_CO_FRAME_POOL_CAP) {
+                long baseOff = IoConst.TLS_FRM_ITEMS + (long)c * (long)IoConst.ZAN_CO_FRAME_POOL_CAP * 8L;
+                NativeMemory.AsRef<nint>((tls) + (nint)(baseOff + (long)cnt * 8L)) = pfx;
+                NativeMemory.AsRef<ulong>((tls) + (nint)(cntOff)) = cnt + 1UL;
+                return;
+            }
+        }
+        IoPlat.CFree(pfx);
+    }
+
+    static void FramePoolFlushTls() {
+        nint tls = IoPlat.GetTls(false);
+        if (tls == (nint)0) return;
+        for (int c = 0; c < IoConst.ZAN_CO_FRAME_CLASSES; c++) {
+            long cntOff = IoConst.TLS_FRM_CNT + (long)c * 8L;
+            ulong cnt = NativeMemory.AsRef<ulong>((tls) + (nint)(cntOff));
+            long baseOff = IoConst.TLS_FRM_ITEMS + (long)c * (long)IoConst.ZAN_CO_FRAME_POOL_CAP * 8L;
+            for (ulong i = 0UL; i < cnt && i < (ulong)IoConst.ZAN_CO_FRAME_POOL_CAP; i++) {
+                nint fp = NativeMemory.AsRef<nint>((tls) + (nint)(baseOff + (long)i * 8L));
+                if (fp != (nint)0) IoPlat.CFree(fp);
+            }
+            NativeMemory.AsRef<ulong>((tls) + (nint)(cntOff)) = 0UL;
+        }
+    }
+
+    [Export("__zan_co_frame_alloc")]
+    public static nint CoFrameAlloc(ulong size) {
+        ulong req = size != 0UL ? size : 1UL;
+        if (req > 0xFFFFFFFFFFFFFFE0UL) return (nint)0;
+        uint c = FrameSizeClass(req);
+        ulong allocSz = ClassAllocSize(c, req);
+        ulong totalSz = PFX_SIZE + allocSz;
+
+        nint pfx = (nint)0;
+        if (c < (uint)IoConst.ZAN_CO_FRAME_CLASSES) {
+            nint tls = IoPlat.GetTls(true);
+            if (tls != (nint)0) {
+                long cntOff = IoConst.TLS_FRM_CNT + (long)c * 8L;
+                ulong cnt = NativeMemory.AsRef<ulong>((tls) + (nint)(cntOff));
+                if (cnt > 0UL) {
+                    cnt--;
+                    NativeMemory.AsRef<ulong>((tls) + (nint)(cntOff)) = cnt;
+                    long baseOff = IoConst.TLS_FRM_ITEMS + (long)c * (long)IoConst.ZAN_CO_FRAME_POOL_CAP * 8L;
+                    pfx = NativeMemory.AsRef<nint>((tls) + (nint)(baseOff + (long)cnt * 8L));
+                }
+            }
+        }
+        if (pfx == (nint)0) {
+            pfx = IoPlat.CMalloc(totalSz);
+            if (pfx == (nint)0) return (nint)0;
+        }
+        IoPlat.CMemset(pfx, 0, PFX_SIZE + req);
+        NativeMemory.AsRef<uint>((pfx) + (nint)(PFX_MAGIC)) = ZAN_CO_FRAME_MAGIC;
+        NativeMemory.AsRef<uint>((pfx) + (nint)(PFX_CLASS)) = c;
+        NativeMemory.AsRef<ulong>((pfx) + (nint)(PFX_ACTUAL)) = req;
+        nint frame = pfx + (nint)PFX_SIZE;
+        IoPlat.TaskFrameAllocator(frame, NativeMemory.FunctionPointer(FrameRecycle));
+        return frame;
+    }
+
+    [Export("__zan_co_frame_free")]
+    public static void CoFrameFree(nint frame) {
+        if (frame == (nint)0) return;
+        for (;;) {
+            long s = Atomic.LoadAt<long>(frame + (nint)FH_SCHED, MemoryOrder.Acquire);
+            if ((s & CO_DEAD) != 0L) return;
+            if ((s & (CO_QUEUED | CO_RUNNING)) != 0L) {
+                if (Atomic.CompareExchangeBoolAt<long>(frame + (nint)FH_SCHED, s, s | CO_DEAD,
+                                                       MemoryOrder.AcqRel, MemoryOrder.Acquire))
+                    return;
+                continue;
+            }
+            if (Atomic.CompareExchangeBoolAt<long>(frame + (nint)FH_SCHED, s, CO_DEAD,
+                                                   MemoryOrder.AcqRel, MemoryOrder.Acquire))
+                break;
+        }
+        IoPlat.TaskRetire(frame, NativeMemory.FunctionPointer(FreeWrapper));
+    }
+
+    [Export("zan_co_delay")]
+    public static void CoDelay(long ms, nint frame, nint step) {
+        IoPlat.TimerDelay(ms, frame, step);
+        CntAdd(CoSelf(), 1, 0);
+        CoNotify();
+    }
+
+    static int ComputeWorkerCount() {
+        int w = IoPlat.AsyncCfgWorkers();
+#if WINDOWS
+        if (w <= 0) {
+            IoBuf32 envBuf = new IoBuf32();
+            nint ep = NativeMemory.AddressOf(ref envBuf);
+            uint r = IoPlat.WinGetEnvA((nint)"ZAN_CO_WORKERS", ep, 32U);
+            if (r > 0U && r < 32U) w = IoPlat.CAtoi(ep);
+        }
+#endif
+        if (w <= 0) {
+            nint e = IoPlat.CGetEnv((nint)"ZAN_CO_WORKERS");
+            if (e != (nint)0 && NativeMemory.AsRef<byte>(e) != 0) w = IoPlat.CAtoi(e);
+        }
+        if (w <= 0) {
+            w = IoPlat.CpuCount();
+            if (w > 16) w = 16;
+        }
+        if (w < 1) w = 1;
+        if (w > ZAN_CO_MAXW) w = ZAN_CO_MAXW;
+        return w;
+    }
+
+    // ---- Preemption poll ----
+    [Export("zan_co_poll")]
+    public static int CoPoll() {
+        nint w = CoSelf();
+        if (w == (nint)0) return 0;
+        uint pt = NativeMemory.AsRef<uint>((w) + (nint)(WK_POLL_TICK)) + 1U;
+        NativeMemory.AsRef<uint>((w) + (nint)(WK_POLL_TICK)) = pt;
+        if ((pt & (ZAN_POLL_GATE - 1U)) != 0U) return 0;
+        long q = IoPlat.CoQuantumMs();
+        if (q <= 0L) return 0;
+        long now = IoPlat.CoPreciseUs();
+        long sliceStart = NativeMemory.AsRef<long>((w) + (nint)(WK_SLICE_US));
+        if (sliceStart <= 0L) {
+            NativeMemory.AsRef<long>((w) + (nint)(WK_SLICE_US)) = now;
+            return 0;
+        }
+        return (now - sliceStart >= q * 1000L) ? 1 : 0;
+    }
+
+    // ---- External root awaiter wake/wait ----
+    static void ExtWake(nint frame) {
+        if (Atomic.Load(ref s_extWaiters, MemoryOrder.SeqCst) <= 0) return;
+        if (Atomic.Load(ref s_extOverflow, MemoryOrder.SeqCst) <= 0) {
+            bool hit = false;
+            nint slots = NativeMemory.AddressOf(ref s_extSlots);
+            for (int i = 0; i < ZAN_CO_EXT_SLOTS && !hit; i++) {
+                nint d = Atomic.LoadAt<nint>(slots + (nint)((long)i * 8L), MemoryOrder.SeqCst);
+                if (d != (nint)0 && ((ulong)d - (ulong)frame) < ZAN_CO_EXT_DONE_SPAN) hit = true;
+            }
+            if (!hit) return;
+        }
+#if WINDOWS
+        IoPlat.WinAcquireSrw(NativeMemory.AddressOf(ref s_extSrw));
+        IoPlat.WinWakeAllCv(NativeMemory.AddressOf(ref s_extCv));
+        IoPlat.WinReleaseSrw(NativeMemory.AddressOf(ref s_extSrw));
+#else
+        EnsureExtSync();
+        IoPlat.PosixMutexLock(NativeMemory.AddressOf(ref s_extMx));
+        IoPlat.PosixCondBroadcast(NativeMemory.AddressOf(ref s_extCv));
+        IoPlat.PosixMutexUnlock(NativeMemory.AddressOf(ref s_extMx));
+#endif
+    }
+
+    static void ExtWait(nint donePtr) {
+        for (int i = 0; i < ZAN_CO_EXT_SPIN; i++) {
+            if (Atomic.LoadAt<int>(donePtr, MemoryOrder.Acquire) != 0) return;
+            Atomic.Pause();
+        }
+        int slot = -1;
+        nint slots = NativeMemory.AddressOf(ref s_extSlots);
+        for (int i = 0; i < ZAN_CO_EXT_SLOTS; i++) {
+            if (Atomic.CompareExchangeBoolAt<nint>(slots + (nint)((long)i * 8L), (nint)0, donePtr,
+                                                   MemoryOrder.SeqCst, MemoryOrder.SeqCst)) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot < 0) Atomic.FetchAdd(ref s_extOverflow, 1, MemoryOrder.SeqCst);
+        Atomic.FetchAdd(ref s_extWaiters, 1, MemoryOrder.SeqCst);
+#if WINDOWS
+        IoPlat.WinAcquireSrw(NativeMemory.AddressOf(ref s_extSrw));
+        while (Atomic.LoadAt<int>(donePtr, MemoryOrder.SeqCst) == 0) {
+            IoPlat.WinSleepCvSrw(NativeMemory.AddressOf(ref s_extCv),
+                                 NativeMemory.AddressOf(ref s_extSrw),
+                                 (uint)ZAN_CO_EXT_BACKSTOP_MS, 0U);
+        }
+        IoPlat.WinReleaseSrw(NativeMemory.AddressOf(ref s_extSrw));
+#else
+        EnsureExtSync();
+        IoPlat.PosixMutexLock(NativeMemory.AddressOf(ref s_extMx));
+        while (Atomic.LoadAt<int>(donePtr, MemoryOrder.SeqCst) == 0) {
+            IoBuf16 ts = new IoBuf16();
+            nint tsp = NativeMemory.AddressOf(ref ts);
+            IoPlat.PosixClockGetTime(IoConst.CLOCK_REALTIME, tsp);
+            long sec = NativeMemory.AsRef<long>(tsp);
+            long nsec = NativeMemory.AsRef<long>((tsp) + (nint)(8L)) + ZAN_CO_EXT_BACKSTOP_MS * 1000000L;
+            if (nsec >= 1000000000L) { sec += 1L; nsec -= 1000000000L; }
+            NativeMemory.AsRef<long>(tsp) = sec;
+            NativeMemory.AsRef<long>((tsp) + (nint)(8L)) = nsec;
+            IoPlat.PosixCondTimedWait(NativeMemory.AddressOf(ref s_extCv),
+                                      NativeMemory.AddressOf(ref s_extMx), tsp);
+        }
+        IoPlat.PosixMutexUnlock(NativeMemory.AddressOf(ref s_extMx));
+#endif
+        Atomic.FetchAdd(ref s_extWaiters, -1, MemoryOrder.SeqCst);
+        if (slot >= 0) Atomic.StoreAt<nint>(slots + (nint)((long)slot * 8L), (nint)0, MemoryOrder.SeqCst);
+        else Atomic.FetchAdd(ref s_extOverflow, -1, MemoryOrder.SeqCst);
+    }
+
+}
+#endif

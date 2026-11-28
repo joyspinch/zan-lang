@@ -626,6 +626,83 @@ static LLVMValueRef emit_closure_record_gctx(
         LLVMConstInt(i64, ZAN_CLOSURE_TAG, 0), "clo.tag");
     return LLVMBuildIntToPtr(g->builder, tagged, i8ptr, "clo.v");
 }
+
+static LLVMValueRef get_noescape_closure_dtor(zan_irgen_t *g) {
+    LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_noescape_clo_dtor");
+    if (fn) return fn;
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef void_t = LLVMVoidTypeInContext(g->ctx);
+    LLVMTypeRef fty = LLVMFunctionType(void_t, &i8ptr, 1, 0);
+    fn = LLVMAddFunction(g->mod, "__zan_noescape_clo_dtor", fty);
+    zan_set_module_local(fn);
+    LLVMBasicBlockRef saved_bb = LLVMGetInsertBlock(g->builder);
+    LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
+    LLVMPositionBuilderAtEnd(g->builder, bb);
+    LLVMBuildRetVoid(g->builder);
+    if (saved_bb) LLVMPositionBuilderAtEnd(g->builder, saved_bb);
+    return fn;
+}
+
+static LLVMValueRef emit_stack_closure_record_gctx(
+    zan_irgen_t *g, LLVMTypeRef rec_ty, LLVMValueRef fn_ptr,
+    lambda_capture_t *caps, int capc, int has_this, LLVMValueRef self,
+    LLVMValueRef gctx_val) {
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMBasicBlockRef cur_bb = LLVMGetInsertBlock(g->builder);
+    LLVMValueRef cur_fn = LLVMGetBasicBlockParent(cur_bb);
+    LLVMBasicBlockRef entry_bb = LLVMGetEntryBasicBlock(cur_fn);
+    LLVMValueRef first_inst = LLVMGetFirstInstruction(entry_bb);
+    LLVMBuilderRef ab = LLVMCreateBuilderInContext(g->ctx);
+    if (first_inst) LLVMPositionBuilderBefore(ab, first_inst);
+    else LLVMPositionBuilderAtEnd(ab, entry_bb);
+    LLVMValueRef rec = LLVMBuildAlloca(ab, rec_ty, "clo.stk");
+    LLVMSetAlignment(rec, 16);
+    LLVMDisposeBuilder(ab);
+
+    LLVMValueRef dtor = get_noescape_closure_dtor(g);
+    LLVMBuildStore(g->builder,
+        LLVMBuildBitCast(g->builder, fn_ptr, i8ptr, "clo.fn"),
+        LLVMBuildStructGEP2(g->builder, rec_ty, rec, 0, "clo.fnp"));
+    LLVMBuildStore(g->builder,
+        LLVMBuildBitCast(g->builder, dtor, i8ptr, "clo.dt"),
+        LLVMBuildStructGEP2(g->builder, rec_ty, rec, 1, "clo.dtp"));
+    LLVMBuildStore(g->builder, LLVMConstNull(i8ptr),
+        LLVMBuildStructGEP2(g->builder, rec_ty, rec, 2, "clo.tgp"));
+    for (int i = 0; i < capc; i++) {
+        if (caps[i].boxed) {
+            /* Non-escaping synchronous closure: borrow outer box cell directly
+             * without heap allocation or ARC traffic. */
+            LLVMBuildStore(g->builder, caps[i].slot,
+                LLVMBuildStructGEP2(g->builder, rec_ty, rec,
+                                    (unsigned)(ZAN_CLOSURE_HDR_FIELDS + i), "cap.bp"));
+            continue;
+        }
+        LLVMValueRef v = LLVMBuildLoad2(g->builder, caps[i].llvm, caps[i].slot, "cap.v");
+        LLVMBuildStore(g->builder, v,
+            LLVMBuildStructGEP2(g->builder, rec_ty, rec,
+                                (unsigned)(ZAN_CLOSURE_HDR_FIELDS + i), "cap.sp"));
+    }
+    if (has_this && self) {
+        if (LLVMTypeOf(self) != i8ptr)
+            self = LLVMBuildBitCast(g->builder, self, i8ptr, "cap.self8");
+        LLVMBuildStore(g->builder, self,
+            LLVMBuildStructGEP2(g->builder, rec_ty, rec,
+                                (unsigned)(ZAN_CLOSURE_HDR_FIELDS + capc), "cap.selfp"));
+    }
+    if (gctx_val) {
+        if (LLVMTypeOf(gctx_val) != i8ptr)
+            gctx_val = LLVMBuildBitCast(g->builder, gctx_val, i8ptr, "cap.gctx8");
+        LLVMBuildStore(g->builder, gctx_val,
+            LLVMBuildStructGEP2(g->builder, rec_ty, rec,
+                                (unsigned)(ZAN_CLOSURE_HDR_FIELDS + capc + (has_this ? 1 : 0)),
+                                "cap.gctxp"));
+    }
+    LLVMValueRef tagged = LLVMBuildOr(g->builder,
+        LLVMBuildPtrToInt(g->builder, rec, i64, "clo.i"),
+        LLVMConstInt(i64, ZAN_CLOSURE_TAG, 0), "clo.tag");
+    return LLVMBuildIntToPtr(g->builder, tagged, i8ptr, "clo.v");
+}
 static LLVMValueRef emit_closure_record(zan_irgen_t *g, zan_loc_t loc,
                                         const char *lname, LLVMTypeRef rec_ty,
                                         LLVMValueRef fn_ptr, LLVMValueRef target,

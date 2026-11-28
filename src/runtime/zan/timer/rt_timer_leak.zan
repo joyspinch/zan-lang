@@ -1,0 +1,398 @@
+// rt_timer_leak.zan: --check-leaks exit cycle diagnosis & CSR iterative DFS
+// cycle path printer (S13, docs/ZAN_STANDARD.md §3).
+// Replaces src/runtime/timer/rt_timer_leak.c in 100% pure Zan.
+
+namespace Zan.Runtime.Timer;
+
+// LeakEdge (12B -> pad to 16B): to(0), kind(4), index(8)
+static class RtTimerLeak {
+    const int MAX_CYCLES = 8;
+    const int MAX_PATH = 12;
+    const long EDGE_SIZE = 16L;
+
+    static void EmitBytes(nint logFh, nint buf, ulong len) {
+        if (len == 0UL) return;
+        RtPlat.WriteStdoutBytes(buf, len);
+        if (logFh != (nint)0) {
+            RtPlat.CFwrite(buf, 1UL, len, logFh);
+        }
+    }
+
+    static void EmitCStr(nint logFh, nint s) {
+        EmitBytes(logFh, s, RtPlat.CStrLen(s));
+    }
+
+    static void PushEdge(ref nint edges, ref ulong count, ref ulong cap, int to, int kind, uint index) {
+        if (count == cap) {
+            if (cap > RtAbi.SIZE_MAX_U64 / 32UL) return;
+            ulong ncap = cap != 0UL ? cap * 2UL : 64UL;
+            nint ne = RtPlat.CRealloc(edges, ncap * (ulong)EDGE_SIZE);
+            if (ne == (nint)0) return;
+            edges = ne;
+            cap = ncap;
+        }
+        nint e = edges + (nint)((long)count * EDGE_SIZE);
+        NativeMemory.Write<int>(e, to);
+        NativeMemory.Write<int>(e + (nint)4, kind);
+        NativeMemory.Write<uint>(e + (nint)8, index);
+        count++;
+    }
+
+    // mode: 0 = internal_rc count, 1 = BFS mark, 2 = collect unmarked CSR edges
+    static void HandleEdgeTarget(nint target, int kind, uint index, int mode,
+                                 nint nodes, ref ObjMap map, nint queue, ref ulong qtail,
+                                 ref nint edges, ref ulong ecount, ref ulong ecap) {
+        int j = RtTimerGc.ObjMapGet(ref map, RtTimerGc.EdgeUntag(target));
+        if (j < 0) return;
+        nint nd = nodes + (nint)((long)j * GcOff.CN_SIZE);
+        if (mode == 0) {
+            NativeMemory.Write<long>(nd + (nint)GcOff.CN_INTERNAL,
+                NativeMemory.Read<long>(nd + (nint)GcOff.CN_INTERNAL) + 1L);
+        } else if (mode == 1) {
+            if (NativeMemory.Read<int>(nd + (nint)GcOff.CN_MARKED) == 0) {
+                NativeMemory.Write<int>(nd + (nint)GcOff.CN_MARKED, 1);
+                NativeMemory.At<int>(queue, (long)qtail) = j;
+                qtail++;
+            }
+        } else {
+            if (NativeMemory.Read<int>(nd + (nint)GcOff.CN_MARKED) == 0) {
+                PushEdge(ref edges, ref ecount, ref ecap, j, kind, index);
+            }
+        }
+    }
+
+    static void WalkLabeledEdges(nint entry, int mode, nint nodes, ref ObjMap map,
+                                 nint queue, ref ulong qtail,
+                                 ref nint edges, ref ulong ecount, ref ulong ecap) {
+        nint obj = NativeMemory.Read<nint>(entry + (nint)GcOff.LE_OBJ);
+        int kind = NativeMemory.Read<int>(entry + (nint)GcOff.LE_KIND);
+        ulong size = NativeMemory.Read<ulong>(entry + (nint)GcOff.LE_BYTES);
+        if (kind != GcOff.KIND_OBJECT) {
+            if (kind == GcOff.KIND_REF_ARRAY) {
+                long count = NativeMemory.Read<long>(obj + (nint)RtAbi.ARR_COUNT_OFF);
+                ulong dataOff = NativeMemory.Read<ulong>(entry + (nint)GcOff.LE_DATA_OFF);
+                ulong bytes = size - (ulong)RtAbi.ARR_HDR_SIZE - dataOff;
+                if (count > 0L && (ulong)count <= bytes / 8UL) {
+                    nint elems = obj + (nint)dataOff;
+                    for (long i = 0L; i < count; i++) {
+                        nint el = NativeMemory.At<nint>(elems, i);
+                        if (el != (nint)0) {
+                            HandleEdgeTarget(el, 1, (uint)i, mode, nodes, ref map, queue, ref qtail, ref edges, ref ecount, ref ecap);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        ulong word = NativeMemory.Read<ulong>(entry + (nint)GcOff.LE_SITE) & ~RtAbi.OBJ_STACK_FLAG;
+        if (RtTimerGc.WordIsString(word)) return;
+        nint fg = RtTimerGc.EntryFieldGraph(entry, word);
+        if (fg == (nint)0) return;
+
+        ulong hdrBytes = RtTimerGc.ObjHdrBytes(word);
+        if (size < hdrBytes) return;
+        ulong body = size - hdrBytes;
+        uint fgKind = NativeMemory.Read<uint>(fg + (nint)GcOff.FG_KIND);
+        uint refCount = NativeMemory.Read<uint>(fg + (nint)GcOff.FG_REF_COUNT);
+
+        if (fgKind == 0U) {
+            for (uint k = 0U; k < refCount; k++) {
+                nint r = fg + (nint)(GcOff.FG_REFS + (long)k * 8L);
+                uint off = NativeMemory.Read<uint>(r);
+                uint isRc = NativeMemory.Read<uint>(r + (nint)4);
+                if (isRc == 0U || (ulong)off > body || body - (ulong)off < 8UL) continue;
+                nint child = NativeMemory.Read<nint>(obj + (nint)off);
+                if (child != (nint)0) {
+                    HandleEdgeTarget(child, 0, k, mode, nodes, ref map, queue, ref qtail, ref edges, ref ecount, ref ecap);
+                }
+            }
+        } else if (fgKind == 1U || fgKind == 2U) {
+            ulong req = 16UL + 8UL * (ulong)fgKind;
+            if (body < req) return;
+            long count = NativeMemory.Read<long>(obj);
+            long capacity = NativeMemory.Read<long>(obj + (nint)8);
+            if (count <= 0L || count > capacity) return;
+            if (fgKind == 1U) {
+                nint data = NativeMemory.Read<nint>(obj + (nint)16);
+                if (data != (nint)0) {
+                    for (long j = 0L; j < count; j++) {
+                        nint el = NativeMemory.At<nint>(data, j);
+                        if (el != (nint)0) {
+                            HandleEdgeTarget(el, 1, (uint)j, mode, nodes, ref map, queue, ref qtail, ref edges, ref ecount, ref ecap);
+                        }
+                    }
+                }
+            } else {
+                nint ks = NativeMemory.Read<nint>(obj + (nint)16);
+                nint vs = NativeMemory.Read<nint>(obj + (nint)24);
+                bool keyIsRc = (refCount & 1U) != 0U;
+                bool valIsRc = ((refCount >> 1) & 1U) != 0U;
+                for (long j = 0L; j < count; j++) {
+                    if (keyIsRc && ks != (nint)0) {
+                        nint kEl = NativeMemory.At<nint>(ks, j);
+                        if (kEl != (nint)0) HandleEdgeTarget(kEl, 2, (uint)j, mode, nodes, ref map, queue, ref qtail, ref edges, ref ecount, ref ecap);
+                    }
+                    if (valIsRc && vs != (nint)0) {
+                        nint vEl = NativeMemory.At<nint>(vs, j);
+                        if (vEl != (nint)0) HandleEdgeTarget(vEl, 3, (uint)j, mode, nodes, ref map, queue, ref qtail, ref edges, ref ecount, ref ecap);
+                    }
+                }
+            }
+        }
+    }
+
+    static void EmitNode(nint siteNames, long siteCount, nint logFh, nint entry) {
+        ulong site = RtTimerGc.WordSite(NativeMemory.Read<ulong>(entry + (nint)GcOff.LE_SITE) & ~RtAbi.OBJ_STACK_FLAG);
+        nint ty = RtTimerGc.GetObjectTyname(entry);
+        nint loc = (nint)0;
+        if (siteNames != (nint)0 && site > 0UL && (long)site < siteCount) {
+            loc = NativeMemory.At<nint>(siteNames, (long)site);
+        } else {
+            nint src = NativeMemory.Read<nint>(entry + (nint)GcOff.LE_SOURCE);
+            if (src != (nint)0) loc = src;
+        }
+        if (loc != (nint)0 && RtPlat.CStrCmp(ty, (nint)"object") == 0) {
+            if (RtPlat.CStrStr(loc, (nint)"[closure]") != (nint)0) ty = (nint)"closure";
+            else if (RtPlat.CStrStr(loc, (nint)"[captured local]") != (nint)0) ty = (nint)"box";
+        }
+        Buf512 buf = new Buf512();
+        nint bp = NativeMemory.AddressOf(ref buf);
+        ulong p = RtPlat.BufAppendCStr(bp, 512UL, 0UL, ty);
+        if (loc != (nint)0) {
+            ulong n = RtPlat.CStrCspnByte(loc, (byte)32);
+            p = RtPlat.BufAppendChar(bp, 512UL, p, (byte)64); // '@'
+            p = RtPlat.BufAppendBytes(bp, 512UL, p, loc, n);
+        }
+        EmitBytes(logFh, bp, p);
+    }
+
+    static void EmitEdge(nint fieldNames, long siteCount, nint logFh, nint entry, nint edge) {
+        int kind = NativeMemory.Read<int>(edge + (nint)4);
+        uint idx = NativeMemory.Read<uint>(edge + (nint)8);
+        Buf256 buf = new Buf256();
+        nint bp = NativeMemory.AddressOf(ref buf);
+        ulong p = 0UL;
+        if (kind == 0) {
+            ulong site = RtTimerGc.WordSite(NativeMemory.Read<ulong>(entry + (nint)GcOff.LE_SITE) & ~RtAbi.OBJ_STACK_FLAG);
+            nint name = (nint)0;
+            if (fieldNames != (nint)0 && site > 0UL && (long)site < siteCount) {
+                nint names = NativeMemory.At<nint>(fieldNames, (long)site);
+                if (names != (nint)0) name = NativeMemory.At<nint>(names, (long)idx);
+            }
+            p = RtPlat.BufAppendCStr(bp, 256UL, p, (nint)" .");
+            if (name != (nint)0) {
+                p = RtPlat.BufAppendCStr(bp, 256UL, p, name);
+            } else {
+                p = RtPlat.BufAppendChar(bp, 256UL, p, (byte)35); // '#'
+                p = RtPlat.BufAppendU64(bp, 256UL, p, (ulong)idx);
+            }
+            p = RtPlat.BufAppendCStr(bp, 256UL, p, (nint)" -> ");
+            EmitBytes(logFh, bp, p);
+            return;
+        }
+        p = RtPlat.BufAppendCStr(bp, 256UL, p, (nint)" [");
+        p = RtPlat.BufAppendU64(bp, 256UL, p, (ulong)idx);
+        p = RtPlat.BufAppendChar(bp, 256UL, p, (byte)93); // ']'
+        if (kind == 2) p = RtPlat.BufAppendCStr(bp, 256UL, p, (nint)" (key)");
+        else if (kind == 3) p = RtPlat.BufAppendCStr(bp, 256UL, p, (nint)" (value)");
+        p = RtPlat.BufAppendCStr(bp, 256UL, p, (nint)" -> ");
+        EmitBytes(logFh, bp, p);
+    }
+
+    static int PrintCycles(nint siteNames, nint fieldNames, long siteCount, nint logFh,
+                           nint nodes, ulong n, nint first, nint edges) {
+        nint state = RtPlat.CCalloc(n, 4UL);
+        nint stack = RtPlat.CMalloc(n * 4UL);
+        nint cursor = RtPlat.CMalloc(n * 8UL);
+        nint via = RtPlat.CMalloc(n * 4UL);
+        nint reported = RtPlat.CCalloc(n, 1UL);
+        int printed = 0;
+
+        if (state != (nint)0 && stack != (nint)0 && cursor != (nint)0 && via != (nint)0 && reported != (nint)0) {
+            for (ulong root = 0UL; root < n && printed < MAX_CYCLES; root++) {
+                nint rnd = nodes + (nint)((long)root * GcOff.CN_SIZE);
+                if (NativeMemory.Read<int>(rnd + (nint)GcOff.CN_MARKED) != 0 ||
+                    NativeMemory.At<int>(state, (long)root) != 0) {
+                    continue;
+                }
+                ulong sp = 0UL;
+                NativeMemory.At<int>(stack, (long)sp) = (int)root;
+                sp++;
+                NativeMemory.At<int>(state, (long)root) = 1;
+                NativeMemory.At<ulong>(cursor, (long)root) = NativeMemory.At<ulong>(first, (long)root);
+                NativeMemory.At<int>(via, (long)root) = -1;
+
+                while (sp > 0UL && printed < MAX_CYCLES) {
+                    int u = NativeMemory.At<int>(stack, (long)(sp - 1UL));
+                    ulong cur = NativeMemory.At<ulong>(cursor, (long)u);
+                    if (cur >= NativeMemory.At<ulong>(first, (long)(u + 1))) {
+                        NativeMemory.At<int>(state, (long)u) = 2;
+                        sp--;
+                        continue;
+                    }
+                    NativeMemory.At<ulong>(cursor, (long)u) = cur + 1UL;
+                    nint edgePtr = edges + (nint)((long)cur * EDGE_SIZE);
+                    int v = NativeMemory.Read<int>(edgePtr);
+                    int stv = NativeMemory.At<int>(state, (long)v);
+                    if (stv == 0) {
+                        NativeMemory.At<int>(state, (long)v) = 1;
+                        NativeMemory.At<ulong>(cursor, (long)v) = NativeMemory.At<ulong>(first, (long)v);
+                        NativeMemory.At<int>(via, (long)v) = (int)cur;
+                        NativeMemory.At<int>(stack, (long)sp) = v;
+                        sp++;
+                    } else if (stv == 1 && NativeMemory.At<byte>(reported, (long)v) == (byte)0) {
+                        ulong start = sp;
+                        while (start > 0UL && NativeMemory.At<int>(stack, (long)(start - 1UL)) != v) start--;
+                        start--;
+                        ulong len = sp - start;
+                        EmitCStr(logFh, (nint)"  cycle: ");
+                        for (ulong k = start; k < sp; k++) {
+                            int node = NativeMemory.At<int>(stack, (long)k);
+                            if (k - start == (ulong)MAX_PATH) {
+                                EmitCStr(logFh, (nint)"... -> ");
+                                break;
+                            }
+                            nint nEntry = NativeMemory.Read<nint>(nodes + (nint)((long)node * GcOff.CN_SIZE) + (nint)GcOff.CN_ENTRY);
+                            EmitNode(siteNames, siteCount, logFh, nEntry);
+                            nint ePtr = (k + 1UL < sp)
+                                ? (edges + (nint)((long)NativeMemory.At<int>(via, (long)NativeMemory.At<int>(stack, (long)(k + 1UL))) * EDGE_SIZE))
+                                : edgePtr;
+                            EmitEdge(fieldNames, siteCount, logFh, nEntry, ePtr);
+                            NativeMemory.At<byte>(reported, (long)node) = (byte)1;
+                        }
+                        nint vEntry = NativeMemory.Read<nint>(nodes + (nint)((long)v * GcOff.CN_SIZE) + (nint)GcOff.CN_ENTRY);
+                        EmitNode(siteNames, siteCount, logFh, vEntry);
+                        EmitCStr(logFh, len == 1UL ? (nint)" (self)\n" : (nint)"\n");
+                        printed++;
+                    }
+                }
+            }
+        }
+
+        RtPlat.CFree(state);
+        RtPlat.CFree(stack);
+        RtPlat.CFree(cursor);
+        RtPlat.CFree(via);
+        RtPlat.CFree(reported);
+        return printed;
+    }
+
+    [Export("zan_rt_leak_cycles")]
+    public static long LeakCycles(nint siteNames, nint fieldNames, long siteCount, nint logFh, int print) {
+        if (Atomic.Load(ref RtTimerGc.s_stripesInited, MemoryOrder.Acquire) == 0) return 0L;
+        RtTimerGc.LiveLockAll();
+
+        ulong total = 0UL;
+        for (int s = 0; s < GcOff.LIVE_STRIPES; s++) {
+            total += NativeMemory.Read<ulong>(RtTimerGc.StripeAt(s) + (nint)GcOff.STRIPE_COUNT);
+        }
+
+        nint nodes = (nint)0;
+        nint queue = (nint)0;
+        long orphans = 0L;
+        ObjMap map;
+        map.Entries = (nint)0; map.Capacity = 0UL; map.Mask = 0UL;
+
+        if (total > 0UL && total <= 0x7FFFFFFFUL && total <= RtAbi.SIZE_MAX_U64 / (ulong)GcOff.CN_SIZE) {
+            nodes = RtPlat.CMalloc(total * (ulong)GcOff.CN_SIZE);
+            queue = RtPlat.CMalloc(total * 4UL);
+            RtTimerGc.ObjMapInit(ref map, total);
+            if (nodes != (nint)0 && queue != (nint)0 && map.Entries != (nint)0) {
+                ulong n = 0UL;
+                for (int s = 0; s < GcOff.LIVE_STRIPES; s++) {
+                    nint st = RtTimerGc.StripeAt(s);
+                    nint buckets = NativeMemory.Read<nint>(st + (nint)GcOff.STRIPE_BUCKETS);
+                    ulong bcnt = NativeMemory.Read<ulong>(st + (nint)GcOff.STRIPE_BCNT);
+                    for (ulong b = 0UL; b < bcnt; b++) {
+                        nint e = NativeMemory.At<nint>(buckets, (long)b);
+                        while (e != (nint)0 && n < total) {
+                            long rc = RtTimerGc.LiveReadRc(e);
+                            if (rc != 0L) {
+                                nint nd = nodes + (nint)((long)n * GcOff.CN_SIZE);
+                                NativeMemory.Write<nint>(nd + (nint)GcOff.CN_ENTRY, e);
+                                NativeMemory.Write<long>(nd + (nint)GcOff.CN_RC, rc);
+                                NativeMemory.Write<long>(nd + (nint)GcOff.CN_INTERNAL, 0L);
+                                NativeMemory.Write<int>(nd + (nint)GcOff.CN_MARKED, 0);
+                                RtTimerGc.ObjMapPut(ref map, NativeMemory.Read<nint>(e + (nint)GcOff.LE_OBJ), (int)n);
+                                n++;
+                            }
+                            e = NativeMemory.Read<nint>(e + (nint)GcOff.LE_NEXT);
+                        }
+                    }
+                }
+
+                nint edges = (nint)0;
+                ulong ecount = 0UL;
+                ulong ecap = 0UL;
+                ulong qtail = 0UL;
+
+                for (ulong i = 0UL; i < n; i++) {
+                    nint e = NativeMemory.Read<nint>(nodes + (nint)((long)i * GcOff.CN_SIZE) + (nint)GcOff.CN_ENTRY);
+                    WalkLabeledEdges(e, 0, nodes, ref map, queue, ref qtail, ref edges, ref ecount, ref ecap);
+                }
+
+                ulong qhead = 0UL;
+                for (ulong i = 0UL; i < n; i++) {
+                    nint nd = nodes + (nint)((long)i * GcOff.CN_SIZE);
+                    long rc = NativeMemory.Read<long>(nd + (nint)GcOff.CN_RC);
+                    long irc = NativeMemory.Read<long>(nd + (nint)GcOff.CN_INTERNAL);
+                    if (rc < 0L || rc > irc) {
+                        NativeMemory.Write<int>(nd + (nint)GcOff.CN_MARKED, 1);
+                        NativeMemory.At<int>(queue, (long)qtail) = (int)i;
+                        qtail++;
+                    }
+                }
+                while (qhead < qtail) {
+                    int u = NativeMemory.At<int>(queue, (long)qhead);
+                    qhead++;
+                    nint e = NativeMemory.Read<nint>(nodes + (nint)((long)u * GcOff.CN_SIZE) + (nint)GcOff.CN_ENTRY);
+                    WalkLabeledEdges(e, 1, nodes, ref map, queue, ref qtail, ref edges, ref ecount, ref ecap);
+                }
+
+                for (ulong i = 0UL; i < n; i++) {
+                    if (NativeMemory.Read<int>(nodes + (nint)((long)i * GcOff.CN_SIZE) + (nint)GcOff.CN_MARKED) == 0) {
+                        orphans++;
+                    }
+                }
+
+                if (print != 0 && orphans > 0L) {
+                    nint first = RtPlat.CCalloc(n + 1UL, 8UL);
+                    if (first != (nint)0) {
+                        for (ulong i = 0UL; i < n; i++) {
+                            NativeMemory.At<ulong>(first, (long)i) = ecount;
+                            nint nd = nodes + (nint)((long)i * GcOff.CN_SIZE);
+                            if (NativeMemory.Read<int>(nd + (nint)GcOff.CN_MARKED) == 0) {
+                                nint e = NativeMemory.Read<nint>(nd + (nint)GcOff.CN_ENTRY);
+                                WalkLabeledEdges(e, 2, nodes, ref map, queue, ref qtail, ref edges, ref ecount, ref ecap);
+                            }
+                        }
+                        NativeMemory.At<ulong>(first, (long)n) = ecount;
+
+                        Buf256 hdr = new Buf256();
+                        nint hp = NativeMemory.AddressOf(ref hdr);
+                        ulong p = RtPlat.BufAppendCStr(hp, 256UL, 0UL, (nint)"  ");
+                        p = RtPlat.BufAppendI64(hp, 256UL, p, orphans);
+                        p = RtPlat.BufAppendCStr(hp, 256UL, p, (nint)" object(s) form unreachable reference cycles:\n");
+                        EmitBytes(logFh, hp, p);
+
+                        int cycles = PrintCycles(siteNames, fieldNames, siteCount, logFh, nodes, n, first, edges);
+                        if (cycles > 0) {
+                            EmitCStr(logFh, (nint)"  break each cycle: mark one field on it 'weak', unsubscribe the handler, or Dispose\n");
+                        }
+                        RtPlat.CFree(first);
+                    }
+                }
+                RtPlat.CFree(edges);
+            }
+        }
+
+        RtTimerGc.ObjMapFree(ref map);
+        RtPlat.CFree(queue);
+        RtPlat.CFree(nodes);
+        RtTimerGc.LiveUnlockAll();
+        if (logFh != (nint)0) RtPlat.CFflush(logFh);
+        RtPlat.FlushStdout();
+        return orphans;
+    }
+}

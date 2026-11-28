@@ -992,6 +992,11 @@ bool sym_supports_canon(zan_irgen_t *g, zan_symbol_t *sym) {
   ctx.ok = true;
 
   if (d->kind == AST_METHOD_DECL) {
+    if (decl_uses_static_abstract_or_assoc(g, zan_ast_method_where_clauses(d))) {
+      sym->canon_check_visiting = 0;
+      sym->canon_eligible_cache = -1;
+      return false;
+    }
     ctx.owner_cls = sym->parent;
     for (int i = 0; i < d->method_decl.type_params.count && ctx.tp_count < 16; i++) {
       zan_ast_node_t *tp = d->method_decl.type_params.items[i];
@@ -1001,6 +1006,11 @@ bool sym_supports_canon(zan_irgen_t *g, zan_symbol_t *sym) {
     canon_chk_load_where(&ctx, zan_ast_method_where_clauses(d));
     canon_chk_method(&ctx, d, false);
   } else {
+    if (decl_uses_static_abstract_or_assoc(g, zan_ast_type_where_clauses(d))) {
+      sym->canon_check_visiting = 0;
+      sym->canon_eligible_cache = -1;
+      return false;
+    }
     ctx.owner_cls = sym;
     for (int i = 0; i < d->type_decl.type_params.count && ctx.tp_count < 16; i++) {
       zan_ast_node_t *tp = d->type_decl.type_params.items[i];

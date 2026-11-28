@@ -1,0 +1,621 @@
+// rt_timer_co.zan: 64-shard coroutine live registry & structured concurrency
+// join primitives (WhenAll / WhenAny + exception ownership transfer).
+// Replaces src/runtime/timer/rt_timer_co.c in 100% pure Zan.
+
+namespace Zan.Runtime.Timer;
+
+// 64-byte cache-line aligned shard for coroutine live table:
+//  0: int Lock (+ 4B pad)
+//  8: nint Slots
+// 16: ulong Cap
+// 24: ulong Live
+// 32: ulong Dead
+// 40..63: padding (24B)
+struct CoLiveShard {
+    public int Lock;
+    public int Pad0;
+    public nint Slots;
+    public ulong Cap;
+    public ulong Live;
+    public ulong Dead;
+    public ulong Pad1;
+    public ulong Pad2;
+    public ulong Pad3;
+}
+
+struct CoLiveShard8 {
+    public CoLiveShard S0; public CoLiveShard S1; public CoLiveShard S2; public CoLiveShard S3;
+    public CoLiveShard S4; public CoLiveShard S5; public CoLiveShard S6; public CoLiveShard S7;
+}
+
+struct CoLiveShard64 {
+    public CoLiveShard8 G0; public CoLiveShard8 G1; public CoLiveShard8 G2; public CoLiveShard8 G3;
+    public CoLiveShard8 G4; public CoLiveShard8 G5; public CoLiveShard8 G6; public CoLiveShard8 G7;
+}
+
+// Inline wake buffer (16 wakes * 16B = 256B)
+struct JoinWakeList {
+    public ulong Count;
+    public ulong OverflowCap;
+    public nint Overflow;
+    public Buf256 Local;
+}
+
+// Coroutine header offsets (verified against zan_co_header_probe in rt_timer_co.c):
+//   sched(0), sched_step(8), state(16), done(20), awaiter(24), awaiter_step(32),
+//   result(40), cleanup(48), hcount(56), self_step(64), exc(72), exc_tid(80), exc_owned(88)
+static class JoinOff {
+    internal const long CO_DONE = 20L;
+    internal const long CO_EXC = 72L;
+    internal const long CO_EXC_TID = 80L;
+    internal const long CO_EXC_OWN = 88L;
+
+    // zan_join_pair_t (32 bytes):
+    //  0: nint Frame
+    //  8: nint Owner
+    // 16: int Idx
+    // 20: int Done
+    // 24: nint NextInFrame
+    internal const long PAIR_SIZE = 32L;
+    internal const long PAIR_FRAME = 0L;
+    internal const long PAIR_OWNER = 8L;
+    internal const long PAIR_IDX = 16L;
+    internal const long PAIR_DONE = 20L;
+    internal const long PAIR_NEXT = 24L;
+
+    // zan_join_t header (64 bytes), followed by pairs[capacity]:
+    //  0: int Any
+    //  4: int Fired
+    //  8: nint Joiner
+    // 16: nint JoinerStep
+    // 24: int Npairs
+    // 28: int Winner
+    // 32: int Remaining
+    // 36: int Pad
+    // 40: nint Exc
+    // 48: nint ExcTid
+    // 56: int ExcOwned
+    // 60: int ExcTaken
+    // 64: int Capacity (+ 4B pad -> 72B header! wait: keep 8B-aligned = 72B)
+    internal const long J_ANY = 0L;
+    internal const long J_FIRED = 4L;
+    internal const long J_JOINER = 8L;
+    internal const long J_JOINER_STEP = 16L;
+    internal const long J_NPAIRS = 24L;
+    internal const long J_WINNER = 28L;
+    internal const long J_REMAINING = 32L;
+    internal const long J_EXC = 40L;
+    internal const long J_EXC_TID = 48L;
+    internal const long J_EXC_OWNED = 56L;
+    internal const long J_EXC_TAKEN = 60L;
+    internal const long J_CAPACITY = 64L;
+    internal const long J_PAIRS_OFF = 72L;
+}
+
+static class RtTimerCo {
+    const ulong COLIVE_SHARDS = 64UL;
+    const ulong COLIVE_MASK = 63UL;
+    const long JOIN_INLINE_WAKES = 16L;
+
+    static CoLiveShard64 s_colive;
+    static int s_joinLock = 0;
+    static ulong s_joinmapActive = 0UL;
+
+    static nint s_joinmapSlots = (nint)0;
+    static ulong s_joinmapCap = 0UL;
+    static ulong s_joinmapLive = 0UL;
+    static ulong s_joinmapDead = 0UL;
+
+    static void JoinLock() { RtPlat.SpinLockWord(NativeMemory.AddressOf(ref s_joinLock)); }
+    static void JoinUnlock() { RtPlat.SpinUnlockWord(NativeMemory.AddressOf(ref s_joinLock)); }
+
+    static ulong LiveHash(nint p) {
+        ulong x = (ulong)p;
+        x ^= x >> 33;
+        x *= 0xFF51AFD7ED558CCDUL;
+        x ^= x >> 33;
+        x *= 0xC4CEB9FE1A85EC53UL;
+        x ^= x >> 33;
+        return x;
+    }
+
+    static nint ShardPtr(ulong shardIdx) {
+        return NativeMemory.AddressOf(ref s_colive) + (nint)((long)shardIdx * 64L);
+    }
+
+    static void LiveRehash(nint sh, ulong ncap) {
+        nint old = NativeMemory.Read<nint>(sh + (nint)8);
+        ulong ocap = NativeMemory.Read<ulong>(sh + (nint)16);
+        nint ns = RtPlat.CCalloc(ncap, 8UL);
+        if (ns == (nint)0) {
+            RtTimerDiag.Fatal((nint)"oom", (nint)"timer: coroutine-live table grow failed");
+            return;
+        }
+        NativeMemory.Write<nint>(sh + (nint)8, ns);
+        NativeMemory.Write<ulong>(sh + (nint)16, ncap);
+        NativeMemory.Write<ulong>(sh + (nint)32, 0UL);
+        ulong live = 0UL;
+        ulong nmask = ncap - 1UL;
+        for (ulong i = 0UL; i < ocap; i++) {
+            nint f = NativeMemory.At<nint>(old, (long)i);
+            if (f == (nint)0 || f == (nint)1) continue;
+            ulong j = LiveHash(f) & nmask;
+            while (NativeMemory.At<nint>(ns, (long)j) != (nint)0) {
+                j = (j + 1UL) & nmask;
+            }
+            NativeMemory.At<nint>(ns, (long)j) = f;
+            live++;
+        }
+        NativeMemory.Write<ulong>(sh + (nint)24, live);
+        RtPlat.CFree(old);
+    }
+
+    [Export("zan_co_live_add")]
+    public static void CoLiveAdd(nint frame) {
+        if (frame == (nint)0) return;
+        ulong h = LiveHash(frame);
+        nint sh = ShardPtr((h >> 16) & COLIVE_MASK);
+        RtPlat.SpinLockWord(sh);
+        ulong cap = NativeMemory.Read<ulong>(sh + (nint)16);
+        ulong live = NativeMemory.Read<ulong>(sh + (nint)24);
+        ulong dead = NativeMemory.Read<ulong>(sh + (nint)32);
+        if ((live + dead + 1UL) * 4UL > cap * 3UL) {
+            ulong ncap = cap != 0UL ? (live * 4UL > cap ? cap * 2UL : cap) : 32UL;
+            LiveRehash(sh, ncap);
+            cap = NativeMemory.Read<ulong>(sh + (nint)16);
+            live = NativeMemory.Read<ulong>(sh + (nint)24);
+            dead = NativeMemory.Read<ulong>(sh + (nint)32);
+        }
+        nint slots = NativeMemory.Read<nint>(sh + (nint)8);
+        ulong mask = cap - 1UL;
+        ulong i = h & mask;
+        ulong reuse = RtAbi.SIZE_MAX_U64;
+        while (true) {
+            nint cur = NativeMemory.At<nint>(slots, (long)i);
+            if (cur == (nint)0) break;
+            if (cur == frame) {
+                RtPlat.SpinUnlockWord(sh);
+                return;
+            }
+            if (cur == (nint)1 && reuse == RtAbi.SIZE_MAX_U64) reuse = i;
+            i = (i + 1UL) & mask;
+        }
+        if (reuse != RtAbi.SIZE_MAX_U64) {
+            i = reuse;
+            dead--;
+            NativeMemory.Write<ulong>(sh + (nint)32, dead);
+        }
+        NativeMemory.At<nint>(slots, (long)i) = frame;
+        NativeMemory.Write<ulong>(sh + (nint)24, live + 1UL);
+        RtPlat.SpinUnlockWord(sh);
+    }
+
+    [Export("zan_co_live_count")]
+    public static int CoLiveCount() {
+        ulong total = 0UL;
+        for (ulong s = 0UL; s < COLIVE_SHARDS; s++) {
+            nint sh = ShardPtr(s);
+            RtPlat.SpinLockWord(sh);
+            total += NativeMemory.Read<ulong>(sh + (nint)24);
+            RtPlat.SpinUnlockWord(sh);
+        }
+        return (int)total;
+    }
+
+    [Export("zan_co_live_has")]
+    public static int CoLiveHas(nint frame) {
+        if (frame == (nint)0) return 0;
+        ulong h = LiveHash(frame);
+        nint sh = ShardPtr((h >> 16) & COLIVE_MASK);
+        RtPlat.SpinLockWord(sh);
+        int found = 0;
+        ulong cap = NativeMemory.Read<ulong>(sh + (nint)16);
+        if (cap != 0UL) {
+            nint slots = NativeMemory.Read<nint>(sh + (nint)8);
+            ulong mask = cap - 1UL;
+            ulong i = h & mask;
+            while (true) {
+                nint cur = NativeMemory.At<nint>(slots, (long)i);
+                if (cur == (nint)0) break;
+                if (cur == frame) { found = 1; break; }
+                i = (i + 1UL) & mask;
+            }
+        }
+        RtPlat.SpinUnlockWord(sh);
+        return found;
+    }
+
+    [Export("zan_co_live_reset")]
+    public static void CoLiveReset() {
+        for (ulong s = 0UL; s < COLIVE_SHARDS; s++) {
+            nint sh = ShardPtr(s);
+            RtPlat.SpinLockWord(sh);
+            RtPlat.CFree(NativeMemory.Read<nint>(sh + (nint)8));
+            NativeMemory.Write<nint>(sh + (nint)8, (nint)0);
+            NativeMemory.Write<ulong>(sh + (nint)16, 0UL);
+            NativeMemory.Write<ulong>(sh + (nint)24, 0UL);
+            NativeMemory.Write<ulong>(sh + (nint)32, 0UL);
+            RtPlat.SpinUnlockWord(sh);
+        }
+    }
+
+    // ---- Join map (caller holds JoinLock) ----
+
+    static void JoinmapRehash(ulong ncap) {
+        nint nslots = RtPlat.CCalloc(ncap, 8UL);
+        if (nslots == (nint)0) {
+            RtTimerDiag.Fatal((nint)"oom", (nint)"joinmap: rehash failed");
+            return;
+        }
+        ulong nmask = ncap - 1UL;
+        for (ulong i = 0UL; i < s_joinmapCap; i++) {
+            nint cur = NativeMemory.At<nint>(s_joinmapSlots, (long)i);
+            if (cur == (nint)0 || cur == (nint)1) continue;
+            nint frame = NativeMemory.Read<nint>(cur + (nint)JoinOff.PAIR_FRAME);
+            ulong j = LiveHash(frame) & nmask;
+            while (NativeMemory.At<nint>(nslots, (long)j) != (nint)0) {
+                j = (j + 1UL) & nmask;
+            }
+            NativeMemory.At<nint>(nslots, (long)j) = cur;
+        }
+        RtPlat.CFree(s_joinmapSlots);
+        s_joinmapSlots = nslots;
+        s_joinmapCap = ncap;
+        s_joinmapDead = 0UL;
+    }
+
+    static void JoinmapPut(nint pr) {
+        if (pr == (nint)0) return;
+        nint frame = NativeMemory.Read<nint>(pr + (nint)JoinOff.PAIR_FRAME);
+        if (frame == (nint)0) return;
+        NativeMemory.Write<nint>(pr + (nint)JoinOff.PAIR_NEXT, (nint)0);
+        if ((s_joinmapLive + s_joinmapDead + 1UL) * 4UL >= s_joinmapCap * 3UL) {
+            ulong ncap = s_joinmapCap != 0UL
+                ? (s_joinmapLive * 4UL > s_joinmapCap ? s_joinmapCap * 2UL : s_joinmapCap)
+                : 64UL;
+            JoinmapRehash(ncap);
+        }
+        ulong mask = s_joinmapCap - 1UL;
+        ulong i = LiveHash(frame) & mask;
+        ulong reuse = RtAbi.SIZE_MAX_U64;
+        while (true) {
+            nint cur = NativeMemory.At<nint>(s_joinmapSlots, (long)i);
+            if (cur == (nint)0) break;
+            if (cur == (nint)1) {
+                if (reuse == RtAbi.SIZE_MAX_U64) reuse = i;
+            } else if (NativeMemory.Read<nint>(cur + (nint)JoinOff.PAIR_FRAME) == frame) {
+                NativeMemory.Write<nint>(pr + (nint)JoinOff.PAIR_NEXT, cur);
+                NativeMemory.At<nint>(s_joinmapSlots, (long)i) = pr;
+                return;
+            }
+            i = (i + 1UL) & mask;
+        }
+        if (reuse != RtAbi.SIZE_MAX_U64) {
+            i = reuse;
+            s_joinmapDead--;
+        }
+        NativeMemory.At<nint>(s_joinmapSlots, (long)i) = pr;
+        s_joinmapLive++;
+    }
+
+    static nint JoinmapTake(nint frame) {
+        if (s_joinmapCap == 0UL) return (nint)0;
+        ulong mask = s_joinmapCap - 1UL;
+        ulong i = LiveHash(frame) & mask;
+        while (true) {
+            nint cur = NativeMemory.At<nint>(s_joinmapSlots, (long)i);
+            if (cur == (nint)0) return (nint)0;
+            if (cur != (nint)1 && NativeMemory.Read<nint>(cur + (nint)JoinOff.PAIR_FRAME) == frame) {
+                NativeMemory.At<nint>(s_joinmapSlots, (long)i) = (nint)1;
+                s_joinmapLive--;
+                s_joinmapDead++;
+                return cur;
+            }
+            i = (i + 1UL) & mask;
+        }
+    }
+
+    static bool JoinmapRemove(nint frame, nint pr) {
+        if (s_joinmapCap == 0UL || pr == (nint)0) return false;
+        ulong mask = s_joinmapCap - 1UL;
+        ulong i = LiveHash(frame) & mask;
+        while (true) {
+            nint cur = NativeMemory.At<nint>(s_joinmapSlots, (long)i);
+            if (cur == (nint)0) return false;
+            if (cur != (nint)1 && NativeMemory.Read<nint>(cur + (nint)JoinOff.PAIR_FRAME) == frame) {
+                nint pp = s_joinmapSlots + (nint)((long)i * 8L);
+                while (true) {
+                    nint node = NativeMemory.Read<nint>(pp);
+                    if (node == (nint)0) return false;
+                    if (node == pr) {
+                        NativeMemory.Write<nint>(pp, NativeMemory.Read<nint>(pr + (nint)JoinOff.PAIR_NEXT));
+                        NativeMemory.Write<nint>(pr + (nint)JoinOff.PAIR_NEXT, (nint)0);
+                        if (NativeMemory.At<nint>(s_joinmapSlots, (long)i) == (nint)0) {
+                            NativeMemory.At<nint>(s_joinmapSlots, (long)i) = (nint)1;
+                            s_joinmapLive--;
+                            s_joinmapDead++;
+                        }
+                        return true;
+                    }
+                    pp = node + (nint)JoinOff.PAIR_NEXT;
+                }
+            }
+            i = (i + 1UL) & mask;
+        }
+    }
+
+    static bool JoinPairDone(nint pr) {
+        if (NativeMemory.Read<int>(pr + (nint)JoinOff.PAIR_DONE) != 0) return true;
+        nint frame = NativeMemory.Read<nint>(pr + (nint)JoinOff.PAIR_FRAME);
+        if (CoLiveHas(frame) == 0) return true;
+        int done = Atomic.LoadAt<int>(frame + (nint)JoinOff.CO_DONE, MemoryOrder.Acquire);
+        return done != 0;
+    }
+
+    static bool JoinAnyDone(nint j) {
+        int npairs = NativeMemory.Read<int>(j + (nint)JoinOff.J_NPAIRS);
+        if (npairs == 0) return true;
+        nint pairsBase = j + (nint)JoinOff.J_PAIRS_OFF;
+        for (int i = 0; i < npairs; i++) {
+            nint pr = pairsBase + (nint)((long)i * JoinOff.PAIR_SIZE);
+            if (JoinPairDone(pr)) {
+                NativeMemory.Write<int>(j + (nint)JoinOff.J_WINNER, NativeMemory.Read<int>(pr + (nint)JoinOff.PAIR_IDX));
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static void JoinWakesAdd(nint wakesPtr, nint j) {
+        nint joiner = NativeMemory.Read<nint>(j + (nint)JoinOff.J_JOINER);
+        nint step = NativeMemory.Read<nint>(j + (nint)JoinOff.J_JOINER_STEP);
+        if (joiner == (nint)0 || step == (nint)0) return;
+
+        ulong cnt = NativeMemory.Read<ulong>(wakesPtr);
+        NativeMemory.Write<ulong>(wakesPtr, cnt + 1UL);
+        if (cnt < (ulong)JOIN_INLINE_WAKES) {
+            nint dst = wakesPtr + (nint)(24L + (long)cnt * 16L);
+            NativeMemory.Write<nint>(dst, joiner);
+            NativeMemory.Write<nint>(dst + (nint)8, step);
+            return;
+        }
+        ulong ovIdx = cnt - (ulong)JOIN_INLINE_WAKES;
+        ulong ovCap = NativeMemory.Read<ulong>(wakesPtr + (nint)8);
+        nint ov = NativeMemory.Read<nint>(wakesPtr + (nint)16);
+        if (ovIdx == ovCap) {
+            ulong ncap = ovCap != 0UL ? ovCap * 2UL : (ulong)JOIN_INLINE_WAKES;
+            if (ncap < ovCap || ncap > RtAbi.SIZE_MAX_U64 / 16UL) {
+                RtTimerDiag.Fatal((nint)"oom", (nint)"join: wake list too large");
+            }
+            nint items = RtPlat.CRealloc(ov, ncap * 16UL);
+            if (items == (nint)0) {
+                RtTimerDiag.Fatal((nint)"oom", (nint)"join: wake list allocation failed");
+            }
+            ov = items;
+            NativeMemory.Write<nint>(wakesPtr + (nint)16, ov);
+            NativeMemory.Write<ulong>(wakesPtr + (nint)8, ncap);
+        }
+        nint dst2 = ov + (nint)((long)ovIdx * 16L);
+        NativeMemory.Write<nint>(dst2, joiner);
+        NativeMemory.Write<nint>(dst2 + (nint)8, step);
+    }
+
+    static void JoinWakesDispatch(nint wakesPtr) {
+        ulong cnt = NativeMemory.Read<ulong>(wakesPtr);
+        if (cnt == 0UL) return;
+        nint hook = RtTimerCore.GetReadyHook();
+        nint ov = NativeMemory.Read<nint>(wakesPtr + (nint)16);
+        if (hook != (nint)0) {
+            for (ulong i = 0UL; i < cnt; i++) {
+                nint src = (i < (ulong)JOIN_INLINE_WAKES)
+                    ? (wakesPtr + (nint)(24L + (long)i * 16L))
+                    : (ov + (nint)((long)(i - (ulong)JOIN_INLINE_WAKES) * 16L));
+                nint frame = NativeMemory.Read<nint>(src);
+                nint step = NativeMemory.Read<nint>(src + (nint)8);
+                NativeMemory.InvokeVoidWithCC<nint, nint>("c", hook, frame, step);
+            }
+        }
+        if (ov != (nint)0) RtPlat.CFree(ov);
+    }
+
+    static void JoinOnTaskEndLocked(nint frame, nint wakesPtr) {
+        nint pr = JoinmapTake(frame);
+        while (pr != (nint)0) {
+            nint next = NativeMemory.Read<nint>(pr + (nint)JoinOff.PAIR_NEXT);
+            NativeMemory.Write<nint>(pr + (nint)JoinOff.PAIR_NEXT, (nint)0);
+            Atomic.FetchAdd(ref s_joinmapActive, unchecked((ulong)(-1L)), MemoryOrder.Release);
+            if (NativeMemory.Read<int>(pr + (nint)JoinOff.PAIR_DONE) == 0) {
+                NativeMemory.Write<int>(pr + (nint)JoinOff.PAIR_DONE, 1);
+                nint j = NativeMemory.Read<nint>(pr + (nint)JoinOff.PAIR_OWNER);
+                int rem = NativeMemory.Read<int>(j + (nint)JoinOff.J_REMAINING) - 1;
+                NativeMemory.Write<int>(j + (nint)JoinOff.J_REMAINING, rem);
+                if (NativeMemory.Read<int>(j + (nint)JoinOff.J_EXC_TAKEN) == 0 &&
+                    NativeMemory.Read<nint>(j + (nint)JoinOff.J_EXC) == (nint)0) {
+                    nint exc = NativeMemory.Read<nint>(frame + (nint)JoinOff.CO_EXC);
+                    if (exc != (nint)0) {
+                        NativeMemory.Write<nint>(j + (nint)JoinOff.J_EXC, exc);
+                        NativeMemory.Write<nint>(j + (nint)JoinOff.J_EXC_TID, NativeMemory.Read<nint>(frame + (nint)JoinOff.CO_EXC_TID));
+                        NativeMemory.Write<int>(j + (nint)JoinOff.J_EXC_OWNED, NativeMemory.Read<int>(frame + (nint)JoinOff.CO_EXC_OWN));
+                        NativeMemory.Write<nint>(frame + (nint)JoinOff.CO_EXC, (nint)0);
+                        NativeMemory.Write<int>(frame + (nint)JoinOff.CO_EXC_OWN, 0);
+                    }
+                }
+                int fired = NativeMemory.Read<int>(j + (nint)JoinOff.J_FIRED);
+                if (fired == 0) {
+                    int isAny = NativeMemory.Read<int>(j + (nint)JoinOff.J_ANY);
+                    bool ready = isAny != 0 ? JoinAnyDone(j) : (rem == 0);
+                    if (ready) {
+                        NativeMemory.Write<int>(j + (nint)JoinOff.J_FIRED, 1);
+                        JoinWakesAdd(wakesPtr, j);
+                    }
+                }
+            }
+            pr = next;
+        }
+    }
+
+    [Export("zan_join_complete")]
+    public static void JoinComplete(nint frame) {
+        if (frame == (nint)0) return;
+        JoinWakeList wakes = new JoinWakeList();
+        nint wp = NativeMemory.AddressOf(ref wakes);
+        RtPlat.CMemset(wp, 0, 24UL);
+        JoinLock();
+        JoinOnTaskEndLocked(frame, wp);
+        JoinUnlock();
+        JoinWakesDispatch(wp);
+    }
+
+    [Export("zan_co_live_del")]
+    public static void CoLiveDel(nint frame) {
+        if (frame == (nint)0) return;
+        ulong h = LiveHash(frame);
+        nint sh = ShardPtr((h >> 16) & COLIVE_MASK);
+        RtPlat.SpinLockWord(sh);
+        ulong cap = NativeMemory.Read<ulong>(sh + (nint)16);
+        if (cap != 0UL) {
+            nint slots = NativeMemory.Read<nint>(sh + (nint)8);
+            ulong mask = cap - 1UL;
+            ulong i = h & mask;
+            while (true) {
+                nint cur = NativeMemory.At<nint>(slots, (long)i);
+                if (cur == (nint)0) break;
+                if (cur == frame) {
+                    NativeMemory.At<nint>(slots, (long)i) = (nint)1;
+                    NativeMemory.Write<ulong>(sh + (nint)24, NativeMemory.Read<ulong>(sh + (nint)24) - 1UL);
+                    NativeMemory.Write<ulong>(sh + (nint)32, NativeMemory.Read<ulong>(sh + (nint)32) + 1UL);
+                    break;
+                }
+                i = (i + 1UL) & mask;
+            }
+        }
+        RtPlat.SpinUnlockWord(sh);
+
+        Atomic.Fence(MemoryOrder.SeqCst);
+        if (Atomic.Load(ref s_joinmapActive, MemoryOrder.SeqCst) > 0UL) {
+            JoinWakeList wakes = new JoinWakeList();
+            nint wp = NativeMemory.AddressOf(ref wakes);
+            RtPlat.CMemset(wp, 0, 24UL);
+            JoinLock();
+            JoinOnTaskEndLocked(frame, wp);
+            JoinUnlock();
+            JoinWakesDispatch(wp);
+        }
+    }
+
+    [Export("zan_join_new")]
+    public static long JoinNew(int npairs, int any) {
+        ulong sz = (ulong)JoinOff.J_PAIRS_OFF + (ulong)npairs * (ulong)JoinOff.PAIR_SIZE;
+        nint j = RtPlat.CMalloc(sz);
+        if (j == (nint)0) {
+            RtTimerDiag.Fatal((nint)"oom", (nint)"join: entry alloc failed");
+            return 0L;
+        }
+        RtPlat.CMemset(j, 0, sz);
+        NativeMemory.Write<int>(j + (nint)JoinOff.J_ANY, any != 0 ? 1 : 0);
+        NativeMemory.Write<int>(j + (nint)JoinOff.J_CAPACITY, npairs);
+        return (long)j;
+    }
+
+    [Export("zan_join_bind")]
+    public static int JoinBind(long entry, nint frame, int idx) {
+        nint j = (nint)entry;
+        if (j == (nint)0 || frame == (nint)0) return 0;
+        int bound = 0;
+        JoinLock();
+        Atomic.FetchAdd(ref s_joinmapActive, 1UL, MemoryOrder.SeqCst);
+        if (CoLiveHas(frame) != 0) {
+            int done = Atomic.LoadAt<int>(frame + (nint)JoinOff.CO_DONE, MemoryOrder.Acquire);
+            if (done != 0 &&
+                NativeMemory.Read<int>(j + (nint)JoinOff.J_EXC_TAKEN) == 0 &&
+                NativeMemory.Read<nint>(j + (nint)JoinOff.J_EXC) == (nint)0) {
+                nint exc = NativeMemory.Read<nint>(frame + (nint)JoinOff.CO_EXC);
+                if (exc != (nint)0) {
+                    NativeMemory.Write<nint>(j + (nint)JoinOff.J_EXC, exc);
+                    NativeMemory.Write<nint>(j + (nint)JoinOff.J_EXC_TID, NativeMemory.Read<nint>(frame + (nint)JoinOff.CO_EXC_TID));
+                    NativeMemory.Write<int>(j + (nint)JoinOff.J_EXC_OWNED, NativeMemory.Read<int>(frame + (nint)JoinOff.CO_EXC_OWN));
+                    NativeMemory.Write<nint>(frame + (nint)JoinOff.CO_EXC, (nint)0);
+                    NativeMemory.Write<int>(frame + (nint)JoinOff.CO_EXC_OWN, 0);
+                }
+            }
+            int npairs = NativeMemory.Read<int>(j + (nint)JoinOff.J_NPAIRS);
+            int cap = NativeMemory.Read<int>(j + (nint)JoinOff.J_CAPACITY);
+            if (done == 0 && npairs < cap) {
+                nint pr = j + (nint)(JoinOff.J_PAIRS_OFF + (long)npairs * JoinOff.PAIR_SIZE);
+                NativeMemory.Write<nint>(pr + (nint)JoinOff.PAIR_FRAME, frame);
+                NativeMemory.Write<nint>(pr + (nint)JoinOff.PAIR_OWNER, j);
+                NativeMemory.Write<int>(pr + (nint)JoinOff.PAIR_IDX, idx);
+                NativeMemory.Write<int>(pr + (nint)JoinOff.PAIR_DONE, 0);
+                NativeMemory.Write<nint>(pr + (nint)JoinOff.PAIR_NEXT, (nint)0);
+                NativeMemory.Write<int>(j + (nint)JoinOff.J_NPAIRS, npairs + 1);
+                NativeMemory.Write<int>(j + (nint)JoinOff.J_REMAINING, NativeMemory.Read<int>(j + (nint)JoinOff.J_REMAINING) + 1);
+                JoinmapPut(pr);
+                bound = 1;
+            }
+        }
+        if (bound == 0) {
+            Atomic.FetchAdd(ref s_joinmapActive, unchecked((ulong)(-1L)), MemoryOrder.Release);
+        }
+        JoinUnlock();
+        return bound;
+    }
+
+    [Export("zan_join_wait2")]
+    public static int JoinWait2(long entry, nint frame, nint step) {
+        nint j = (nint)entry;
+        if (j == (nint)0 || frame == (nint)0 || step == (nint)0 || RtTimerCore.GetReadyHook() == (nint)0) {
+            return 2;
+        }
+        JoinLock();
+        bool satisfied = NativeMemory.Read<int>(j + (nint)JoinOff.J_FIRED) != 0 ||
+            (NativeMemory.Read<int>(j + (nint)JoinOff.J_ANY) != 0
+                ? JoinAnyDone(j)
+                : NativeMemory.Read<int>(j + (nint)JoinOff.J_REMAINING) == 0);
+        if (!satisfied) {
+            NativeMemory.Write<nint>(j + (nint)JoinOff.J_JOINER, frame);
+            NativeMemory.Write<nint>(j + (nint)JoinOff.J_JOINER_STEP, step);
+        }
+        JoinUnlock();
+        return satisfied ? 1 : 0;
+    }
+
+    [Export("zan_join_exc")]
+    public static nint JoinExc(long entry, nint tidOutPtr, nint ownedOutPtr) {
+        nint j = (nint)entry;
+        if (j == (nint)0) {
+            if (tidOutPtr != (nint)0) NativeMemory.Write<nint>(tidOutPtr, (nint)0);
+            if (ownedOutPtr != (nint)0) NativeMemory.Write<int>(ownedOutPtr, 0);
+            return (nint)0;
+        }
+        JoinLock();
+        nint exc = NativeMemory.Read<nint>(j + (nint)JoinOff.J_EXC);
+        nint tid = NativeMemory.Read<nint>(j + (nint)JoinOff.J_EXC_TID);
+        int owned = NativeMemory.Read<int>(j + (nint)JoinOff.J_EXC_OWNED);
+        NativeMemory.Write<nint>(j + (nint)JoinOff.J_EXC, (nint)0);
+        NativeMemory.Write<nint>(j + (nint)JoinOff.J_EXC_TID, (nint)0);
+        NativeMemory.Write<int>(j + (nint)JoinOff.J_EXC_OWNED, 0);
+        NativeMemory.Write<int>(j + (nint)JoinOff.J_EXC_TAKEN, 1);
+        JoinUnlock();
+        if (tidOutPtr != (nint)0) NativeMemory.Write<nint>(tidOutPtr, tid);
+        if (ownedOutPtr != (nint)0) NativeMemory.Write<int>(ownedOutPtr, owned);
+        return exc;
+    }
+
+    [Export("zan_join_cancel")]
+    public static void JoinCancel(long entry) {
+        nint j = (nint)entry;
+        if (j == (nint)0) return;
+        JoinLock();
+        int npairs = NativeMemory.Read<int>(j + (nint)JoinOff.J_NPAIRS);
+        nint pairsBase = j + (nint)JoinOff.J_PAIRS_OFF;
+        for (int i = 0; i < npairs; i++) {
+            nint pr = pairsBase + (nint)((long)i * JoinOff.PAIR_SIZE);
+            if (NativeMemory.Read<int>(pr + (nint)JoinOff.PAIR_DONE) == 0 &&
+                JoinmapRemove(NativeMemory.Read<nint>(pr + (nint)JoinOff.PAIR_FRAME), pr)) {
+                Atomic.FetchAdd(ref s_joinmapActive, unchecked((ulong)(-1L)), MemoryOrder.Release);
+            }
+        }
+        JoinUnlock();
+        RtPlat.CFree(j);
+    }
+}

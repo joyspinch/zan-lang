@@ -1,0 +1,72 @@
+using System;
+
+class Program {
+    static int ReduceRange(int n, noescape Func<int, int> fn) {
+        int sum = 0;
+        for (int i = 0; i < n; i++) {
+            sum = sum + fn(i);
+        }
+        return sum;
+    }
+
+    static void ForEachIndex(int n, noescape Action<int> body) {
+        for (int i = 0; i < n; i++) {
+            body(i);
+        }
+    }
+
+    static void Main() {
+        // 1. Capturing non-escaping closure (zero heap allocation, inlined at -O2)
+        int scale = 3;
+        int bias = 2;
+        int acc = ReduceRange(10, x => x * scale + bias);
+        Console.WriteLine($"reduce:{acc}");
+
+        // 2. Non-escaping closure capturing Span<int> & mutating outer local
+        [8]int buf = new InlineArray<8, int>();
+        Span<int> sp = buf.AsSpan();
+        int touched = 0;
+        ForEachIndex(8, i => {
+            sp[i] = (i + 1) * 10;
+            touched = touched + 1;
+        });
+        Console.WriteLine($"span:{sp[0]},{sp[3]},{sp[7]},touched:{touched}");
+
+        // 3. Scoped zero-copy Parallel.For over a large array + Span<int>
+        int n = 4096;
+        int[] src = new int[n];
+        int[] dst = new int[n];
+        for (int i = 0; i < n; i++) src[i] = i + 1;
+        ReadOnlySpan<int> rsrc = src.AsReadOnlySpan();
+        Span<int> wdst = dst.AsSpan();
+        int mul = 5;
+        Parallel.For(0, n, i => {
+            wdst[i] = rsrc[i] * mul + 1;
+        });
+        long sum1 = 0;
+        for (int i = 0; i < n; i++) sum1 = sum1 + dst[i];
+        Console.WriteLine($"par_for:{dst[0]},{dst[100]},{dst[n - 1]},sum:{sum1}");
+
+        // 4. Scoped zero-copy Parallel.ForRange (chunked inner loop, zero per-iter delegate call)
+        int[] out2 = new int[n];
+        Span<int> wout2 = out2.AsSpan();
+        Parallel.ForRange(0, n, (start, end) => {
+            for (int i = start; i < end; i++) {
+                wout2[i] = rsrc[i] * 2;
+            }
+        });
+        long sum2 = 0;
+        for (int i = 0; i < n; i++) sum2 = sum2 + out2[i];
+        Console.WriteLine($"par_range:{out2[0]},{out2[n - 1]},sum:{sum2}");
+
+        // 5. Nested Parallel.For (reentrancy guard: zero deadlock)
+        int[] grid = new int[64];
+        Span<int> wgrid = grid.AsSpan();
+        Parallel.For(0, 8, r => {
+            Parallel.For(0, 8, c => {
+                wgrid[r * 8 + c] = r * 10 + c;
+            });
+        });
+        Console.WriteLine($"nested:{grid[0]},{grid[27]},{grid[63]},cpus:{Parallel.ProcessorCount >= 1}");
+    }
+}

@@ -1,0 +1,1017 @@
+// rt_timer_plat.zan: Shared platform bindings, synchronization, C-string/stack
+// formatting helpers, ABI constants, and B-ID98 OOM injection gate for zanrt_timer.
+// 100% pure Zan, zero inline assembly, zero ARC heap allocation.
+
+namespace Zan.Runtime.Timer;
+
+// ---- Fixed-size unmanaged stack/static storage structs ----
+
+struct Buf32 {
+    public ulong W0; public ulong W1; public ulong W2; public ulong W3;
+}
+
+struct Buf48 {
+    public ulong W0; public ulong W1; public ulong W2;
+    public ulong W3; public ulong W4; public ulong W5;
+}
+
+struct Buf64 {
+    public ulong W0; public ulong W1; public ulong W2; public ulong W3;
+    public ulong W4; public ulong W5; public ulong W6; public ulong W7;
+}
+
+struct Buf160 {
+    public Buf64 A; public Buf64 B; public Buf32 C;
+}
+
+struct Buf256 {
+    public Buf64 A; public Buf64 B; public Buf64 C; public Buf64 D;
+}
+
+struct Buf512 {
+    public Buf256 A; public Buf256 B;
+}
+
+struct Buf1408 {
+    public Buf512 A; public Buf512 B; public Buf256 C; public Buf64 D; public Buf64 E;
+}
+
+struct Buf4096 {
+    public Buf512 A; public Buf512 B; public Buf512 C; public Buf512 D;
+    public Buf512 E; public Buf512 F; public Buf512 G; public Buf512 H;
+}
+
+// 4128 + 8 + 4096 = 8232 bytes -> use 8256 bytes (aligned to 16 via ulong fields)
+struct SoftScratchStore {
+    public Buf4096 A;
+    public Buf4096 B;
+    public Buf64 C;
+}
+
+// Platform mutex storage: 8B SRWLOCK on Windows; 64B on POSIX (40B Linux x64 / 48B Linux arm64 / 4B os_unfair_lock on macOS)
+#if WINDOWS
+struct OsMutex {
+    public nint Lock;
+}
+#else
+struct OsMutex {
+    public ulong W0; public ulong W1; public ulong W2; public ulong W3;
+    public ulong W4; public ulong W5; public ulong W6; public ulong W7;
+}
+#endif
+
+// Unified per-thread TLS block for zanrt_timer (FLS / pthread_key, zero _tls_index)
+struct TimerTls {
+    public nint SoftScratch;
+    public nint ProfileSlice;
+    public ulong HeapMutatorDepth;
+    public ulong ThreadAllocBytes;
+    public int DispatchOwned;
+    public int SoftScratchExiting;
+}
+
+// ---- Shared ABI constants (src/common/zan_abi.h) ----
+
+static class RtAbi {
+    internal const long OBJ_HDR_SIZE = 8L;
+    internal const long STR_HDR_SIZE = 12L;
+    internal const long RC_OFF = -8L;
+    internal const long HDR_WORD_OFF = -8L;
+    internal const long STR_LEN_OFF = -12L;
+
+    internal const uint OBJ_TW_MARK = 0x40000000U;
+    internal const uint OBJ_TW_PAD16 = 0x20000000U;
+    internal const uint OBJ_TW_SITE_MASK = 0x1FFFFFFFU;
+    internal const ulong OBJ_STACK_FLAG = 0x8000000000000000UL;
+
+    internal const ulong STRING_TAG = 0x5A414E53UL;      // "ZANS"
+    internal const uint STR_LEN_UNKNOWN = 0x54524D47U;   // "TRMG"
+
+    internal const ulong ARRAY_MAGIC = 0x5A414E4152524159UL;    // "ZANARRAY"
+    internal const ulong ARRAY_RC_MAGIC = 0x5A414E41525243UL;   // "ZANARRC"
+    internal const long ARR_HDR_SIZE = 32L;
+    internal const long ARR_COUNT_OFF = -16L;
+    internal const long ARR_RC_OFF = -32L;
+
+    internal const long SOFT_ARR_SPAN = 4064L;
+    internal const long SOFT_PREFIX_SIZE = 4128L; // 32 + 4064 + 32
+
+    internal const ulong CLOSURE_TAG = 1UL;
+
+    internal const ulong SIZE_MAX_U64 = 0xFFFFFFFFFFFFFFFFUL;
+    internal const long LLONG_MAX_I64 = 0x7FFFFFFFFFFFFFFFL;
+}
+
+// ---- Platform CRT / OS externs & sync primitives ----
+
+static class RtPlat {
+    // ---- Standard C library ----
+    [DllImport("crt", EntryPoint = "malloc")]
+    internal static extern nint CMalloc(ulong n);
+
+    [DllImport("crt", EntryPoint = "calloc")]
+    internal static extern nint CCalloc(ulong n, ulong sz);
+
+    [DllImport("crt", EntryPoint = "realloc")]
+    internal static extern nint CRealloc(nint p, ulong n);
+
+    [DllImport("crt", EntryPoint = "free")]
+    internal static extern void CFree(nint p);
+
+    [DllImport("crt", EntryPoint = "memcpy")]
+    internal static extern nint CMemcpy(nint dst, nint src, ulong n);
+
+    [DllImport("crt", EntryPoint = "memset")]
+    internal static extern nint CMemset(nint dst, int c, ulong n);
+
+    [DllImport("crt", EntryPoint = "getenv")]
+    internal static extern nint CGetenv(nint name);
+
+    [DllImport("crt", EntryPoint = "atexit")]
+    internal static extern int CAtexit(nint fn);
+
+    [DllImport("crt", EntryPoint = "abort")]
+    internal static extern void CAbort();
+
+    [DllImport("crt", EntryPoint = "exit")]
+    internal static extern void CExit(int code);
+
+    [DllImport("crt", EntryPoint = "fopen")]
+    internal static extern nint CFopen(nint path, nint mode);
+
+    [DllImport("crt", EntryPoint = "fclose")]
+    internal static extern int CFclose(nint fh);
+
+    [DllImport("crt", EntryPoint = "fseek")]
+    internal static extern int CFseek(nint fh, long offset, int whence);
+
+    [DllImport("crt", EntryPoint = "ftell")]
+    internal static extern long CFtell(nint fh);
+
+    [DllImport("crt", EntryPoint = "fwrite")]
+    internal static extern ulong CFwrite(nint ptr, ulong size, ulong count, nint fh);
+
+    [DllImport("crt", EntryPoint = "fread")]
+    internal static extern ulong CFread(nint ptr, ulong size, ulong count, nint fh);
+
+    [DllImport("crt", EntryPoint = "fflush")]
+    internal static extern int CFflush(nint fh);
+
+    [DllImport("crt", EntryPoint = "ferror")]
+    internal static extern int CFerror(nint fh);
+
+    [DllImport("crt", EntryPoint = "setvbuf")]
+    internal static extern int CSetvbuf(nint fh, nint buf, int mode, ulong size);
+
+    [DllImport("crt", EntryPoint = "strtod")]
+    internal static extern double CStrtod(nint s, nint endp);
+
+    [DllImport("crt", EntryPoint = "strtof")]
+    internal static extern float CStrtof(nint s, nint endp);
+
+    [DllImport("crt", EntryPoint = "strtoll")]
+    internal static extern long CStrtoll(nint s, nint endp, int baseNum);
+
+    [DllImport("crt", EntryPoint = "snprintf")]
+    internal static extern int CSnprintf(nint buf, ulong cap, nint fmt);
+
+    internal const int SEEK_END = 2;
+    internal const int IOFBF = 0;
+
+#if WINDOWS
+    internal const int ERANGE_VAL = 34;
+    internal const uint FLS_OUT_OF_INDEXES = 0xFFFFFFFFU;
+    internal const uint MEM_COMMIT = 0x1000U;
+    internal const uint MEM_RESERVE = 0x2000U;
+    internal const uint MEM_DECOMMIT = 0x4000U;
+    internal const uint MEM_RELEASE = 0x8000U;
+    internal const uint PAGE_NOACCESS = 0x01U;
+    internal const uint PAGE_READWRITE = 0x04U;
+    internal const uint PAGE_GUARD = 0x100U;
+    internal const uint CP_UTF8 = 65001U;
+    internal const uint STD_OUTPUT_HANDLE = 0xFFFFFFF5U;
+    internal const uint FILE_TYPE_DISK = 1U;
+
+    [DllImport("kernel32", EntryPoint = "AcquireSRWLockExclusive")]
+    internal static extern void WinAcquireSrw(nint lk);
+
+    [DllImport("kernel32", EntryPoint = "ReleaseSRWLockExclusive")]
+    internal static extern void WinReleaseSrw(nint lk);
+
+    [DllImport("kernel32", EntryPoint = "TryAcquireSRWLockExclusive")]
+    internal static extern byte WinTryAcquireSrw(nint lk);
+
+    [DllImport("kernel32", EntryPoint = "GetCurrentThreadId")]
+    internal static extern uint WinGetCurrentThreadId();
+
+    [DllImport("kernel32", EntryPoint = "GetCurrentProcessId")]
+    internal static extern uint WinGetCurrentProcessId();
+
+    [DllImport("kernel32", EntryPoint = "GetCurrentThread")]
+    internal static extern nint WinGetCurrentThread();
+
+    [DllImport("kernel32", EntryPoint = "GetCurrentProcess")]
+    internal static extern nint WinGetCurrentProcess();
+
+    [DllImport("kernel32", EntryPoint = "Sleep")]
+    internal static extern void WinSleep(uint ms);
+
+    [DllImport("kernel32", EntryPoint = "SwitchToThread")]
+    internal static extern int WinSwitchToThread();
+
+    [DllImport("kernel32", EntryPoint = "GetTickCount64")]
+    internal static extern ulong WinGetTickCount64();
+
+    [DllImport("kernel32", EntryPoint = "QueryPerformanceCounter")]
+    internal static extern int WinQueryPerformanceCounter(nint counterPtr);
+
+    [DllImport("kernel32", EntryPoint = "QueryPerformanceFrequency")]
+    internal static extern int WinQueryPerformanceFrequency(nint freqPtr);
+
+    [DllImport("kernel32", EntryPoint = "QueryThreadCycleTime")]
+    internal static extern int WinQueryThreadCycleTime(nint threadHandle, nint cyclesPtr);
+
+    [DllImport("kernel32", EntryPoint = "GetProcessTimes")]
+    internal static extern int WinGetProcessTimes(nint proc, nint created, nint exited, nint kernel, nint user);
+
+    [DllImport("kernel32", EntryPoint = "GetSystemTimeAsFileTime")]
+    internal static extern void WinGetSystemTimeAsFileTime(nint ftPtr);
+
+    [DllImport("kernel32", EntryPoint = "GetLocalTime")]
+    internal static extern void WinGetLocalTime(nint stPtr);
+
+    [DllImport("kernel32", EntryPoint = "GetSystemInfo")]
+    internal static extern void WinGetSystemInfo(nint siPtr);
+
+    [DllImport("kernel32", EntryPoint = "GetModuleFileNameA")]
+    internal static extern uint WinGetModuleFileNameA(nint mod, nint buf, uint cap);
+
+    [DllImport("kernel32", EntryPoint = "GetTempPathA")]
+    internal static extern uint WinGetTempPathA(uint cap, nint buf);
+
+    [DllImport("kernel32", EntryPoint = "GetStdHandle")]
+    internal static extern nint WinGetStdHandle(uint stdHandle);
+
+    [DllImport("kernel32", EntryPoint = "GetFileType")]
+    internal static extern uint WinGetFileType(nint handle);
+
+    [DllImport("kernel32", EntryPoint = "GetCommandLineW")]
+    internal static extern nint WinGetCommandLineW();
+
+    [DllImport("shell32", EntryPoint = "CommandLineToArgvW")]
+    internal static extern nint WinCommandLineToArgvW(nint cmdLine, nint pNumArgs);
+
+    [DllImport("kernel32", EntryPoint = "LocalFree")]
+    internal static extern nint WinLocalFree(nint hMem);
+
+    [DllImport("kernel32", EntryPoint = "WideCharToMultiByte")]
+    internal static extern int WinWideCharToMultiByte(uint cp, uint flags, nint wideStr, int wideLen, nint mbStr, int mbLen, nint defChar, nint usedDef);
+
+    [DllImport("kernel32", EntryPoint = "VirtualAlloc")]
+    internal static extern nint WinVirtualAlloc(nint addr, ulong size, uint allocType, uint protect);
+
+    [DllImport("kernel32", EntryPoint = "VirtualFree")]
+    internal static extern int WinVirtualFree(nint addr, ulong size, uint freeType);
+
+    [DllImport("kernel32", EntryPoint = "VirtualQuery")]
+    internal static extern ulong WinVirtualQuery(nint addr, nint mbiPtr, ulong len);
+
+    [DllImport("kernel32", EntryPoint = "RaiseException")]
+    internal static extern void WinRaiseException(uint code, uint flags, uint nArgs, nint argsPtr);
+
+    [DllImport("kernel32", EntryPoint = "FlsAlloc")]
+    internal static extern uint WinFlsAlloc(nint cb);
+
+    [DllImport("kernel32", EntryPoint = "FlsGetValue")]
+    internal static extern nint WinFlsGetValue(uint idx);
+
+    [DllImport("kernel32", EntryPoint = "FlsSetValue")]
+    internal static extern int WinFlsSetValue(uint idx, nint val);
+
+    [DllImport("crt", EntryPoint = "__acrt_iob_func")]
+    internal static extern nint WinAcrtIobFunc(uint index);
+
+    [DllImport("kernel32", EntryPoint = "GetModuleHandleA")]
+    internal static extern nint WinGetModuleHandleA(nint name);
+
+    [DllImport("kernel32", EntryPoint = "LoadLibraryA")]
+    internal static extern nint WinLoadLibraryA(nint name);
+
+    [DllImport("kernel32", EntryPoint = "GetProcAddress")]
+    internal static extern nint WinGetProcAddress(nint mod, nint name);
+
+    [DllImport("crt", EntryPoint = "_errno")]
+    internal static extern nint WinErrnoPtr();
+
+    static nint s_winRandSFn = (nint)0;
+
+    internal static int WinRandS(nint outUint) {
+        nint fn = Atomic.Load(ref s_winRandSFn, MemoryOrder.Acquire);
+        if (fn == (nint)0) {
+            nint mod = WinGetModuleHandleA((nint)"ucrtbase.dll");
+            if (mod == (nint)0) mod = WinGetModuleHandleA((nint)"msvcrt.dll");
+            if (mod == (nint)0) mod = WinLoadLibraryA((nint)"msvcrt.dll");
+            if (mod != (nint)0) fn = WinGetProcAddress(mod, (nint)"rand_s");
+            if (fn == (nint)0) fn = (nint)1;
+            Atomic.Store(ref s_winRandSFn, fn, MemoryOrder.Release);
+        }
+        if (fn == (nint)1) return -1;
+        return NativeMemory.InvokeWithCC<int>("c", fn, outUint);
+    }
+
+    [DllImport("crt", EntryPoint = "_localtime64_s")]
+    internal static extern int WinLocaltime64S(nint tmPtr, nint time64Ptr);
+
+    [DllImport("crt", EntryPoint = "_mkgmtime64")]
+    internal static extern long WinMkgmtime64(nint tmPtr);
+
+    internal static nint StdoutFile() => WinAcrtIobFunc(1U);
+    internal static nint StderrFile() => WinAcrtIobFunc(2U);
+    internal static nint ErrnoPtr() => WinErrnoPtr();
+
+    internal static void MutexInit(nint m) {
+        NativeMemory.Write<nint>(m, (nint)0);
+    }
+    internal static void MutexLock(nint m) { WinAcquireSrw(m); }
+    internal static bool MutexTryLock(nint m) => WinTryAcquireSrw(m) != (byte)0;
+    internal static void MutexUnlock(nint m) { WinReleaseSrw(m); }
+
+    internal static ulong TimerSelfTid() => (ulong)WinGetCurrentThreadId();
+    internal static void TimerYield() { WinSleep(1U); }
+    internal static void OsYield() { WinSwitchToThread(); }
+
+    internal static void WriteStderrBytes(nint buf, ulong len) {
+        if (len == 0UL) return;
+        nint err = StderrFile();
+        if (err != (nint)0) {
+            CFwrite(buf, 1UL, len, err);
+            CFflush(err);
+        }
+    }
+
+    internal static void WriteStdoutBytes(nint buf, ulong len) {
+        if (len == 0UL) return;
+        nint outF = StdoutFile();
+        if (outF != (nint)0) {
+            CFwrite(buf, 1UL, len, outF);
+        }
+    }
+
+    internal static void FlushStdout() {
+        nint outF = StdoutFile();
+        if (outF != (nint)0) CFflush(outF);
+    }
+#else
+    internal const int ERANGE_VAL = 34;
+    internal const int EFAULT_VAL = 14;
+    internal const int CLOCK_REALTIME = 0;
+    internal const int PROT_NONE = 0;
+    internal const int PROT_READ_WRITE = 3;
+#if MACOS
+    internal const int CLOCK_MONOTONIC = 6;
+    internal const int CLOCK_THREAD_CPUTIME_ID = 16;
+    internal const int MAP_PRIVATE_ANON = 0x1002;
+    internal const int MAP_PRIVATE_ANON_FIXED = 0x1012;
+    internal const int SC_PAGESIZE = 29;
+    internal const int KERN_SUCCESS = 0;
+    internal const int KERN_INVALID_ADDRESS = 1;
+    internal const int KERN_PROTECTION_FAILURE = 2;
+#else
+    internal const int CLOCK_MONOTONIC = 1;
+    internal const int CLOCK_THREAD_CPUTIME_ID = 3;
+    internal const int MAP_PRIVATE_ANON = 0x22;
+    internal const int MAP_PRIVATE_ANON_FIXED = 0x32;
+    internal const int SC_PAGESIZE = 30;
+#if ARM64
+    internal const long SYS_GETRANDOM = 278L;
+#else
+    internal const long SYS_GETRANDOM = 318L;
+#endif
+#endif
+
+#if MACOS
+    [DllImport("crt", EntryPoint = "os_unfair_lock_lock")]
+    internal static extern void MacUnfairLock(nint m);
+
+    [DllImport("crt", EntryPoint = "os_unfair_lock_trylock")]
+    internal static extern byte MacUnfairTryLock(nint m);
+
+    [DllImport("crt", EntryPoint = "os_unfair_lock_unlock")]
+    internal static extern void MacUnfairUnlock(nint m);
+
+    [DllImport("crt", EntryPoint = "pthread_key_create")]
+    internal static extern int PosixKeyCreate(nint keyPtr, nint dtor);
+
+    [DllImport("crt", EntryPoint = "pthread_getspecific")]
+    internal static extern nint PosixGetSpecific(ulong key);
+
+    [DllImport("crt", EntryPoint = "pthread_setspecific")]
+    internal static extern int PosixSetSpecific(ulong key, nint val);
+
+    [DllImport("crt", EntryPoint = "__error")]
+    internal static extern nint PosixErrnoPtr();
+
+    [DllImport("crt", EntryPoint = "arc4random_buf")]
+    internal static extern void MacArc4RandomBuf(nint buf, ulong len);
+
+    [DllImport("crt", EntryPoint = "_NSGetExecutablePath")]
+    internal static extern int MacGetExecutablePath(nint buf, nint bufSizePtr);
+
+    [DllImport("crt", EntryPoint = "dladdr")]
+    internal static extern int MacDladdr(nint addr, nint info);
+
+    [DllImport("crt", EntryPoint = "mach_task_self")]
+    internal static extern uint MacTaskSelf();
+
+    [DllImport("crt", EntryPoint = "vm_read_overwrite")]
+    internal static extern int MacVmReadOverwrite(uint task, ulong addr, ulong size, ulong dst, nint outSize);
+#else
+    [DllImport("crt", EntryPoint = "pthread_mutex_init")]
+    internal static extern int PosixMutexInit(nint m, nint attr);
+
+    [DllImport("crt", EntryPoint = "pthread_mutex_lock")]
+    internal static extern int PosixMutexLock(nint m);
+
+    [DllImport("crt", EntryPoint = "pthread_mutex_trylock")]
+    internal static extern int PosixMutexTryLock(nint m);
+
+    [DllImport("crt", EntryPoint = "pthread_mutex_unlock")]
+    internal static extern int PosixMutexUnlock(nint m);
+
+    [DllImport("crt", EntryPoint = "pthread_key_create")]
+    internal static extern int PosixKeyCreate(nint keyPtr, nint dtor);
+
+    [DllImport("crt", EntryPoint = "pthread_getspecific")]
+    internal static extern nint PosixGetSpecific(uint key);
+
+    [DllImport("crt", EntryPoint = "pthread_setspecific")]
+    internal static extern int PosixSetSpecific(uint key, nint val);
+
+    [DllImport("crt", EntryPoint = "readlink")]
+    internal static extern long PosixReadlink(nint path, nint buf, ulong cap);
+
+    [DllImport("crt", EntryPoint = "process_vm_readv")]
+    internal static extern long PosixProcessVmReadv(int pid, nint localIov, ulong liovcnt, nint remoteIov, ulong riovcnt, ulong flags);
+
+    [DllImport("crt", EntryPoint = "syscall")]
+    internal static extern long PosixSyscall(long num);
+
+    [DllImport("crt", EntryPoint = "__errno_location")]
+    internal static extern nint PosixErrnoPtr();
+#endif
+
+    [DllImport("crt", EntryPoint = "pthread_self")]
+    internal static extern ulong PosixSelf();
+
+    [DllImport("crt", EntryPoint = "sched_yield")]
+    internal static extern int PosixSchedYield();
+
+    [DllImport("crt", EntryPoint = "clock_gettime")]
+    internal static extern int PosixClockGettime(int clkId, nint tsPtr);
+
+    [DllImport("crt", EntryPoint = "time")]
+    internal static extern long PosixTime(nint tloc);
+
+    [DllImport("crt", EntryPoint = "localtime_r")]
+    internal static extern nint PosixLocaltimeR(nint timep, nint result);
+
+    [DllImport("crt", EntryPoint = "timegm")]
+    internal static extern long PosixTimegm(nint tmPtr);
+
+    [DllImport("crt", EntryPoint = "mmap")]
+    internal static extern nint PosixMmap(nint addr, ulong len, int prot, int flags, int fd, long off);
+
+    [DllImport("crt", EntryPoint = "munmap")]
+    internal static extern int PosixMunmap(nint addr, ulong len);
+
+    [DllImport("crt", EntryPoint = "mprotect")]
+    internal static extern int PosixMprotect(nint addr, ulong len, int prot);
+
+    [DllImport("crt", EntryPoint = "sysconf")]
+    internal static extern long PosixSysconf(int name);
+
+    [DllImport("crt", EntryPoint = "mkdir")]
+    internal static extern int PosixMkdir(nint path, uint mode);
+
+    [DllImport("crt", EntryPoint = "fileno")]
+    internal static extern int PosixFileno(nint fh);
+
+    [DllImport("crt", EntryPoint = "fstat")]
+    internal static extern int PosixFstat(int fd, nint stPtr);
+
+    [DllImport("crt", EntryPoint = "write")]
+    internal static extern long PosixWrite(int fd, nint buf, ulong count);
+
+    [DllImport("crt", EntryPoint = "getpid")]
+    internal static extern int PosixGetpid();
+
+    internal static nint ErrnoPtr() => PosixErrnoPtr();
+
+#if MACOS
+    internal static void MutexInit(nint m) {
+        NativeMemory.Write<uint>(m, 0U);
+    }
+    internal static void MutexLock(nint m) { MacUnfairLock(m); }
+    internal static bool MutexTryLock(nint m) => MacUnfairTryLock(m) != (byte)0;
+    internal static void MutexUnlock(nint m) { MacUnfairUnlock(m); }
+#else
+    internal static void MutexInit(nint m) {
+        PosixMutexInit(m, (nint)0);
+    }
+    internal static void MutexLock(nint m) { PosixMutexLock(m); }
+    internal static bool MutexTryLock(nint m) { return PosixMutexTryLock(m) == 0; }
+    internal static void MutexUnlock(nint m) { PosixMutexUnlock(m); }
+#endif
+
+    internal static ulong TimerSelfTid() { return PosixSelf(); }
+    internal static void TimerYield() { PosixSchedYield(); }
+    internal static void OsYield() { PosixSchedYield(); }
+
+    internal static void WriteStderrBytes(nint buf, ulong len) {
+        if (len == 0UL) return;
+        ulong off = 0UL;
+        while (off < len) {
+            long w = PosixWrite(2, buf + (nint)off, len - off);
+            if (w <= 0L) break;
+            off += (ulong)w;
+        }
+    }
+
+    internal static void WriteStdoutBytes(nint buf, ulong len) {
+        if (len == 0UL) return;
+        CFflush((nint)0);
+        ulong off = 0UL;
+        while (off < len) {
+            long w = PosixWrite(1, buf + (nint)off, len - off);
+            if (w <= 0L) break;
+            off += (ulong)w;
+        }
+    }
+
+    internal static void FlushStdout() {
+        CFflush((nint)0);
+    }
+#endif
+
+    // ---- Shared global timer mutex ----
+    static OsMutex s_timerLock;
+
+    internal static void TimerLock() {
+        MutexLock(NativeMemory.AddressOf(ref s_timerLock));
+    }
+
+    internal static void TimerUnlock() {
+        MutexUnlock(NativeMemory.AddressOf(ref s_timerLock));
+    }
+
+    // ---- Unified per-thread TLS block (FLS / pthread_key, zero _tls_index) ----
+    static int s_tlsKeyState = 0; // 0=uninit, 1=initing, 2=ready, 3=failed
+#if WINDOWS
+    static uint s_tlsFls = 0xFFFFFFFFU;
+#elif MACOS
+    static ulong s_tlsKey = 0UL;
+#else
+    static uint s_tlsKey = 0U;
+#endif
+
+    [Export("__zan_timer_tls_exit")]
+    [Visibility("hidden")]
+    static void TimerTlsExit(nint p) {
+        if (p == (nint)0) return;
+        ref TimerTls tls = ref NativeMemory.AsRef<TimerTls>(p);
+        nint scratch = tls.SoftScratch;
+        tls.SoftScratch = (nint)0;
+        tls.SoftScratchExiting = 1;
+        if (scratch != (nint)0) {
+            RtTimerDiag.SoftRelease(scratch);
+        }
+        CFree(p);
+    }
+
+    static bool TimerTlsKeyReady() {
+        int st = Atomic.Load(ref s_tlsKeyState, MemoryOrder.Acquire);
+        if (st == 2) return true;
+        if (st == 3) return false;
+        if (st == 0 && Atomic.CompareExchangeBool(ref s_tlsKeyState, 0, 1, MemoryOrder.AcqRel, MemoryOrder.Acquire)) {
+#if WINDOWS
+            uint idx = WinFlsAlloc(NativeMemory.FunctionPointer(TimerTlsExit));
+            s_tlsFls = idx;
+            st = (idx != FLS_OUT_OF_INDEXES) ? 2 : 3;
+#else
+            bool ok = PosixKeyCreate(NativeMemory.AddressOf(ref s_tlsKey), NativeMemory.FunctionPointer(TimerTlsExit)) == 0;
+            st = ok ? 2 : 3;
+#endif
+            Atomic.Store(ref s_tlsKeyState, st, MemoryOrder.Release);
+            return st == 2;
+        }
+        while ((st = Atomic.Load(ref s_tlsKeyState, MemoryOrder.Acquire)) == 1) {
+            Atomic.Pause();
+        }
+        return st == 2;
+    }
+
+    internal static nint TimerTlsPeek() {
+        if (Atomic.Load(ref s_tlsKeyState, MemoryOrder.Acquire) != 2) return (nint)0;
+#if WINDOWS
+        return WinFlsGetValue(s_tlsFls);
+#else
+        return PosixGetSpecific(s_tlsKey);
+#endif
+    }
+
+    internal static nint TimerTlsGet() {
+        nint p = TimerTlsPeek();
+        if (p != (nint)0) return p;
+        if (!TimerTlsKeyReady()) return (nint)0;
+#if WINDOWS
+        p = WinFlsGetValue(s_tlsFls);
+#else
+        p = PosixGetSpecific(s_tlsKey);
+#endif
+        if (p != (nint)0) return p;
+        p = CCalloc(1UL, (ulong)sizeof(TimerTls));
+        if (p == (nint)0) return (nint)0;
+#if WINDOWS
+        if (WinFlsSetValue(s_tlsFls, p) == 0) {
+            CFree(p);
+            return (nint)0;
+        }
+#else
+        if (PosixSetSpecific(s_tlsKey, p) != 0) {
+            CFree(p);
+            return (nint)0;
+        }
+#endif
+        return p;
+    }
+
+    // ---- TTAS spinlock helpers (zero inline asm) ----
+    internal static void SpinLockWord(nint lockPtr) {
+        int spins = 0;
+        while (true) {
+            if (Atomic.LoadAt<int>(lockPtr, MemoryOrder.Relaxed) == 0 &&
+                Atomic.ExchangeAt<int>(lockPtr, 1, MemoryOrder.Acquire) == 0) {
+                return;
+            }
+            spins++;
+            if (spins >= 64) {
+                OsYield();
+            }
+        }
+    }
+
+    internal static void SpinUnlockWord(nint lockPtr) {
+        Atomic.StoreAt<int>(lockPtr, 0, MemoryOrder.Release);
+    }
+
+    // ---- Pure-Zan C string helpers ----
+
+    internal static ulong CStrLen(nint s) {
+        if (s == (nint)0) return 0UL;
+        ulong n = 0UL;
+        while (NativeMemory.At<byte>(s, (long)n) != (byte)0) n++;
+        return n;
+    }
+
+    internal static int CStrCmp(nint a, nint b) {
+        if (a == b) return 0;
+        if (a == (nint)0) return -1;
+        if (b == (nint)0) return 1;
+        long i = 0L;
+        while (true) {
+            byte ca = NativeMemory.At<byte>(a, i);
+            byte cb = NativeMemory.At<byte>(b, i);
+            if (ca != cb) return (int)ca - (int)cb;
+            if (ca == (byte)0) return 0;
+            i++;
+        }
+    }
+
+    internal static nint CStrChr(nint s, byte ch) {
+        if (s == (nint)0) return (nint)0;
+        long i = 0L;
+        while (true) {
+            byte c = NativeMemory.At<byte>(s, i);
+            if (c == ch) return s + (nint)i;
+            if (c == (byte)0) return (nint)0;
+            i++;
+        }
+    }
+
+    internal static nint CStrRChr(nint s, byte ch) {
+        if (s == (nint)0) return (nint)0;
+        nint last = (nint)0;
+        long i = 0L;
+        while (true) {
+            byte c = NativeMemory.At<byte>(s, i);
+            if (c == ch) last = s + (nint)i;
+            if (c == (byte)0) return last;
+            i++;
+        }
+    }
+
+    internal static nint CStrStr(nint haystack, nint needle) {
+        if (haystack == (nint)0 || needle == (nint)0) return (nint)0;
+        byte n0 = NativeMemory.At<byte>(needle, 0L);
+        if (n0 == (byte)0) return haystack;
+        long i = 0L;
+        while (true) {
+            byte c = NativeMemory.At<byte>(haystack, i);
+            if (c == (byte)0) return (nint)0;
+            if (c == n0) {
+                long j = 1L;
+                while (true) {
+                    byte nj = NativeMemory.At<byte>(needle, j);
+                    if (nj == (byte)0) return haystack + (nint)i;
+                    byte hj = NativeMemory.At<byte>(haystack, i + j);
+                    if (hj != nj) break;
+                    j++;
+                }
+            }
+            i++;
+        }
+    }
+
+    internal static ulong CStrCspnByte(nint s, byte reject) {
+        if (s == (nint)0) return 0UL;
+        ulong i = 0UL;
+        while (true) {
+            byte c = NativeMemory.At<byte>(s, (long)i);
+            if (c == (byte)0 || c == reject) return i;
+            i++;
+        }
+    }
+
+    internal static int ParseAsciiInt(nint s) {
+        if (s == (nint)0) return 0;
+        long i = 0L;
+        while (true) {
+            byte c = NativeMemory.At<byte>(s, i);
+            if (c == (byte)32 || c == (byte)9 || c == (byte)10 || c == (byte)13) i++;
+            else break;
+        }
+        bool neg = false;
+        byte sign = NativeMemory.At<byte>(s, i);
+        if (sign == (byte)45) { neg = true; i++; }
+        else if (sign == (byte)43) { i++; }
+        long val = 0L;
+        while (true) {
+            byte c = NativeMemory.At<byte>(s, i);
+            if (c < (byte)48 || c > (byte)57) break;
+            val = val * 10L + (long)(c - (byte)48);
+            i++;
+        }
+        return neg ? (int)(-val) : (int)val;
+    }
+
+    // ---- Stack C-string buffer builder (always NUL-terminates within cap) ----
+
+    internal static ulong BufAppendChar(nint buf, ulong cap, ulong pos, byte ch) {
+        if (cap == 0UL) return 0UL;
+        if (pos + 1UL < cap) {
+            NativeMemory.At<byte>(buf, (long)pos) = ch;
+            pos++;
+        }
+        NativeMemory.At<byte>(buf, (long)pos) = (byte)0;
+        return pos;
+    }
+
+    internal static ulong BufAppendBytes(nint buf, ulong cap, ulong pos, nint src, ulong len) {
+        if (cap == 0UL || src == (nint)0 || len == 0UL) return pos;
+        ulong avail = (pos + 1UL < cap) ? (cap - 1UL - pos) : 0UL;
+        ulong n = (len < avail) ? len : avail;
+        if (n > 0UL) {
+            CMemcpy(buf + (nint)pos, src, n);
+            pos += n;
+        }
+        NativeMemory.At<byte>(buf, (long)pos) = (byte)0;
+        return pos;
+    }
+
+    internal static ulong BufAppendCStr(nint buf, ulong cap, ulong pos, nint s) {
+        if (s == (nint)0) return pos;
+        return BufAppendBytes(buf, cap, pos, s, CStrLen(s));
+    }
+
+    internal static ulong BufAppendU64(nint buf, ulong cap, ulong pos, ulong v) {
+        Buf32 tmp = new Buf32();
+        nint tp = NativeMemory.AddressOf(ref tmp);
+        long k = 0L;
+        if (v == 0UL) {
+            NativeMemory.At<byte>(tp, 0L) = (byte)48;
+            k = 1L;
+        } else {
+            while (v > 0UL) {
+                NativeMemory.At<byte>(tp, k) = (byte)(48UL + (v % 10UL));
+                v /= 10UL;
+                k++;
+            }
+        }
+        while (k > 0L) {
+            k--;
+            pos = BufAppendChar(buf, cap, pos, NativeMemory.At<byte>(tp, k));
+        }
+        return pos;
+    }
+
+    internal static ulong BufAppendI64(nint buf, ulong cap, ulong pos, long v) {
+        if (v < 0L) {
+            pos = BufAppendChar(buf, cap, pos, (byte)45);
+            ulong uv = (ulong)(-(v + 1L)) + 1UL;
+            return BufAppendU64(buf, cap, pos, uv);
+        }
+        return BufAppendU64(buf, cap, pos, (ulong)v);
+    }
+
+    internal static ulong BufAppendU64ZeroPad(nint buf, ulong cap, ulong pos, ulong v, int width) {
+        Buf32 tmp = new Buf32();
+        nint tp = NativeMemory.AddressOf(ref tmp);
+        int k = 0;
+        if (v == 0UL) {
+            NativeMemory.At<byte>(tp, 0L) = (byte)48;
+            k = 1;
+        } else {
+            while (v > 0UL) {
+                NativeMemory.At<byte>(tp, (long)k) = (byte)(48UL + (v % 10UL));
+                v /= 10UL;
+                k++;
+            }
+        }
+        while (k < width) {
+            pos = BufAppendChar(buf, cap, pos, (byte)48);
+            width--;
+        }
+        while (k > 0) {
+            k--;
+            pos = BufAppendChar(buf, cap, pos, NativeMemory.At<byte>(tp, (long)k));
+        }
+        return pos;
+    }
+
+    internal static ulong BufAppendHexPtr(nint buf, ulong cap, ulong pos, ulong v) {
+        pos = BufAppendChar(buf, cap, pos, (byte)48);  // '0'
+        pos = BufAppendChar(buf, cap, pos, (byte)120); // 'x'
+        Buf32 tmp = new Buf32();
+        nint tp = NativeMemory.AddressOf(ref tmp);
+        int k = 0;
+        if (v == 0UL) {
+            NativeMemory.At<byte>(tp, 0L) = (byte)48;
+            k = 1;
+        } else {
+            while (v > 0UL) {
+                ulong d = v & 15UL;
+                byte ch = (d < 10UL) ? (byte)(48UL + d) : (byte)(97UL + (d - 10UL));
+                NativeMemory.At<byte>(tp, (long)k) = ch;
+                v >>= 4;
+                k++;
+            }
+        }
+        while (k > 0) {
+            k--;
+            pos = BufAppendChar(buf, cap, pos, NativeMemory.At<byte>(tp, (long)k));
+        }
+        return pos;
+    }
+
+    internal static ulong BufAppendPaddedLeft(nint buf, ulong cap, ulong pos, nint s, int width) {
+        ulong slen = CStrLen(s);
+        pos = BufAppendBytes(buf, cap, pos, s, slen);
+        int pad = width - (int)slen;
+        while (pad > 0) {
+            pos = BufAppendChar(buf, cap, pos, (byte)32);
+            pad--;
+        }
+        return pos;
+    }
+
+    internal static ulong BufAppendPaddedRightU64(nint buf, ulong cap, ulong pos, ulong v, int width) {
+        Buf32 num = new Buf32();
+        nint np = NativeMemory.AddressOf(ref num);
+        NativeMemory.At<byte>(np, 0L) = (byte)0;
+        ulong nlen = BufAppendU64(np, 32UL, 0UL, v);
+        int pad = width - (int)nlen;
+        while (pad > 0) {
+            pos = BufAppendChar(buf, cap, pos, (byte)32);
+            pad--;
+        }
+        return BufAppendBytes(buf, cap, pos, np, nlen);
+    }
+
+    internal static ulong BufAppendPaddedRightCStr(nint buf, ulong cap, ulong pos, nint s, int width) {
+        ulong slen = CStrLen(s);
+        int pad = width - (int)slen;
+        while (pad > 0) {
+            pos = BufAppendChar(buf, cap, pos, (byte)32);
+            pad--;
+        }
+        return BufAppendBytes(buf, cap, pos, s, slen);
+    }
+
+    // ---- B-ID98 OOM injection gate (rt_oom.h) ----
+
+    const int OOM_MAX_SITES = 8;
+
+    struct OomSite {
+        public nint Site;
+        public int Remaining;
+        public int Pad;
+    }
+
+    struct OomTable {
+        public OomSite S0; public OomSite S1; public OomSite S2; public OomSite S3;
+        public OomSite S4; public OomSite S5; public OomSite S6; public OomSite S7;
+    }
+
+    static OomTable s_oomSites;
+    static int s_oomSiteCount = -1;
+    static int s_oomInitLock = 0;
+
+    static void OomEnvParse() {
+        nint e = CGetenv((nint)"ZAN_OOM_INJECT_SITE");
+        int count = 0;
+        if (e == (nint)0 || NativeMemory.At<byte>(e, 0L) == (byte)0) {
+            Atomic.Store(ref s_oomSiteCount, 0, MemoryOrder.Release);
+            return;
+        }
+        Buf256 buf = new Buf256();
+        nint bp = NativeMemory.AddressOf(ref buf);
+        ulong n = CStrLen(e);
+        if (n >= 256UL) n = 255UL;
+        CMemcpy(bp, e, n);
+        NativeMemory.At<byte>(bp, (long)n) = (byte)0;
+
+        nint sitesBase = NativeMemory.AddressOf(ref s_oomSites);
+        long pos = 0L;
+        while (NativeMemory.At<byte>(bp, pos) != (byte)0 && count < OOM_MAX_SITES) {
+            while (NativeMemory.At<byte>(bp, pos) == (byte)44) pos++; // ','
+            if (NativeMemory.At<byte>(bp, pos) == (byte)0) break;
+            long segStart = pos;
+            while (NativeMemory.At<byte>(bp, pos) != (byte)0 && NativeMemory.At<byte>(bp, pos) != (byte)44) pos++;
+            if (NativeMemory.At<byte>(bp, pos) != (byte)0) {
+                NativeMemory.At<byte>(bp, pos) = (byte)0;
+                pos++;
+            }
+            nint seg = bp + (nint)segStart;
+            nint colon = CStrChr(seg, (byte)58); // ':'
+            int k = 1;
+            if (colon != (nint)0) {
+                NativeMemory.Write<byte>(colon, (byte)0);
+                k = ParseAsciiInt(colon + (nint)1);
+                if (k < 0) k = 0;
+            }
+            if (NativeMemory.At<byte>(seg, 0L) != (byte)0) {
+                ulong slen = CStrLen(seg);
+                nint copy = CMalloc(slen + 1UL);
+                if (copy != (nint)0) {
+                    CMemcpy(copy, seg, slen + 1UL);
+                    nint slot = sitesBase + (nint)((long)count * 16L);
+                    NativeMemory.Write<nint>(slot, copy);
+                    NativeMemory.Write<int>(slot + (nint)8, k);
+                    count++;
+                }
+            }
+        }
+        Atomic.Store(ref s_oomSiteCount, count, MemoryOrder.Release);
+    }
+
+    internal static bool OomHit(nint site) {
+        int cnt = Atomic.Load(ref s_oomSiteCount, MemoryOrder.Acquire);
+        if (cnt < 0) {
+            SpinLockWord(NativeMemory.AddressOf(ref s_oomInitLock));
+            if (Atomic.Load(ref s_oomSiteCount, MemoryOrder.Relaxed) < 0) {
+                OomEnvParse();
+            }
+            SpinUnlockWord(NativeMemory.AddressOf(ref s_oomInitLock));
+            cnt = Atomic.Load(ref s_oomSiteCount, MemoryOrder.Acquire);
+        }
+        if (cnt <= 0) return false;
+        nint sitesBase = NativeMemory.AddressOf(ref s_oomSites);
+        for (int i = 0; i < cnt; i++) {
+            nint slot = sitesBase + (nint)((long)i * 16L);
+            int rem = NativeMemory.Read<int>(slot + (nint)8);
+            if (rem > 0 && CStrCmp(NativeMemory.Read<nint>(slot), site) == 0) {
+                NativeMemory.Write<int>(slot + (nint)8, rem - 1);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    internal static nint OomCalloc(nint site, ulong count, ulong sz) {
+        if (OomHit(site)) return (nint)0;
+        return CCalloc(count, sz);
+    }
+
+    // ---- 64-bit leading zero count (portable, zero asm) ----
+    internal static int Clz64(ulong x) {
+        if (x == 0UL) return 64;
+        int n = 0;
+        if ((x & 0xFFFFFFFF00000000UL) == 0UL) { n += 32; x <<= 32; }
+        if ((x & 0xFFFF000000000000UL) == 0UL) { n += 16; x <<= 16; }
+        if ((x & 0xFF00000000000000UL) == 0UL) { n += 8; x <<= 8; }
+        if ((x & 0xF000000000000000UL) == 0UL) { n += 4; x <<= 4; }
+        if ((x & 0xC000000000000000UL) == 0UL) { n += 2; x <<= 2; }
+        if ((x & 0x8000000000000000UL) == 0UL) { n += 1; }
+        return n;
+    }
+}

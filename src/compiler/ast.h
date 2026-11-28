@@ -21,6 +21,8 @@ typedef enum {
   AST_CONSTRUCTOR_DECL,
   AST_DESTRUCTOR_DECL,
   AST_PROPERTY_DECL,
+  AST_ASSOC_TYPE_DECL,
+  AST_MACRO_DECL,
   AST_PARAM,
 
   AST_BLOCK,
@@ -60,6 +62,7 @@ typedef enum {
   AST_BASE_EXPR,
   AST_TYPEOF_EXPR,
   AST_SIZEOF_EXPR,
+  AST_STACKALLOC_EXPR,
   AST_CONDITIONAL,
   AST_LAMBDA,
   AST_AWAIT_EXPR,
@@ -123,6 +126,23 @@ typedef struct {
 } zan_method_ext_t;
 
 typedef struct {
+  zan_istr_t name;
+  int tag;
+  zan_ast_list_t params;          /* AST_PARAM nodes from ADT enum variant */
+  zan_istr_t *struct_field_names; /* __adt_v<tag>_<idx> for each param */
+} zan_adt_variant_t;
+
+typedef struct {
+  zan_adt_variant_t *variants;
+  int variant_count;
+} zan_adt_info_t;
+
+typedef struct {
+  zan_istr_t variant;
+  zan_ast_list_t bindings;
+} zan_adt_pat_t;
+
+typedef struct {
   zan_ast_list_t attributes;
   zan_istr_t ns_name;
   zan_istr_t orig_name;
@@ -130,6 +150,7 @@ typedef struct {
   zan_ast_node_t *delegate_host; /* enclosing type of a hoisted delegate */
   zan_ast_list_t
       partial_decls; /* absorbed declarations, for source provenance */
+  zan_adt_info_t *adt_info; /* non-NULL for Tagged Union ADT enum */
 } zan_decl_meta_t;
 
 struct zan_ast_node {
@@ -166,6 +187,7 @@ struct zan_ast_node {
       bool is_type_receiver; /* nsresolve proved an explicit qualified type */
       int variance; /* 0: invariant, 1: covariant (out), -1: contravariant (in)
                      */
+      bool is_const_param;   /* const generic param, e.g. <const int N> */
       const zan_ast_node_t
           *ns_decl; /* resolved static receiver across nsresolve passes */
     } ident;
@@ -225,10 +247,12 @@ struct zan_ast_node {
       bool list_copy;
     } new_expr;
 
-    /* cast: (Type)expr */
+    /* cast: (Type)expr; also reused by sizeof/alignof/offsetof/stackalloc */
     struct {
       zan_ast_node_t *type;
       zan_ast_node_t *expr;
+      zan_istr_t field_name; /* offsetof(T, Field) */
+      uint8_t layout_op;     /* 0=sizeof, 1=alignof, 2=offsetof */
     } cast;
 
     /* is / as */
@@ -246,6 +270,7 @@ struct zan_ast_node {
       zan_ast_node_t *initializer; /* NULL if none */
       bool is_const;               /* const */
       bool is_let;                 /* let (immutable) */
+      bool is_ref;                 /* ref T x = ref expr */
       zan_loc_t name_loc;          /* zero line for synthesized declarations */
     } var_decl;
 
@@ -271,6 +296,7 @@ struct zan_ast_node {
     /* return */
     struct {
       zan_ast_node_t *value;
+      bool is_ref;
     } ret;
 
     /* if */
@@ -334,6 +360,7 @@ struct zan_ast_node {
       zan_ast_node_t *when_cond;
       zan_ast_node_t *body;
       zan_istr_t var_name;
+      zan_adt_pat_t *adt_pat;
     } switch_case;
 
     struct {
@@ -352,6 +379,7 @@ struct zan_ast_node {
       zan_ast_node_t *when_cond;
       zan_ast_node_t *result;
       zan_istr_t var_name;
+      zan_adt_pat_t *adt_pat;
       bool is_default; /* `_ =>` / `default =>` */
     } switch_arm;
 
@@ -386,6 +414,7 @@ struct zan_ast_node {
       uint32_t modifiers;
       bool is_c_layout; /* [StructLayout(LayoutKind.Sequential)] for C ABI */
       bool is_explicit_layout;
+      uint8_t pack_align; /* 0 = natural, or 1/2/4/8 from [StructLayout(..., Pack = N)] */
       zan_ast_list_t *where_clauses;
       zan_ast_node_t *nested_host;
     } type_decl;
@@ -403,6 +432,7 @@ struct zan_ast_node {
       bool has_base_init;
       bool has_this_init;
       bool is_task_return;
+      bool is_ref_return;
       zan_method_ext_t *ext;
     } method_decl;
 
@@ -473,6 +503,9 @@ struct zan_ast_node {
       int is_params;
       int by_ref; /* 0 = by value, 1 = `ref`, 2 = `out` */
       int is_this;
+      uint8_t is_noalias;  /* contextual `noalias` exclusive borrow hint */
+      uint8_t is_scoped;   /* contextual `scoped` non-escaping ref/Span */
+      uint8_t is_noescape; /* contextual `noescape` non-escaping delegate */
       zan_loc_t name_loc;
     } param;
 
@@ -500,6 +533,8 @@ struct zan_ast_node {
       zan_ast_list_t type_args;
       bool is_nullable;
       bool is_array;
+      bool is_const_int;
+      int64_t const_int_val;
       int array_rank;
       zan_ast_node_t *array_element;
       void *rt_type;
@@ -532,6 +567,7 @@ struct zan_ast_node {
     struct {
       zan_ast_list_t params;
       zan_ast_node_t *body; /* block or expr */
+      uint8_t is_noescape;  /* bound to a `noescape` parameter: stack closure */
     } lambda;
 
     struct {
@@ -559,6 +595,8 @@ struct zan_ast_node {
 #define MOD_PARTIAL 0x8000
 #define MOD_REF 0x10000
 #define MOD_INTRINSIC 0x20000
+#define MOD_CONST 0x40000
+#define MOD_NONCOPYABLE 0x80000
 
 zan_ast_node_t *zan_ast_new(zan_arena_t *arena, zan_ast_kind_t kind,
                             zan_loc_t loc);
@@ -585,6 +623,10 @@ int zan_ast_child_count(const zan_ast_node_t *n);
 zan_ast_node_t *zan_ast_child_at(const zan_ast_node_t *n, int i);
 size_t zan_ast_subtree_count(const zan_ast_node_t *root);
 bool zan_ast_has_attr(const zan_ast_node_t *decl, const char *name);
+bool zan_ast_attr_string(const zan_ast_node_t *decl, const char *name,
+                         char *out, size_t cap);
+bool zan_ast_attr_int(const zan_ast_node_t *decl, const char *name,
+                      int64_t *out);
 bool zan_ast_has_module_initializer(const zan_ast_node_t *decl);
 void zan_ast_list_init(zan_ast_list_t *list);
 void zan_ast_list_push(zan_ast_list_t *list, zan_ast_node_t *node,

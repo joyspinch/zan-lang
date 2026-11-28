@@ -98,12 +98,86 @@ LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
           LLVMGetIntTypeWidth(LLVMTypeOf(idx)) < 64)
         idx = LLVMBuildSExt(g->builder, idx, LLVMInt64TypeInContext(g->ctx),
                             "spx.ix");
-      idx = emit_index_safe_bounds(g, idx, span_len, expr->loc, "span");
+      int bce_scope = 0;
+      bool bce_ok = irgen_bce_check(g, expr->index.object, expr->index.index,
+                                    locals, &bce_scope);
+      if (!bce_ok)
+        idx = emit_index_safe_bounds(g, idx, span_len, expr->loc, "span");
       LLVMValueRef ep =
           LLVMBuildInBoundsGEP2(g->builder, elem_llvm, typed, &idx, 1, "spx.ep");
       LLVMValueRef ld = LLVMBuildLoad2(g->builder, elem_llvm, ep, "spx.elem");
-      LLVMSetAlignment(ld, 1);
+      LLVMSetAlignment(ld, zan_span_elem_align(g, elem_llvm));
+      int na_scope = bce_scope > 0
+                         ? bce_scope
+                         : zan_local_noalias_scope(expr->index.object, locals);
+      if (na_scope > 0)
+        zan_attach_noalias_md(g, ld, na_scope);
       return promote_loaded(g, ld, et);
+    }
+    if (is_inline_array_type(sot)) {
+      int64_t arr_n = inline_array_len(sot);
+      zan_type_t *et = inline_array_elem(sot);
+      LLVMTypeRef elem_llvm = span_elem_storage_type(g, et);
+      LLVMTypeRef arr_llvm = LLVMArrayType(elem_llvm, (unsigned)(arr_n > 0 ? arr_n : 1));
+      LLVMValueRef ptr = emit_ref_lvalue_ptr(g, expr->index.object, locals);
+      if (!ptr) {
+        LLVMValueRef val = emit_expr(g, expr->index.object, locals);
+        ptr = emit_entry_alloca(g, arr_llvm, "ia.tmp");
+        LLVMBuildStore(g->builder, val, ptr);
+      }
+      LLVMValueRef idx = emit_expr(g, expr->index.index, locals);
+      LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+      if (LLVMGetTypeKind(LLVMTypeOf(idx)) == LLVMIntegerTypeKind &&
+          LLVMGetIntTypeWidth(LLVMTypeOf(idx)) < 64)
+        idx = LLVMBuildSExt(g->builder, idx, i64t, "ia.ix");
+      bool safe = false;
+      if (LLVMIsAConstantInt(idx)) {
+        long long ci = LLVMConstIntGetSExtValue(idx);
+        if (ci >= 0 && ci < arr_n)
+          safe = true;
+      }
+      if (!safe) {
+        int bce_scope = 0;
+        safe = irgen_bce_check(g, expr->index.object, expr->index.index, locals,
+                               &bce_scope);
+      }
+      if (!safe)
+        idx = emit_index_safe_bounds(
+            g, idx, LLVMConstInt(i64t, (unsigned long long)arr_n, 0),
+            expr->loc, "InlineArray");
+      LLVMValueRef typed =
+          LLVMBuildBitCast(g->builder, ptr, LLVMPointerType(elem_llvm, 0), "ia.p");
+      LLVMValueRef ep =
+          LLVMBuildInBoundsGEP2(g->builder, elem_llvm, typed, &idx, 1, "ia.ep");
+      LLVMValueRef ld = LLVMBuildLoad2(g->builder, elem_llvm, ep, "ia.elem");
+      LLVMSetAlignment(ld, zan_span_elem_align(g, elem_llvm));
+      return promote_loaded(g, ld, et);
+    }
+    if (is_vec_type(sot)) {
+      int64_t vn = vec_len(sot);
+      zan_type_t *et = vec_elem(sot);
+      LLVMValueRef vv = emit_expr(g, expr->index.object, locals);
+      LLVMValueRef idx = emit_expr(g, expr->index.index, locals);
+      LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+      if (LLVMGetTypeKind(LLVMTypeOf(idx)) == LLVMIntegerTypeKind &&
+          LLVMGetIntTypeWidth(LLVMTypeOf(idx)) != 32)
+        idx = LLVMBuildIntCast2(g->builder, idx, i32t, 1, "vec.ix");
+      bool safe = false;
+      if (LLVMIsAConstantInt(idx)) {
+        long long ci = LLVMConstIntGetSExtValue(idx);
+        if (ci >= 0 && ci < vn)
+          safe = true;
+      }
+      if (!safe) {
+        LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+        LLVMValueRef ix64 = LLVMBuildSExt(g->builder, idx, i64t, "vec.ix64");
+        ix64 = emit_index_safe_bounds(
+            g, ix64, LLVMConstInt(i64t, (unsigned long long)vn, 0),
+            expr->loc, "Vec");
+        idx = LLVMBuildTrunc(g->builder, ix64, i32t, "vec.ix32");
+      }
+      LLVMValueRef ex = LLVMBuildExtractElement(g->builder, vv, idx, "vec.lane");
+      return promote_loaded(g, ex, et);
     }
   }
   LLVMValueRef arr_ptr = NULL;

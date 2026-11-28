@@ -870,6 +870,145 @@ static void emit_abstract_method_stub(zan_irgen_t *g, LLVMValueRef fn,
   LLVMBuildUnreachable(g->builder);
 }
 
+bool method_c_export_name(zan_ast_node_t *member, char *out, size_t cap) {
+  if (!member || member->kind != AST_METHOD_DECL)
+    return false;
+  zan_ast_list_t *attrs = zan_ast_attributes(member);
+  if (!attrs || attrs->count == 0)
+    return false;
+  for (int i = 0; i < attrs->count; i++) {
+    zan_ast_node_t *a = attrs->items[i];
+    if (!a || a->kind != AST_ATTRIBUTE || !a->attribute.name)
+      continue;
+    zan_istr_t n = a->attribute.name->ident.name;
+    if (!n.str)
+      continue;
+    bool is_exp = (n.len == 6 && memcmp(n.str, "Export", 6) == 0) ||
+                  (n.len == 20 && memcmp(n.str, "UnmanagedCallersOnly", 20) == 0);
+    if (!is_exp)
+      continue;
+    zan_istr_t sym = member->method_decl.name;
+    for (int j = 0; j < a->attribute.args.count; j++) {
+      zan_ast_node_t *arg = a->attribute.args.items[j];
+      if (!arg)
+        continue;
+      if (arg->kind == AST_STRING_LITERAL && arg->str_val.len > 0) {
+        sym = arg->str_val;
+        break;
+      }
+      if (arg->kind == AST_ASSIGNMENT && arg->binary.left &&
+          arg->binary.left->kind == AST_IDENTIFIER &&
+          arg->binary.left->ident.name.len == 10 &&
+          memcmp(arg->binary.left->ident.name.str, "EntryPoint", 10) == 0 &&
+          arg->binary.right && arg->binary.right->kind == AST_STRING_LITERAL &&
+          arg->binary.right->str_val.len > 0) {
+        sym = arg->binary.right->str_val;
+        break;
+      }
+    }
+    if (out && cap > 0) {
+      snprintf(out, cap, "%.*s", (int)sym.len, sym.str ? sym.str : "");
+    }
+    return true;
+  }
+  return false;
+}
+
+bool field_c_attr_name(zan_ast_node_t *member, const char *attr_name,
+                       char *out, size_t cap) {
+  if (!member || member->kind != AST_FIELD_DECL || !attr_name)
+    return false;
+  zan_ast_list_t *attrs = zan_ast_attributes(member);
+  if (!attrs || attrs->count == 0)
+    return false;
+  size_t alen = strlen(attr_name);
+  for (int i = 0; i < attrs->count; i++) {
+    zan_ast_node_t *a = attrs->items[i];
+    if (!a || a->kind != AST_ATTRIBUTE || !a->attribute.name)
+      continue;
+    zan_istr_t n = a->attribute.name->ident.name;
+    if (!n.str || n.len != (int)alen || memcmp(n.str, attr_name, alen) != 0)
+      continue;
+    zan_istr_t sym = member->field_decl.name;
+    for (int j = 0; j < a->attribute.args.count; j++) {
+      zan_ast_node_t *arg = a->attribute.args.items[j];
+      if (!arg)
+        continue;
+      if (arg->kind == AST_STRING_LITERAL && arg->str_val.len > 0) {
+        sym = arg->str_val;
+        break;
+      }
+      if (arg->kind == AST_ASSIGNMENT && arg->binary.left &&
+          arg->binary.left->kind == AST_IDENTIFIER &&
+          arg->binary.left->ident.name.len == 10 &&
+          memcmp(arg->binary.left->ident.name.str, "EntryPoint", 10) == 0 &&
+          arg->binary.right && arg->binary.right->kind == AST_STRING_LITERAL &&
+          arg->binary.right->str_val.len > 0) {
+        sym = arg->binary.right->str_val;
+        break;
+      }
+    }
+    if (out && cap > 0)
+      snprintf(out, cap, "%.*s", (int)sym.len, sym.str ? sym.str : "");
+    return true;
+  }
+  return false;
+}
+
+bool method_calling_conv(zan_ast_node_t *member, unsigned *out_cc,
+                         const char **out_c_macro) {
+  if (!member || member->kind != AST_METHOD_DECL)
+    return false;
+  char cc_buf[64];
+  if (!zan_ast_attr_string(member, "CallingConvention", cc_buf, sizeof(cc_buf)))
+    return false;
+  for (char *p = cc_buf; *p; p++) {
+    if (*p >= 'A' && *p <= 'Z')
+      *p = (char)(*p - 'A' + 'a');
+  }
+  unsigned cc = LLVMCCallConv;
+  const char *cm = "";
+  if (strcmp(cc_buf, "c") == 0 || strcmp(cc_buf, "cdecl") == 0) {
+    cc = LLVMCCallConv;
+    cm = "";
+  } else if (strcmp(cc_buf, "stdcall") == 0) {
+    cc = LLVMX86StdcallCallConv;
+    cm = "ZAN_CC_STDCALL ";
+  } else if (strcmp(cc_buf, "fastcall") == 0) {
+    cc = LLVMX86FastcallCallConv;
+    cm = "ZAN_CC_FASTCALL ";
+  } else if (strcmp(cc_buf, "win64") == 0) {
+    cc = LLVMWin64CallConv;
+    cm = "ZAN_CC_WIN64 ";
+  } else if (strcmp(cc_buf, "sysv64") == 0) {
+    cc = LLVMX8664SysVCallConv;
+    cm = "ZAN_CC_SYSV64 ";
+  } else if (strcmp(cc_buf, "aapcs") == 0) {
+    cc = LLVMARMAAPCSCallConv;
+    cm = "";
+  } else if (strcmp(cc_buf, "vectorcall") == 0) {
+    cc = LLVMX86VectorCallCallConv;
+    cm = "ZAN_CC_VECTORCALL ";
+  } else if (strcmp(cc_buf, "preserve_most") == 0) {
+    cc = LLVMPreserveMostCallConv;
+    cm = "";
+  } else if (strcmp(cc_buf, "preserve_all") == 0) {
+    cc = LLVMPreserveAllCallConv;
+    cm = "";
+  } else if (strcmp(cc_buf, "interrupt") == 0 ||
+             strcmp(cc_buf, "x86-interrupt") == 0) {
+    cc = LLVMX86INTRCallConv;
+    cm = "";
+  } else {
+    return false;
+  }
+  if (out_cc)
+    *out_cc = cc;
+  if (out_c_macro)
+    *out_c_macro = cm;
+  return true;
+}
+
 static method_body_work_t *declare_user_methods(zan_irgen_t *g,
                                                 zan_ast_node_t *unit,
                                                 int *out_work_count) {
@@ -944,7 +1083,8 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
       for (int j = 0; j < decl->type_decl.members.count; j++) {
         zan_ast_node_t *member = decl->type_decl.members.items[j];
         bool is_ctor = (member->kind == AST_CONSTRUCTOR_DECL);
-        if (member->kind != AST_METHOD_DECL && !is_ctor)
+        bool is_dtor = (member->kind == AST_DESTRUCTOR_DECL);
+        if (member->kind != AST_METHOD_DECL && !is_ctor && !is_dtor)
           continue;
         bool is_type_init =
             is_ctor && (member->method_decl.modifiers & MOD_STATIC) != 0;
@@ -1028,11 +1168,22 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
           LLVMValueRef efn = NULL;
           if (!member->method_decl.is_variadic)
             efn = abi_extern_thunk(g, ext_name, ft);
-          if (!efn)
+          if (!efn) {
             efn = LLVMGetNamedFunction(g->mod, ext_name);
+            if (efn && !member->method_decl.is_variadic &&
+                LLVMGlobalGetValueType(efn) != ft) {
+              LLVMValueRef adapted =
+                  abi_extern_sig_adapt_thunk(g, ext_name, efn, ft);
+              if (adapted)
+                efn = adapted;
+            }
+          }
           if (!efn) {
             efn = LLVMAddFunction(g->mod, ext_name, ft);
             abi_add_int_ext_attrs(g, efn, rt, pzt, pc);
+            unsigned cc = LLVMCCallConv;
+            if (method_calling_conv(member, &cc, NULL))
+              LLVMSetFunctionCallConv(efn, cc);
           }
           free(pzt);
           zan_symbol_t *method_sym = method_sym_for_decl(type_sym, member);
@@ -1086,7 +1237,7 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
         if (!member->method_decl.body && !is_abstract_method)
           continue;
 
-        bool is_static = (!is_ctor || is_type_init) &&
+        bool is_static = (!is_ctor && !is_dtor || is_type_init) &&
                          (member->method_decl.modifiers & MOD_STATIC) != 0;
         if (is_static && member->method_decl.name.len == 4 &&
             memcmp(member->method_decl.name.str, "Main", 4) == 0 &&
@@ -1094,6 +1245,7 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
           continue;
 
         char fn_name[512];
+        bool is_c_export = false;
         if (is_type_init) {
           snprintf(fn_name, sizeof(fn_name), "%.*s_cctor",
                    (int)decl->type_decl.name.len, decl->type_decl.name.str);
@@ -1101,6 +1253,13 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
           snprintf(fn_name, sizeof(fn_name), "%.*s_ctor%s",
                    (int)decl->type_decl.name.len, decl->type_decl.name.str,
                    vsuffix);
+        } else if (is_dtor) {
+          snprintf(fn_name, sizeof(fn_name), "%.*s___dtor%s",
+                   (int)decl->type_decl.name.len, decl->type_decl.name.str,
+                   vsuffix);
+        } else if (!cur_variant &&
+                   method_c_export_name(member, fn_name, sizeof(fn_name))) {
+          is_c_export = true;
         } else {
           snprintf(fn_name, sizeof(fn_name), "%.*s_%.*s%s",
                    (int)decl->type_decl.name.len, decl->type_decl.name.str,
@@ -1147,15 +1306,18 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
         }
 
         zan_type_t *ret_type =
-            is_ctor ? g->binder->type_void
+            (is_ctor || is_dtor) ? g->binder->type_void
                     : (member->method_decl.return_type
                            ? zan_binder_resolve_type(
                                  g->binder, member->method_decl.return_type)
                            : g->binder->type_void);
         if (body_variant)
           ret_type = subst_type_param_deep(g, ret_type, body_variant);
-        LLVMTypeRef llvm_ret = map_type(g, ret_type);
-        bool is_async = !is_ctor && !is_abstract_method &&
+        LLVMTypeRef llvm_ret =
+            (!is_ctor && !is_dtor && member->method_decl.is_ref_return)
+                ? LLVMPointerType(map_type(g, ret_type), 0)
+                : map_type(g, ret_type);
+        bool is_async = !is_ctor && !is_dtor && !is_abstract_method &&
                         (member->method_decl.modifiers & MOD_ASYNC) != 0;
 
         LLVMTypeRef fn_type = NULL;
@@ -1190,12 +1352,94 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
         } else {
           fn_type = LLVMFunctionType(llvm_ret, param_types,
                                      (unsigned)total_params, 0);
+          if (is_c_export) {
+            LLVMValueRef prev = LLVMGetNamedFunction(g->mod, fn_name);
+            if (prev && (LLVMIsDeclaration(prev) ||
+                         LLVMGetLinkage(prev) == LLVMWeakAnyLinkage)) {
+              char sup_name[560];
+              snprintf(sup_name, sizeof(sup_name), "__zan_rt_superseded_%s",
+                       fn_name);
+              LLVMSetValueName2(prev, sup_name, strlen(sup_name));
+              if (!LLVMIsDeclaration(prev))
+                LLVMSetLinkage(prev, LLVMInternalLinkage);
+            }
+          }
           fn = LLVMAddFunction(g->mod, fn_name, fn_type);
+          bool is_weak_sym = zan_ast_has_attr(member, "Weak");
           bool is_user_export =
-              g->emit_lib && decl && !decl->from_stdlib && !decl->from_package &&
-              !cur_variant && (member->method_decl.modifiers & MOD_PUBLIC) != 0;
-          if (!is_user_export)
+              is_c_export ||
+              (g->emit_lib && decl && !decl->from_stdlib && !decl->from_package &&
+               !cur_variant && (member->method_decl.modifiers & MOD_PUBLIC) != 0);
+          if (is_weak_sym) {
+            LLVMSetLinkage(fn, LLVMWeakAnyLinkage);
+            if (is_c_export) {
+              LLVMSetFunctionCallConv(fn, LLVMCCallConv);
+              LLVMSetUnnamedAddress(fn, LLVMNoUnnamedAddr);
+            }
+          } else if (!is_user_export) {
             zan_set_module_local(fn);
+          } else if (is_c_export) {
+            LLVMSetLinkage(fn, LLVMExternalLinkage);
+            LLVMSetFunctionCallConv(fn, LLVMCCallConv);
+            LLVMSetUnnamedAddress(fn, LLVMNoUnnamedAddr);
+#ifdef _WIN32
+            bool is_win = !g->target_triple[0] ||
+                          strstr(g->target_triple, "windows") != NULL ||
+                          strstr(g->target_triple, "mingw") != NULL ||
+                          strstr(g->target_triple, "msvc") != NULL;
+#else
+            bool is_win = g->target_triple[0] &&
+                          (strstr(g->target_triple, "windows") != NULL ||
+                           strstr(g->target_triple, "mingw") != NULL ||
+                           strstr(g->target_triple, "msvc") != NULL);
+#endif
+            if (is_win)
+              LLVMSetDLLStorageClass(fn, LLVMDLLExportStorageClass);
+            else
+              LLVMSetVisibility(fn, LLVMDefaultVisibility);
+          }
+          {
+            unsigned cc = LLVMCCallConv;
+            if (method_calling_conv(member, &cc, NULL)) {
+              LLVMSetFunctionCallConv(fn, cc);
+              if (cc == LLVMX86INTRCallConv) {
+                unsigned nrz_k = LLVMGetEnumAttributeKindForName("noredzone", 9);
+                if (nrz_k) {
+                  LLVMAddAttributeAtIndex(
+                      fn, LLVMAttributeFunctionIndex,
+                      LLVMCreateEnumAttribute(g->ctx, nrz_k, 0));
+                }
+                if (is_static && param_count >= 1) {
+                  zan_ast_node_t *p0 = member->method_decl.params.items[0];
+                  if (p0 && p0->param.by_ref && p0->param.type) {
+                    zan_type_t *p0t =
+                        zan_binder_resolve_type(g->binder, p0->param.type);
+                    if (body_variant)
+                      p0t = subst_type_param_deep(g, p0t, body_variant);
+                    LLVMTypeRef frame_lt = map_type(g, p0t);
+                    unsigned bv_k = LLVMGetEnumAttributeKindForName("byval", 5);
+                    if (bv_k && frame_lt) {
+                      LLVMAddAttributeAtIndex(
+                          fn, 1, LLVMCreateTypeAttribute(g->ctx, bv_k, frame_lt));
+                    }
+                  }
+                }
+              }
+            }
+            char vis_buf[64];
+            if (zan_ast_attr_string(member, "Visibility", vis_buf, sizeof(vis_buf))) {
+              for (char *p = vis_buf; *p; p++)
+                if (*p >= 'A' && *p <= 'Z') *p = (char)(*p - 'A' + 'a');
+              if (strcmp(vis_buf, "hidden") == 0) {
+                LLVMSetDLLStorageClass(fn, LLVMDefaultStorageClass);
+                LLVMSetVisibility(fn, LLVMHiddenVisibility);
+              } else if (strcmp(vis_buf, "protected") == 0) {
+                LLVMSetVisibility(fn, LLVMProtectedVisibility);
+              } else if (strcmp(vis_buf, "default") == 0) {
+                LLVMSetVisibility(fn, LLVMDefaultVisibility);
+              }
+            }
+          }
         }
 
         if (is_type_init) {

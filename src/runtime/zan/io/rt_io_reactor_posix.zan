@@ -1,0 +1,1059 @@
+// rt_io_reactor_posix.zan: Linux epoll & macOS kqueue async I/O reactor backend.
+
+namespace Zan.Runtime.Io;
+
+static partial class IoReactor {
+#if !WINDOWS
+    // ---- Linux epoll Backend ----
+    const long ZAN_IO_SWEEP_MS = 20L;
+
+    // Waiter layout (56 bytes)
+    const long WT_CO = 0L;
+    const long WT_STEP = 8L;
+    const long WT_RBUF = 16L;
+    const long WT_RLEN = 24L;
+    const long WT_OUTN = 32L;
+    const long WT_ACCEPT = 40L;
+    const long WT_NEXT = 48L;
+    const ulong WT_SIZE = 56UL;
+
+    // Slot layout (120 bytes): r@0..55, w@56..111, has_r@112, has_w@113, in_epoll@114
+    const long SL_R = 0L;
+    const long SL_W = 56L;
+    const long SL_HAS_R = 112L;
+    const long SL_HAS_W = 113L;
+    const long SL_INEP = 114L;
+    const ulong SL_SIZE = 120UL;
+
+    // Shard layout (96 bytes): mx@0..63, poll_fd@64, wake_rfd@68, wake_wfd@72, rto@80, dead@88
+    const long SH_MX = 0L;
+    internal const long SH_POLLFD = 64L;
+    const long SH_WAKER = 68L;
+    internal const long SH_WAKEW = 72L;
+    const long SH_RTO = 80L;
+    const long SH_DEAD = 88L;
+    const ulong SH_SIZE = 96UL;
+
+    // Rto layout (48 bytes)
+    const long RTO_FD = 0L;
+    const long RTO_FRAME = 8L;
+    const long RTO_STEP = 16L;
+    const long RTO_OUTN = 24L;
+    const long RTO_DUE = 32L;
+    const long RTO_NEXT = 40L;
+    const ulong RTO_SIZE = 48UL;
+
+    // Dead layout (40 bytes)
+    const long DEAD_CO = 0L;
+    const long DEAD_STEP = 8L;
+    const long DEAD_OUTN = 16L;
+    const long DEAD_ACCEPT = 24L;
+    const long DEAD_NEXT = 32L;
+    const ulong DEAD_SIZE = 40UL;
+
+    internal static nint s_shardArr = (nint)0; // 256 * 96 bytes
+    static int s_shardPrimed = 0;
+    static nint s_slots = (nint)0;
+    static int s_slotsCap = 0;
+    internal static int s_deadCount = 0;
+
+#if ZAN_CO_DRIVER
+    static int s_initMxReady = 0;
+    static IoBuf64 s_initMx;
+
+    static void InitLock() {
+        int st = Atomic.Load(ref s_initMxReady, MemoryOrder.Acquire);
+        if (st != 2) {
+            if (Atomic.CompareExchange(ref s_initMxReady, 0, 1, MemoryOrder.AcqRel, MemoryOrder.Acquire) == 0) {
+                IoPlat.PosixMutexInit(NativeMemory.AddressOf(ref s_initMx), (nint)0);
+                Atomic.Store(ref s_initMxReady, 2, MemoryOrder.Release);
+            } else {
+                while (Atomic.Load(ref s_initMxReady, MemoryOrder.Acquire) != 2) IoPlat.YieldCpu();
+            }
+        }
+        IoPlat.PosixMutexLock(NativeMemory.AddressOf(ref s_initMx));
+    }
+
+    static void InitUnlock() {
+        IoPlat.PosixMutexUnlock(NativeMemory.AddressOf(ref s_initMx));
+    }
+
+    internal static void ShardLock(nint sh) { IoPlat.PosixMutexLock(sh + (nint)SH_MX); }
+    internal static void ShardUnlock(nint sh) { IoPlat.PosixMutexUnlock(sh + (nint)SH_MX); }
+
+    static int ShardIndexOfFd(nint fd) {
+        int n = ShardCount();
+        if (n <= 1 || (long)fd <= 0L) return 0;
+        return IoPlat.ShardHash((ulong)fd, n);
+    }
+
+    internal static int ThreadShard() {
+        return IoSched.ThreadShardIndex();
+    }
+#else
+    static void InitLock() {}
+    static void InitUnlock() {}
+    internal static void ShardLock(nint sh) { _ = sh; }
+    internal static void ShardUnlock(nint sh) { _ = sh; }
+    static int ShardIndexOfFd(nint fd) { _ = fd; return 0; }
+    internal static int ThreadShard() { return 0; }
+#endif
+
+    internal static nint ShardAt(int i) {
+        return s_shardArr + (nint)((long)i * (long)SH_SIZE);
+    }
+
+    internal static nint ShardOfFd(nint fd) {
+        return ShardAt(ShardIndexOfFd(fd));
+    }
+
+    static void FdCloexec(int fd) {
+        if (fd < 0) return;
+        int flags = IoPlat.PosixFcntl2(fd, IoConst.F_GETFD);
+        if (flags >= 0) IoPlat.PosixFcntl3(fd, IoConst.F_SETFD, flags | IoConst.FD_CLOEXEC);
+    }
+
+#if MACOS
+    static void FdNonblockCloexec(int fd) {
+        if (fd < 0) return;
+        FdCloexec(fd);
+        int fl = IoPlat.PosixFcntl2(fd, IoConst.F_GETFL);
+        if (fl >= 0) IoPlat.PosixFcntl3(fd, IoConst.F_SETFL, fl | IoConst.O_NONBLOCK);
+    }
+
+    static void KeventSet(int kq, int fd, short filter, ushort flags) {
+        IoBuf32 kev = new IoBuf32();
+        nint kp = NativeMemory.AddressOf(ref kev);
+        NativeMemory.AsRef<ulong>(kp) = (ulong)fd;
+        NativeMemory.AsRef<short>(kp + (nint)8) = filter;
+        NativeMemory.AsRef<ushort>(kp + (nint)10) = flags;
+        IoPlat.MacKevent(kq, kp, 1, (nint)0, 0, (nint)0);
+    }
+
+    static void KeventDeleteFd(int kq, int fd) {
+        if (kq < 0 || fd < 0) return;
+        KeventSet(kq, fd, IoConst.EVFILT_READ, IoConst.EV_DELETE);
+        KeventSet(kq, fd, IoConst.EVFILT_WRITE, IoConst.EV_DELETE);
+    }
+#endif
+
+    static void PrimeShards() {
+        if (s_shardPrimed != 0) return;
+        if (s_shardArr == (nint)0) {
+            s_shardArr = IoPlat.CCalloc((ulong)IoConst.ZAN_IO_MAXSHARD, SH_SIZE);
+            if (s_shardArr == (nint)0) return;
+#if ZAN_CO_DRIVER
+            for (int i = 0; i < IoConst.ZAN_IO_MAXSHARD; i++) {
+                IoPlat.PosixMutexInit(ShardAt(i) + (nint)SH_MX, (nint)0);
+            }
+#endif
+        }
+        for (int i = 0; i < IoConst.ZAN_IO_MAXSHARD; i++) {
+            nint sh = ShardAt(i);
+            NativeMemory.AsRef<int>((sh) + (nint)(SH_POLLFD)) = -1;
+            NativeMemory.AsRef<int>((sh) + (nint)(SH_WAKER)) = -1;
+            NativeMemory.AsRef<int>((sh) + (nint)(SH_WAKEW)) = -1;
+        }
+        s_shardPrimed = 1;
+    }
+
+    static bool ShardOpen(int i) {
+        PrimeShards();
+        if (s_shardArr == (nint)0) return false;
+        nint sh = ShardAt(i);
+        if (NativeMemory.AsRef<int>((sh) + (nint)(SH_POLLFD)) >= 0) return true;
+#if MACOS
+        int pfd = IoPlat.MacKqueue();
+        if (pfd < 0) return false;
+        FdCloexec(pfd);
+        NativeMemory.AsRef<int>((sh) + (nint)(SH_POLLFD)) = pfd;
+        IoBuf16 wpipe = new IoBuf16();
+        nint wp = NativeMemory.AddressOf(ref wpipe);
+        if (IoPlat.PosixPipe(wp) == 0) {
+            int rfd = NativeMemory.AsRef<int>(wp);
+            int wfd = NativeMemory.AsRef<int>(wp + (nint)4);
+            FdNonblockCloexec(rfd);
+            FdNonblockCloexec(wfd);
+            NativeMemory.AsRef<int>((sh) + (nint)(SH_WAKER)) = rfd;
+            NativeMemory.AsRef<int>((sh) + (nint)(SH_WAKEW)) = wfd;
+            KeventSet(pfd, rfd, IoConst.EVFILT_READ, IoConst.EV_ADD);
+        }
+        if (i == 0) {
+            IoBuf16 dpipe = new IoBuf16();
+            nint dp = NativeMemory.AddressOf(ref dpipe);
+            if (IoPlat.PosixPipe(dp) == 0) {
+                int drfd = NativeMemory.AsRef<int>(dp);
+                int dwfd = NativeMemory.AsRef<int>(dp + (nint)4);
+                FdNonblockCloexec(drfd);
+                FdNonblockCloexec(dwfd);
+                IoDns.s_dnsWakeFd = drfd;
+                IoDns.s_dnsWakeWfd = dwfd;
+                KeventSet(pfd, drfd, IoConst.EVFILT_READ, IoConst.EV_ADD);
+            }
+        }
+        return true;
+#else
+        int pfd = IoPlat.PosixEpollCreate1(IoConst.EPOLL_CLOEXEC);
+        if (pfd < 0) return false;
+        FdCloexec(pfd);
+        NativeMemory.AsRef<int>((sh) + (nint)(SH_POLLFD)) = pfd;
+        int wfd = IoPlat.PosixEventfd(0U, IoConst.EFD_NONBLOCK | IoConst.EFD_CLOEXEC);
+        FdCloexec(wfd);
+        NativeMemory.AsRef<int>((sh) + (nint)(SH_WAKER)) = wfd;
+        NativeMemory.AsRef<int>((sh) + (nint)(SH_WAKEW)) = wfd;
+        if (wfd >= 0) {
+            IoBuf16 ev = new IoBuf16(); // packed 12B: uint events@0, int fd@4
+            nint evp = NativeMemory.AddressOf(ref ev);
+            NativeMemory.AsRef<uint>(evp) = IoConst.EPOLLIN;
+            NativeMemory.AsRef<int>((evp) + (nint)(4L)) = wfd;
+            IoPlat.PosixEpollCtl(pfd, IoConst.EPOLL_CTL_ADD, wfd, evp);
+        }
+        if (i == 0) {
+            int dfd = IoPlat.PosixEventfd(0U, IoConst.EFD_NONBLOCK | IoConst.EFD_CLOEXEC);
+            FdCloexec(dfd);
+            IoDns.s_dnsWakeFd = dfd;
+            if (dfd >= 0) {
+                IoBuf16 ev = new IoBuf16();
+                nint evp = NativeMemory.AddressOf(ref ev);
+                NativeMemory.AsRef<uint>(evp) = IoConst.EPOLLIN;
+                NativeMemory.AsRef<int>((evp) + (nint)(4L)) = dfd;
+                IoPlat.PosixEpollCtl(pfd, IoConst.EPOLL_CTL_ADD, dfd, evp);
+            }
+        }
+        return true;
+#endif
+    }
+
+#if ZAN_CO_DRIVER
+    internal static void ShardsStart(int n) {
+        PrimeShards();
+        int cfg = IoPlat.AsyncCfgIoShards();
+        if (cfg > 0 && cfg < n) n = cfg;
+        nint e = IoPlat.CGetEnv((nint)"ZAN_IO_SHARDS");
+        if (e != (nint)0 && NativeMemory.AsRef<byte>(e) != 0) {
+            int v = IoPlat.CAtoi(e);
+            if (v > 0 && v < n) n = v;
+        }
+        if (n > IoConst.ZAN_IO_MAXSHARD) n = IoConst.ZAN_IO_MAXSHARD;
+        for (int i = 1; i < n; i++) {
+            if (NativeMemory.AsRef<int>((ShardAt(i)) + (nint)(SH_POLLFD)) < 0 && !ShardOpen(i)) {
+                n = i;
+                break;
+            }
+        }
+        if (n < 1) n = 1;
+        Atomic.Store(ref s_shards, n, MemoryOrder.Release);
+    }
+
+    internal static void ShardsStop() {}
+#endif
+
+    static nint GetSlot(int fd) {
+        int cap = Atomic.Load(ref s_slotsCap, MemoryOrder.Acquire);
+        if (fd < 0 || fd >= cap) return (nint)0;
+        nint slots = Atomic.Load(ref s_slots, MemoryOrder.Acquire);
+        return slots != (nint)0 ? slots + (nint)((long)fd * (long)SL_SIZE) : (nint)0;
+    }
+
+    static bool SlotsEnsure(int need) {
+        if (need <= Atomic.Load(ref s_slotsCap, MemoryOrder.Acquire)) return true;
+        int n = ShardCount();
+        for (int i = 0; i < n; i++) ShardLock(ShardAt(i));
+        int curCap = Atomic.Load(ref s_slotsCap, MemoryOrder.Relaxed);
+        if (need <= curCap) {
+            for (int i = n - 1; i >= 0; i--) ShardUnlock(ShardAt(i));
+            return true;
+        }
+        int cap = curCap > 0 ? curCap : 256;
+        while (cap > 0 && cap < need) {
+            cap = cap <= 0x3FFFFFFF ? cap * 2 : 0;
+        }
+        if (cap <= 0) {
+            for (int i = n - 1; i >= 0; i--) ShardUnlock(ShardAt(i));
+            return false;
+        }
+        nint oldSlots = Atomic.Load(ref s_slots, MemoryOrder.Relaxed);
+        nint ns = IoPlat.CRealloc(oldSlots, (ulong)cap * SL_SIZE);
+        bool ok = ns != (nint)0;
+        if (ok) {
+            IoPlat.CMemset(ns + (nint)((long)curCap * (long)SL_SIZE), 0, (ulong)(cap - curCap) * SL_SIZE);
+            Atomic.Store(ref s_slots, ns, MemoryOrder.Release);
+            Atomic.Store(ref s_slotsCap, cap, MemoryOrder.Release);
+        }
+        for (int i = n - 1; i >= 0; i--) ShardUnlock(ShardAt(i));
+        return ok;
+    }
+
+    static void RtoDrop(nint sh, nint frame) {
+        nint prev = (nint)0;
+        nint cur = NativeMemory.AsRef<nint>((sh) + (nint)(SH_RTO));
+        while (cur != (nint)0) {
+            nint next = NativeMemory.AsRef<nint>((cur) + (nint)(RTO_NEXT));
+            if (NativeMemory.AsRef<nint>((cur) + (nint)(RTO_FRAME)) == frame) {
+                if (prev != (nint)0) NativeMemory.AsRef<nint>((prev) + (nint)(RTO_NEXT)) = next;
+                else NativeMemory.AsRef<nint>((sh) + (nint)(SH_RTO)) = next;
+                IoPlat.CFree(cur);
+                return;
+            }
+            prev = cur;
+            cur = next;
+        }
+    }
+
+    static void RtoArm(nint sh, int fd, nint frame, nint step, nint outN, long timeoutMs) {
+        nint e = IoPlat.CCalloc(1UL, RTO_SIZE);
+        if (e == (nint)0) return;
+        NativeMemory.AsRef<int>((e) + (nint)(RTO_FD)) = fd;
+        NativeMemory.AsRef<nint>((e) + (nint)(RTO_FRAME)) = frame;
+        NativeMemory.AsRef<nint>((e) + (nint)(RTO_STEP)) = step;
+        NativeMemory.AsRef<nint>((e) + (nint)(RTO_OUTN)) = outN;
+        NativeMemory.AsRef<long>((e) + (nint)(RTO_DUE)) = IoPlat.NowMs() + (timeoutMs > 0L ? timeoutMs : 0L);
+        NativeMemory.AsRef<nint>((e) + (nint)(RTO_NEXT)) = NativeMemory.AsRef<nint>((sh) + (nint)(SH_RTO));
+        NativeMemory.AsRef<nint>((sh) + (nint)(SH_RTO)) = e;
+    }
+
+    static void MarkDead(nint sh, nint co, nint step, nint outN, nint outAccept) {
+        RtoDrop(sh, co);
+        nint d = IoPlat.CCalloc(1UL, DEAD_SIZE);
+        if (d == (nint)0) return;
+        NativeMemory.AsRef<nint>((d) + (nint)(DEAD_CO)) = co;
+        NativeMemory.AsRef<nint>((d) + (nint)(DEAD_STEP)) = step;
+        NativeMemory.AsRef<nint>((d) + (nint)(DEAD_OUTN)) = outN;
+        NativeMemory.AsRef<nint>((d) + (nint)(DEAD_ACCEPT)) = outAccept;
+        NativeMemory.AsRef<nint>((d) + (nint)(DEAD_NEXT)) = NativeMemory.AsRef<nint>((sh) + (nint)(SH_DEAD));
+        NativeMemory.AsRef<nint>((sh) + (nint)(SH_DEAD)) = d;
+        Atomic.FetchAdd(ref s_deadCount, 1, MemoryOrder.AcqRel);
+    }
+
+    static int FlushDead(nint sh) {
+        int woke = 0;
+        while (NativeMemory.AsRef<nint>((sh) + (nint)(SH_DEAD)) != (nint)0) {
+            nint d = NativeMemory.AsRef<nint>((sh) + (nint)(SH_DEAD));
+            NativeMemory.AsRef<nint>((sh) + (nint)(SH_DEAD)) = NativeMemory.AsRef<nint>((d) + (nint)(DEAD_NEXT));
+            nint acc = NativeMemory.AsRef<nint>((d) + (nint)(DEAD_ACCEPT));
+            nint outN = NativeMemory.AsRef<nint>((d) + (nint)(DEAD_OUTN));
+            if (acc != (nint)0) NativeMemory.AsRef<nint>(acc) = (nint)(-1L);
+            else if (outN != (nint)0) NativeMemory.AsRef<long>(outN) = 0L;
+            IoPlat.WakeCo(NativeMemory.AsRef<nint>((d) + (nint)(DEAD_CO)), NativeMemory.AsRef<nint>((d) + (nint)(DEAD_STEP)));
+            IoPlat.CFree(d);
+            Atomic.FetchAdd(ref s_deadCount, -1, MemoryOrder.AcqRel);
+            woke++;
+        }
+        return woke;
+    }
+
+    static void ClearDead(nint sh) {
+        while (NativeMemory.AsRef<nint>((sh) + (nint)(SH_DEAD)) != (nint)0) {
+            nint d = NativeMemory.AsRef<nint>((sh) + (nint)(SH_DEAD));
+            NativeMemory.AsRef<nint>((sh) + (nint)(SH_DEAD)) = NativeMemory.AsRef<nint>((d) + (nint)(DEAD_NEXT));
+            Atomic.FetchAdd(ref s_deadCount, -1, MemoryOrder.AcqRel);
+            IoPlat.CFree(d);
+        }
+    }
+
+    static void UnlinkWaiter(nint s, bool readDir, nint w) {
+        long hasOff = readDir ? SL_HAS_R : SL_HAS_W;
+        nint inl = s + (nint)(readDir ? SL_R : SL_W);
+        if (w == inl) {
+            nint rest = NativeMemory.AsRef<nint>((inl) + (nint)(WT_NEXT));
+            if (rest != (nint)0) {
+                IoPlat.CMemcpy(inl, rest, WT_SIZE);
+                IoPlat.CFree(rest);
+            } else {
+                NativeMemory.AsRef<nint>((inl) + (nint)(WT_NEXT)) = (nint)0;
+                NativeMemory.AsRef<byte>((s) + (nint)(hasOff)) = 0;
+            }
+            return;
+        }
+        nint p = inl;
+        while (p != (nint)0 && NativeMemory.AsRef<nint>((p) + (nint)(WT_NEXT)) != w) {
+            p = NativeMemory.AsRef<nint>((p) + (nint)(WT_NEXT));
+        }
+        if (p == (nint)0) return;
+        NativeMemory.AsRef<nint>((p) + (nint)(WT_NEXT)) = NativeMemory.AsRef<nint>((w) + (nint)(WT_NEXT));
+        IoPlat.CFree(w);
+    }
+
+    static nint FindReadWaiter(nint s, nint co) {
+        if (NativeMemory.AsRef<byte>((s) + (nint)(SL_HAS_R)) == 0) return (nint)0;
+        nint inl = s + (nint)SL_R;
+        if (NativeMemory.AsRef<nint>((inl) + (nint)(WT_CO)) == co) return inl;
+        for (nint x = NativeMemory.AsRef<nint>((inl) + (nint)(WT_NEXT)); x != (nint)0; x = NativeMemory.AsRef<nint>((x) + (nint)(WT_NEXT))) {
+            if (NativeMemory.AsRef<nint>((x) + (nint)(WT_CO)) == co) return x;
+        }
+        return (nint)0;
+    }
+
+    static int TakeWaiters(nint s, int fd, bool readDir, nint outBuf, int max) {
+        long hasOff = readDir ? SL_HAS_R : SL_HAS_W;
+        if (NativeMemory.AsRef<byte>((s) + (nint)(hasOff)) == 0 || max <= 0) return 0;
+        nint inl = s + (nint)(readDir ? SL_R : SL_W);
+        int n = 0;
+        IoPlat.CMemcpy(outBuf, inl, WT_SIZE);
+        n++;
+        nint x = NativeMemory.AsRef<nint>((inl) + (nint)(WT_NEXT));
+        while (x != (nint)0 && n < max) {
+            nint nx = NativeMemory.AsRef<nint>((x) + (nint)(WT_NEXT));
+            IoPlat.CMemcpy(outBuf + (nint)((long)n * (long)WT_SIZE), x, WT_SIZE);
+            IoPlat.CFree(x);
+            n++;
+            x = nx;
+        }
+        if (x != (nint)0) {
+            IoPlat.CMemcpy(inl, x, WT_SIZE);
+            IoPlat.CFree(x);
+        } else {
+            NativeMemory.AsRef<nint>((inl) + (nint)(WT_NEXT)) = (nint)0;
+            NativeMemory.AsRef<byte>((s) + (nint)(hasOff)) = 0;
+        }
+        nint sh = ShardOfFd((nint)fd);
+        if (NativeMemory.AsRef<nint>((sh) + (nint)(SH_RTO)) != (nint)0) {
+            for (int i = 0; i < n; i++) {
+                RtoDrop(sh, NativeMemory.AsRef<nint>((outBuf + (nint)((long)i * (long)WT_SIZE)) + (nint)(WT_CO)));
+            }
+        }
+        return n;
+    }
+
+    static bool DeliverWaiter(int fd, nint w) {
+        nint outAcc = NativeMemory.AsRef<nint>((w) + (nint)(WT_ACCEPT));
+        if (outAcc != (nint)0) {
+#if MACOS
+            int cfd = IoPlat.SockAccept(fd, (nint)0, (nint)0);
+            if (cfd >= 0) {
+                FdNonblockCloexec(cfd);
+                int one = 1;
+                IoPlat.SockSetOpt(cfd, IoConst.SOL_SOCKET, IoConst.SO_NOSIGPIPE, NativeMemory.AddressOf(ref one), 4U);
+            }
+#else
+            int cfd = IoPlat.SockAccept4(fd, (nint)0, (nint)0, IoConst.SOCK_NONBLOCK | IoConst.SOCK_CLOEXEC);
+#endif
+            NativeMemory.AsRef<nint>(outAcc) = (nint)cfd;
+            return true;
+        }
+        nint outN = NativeMemory.AsRef<nint>((w) + (nint)(WT_OUTN));
+        if (outN == (nint)0) return true;
+        nint rbuf = NativeMemory.AsRef<nint>((w) + (nint)(WT_RBUF));
+        int rlen = NativeMemory.AsRef<int>((w) + (nint)(WT_RLEN));
+        if (rbuf == (nint)0 || rlen <= 0) {
+            NativeMemory.AsRef<long>(outN) = 0L;
+            return true;
+        }
+        long rn = 0L;
+        for (;;) {
+            rn = IoPlat.SockRecv(fd, rbuf, (ulong)rlen, IoConst.MSG_DONTWAIT);
+            if (rn >= 0L || IoPlat.GetErrno() != IoConst.EINTR) break;
+        }
+        if (rn < 0L) {
+            int e = IoPlat.GetErrno();
+            if (e == IoConst.EAGAIN || e == IoConst.EWOULDBLOCK) return false;
+        }
+        NativeMemory.AsRef<long>(outN) = rn < 0L ? 0L : rn;
+        return true;
+    }
+
+    static int FailSlotWaiters(int fd, nint s) {
+        nint sh = ShardOfFd((nint)fd);
+        int failed = 0;
+        for (int dir = 0; dir < 2; dir++) {
+            bool isR = dir != 0;
+            long hasOff = isR ? SL_HAS_R : SL_HAS_W;
+            if (NativeMemory.AsRef<byte>((s) + (nint)(hasOff)) == 0) continue;
+            nint inl = s + (nint)(isR ? SL_R : SL_W);
+            MarkDead(sh, NativeMemory.AsRef<nint>((inl) + (nint)(WT_CO)), NativeMemory.AsRef<nint>((inl) + (nint)(WT_STEP)),
+                     NativeMemory.AsRef<nint>((inl) + (nint)(WT_OUTN)), NativeMemory.AsRef<nint>((inl) + (nint)(WT_ACCEPT)));
+            failed++;
+            nint x = NativeMemory.AsRef<nint>((inl) + (nint)(WT_NEXT));
+            while (x != (nint)0) {
+                nint nx = NativeMemory.AsRef<nint>((x) + (nint)(WT_NEXT));
+                MarkDead(sh, NativeMemory.AsRef<nint>((x) + (nint)(WT_CO)), NativeMemory.AsRef<nint>((x) + (nint)(WT_STEP)),
+                         NativeMemory.AsRef<nint>((x) + (nint)(WT_OUTN)), NativeMemory.AsRef<nint>((x) + (nint)(WT_ACCEPT)));
+                IoPlat.CFree(x);
+                failed++;
+                x = nx;
+            }
+            NativeMemory.AsRef<nint>((inl) + (nint)(WT_NEXT)) = (nint)0;
+            NativeMemory.AsRef<byte>((s) + (nint)(hasOff)) = 0;
+        }
+        if (failed > 0) Atomic.FetchAdd(ref s_ioCount, -failed, MemoryOrder.AcqRel);
+        return failed;
+    }
+
+    static bool ArmSlot(int fd, nint s) {
+        nint sh = ShardOfFd((nint)fd);
+        int pfd = NativeMemory.AsRef<int>((sh) + (nint)(SH_POLLFD));
+#if MACOS
+        IoBuf64 chg = new IoBuf64(); // up to 2 * 32B struct kevent
+        nint cp = NativeMemory.AddressOf(ref chg);
+        int nc = 0;
+        if (NativeMemory.AsRef<byte>((s) + (nint)(SL_HAS_R)) != 0) {
+            nint e = cp + (nint)((long)nc * IoConst.KEVENT_SIZE);
+            NativeMemory.AsRef<ulong>(e) = (ulong)fd;
+            NativeMemory.AsRef<short>(e + (nint)8) = IoConst.EVFILT_READ;
+            NativeMemory.AsRef<ushort>(e + (nint)10) = (ushort)(IoConst.EV_ADD | IoConst.EV_ONESHOT);
+            nc++;
+        }
+        if (NativeMemory.AsRef<byte>((s) + (nint)(SL_HAS_W)) != 0) {
+            nint e = cp + (nint)((long)nc * IoConst.KEVENT_SIZE);
+            NativeMemory.AsRef<ulong>(e) = (ulong)fd;
+            NativeMemory.AsRef<short>(e + (nint)8) = IoConst.EVFILT_WRITE;
+            NativeMemory.AsRef<ushort>(e + (nint)10) = (ushort)(IoConst.EV_ADD | IoConst.EV_ONESHOT);
+            nc++;
+        }
+        if (nc == 0) return true;
+        for (int attempt = 0; attempt < 8; attempt++) {
+            if (IoPlat.MacKevent(pfd, cp, nc, (nint)0, 0, (nint)0) >= 0) {
+                NativeMemory.AsRef<byte>((s) + (nint)(SL_INEP)) = 1;
+                return true;
+            }
+            if (IoPlat.GetErrno() == IoConst.EINTR) continue;
+            return false;
+        }
+        return false;
+#else
+        IoBuf16 ev = new IoBuf16();
+        nint evp = NativeMemory.AddressOf(ref ev);
+        uint mask = IoConst.EPOLLONESHOT;
+        if (NativeMemory.AsRef<byte>((s) + (nint)(SL_HAS_R)) != 0) mask |= IoConst.EPOLLIN;
+        if (NativeMemory.AsRef<byte>((s) + (nint)(SL_HAS_W)) != 0) mask |= IoConst.EPOLLOUT;
+        NativeMemory.AsRef<uint>(evp) = mask;
+        NativeMemory.AsRef<int>((evp) + (nint)(4L)) = fd;
+        for (int attempt = 0; attempt < 8; attempt++) {
+            if (NativeMemory.AsRef<byte>((s) + (nint)(SL_INEP)) == 0) {
+                if (IoPlat.PosixEpollCtl(pfd, IoConst.EPOLL_CTL_ADD, fd, evp) == 0) {
+                    NativeMemory.AsRef<byte>((s) + (nint)(SL_INEP)) = 1;
+                    return true;
+                }
+                int e = IoPlat.GetErrno();
+                if (e == IoConst.EINTR) continue;
+                if (e == IoConst.EEXIST) {
+                    NativeMemory.AsRef<byte>((s) + (nint)(SL_INEP)) = 1;
+                    continue;
+                }
+                return false;
+            }
+            if (IoPlat.PosixEpollCtl(pfd, IoConst.EPOLL_CTL_MOD, fd, evp) == 0) return true;
+            int e2 = IoPlat.GetErrno();
+            if (e2 == IoConst.EINTR) continue;
+            if (e2 == IoConst.ENOENT) {
+                NativeMemory.AsRef<byte>((s) + (nint)(SL_INEP)) = 0;
+                continue;
+            }
+            return false;
+        }
+        return false;
+#endif
+    }
+
+    static void RegisterLocked(nint fd, int interest, nint co, nint step, nint rbuf, int rlen, nint outN, nint outAcc) {
+        nint sh = ShardOfFd(fd);
+        if (s_broken != 0 || IoPlat.SocketAlive(fd) == 0) {
+            MarkDead(sh, co, step, outN, outAcc);
+            return;
+        }
+        int ifd = (int)fd;
+        if (ifd >= Atomic.Load(ref s_slotsCap, MemoryOrder.Acquire)) {
+            ShardUnlock(sh);
+            bool ok = SlotsEnsure(ifd + 1);
+            ShardLock(sh);
+            if (!ok) {
+                MarkDead(sh, co, step, outN, outAcc);
+                return;
+            }
+        }
+        nint s = GetSlot(ifd);
+        if (s == (nint)0) {
+            MarkDead(sh, co, step, outN, outAcc);
+            return;
+        }
+        bool isR = interest == IoConst.ZAN_IO_READ;
+        long hasOff = isR ? SL_HAS_R : SL_HAS_W;
+        nint inl = s + (nint)(isR ? SL_R : SL_W);
+        nint w = (nint)0;
+        if (NativeMemory.AsRef<byte>((s) + (nint)(hasOff)) == 0) {
+            w = inl;
+            NativeMemory.AsRef<nint>((w) + (nint)(WT_NEXT)) = (nint)0;
+            NativeMemory.AsRef<byte>((s) + (nint)(hasOff)) = 1;
+        } else {
+            w = IoPlat.CCalloc(1UL, WT_SIZE);
+            if (w == (nint)0) {
+                MarkDead(sh, co, step, outN, outAcc);
+                return;
+            }
+            nint tail = inl;
+            while (NativeMemory.AsRef<nint>((tail) + (nint)(WT_NEXT)) != (nint)0) {
+                tail = NativeMemory.AsRef<nint>((tail) + (nint)(WT_NEXT));
+            }
+            NativeMemory.AsRef<nint>((tail) + (nint)(WT_NEXT)) = w;
+        }
+        NativeMemory.AsRef<nint>((w) + (nint)(WT_CO)) = co;
+        NativeMemory.AsRef<nint>((w) + (nint)(WT_STEP)) = step;
+        NativeMemory.AsRef<nint>((w) + (nint)(WT_RBUF)) = rbuf;
+        NativeMemory.AsRef<int>((w) + (nint)(WT_RLEN)) = rlen;
+        NativeMemory.AsRef<nint>((w) + (nint)(WT_OUTN)) = outN;
+        NativeMemory.AsRef<nint>((w) + (nint)(WT_ACCEPT)) = outAcc;
+        Atomic.FetchAdd(ref s_ioCount, 1, MemoryOrder.AcqRel);
+
+        if (!ArmSlot(ifd, s)) {
+            UnlinkWaiter(s, isR, w);
+            MarkDead(sh, co, step, outN, outAcc);
+            Atomic.FetchAdd(ref s_ioCount, -1, MemoryOrder.AcqRel);
+        }
+    }
+
+    internal static int RtoTimeoutScan(nint sh) {
+        if (NativeMemory.AsRef<nint>((sh) + (nint)(SH_RTO)) == (nint)0) return 0;
+        int woke = 0;
+        long now = IoPlat.NowMs();
+        nint prev = (nint)0;
+        nint cur = NativeMemory.AsRef<nint>((sh) + (nint)(SH_RTO));
+        while (cur != (nint)0) {
+            nint next = NativeMemory.AsRef<nint>((cur) + (nint)(RTO_NEXT));
+            if (NativeMemory.AsRef<long>((cur) + (nint)(RTO_DUE)) > now) {
+                prev = cur;
+                cur = next;
+                continue;
+            }
+            if (prev != (nint)0) NativeMemory.AsRef<nint>((prev) + (nint)(RTO_NEXT)) = next;
+            else NativeMemory.AsRef<nint>((sh) + (nint)(SH_RTO)) = next;
+
+            int fd = NativeMemory.AsRef<int>((cur) + (nint)(RTO_FD));
+            nint frame = NativeMemory.AsRef<nint>((cur) + (nint)(RTO_FRAME));
+            nint step = NativeMemory.AsRef<nint>((cur) + (nint)(RTO_STEP));
+            nint outN = NativeMemory.AsRef<nint>((cur) + (nint)(RTO_OUTN));
+            nint s = GetSlot(fd);
+            nint w = s != (nint)0 ? FindReadWaiter(s, frame) : (nint)0;
+            if (w != (nint)0) {
+                UnlinkWaiter(s, true, w);
+                if (NativeMemory.AsRef<byte>((s) + (nint)(SL_HAS_R)) != 0 || NativeMemory.AsRef<byte>((s) + (nint)(SL_HAS_W)) != 0) {
+                    if (!ArmSlot(fd, s)) FailSlotWaiters(fd, s);
+                }
+                if (outN != (nint)0) NativeMemory.AsRef<long>(outN) = -1L;
+                IoPlat.WakeCo(frame, step);
+                Atomic.FetchAdd(ref s_ioCount, -1, MemoryOrder.AcqRel);
+                woke++;
+            }
+            IoPlat.CFree(cur);
+            cur = next;
+        }
+        return woke;
+    }
+
+    static int SweepSlots(int idx) {
+        int woke = 0;
+        int cap = Atomic.Load(ref s_slotsCap, MemoryOrder.Acquire);
+        nint slots = Atomic.Load(ref s_slots, MemoryOrder.Acquire);
+        if (slots == (nint)0) return 0;
+        IoBuf1024 readyBuf = new IoBuf1024(); // 16 * 56 = 896 bytes
+        nint rbp = NativeMemory.AddressOf(ref readyBuf);
+        for (int fd = 0; fd < cap; fd++) {
+            if (ShardIndexOfFd((nint)fd) != idx) continue;
+            nint s = slots + (nint)((long)fd * (long)SL_SIZE);
+            if (NativeMemory.AsRef<byte>((s) + (nint)(SL_HAS_R)) == 0 && NativeMemory.AsRef<byte>((s) + (nint)(SL_HAS_W)) == 0) continue;
+            if (IoPlat.SocketAlive((nint)fd) != 0) continue;
+            NativeMemory.AsRef<byte>((s) + (nint)(SL_INEP)) = 0;
+            for (;;) {
+                int nr = TakeWaiters(s, fd, true, rbp, 16);
+                nr += TakeWaiters(s, fd, false, rbp + (nint)((long)nr * (long)WT_SIZE), 16 - nr);
+                if (nr == 0) break;
+                for (int k = 0; k < nr; k++) {
+                    nint item = rbp + (nint)((long)k * (long)WT_SIZE);
+                    nint acc = NativeMemory.AsRef<nint>((item) + (nint)(WT_ACCEPT));
+                    nint outN = NativeMemory.AsRef<nint>((item) + (nint)(WT_OUTN));
+                    if (acc != (nint)0) NativeMemory.AsRef<nint>(acc) = (nint)(-1L);
+                    else if (outN != (nint)0) NativeMemory.AsRef<long>(outN) = 0L;
+                    IoPlat.WakeCo(NativeMemory.AsRef<nint>((item) + (nint)(WT_CO)), NativeMemory.AsRef<nint>((item) + (nint)(WT_STEP)));
+                    Atomic.FetchAdd(ref s_ioCount, -1, MemoryOrder.AcqRel);
+                    woke++;
+                }
+            }
+        }
+        return woke;
+    }
+
+    [Export("zan_io_init")]
+    public static void IoInit() {
+        if (Atomic.Load(ref s_started, MemoryOrder.Acquire) != 0) return;
+        InitLock();
+        if (Atomic.Load(ref s_started, MemoryOrder.Acquire) == 0) {
+            PrimeShards();
+            IoPlat.PosixSignal(IoConst.SIGPIPE, (nint)1); // SIG_IGN
+            s_broken = 0;
+            Atomic.Store(ref s_ioCount, 0, MemoryOrder.Release);
+            if (!ShardOpen(0)) s_broken = 1;
+            Atomic.Store(ref s_started, 1, MemoryOrder.Release);
+        }
+        InitUnlock();
+    }
+
+    [Export("zan_io_shutdown")]
+    public static void IoShutdown() {
+        if (s_shardArr == (nint)0) return;
+        int n = ShardCount();
+        for (int i = 0; i < n; i++) ShardLock(ShardAt(i));
+
+        int cap = Atomic.Load(ref s_slotsCap, MemoryOrder.Relaxed);
+        nint slots = Atomic.Load(ref s_slots, MemoryOrder.Relaxed);
+        if (slots != (nint)0) {
+            for (int fd = 0; fd < cap; fd++) {
+                nint s = slots + (nint)((long)fd * (long)SL_SIZE);
+                if (NativeMemory.AsRef<byte>((s) + (nint)(SL_INEP)) != 0) {
+                    int pfd = NativeMemory.AsRef<int>((ShardOfFd((nint)fd)) + (nint)(SH_POLLFD));
+#if MACOS
+                    if (pfd >= 0) KeventDeleteFd(pfd, fd);
+#else
+                    if (pfd >= 0) IoPlat.PosixEpollCtl(pfd, IoConst.EPOLL_CTL_DEL, fd, (nint)0);
+#endif
+                }
+                nint x = NativeMemory.AsRef<nint>((s + (nint)SL_R) + (nint)(WT_NEXT));
+                while (x != (nint)0) {
+                    nint nx = NativeMemory.AsRef<nint>((x) + (nint)(WT_NEXT));
+                    IoPlat.CFree(x);
+                    x = nx;
+                }
+                x = NativeMemory.AsRef<nint>((s + (nint)SL_W) + (nint)(WT_NEXT));
+                while (x != (nint)0) {
+                    nint nx = NativeMemory.AsRef<nint>((x) + (nint)(WT_NEXT));
+                    IoPlat.CFree(x);
+                    x = nx;
+                }
+            }
+            IoPlat.CFree(slots);
+            Atomic.Store(ref s_slots, (nint)0, MemoryOrder.Release);
+            Atomic.Store(ref s_slotsCap, 0, MemoryOrder.Release);
+        }
+        Atomic.Store(ref s_ioCount, 0, MemoryOrder.Release);
+        for (int i = 0; i < n; i++) {
+            nint sh = ShardAt(i);
+            ClearDead(sh);
+            while (NativeMemory.AsRef<nint>((sh) + (nint)(SH_RTO)) != (nint)0) {
+                nint e = NativeMemory.AsRef<nint>((sh) + (nint)(SH_RTO));
+                NativeMemory.AsRef<nint>((sh) + (nint)(SH_RTO)) = NativeMemory.AsRef<nint>((e) + (nint)(RTO_NEXT));
+                IoPlat.CFree(e);
+            }
+        }
+        IoDns.ShutdownCleanup();
+        for (int i = 0; i < n; i++) {
+            nint sh = ShardAt(i);
+            int pfd = NativeMemory.AsRef<int>((sh) + (nint)(SH_POLLFD));
+            if (pfd >= 0) { IoPlat.PosixClose(pfd); NativeMemory.AsRef<int>((sh) + (nint)(SH_POLLFD)) = -1; }
+            int wfd = NativeMemory.AsRef<int>((sh) + (nint)(SH_WAKER));
+            int wwfd = NativeMemory.AsRef<int>((sh) + (nint)(SH_WAKEW));
+            if (wfd >= 0) { IoPlat.PosixClose(wfd); NativeMemory.AsRef<int>((sh) + (nint)(SH_WAKER)) = -1; }
+            if (wwfd >= 0 && wwfd != wfd) { IoPlat.PosixClose(wwfd); }
+            NativeMemory.AsRef<int>((sh) + (nint)(SH_WAKEW)) = -1;
+        }
+        if (IoDns.s_dnsWakeFd >= 0) {
+            IoPlat.PosixClose(IoDns.s_dnsWakeFd);
+            IoDns.s_dnsWakeFd = -1;
+        }
+#if MACOS
+        if (IoDns.s_dnsWakeWfd >= 0) {
+            IoPlat.PosixClose(IoDns.s_dnsWakeWfd);
+            IoDns.s_dnsWakeWfd = -1;
+        }
+#endif
+        Atomic.Store(ref s_started, 0, MemoryOrder.Release);
+        s_shardPrimed = 0;
+#if ZAN_CO_DRIVER
+        Atomic.Store(ref s_shards, 1, MemoryOrder.Release);
+#endif
+        s_shardsLive = 0;
+        for (int i = n - 1; i >= 0; i--) ShardUnlock(ShardAt(i));
+    }
+
+    [Export("zan_io_wait_co")]
+    public static void WaitCo(nint fd, int interest, nint frame, nint step) {
+        IoInit();
+        nint sh = ShardOfFd(fd);
+        ShardLock(sh);
+        RegisterLocked(fd, interest, frame, step, (nint)0, 0, (nint)0, (nint)0);
+        ShardUnlock(sh);
+    }
+
+    static bool TryFastRecv(nint fd, nint buf, int len, nint frame, nint step, nint outN) {
+        if ((long)fd < 0L || buf == (nint)0 || len <= 0 || outN == (nint)0) return false;
+        nint tls = IoPlat.GetTls(true);
+        if (tls == (nint)0) return false;
+        int budget = NativeMemory.AsRef<int>((tls) + (nint)(IoConst.TLS_FAST_BUDGET));
+        if (budget <= 0) return false;
+        long rn = IoPlat.SockRecv((int)fd, buf, (ulong)len, IoConst.MSG_DONTWAIT);
+        if (rn < 0L) {
+            int e = IoPlat.GetErrno();
+            if (e == IoConst.EAGAIN || e == IoConst.EWOULDBLOCK || e == IoConst.EINTR) return false;
+        }
+        NativeMemory.AsRef<int>((tls) + (nint)(IoConst.TLS_FAST_BUDGET)) = budget - 1;
+        NativeMemory.AsRef<long>(outN) = rn < 0L ? 0L : rn;
+        IoPlat.WakeCo(frame, step);
+        return true;
+    }
+
+    [Export("zan_io_recv_co")]
+    public static void RecvCo(nint fd, nint buf, int len, nint frame, nint step, nint outN) {
+        IoInit();
+        if (TryFastRecv(fd, buf, len, frame, step, outN)) return;
+        nint sh = ShardOfFd(fd);
+        ShardLock(sh);
+        RegisterLocked(fd, IoConst.ZAN_IO_READ, frame, step, buf, len, outN, (nint)0);
+        ShardUnlock(sh);
+    }
+
+    [Export("zan_io_recv_to_co")]
+    public static void RecvToCo(nint fd, nint buf, int len, long timeoutMs, nint frame, nint step, nint outN) {
+        IoInit();
+        if (TryFastRecv(fd, buf, len, frame, step, outN)) return;
+        nint sh = ShardOfFd(fd);
+        ShardLock(sh);
+        RtoArm(sh, (int)fd, frame, step, outN, timeoutMs);
+        RegisterLocked(fd, IoConst.ZAN_IO_READ, frame, step, buf, len, outN, (nint)0);
+        ShardUnlock(sh);
+    }
+
+    [Export("zan_io_accept_co")]
+    public static void AcceptCo(nint fd, nint frame, nint step, nint outFd) {
+        IoInit();
+        nint sh = ShardOfFd(fd);
+        ShardLock(sh);
+        RegisterLocked(fd, IoConst.ZAN_IO_READ, frame, step, (nint)0, 0, (nint)0, outFd);
+        ShardUnlock(sh);
+    }
+
+    internal static int PollShardEx(int shard, long timeoutMs, bool park) {
+        if (s_shardArr == (nint)0) return 0;
+        nint sh = ShardAt(shard);
+        ShardLock(sh);
+        if (NativeMemory.AsRef<nint>((sh) + (nint)(SH_DEAD)) != (nint)0) {
+            int wd = FlushDead(sh);
+            ShardUnlock(sh);
+            return wd;
+        }
+        if (NativeMemory.AsRef<nint>((sh) + (nint)(SH_RTO)) != (nint)0) {
+            int wr = RtoTimeoutScan(sh);
+            if (wr != 0) {
+                ShardUnlock(sh);
+                return wr;
+            }
+        }
+        bool empty = Atomic.Load(ref s_ioCount, MemoryOrder.Acquire) == 0 &&
+                     Atomic.Load(ref IoDns.s_inflight, MemoryOrder.Acquire) == 0;
+        int pfd = NativeMemory.AsRef<int>((sh) + (nint)(SH_POLLFD));
+        int waker = NativeMemory.AsRef<int>((sh) + (nint)(SH_WAKER));
+        ShardUnlock(sh);
+        if (empty && !park) return 0;
+        if (pfd < 0) return -1;
+
+        IoBuf4096 events = new IoBuf4096(); // 256 * 12 = 3072 bytes
+        nint evp = NativeMemory.AddressOf(ref events);
+        IoBuf512 readyLocal = new IoBuf512(); // 8 * 56 = 448 bytes
+        nint rlp = NativeMemory.AddressOf(ref readyLocal);
+#if ZAN_CO_DRIVER
+        IoBuf4096 readyBatch = new IoBuf4096(); // 256 * 16 = 4096 bytes
+        nint rbp = NativeMemory.AddressOf(ref readyBatch);
+#endif
+        for (;;) {
+            long wait = IoDns.WaitMs(timeoutMs);
+            bool capped = wait < 0L || (wait > ZAN_IO_SWEEP_MS && !(park && empty));
+            if (capped) wait = ZAN_IO_SWEEP_MS;
+            if (wait > 0x7FFFFFFFL) wait = 0x7FFFFFFFL;
+#if MACOS
+            IoBuf16 ts = new IoBuf16();
+            nint tsp = (nint)0;
+            if (wait >= 0L) {
+                tsp = NativeMemory.AddressOf(ref ts);
+                NativeMemory.AsRef<long>(tsp) = wait / 1000L;
+                NativeMemory.AsRef<long>(tsp + (nint)8) = (wait % 1000L) * 1000000L;
+            }
+            int n = IoPlat.MacKevent(pfd, (nint)0, 0, evp, 128, tsp);
+#else
+            int n = IoPlat.PosixEpollWait(pfd, evp, 256, (int)wait);
+#endif
+            ShardLock(sh);
+            if (n < 0) n = 0;
+            bool retryRead = false;
+            if (n != 0) {
+                int woke = 0;
+                bool interrupted = false;
+#if ZAN_CO_DRIVER
+                ulong readyCount = 0UL;
+#endif
+                int completedCount = 0;
+                int cap = Atomic.Load(ref s_slotsCap, MemoryOrder.Acquire);
+                nint slots = Atomic.Load(ref s_slots, MemoryOrder.Acquire);
+                for (int i = 0; i < n; i++) {
+#if MACOS
+                    long eoff = (long)i * IoConst.KEVENT_SIZE;
+                    int fd = (int)NativeMemory.AsRef<ulong>((evp) + (nint)(eoff));
+                    short kfilt = NativeMemory.AsRef<short>((evp) + (nint)(eoff + 8L));
+                    ushort kflg = NativeMemory.AsRef<ushort>((evp) + (nint)(eoff + 10L));
+                    if (fd == waker) {
+                        IoBuf64 tmp = new IoBuf64();
+                        nint tp = NativeMemory.AddressOf(ref tmp);
+                        while (IoPlat.PosixRead(waker, tp, 64UL) > 0L) {}
+                        interrupted = true;
+                        continue;
+                    }
+                    if (fd == IoDns.s_dnsWakeFd) {
+                        interrupted = true;
+                        IoDns.WakeRead();
+                        woke += IoDns.Drain();
+                        continue;
+                    }
+                    if (fd < 0 || fd >= cap || slots == (nint)0) continue;
+                    nint s = slots + (nint)((long)fd * (long)SL_SIZE);
+                    bool err = (kflg & (IoConst.EV_EOF | IoConst.EV_ERROR)) != (ushort)0;
+                    bool evRead = kfilt == IoConst.EVFILT_READ || err;
+                    bool evWrite = kfilt == IoConst.EVFILT_WRITE || err;
+#else
+                    long eoff = (long)i * 12L;
+                    uint ev = NativeMemory.AsRef<uint>((evp) + (nint)(eoff));
+                    int fd = NativeMemory.AsRef<int>((evp) + (nint)(eoff + 4L));
+                    if (fd == waker) {
+                        ulong tmp = 0UL;
+                        long rr = IoPlat.PosixRead(waker, NativeMemory.AddressOf(ref tmp), 8UL);
+                        _ = rr;
+                        interrupted = true;
+                        continue;
+                    }
+                    if (fd == IoDns.s_dnsWakeFd) {
+                        interrupted = true;
+                        IoDns.WakeRead();
+                        woke += IoDns.Drain();
+                        continue;
+                    }
+                    if (fd < 0 || fd >= cap || slots == (nint)0) continue;
+                    nint s = slots + (nint)((long)fd * (long)SL_SIZE);
+                    bool err = (ev & (IoConst.EPOLLERR | IoConst.EPOLLHUP)) != 0U;
+                    bool evRead = (ev & IoConst.EPOLLIN) != 0U || err;
+                    bool evWrite = (ev & IoConst.EPOLLOUT) != 0U || err;
+#endif
+                    int nr = 0;
+                    if (evRead) {
+                        while (NativeMemory.AsRef<byte>((s) + (nint)(SL_HAS_R)) != 0 && nr < 8) {
+                            nint rw = s + (nint)SL_R;
+                            if (!DeliverWaiter(fd, rw)) {
+                                retryRead = true;
+                                break;
+                            }
+                            IoPlat.CMemcpy(rlp + (nint)((long)nr * (long)WT_SIZE), rw, WT_SIZE);
+                            nr++;
+                            RtoDrop(sh, NativeMemory.AsRef<nint>((rw) + (nint)(WT_CO)));
+                            UnlinkWaiter(s, true, rw);
+                        }
+                    }
+                    if (evWrite) {
+                        nr += TakeWaiters(s, fd, false, rlp + (nint)((long)nr * (long)WT_SIZE), 8 - nr);
+                    }
+                    if (NativeMemory.AsRef<byte>((s) + (nint)(SL_HAS_R)) != 0 || NativeMemory.AsRef<byte>((s) + (nint)(SL_HAS_W)) != 0) {
+                        if (!ArmSlot(fd, s)) FailSlotWaiters(fd, s);
+                    }
+                    for (int k = 0; k < nr; k++) {
+                        nint item = rlp + (nint)((long)k * (long)WT_SIZE);
+                        nint co = NativeMemory.AsRef<nint>((item) + (nint)(WT_CO));
+                        nint step = NativeMemory.AsRef<nint>((item) + (nint)(WT_STEP));
+                        completedCount++;
+#if ZAN_CO_DRIVER
+                        if (co != (nint)0 && step != (nint)0 && readyCount < 256UL) {
+                            NativeMemory.AsRef<nint>((rbp) + (nint)((long)readyCount * 16L)) = co;
+                            NativeMemory.AsRef<nint>((rbp) + (nint)((long)readyCount * 16L + 8L)) = step;
+                            readyCount++;
+                        } else {
+                            IoPlat.WakeCo(co, step);
+                        }
+#else
+                        IoPlat.WakeCo(co, step);
+#endif
+                        woke++;
+                    }
+                }
+                if (!retryRead || woke != 0 || interrupted || timeoutMs >= 0L) {
+                    ShardUnlock(sh);
+#if ZAN_CO_DRIVER
+                    if (readyCount > 0UL) IoSched.CoReadyBatch(rbp, readyCount);
+#endif
+                    if (completedCount > 0) Atomic.FetchAdd(ref s_ioCount, -completedCount, MemoryOrder.AcqRel);
+                    return woke;
+                }
+                if (NativeMemory.AsRef<nint>((sh) + (nint)(SH_DEAD)) != (nint)0) {
+                    int wd = FlushDead(sh);
+                    ShardUnlock(sh);
+                    return wd;
+                }
+            }
+            int w2 = IoDns.TimeoutScan();
+            int w3 = w2 != 0 ? 0 : IoDns.Drain();
+            int w4 = w3 != 0 ? 0 : SweepSlots(shard);
+            int w5 = w4 != 0 ? 0 : RtoTimeoutScan(sh);
+            bool done = true;
+            int val = 0;
+            if (w2 != 0) val = w2;
+            else if (w3 != 0) val = w3;
+            else if (w4 != 0) val = w4;
+            else if (w5 != 0) val = w5;
+            else if ((capped || retryRead) &&
+                     Atomic.Load(ref s_ioCount, MemoryOrder.Acquire) + Atomic.Load(ref IoDns.s_inflight, MemoryOrder.Acquire) > 0 &&
+                     timeoutMs < 0L) {
+                done = false;
+            }
+            ShardUnlock(sh);
+            if (done) return val;
+        }
+    }
+
+    [Export("zan_io_poll")]
+    public static int IoPoll(long timeoutMs) {
+        return PollShardEx(ThreadShard(), timeoutMs, false);
+    }
+
+    [Export("zan_io_close_notify")]
+    public static void CloseNotify(nint fdp) {
+        if (s_shardArr == (nint)0) return;
+        int fd = (int)fdp;
+        if (fd < 0) return;
+        nint sh = ShardOfFd(fdp);
+        ShardLock(sh);
+        int cap = Atomic.Load(ref s_slotsCap, MemoryOrder.Acquire);
+        nint slots = Atomic.Load(ref s_slots, MemoryOrder.Acquire);
+        if (fd < cap && slots != (nint)0) {
+            nint s = slots + (nint)((long)fd * (long)SL_SIZE);
+            if (NativeMemory.AsRef<byte>((s) + (nint)(SL_INEP)) != 0) {
+                NativeMemory.AsRef<byte>((s) + (nint)(SL_INEP)) = 0;
+                int pfd = NativeMemory.AsRef<int>((sh) + (nint)(SH_POLLFD));
+#if MACOS
+                if (pfd >= 0) KeventDeleteFd(pfd, fd);
+#else
+                if (pfd >= 0) IoPlat.PosixEpollCtl(pfd, IoConst.EPOLL_CTL_DEL, fd, (nint)0);
+#endif
+            }
+            IoBuf1024 readyBuf = new IoBuf1024();
+            nint rbp = NativeMemory.AddressOf(ref readyBuf);
+            for (;;) {
+                int nr = TakeWaiters(s, fd, true, rbp, 16);
+                nr += TakeWaiters(s, fd, false, rbp + (nint)((long)nr * (long)WT_SIZE), 16 - nr);
+                if (nr == 0) break;
+                for (int k = 0; k < nr; k++) {
+                    nint item = rbp + (nint)((long)k * (long)WT_SIZE);
+                    nint acc = NativeMemory.AsRef<nint>((item) + (nint)(WT_ACCEPT));
+                    nint outN = NativeMemory.AsRef<nint>((item) + (nint)(WT_OUTN));
+                    if (acc != (nint)0) NativeMemory.AsRef<nint>(acc) = (nint)(-1L);
+                    else if (outN != (nint)0) NativeMemory.AsRef<long>(outN) = 0L;
+                    IoPlat.WakeCo(NativeMemory.AsRef<nint>((item) + (nint)(WT_CO)), NativeMemory.AsRef<nint>((item) + (nint)(WT_STEP)));
+                    Atomic.FetchAdd(ref s_ioCount, -1, MemoryOrder.AcqRel);
+                }
+            }
+        }
+        ShardUnlock(sh);
+    }
+
+    [Export("zan_io_has_pending")]
+    public static int HasPending() {
+        if (Atomic.Load(ref s_deadCount, MemoryOrder.Acquire) > 0) return 1;
+        return (Atomic.Load(ref s_ioCount, MemoryOrder.Acquire) > 0 ||
+                Atomic.Load(ref IoDns.s_inflight, MemoryOrder.Acquire) > 0) ? 1 : 0;
+    }
+
+    internal static void ResetFastBudget() {
+        nint tls = IoPlat.GetTls(false);
+        if (tls != (nint)0) NativeMemory.AsRef<int>((tls) + (nint)(IoConst.TLS_FAST_BUDGET)) = IoConst.ZAN_IO_FAST_BURST;
+    }
+#endif
+}

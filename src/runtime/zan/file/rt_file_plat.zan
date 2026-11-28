@@ -1,0 +1,903 @@
+using System;
+using System.Threading;
+
+// Pure-Zan file metadata, stream-handle table, and cross-process file lock runtime.
+// Replaces target zanrt_file.obj (src/runtime/rt_file.c + file/rt_file_win.c + file/rt_file_posix.c).
+// Compiled directly by `zanc -c -O2 --no-runtime-checks` into zanrt_file.obj/.o.
+
+struct PathBuf4096 {
+    public InlineArray<4096, byte> Data;
+}
+
+struct FileHandleSlot {
+    public nint Fp;
+    public uint Gen;
+    public int Open;
+    public int InUse;
+    public nint Dying;
+}
+
+struct FileLockSlot {
+    public long LockVal;
+    public int Used;
+    public uint Gen;
+}
+
+struct FileLockTable32 {
+    public InlineArray<32, FileLockSlot> Slots;
+}
+
+#if WINDOWS
+struct WinFileTime {
+    public uint LowDateTime;
+    public uint HighDateTime;
+}
+
+struct Win32FileAttributeData {
+    public uint FileAttributes;
+    public WinFileTime CreationTime;
+    public WinFileTime LastAccessTime;
+    public WinFileTime LastWriteTime;
+    public uint FileSizeHigh;
+    public uint FileSizeLow;
+}
+
+struct WinByHandleFileInfo {
+    public uint FileAttributes;
+    public WinFileTime CreationTime;
+    public WinFileTime LastAccessTime;
+    public WinFileTime LastWriteTime;
+    public uint VolumeSerialNumber;
+    public uint FileSizeHigh;
+    public uint FileSizeLow;
+    public uint NumberOfLinks;
+    public uint FileIndexHigh;
+    public uint FileIndexLow;
+}
+#else
+struct PosixStatBuf {
+    public InlineArray<144, byte> Data;
+}
+
+struct PosixTimespec2 {
+    public long Sec0;
+    public long Nsec0;
+    public long Sec1;
+    public long Nsec1;
+}
+#endif
+
+partial class ZanFileRuntime {
+    const uint ZAN_FH_CAP0 = 64U;
+    const uint ZAN_FH_CAP_MAX = 1048576U; // 1024 * 1024
+    const int ZAN_LK_CAP = 32;
+    const int ZAN_ALT_BASES = 2;
+
+    const int SEEK_SET = 0;
+    const int SEEK_CUR = 1;
+    const int SEEK_END = 2;
+
+    // ---- Shared CRT imports ----
+    [DllImport("crt", EntryPoint = "malloc")]
+    static extern nint CMalloc(long size);
+
+    [DllImport("crt", EntryPoint = "calloc")]
+    static extern nint CCalloc(long nmemb, long size);
+
+    [DllImport("crt", EntryPoint = "free")]
+    static extern void CFree(nint ptr);
+
+    [DllImport("crt", EntryPoint = "memcpy")]
+    static extern nint CMemcpy(nint dst, nint src, long n);
+
+    [DllImport("crt", EntryPoint = "getenv")]
+    static extern nint CGetenv(nint name);
+
+    [DllImport("crt", EntryPoint = "fread")]
+    static extern long CFread(nint ptr, long size, long nmemb, nint stream);
+
+    [DllImport("crt", EntryPoint = "fwrite")]
+    static extern long CFwrite(nint ptr, long size, long nmemb, nint stream);
+
+    [DllImport("crt", EntryPoint = "fflush")]
+    static extern int CFflush(nint stream);
+
+    [DllImport("crt", EntryPoint = "fclose")]
+    static extern int CFclose(nint stream);
+
+    [DllImport("crt", EntryPoint = "feof")]
+    static extern int CFeof(nint stream);
+
+#if WINDOWS
+    // ---- Win32 Kernel32 / UCRT imports ----
+    const uint CP_UTF8 = 65001U;
+    const uint MB_ERR_INVALID_CHARS = 8U;
+    const uint GENERIC_WRITE = 0x40000000U;
+    const uint FILE_WRITE_ATTRIBUTES = 0x0100U;
+    const uint FILE_SHARE_READ = 1U;
+    const uint FILE_SHARE_WRITE = 2U;
+    const uint FILE_SHARE_DELETE = 4U;
+    const uint OPEN_EXISTING = 3U;
+    const uint OPEN_ALWAYS = 4U;
+    const uint FILE_ATTRIBUTE_READONLY = 0x1U;
+    const uint FILE_ATTRIBUTE_HIDDEN = 0x2U;
+    const uint FILE_ATTRIBUTE_DIRECTORY = 0x10U;
+    const uint FILE_ATTRIBUTE_NORMAL = 0x80U;
+    const uint FILE_ATTRIBUTE_REPARSE_POINT = 0x400U;
+    const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000U;
+    const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000U;
+    const uint INVALID_FILE_ATTRIBUTES = 0xFFFFFFFFU;
+    const uint FILE_TYPE_DISK = 1U;
+    const uint MOVEFILE_REPLACE_EXISTING = 1U;
+    const uint STD_ERROR_HANDLE = 0xFFFFFFF4U;
+    const long PLAT_LOCK_INVALID = 0L;
+
+    [DllImport("crt", EntryPoint = "_wfopen")]
+    static extern nint CWfopen(nint path, nint mode);
+
+    [DllImport("crt", EntryPoint = "_fseeki64")]
+    static extern int CFseek64(nint stream, long offset, int origin);
+
+    [DllImport("crt", EntryPoint = "_ftelli64")]
+    static extern long CFtell64(nint stream);
+
+    [DllImport("kernel32", EntryPoint = "MultiByteToWideChar")]
+    static extern int WinMultiByteToWideChar(
+        uint codePage, uint flags, nint multiByteStr, int cbMultiByte,
+        nint wideCharStr, int cchWideChar);
+
+    [DllImport("kernel32", EntryPoint = "DeleteFileW")]
+    static extern int WinDeleteFileW(nint path);
+
+    [DllImport("kernel32", EntryPoint = "MoveFileExW")]
+    static extern int WinMoveFileExW(nint existingFile, nint newFile, uint flags);
+
+    [DllImport("kernel32", EntryPoint = "CreateFileW")]
+    static extern nint WinCreateFileW(
+        nint fileName, uint desiredAccess, uint shareMode,
+        nint securityAttrs, uint creationDisposition,
+        uint flagsAndAttrs, nint templateFile);
+
+    [DllImport("kernel32", EntryPoint = "CloseHandle")]
+    static extern int WinCloseHandle(nint handle);
+
+    [DllImport("kernel32", EntryPoint = "GetFileType")]
+    static extern uint WinGetFileType(nint handle);
+
+    [DllImport("kernel32", EntryPoint = "GetFileInformationByHandle")]
+    static extern int WinGetFileInformationByHandle(nint handle, nint infoPtr);
+
+    [DllImport("kernel32", EntryPoint = "FlushFileBuffers")]
+    static extern int WinFlushFileBuffers(nint handle);
+
+    [DllImport("kernel32", EntryPoint = "GetFileAttributesExW")]
+    static extern int WinGetFileAttributesExW(nint fileName, int infoLevelId, nint infoPtr);
+
+    [DllImport("kernel32", EntryPoint = "GetFileAttributesW")]
+    static extern uint WinGetFileAttributesW(nint fileName);
+
+    [DllImport("kernel32", EntryPoint = "SetFileAttributesW")]
+    static extern int WinSetFileAttributesW(nint fileName, uint attrs);
+
+    [DllImport("kernel32", EntryPoint = "SetFileTime")]
+    static extern int WinSetFileTime(nint handle, nint creation, nint lastAccess, nint lastWrite);
+
+    [DllImport("kernel32", EntryPoint = "GetModuleFileNameA")]
+    static extern uint WinGetModuleFileNameA(nint module, nint buf, uint size);
+
+    [DllImport("kernel32", EntryPoint = "SwitchToThread")]
+    static extern int WinSwitchToThread();
+
+    [DllImport("kernel32", EntryPoint = "GetStdHandle")]
+    static extern nint WinGetStdHandle(uint stdHandle);
+
+    [DllImport("kernel32", EntryPoint = "WriteFile")]
+    static extern int WinWriteFile(nint handle, nint buf, uint bytesToWrite, nint bytesWritten, nint overlapped);
+
+    const uint FLS_OUT_OF_INDEXES = 0xFFFFFFFFU;
+
+    [DllImport("kernel32", EntryPoint = "FlsAlloc")]
+    static extern uint WinFlsAlloc(nint cb);
+
+    [DllImport("kernel32", EntryPoint = "FlsGetValue")]
+    static extern nint WinFlsGetValue(uint flsIndex);
+
+    [DllImport("kernel32", EntryPoint = "FlsSetValue")]
+    static extern int WinFlsSetValue(uint flsIndex, nint value);
+#else
+    const long PLAT_LOCK_INVALID = -1L;
+
+    [DllImport("crt", EntryPoint = "pthread_key_create")]
+    static extern int PosixKeyCreate(nint keyPtr, nint dtor);
+
+#if MACOS
+    [DllImport("crt", EntryPoint = "pthread_getspecific")]
+    static extern nint PosixGetSpecific(ulong key);
+
+    [DllImport("crt", EntryPoint = "pthread_setspecific")]
+    static extern int PosixSetSpecific(ulong key, nint val);
+#else
+    [DllImport("crt", EntryPoint = "pthread_getspecific")]
+    static extern nint PosixGetSpecific(uint key);
+
+    [DllImport("crt", EntryPoint = "pthread_setspecific")]
+    static extern int PosixSetSpecific(uint key, nint val);
+#endif
+
+    [DllImport("crt", EntryPoint = "fopen")]
+    static extern nint CFopen(nint path, nint mode);
+
+    [DllImport("crt", EntryPoint = "remove")]
+    static extern int CRemove(nint path);
+
+    [DllImport("crt", EntryPoint = "rename")]
+    static extern int CRename(nint src, nint dst);
+
+    [DllImport("crt", EntryPoint = "fseeko")]
+    static extern int CFseeko(nint stream, long offset, int whence);
+
+    [DllImport("crt", EntryPoint = "ftello")]
+    static extern long CFtello(nint stream);
+
+    [DllImport("crt", EntryPoint = "open")]
+    static extern int COpen3(nint path, int flags, int mode);
+
+    [DllImport("crt", EntryPoint = "close")]
+    static extern int CClose(int fd);
+
+    [DllImport("crt", EntryPoint = "fsync")]
+    static extern int CFsync(int fd);
+
+    [DllImport("crt", EntryPoint = "stat")]
+    static extern int CStat(nint path, nint buf);
+
+    [DllImport("crt", EntryPoint = "fstat")]
+    static extern int CFstat(int fd, nint buf);
+
+    [DllImport("crt", EntryPoint = "fchmod")]
+    static extern int CFchmod(int fd, uint mode);
+
+    [DllImport("crt", EntryPoint = "futimens")]
+    static extern int CFutimens(int fd, nint times);
+
+    [DllImport("crt", EntryPoint = "flock")]
+    static extern int CFlock(int fd, int op);
+
+    [DllImport("crt", EntryPoint = "sched_yield")]
+    static extern int CSchedYield();
+
+    [DllImport("crt", EntryPoint = "write")]
+    static extern long CWriteFd(int fd, nint buf, long count);
+
+#if MACOS
+    [DllImport("crt", EntryPoint = "_NSGetExecutablePath")]
+    static extern int MacGetExecutablePath(nint buf, nint bufSizePtr);
+#elif LINUX
+    [DllImport("crt", EntryPoint = "readlink")]
+    static extern long CReadlink(nint path, nint buf, long cap);
+#endif
+#endif
+
+    // ---- Static state (unmanaged, zero-initialized in BSS) ----
+    static byte s_emptyStr = 0;
+    static int s_appDirState = 0;  // 0=unresolved, 2=resolving, 1=resolved
+    static PathBuf4096 s_appDir;
+
+    static int s_altKeyState = 0;  // 0=uninit, 1=initing, 2=ready, 3=failed
+#if WINDOWS
+    static uint s_altFls = 0xFFFFFFFFU;
+#elif MACOS
+    static ulong s_altKey = 0UL;
+#else
+    static uint s_altKey = 0U;
+#endif
+
+    [Export("__zan_file_alt_exit")]
+    [Visibility("hidden")]
+    static void AltBufThreadExit(nint p) {
+        if (p != (nint)0) CFree(p);
+    }
+
+    static nint GetAltBuf() {
+        int st = Atomic.Load(ref s_altKeyState, MemoryOrder.Acquire);
+        if (st == 0 && Atomic.CompareExchangeBool(ref s_altKeyState, 0, 1, MemoryOrder.AcqRel, MemoryOrder.Acquire)) {
+#if WINDOWS
+            uint idx = WinFlsAlloc(NativeMemory.FunctionPointer(AltBufThreadExit));
+            s_altFls = idx;
+            st = (idx != FLS_OUT_OF_INDEXES) ? 2 : 3;
+#else
+            bool ok = PosixKeyCreate(NativeMemory.AddressOf(ref s_altKey), NativeMemory.FunctionPointer(AltBufThreadExit)) == 0;
+            st = ok ? 2 : 3;
+#endif
+            Atomic.Store(ref s_altKeyState, st, MemoryOrder.Release);
+        } else {
+            while ((st = Atomic.Load(ref s_altKeyState, MemoryOrder.Acquire)) == 1) {
+                Atomic.Pause();
+            }
+        }
+        if (st != 2) return (nint)0;
+#if WINDOWS
+        nint p = WinFlsGetValue(s_altFls);
+#else
+        nint p = PosixGetSpecific(s_altKey);
+#endif
+        if (p != (nint)0) return p;
+        p = CMalloc(4096L);
+        if (p == (nint)0) return (nint)0;
+#if WINDOWS
+        if (WinFlsSetValue(s_altFls, p) == 0) {
+            CFree(p);
+            return (nint)0;
+        }
+#else
+        if (PosixSetSpecific(s_altKey, p) != 0) {
+            CFree(p);
+            return (nint)0;
+        }
+#endif
+        return p;
+    }
+
+    static int s_fhSpin = 0;
+    static nint s_fhTable = (nint)0;
+    static uint s_fhCap = 0U;
+
+    static FileLockTable32 s_lkTable;
+
+    // ---- Helpers ----
+
+    [NoAlloc]
+    static long CStrLen(nint s) {
+        if (s == (nint)0) return 0L;
+        long n = 0L;
+        while (NativeMemory.At<byte>(s, n) != (byte)0) n++;
+        return n;
+    }
+
+    [NoAlloc]
+    static bool CStrContains(nint s, byte ch) {
+        if (s == (nint)0) return false;
+        long i = 0L;
+        while (true) {
+            byte b = NativeMemory.At<byte>(s, i);
+            if (b == (byte)0) return false;
+            if (b == ch) return true;
+            i++;
+        }
+    }
+
+    [NoAlloc]
+    static long CStrLastIndexOf(nint s, byte ch) {
+        if (s == (nint)0) return -1L;
+        long last = -1L;
+        long i = 0L;
+        while (true) {
+            byte b = NativeMemory.At<byte>(s, i);
+            if (b == (byte)0) return last;
+            if (b == ch) last = i;
+            i++;
+        }
+    }
+
+    [NoAlloc]
+    static void YieldThread() {
+#if WINDOWS
+        WinSwitchToThread();
+#else
+        CSchedYield();
+#endif
+    }
+
+    [NoAlloc]
+    static void FhLock() {
+        int spins = 0;
+        while (Atomic.Exchange(ref s_fhSpin, 1) != 0) {
+            spins++;
+            if (spins < 64) {
+                Atomic.Pause();
+            } else {
+                YieldThread();
+                spins = 0;
+            }
+        }
+    }
+
+    [NoAlloc]
+    static void FhUnlock() {
+        Atomic.Store(ref s_fhSpin, 0);
+    }
+
+    [NoAlloc]
+    static bool AppDirIsResolved() {
+        return Atomic.Load(ref s_appDirState, MemoryOrder.Acquire) == 1;
+    }
+
+    [NoAlloc]
+    static void AppDirAcquire() {
+        while (true) {
+            if (Atomic.Load(ref s_appDirState, MemoryOrder.Acquire) == 1) return;
+            if (Atomic.CompareExchangeBool(ref s_appDirState, 0, 2, MemoryOrder.AcqRel, MemoryOrder.Acquire)) return;
+            YieldThread();
+        }
+    }
+
+    [NoAlloc]
+    static void AppDirRelease() {
+        Atomic.Store(ref s_appDirState, 1, MemoryOrder.Release);
+    }
+
+    [NoAlloc]
+    static nint GetEnvAppDir() {
+        // "ZAN_APP_DIR\0"
+        InlineArray<16, byte> name = new InlineArray<16, byte>();
+        nint p = NativeMemory.AddressOf(ref name);
+        NativeMemory.At<byte>(p, 0) = (byte)90;  // Z
+        NativeMemory.At<byte>(p, 1) = (byte)65;  // A
+        NativeMemory.At<byte>(p, 2) = (byte)78;  // N
+        NativeMemory.At<byte>(p, 3) = (byte)95;  // _
+        NativeMemory.At<byte>(p, 4) = (byte)65;  // A
+        NativeMemory.At<byte>(p, 5) = (byte)80;  // P
+        NativeMemory.At<byte>(p, 6) = (byte)80;  // P
+        NativeMemory.At<byte>(p, 7) = (byte)95;  // _
+        NativeMemory.At<byte>(p, 8) = (byte)68;  // D
+        NativeMemory.At<byte>(p, 9) = (byte)73;  // I
+        NativeMemory.At<byte>(p, 10) = (byte)82; // R
+        NativeMemory.At<byte>(p, 11) = (byte)0;
+        return CGetenv(p);
+    }
+
+    [NoAlloc]
+    static nint GetEnvPkgDir() {
+        // "ZAN_PKG_DIR\0"
+        InlineArray<16, byte> name = new InlineArray<16, byte>();
+        nint p = NativeMemory.AddressOf(ref name);
+        NativeMemory.At<byte>(p, 0) = (byte)90;  // Z
+        NativeMemory.At<byte>(p, 1) = (byte)65;  // A
+        NativeMemory.At<byte>(p, 2) = (byte)78;  // N
+        NativeMemory.At<byte>(p, 3) = (byte)95;  // _
+        NativeMemory.At<byte>(p, 4) = (byte)80;  // P
+        NativeMemory.At<byte>(p, 5) = (byte)75;  // K
+        NativeMemory.At<byte>(p, 6) = (byte)71;  // G
+        NativeMemory.At<byte>(p, 7) = (byte)95;  // _
+        NativeMemory.At<byte>(p, 8) = (byte)68;  // D
+        NativeMemory.At<byte>(p, 9) = (byte)73;  // I
+        NativeMemory.At<byte>(p, 10) = (byte)82; // R
+        NativeMemory.At<byte>(p, 11) = (byte)0;
+        return CGetenv(p);
+    }
+
+    [NoAlloc]
+    static void WarnAppDirTooLong() {
+        // "zan: ZAN_APP_DIR too long -- falling back to the executable directory\n"
+        InlineArray<72, byte> msg = new InlineArray<72, byte>();
+        nint p = NativeMemory.AddressOf(ref msg);
+        NativeMemory.At<byte>(p, 0) = (byte)122; NativeMemory.At<byte>(p, 1) = (byte)97;
+        NativeMemory.At<byte>(p, 2) = (byte)110; NativeMemory.At<byte>(p, 3) = (byte)58;
+        NativeMemory.At<byte>(p, 4) = (byte)32;  NativeMemory.At<byte>(p, 5) = (byte)90;
+        NativeMemory.At<byte>(p, 6) = (byte)65;  NativeMemory.At<byte>(p, 7) = (byte)78;
+        NativeMemory.At<byte>(p, 8) = (byte)95;  NativeMemory.At<byte>(p, 9) = (byte)65;
+        NativeMemory.At<byte>(p, 10) = (byte)80; NativeMemory.At<byte>(p, 11) = (byte)80;
+        NativeMemory.At<byte>(p, 12) = (byte)95; NativeMemory.At<byte>(p, 13) = (byte)68;
+        NativeMemory.At<byte>(p, 14) = (byte)73; NativeMemory.At<byte>(p, 15) = (byte)82;
+        NativeMemory.At<byte>(p, 16) = (byte)32; NativeMemory.At<byte>(p, 17) = (byte)116;
+        NativeMemory.At<byte>(p, 18) = (byte)111; NativeMemory.At<byte>(p, 19) = (byte)111;
+        NativeMemory.At<byte>(p, 20) = (byte)32; NativeMemory.At<byte>(p, 21) = (byte)108;
+        NativeMemory.At<byte>(p, 22) = (byte)111; NativeMemory.At<byte>(p, 23) = (byte)110;
+        NativeMemory.At<byte>(p, 24) = (byte)103; NativeMemory.At<byte>(p, 25) = (byte)10;
+#if WINDOWS
+        nint hErr = WinGetStdHandle(STD_ERROR_HANDLE);
+        if (hErr != (nint)0 && hErr != (nint)(-1L)) {
+            uint written = 0U;
+            WinWriteFile(hErr, p, 26U, NativeMemory.AddressOf(ref written), (nint)0);
+        }
+#else
+        CWriteFd(2, p, 26L);
+#endif
+    }
+
+    // ---- Platform-specific primitives ----
+
+#if WINDOWS
+    static nint WinUtf8ToWide(nint text) {
+        if (text == (nint)0) return (nint)0;
+        int n = WinMultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, (nint)0, 0);
+        if (n <= 0) return (nint)0;
+        nint wide = CMalloc((long)n * 2L);
+        if (wide == (nint)0) return (nint)0;
+        if (WinMultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, wide, n) != n) {
+            CFree(wide);
+            return (nint)0;
+        }
+        return wide;
+    }
+
+    static nint PlatFopen(nint path, nint mode) {
+        if (path == (nint)0 || mode == (nint)0) return (nint)0;
+        nint widePath = WinUtf8ToWide(path);
+        nint wideMode = WinUtf8ToWide(mode);
+        if (widePath == (nint)0 || wideMode == (nint)0) {
+            if (widePath != (nint)0) CFree(widePath);
+            if (wideMode != (nint)0) CFree(wideMode);
+            return (nint)0;
+        }
+        nint f = CWfopen(widePath, wideMode);
+        CFree(widePath);
+        CFree(wideMode);
+        return f;
+    }
+
+    static int PlatRemove(nint path) {
+        if (path == (nint)0 || NativeMemory.At<byte>(path, 0) == (byte)0) return -1;
+        nint widePath = WinUtf8ToWide(path);
+        if (widePath == (nint)0) return -1;
+        int ok = (WinDeleteFileW(widePath) != 0) ? 0 : -1;
+        CFree(widePath);
+        return ok;
+    }
+
+    static int PlatRename(nint source, nint dest) {
+        if (source == (nint)0 || NativeMemory.At<byte>(source, 0) == (byte)0 ||
+            dest == (nint)0 || NativeMemory.At<byte>(dest, 0) == (byte)0) return -1;
+        nint wideSource = WinUtf8ToWide(source);
+        nint wideDest = WinUtf8ToWide(dest);
+        if (wideSource == (nint)0 || wideDest == (nint)0) {
+            if (wideSource != (nint)0) CFree(wideSource);
+            if (wideDest != (nint)0) CFree(wideDest);
+            return -1;
+        }
+        int ok = (WinMoveFileExW(wideSource, wideDest, MOVEFILE_REPLACE_EXISTING) != 0) ? 0 : -1;
+        CFree(wideSource);
+        CFree(wideDest);
+        return ok;
+    }
+
+    static int PlatFlushToDisk(nint path) {
+        if (path == (nint)0 || NativeMemory.At<byte>(path, 0) == (byte)0) return -1;
+        nint widePath = WinUtf8ToWide(path);
+        if (widePath == (nint)0) return -1;
+        nint h = WinCreateFileW(
+            widePath, GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            (nint)0, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, (nint)0);
+        CFree(widePath);
+        if (h == (nint)(-1L)) return -1;
+        WinByHandleFileInfo info = new WinByHandleFileInfo();
+        bool ok = WinGetFileType(h) == FILE_TYPE_DISK &&
+                  WinGetFileInformationByHandle(h, NativeMemory.AddressOf(ref info)) != 0 &&
+                  (info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0U &&
+                  (info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0U &&
+                  WinFlushFileBuffers(h) != 0;
+        bool closed = WinCloseHandle(h) != 0;
+        return (ok && closed) ? 0 : -1;
+    }
+
+    static int PlatFlushDirToDisk(nint path) {
+        return -2;
+    }
+
+    static long PlatFileTime(nint path, int which) {
+        if (path == (nint)0 || NativeMemory.At<byte>(path, 0) == (byte)0) return 0L;
+        nint widePath = WinUtf8ToWide(path);
+        if (widePath == (nint)0) return 0L;
+        Win32FileAttributeData d = new Win32FileAttributeData();
+        int got = WinGetFileAttributesExW(widePath, 0, NativeMemory.AddressOf(ref d));
+        CFree(widePath);
+        if (got == 0) return 0L;
+        WinFileTime ft = d.LastWriteTime;
+        if (which == 1) ft = d.CreationTime;
+        else if (which == 2) ft = d.LastAccessTime;
+        ulong t = (((ulong)ft.HighDateTime) << 32) | (ulong)ft.LowDateTime;
+        if (t == 0UL) return 0L;
+        return (long)(t / 10000000UL) - 11644473600L;
+    }
+
+    static long PlatFileLength(nint path) {
+        if (path == (nint)0 || NativeMemory.At<byte>(path, 0) == (byte)0) return -1L;
+        nint widePath = WinUtf8ToWide(path);
+        if (widePath == (nint)0) return -1L;
+        Win32FileAttributeData d = new Win32FileAttributeData();
+        int got = WinGetFileAttributesExW(widePath, 0, NativeMemory.AddressOf(ref d));
+        CFree(widePath);
+        if (got == 0) return -1L;
+        return (long)((((ulong)d.FileSizeHigh) << 32) | (ulong)d.FileSizeLow);
+    }
+
+    static long PlatFileAttributesAt(nint path) {
+        if (path == (nint)0 || NativeMemory.At<byte>(path, 0) == (byte)0) return -1L;
+        nint widePath = WinUtf8ToWide(path);
+        if (widePath == (nint)0) return -1L;
+        uint a = WinGetFileAttributesW(widePath);
+        CFree(widePath);
+        if (a == INVALID_FILE_ATTRIBUTES) return -1L;
+        long r = 0L;
+        if ((a & FILE_ATTRIBUTE_READONLY) != 0U)  r |= 1L;
+        if ((a & FILE_ATTRIBUTE_HIDDEN) != 0U)    r |= 2L;
+        if ((a & FILE_ATTRIBUTE_DIRECTORY) != 0U) r |= 4L;
+        return r;
+    }
+
+    static long PlatFileSetReadOnly(nint path, int on) {
+        if (path == (nint)0 || NativeMemory.At<byte>(path, 0) == (byte)0) return 0L;
+        nint widePath = WinUtf8ToWide(path);
+        if (widePath == (nint)0) return 0L;
+        uint a = WinGetFileAttributesW(widePath);
+        if (a == INVALID_FILE_ATTRIBUTES) { CFree(widePath); return 0L; }
+        if (on != 0) a |= FILE_ATTRIBUTE_READONLY;
+        else a &= ~FILE_ATTRIBUTE_READONLY;
+        long ok = (WinSetFileAttributesW(widePath, a) != 0) ? 1L : 0L;
+        CFree(widePath);
+        return ok;
+    }
+
+    static long PlatFileSetTime(nint path, int which, long unixSec) {
+        if (path == (nint)0 || NativeMemory.At<byte>(path, 0) == (byte)0) return 0L;
+        if (which != 0 && which != 1 && which != 2) return 0L;
+        nint widePath = WinUtf8ToWide(path);
+        if (widePath == (nint)0) return 0L;
+        nint h = WinCreateFileW(
+            widePath, FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE,
+            (nint)0, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, (nint)0);
+        CFree(widePath);
+        if (h == (nint)(-1L)) return 0L;
+        ulong ticks = (ulong)(unixSec + 11644473600L) * 10000000UL;
+        WinFileTime ft;
+        ft.LowDateTime = (uint)(ticks & 0xFFFFFFFFUL);
+        ft.HighDateTime = (uint)(ticks >> 32);
+        nint ftPtr = NativeMemory.AddressOf(ref ft);
+        int ok = 0;
+        if (which == 0)      ok = WinSetFileTime(h, (nint)0, (nint)0, ftPtr);
+        else if (which == 1) ok = WinSetFileTime(h, ftPtr, (nint)0, (nint)0);
+        else                 ok = WinSetFileTime(h, (nint)0, ftPtr, (nint)0);
+        WinCloseHandle(h);
+        return (ok != 0) ? 1L : 0L;
+    }
+
+    static void PlatGetExecutablePath(nint exe, long cap) {
+        uint n = WinGetModuleFileNameA((nint)0, exe, (uint)cap);
+        if (n == 0U || (long)n >= cap) NativeMemory.At<byte>(exe, 0) = (byte)0;
+    }
+
+    static long PlatSeekRaw(nint f, long offset, int whence) {
+        return (CFseek64(f, offset, whence) != 0) ? -1L : CFtell64(f);
+    }
+
+    static long PlatTellRaw(nint f) {
+        return CFtell64(f);
+    }
+
+    static long PlatLockOpen(nint path) {
+        nint widePath = WinUtf8ToWide(path);
+        if (widePath == (nint)0) return PLAT_LOCK_INVALID;
+        nint h = WinCreateFileW(
+            widePath, GENERIC_WRITE, 0U, (nint)0,
+            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, (nint)0);
+        CFree(widePath);
+        if (h == (nint)(-1L)) return PLAT_LOCK_INVALID;
+        return (long)h;
+    }
+
+    static void PlatLockClose(long lk) {
+        if (lk != 0L && lk != -1L) {
+            WinCloseHandle((nint)lk);
+        }
+    }
+#else
+    // POSIX / Linux / macOS
+    static uint PosixStatMode(nint sb) {
+#if MACOS
+        return (uint)NativeMemory.At<byte>(sb, 4) | (((uint)NativeMemory.At<byte>(sb, 5)) << 8);
+#elif X86_64
+        return (uint)NativeMemory.At<byte>(sb, 24) | (((uint)NativeMemory.At<byte>(sb, 25)) << 8);
+#else
+        return (uint)NativeMemory.At<byte>(sb, 16) | (((uint)NativeMemory.At<byte>(sb, 17)) << 8);
+#endif
+    }
+
+    static long PosixStatSize(nint sb) {
+#if MACOS
+        return NativeMemory.At<long>(sb, 12); // offset 96
+#else
+        return NativeMemory.At<long>(sb, 6);  // offset 48
+#endif
+    }
+
+    static long PosixStatTime(nint sb, int which) {
+#if MACOS
+        if (which == 1) return NativeMemory.At<long>(sb, 10); // birthtime @ 80
+        if (which == 2) return NativeMemory.At<long>(sb, 4);  // atime @ 32
+        return NativeMemory.At<long>(sb, 6);                  // mtime @ 48
+#else
+        if (which == 1) return NativeMemory.At<long>(sb, 13); // ctime @ 104
+        if (which == 2) return NativeMemory.At<long>(sb, 9);  // atime @ 72
+        return NativeMemory.At<long>(sb, 11);                 // mtime @ 88
+#endif
+    }
+
+    static int PosixOpenFlagsNoFollow() {
+#if MACOS
+        return 0x01000100; // O_CLOEXEC (0x01000000) | O_NOFOLLOW (0x0100)
+#elif ARM64
+        return 0x00088000; // Linux aarch64: O_CLOEXEC (0x80000) | O_NOFOLLOW (0x8000)
+#else
+        return 0x000A0000; // Linux x86_64: O_CLOEXEC (0x80000) | O_NOFOLLOW (0x20000)
+#endif
+    }
+
+    static int PosixOpenFlagsNonBlock() {
+#if MACOS
+        return 0x0004;
+#else
+        return 0x0800;
+#endif
+    }
+
+    static int PosixOpenFlagsDirectory() {
+#if MACOS
+        return 0x00100000;
+#elif ARM64
+        return 0x00004000;
+#else
+        return 0x00010000;
+#endif
+    }
+
+    static int PosixOpenFlagsLock() {
+#if MACOS
+        return 0x01000202; // O_RDWR(2) | O_CREAT(0x200) | O_CLOEXEC(0x1000000)
+#else
+        return 0x00080042; // O_RDWR(2) | O_CREAT(0x40) | O_CLOEXEC(0x80000)
+#endif
+    }
+
+    static nint PlatFopen(nint path, nint mode) {
+        if (path == (nint)0 || mode == (nint)0) return (nint)0;
+        return CFopen(path, mode);
+    }
+
+    static int PlatRemove(nint path) {
+        if (path == (nint)0 || NativeMemory.At<byte>(path, 0) == (byte)0) return -1;
+        return CRemove(path);
+    }
+
+    static int PlatRename(nint source, nint dest) {
+        if (source == (nint)0 || NativeMemory.At<byte>(source, 0) == (byte)0 ||
+            dest == (nint)0 || NativeMemory.At<byte>(dest, 0) == (byte)0) return -1;
+        return CRename(source, dest);
+    }
+
+    static int PlatFlushToDisk(nint path) {
+        if (path == (nint)0 || NativeMemory.At<byte>(path, 0) == (byte)0) return -1;
+        int fd = COpen3(path, PosixOpenFlagsNoFollow() | PosixOpenFlagsNonBlock(), 0);
+        if (fd < 0) return -1;
+        PosixStatBuf sb = new PosixStatBuf();
+        nint sp = NativeMemory.AddressOf(ref sb);
+        bool ok = CFstat(fd, sp) == 0 && ((PosixStatMode(sp) & 0xF000U) == 0x8000U) && CFsync(fd) == 0;
+        int closeRc = CClose(fd);
+        return (ok && closeRc == 0) ? 0 : -1;
+    }
+
+    static int PlatFlushDirToDisk(nint path) {
+        if (path == (nint)0 || NativeMemory.At<byte>(path, 0) == (byte)0) return -1;
+        int fd = COpen3(path, PosixOpenFlagsNoFollow() | PosixOpenFlagsDirectory(), 0);
+        if (fd < 0) return -1;
+        PosixStatBuf sb = new PosixStatBuf();
+        nint sp = NativeMemory.AddressOf(ref sb);
+        bool ok = CFstat(fd, sp) == 0 && ((PosixStatMode(sp) & 0xF000U) == 0x4000U) && CFsync(fd) == 0;
+        int closeRc = CClose(fd);
+        return (ok && closeRc == 0) ? 0 : -1;
+    }
+
+    static long PlatFileTime(nint path, int which) {
+        if (path == (nint)0 || NativeMemory.At<byte>(path, 0) == (byte)0) return 0L;
+        PosixStatBuf sb = new PosixStatBuf();
+        nint sp = NativeMemory.AddressOf(ref sb);
+        if (CStat(path, sp) != 0) return 0L;
+        return PosixStatTime(sp, which);
+    }
+
+    static long PlatFileLength(nint path) {
+        if (path == (nint)0 || NativeMemory.At<byte>(path, 0) == (byte)0) return -1L;
+        PosixStatBuf sb = new PosixStatBuf();
+        nint sp = NativeMemory.AddressOf(ref sb);
+        if (CStat(path, sp) != 0) return -1L;
+        return PosixStatSize(sp);
+    }
+
+    static long PlatFileAttributesAt(nint path) {
+        if (path == (nint)0 || NativeMemory.At<byte>(path, 0) == (byte)0) return -1L;
+        PosixStatBuf sb = new PosixStatBuf();
+        nint sp = NativeMemory.AddressOf(ref sb);
+        if (CStat(path, sp) != 0) return -1L;
+        uint mode = PosixStatMode(sp);
+        long r = 0L;
+        if ((mode & 0x92U) == 0U) r |= 1L; // S_IWUSR|S_IWGRP|S_IWOTH = 0222 = 0x92
+        long slash = CStrLastIndexOf(path, (byte)47);
+        byte firstChar = (slash >= 0L) ? NativeMemory.At<byte>(path, slash + 1L) : NativeMemory.At<byte>(path, 0);
+        if (firstChar == (byte)46) r |= 2L; // '.'
+        if ((mode & 0xF000U) == 0x4000U) r |= 4L; // S_IFDIR
+        return r;
+    }
+
+    static long PlatFileSetReadOnly(nint path, int on) {
+        if (path == (nint)0 || NativeMemory.At<byte>(path, 0) == (byte)0) return 0L;
+        int fd = COpen3(path, PosixOpenFlagsNoFollow(), 0);
+        if (fd < 0) return 0L;
+        PosixStatBuf sb = new PosixStatBuf();
+        nint sp = NativeMemory.AddressOf(ref sb);
+        if (CFstat(fd, sp) != 0) { CClose(fd); return 0L; }
+        uint m = PosixStatMode(sp);
+        if (on != 0) m &= ~0x92U;
+        else m |= 0x80U; // S_IWUSR = 0200 = 0x80
+        long ok = (CFchmod(fd, m) == 0) ? 1L : 0L;
+        CClose(fd);
+        return ok;
+    }
+
+    static long PlatFileSetTime(nint path, int which, long unixSec) {
+        if (path == (nint)0 || NativeMemory.At<byte>(path, 0) == (byte)0) return 0L;
+        if (which == 1) return 0L;
+        int fd = COpen3(path, PosixOpenFlagsNoFollow(), 0);
+        if (fd < 0) return 0L;
+        PosixStatBuf sb = new PosixStatBuf();
+        nint sp = NativeMemory.AddressOf(ref sb);
+        if (CFstat(fd, sp) != 0) { CClose(fd); return 0L; }
+        PosixTimespec2 ts;
+        ts.Sec0 = (which == 2) ? unixSec : PosixStatTime(sp, 2);
+        ts.Nsec0 = 0L;
+        ts.Sec1 = (which == 0) ? unixSec : PosixStatTime(sp, 0);
+        ts.Nsec1 = 0L;
+        long ok = (CFutimens(fd, NativeMemory.AddressOf(ref ts)) == 0) ? 1L : 0L;
+        CClose(fd);
+        return ok;
+    }
+
+    static void PlatGetExecutablePath(nint exe, long cap) {
+#if MACOS
+        uint c = (uint)cap;
+        if (MacGetExecutablePath(exe, NativeMemory.AddressOf(ref c)) != 0) {
+            NativeMemory.At<byte>(exe, 0) = (byte)0;
+        }
+#elif LINUX
+        InlineArray<16, byte> proc = new InlineArray<16, byte>();
+        nint p = NativeMemory.AddressOf(ref proc);
+        // "/proc/self/exe\0"
+        NativeMemory.At<byte>(p, 0) = (byte)47;  NativeMemory.At<byte>(p, 1) = (byte)112;
+        NativeMemory.At<byte>(p, 2) = (byte)114; NativeMemory.At<byte>(p, 3) = (byte)111;
+        NativeMemory.At<byte>(p, 4) = (byte)99;  NativeMemory.At<byte>(p, 5) = (byte)47;
+        NativeMemory.At<byte>(p, 6) = (byte)115; NativeMemory.At<byte>(p, 7) = (byte)101;
+        NativeMemory.At<byte>(p, 8) = (byte)108; NativeMemory.At<byte>(p, 9) = (byte)102;
+        NativeMemory.At<byte>(p, 10) = (byte)47; NativeMemory.At<byte>(p, 11) = (byte)101;
+        NativeMemory.At<byte>(p, 12) = (byte)120; NativeMemory.At<byte>(p, 13) = (byte)101;
+        NativeMemory.At<byte>(p, 14) = (byte)0;
+        long n = CReadlink(p, exe, cap - 1L);
+        if (n <= 0L) NativeMemory.At<byte>(exe, 0) = (byte)0;
+        else NativeMemory.At<byte>(exe, n) = (byte)0;
+#else
+        NativeMemory.At<byte>(exe, 0) = (byte)0;
+#endif
+    }
+
+    static long PlatSeekRaw(nint f, long offset, int whence) {
+        return (CFseeko(f, offset, whence) != 0) ? -1L : CFtello(f);
+    }
+
+    static long PlatTellRaw(nint f) {
+        return CFtello(f);
+    }
+
+    static long PlatLockOpen(nint path) {
+        int fd = COpen3(path, PosixOpenFlagsLock(), 420); // 0644
+        if (fd < 0) return PLAT_LOCK_INVALID;
+        if (CFlock(fd, 6) != 0) { // LOCK_EX(2) | LOCK_NB(4)
+            CClose(fd);
+            return PLAT_LOCK_INVALID;
+        }
+        return (long)fd;
+    }
+
+    static void PlatLockClose(long lk) {
+        if (lk >= 0L) CClose((int)lk);
+    }
+#endif
+
+}

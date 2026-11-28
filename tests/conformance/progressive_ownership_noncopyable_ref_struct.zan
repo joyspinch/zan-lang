@@ -1,0 +1,98 @@
+using System;
+
+struct UniqueHandle : ~Copyable {
+    public int Id;
+    public int Tag;
+    public UniqueHandle(int id, int tag) {
+        this.Id = id;
+        this.Tag = tag;
+    }
+    public int Checksum() => this.Id * 10 + this.Tag;
+}
+
+struct OwnedPair : ~Copyable {
+    public UniqueHandle First;
+    public int Meta;
+    public OwnedPair(UniqueHandle first, int meta) {
+        this.First = first;
+        this.Meta = meta;
+    }
+}
+
+ref struct SpanWindow {
+    public Span<int> Data;
+    public int Offset;
+    public SpanWindow(Span<int> data, int offset) {
+        this.Data = data;
+        this.Offset = offset;
+    }
+    public int Sum() {
+        int s = 0;
+        for (int i = this.Offset; i < this.Data.Length; i++) {
+            s += this.Data[i];
+        }
+        return s;
+    }
+}
+
+class Program {
+    static UniqueHandle Open(int id) => new UniqueHandle(id, id + 1);
+
+    static int Peek(ref UniqueHandle h) {
+        return h.Id + h.Tag;
+    }
+
+    static UniqueHandle Transform(UniqueHandle h) {
+        return new UniqueHandle(h.Id * 2, h.Tag + 5);
+    }
+
+    static int Consume(UniqueHandle h) {
+        return h.Checksum();
+    }
+
+    static int RunScoped(noescape Func<int> f) => f();
+
+    static int SumScopedSpan(scoped Span<int> s) {
+        int total = 0;
+        for (int i = 0; i < s.Length; i++) total += s[i];
+        return total;
+    }
+
+    static Span<int> SliceHeapArray(int[] arr, int start, int len) {
+        return arr.AsSpan(start, len);
+    }
+
+    static void Main() {
+        // 1. ~Copyable borrow (member read, method call, ref param), move, and re-assignment
+        var h = Open(3);
+        int b1 = h.Id;
+        int b2 = h.Checksum();
+        int b3 = Peek(ref h);
+        // Borrow inside noescape closure is allowed
+        int b4 = RunScoped(() => h.Checksum());
+        // Move h into Transform and re-assign back to h
+        h = Transform(h);
+        int afterTx = h.Checksum();
+        // Move into OwnedPair
+        var pair = new OwnedPair(h, 7);
+        int pairSum = pair.First.Checksum() + pair.Meta;
+        // Re-assign h after move makes it usable again
+        h = Open(5);
+        int finalConsume = Consume(h);
+        Console.WriteLine($"own:{b1},{b2},{b3},{b4},{afterTx},{pairSum},{finalConsume}");
+
+        // 2. ref struct holding Span<int> over stack-local InlineArray
+        [4]int buf = new InlineArray<4, int>();
+        buf[0] = 10; buf[1] = 20; buf[2] = 30; buf[3] = 40;
+        var sp = buf.AsSpan();
+        var win = new SpanWindow(sp, 1);
+        int winSum = win.Sum();
+        int scopedSum = SumScopedSpan(sp);
+        int neSpanSum = RunScoped(() => sp[0] + sp[3]);
+
+        // 3. Returning Span from heap array is allowed
+        int[] heap = new int[] { 2, 4, 6, 8 };
+        Span<int> hs = SliceHeapArray(heap, 1, 2);
+        Console.WriteLine($"ref:{winSum},{scopedSum},{neSpanSum},{hs[0] + hs[1]}");
+    }
+}

@@ -13,6 +13,26 @@ void print_usage(void) {
       "                     .a/.lib static; executable: any other suffix)\n");
   fprintf(stderr,
           "    --emit-lib       Force library output (no CRT/entry point)\n");
+  fprintf(stderr,
+          "    -c, --emit-obj   Compile to object file (.o/.obj) without linking or Zan startup\n");
+  fprintf(stderr,
+          "    --emit-header <file.h>  Emit C11/C++ header for [Export] symbols\n");
+  fprintf(stderr,
+          "    --freestanding   Bare-metal mode (zero runtime/CRT, direct .o/.obj or -T ELF image)\n");
+  fprintf(stderr,
+          "    -T, --linker-script <ld>  Link freestanding image with custom linker script\n");
+  fprintf(stderr,
+          "    -e, --entry <sym>         Entry symbol for freestanding bare-metal link\n");
+  fprintf(stderr,
+          "    --cpu <name>     Override LLVM target CPU (e.g. generic, x86-64, native)\n");
+  fprintf(stderr,
+          "    --features <f>   Override LLVM target features (e.g. -sse,-sse2,-avx,-avx2)\n");
+  fprintf(stderr,
+          "    --code-model <m> default | small | kernel | medium | large\n");
+  fprintf(stderr,
+          "    --reloc-model <r> default | static | pic | dynamic-no-pic\n");
+  fprintf(stderr,
+          "    --no-red-zone    Disable x86-64 red zone on all functions (kernel/ISR)\n");
   fprintf(stderr, "    -O0..-O3/-Os/-Oz Set optimization level (default: O2; "
                   "--publish: Os;\n");
   fprintf(stderr, "                     -g forces O0; -Oz = minimum size for "

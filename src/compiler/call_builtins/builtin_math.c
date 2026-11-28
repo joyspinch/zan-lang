@@ -35,6 +35,8 @@
   LLVMValueRef sp_out = NULL;
   if (emit_span_call(g, expr, locals, &sp_out))
     return sp_out;
+  if (emit_vec_call(g, expr, locals, &sp_out))
+    return sp_out;
 }
 
 {
@@ -217,7 +219,7 @@ if (!zan_type_defines(g, "Math", "Atan2") &&
   return zan_call2(g->builder, atan2_type, atan2_fn, args, 2, "atan2");
 }
 
-/* Math.Abs(expr) → 浮点直降 llvm.fabs.f64（单条 andpd） */
+/* Math.Abs(expr) → float 直降 llvm.fabs.f32，double 直降 llvm.fabs.f64 */
 if (!zan_type_defines(g, "Math", "Abs") && is_call_to(expr, "Math", "Abs") &&
     expr->call.args.count == 1) {
   LLVMValueRef arg = emit_expr(g, expr->call.args.items[0], locals);
@@ -225,11 +227,15 @@ if (!zan_type_defines(g, "Math", "Abs") && is_call_to(expr, "Math", "Abs") &&
   if (!math_require_numeric(g, expr, expr->call.args.items[0], arg, locals,
                             "Abs"))
     return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
-  if (LLVMGetTypeKind(arg_type) == LLVMDoubleTypeKind ||
-      LLVMGetTypeKind(arg_type) == LLVMFloatTypeKind) {
+  if (LLVMGetTypeKind(arg_type) == LLVMFloatTypeKind) {
+    LLVMTypeRef flt = LLVMFloatTypeInContext(g->ctx);
+    LLVMTypeRef fabs_type = LLVMFunctionType(flt, (LLVMTypeRef[]){flt}, 1, 0);
+    LLVMValueRef fabs_fn = LLVMGetNamedFunction(g->mod, "llvm.fabs.f32");
+    if (!fabs_fn)
+      fabs_fn = LLVMAddFunction(g->mod, "llvm.fabs.f32", fabs_type);
+    return zan_call2(g->builder, fabs_type, fabs_fn, &arg, 1, "fabsf");
+  } else if (LLVMGetTypeKind(arg_type) == LLVMDoubleTypeKind) {
     LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
-    if (LLVMGetTypeKind(arg_type) == LLVMFloatTypeKind)
-      arg = LLVMBuildFPExt(g->builder, arg, dbl, "ext");
     LLVMTypeRef fabs_type = LLVMFunctionType(dbl, (LLVMTypeRef[]){dbl}, 1, 0);
     LLVMValueRef fabs_fn = LLVMGetNamedFunction(g->mod, "llvm.fabs.f64");
     if (!fabs_fn) {
@@ -269,6 +275,31 @@ if (!zan_type_defines(g, "Math", "Max") &&
                                     : "Math.%s requires numeric arguments",
                        want_max ? "Max" : "Min");
     return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
+  }
+  if (strcmp(result, "float") == 0) {
+    LLVMTypeRef flt = LLVMFloatTypeInContext(g->ctx);
+    if (LLVMTypeOf(a) != flt) {
+      if (LLVMGetTypeKind(LLVMTypeOf(a)) == LLVMIntegerTypeKind)
+        a = LLVMBuildSIToFP(g->builder, a, flt, "tofp32");
+      else
+        a = LLVMBuildFPCast(g->builder, a, flt, "tofp32");
+    }
+    if (LLVMTypeOf(b) != flt) {
+      if (LLVMGetTypeKind(LLVMTypeOf(b)) == LLVMIntegerTypeKind)
+        b = LLVMBuildSIToFP(g->builder, b, flt, "tofp32");
+      else
+        b = LLVMBuildFPCast(g->builder, b, flt, "tofp32");
+    }
+    LLVMValueRef a_nan = LLVMBuildFCmp(g->builder, LLVMRealUNO, a, a, "an");
+    LLVMValueRef b_nan = LLVMBuildFCmp(g->builder, LLVMRealUNO, b, b, "bn");
+    LLVMValueRef cmp = LLVMBuildFCmp(
+        g->builder, want_max ? LLVMRealOGT : LLVMRealOLT, a, b, "cmpf");
+    LLVMValueRef picked =
+        LLVMBuildSelect(g->builder, cmp, a, b, want_max ? "maxf" : "minf");
+    LLVMValueRef from_b =
+        LLVMBuildSelect(g->builder, b_nan, b, picked, want_max ? "maxf" : "minf");
+    return LLVMBuildSelect(g->builder, a_nan, a, from_b,
+                           want_max ? "maxf" : "minf");
   }
   if (strcmp(result, "double") == 0) {
     LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
@@ -425,6 +456,186 @@ if (!zan_type_defines(g, "Math", "Round") &&
   LLVMValueRef scaled = LLVMBuildFMul(g->builder, arg, scale, "scaled");
   LLVMValueRef r = zan_call2(g->builder, d1_ty, round_fn, &scaled, 1, "rint");
   return LLVMBuildFDiv(g->builder, r, scale, "rdig");
+}
+
+/* Math.Clamp(v, lo, hi) — precision-preserving for int/long/uint/ulong/float/double */
+if (!zan_type_defines(g, "Math", "Clamp") &&
+    is_call_to(expr, "Math", "Clamp") && expr->call.args.count == 3) {
+  LLVMValueRef v = emit_expr(g, expr->call.args.items[0], locals);
+  LLVMValueRef lo = emit_expr(g, expr->call.args.items[1], locals);
+  LLVMValueRef hi = emit_expr(g, expr->call.args.items[2], locals);
+  zan_type_t *vt = infer_expr_type(g, expr->call.args.items[0], locals);
+  zan_type_t *lot = infer_expr_type(g, expr->call.args.items[1], locals);
+  zan_type_t *hit = infer_expr_type(g, expr->call.args.items[2], locals);
+  bool any_dbl = (vt && vt->kind == TYPE_DOUBLE) ||
+                 (lot && lot->kind == TYPE_DOUBLE) ||
+                 (hit && hit->kind == TYPE_DOUBLE);
+  bool any_flt = !any_dbl && ((vt && vt->kind == TYPE_FLOAT) ||
+                              (lot && lot->kind == TYPE_FLOAT) ||
+                              (hit && hit->kind == TYPE_FLOAT));
+  if (any_dbl || any_flt) {
+    LLVMTypeRef ft = any_dbl ? LLVMDoubleTypeInContext(g->ctx)
+                             : LLVMFloatTypeInContext(g->ctx);
+    LLVMValueRef *arr[3] = {&v, &lo, &hi};
+    for (int ci = 0; ci < 3; ci++) {
+      if (LLVMTypeOf(*arr[ci]) != ft) {
+        if (LLVMGetTypeKind(LLVMTypeOf(*arr[ci])) == LLVMIntegerTypeKind)
+          *arr[ci] = LLVMBuildSIToFP(g->builder, *arr[ci], ft, "cl.fp");
+        else
+          *arr[ci] = LLVMBuildFPCast(g->builder, *arr[ci], ft, "cl.fpc");
+      }
+    }
+    LLVMValueRef c1 = LLVMBuildFCmp(g->builder, LLVMRealOLT, v, lo, "cl.lt");
+    LLVMValueRef t1 = LLVMBuildSelect(g->builder, c1, lo, v, "cl.m1");
+    LLVMValueRef c2 = LLVMBuildFCmp(g->builder, LLVMRealOGT, t1, hi, "cl.gt");
+    return LLVMBuildSelect(g->builder, c2, hi, t1, "cl.res");
+  }
+  bool any_u64 = (vt && vt->kind == TYPE_ULONG) ||
+                 (lot && lot->kind == TYPE_ULONG) ||
+                 (hit && hit->kind == TYPE_ULONG);
+  bool any_i64 = (vt && vt->kind == TYPE_LONG) ||
+                 (lot && lot->kind == TYPE_LONG) ||
+                 (hit && hit->kind == TYPE_LONG);
+  bool any_u32 = (vt && vt->kind == TYPE_UINT) ||
+                 (lot && lot->kind == TYPE_UINT) ||
+                 (hit && hit->kind == TYPE_UINT);
+  bool is_uns = any_u64 || (any_u32 && !any_i64);
+  LLVMTypeRef it = (any_u64 || any_i64) ? LLVMInt64TypeInContext(g->ctx)
+                                        : LLVMInt32TypeInContext(g->ctx);
+  if (LLVMTypeOf(v) != it)
+    v = LLVMBuildIntCast2(g->builder, v, it, !is_uns, "cl.v");
+  if (LLVMTypeOf(lo) != it)
+    lo = LLVMBuildIntCast2(g->builder, lo, it, !is_uns, "cl.lo");
+  if (LLVMTypeOf(hi) != it)
+    hi = LLVMBuildIntCast2(g->builder, hi, it, !is_uns, "cl.hi");
+  LLVMValueRef c1 =
+      zan_icmp(g->builder, is_uns ? LLVMIntULT : LLVMIntSLT, v, lo, "cl.lt");
+  LLVMValueRef t1 = LLVMBuildSelect(g->builder, c1, lo, v, "cl.m1");
+  LLVMValueRef c2 =
+      zan_icmp(g->builder, is_uns ? LLVMIntUGT : LLVMIntSGT, t1, hi, "cl.gt");
+  return LLVMBuildSelect(g->builder, c2, hi, t1, "cl.res");
+}
+
+/* Math.FusedMultiplyAdd(x, y, z) → llvm.fma.f32 / llvm.fma.f64 */
+if (!zan_type_defines(g, "Math", "FusedMultiplyAdd") &&
+    is_call_to(expr, "Math", "FusedMultiplyAdd") && expr->call.args.count == 3) {
+  LLVMValueRef a = emit_expr(g, expr->call.args.items[0], locals);
+  LLVMValueRef b = emit_expr(g, expr->call.args.items[1], locals);
+  LLVMValueRef c = emit_expr(g, expr->call.args.items[2], locals);
+  zan_type_t *at = infer_expr_type(g, expr->call.args.items[0], locals);
+  zan_type_t *bt = infer_expr_type(g, expr->call.args.items[1], locals);
+  zan_type_t *ct = infer_expr_type(g, expr->call.args.items[2], locals);
+  bool all_f32 = at && bt && ct && at->kind == TYPE_FLOAT &&
+                 bt->kind == TYPE_FLOAT && ct->kind == TYPE_FLOAT;
+  LLVMTypeRef ft = all_f32 ? LLVMFloatTypeInContext(g->ctx)
+                           : LLVMDoubleTypeInContext(g->ctx);
+  const char *fname = all_f32 ? "llvm.fma.f32" : "llvm.fma.f64";
+  LLVMValueRef *arr[3] = {&a, &b, &c};
+  for (int fi = 0; fi < 3; fi++) {
+    if (LLVMTypeOf(*arr[fi]) != ft) {
+      if (LLVMGetTypeKind(LLVMTypeOf(*arr[fi])) == LLVMIntegerTypeKind)
+        *arr[fi] = LLVMBuildSIToFP(g->builder, *arr[fi], ft, "fma.fp");
+      else
+        *arr[fi] = LLVMBuildFPCast(g->builder, *arr[fi], ft, "fma.fpc");
+    }
+  }
+  LLVMTypeRef fty = LLVMFunctionType(ft, (LLVMTypeRef[]){ft, ft, ft}, 3, 0);
+  LLVMValueRef fn = LLVMGetNamedFunction(g->mod, fname);
+  if (!fn)
+    fn = LLVMAddFunction(g->mod, fname, fty);
+  return zan_call2(g->builder, fty, fn, (LLVMValueRef[]){a, b, c}, 3, "fma");
+}
+
+/* Native f32 MathF.* intrinsics (zero fpext/fptrunc round-trips) */
+if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS &&
+    expr->call.callee->member.object->kind == AST_IDENTIFIER &&
+    !local_find(locals, expr->call.callee->member.object->ident.name) &&
+    expr->call.callee->member.object->ident.name.len == 5 &&
+    memcmp(expr->call.callee->member.object->ident.name.str, "MathF", 5) == 0) {
+  zan_istr_t mf = expr->call.callee->member.name;
+  LLVMTypeRef flt = LLVMFloatTypeInContext(g->ctx);
+  int ac = expr->call.args.count;
+  LLVMValueRef fargs[3] = {NULL, NULL, NULL};
+  for (int ai = 0; ai < ac && ai < 3; ai++) {
+    LLVMValueRef av = emit_expr(g, expr->call.args.items[ai], locals);
+    if (LLVMTypeOf(av) != flt) {
+      if (LLVMGetTypeKind(LLVMTypeOf(av)) == LLVMIntegerTypeKind)
+        av = LLVMBuildSIToFP(g->builder, av, flt, "mf.fp");
+      else
+        av = LLVMBuildFPCast(g->builder, av, flt, "mf.fpc");
+    }
+    fargs[ai] = av;
+  }
+  if (ac == 1) {
+    const char *intr = NULL;
+    if (mf.len == 4 && memcmp(mf.str, "Sqrt", 4) == 0) intr = "llvm.sqrt.f32";
+    else if (mf.len == 3 && memcmp(mf.str, "Abs", 3) == 0) intr = "llvm.fabs.f32";
+    else if (mf.len == 5 && memcmp(mf.str, "Floor", 5) == 0) intr = "llvm.floor.f32";
+    else if (mf.len == 7 && memcmp(mf.str, "Ceiling", 7) == 0) intr = "llvm.ceil.f32";
+    else if (mf.len == 5 && memcmp(mf.str, "Round", 5) == 0) intr = "llvm.rint.f32";
+    else if (mf.len == 3 && memcmp(mf.str, "Sin", 3) == 0) intr = "sinf";
+    else if (mf.len == 3 && memcmp(mf.str, "Cos", 3) == 0) intr = "cosf";
+    else if (mf.len == 3 && memcmp(mf.str, "Tan", 3) == 0) intr = "tanf";
+    else if (mf.len == 3 && memcmp(mf.str, "Log", 3) == 0) intr = "logf";
+    else if (mf.len == 3 && memcmp(mf.str, "Exp", 3) == 0) intr = "expf";
+    else if (mf.len == 4 && memcmp(mf.str, "Atan", 4) == 0) intr = "atanf";
+    else if (mf.len == 4 && memcmp(mf.str, "Asin", 4) == 0) intr = "asinf";
+    else if (mf.len == 4 && memcmp(mf.str, "Acos", 4) == 0) intr = "acosf";
+    if (intr) {
+      LLVMTypeRef fty = LLVMFunctionType(flt, (LLVMTypeRef[]){flt}, 1, 0);
+      LLVMValueRef fn = LLVMGetNamedFunction(g->mod, intr);
+      if (!fn) {
+        fn = LLVMAddFunction(g->mod, intr, fty);
+        if (strncmp(intr, "llvm.", 5) != 0) {
+          unsigned nw = LLVMGetEnumAttributeKindForName("nounwind", 8);
+          unsigned wr = LLVMGetEnumAttributeKindForName("willreturn", 10);
+          unsigned mm = LLVMGetEnumAttributeKindForName("memory", 6);
+          if (nw) LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex, LLVMCreateEnumAttribute(g->ctx, nw, 0));
+          if (wr) LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex, LLVMCreateEnumAttribute(g->ctx, wr, 0));
+          if (mm) LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex, LLVMCreateEnumAttribute(g->ctx, mm, 0));
+        }
+      }
+      return zan_call2(g->builder, fty, fn, &fargs[0], 1, "mf1");
+    }
+  } else if (ac == 2) {
+    if (mf.len == 3 && (memcmp(mf.str, "Min", 3) == 0 || memcmp(mf.str, "Max", 3) == 0)) {
+      bool is_max = (mf.str[2] == 'x');
+      LLVMValueRef cmp = LLVMBuildFCmp(g->builder, is_max ? LLVMRealOGT : LLVMRealOLT,
+                                       fargs[0], fargs[1], "mf.cmp");
+      return LLVMBuildSelect(g->builder, cmp, fargs[0], fargs[1], is_max ? "mf.max" : "mf.min");
+    }
+    const char *intr2 = NULL;
+    if (mf.len == 3 && memcmp(mf.str, "Pow", 3) == 0) intr2 = "powf";
+    else if (mf.len == 5 && memcmp(mf.str, "Atan2", 5) == 0) intr2 = "atan2f";
+    if (intr2) {
+      LLVMTypeRef fty = LLVMFunctionType(flt, (LLVMTypeRef[]){flt, flt}, 2, 0);
+      LLVMValueRef fn = LLVMGetNamedFunction(g->mod, intr2);
+      if (!fn) {
+        fn = LLVMAddFunction(g->mod, intr2, fty);
+        unsigned nw = LLVMGetEnumAttributeKindForName("nounwind", 8);
+        unsigned wr = LLVMGetEnumAttributeKindForName("willreturn", 10);
+        unsigned mm = LLVMGetEnumAttributeKindForName("memory", 6);
+        if (nw) LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex, LLVMCreateEnumAttribute(g->ctx, nw, 0));
+        if (wr) LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex, LLVMCreateEnumAttribute(g->ctx, wr, 0));
+        if (mm) LLVMAddAttributeAtIndex(fn, LLVMAttributeFunctionIndex, LLVMCreateEnumAttribute(g->ctx, mm, 0));
+      }
+      return zan_call2(g->builder, fty, fn, fargs, 2, "mf2");
+    }
+  } else if (ac == 3) {
+    if (mf.len == 5 && memcmp(mf.str, "Clamp", 5) == 0) {
+      LLVMValueRef c1 = LLVMBuildFCmp(g->builder, LLVMRealOLT, fargs[0], fargs[1], "mfc.lt");
+      LLVMValueRef t1 = LLVMBuildSelect(g->builder, c1, fargs[1], fargs[0], "mfc.m1");
+      LLVMValueRef c2 = LLVMBuildFCmp(g->builder, LLVMRealOGT, t1, fargs[2], "mfc.gt");
+      return LLVMBuildSelect(g->builder, c2, fargs[2], t1, "mfc.res");
+    }
+    if (mf.len == 16 && memcmp(mf.str, "FusedMultiplyAdd", 16) == 0) {
+      LLVMTypeRef fty = LLVMFunctionType(flt, (LLVMTypeRef[]){flt, flt, flt}, 3, 0);
+      LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "llvm.fma.f32");
+      if (!fn)
+        fn = LLVMAddFunction(g->mod, "llvm.fma.f32", fty);
+      return zan_call2(g->builder, fty, fn, fargs, 3, "mffma");
+    }
+  }
 }
 
 /* char 的静态类（A525）：char.IsDigit('5') 等。谓词走 <ctype.h>

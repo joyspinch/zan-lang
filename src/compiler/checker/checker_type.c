@@ -260,6 +260,8 @@ static bool checker_type_equal(zan_type_t *a, zan_type_t *b) {
     return false;
   if (a->kind != b->kind)
     return false;
+  if (a->kind == TYPE_CONST_INT)
+    return a->const_int_val == b->const_int_val;
   if (a->kind == TYPE_ARRAY || a->kind == TYPE_NULLABLE) {
     if (a->kind == TYPE_ARRAY && a->array_rank != b->array_rank)
       return false;
@@ -825,10 +827,16 @@ static bool checker_type_assignable(zan_type_t *target, zan_type_t *value) {
         return true;
     }
     if (value->kind == TYPE_STRUCT) {
-      if (target->sym && value->sym && target->sym == value->sym)
-        return true;
+      if (target->sym && value->sym && target->sym == value->sym) {
+        if (target->type_arg_count == 0 && value->type_arg_count == 0)
+          return true;
+        if (checker_type_equal(target, value))
+          return true;
+      }
       if (same_generic_container(target, value) &&
           checker_type_equal(target, value))
+        return true;
+      if (!target->sym && !value->sym && checker_type_equal(target, value))
         return true;
     }
     return false;
@@ -1271,6 +1279,8 @@ static void checker_check_assignable(zan_checker_t *c, zan_type_t *target,
     }
   }
   if (target == c->binder->type_error || value == c->binder->type_error)
+    return;
+  if (checker_check_ownership_boxing(c, target, value, loc))
     return;
   if (value == c->binder->type_void && target != c->binder->type_void) {
     zan_diag_emit_code(c->diag, DIAG_ERROR, loc, 2021,

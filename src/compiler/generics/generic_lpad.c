@@ -81,6 +81,8 @@ int expr_yields_owned_rc_value(zan_irgen_t *g, zan_ast_node_t *e,
                                local_scope_t *locals) {
   if (!e)
     return 0;
+  if (e->kind == AST_CALL && call_returns_ref(g, e, locals))
+    return 0;
   /* A556-1：隐式装箱过的表达式产出 fresh owned 堆箱——消费方不得再
    * retain（与下面装箱 cast 的显式形态同一口径）。 */
   if (irgen_expr_was_boxed(g, e))
@@ -103,7 +105,8 @@ int expr_yields_owned_rc_value(zan_irgen_t *g, zan_ast_node_t *e,
    * the emitter releases that reference itself on a failed type check. */
   if (e->kind == AST_AS_EXPR)
     return expr_yields_owned_rc_value(g, e->type_test.expr, locals);
-  if (e->kind == AST_POSTFIX_UNARY && e->unary.op == TK_BANG)
+  if (e->kind == AST_POSTFIX_UNARY &&
+      (e->unary.op == TK_BANG || e->unary.op == TK_QUESTION))
     return expr_yields_owned_rc_value(g, e->unary.operand, locals);
   if (e->kind == AST_TUPLE_EXPR)
     return 1;
@@ -135,8 +138,7 @@ int expr_yields_owned_rc_value(zan_irgen_t *g, zan_ast_node_t *e,
     /* Match emit_expr_member_access: a type-qualified static load does not
      * evaluate an inherited field/property with the same receiver name.
      * Static fields are borrowed; custom getter results remain owned. */
-    zan_symbol_t *cs =
-        zan_binder_lookup(g->binder, e->member.object->ident.name);
+    zan_symbol_t *cs = receiver_type_symbol(g, e->member.object, locals);
     if (cs && (cs->kind == SYM_CLASS || cs->kind == SYM_STRUCT)) {
       zan_symbol_t *fs = get_field_sym(cs, e->member.name);
       if (fs && (fs->modifiers & MOD_STATIC))
@@ -177,7 +179,7 @@ int expr_yields_owned_rc_value(zan_irgen_t *g, zan_ast_node_t *e,
       tsym = g->current_type_sym;
     if (!tsym && obj && obj->kind == AST_IDENTIFIER && locals &&
         !local_find(locals, obj->ident.name)) {
-      zan_symbol_t *cs = zan_binder_lookup(g->binder, obj->ident.name);
+      zan_symbol_t *cs = receiver_type_symbol(g, obj, locals);
       if (cs && (cs->kind == SYM_CLASS || cs->kind == SYM_STRUCT)) {
         tsym = cs;
       } else if (g->current_type_sym) {
@@ -423,6 +425,8 @@ int call_arg_is_owned_temp(zan_irgen_t *g, zan_ast_node_t *arg, zan_type_t *at,
                            local_scope_t *locals) {
   if (!arg)
     return 0;
+  if (arg->kind == AST_LAMBDA && arg->lambda.is_noescape)
+    return 0;
   if (type_is_binding(at) && arg->kind != AST_NULL_LITERAL &&
       !type_is_binding(infer_expr_type(g, arg, locals)))
     return 1;
@@ -441,6 +445,8 @@ int call_arg_is_owned_temp(zan_irgen_t *g, zan_ast_node_t *arg, zan_type_t *at,
 void emit_release_owned_call_temp(zan_irgen_t *g, zan_ast_node_t *arg,
                                   LLVMValueRef val, local_scope_t *locals) {
   if (!arg || !locals || !val)
+    return;
+  if (arg->kind == AST_LAMBDA && arg->lambda.is_noescape)
     return;
   zan_type_t *emitted_type = call_arg_temp_type(g, arg, val, locals);
   if (type_is_binding(emitted_type) &&
@@ -973,7 +979,8 @@ static bool same_cleanup(const local_var_t *a, const local_var_t *b) {
          a->obj_rc_flag == b->obj_rc_flag && a->byref_slot == b->byref_slot &&
          a->binding_decl == b->binding_decl && a->async_decl == b->async_decl &&
          a->async_role == b->async_role && a->frame_owner == b->frame_owner &&
-         a->struct_rc == b->struct_rc && a->per_iteration == b->per_iteration;
+         a->struct_rc == b->struct_rc && a->drop_flag == b->drop_flag &&
+         a->per_iteration == b->per_iteration;
 }
 
 LLVMBasicBlockRef active_lpad(zan_irgen_t *g, zan_lpad_entry_t *entry) {
@@ -1123,6 +1130,8 @@ void emit_lpad_cleanups(zan_irgen_t *g, zan_lpad_entry_t *entry) {
       emit_release_obj_local_ex(g, cl, cold_mem);
     } else if (cl->box_cell) {
       release_boxed_local_ex(g, cl, cold_mem);
+    } else if (cl->drop_flag) {
+      emit_raii_drop_local_ex(g, cl, cold_mem);
     } else if (cl->struct_rc) {
       emit_struct_local_release_ex(g, cl->type, cl->alloca, cold_mem);
     } else if (local_owns_arc(cl)) {
@@ -1163,6 +1172,8 @@ static void emit_release_owned_locals_except(zan_irgen_t *g,
       emit_release_obj_local(g, &locals->vars[i]);
     } else if (locals->vars[i].box_cell) {
       release_boxed_local(g, &locals->vars[i]);
+    } else if (locals->vars[i].drop_flag) {
+      emit_raii_drop_local(g, &locals->vars[i]);
     } else if (locals->vars[i].struct_rc) {
       emit_struct_local_release(g, locals->vars[i].type,
                                 locals->vars[i].alloca);
@@ -1185,6 +1196,8 @@ void emit_release_owned_locals_no_pop(zan_irgen_t *g, local_scope_t *locals) {
       emit_release_obj_local(g, &locals->vars[i]);
     } else if (locals->vars[i].box_cell) {
       release_boxed_local(g, &locals->vars[i]);
+    } else if (locals->vars[i].drop_flag) {
+      emit_raii_drop_local(g, &locals->vars[i]);
     } else if (locals->vars[i].struct_rc) {
       emit_struct_local_release(g, locals->vars[i].type,
                                 locals->vars[i].alloca);
@@ -1222,6 +1235,8 @@ void emit_release_owned_locals_range_ex(zan_irgen_t *g, local_scope_t *locals,
       emit_release_obj_local(g, &locals->vars[i]);
     } else if (locals->vars[i].box_cell) {
       release_boxed_local(g, &locals->vars[i]);
+    } else if (locals->vars[i].drop_flag) {
+      emit_raii_drop_local(g, &locals->vars[i]);
     } else if (locals->vars[i].struct_rc) {
       emit_struct_local_release(g, locals->vars[i].type,
                                 locals->vars[i].alloca);
@@ -1300,6 +1315,8 @@ void emit_release_owned_locals_from(zan_irgen_t *g, local_scope_t *locals,
       emit_release_obj_local(g, &locals->vars[i]);
     } else if (!terminated && locals->vars[i].box_cell) {
       release_boxed_local(g, &locals->vars[i]);
+    } else if (!terminated && locals->vars[i].drop_flag) {
+      emit_raii_drop_local(g, &locals->vars[i]);
     } else if (!terminated && locals->vars[i].struct_rc) {
       emit_struct_local_release(g, locals->vars[i].type,
                                 locals->vars[i].alloca);

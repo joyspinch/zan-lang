@@ -30,7 +30,13 @@ static zan_ast_node_t *parse_type_decl(zan_parser_t *p, uint32_t modifiers) {
   if (parser_match(p, TK_LESS)) {
     while (!parser_check(p, TK_GREATER) && !parser_check(p, TK_EOF)) {
       int variance = 0;
-      if (parser_match(p, TK_OUT)) {
+      bool is_const_tp = false;
+      if (parser_match(p, TK_CONST)) {
+        is_const_tp = true;
+        if (parser_check(p, TK_INT) || parser_check(p, TK_LONG) ||
+            parser_check(p, TK_UINT) || parser_check(p, TK_ULONG))
+          parser_advance(p);
+      } else if (parser_match(p, TK_OUT)) {
         variance = 1;
       } else if (parser_match(p, TK_IN)) {
         variance = -1;
@@ -42,6 +48,7 @@ static zan_ast_node_t *parse_type_decl(zan_parser_t *p, uint32_t modifiers) {
         tp->ident.name = p->previous.str_val;
         zan_ast_set_name_span(tp, p->previous.loc, tp->ident.name.len);
         tp->ident.variance = variance;
+        tp->ident.is_const_param = is_const_tp;
         zan_ast_list_push(&type_params, tp, p->arena);
       }
       if (!parser_match(p, TK_COMMA))
@@ -54,6 +61,17 @@ static zan_ast_node_t *parse_type_decl(zan_parser_t *p, uint32_t modifiers) {
   zan_ast_list_init(&bases);
   if (parser_match(p, TK_COLON)) {
     do {
+      if (parser_match(p, TK_TILDE)) {
+        if (parser_check(p, TK_IDENT) && p->current.str_val.len == 8 &&
+            memcmp(p->current.str_val.str, "Copyable", 8) == 0) {
+          parser_advance(p);
+          modifiers |= MOD_NONCOPYABLE;
+          continue;
+        }
+        zan_diag_emit_code(p->diag, DIAG_ERROR, p->current.loc, 53,
+                           "expected 'Copyable' after '~' in type declaration");
+        continue;
+      }
       zan_ast_node_t *base = parse_type_ref(p);
       zan_ast_list_push(&bases, base, p->arena);
     } while (parser_match(p, TK_COMMA));
@@ -66,26 +84,269 @@ static zan_ast_node_t *parse_type_decl(zan_parser_t *p, uint32_t modifiers) {
   zan_ast_list_t members;
   zan_ast_list_init(&members);
 
+  zan_adt_info_t *adt_info = NULL;
+
   if (kind == AST_ENUM_DECL) {
     parser_expect(p, TK_LBRACE);
+    bool is_adt = (type_params.count > 0);
+    /* Temporarily collect parsed variants (name, loc, value, optional params) */
+    typedef struct {
+      zan_istr_t name;
+      zan_loc_t loc;
+      zan_ast_node_t *value;
+      zan_ast_list_t params;
+      bool has_parens;
+    } adt_raw_var_t;
+    int vcap = 16, vcnt = 0;
+    adt_raw_var_t *vars = (adt_raw_var_t *)zan_arena_alloc(
+        p->arena, sizeof(adt_raw_var_t) * (size_t)vcap);
+
     while (!parser_check(p, TK_RBRACE) && !parser_check(p, TK_EOF)) {
-      zan_loc_t member_loc = p->current.loc;
       if (parser_check(p, TK_IDENT)) {
         parser_advance(p);
-        zan_ast_node_t *em = zan_ast_new(p->arena, AST_ENUM_MEMBER, member_loc);
-        em->enum_member.name = p->previous.str_val;
-        zan_ast_set_name_span(em, p->previous.loc, em->enum_member.name.len);
-        em->enum_member.value = NULL;
-        if (parser_match(p, TK_EQ)) {
-          em->enum_member.value = parse_expression(p);
+        zan_istr_t vname = p->previous.str_val;
+        zan_loc_t vname_loc = p->previous.loc;
+        zan_ast_list_t vparams;
+        zan_ast_list_init(&vparams);
+        bool has_parens = false;
+        zan_ast_node_t *val_expr = NULL;
+
+        if (parser_match(p, TK_LPAREN)) {
+          has_parens = true;
+          is_adt = true;
+          int pidx = 0;
+          while (!parser_check(p, TK_RPAREN) && !parser_check(p, TK_EOF)) {
+            zan_loc_t ploc = p->current.loc;
+            zan_ast_node_t *ptype = parse_type_ref(p);
+            zan_istr_t pname;
+            zan_loc_t pname_loc = ploc;
+            if (parser_check(p, TK_IDENT)) {
+              parser_advance(p);
+              pname = p->previous.str_val;
+              pname_loc = p->previous.loc;
+            } else {
+              char pbuf[24];
+              int plen = snprintf(pbuf, sizeof(pbuf), "_%d", pidx);
+              char *ps = (char *)zan_arena_alloc(p->arena, (size_t)plen + 1);
+              memcpy(ps, pbuf, (size_t)plen + 1);
+              pname.str = ps;
+              pname.len = (uint32_t)plen;
+            }
+            zan_ast_node_t *param = zan_ast_new(p->arena, AST_PARAM, ploc);
+            param->param.type = ptype;
+            param->param.name = pname;
+            param->param.name_loc = pname_loc;
+            zan_ast_set_name_span(param, pname_loc, pname.len);
+            zan_ast_list_push(&vparams, param, p->arena);
+            pidx++;
+            if (!parser_match(p, TK_COMMA))
+              break;
+          }
+          parser_expect(p, TK_RPAREN);
+        } else if (parser_match(p, TK_EQ)) {
+          val_expr = parse_expression(p);
         }
-        zan_ast_list_push(&members, em, p->arena);
+
+        if (vcnt >= vcap) {
+          int ncap = vcap * 2;
+          adt_raw_var_t *nv = (adt_raw_var_t *)zan_arena_alloc(
+              p->arena, sizeof(adt_raw_var_t) * (size_t)ncap);
+          memcpy(nv, vars, sizeof(adt_raw_var_t) * (size_t)vcnt);
+          vars = nv;
+          vcap = ncap;
+        }
+        vars[vcnt].name = vname;
+        vars[vcnt].loc = vname_loc;
+        vars[vcnt].value = val_expr;
+        vars[vcnt].params = vparams;
+        vars[vcnt].has_parens = has_parens;
+        vcnt++;
         parser_match(p, TK_COMMA);
       } else {
         parser_advance(p); /* skip */
       }
     }
     parser_expect(p, TK_RBRACE);
+
+    if (!is_adt) {
+      /* Plain C# integer enum — zero regression */
+      for (int vi = 0; vi < vcnt; vi++) {
+        zan_ast_node_t *em = zan_ast_new(p->arena, AST_ENUM_MEMBER, vars[vi].loc);
+        em->enum_member.name = vars[vi].name;
+        zan_ast_set_name_span(em, vars[vi].loc, vars[vi].name.len);
+        em->enum_member.value = vars[vi].value;
+        zan_ast_list_push(&members, em, p->arena);
+      }
+    } else {
+      /* Tagged Union ADT: lower cleanly to value-type AST_STRUCT_DECL */
+      kind = AST_STRUCT_DECL;
+      adt_info = (zan_adt_info_t *)zan_arena_alloc(p->arena, sizeof(zan_adt_info_t));
+      adt_info->variant_count = vcnt;
+      adt_info->variants = (zan_adt_variant_t *)zan_arena_alloc(
+          p->arena, sizeof(zan_adt_variant_t) * (size_t)(vcnt > 0 ? vcnt : 1));
+
+      /* Helper lambda-like macro for fresh self type ref */
+      #define MAKE_ADT_SELF_TREF(out_tr, ref_loc) do {                         \
+        zan_ast_node_t *_tr = zan_ast_new(p->arena, AST_TYPE_REF, (ref_loc));  \
+        _tr->type_ref.name = name;                                             \
+        zan_ast_list_init(&_tr->type_ref.type_args);                           \
+        for (int _ti = 0; _ti < type_params.count; _ti++) {                    \
+          zan_ast_node_t *_tp = type_params.items[_ti];                        \
+          zan_ast_node_t *_ta = zan_ast_new(p->arena, AST_TYPE_REF, (ref_loc));\
+          _ta->type_ref.name = _tp->ident.name;                                \
+          zan_ast_list_init(&_ta->type_ref.type_args);                         \
+          zan_ast_list_push(&_tr->type_ref.type_args, _ta, p->arena);          \
+        }                                                                      \
+        (out_tr) = _tr;                                                        \
+      } while (0)
+
+      /* Field 0: public int __adt_tag; */
+      {
+        zan_ast_node_t *tf = zan_ast_new(p->arena, AST_FIELD_DECL, loc);
+        zan_istr_t tname = {(char *)"__adt_tag", 9};
+        zan_ast_node_t *int_tr = zan_ast_new(p->arena, AST_TYPE_REF, loc);
+        int_tr->type_ref.name = (zan_istr_t){(char *)"int", 3};
+        zan_ast_list_init(&int_tr->type_ref.type_args);
+        tf->field_decl.name = tname;
+        tf->field_decl.type = int_tr;
+        tf->field_decl.modifiers = MOD_PUBLIC;
+        zan_ast_list_push(&members, tf, p->arena);
+      }
+
+      /* Flattened payload fields + static variant constructors/properties */
+      for (int vi = 0; vi < vcnt; vi++) {
+        adt_raw_var_t *rv = &vars[vi];
+        zan_adt_variant_t *av = &adt_info->variants[vi];
+        av->name = rv->name;
+        av->tag = vi;
+        av->params = rv->params;
+        av->struct_field_names = NULL;
+        int fc = rv->params.count;
+        if (fc > 0) {
+          av->struct_field_names = (zan_istr_t *)zan_arena_alloc(
+              p->arena, sizeof(zan_istr_t) * (size_t)fc);
+          for (int fi = 0; fi < fc; fi++) {
+            zan_ast_node_t *param = rv->params.items[fi];
+            char fbuf[40];
+            int flen = snprintf(fbuf, sizeof(fbuf), "__adt_v%d_%d", vi, fi);
+            char *fs = (char *)zan_arena_alloc(p->arena, (size_t)flen + 1);
+            memcpy(fs, fbuf, (size_t)flen + 1);
+            zan_istr_t fistr = {fs, (uint32_t)flen};
+            av->struct_field_names[fi] = fistr;
+
+            zan_ast_node_t *fld = zan_ast_new(p->arena, AST_FIELD_DECL, param->loc);
+            fld->field_decl.name = fistr;
+            fld->field_decl.type = param->param.type;
+            fld->field_decl.modifiers = MOD_PUBLIC;
+            zan_ast_list_push(&members, fld, p->arena);
+          }
+        }
+
+        /* Synthesize body:
+         *   Self __v = new Self();
+         *   __v.__adt_tag = vi;
+         *   __v.__adt_v<vi>_<fi> = <param_fi>;
+         *   return __v;
+         */
+        zan_ast_node_t *body = zan_ast_new(p->arena, AST_BLOCK, rv->loc);
+        zan_ast_list_init(&body->block.stmts);
+        zan_istr_t vlocal = {(char *)"__v", 3};
+
+        zan_ast_node_t *vdecl = zan_ast_new(p->arena, AST_VAR_DECL, rv->loc);
+        vdecl->var_decl.name = vlocal;
+        MAKE_ADT_SELF_TREF(vdecl->var_decl.type, rv->loc);
+        zan_ast_node_t *vnew = zan_ast_new(p->arena, AST_NEW_EXPR, rv->loc);
+        MAKE_ADT_SELF_TREF(vnew->new_expr.type, rv->loc);
+        zan_ast_list_init(&vnew->new_expr.args);
+        zan_ast_list_init(&vnew->new_expr.arg_inits);
+        vdecl->var_decl.initializer = vnew;
+        zan_ast_list_push(&body->block.stmts, vdecl, p->arena);
+
+        /* __v.__adt_tag = vi; */
+        {
+          zan_ast_node_t *obj = zan_ast_new(p->arena, AST_IDENTIFIER, rv->loc);
+          obj->ident.name = vlocal;
+          zan_ast_node_t *mem = zan_ast_new(p->arena, AST_MEMBER_ACCESS, rv->loc);
+          mem->member.object = obj;
+          mem->member.name = (zan_istr_t){(char *)"__adt_tag", 9};
+          zan_ast_node_t *taglit = zan_ast_new(p->arena, AST_INT_LITERAL, rv->loc);
+          taglit->int_val = vi;
+          zan_ast_node_t *asg = zan_ast_new(p->arena, AST_ASSIGNMENT, rv->loc);
+          asg->binary.op = TK_EQ;
+          asg->binary.left = mem;
+          asg->binary.right = taglit;
+          zan_ast_node_t *es = zan_ast_new(p->arena, AST_EXPR_STMT, rv->loc);
+          es->expr_stmt.expr = asg;
+          zan_ast_list_push(&body->block.stmts, es, p->arena);
+        }
+
+        /* __v.__adt_v<vi>_<fi> = <param_fi>; */
+        for (int fi = 0; fi < fc; fi++) {
+          zan_ast_node_t *param = rv->params.items[fi];
+          zan_ast_node_t *obj = zan_ast_new(p->arena, AST_IDENTIFIER, param->loc);
+          obj->ident.name = vlocal;
+          zan_ast_node_t *mem = zan_ast_new(p->arena, AST_MEMBER_ACCESS, param->loc);
+          mem->member.object = obj;
+          mem->member.name = av->struct_field_names[fi];
+          zan_ast_node_t *rhs = zan_ast_new(p->arena, AST_IDENTIFIER, param->loc);
+          rhs->ident.name = param->param.name;
+          zan_ast_node_t *asg = zan_ast_new(p->arena, AST_ASSIGNMENT, param->loc);
+          asg->binary.op = TK_EQ;
+          asg->binary.left = mem;
+          asg->binary.right = rhs;
+          zan_ast_node_t *es = zan_ast_new(p->arena, AST_EXPR_STMT, param->loc);
+          es->expr_stmt.expr = asg;
+          zan_ast_list_push(&body->block.stmts, es, p->arena);
+        }
+
+        /* return __v; */
+        {
+          zan_ast_node_t *rv_id = zan_ast_new(p->arena, AST_IDENTIFIER, rv->loc);
+          rv_id->ident.name = vlocal;
+          zan_ast_node_t *ret = zan_ast_new(p->arena, AST_RETURN_STMT, rv->loc);
+          ret->ret.value = rv_id;
+          zan_ast_list_push(&body->block.stmts, ret, p->arena);
+        }
+
+        if (fc > 0 || rv->has_parens) {
+          /* Payload variant: public static Self Variant(T0 p0, ...) */
+          zan_ast_node_t *m = zan_ast_new(p->arena, AST_METHOD_DECL, rv->loc);
+          m->method_decl.name = rv->name;
+          zan_ast_set_name_span(m, rv->loc, rv->name.len);
+          MAKE_ADT_SELF_TREF(m->method_decl.return_type, rv->loc);
+          m->method_decl.params = rv->params;
+          zan_ast_list_init(&m->method_decl.type_params);
+          m->method_decl.body = body;
+          m->method_decl.modifiers = MOD_PUBLIC | MOD_STATIC;
+          zan_ast_list_push(&members, m, p->arena);
+        } else {
+          /* Unit variant: public static Self Variant { get { ... } } */
+          zan_ast_node_t *pf = zan_ast_new(p->arena, AST_PROPERTY_DECL, rv->loc);
+          pf->field_decl.name = rv->name;
+          zan_ast_set_name_span(pf, rv->loc, rv->name.len);
+          MAKE_ADT_SELF_TREF(pf->field_decl.type, rv->loc);
+          pf->field_decl.modifiers = MOD_PUBLIC | MOD_STATIC;
+          pf->field_decl.has_getter = true;
+          pf->field_decl.getter_body = body;
+          zan_ast_list_push(&members, pf, p->arena);
+
+          char *gname = (char *)zan_arena_alloc(p->arena, 4 + (size_t)rv->name.len + 1);
+          memcpy(gname, "get_", 4);
+          memcpy(gname + 4, rv->name.str, rv->name.len);
+          gname[4 + rv->name.len] = '\0';
+          zan_istr_t gistr = {gname, (uint32_t)(4 + rv->name.len)};
+          zan_ast_node_t *gm = zan_ast_new(p->arena, AST_METHOD_DECL, rv->loc);
+          gm->method_decl.name = gistr;
+          MAKE_ADT_SELF_TREF(gm->method_decl.return_type, rv->loc);
+          zan_ast_list_init(&gm->method_decl.params);
+          zan_ast_list_init(&gm->method_decl.type_params);
+          gm->method_decl.body = body;
+          gm->method_decl.modifiers = MOD_PUBLIC | MOD_STATIC;
+          zan_ast_list_push(&members, gm, p->arena);
+        }
+      }
+      #undef MAKE_ADT_SELF_TREF
+    }
   } else {
     parser_expect(p, TK_LBRACE);
     while (!parser_check(p, TK_RBRACE) && !parser_check(p, TK_EOF)) {
@@ -112,6 +373,9 @@ static zan_ast_node_t *parse_type_decl(zan_parser_t *p, uint32_t modifiers) {
   n->type_decl.bases = bases;
   n->type_decl.members = members;
   n->type_decl.modifiers = modifiers;
+  if (adt_info) {
+    zan_ast_ensure_decl_meta(n, p->arena)->adt_info = adt_info;
+  }
   if (wheres.count > 0) {
     n->type_decl.where_clauses =
         (zan_ast_list_t *)zan_arena_alloc(p->arena, sizeof(zan_ast_list_t));
@@ -634,11 +898,428 @@ static void iter_rewrite_stmt(zan_ast_node_t *s, iter_ctx *c) {
   }
 }
 
+/* Rewrite `yield return v;` -> `if (!await this.__ch.Write(v)) return;`
+ * and `yield break;` -> `return;` inside an async IAsyncEnumerable<T> body. */
+static void async_iter_rewrite_yields(zan_parser_t *p, zan_ast_node_t **slot) {
+  if (!slot || !*slot)
+    return;
+  zan_ast_node_t *s = *slot;
+  if (s->kind == AST_YIELD_STMT) {
+    zan_loc_t loc = s->loc;
+    if (!s->yield_stmt.value) {
+      zan_ast_node_t *r = zan_ast_new(p->arena, AST_RETURN_STMT, loc);
+      r->ret.value = NULL;
+      *slot = r;
+      return;
+    }
+    zan_ast_node_t *ch =
+        iter_member(p, zan_ast_new(p->arena, AST_THIS_EXPR, loc), "__ch", loc);
+    zan_ast_node_t *wm = iter_member(p, ch, "Write", loc);
+    zan_ast_node_t *wcall = zan_ast_new(p->arena, AST_CALL, loc);
+    wcall->call.callee = wm;
+    zan_ast_list_init(&wcall->call.args);
+    zan_ast_list_init(&wcall->call.type_args);
+    zan_ast_list_push(&wcall->call.args, s->yield_stmt.value, p->arena);
+
+    zan_ast_node_t *aw = zan_ast_new(p->arena, AST_AWAIT_EXPR, loc);
+    aw->await_expr.expr = wcall;
+
+    zan_ast_node_t *neg = zan_ast_new(p->arena, AST_UNARY, loc);
+    neg->unary.op = TK_BANG;
+    neg->unary.operand = aw;
+
+    zan_ast_node_t *ret = zan_ast_new(p->arena, AST_RETURN_STMT, loc);
+    ret->ret.value = NULL;
+
+    zan_ast_node_t *ifs = zan_ast_new(p->arena, AST_IF_STMT, loc);
+    ifs->if_stmt.cond = neg;
+    ifs->if_stmt.then_body = ret;
+    ifs->if_stmt.else_body = NULL;
+    *slot = ifs;
+    return;
+  }
+  int n = zan_ast_child_count(s);
+  for (int i = 0; i < n; i++) {
+    zan_ast_node_t **ch = zan_ast_child_ptr_at(s, i);
+    if (ch && *ch)
+      async_iter_rewrite_yields(p, ch);
+  }
+}
+
+static void async_iter_ensure_using(zan_parser_t *p, zan_ast_node_t *unit,
+                                    const char **parts, int count,
+                                    zan_loc_t loc) {
+  for (int i = 0; i < unit->comp_unit.usings.count; i++) {
+    zan_ast_node_t *u = unit->comp_unit.usings.items[i];
+    if (!u || u->kind != AST_USING_DECL || !u->using_decl.name ||
+        u->using_decl.name->kind != AST_QUALIFIED_NAME ||
+        u->using_decl.name->qualified_name.parts.count != count)
+      continue;
+    bool match = true;
+    for (int k = 0; k < count; k++) {
+      zan_ast_node_t *pt = u->using_decl.name->qualified_name.parts.items[k];
+      if (!pt || pt->kind != AST_IDENTIFIER ||
+          pt->ident.name.len != (uint32_t)strlen(parts[k]) ||
+          memcmp(pt->ident.name.str, parts[k], pt->ident.name.len) != 0) {
+        match = false;
+        break;
+      }
+    }
+    if (match)
+      return;
+  }
+  zan_ast_node_t *un = zan_ast_new(p->arena, AST_USING_DECL, loc);
+  un->using_decl.is_static = false;
+  zan_ast_node_t *qn = zan_ast_new(p->arena, AST_QUALIFIED_NAME, loc);
+  zan_ast_list_init(&qn->qualified_name.parts);
+  for (int k = 0; k < count; k++)
+    zan_ast_list_push(&qn->qualified_name.parts, iter_ident(p, parts[k], loc),
+                      p->arena);
+  un->using_decl.name = qn;
+  zan_ast_list_push(&unit->comp_unit.usings, un, p->arena);
+}
+
+static void async_iter_desugar_method(zan_parser_t *p, zan_ast_node_t *enc,
+                                      zan_ast_node_t *m, zan_ast_node_t *unit) {
+  (void)enc;
+  zan_ast_node_t *rt = m->method_decl.return_type;
+  zan_ast_node_t *elem_ty = rt->type_ref.type_args.items[0];
+  zan_loc_t loc = m->loc;
+
+  char clsbuf[96];
+  snprintf(clsbuf, sizeof(clsbuf), "__AsyncIter_%.*s_%d",
+           (int)m->method_decl.name.len, m->method_decl.name.str,
+           p->synth_counter++);
+
+  zan_ast_node_t *cls = zan_ast_new(p->arena, AST_CLASS_DECL, loc);
+  cls->type_decl.name = iter_intern(p, clsbuf);
+  zan_ast_list_init(&cls->type_decl.type_params);
+  zan_ast_list_init(&cls->type_decl.bases);
+  zan_ast_list_init(&cls->type_decl.members);
+  cls->type_decl.modifiers = 0;
+
+  /* Implements IAsyncEnumerator<T>, IAsyncEnumerable<T> */
+  zan_ast_node_t *ibase = iter_type_ref(p, "IAsyncEnumerator", loc);
+  zan_ast_list_push(&ibase->type_ref.type_args, elem_ty, p->arena);
+  zan_ast_list_push(&cls->type_decl.bases, ibase, p->arena);
+
+  zan_ast_node_t *ebase = iter_type_ref(p, "IAsyncEnumerable", loc);
+  zan_ast_list_push(&ebase->type_ref.type_args, elem_ty, p->arena);
+  zan_ast_list_push(&cls->type_decl.bases, ebase, p->arena);
+
+  /* Fields: Channel<T> __ch; T __cur; bool __started; + __arg0..N */
+  iter_ctx c;
+  memset(&c, 0, sizeof(c));
+  c.p = p;
+  c.cls = cls;
+  zan_ast_node_t *ch_ty = iter_type_ref(p, "Channel", loc);
+  zan_ast_list_push(&ch_ty->type_ref.type_args, elem_ty, p->arena);
+  iter_add_field(&c, "__ch", ch_ty, loc);
+  iter_add_field(&c, "__cur", elem_ty, loc);
+  iter_add_field(&c, "__started", iter_type_ref(p, "bool", loc), loc);
+
+  /* Constructor: __AsyncIter(params) { this.__ch = new Channel<T>(1); ... } */
+  zan_ast_list_t *mps = &m->method_decl.params;
+  zan_ast_node_t *ctor = zan_ast_new(p->arena, AST_CONSTRUCTOR_DECL, loc);
+  ctor->method_decl.name = cls->type_decl.name;
+  zan_ast_list_init(&ctor->method_decl.params);
+  zan_ast_node_t *cbody = zan_ast_new(p->arena, AST_BLOCK, loc);
+  zan_ast_list_init(&cbody->block.stmts);
+  ctor->method_decl.body = cbody;
+  ctor->method_decl.modifiers = MOD_PUBLIC;
+
+  {
+    /* this.__ch = new Channel<T>(1); */
+    zan_ast_node_t *nw_ch = zan_ast_new(p->arena, AST_NEW_EXPR, loc);
+    nw_ch->new_expr.type = ch_ty;
+    zan_ast_list_init(&nw_ch->new_expr.args);
+    zan_ast_node_t *cap1 = zan_ast_new(p->arena, AST_INT_LITERAL, loc);
+    cap1->int_val = 1;
+    cap1->lit_radix = 10;
+    zan_ast_list_push(&nw_ch->new_expr.args, cap1, p->arena);
+    zan_ast_node_t *as_ch = zan_ast_new(p->arena, AST_EXPR_STMT, loc);
+    as_ch->expr_stmt.expr =
+        iter_assign(p,
+                    iter_member(p, zan_ast_new(p->arena, AST_THIS_EXPR, loc),
+                                "__ch", loc),
+                    nw_ch, loc);
+    zan_ast_list_push(&cbody->block.stmts, as_ch, p->arena);
+
+    /* this.__started = false; */
+    zan_ast_node_t *bf = zan_ast_new(p->arena, AST_BOOL_LITERAL, loc);
+    bf->bool_val = false;
+    zan_ast_node_t *as_st = zan_ast_new(p->arena, AST_EXPR_STMT, loc);
+    as_st->expr_stmt.expr =
+        iter_assign(p,
+                    iter_member(p, zan_ast_new(p->arena, AST_THIS_EXPR, loc),
+                                "__started", loc),
+                    bf, loc);
+    zan_ast_list_push(&cbody->block.stmts, as_st, p->arena);
+  }
+
+  for (int i = 0; i < mps->count; i++) {
+    zan_ast_node_t *pm = mps->items[i];
+    if (!pm || pm->kind != AST_PARAM)
+      continue;
+    char fbuf[32];
+    snprintf(fbuf, sizeof(fbuf), "__arg%d", i);
+    iter_add_field(&c, fbuf, pm->param.type, loc);
+
+    zan_ast_node_t *np = zan_ast_new(p->arena, AST_PARAM, loc);
+    np->param.name = pm->param.name;
+    np->param.type = pm->param.type;
+    zan_ast_list_push(&ctor->method_decl.params, np, p->arena);
+
+    zan_ast_node_t *as = zan_ast_new(p->arena, AST_EXPR_STMT, loc);
+    as->expr_stmt.expr = iter_assign(
+        p, iter_member(p, zan_ast_new(p->arena, AST_THIS_EXPR, loc), fbuf, loc),
+        iter_istr_ident(p, pm->param.name, loc), loc);
+    zan_ast_list_push(&cbody->block.stmts, as, p->arena);
+  }
+  zan_ast_list_push(&cls->type_decl.members, ctor, p->arena);
+
+  /* private async void __Produce(original params) { try { body } finally { this.__ch.Complete(); } } */
+  async_iter_rewrite_yields(p, &m->method_decl.body);
+  zan_ast_node_t *prod = zan_ast_new(p->arena, AST_METHOD_DECL, loc);
+  prod->method_decl.name = iter_intern(p, "__Produce");
+  prod->method_decl.return_type = iter_type_ref(p, "void", loc);
+  prod->method_decl.params = m->method_decl.params;
+  prod->method_decl.modifiers = MOD_PRIVATE | MOD_ASYNC;
+  {
+    zan_ast_node_t *fin_call = zan_ast_new(p->arena, AST_CALL, loc);
+    fin_call->call.callee = iter_member(
+        p, iter_member(p, zan_ast_new(p->arena, AST_THIS_EXPR, loc), "__ch", loc),
+        "Complete", loc);
+    zan_ast_list_init(&fin_call->call.args);
+    zan_ast_list_init(&fin_call->call.type_args);
+    zan_ast_node_t *fin_stmt = zan_ast_new(p->arena, AST_EXPR_STMT, loc);
+    fin_stmt->expr_stmt.expr = fin_call;
+    zan_ast_node_t *fin_blk = zan_ast_new(p->arena, AST_BLOCK, loc);
+    zan_ast_list_init(&fin_blk->block.stmts);
+    zan_ast_list_push(&fin_blk->block.stmts, fin_stmt, p->arena);
+
+    zan_ast_node_t *ts = zan_ast_new(p->arena, AST_TRY_STMT, loc);
+    ts->try_stmt.try_body = m->method_decl.body;
+    zan_ast_list_init(&ts->try_stmt.catches);
+    ts->try_stmt.finally_body = fin_blk;
+
+    zan_ast_node_t *pbody = zan_ast_new(p->arena, AST_BLOCK, loc);
+    zan_ast_list_init(&pbody->block.stmts);
+    zan_ast_list_push(&pbody->block.stmts, ts, p->arena);
+    prod->method_decl.body = pbody;
+  }
+  zan_ast_list_push(&cls->type_decl.members, prod, p->arena);
+
+  /* public async Task<bool> MoveNextAsync() (unwrapped return_type = bool + is_task_return) */
+  zan_ast_node_t *mn = zan_ast_new(p->arena, AST_METHOD_DECL, loc);
+  mn->method_decl.name = iter_intern(p, "MoveNextAsync");
+  mn->method_decl.return_type = iter_type_ref(p, "bool", loc);
+  mn->method_decl.is_task_return = true;
+  zan_ast_list_init(&mn->method_decl.params);
+  mn->method_decl.modifiers = MOD_PUBLIC | MOD_ASYNC;
+  {
+    zan_ast_node_t *mb = zan_ast_new(p->arena, AST_BLOCK, loc);
+    zan_ast_list_init(&mb->block.stmts);
+
+    /* if (!this.__started) { this.__started = true; Task.Spawn(this.__Produce(this.__arg0, ...)); } */
+    zan_ast_node_t *not_st = zan_ast_new(p->arena, AST_UNARY, loc);
+    not_st->unary.op = TK_BANG;
+    not_st->unary.operand = iter_member(
+        p, zan_ast_new(p->arena, AST_THIS_EXPR, loc), "__started", loc);
+
+    zan_ast_node_t *bt = zan_ast_new(p->arena, AST_BOOL_LITERAL, loc);
+    bt->bool_val = true;
+    zan_ast_node_t *set_st = zan_ast_new(p->arena, AST_EXPR_STMT, loc);
+    set_st->expr_stmt.expr = iter_assign(
+        p,
+        iter_member(p, zan_ast_new(p->arena, AST_THIS_EXPR, loc), "__started",
+                    loc),
+        bt, loc);
+
+    zan_ast_node_t *pcall = zan_ast_new(p->arena, AST_CALL, loc);
+    pcall->call.callee = iter_member(
+        p, zan_ast_new(p->arena, AST_THIS_EXPR, loc), "__Produce", loc);
+    zan_ast_list_init(&pcall->call.args);
+    zan_ast_list_init(&pcall->call.type_args);
+    for (int i = 0; i < mps->count; i++) {
+      char fbuf[32];
+      snprintf(fbuf, sizeof(fbuf), "__arg%d", i);
+      zan_ast_list_push(
+          &pcall->call.args,
+          iter_member(p, zan_ast_new(p->arena, AST_THIS_EXPR, loc), fbuf, loc),
+          p->arena);
+    }
+    zan_ast_node_t *sp_call = zan_ast_new(p->arena, AST_CALL, loc);
+    sp_call->call.callee =
+        iter_member(p, iter_ident(p, "Task", loc), "Spawn", loc);
+    zan_ast_list_init(&sp_call->call.args);
+    zan_ast_list_init(&sp_call->call.type_args);
+    zan_ast_list_push(&sp_call->call.args, pcall, p->arena);
+    zan_ast_node_t *sp_stmt = zan_ast_new(p->arena, AST_EXPR_STMT, loc);
+    sp_stmt->expr_stmt.expr = sp_call;
+
+    zan_ast_node_t *if_blk = zan_ast_new(p->arena, AST_BLOCK, loc);
+    zan_ast_list_init(&if_blk->block.stmts);
+    zan_ast_list_push(&if_blk->block.stmts, set_st, p->arena);
+    zan_ast_list_push(&if_blk->block.stmts, sp_stmt, p->arena);
+
+    zan_ast_node_t *if_st = zan_ast_new(p->arena, AST_IF_STMT, loc);
+    if_st->if_stmt.cond = not_st;
+    if_st->if_stmt.then_body = if_blk;
+    if_st->if_stmt.else_body = NULL;
+    zan_ast_list_push(&mb->block.stmts, if_st, p->arena);
+
+    /* T __v; bool __ok = await this.__ch.Read(out __v); if (__ok) { this.__cur = __v; return true; } return false; */
+    zan_ast_node_t *vdecl = zan_ast_new(p->arena, AST_VAR_DECL, loc);
+    vdecl->var_decl.name = iter_intern(p, "__v");
+    vdecl->var_decl.type = elem_ty;
+    vdecl->var_decl.initializer = NULL;
+    zan_ast_list_push(&mb->block.stmts, vdecl, p->arena);
+
+    zan_ast_node_t *ref_v = zan_ast_new(p->arena, AST_REF_ARG, loc);
+    ref_v->ref_arg.expr = iter_ident(p, "__v", loc);
+    ref_v->ref_arg.is_out = 1;
+
+    zan_ast_node_t *rcall = zan_ast_new(p->arena, AST_CALL, loc);
+    rcall->call.callee = iter_member(
+        p, iter_member(p, zan_ast_new(p->arena, AST_THIS_EXPR, loc), "__ch", loc),
+        "Read", loc);
+    zan_ast_list_init(&rcall->call.args);
+    zan_ast_list_init(&rcall->call.type_args);
+    zan_ast_list_push(&rcall->call.args, ref_v, p->arena);
+
+    zan_ast_node_t *raw = zan_ast_new(p->arena, AST_AWAIT_EXPR, loc);
+    raw->await_expr.expr = rcall;
+
+    zan_ast_node_t *ok_decl = zan_ast_new(p->arena, AST_VAR_DECL, loc);
+    ok_decl->var_decl.name = iter_intern(p, "__ok");
+    ok_decl->var_decl.type = iter_type_ref(p, "bool", loc);
+    ok_decl->var_decl.initializer = raw;
+    zan_ast_list_push(&mb->block.stmts, ok_decl, p->arena);
+
+    zan_ast_node_t *set_cur = zan_ast_new(p->arena, AST_EXPR_STMT, loc);
+    set_cur->expr_stmt.expr = iter_assign(
+        p,
+        iter_member(p, zan_ast_new(p->arena, AST_THIS_EXPR, loc), "__cur", loc),
+        iter_ident(p, "__v", loc), loc);
+    zan_ast_node_t *rt_t = zan_ast_new(p->arena, AST_RETURN_STMT, loc);
+    zan_ast_node_t *lit_t = zan_ast_new(p->arena, AST_BOOL_LITERAL, loc);
+    lit_t->bool_val = true;
+    rt_t->ret.value = lit_t;
+    zan_ast_node_t *ok_blk = zan_ast_new(p->arena, AST_BLOCK, loc);
+    zan_ast_list_init(&ok_blk->block.stmts);
+    zan_ast_list_push(&ok_blk->block.stmts, set_cur, p->arena);
+    zan_ast_list_push(&ok_blk->block.stmts, rt_t, p->arena);
+
+    zan_ast_node_t *if_ok = zan_ast_new(p->arena, AST_IF_STMT, loc);
+    if_ok->if_stmt.cond = iter_ident(p, "__ok", loc);
+    if_ok->if_stmt.then_body = ok_blk;
+    if_ok->if_stmt.else_body = NULL;
+    zan_ast_list_push(&mb->block.stmts, if_ok, p->arena);
+
+    zan_ast_node_t *rt_f = zan_ast_new(p->arena, AST_RETURN_STMT, loc);
+    zan_ast_node_t *lit_f = zan_ast_new(p->arena, AST_BOOL_LITERAL, loc);
+    lit_f->bool_val = false;
+    rt_f->ret.value = lit_f;
+    zan_ast_list_push(&mb->block.stmts, rt_f, p->arena);
+    mn->method_decl.body = mb;
+  }
+  zan_ast_list_push(&cls->type_decl.members, mn, p->arena);
+
+  /* public T Current() { return this.__cur; } */
+  zan_ast_node_t *cur = zan_ast_new(p->arena, AST_METHOD_DECL, loc);
+  cur->method_decl.name = iter_intern(p, "Current");
+  cur->method_decl.return_type = elem_ty;
+  zan_ast_list_init(&cur->method_decl.params);
+  cur->method_decl.modifiers = MOD_PUBLIC;
+  {
+    zan_ast_node_t *cb = zan_ast_new(p->arena, AST_BLOCK, loc);
+    zan_ast_list_init(&cb->block.stmts);
+    zan_ast_node_t *rr = zan_ast_new(p->arena, AST_RETURN_STMT, loc);
+    rr->ret.value =
+        iter_member(p, zan_ast_new(p->arena, AST_THIS_EXPR, loc), "__cur", loc);
+    zan_ast_list_push(&cb->block.stmts, rr, p->arena);
+    cur->method_decl.body = cb;
+  }
+  zan_ast_list_push(&cls->type_decl.members, cur, p->arena);
+
+  /* public IAsyncEnumerator<T> GetAsyncEnumerator() { return this; } */
+  zan_ast_node_t *ge = zan_ast_new(p->arena, AST_METHOD_DECL, loc);
+  ge->method_decl.name = iter_intern(p, "GetAsyncEnumerator");
+  ge->method_decl.return_type = ibase;
+  zan_ast_list_init(&ge->method_decl.params);
+  ge->method_decl.modifiers = MOD_PUBLIC;
+  {
+    zan_ast_node_t *gb = zan_ast_new(p->arena, AST_BLOCK, loc);
+    zan_ast_list_init(&gb->block.stmts);
+    zan_ast_node_t *rr = zan_ast_new(p->arena, AST_RETURN_STMT, loc);
+    rr->ret.value = zan_ast_new(p->arena, AST_THIS_EXPR, loc);
+    zan_ast_list_push(&gb->block.stmts, rr, p->arena);
+    ge->method_decl.body = gb;
+  }
+  zan_ast_list_push(&cls->type_decl.members, ge, p->arena);
+
+  /* public void Dispose() { if (this.__ch != null) { this.__ch.Complete(); } } */
+  zan_ast_node_t *dp = zan_ast_new(p->arena, AST_METHOD_DECL, loc);
+  dp->method_decl.name = iter_intern(p, "Dispose");
+  dp->method_decl.return_type = iter_type_ref(p, "void", loc);
+  zan_ast_list_init(&dp->method_decl.params);
+  dp->method_decl.modifiers = MOD_PUBLIC;
+  {
+    zan_ast_node_t *db = zan_ast_new(p->arena, AST_BLOCK, loc);
+    zan_ast_list_init(&db->block.stmts);
+    zan_ast_node_t *cc = zan_ast_new(p->arena, AST_CALL, loc);
+    cc->call.callee = iter_member(
+        p, iter_member(p, zan_ast_new(p->arena, AST_THIS_EXPR, loc), "__ch", loc),
+        "Complete", loc);
+    zan_ast_list_init(&cc->call.args);
+    zan_ast_list_init(&cc->call.type_args);
+    zan_ast_node_t *cs = zan_ast_new(p->arena, AST_EXPR_STMT, loc);
+    cs->expr_stmt.expr = cc;
+    zan_ast_list_push(&db->block.stmts, cs, p->arena);
+    dp->method_decl.body = db;
+  }
+  zan_ast_list_push(&cls->type_decl.members, dp, p->arena);
+
+  /* Original method: strip MOD_ASYNC (returns IAsyncEnumerable<T> directly),
+   * body -> `return new __AsyncIter_Name_N(args...);` */
+  m->method_decl.modifiers &= ~(uint32_t)MOD_ASYNC;
+  zan_ast_node_t *nb = zan_ast_new(p->arena, AST_BLOCK, loc);
+  zan_ast_list_init(&nb->block.stmts);
+  zan_ast_node_t *nw = zan_ast_new(p->arena, AST_NEW_EXPR, loc);
+  nw->new_expr.type = iter_type_ref(p, cls->type_decl.name.str, loc);
+  zan_ast_list_init(&nw->new_expr.args);
+  for (int i = 0; i < mps->count; i++) {
+    zan_ast_node_t *pm = mps->items[i];
+    if (pm && pm->kind == AST_PARAM)
+      zan_ast_list_push(&nw->new_expr.args,
+                        iter_istr_ident(p, pm->param.name, loc), p->arena);
+  }
+  zan_ast_node_t *nret = zan_ast_new(p->arena, AST_RETURN_STMT, loc);
+  nret->ret.value = nw;
+  zan_ast_list_push(&nb->block.stmts, nret, p->arena);
+  m->method_decl.body = nb;
+
+  const char *u_gen[3] = {"System", "Collections", "Generic"};
+  const char *u_thr[2] = {"System", "Threading"};
+  async_iter_ensure_using(p, unit, u_gen, 3, loc);
+  async_iter_ensure_using(p, unit, u_thr, 2, loc);
+
+  zan_ast_list_push(&unit->comp_unit.decls, cls, p->arena);
+}
+
 static void iter_desugar_method(zan_parser_t *p, zan_ast_node_t *enc,
                                 zan_ast_node_t *m, zan_ast_node_t *unit) {
   zan_ast_node_t *rt = m->method_decl.return_type;
   if (!rt || rt->kind != AST_TYPE_REF || rt->type_ref.type_args.count != 1)
     return;
+  if (rt->type_ref.name.len == 16 &&
+      memcmp(rt->type_ref.name.str, "IAsyncEnumerable", 16) == 0 &&
+      m->method_decl.body && m->method_decl.body->kind == AST_BLOCK &&
+      stmt_contains_yield(m->method_decl.body)) {
+    async_iter_desugar_method(p, enc, m, unit);
+    return;
+  }
   if (!(rt->type_ref.name.len == 11 &&
         memcmp(rt->type_ref.name.str, "IEnumerable", 11) == 0))
     return;

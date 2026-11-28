@@ -1,0 +1,790 @@
+// rt_timer_diag.zan: UTF-8 argv conversion, soft-failure notes & scratch,
+// guard failures, fatal handler, stdout buffering setup, header readability probe.
+// Replaces src/runtime/timer/rt_timer_diag.c in 100% pure Zan.
+
+namespace Zan.Runtime.Timer;
+
+struct SoftSeen3Entry {
+    public nint File;
+    public uint Line;
+    public uint Col;
+}
+
+static class RtTimerDiag {
+    const int SOFT_MAX_SITES = 1024;
+    const ulong SOFT_SCRATCH_RC = 0x4000000000000000UL; // 1ULL << 62
+    const ulong SOFT_TLS_PAYLOAD = 1048576UL;            // 1 MiB
+    const int SOFT_POOL_MAX = 256;
+
+    // Static seen tables (lazily allocated or inline? 1024*8 = 8KB, 1024*16 = 16KB -> malloc lazily on first soft note)
+    static nint s_softSeen = (nint)0;
+    static int s_softSeenCount = 0;
+    static nint s_softSeen3 = (nint)0;
+    static int s_softSeen3Count = 0;
+
+    static int s_softStrict = 0;
+    static int s_softHard = -1;
+
+    static SoftScratchStore s_softScratchStore;
+    static nint s_softScratch = (nint)0;
+
+    static nint s_softPool = (nint)0;
+    static int s_softPoolN = 0;
+
+    static int s_softSharedOnly = -1;
+
+#if !WINDOWS
+    static Buf4096 s_softLogDir;
+#endif
+
+    static nint s_fatalHandler = (nint)0;
+
+    // ---- zan_utf8_argv ----
+    [Export("zan_utf8_argv")]
+    public static int Utf8Argv(nint argcPtr, nint argvPtr) {
+#if WINDOWS
+        if (argcPtr == (nint)0 || argvPtr == (nint)0) return 0;
+        int wideArgc = 0;
+        nint cmd = RtPlat.WinGetCommandLineW();
+        nint wideArgv = RtPlat.WinCommandLineToArgvW(cmd, NativeMemory.AddressOf(ref wideArgc));
+        if (wideArgv == (nint)0 || wideArgc < 1) return 0;
+
+        nint utf8Argv = RtPlat.CCalloc((ulong)wideArgc + 1UL, 8UL);
+        if (utf8Argv == (nint)0) {
+            RtPlat.WinLocalFree(wideArgv);
+            return 0;
+        }
+
+        for (int i = 0; i < wideArgc; i++) {
+            nint warg = NativeMemory.At<nint>(wideArgv, (long)i);
+            int bytes = RtPlat.WinWideCharToMultiByte(RtPlat.CP_UTF8, 0U, warg, -1, (nint)0, 0, (nint)0, (nint)0);
+            if (bytes <= 0) {
+                for (int j = 0; j < i; j++) RtPlat.CFree(NativeMemory.At<nint>(utf8Argv, (long)j));
+                RtPlat.CFree(utf8Argv);
+                RtPlat.WinLocalFree(wideArgv);
+                return 0;
+            }
+            nint slot = RtPlat.CMalloc((ulong)bytes);
+            if (slot == (nint)0) {
+                for (int j = 0; j < i; j++) RtPlat.CFree(NativeMemory.At<nint>(utf8Argv, (long)j));
+                RtPlat.CFree(utf8Argv);
+                RtPlat.WinLocalFree(wideArgv);
+                return 0;
+            }
+            NativeMemory.At<nint>(utf8Argv, (long)i) = slot;
+            if (RtPlat.WinWideCharToMultiByte(RtPlat.CP_UTF8, 0U, warg, -1, slot, bytes, (nint)0, (nint)0) != bytes) {
+                for (int j = 0; j <= i; j++) RtPlat.CFree(NativeMemory.At<nint>(utf8Argv, (long)j));
+                RtPlat.CFree(utf8Argv);
+                RtPlat.WinLocalFree(wideArgv);
+                return 0;
+            }
+        }
+
+        RtPlat.WinLocalFree(wideArgv);
+        NativeMemory.Write<int>(argcPtr, wideArgc);
+        NativeMemory.Write<nint>(argvPtr, utf8Argv);
+        return 1;
+#else
+        return 0;
+#endif
+    }
+
+    // ---- Soft / hard mode ----
+
+    static int SoftIsHardInternal() {
+        int v = Atomic.Load(ref s_softHard, MemoryOrder.Acquire);
+        if (v >= 0) return v;
+        RtPlat.TimerLock();
+        v = s_softHard;
+        if (v < 0) {
+            nint env = RtPlat.CGetenv((nint)"ZAN_RT_HARD");
+            if (env != (nint)0 && NativeMemory.At<byte>(env, 0L) != (byte)0 && NativeMemory.At<byte>(env, 0L) != (byte)48) {
+                v = 1;
+            } else {
+                v = 0;
+            }
+            if (v == 0 && env == (nint)0) {
+                v = s_softStrict;
+            }
+            Atomic.Store(ref s_softHard, v, MemoryOrder.Release);
+        }
+        RtPlat.TimerUnlock();
+        return v;
+    }
+
+    [Export("zan_rt_soft_is_hard")]
+    public static int SoftIsHard() => SoftIsHardInternal();
+
+    [Export("zan_rt_set_strict")]
+    public static void SetStrict() {
+        s_softStrict = 1;
+    }
+
+    // ---- Per-thread guarded soft-failure scratch ----
+
+    static void SoftScratchInitHeader(nint hdr) {
+        NativeMemory.Write<ulong>(hdr, SOFT_SCRATCH_RC);
+        NativeMemory.Write<ulong>(hdr + (nint)8, RtAbi.ARRAY_RC_MAGIC);
+        NativeMemory.Write<ulong>(hdr + (nint)16, 0UL);
+        NativeMemory.Write<ulong>(hdr + (nint)24, RtAbi.ARRAY_MAGIC);
+
+        nint objHdr = hdr + (nint)(RtAbi.SOFT_PREFIX_SIZE - 32L);
+        NativeMemory.Write<ulong>(objHdr, SOFT_SCRATCH_RC);
+        NativeMemory.Write<ulong>(objHdr + (nint)8, RtAbi.ARRAY_RC_MAGIC);
+        NativeMemory.Write<ulong>(objHdr + (nint)16, SOFT_SCRATCH_RC);
+        NativeMemory.Write<ulong>(objHdr + (nint)24, RtAbi.ARRAY_MAGIC);
+    }
+
+    static nint SoftScratchShared() {
+        nint scratch = Atomic.Load(ref s_softScratch, MemoryOrder.Acquire);
+        if (scratch != (nint)0) return scratch;
+        RtPlat.TimerLock();
+        scratch = s_softScratch;
+        if (scratch == (nint)0) {
+            nint hdr = NativeMemory.AddressOf(ref s_softScratchStore);
+            RtPlat.CMemset(hdr, 0, (ulong)(RtAbi.SOFT_PREFIX_SIZE + 8L + 4096L));
+            SoftScratchInitHeader(hdr);
+            scratch = hdr + (nint)RtAbi.SOFT_PREFIX_SIZE;
+            Atomic.Store(ref s_softScratch, scratch, MemoryOrder.Release);
+        }
+        RtPlat.TimerUnlock();
+        return scratch;
+    }
+
+    static ulong SoftPageSize() {
+#if WINDOWS
+        Buf48 si = new Buf48();
+        nint sp = NativeMemory.AddressOf(ref si);
+        RtPlat.CMemset(sp, 0, 48UL);
+        RtPlat.WinGetSystemInfo(sp);
+        uint ps = NativeMemory.Read<uint>(sp + (nint)4);
+        return ps != 0U ? (ulong)ps : 4096UL;
+#else
+        long ps = RtPlat.PosixSysconf(RtPlat.SC_PAGESIZE);
+        return ps > 0L ? (ulong)ps : 4096UL;
+#endif
+    }
+
+    static ulong SoftMapLen(ulong page) {
+        ulong need = (ulong)RtAbi.SOFT_PREFIX_SIZE + SOFT_TLS_PAYLOAD;
+        ulong body = ((need + page - 1UL) / page) * page;
+        return page + body + page;
+    }
+
+    static bool SoftWipe(nint scratch) {
+        ulong page = SoftPageSize();
+        nint map = scratch - (nint)RtAbi.SOFT_PREFIX_SIZE - (nint)page;
+        ulong body = SoftMapLen(page) - 2UL * page;
+#if WINDOWS
+        if (RtPlat.WinVirtualFree(map + (nint)page, body, RtPlat.MEM_DECOMMIT) == 0) return false;
+        if (RtPlat.WinVirtualAlloc(map + (nint)page, body, RtPlat.MEM_COMMIT, RtPlat.PAGE_READWRITE) == (nint)0) return false;
+#else
+        nint r = RtPlat.PosixMmap(map + (nint)page, body, RtPlat.PROT_READ_WRITE, RtPlat.MAP_PRIVATE_ANON_FIXED, -1, 0L);
+        if (r == (nint)(-1)) return false;
+#endif
+        SoftScratchInitHeader(map + (nint)page);
+        return true;
+    }
+
+    internal static void SoftRelease(nint scratch) {
+        if (scratch == (nint)0) return;
+        if (!SoftWipe(scratch)) return;
+        RtPlat.TimerLock();
+        if (s_softPool == (nint)0) {
+            s_softPool = RtPlat.CCalloc((ulong)SOFT_POOL_MAX, 8UL);
+        }
+        if (s_softPool != (nint)0 && s_softPoolN < SOFT_POOL_MAX) {
+            NativeMemory.At<nint>(s_softPool, (long)s_softPoolN) = scratch;
+            s_softPoolN++;
+        }
+        RtPlat.TimerUnlock();
+    }
+
+    static nint SoftPoolTake() {
+        nint s = (nint)0;
+        RtPlat.TimerLock();
+        if (s_softPool != (nint)0 && s_softPoolN > 0) {
+            s_softPoolN--;
+            s = NativeMemory.At<nint>(s_softPool, (long)s_softPoolN);
+        }
+        RtPlat.TimerUnlock();
+        return s;
+    }
+
+    static nint SoftMap() {
+        ulong page = SoftPageSize();
+        ulong len = SoftMapLen(page);
+#if WINDOWS
+        nint map = RtPlat.WinVirtualAlloc((nint)0, len, RtPlat.MEM_RESERVE, RtPlat.PAGE_NOACCESS);
+        if (map == (nint)0) return (nint)0;
+        if (RtPlat.WinVirtualAlloc(map + (nint)page, len - 2UL * page, RtPlat.MEM_COMMIT, RtPlat.PAGE_READWRITE) == (nint)0) {
+            RtPlat.WinVirtualFree(map, 0UL, RtPlat.MEM_RELEASE);
+            return (nint)0;
+        }
+#else
+        nint map = RtPlat.PosixMmap((nint)0, len, RtPlat.PROT_NONE, RtPlat.MAP_PRIVATE_ANON, -1, 0L);
+        if (map == (nint)(-1)) return (nint)0;
+        if (RtPlat.PosixMprotect(map + (nint)page, len - 2UL * page, RtPlat.PROT_READ_WRITE) != 0) {
+            RtPlat.PosixMunmap(map, len);
+            return (nint)0;
+        }
+#endif
+        SoftScratchInitHeader(map + (nint)page);
+        return map + (nint)page + (nint)RtAbi.SOFT_PREFIX_SIZE;
+    }
+
+    [Export("zan_rt_soft_scratch")]
+    public static nint SoftScratch() {
+        nint tls = RtPlat.TimerTlsPeek();
+        if (tls != (nint)0) {
+            nint mine = NativeMemory.AsRef<TimerTls>(tls).SoftScratch;
+            if (mine != (nint)0) return mine;
+            if (NativeMemory.AsRef<TimerTls>(tls).SoftScratchExiting != 0) return SoftScratchShared();
+        }
+        int so = Atomic.Load(ref s_softSharedOnly, MemoryOrder.Relaxed);
+        if (so < 0) {
+            so = RtPlat.CGetenv((nint)"ZAN_SOFT_SHARED_SCRATCH") != (nint)0 ? 1 : 0;
+            Atomic.Store(ref s_softSharedOnly, so, MemoryOrder.Relaxed);
+        }
+        if (so == 0) {
+            if (tls == (nint)0) tls = RtPlat.TimerTlsGet();
+            if (tls != (nint)0) {
+                ref TimerTls tlsRef = ref NativeMemory.AsRef<TimerTls>(tls);
+                if (tlsRef.SoftScratch != (nint)0) return tlsRef.SoftScratch;
+                if (tlsRef.SoftScratchExiting != 0) return SoftScratchShared();
+                nint mine = SoftPoolTake();
+                if (mine == (nint)0) mine = SoftMap();
+                if (mine != (nint)0) {
+                    tlsRef.SoftScratch = mine;
+                    return mine;
+                }
+            }
+        }
+        return SoftScratchShared();
+    }
+
+    // ---- Seen-site dedup (caller holds TimerLock) ----
+
+    static bool SoftSeenLocked(nint text) {
+        if (s_softSeen == (nint)0) {
+            s_softSeen = RtPlat.CCalloc((ulong)SOFT_MAX_SITES, 8UL);
+            if (s_softSeen == (nint)0) return false;
+        }
+        for (int i = 0; i < s_softSeenCount; i++) {
+            if (NativeMemory.At<nint>(s_softSeen, (long)i) == text) return true;
+        }
+        if (s_softSeenCount < SOFT_MAX_SITES) {
+            NativeMemory.At<nint>(s_softSeen, (long)s_softSeenCount) = text;
+            s_softSeenCount++;
+        }
+        return false;
+    }
+
+    static bool SoftSeen3Locked(nint file, uint line, uint col) {
+        if (s_softSeen3 == (nint)0) {
+            s_softSeen3 = RtPlat.CCalloc((ulong)SOFT_MAX_SITES, 16UL);
+            if (s_softSeen3 == (nint)0) return false;
+        }
+        for (int i = 0; i < s_softSeen3Count; i++) {
+            nint e = s_softSeen3 + (nint)((long)i * 16L);
+            if (NativeMemory.Read<nint>(e) == file &&
+                NativeMemory.Read<uint>(e + (nint)8) == line &&
+                NativeMemory.Read<uint>(e + (nint)12) == col) {
+                return true;
+            }
+        }
+        if (s_softSeen3Count < SOFT_MAX_SITES) {
+            nint e = s_softSeen3 + (nint)((long)s_softSeen3Count * 16L);
+            NativeMemory.Write<nint>(e, file);
+            NativeMemory.Write<uint>(e + (nint)8, line);
+            NativeMemory.Write<uint>(e + (nint)12, col);
+            s_softSeen3Count++;
+        }
+        return false;
+    }
+
+    // ---- Soft log path & append ----
+
+#if WINDOWS
+    static void SoftLogPath(nint path, ulong cap) {
+        uint n = RtPlat.WinGetModuleFileNameA((nint)0, path, (uint)cap);
+        if (n == 0U || (ulong)n >= cap) {
+            RtPlat.BufAppendCStr(path, cap, 0UL, (nint)"zan_soft.log");
+            return;
+        }
+        nint slash = RtPlat.CStrRChr(path, (byte)92); // '\\'
+        if (slash == (nint)0) {
+            RtPlat.BufAppendCStr(path, cap, 0UL, (nint)"zan_soft.log");
+            return;
+        }
+        NativeMemory.Write<byte>(slash + (nint)1, (byte)0);
+        ulong cur = RtPlat.CStrLen(path);
+        RtPlat.BufAppendCStr(path, cap, cur, (nint)"zan_crash.log");
+    }
+#else
+    static void SoftInitLogDir() {
+        nint dir = NativeMemory.AddressOf(ref s_softLogDir);
+        nint env = RtPlat.CGetenv((nint)"ZAN_LOG_DIR");
+        if (env != (nint)0 && NativeMemory.At<byte>(env, 0L) != (byte)0) {
+            ulong elen = RtPlat.CStrLen(env);
+            if (elen < 4096UL) {
+                RtPlat.CMemcpy(dir, env, elen + 1UL);
+                return;
+            }
+        }
+        RtPlat.BufAppendCStr(dir, 4096UL, 0UL, (nint)"logs");
+#if MACOS
+        uint mcap = 4090U;
+        if (RtPlat.MacGetExecutablePath(dir, NativeMemory.AddressOf(ref mcap)) != 0 ||
+            NativeMemory.At<byte>(dir, 0L) == (byte)0) {
+            RtPlat.BufAppendCStr(dir, 4096UL, 0UL, (nint)"logs");
+            return;
+        }
+#else
+        long n = RtPlat.PosixReadlink((nint)"/proc/self/exe", dir, 4090UL);
+        if (n <= 0L) return;
+        NativeMemory.At<byte>(dir, n) = (byte)0;
+#endif
+        nint slash = RtPlat.CStrRChr(dir, (byte)47); // '/'
+        if (slash == (nint)0) {
+            RtPlat.BufAppendCStr(dir, 4096UL, 0UL, (nint)"logs");
+            return;
+        }
+        NativeMemory.Write<byte>(slash + (nint)1, (byte)0);
+        ulong cur = RtPlat.CStrLen(dir);
+        RtPlat.BufAppendCStr(dir, 4096UL, cur, (nint)"logs");
+    }
+
+    static void SoftLogPath(nint path, ulong cap) {
+        nint logdir = NativeMemory.AddressOf(ref s_softLogDir);
+        if (NativeMemory.At<byte>(logdir, 0L) == (byte)0) SoftInitLogDir();
+        long now = RtPlat.PosixTime((nint)0);
+        Buf64 tmBuf = new Buf64();
+        nint tp = NativeMemory.AddressOf(ref tmBuf);
+        if (RtPlat.PosixLocaltimeR(NativeMemory.AddressOf(ref now), tp) == (nint)0) {
+            RtPlat.BufAppendCStr(path, cap, 0UL, (nint)"zan_soft.log");
+            return;
+        }
+        // Linux struct tm: tm_sec(0), tm_min(4), tm_hour(8), tm_mday(12), tm_mon(16), tm_year(20)
+        int mday = NativeMemory.Read<int>(tp + (nint)12);
+        int mon = NativeMemory.Read<int>(tp + (nint)16) + 1;
+        int year = NativeMemory.Read<int>(tp + (nint)20) + 1900;
+
+        Buf4096 dirBuf = new Buf4096();
+        nint dp = NativeMemory.AddressOf(ref dirBuf);
+        ulong dlen = RtPlat.CStrLen(logdir);
+        if (dlen + 8UL >= 4096UL) {
+            RtPlat.BufAppendCStr(path, cap, 0UL, (nint)"zan_soft.log");
+            return;
+        }
+        ulong pos = RtPlat.BufAppendBytes(dp, 4096UL, 0UL, logdir, dlen);
+        pos = RtPlat.BufAppendChar(dp, 4096UL, pos, (byte)47);
+        pos = RtPlat.BufAppendU64ZeroPad(dp, 4096UL, pos, (ulong)year, 4);
+        pos = RtPlat.BufAppendU64ZeroPad(dp, 4096UL, pos, (ulong)mon, 2);
+
+        RtPlat.PosixMkdir(logdir, 0x1EDU); // 0755
+        RtPlat.PosixMkdir(dp, 0x1EDU);
+
+        if (pos + 7UL >= cap) {
+            RtPlat.BufAppendCStr(path, cap, 0UL, (nint)"zan_soft.log");
+            return;
+        }
+        ulong ppos = RtPlat.BufAppendBytes(path, cap, 0UL, dp, pos);
+        ppos = RtPlat.BufAppendChar(path, cap, ppos, (byte)47);
+        ppos = RtPlat.BufAppendU64ZeroPad(path, cap, ppos, (ulong)mday, 2);
+        RtPlat.BufAppendCStr(path, cap, ppos, (nint)".log");
+    }
+#endif
+
+    static void SoftAppend(nint text) {
+        Buf4096 pathBuf = new Buf4096();
+        nint path = NativeMemory.AddressOf(ref pathBuf);
+        SoftLogPath(path, 4096UL);
+        nint f = RtPlat.CFopen(path, (nint)"ab");
+#if WINDOWS
+        if (f == (nint)0) {
+            Buf512 tmpBuf = new Buf512();
+            nint tp = NativeMemory.AddressOf(ref tmpBuf);
+            uint tn = RtPlat.WinGetTempPathA(512U, tp);
+            if (tn > 0U && tn < 512U) {
+                ulong p = RtPlat.BufAppendBytes(path, 4096UL, 0UL, tp, (ulong)tn);
+                RtPlat.BufAppendCStr(path, 4096UL, p, (nint)"zan_crash.log");
+                f = RtPlat.CFopen(path, (nint)"ab");
+            }
+        }
+#endif
+        if (f == (nint)0) return;
+
+        RtPlat.CFseek(f, 0L, RtPlat.SEEK_END);
+        long sz = RtPlat.CFtell(f);
+        if (sz == 0L) {
+            Buf4096 exeBuf = new Buf4096();
+            nint exe = NativeMemory.AddressOf(ref exeBuf);
+#if WINDOWS
+            uint en = RtPlat.WinGetModuleFileNameA((nint)0, exe, 260U);
+            if (en == 0U || en >= 260U) {
+                RtPlat.BufAppendCStr(exe, 4096UL, 0UL, (nint)"<unknown>");
+            }
+#elif MACOS
+            uint ecap = 4095U;
+            if (RtPlat.MacGetExecutablePath(exe, NativeMemory.AddressOf(ref ecap)) != 0 ||
+                NativeMemory.At<byte>(exe, 0L) == (byte)0) {
+                RtPlat.BufAppendCStr(exe, 4096UL, 0UL, (nint)"<unknown>");
+            }
+#else
+            long en = RtPlat.PosixReadlink((nint)"/proc/self/exe", exe, 4095UL);
+            if (en > 0L) NativeMemory.At<byte>(exe, en) = (byte)0;
+            else RtPlat.BufAppendCStr(exe, 4096UL, 0UL, (nint)"<unknown>");
+#endif
+            Buf4096 hdrBuf = new Buf4096();
+            nint hp = NativeMemory.AddressOf(ref hdrBuf);
+            ulong hpos = RtPlat.BufAppendCStr(hp, 4096UL, 0UL, (nint)"==== ZAN RUNTIME (soft) ====\nexe=");
+            hpos = RtPlat.BufAppendCStr(hp, 4096UL, hpos, exe);
+            hpos = RtPlat.BufAppendChar(hp, 4096UL, hpos, (byte)10);
+            RtPlat.CFwrite(hp, 1UL, hpos, f);
+        }
+
+        Buf1408 lineBuf = new Buf1408();
+        nint lp = NativeMemory.AddressOf(ref lineBuf);
+        ulong lpos = 0UL;
+#if WINDOWS
+        Buf32 stBuf = new Buf32();
+        nint st = NativeMemory.AddressOf(ref stBuf);
+        RtPlat.WinGetLocalTime(st);
+        ulong yr = (ulong)NativeMemory.Read<ushort>(st);
+        ulong mo = (ulong)NativeMemory.Read<ushort>(st + (nint)2);
+        ulong dy = (ulong)NativeMemory.Read<ushort>(st + (nint)6);
+        ulong hr = (ulong)NativeMemory.Read<ushort>(st + (nint)8);
+        ulong mi = (ulong)NativeMemory.Read<ushort>(st + (nint)10);
+        ulong sc = (ulong)NativeMemory.Read<ushort>(st + (nint)12);
+        ulong ms = (ulong)NativeMemory.Read<ushort>(st + (nint)14);
+        lpos = RtPlat.BufAppendU64ZeroPad(lp, 1408UL, lpos, yr, 4);
+        lpos = RtPlat.BufAppendChar(lp, 1408UL, lpos, (byte)45);
+        lpos = RtPlat.BufAppendU64ZeroPad(lp, 1408UL, lpos, mo, 2);
+        lpos = RtPlat.BufAppendChar(lp, 1408UL, lpos, (byte)45);
+        lpos = RtPlat.BufAppendU64ZeroPad(lp, 1408UL, lpos, dy, 2);
+        lpos = RtPlat.BufAppendChar(lp, 1408UL, lpos, (byte)32);
+        lpos = RtPlat.BufAppendU64ZeroPad(lp, 1408UL, lpos, hr, 2);
+        lpos = RtPlat.BufAppendChar(lp, 1408UL, lpos, (byte)58);
+        lpos = RtPlat.BufAppendU64ZeroPad(lp, 1408UL, lpos, mi, 2);
+        lpos = RtPlat.BufAppendChar(lp, 1408UL, lpos, (byte)58);
+        lpos = RtPlat.BufAppendU64ZeroPad(lp, 1408UL, lpos, sc, 2);
+        lpos = RtPlat.BufAppendChar(lp, 1408UL, lpos, (byte)46);
+        lpos = RtPlat.BufAppendU64ZeroPad(lp, 1408UL, lpos, ms, 3);
+#else
+        long now = RtPlat.PosixTime((nint)0);
+        Buf64 tmBuf = new Buf64();
+        nint tp = NativeMemory.AddressOf(ref tmBuf);
+        RtPlat.CMemset(tp, 0, 64UL);
+        RtPlat.PosixLocaltimeR(NativeMemory.AddressOf(ref now), tp);
+        ulong yr = (ulong)(NativeMemory.Read<int>(tp + (nint)20) + 1900);
+        ulong mo = (ulong)(NativeMemory.Read<int>(tp + (nint)16) + 1);
+        ulong dy = (ulong)NativeMemory.Read<int>(tp + (nint)12);
+        ulong hr = (ulong)NativeMemory.Read<int>(tp + (nint)8);
+        ulong mi = (ulong)NativeMemory.Read<int>(tp + (nint)4);
+        ulong sc = (ulong)NativeMemory.Read<int>(tp);
+        lpos = RtPlat.BufAppendU64ZeroPad(lp, 1408UL, lpos, yr, 4);
+        lpos = RtPlat.BufAppendChar(lp, 1408UL, lpos, (byte)45);
+        lpos = RtPlat.BufAppendU64ZeroPad(lp, 1408UL, lpos, mo, 2);
+        lpos = RtPlat.BufAppendChar(lp, 1408UL, lpos, (byte)45);
+        lpos = RtPlat.BufAppendU64ZeroPad(lp, 1408UL, lpos, dy, 2);
+        lpos = RtPlat.BufAppendChar(lp, 1408UL, lpos, (byte)32);
+        lpos = RtPlat.BufAppendU64ZeroPad(lp, 1408UL, lpos, hr, 2);
+        lpos = RtPlat.BufAppendChar(lp, 1408UL, lpos, (byte)58);
+        lpos = RtPlat.BufAppendU64ZeroPad(lp, 1408UL, lpos, mi, 2);
+        lpos = RtPlat.BufAppendChar(lp, 1408UL, lpos, (byte)58);
+        lpos = RtPlat.BufAppendU64ZeroPad(lp, 1408UL, lpos, sc, 2);
+#endif
+        lpos = RtPlat.BufAppendCStr(lp, 1408UL, lpos, (nint)" soft runtime error: ");
+        RtPlat.CFwrite(lp, 1UL, lpos, f);
+        ulong tlen = RtPlat.CStrLen(text);
+        if (tlen > 0UL) RtPlat.CFwrite(text, 1UL, tlen, f);
+        RtPlat.CFclose(f);
+    }
+
+    // ---- Soft notes & guard fails ----
+
+    [Export("zan_rt_soft_note")]
+    public static void SoftNote(nint text) {
+        if (text == (nint)0) return;
+        RtPlat.TimerLock();
+        bool seen = SoftSeenLocked(text);
+        RtPlat.TimerUnlock();
+        if (seen) return;
+        RtPlat.WriteStderrBytes(text, RtPlat.CStrLen(text));
+        SoftAppend(text);
+    }
+
+    [Export("zan_rt_soft_note2")]
+    public static void SoftNote2(nint prefix, nint msg) {
+        if (prefix == (nint)0) return;
+        Buf1408 buf = new Buf1408();
+        nint bp = NativeMemory.AddressOf(ref buf);
+        ulong pos = 0UL;
+        RtPlat.TimerLock();
+        bool seen = SoftSeenLocked(prefix);
+        if (!seen) {
+            pos = RtPlat.BufAppendCStr(bp, 1400UL, 0UL, prefix);
+            if (msg != (nint)0) {
+                pos = RtPlat.BufAppendCStr(bp, 1400UL, pos, msg);
+            }
+        }
+        RtPlat.TimerUnlock();
+        if (seen) return;
+        RtPlat.WriteStderrBytes(bp, pos);
+        SoftAppend(bp);
+    }
+
+    [Export("zan_rt_soft_note3")]
+    public static void SoftNote3(nint file, uint line, uint col, nint msg) {
+        Buf1408 buf = new Buf1408();
+        nint bp = NativeMemory.AddressOf(ref buf);
+        ulong pos = RtPlat.BufAppendCStr(bp, 1399UL, 0UL, file != (nint)0 ? file : (nint)"<unknown>");
+        pos = RtPlat.BufAppendChar(bp, 1399UL, pos, (byte)58);
+        pos = RtPlat.BufAppendU64(bp, 1399UL, pos, (ulong)line);
+        pos = RtPlat.BufAppendChar(bp, 1399UL, pos, (byte)58);
+        pos = RtPlat.BufAppendU64(bp, 1399UL, pos, (ulong)col);
+        pos = RtPlat.BufAppendCStr(bp, 1399UL, pos, (nint)": runtime error: ");
+        pos = RtPlat.BufAppendCStr(bp, 1399UL, pos, msg != (nint)0 ? msg : (nint)"");
+        if (pos == 0UL) return;
+        pos = RtPlat.BufAppendChar(bp, 1400UL, pos, (byte)10);
+
+        RtPlat.TimerLock();
+        bool seen = SoftSeen3Locked(file, line, col);
+        RtPlat.TimerUnlock();
+        if (seen) return;
+        RtPlat.WriteStderrBytes(bp, pos);
+        SoftAppend(bp);
+    }
+
+    static void RaiseGuardHard(nint buf, ulong len) {
+        RtPlat.WriteStderrBytes(buf, len);
+#if WINDOWS
+        Buf32 args = new Buf32();
+        nint ap = NativeMemory.AddressOf(ref args);
+        NativeMemory.Write<nint>(ap, buf);
+        NativeMemory.Write<ulong>(ap + (nint)8, 70UL);
+        RtPlat.WinRaiseException(0xE0A2C010U, 0U, 2U, ap);
+#endif
+        RtPlat.CExit(70);
+    }
+
+    [Export("zan_rt_guard_fail2")]
+    public static void GuardFail2(nint prefix, nint msg) {
+        if (SoftIsHardInternal() != 0) {
+            Buf1408 buf = new Buf1408();
+            nint bp = NativeMemory.AddressOf(ref buf);
+            ulong pos = 0UL;
+            if (prefix != (nint)0) pos = RtPlat.BufAppendCStr(bp, 1400UL, pos, prefix);
+            if (msg != (nint)0) pos = RtPlat.BufAppendCStr(bp, 1400UL, pos, msg);
+            RaiseGuardHard(bp, pos);
+            return;
+        }
+        SoftNote2(prefix, msg);
+    }
+
+    [Export("zan_rt_guard_fail3")]
+    public static void GuardFail3(nint file, uint line, uint col, nint msg) {
+        if (SoftIsHardInternal() != 0) {
+            Buf1408 buf = new Buf1408();
+            nint bp = NativeMemory.AddressOf(ref buf);
+            ulong pos = RtPlat.BufAppendCStr(bp, 1399UL, 0UL, file != (nint)0 ? file : (nint)"<unknown>");
+            pos = RtPlat.BufAppendChar(bp, 1399UL, pos, (byte)58);
+            pos = RtPlat.BufAppendU64(bp, 1399UL, pos, (ulong)line);
+            pos = RtPlat.BufAppendChar(bp, 1399UL, pos, (byte)58);
+            pos = RtPlat.BufAppendU64(bp, 1399UL, pos, (ulong)col);
+            pos = RtPlat.BufAppendCStr(bp, 1399UL, pos, (nint)": runtime error: ");
+            pos = RtPlat.BufAppendCStr(bp, 1399UL, pos, msg != (nint)0 ? msg : (nint)"");
+            if (pos > 0UL && NativeMemory.At<byte>(bp, (long)(pos - 1UL)) != (byte)10) {
+                pos = RtPlat.BufAppendChar(bp, 1400UL, pos, (byte)10);
+            }
+            RaiseGuardHard(bp, pos);
+            return;
+        }
+        SoftNote3(file, line, col, msg);
+    }
+
+    // ---- Fatal handler & stdout setup ----
+
+    [Export("zan_rt_set_fatal_handler")]
+    public static void SetFatalHandler(nint fn) {
+        s_fatalHandler = fn;
+    }
+
+    [Export("zan_rt_stdout_setup")]
+    public static void StdoutSetup(nint outFh, int mode, long size) {
+        bool toFile = false;
+#if WINDOWS
+        nint h = RtPlat.WinGetStdHandle(RtPlat.STD_OUTPUT_HANDLE);
+        if (h != (nint)0 && h != (nint)(-1)) {
+            toFile = RtPlat.WinGetFileType(h) == RtPlat.FILE_TYPE_DISK;
+        }
+#else
+        if (outFh != (nint)0) {
+            int fd = RtPlat.PosixFileno(outFh);
+            Buf160 stBuf = new Buf160();
+            nint st = NativeMemory.AddressOf(ref stBuf);
+            if (fd >= 0 && RtPlat.PosixFstat(fd, st) == 0) {
+#if MACOS
+                // Darwin 64-bit struct stat: st_mode is uint16 at offset 4
+                uint stMode = (uint)NativeMemory.Read<ushort>(st + (nint)4);
+#elif X86_64
+                // Linux x86_64 struct stat: st_mode is uint32 at offset 24
+                uint stMode = NativeMemory.Read<uint>(st + (nint)24);
+#else
+                // Linux asm-generic (aarch64/riscv64) struct stat: st_mode is uint32 at offset 16
+                uint stMode = NativeMemory.Read<uint>(st + (nint)16);
+#endif
+                toFile = (stMode & 0xF000U) == 0x8000U; // S_ISREG
+            }
+        }
+#endif
+        if (toFile) {
+            RtPlat.CSetvbuf(outFh, (nint)0, RtPlat.IOFBF, 65536UL);
+        } else {
+            RtPlat.CSetvbuf(outFh, (nint)0, mode, (ulong)size);
+        }
+    }
+
+    [Export("zan_rt_fatal")]
+    public static void Fatal(nint category, nint message) {
+        RtPlat.FlushStdout();
+        Buf512 buf = new Buf512();
+        nint bp = NativeMemory.AddressOf(ref buf);
+        ulong pos = RtPlat.BufAppendCStr(bp, 512UL, 0UL, (nint)"zan runtime: fatal (");
+        pos = RtPlat.BufAppendCStr(bp, 512UL, pos, category != (nint)0 ? category : (nint)"runtime");
+        pos = RtPlat.BufAppendCStr(bp, 512UL, pos, (nint)"): ");
+        pos = RtPlat.BufAppendCStr(bp, 512UL, pos, message != (nint)0 ? message : (nint)"");
+        pos = RtPlat.BufAppendChar(bp, 512UL, pos, (byte)10);
+        RtPlat.WriteStderrBytes(bp, pos);
+
+        nint fn = s_fatalHandler;
+        if (fn != (nint)0) {
+            NativeMemory.InvokeVoidWithCC<nint, nint>("c", fn, category, message);
+        }
+        RtPlat.CAbort();
+    }
+
+    // ---- Header readability slow path ----
+
+#if MACOS
+    static InlineArray<8, ulong> s_imgSegLo;
+    static InlineArray<8, ulong> s_imgSegHi;
+    static int s_imgSegN = 0;
+    static int s_imgState = 0;
+
+    static void MacImgSegmentsInit() {
+        Buf32 diBuf = new Buf32();
+        nint diP = NativeMemory.AddressOf(ref diBuf);
+        RtPlat.CMemset(diP, 0, 32UL);
+        int n = 0;
+        if (RtPlat.MacDladdr(NativeMemory.FunctionPointer(HdrReadable), diP) != 0) {
+            nint mh = NativeMemory.Read<nint>(diP + (nint)8); // dli_fbase
+            if (mh != (nint)0 && NativeMemory.Read<uint>(mh) == 0xFEEDFACFU) { // MH_MAGIC_64
+                uint ncmds = NativeMemory.Read<uint>(mh + (nint)16);
+                nint lc = mh + (nint)32; // sizeof(mach_header_64)
+                long slide = 0L;
+                bool haveSlide = false;
+                for (uint i = 0U; i < ncmds; i++) {
+                    uint cmd = NativeMemory.Read<uint>(lc);
+                    uint cmdsize = NativeMemory.Read<uint>(lc + (nint)4);
+                    if (cmdsize < 8U) break;
+                    if (cmd == 0x19U) { // LC_SEGMENT_64
+                        ulong vmaddr = NativeMemory.Read<ulong>(lc + (nint)24);
+                        ulong fileoff = NativeMemory.Read<ulong>(lc + (nint)40);
+                        ulong filesize = NativeMemory.Read<ulong>(lc + (nint)48);
+                        if (!haveSlide && fileoff == 0UL && filesize != 0UL) {
+                            slide = (long)((ulong)mh - vmaddr);
+                            haveSlide = true;
+                        }
+                    }
+                    lc += (nint)cmdsize;
+                }
+                lc = mh + (nint)32;
+                nint loArr = NativeMemory.AddressOf(ref s_imgSegLo);
+                nint hiArr = NativeMemory.AddressOf(ref s_imgSegHi);
+                for (uint i = 0U; haveSlide && i < ncmds && n < 8; i++) {
+                    uint cmd = NativeMemory.Read<uint>(lc);
+                    uint cmdsize = NativeMemory.Read<uint>(lc + (nint)4);
+                    if (cmdsize < 8U) break;
+                    if (cmd == 0x19U) { // LC_SEGMENT_64
+                        ulong vmaddr = NativeMemory.Read<ulong>(lc + (nint)24);
+                        ulong vmsize = NativeMemory.Read<ulong>(lc + (nint)32);
+                        int initprot = NativeMemory.Read<int>(lc + (nint)60);
+                        if ((initprot & 1) != 0 && vmsize != 0UL &&
+                            RtPlat.CStrCmp(lc + (nint)8, (nint)"__LINKEDIT") != 0) {
+                            ulong segLo = vmaddr + (ulong)slide;
+                            NativeMemory.At<ulong>(loArr, (long)n) = segLo;
+                            NativeMemory.At<ulong>(hiArr, (long)n) = segLo + vmsize;
+                            n++;
+                        }
+                    }
+                    lc += (nint)cmdsize;
+                }
+            }
+        }
+        s_imgSegN = n;
+        Atomic.Store(ref s_imgState, 1, MemoryOrder.Release);
+    }
+
+    static bool InMacImage(ulong lo, ulong hi) {
+        if (Atomic.Load(ref s_imgState, MemoryOrder.Acquire) == 0) MacImgSegmentsInit();
+        nint loArr = NativeMemory.AddressOf(ref s_imgSegLo);
+        nint hiArr = NativeMemory.AddressOf(ref s_imgSegHi);
+        int n = s_imgSegN;
+        for (int i = 0; i < n; i++) {
+            if (lo >= NativeMemory.At<ulong>(loArr, (long)i) && hi <= NativeMemory.At<ulong>(hiArr, (long)i)) {
+                return true;
+            }
+        }
+        return false;
+    }
+#endif
+
+    [Export("zan_rt_hdr_readable")]
+    public static int HdrReadable(nint p, long need) {
+        if (p == (nint)0 || need <= 0L) return 1;
+        ulong pu = (ulong)p;
+        ulong nu = (ulong)need;
+        if (nu > pu) return 0;
+        ulong lo = pu - nu;
+#if WINDOWS
+        Buf48 mbi = new Buf48();
+        nint mp = NativeMemory.AddressOf(ref mbi);
+        if (RtPlat.WinVirtualQuery((nint)lo, mp, 48UL) == 0UL) return 0;
+        uint state = NativeMemory.Read<uint>(mp + (nint)32);
+        uint prot = NativeMemory.Read<uint>(mp + (nint)36);
+        if (state != RtPlat.MEM_COMMIT) return 0;
+        if ((prot & (RtPlat.PAGE_NOACCESS | RtPlat.PAGE_GUARD)) != 0U) return 0;
+        return 1;
+#elif MACOS
+        if (InMacImage(lo, pu)) return 1;
+        Buf64 tmp = new Buf64();
+        ulong cnt = nu > 64UL ? 64UL : nu;
+        ulong got = 0UL;
+        int kr = RtPlat.MacVmReadOverwrite(RtPlat.MacTaskSelf(), lo, cnt,
+            (ulong)NativeMemory.AddressOf(ref tmp), NativeMemory.AddressOf(ref got));
+        if (kr == RtPlat.KERN_SUCCESS) return 1;
+        return (kr == RtPlat.KERN_INVALID_ADDRESS || kr == RtPlat.KERN_PROTECTION_FAILURE) ? 0 : 1;
+#else
+        Buf64 tmp = new Buf64();
+        nint tp = NativeMemory.AddressOf(ref tmp);
+        ulong cnt = nu > 64UL ? 64UL : nu;
+        Buf32 iov = new Buf32();
+        nint ip = NativeMemory.AddressOf(ref iov);
+        // local iovec at ip+0, remote iovec at ip+16
+        NativeMemory.Write<nint>(ip, tp);
+        NativeMemory.Write<ulong>(ip + (nint)8, cnt);
+        NativeMemory.Write<nint>(ip + (nint)16, (nint)lo);
+        NativeMemory.Write<ulong>(ip + (nint)24, cnt);
+
+        nint ep = RtPlat.ErrnoPtr();
+        int saved = NativeMemory.Read<int>(ep);
+        long got = RtPlat.PosixProcessVmReadv(RtPlat.PosixGetpid(), ip, 1UL, ip + (nint)16, 1UL, 0UL);
+        int err = NativeMemory.Read<int>(ep);
+        NativeMemory.Write<int>(ep, saved);
+        if (got == (long)cnt) return 1;
+        return (got >= 0L || err == RtPlat.EFAULT_VAL) ? 0 : 1;
+#endif
+    }
+}

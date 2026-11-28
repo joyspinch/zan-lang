@@ -1,0 +1,280 @@
+using System;
+using System.Collections.Generic;
+using System.Threading;
+
+namespace Pillar10Test;
+
+public class Program {
+    static int g_finallyHits = 0;
+
+    static async IAsyncEnumerable<int> CountUpAsync(int limit) {
+        for (int i = 1; i <= limit; i = i + 1) {
+            await Task.Yield();
+            if (i > 5) {
+                yield break;
+            }
+            yield return i;
+        }
+    }
+
+    static async IAsyncEnumerable<string> WordsAsync() {
+        await Task.Yield();
+        yield return "alpha";
+        await Task.Yield();
+        yield return "beta";
+        await Task.Yield();
+        yield return "gamma";
+    }
+
+    static Result<int, string> ParsePositive(string tag, int n) {
+        if (n < 0) {
+            return Result<int, string>.Err("neg:" + tag);
+        }
+        return Result<int, string>.Ok(n);
+    }
+
+    static Result<int, string> ComputeWithTry(int a, int b) {
+        try {
+            int x = ParsePositive("a", a)?;
+            var rb = ParsePositive("b", b);
+            int y = rb?;
+            int bonus = x > 5 ? ParsePositive("bonus", 2)? : 0;
+            return Result<int, string>.Ok(x + y + bonus);
+        } finally {
+            g_finallyHits = g_finallyHits + 1;
+        }
+    }
+
+    static Result<string, string> FormatPositive(string tag, int n) {
+        if (n < 0) {
+            return Result<string, string>.Err("bad:" + tag);
+        }
+        return Result<string, string>.Ok(tag + "=" + n.ToString());
+    }
+
+    static Result<string, string> CombineStrings(int a, int b) {
+        string sa = FormatPositive("x", a)?;
+        var rb = FormatPositive("y", b);
+        string sb = rb?;
+        return Result<string, string>.Ok(sa + "," + sb);
+    }
+
+    static async Task<Result<int, string>> FetchAsync(string tag, int n) {
+        await Task.Yield();
+        return ParsePositive(tag, n);
+    }
+
+    static async Task<Result<int, string>> AsyncPipeline(int a, int b) {
+        int x = (await FetchAsync("p", a))?;
+        int y = (await FetchAsync("q", b))?;
+        return Result<int, string>.Ok(x * 10 + y);
+    }
+
+    static async void ProduceStream(Channel<int> ch, Gate done) {
+        await ch.Write(10);
+        await ch.Write(20);
+        await ch.Write(30);
+        ch.Complete();
+        done.Signal();
+    }
+
+    static async void ProduceSelect2(Channel<int> ch1, Channel<string> ch2, Gate done) {
+        await Task.Delay(5);
+        ch2.TryWrite("hi");
+        await Task.Delay(5);
+        ch1.TryWrite(42);
+        await Task.Delay(5);
+        ch1.Complete();
+        ch2.Complete();
+        done.Signal();
+    }
+
+    static async void CancelLater(CancellationTokenSource cts, Gate done) {
+        await Task.Delay(10);
+        cts.Cancel();
+        done.Signal();
+    }
+
+    static async Task<int> RunAsync() {
+        // 1. async IAsyncEnumerable<int> full consumption + yield break at 5
+        int sumFull = 0;
+        await foreach (int v in CountUpAsync(10)) {
+            sumFull = sumFull + v;
+        }
+        Console.WriteLine($"stream_full={sumFull}");
+
+        // 2. async IAsyncEnumerable<int> early break (tests Dispose cleanup)
+        int sumEarly = 0;
+        await foreach (int v in CountUpAsync(10)) {
+            sumEarly = sumEarly + v;
+            if (v == 3) {
+                break;
+            }
+        }
+        await Task.Delay(5);
+        Console.WriteLine($"stream_early={sumEarly}");
+
+        // 3. async IAsyncEnumerable<string> ARC payload
+        string joined = "";
+        await foreach (var w in WordsAsync()) {
+            if (joined.Length > 0) { joined = joined + "-"; }
+            joined = joined + w;
+        }
+        Console.WriteLine($"stream_words={joined}");
+
+        // 4. Channel<T>.ReadAllAsync() + await foreach
+        var chStream = Channel<int>.CreateBounded(2);
+        var prodDone = new Gate();
+        Task.Spawn(ProduceStream(chStream, prodDone));
+        int chSum = 0;
+        await foreach (int x in chStream.ReadAllAsync()) {
+            chSum = chSum + x;
+        }
+        await prodDone.Wait();
+        Console.WriteLine($"chan_stream={chSum}");
+
+        // 5. ChannelSelect.Select2 (event-driven wakeups + Closed)
+        var ch1 = Channel<int>.CreateUnbounded();
+        var ch2 = Channel<string>.CreateUnbounded();
+        var selDone = new Gate();
+        Task.Spawn(ProduceSelect2(ch1, ch2, selDone));
+        string selLog = "";
+        while (true) {
+            var r = await ChannelSelect.Select2<int, string>(ch1, ch2);
+            bool done = false;
+            switch (r) {
+                case Select2Result<int, string>.First(var n):
+                    selLog = selLog + "1:" + n.ToString() + ";";
+                    break;
+                case Select2Result<int, string>.Second(var s):
+                    selLog = selLog + "2:" + s + ";";
+                    break;
+                case Select2Result<int, string>.Closed:
+                    selLog = selLog + "closed";
+                    done = true;
+                    break;
+                case Select2Result<int, string>.Cancelled:
+                    selLog = selLog + "cancelled";
+                    done = true;
+                    break;
+            }
+            if (done) { break; }
+        }
+        await selDone.Wait();
+        Console.WriteLine($"select2={selLog}");
+
+        // 6. ChannelSelect.Select2 structured cancellation
+        var idle1 = Channel<int>.CreateUnbounded();
+        var idle2 = Channel<int>.CreateUnbounded();
+        var cts = new CancellationTokenSource();
+        var cancelDone = new Gate();
+        Task.Spawn(CancelLater(cts, cancelDone));
+        var cancelRes = await ChannelSelect.Select2<int, int>(idle1, idle2, cts.Token);
+        await cancelDone.Wait();
+        string cancelTag = "other";
+        switch (cancelRes) {
+            case Select2Result<int, int>.Cancelled:
+                cancelTag = "cancelled";
+                break;
+            case Select2Result<int, int>.First(var _):
+            case Select2Result<int, int>.Second(var _):
+            case Select2Result<int, int>.Closed:
+                cancelTag = "other";
+                break;
+        }
+        idle1.Complete();
+        idle2.Complete();
+        Console.WriteLine($"select_cancel={cancelTag}");
+
+        // 7. ChannelSelect.Select3
+        var t1 = Channel<int>.CreateUnbounded();
+        var t2 = Channel<int>.CreateUnbounded();
+        var t3 = Channel<int>.CreateUnbounded();
+        t3.TryWrite(99);
+        var s3 = await ChannelSelect.Select3<int, int, int>(t1, t2, t3, null);
+        int s3Val = 0;
+        switch (s3) {
+            case Select3Result<int, int, int>.Third(var v):
+                s3Val = v;
+                break;
+            case Select3Result<int, int, int>.First(var v):
+            case Select3Result<int, int, int>.Second(var v):
+                s3Val = -1;
+                break;
+            case Select3Result<int, int, int>.Closed:
+            case Select3Result<int, int, int>.Cancelled:
+                s3Val = -2;
+                break;
+        }
+        t1.Complete();
+        t2.Complete();
+        t3.Complete();
+        Console.WriteLine($"select3={s3Val}");
+
+        // 8. Result<T, E> + ? sync (Ok, Err, finally, ARC string payloads)
+        var rOk = ComputeWithTry(10, 4);
+        switch (rOk) {
+            case Result<int, string>.Ok(var v):
+                Console.WriteLine($"try_ok={v}");
+                break;
+            case Result<int, string>.Err(var e):
+                Console.WriteLine($"try_ok=ERR:{e}");
+                break;
+        }
+        var rErr = ComputeWithTry(10, -3);
+        switch (rErr) {
+            case Result<int, string>.Ok(var v):
+                Console.WriteLine($"try_err=OK:{v}");
+                break;
+            case Result<int, string>.Err(var e):
+                Console.WriteLine($"try_err={e}");
+                break;
+        }
+        Console.WriteLine($"finally_hits={g_finallyHits}");
+
+        var sOk = CombineStrings(7, 8);
+        switch (sOk) {
+            case Result<string, string>.Ok(var v):
+                Console.WriteLine($"str_ok={v}");
+                break;
+            case Result<string, string>.Err(var e):
+                Console.WriteLine($"str_ok=ERR:{e}");
+                break;
+        }
+        var sErr = CombineStrings(-1, 8);
+        switch (sErr) {
+            case Result<string, string>.Ok(var v):
+                Console.WriteLine($"str_err=OK:{v}");
+                break;
+            case Result<string, string>.Err(var e):
+                Console.WriteLine($"str_err={e}");
+                break;
+        }
+
+        // 9. Async Task<Result<T, E>> + ?
+        var aOk = await AsyncPipeline(3, 7);
+        switch (aOk) {
+            case Result<int, string>.Ok(var v):
+                Console.WriteLine($"async_ok={v}");
+                break;
+            case Result<int, string>.Err(var e):
+                Console.WriteLine($"async_ok=ERR:{e}");
+                break;
+        }
+        var aErr = await AsyncPipeline(3, -5);
+        switch (aErr) {
+            case Result<int, string>.Ok(var v):
+                Console.WriteLine($"async_err=OK:{v}");
+                break;
+            case Result<int, string>.Err(var e):
+                Console.WriteLine($"async_err={e}");
+                break;
+        }
+
+        return 0;
+    }
+
+    public static void Main() {
+        await RunAsync();
+    }
+}

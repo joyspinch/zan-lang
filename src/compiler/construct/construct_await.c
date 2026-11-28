@@ -186,6 +186,7 @@ LLVMValueRef emit_expr_switch_expr(zan_irgen_t *g, zan_ast_node_t *expr,
     sc->switch_case.type_pattern = arm->switch_arm.type_pattern;
     sc->switch_case.when_cond = arm->switch_arm.when_cond;
     sc->switch_case.var_name = arm->switch_arm.var_name;
+    sc->switch_case.adt_pat = arm->switch_arm.adt_pat;
 
     /* body: { __swx = result; break; } */
     zan_ast_node_t *block = zan_ast_new(g->arena, AST_BLOCK, arm->loc);

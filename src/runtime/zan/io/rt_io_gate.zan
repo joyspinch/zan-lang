@@ -1,0 +1,325 @@
+// rt_io_gate.zan: Coroutine counting gate with generation-free ticket ownership
+// and runtime-timer-backed timed waits (zan_gate_*).
+// 100% pure Zan, zero assembly.
+
+namespace Zan.Runtime.Io;
+
+static class IoGate {
+    // GateWaiter layout (56 bytes)
+    const long W_NEXT = 0L;
+    const long W_GATE = 8L;
+    const long W_FRAME = 16L;
+    const long W_STEP = 24L;
+    const long W_TICKET = 32L;
+    const long W_PARKED = 40L;
+    const long W_COMPLETED = 44L;
+    const long W_TIMER_DONE = 48L;
+    const long W_DISPATCHING = 52L;
+    const ulong W_SIZE = 56UL;
+
+    // Gate layout (96 bytes: G_LOCK 64B covers Win64 CRITICAL_SECTION=40, Linux x64=40 / arm64=48, macOS=64)
+    const long G_HEAD = 0L;
+    const long G_TAIL = 8L;
+    const long G_SURPLUS = 16L;
+    const long G_REFCNT = 24L;
+    const long G_CLOSED = 28L;
+    const long G_LOCK = 32L;
+    const ulong G_SIZE = 96UL;
+
+    static void Lock(nint g) { IoPlat.MutexLock(g + (nint)G_LOCK); }
+    static void Unlock(nint g) { IoPlat.MutexUnlock(g + (nint)G_LOCK); }
+
+    static void Destroy(nint g) {
+        IoPlat.MutexDestroy(g + (nint)G_LOCK);
+        IoPlat.CFree(g);
+    }
+
+    static void Release(nint g) {
+        Lock(g);
+        int rc = NativeMemory.AsRef<int>((g) + (nint)(G_REFCNT)) - 1;
+        NativeMemory.AsRef<int>((g) + (nint)(G_REFCNT)) = rc;
+        Unlock(g);
+        if (rc == 0) Destroy(g);
+    }
+
+    static void Append(nint g, nint w) {
+        NativeMemory.AsRef<nint>((w) + (nint)(W_NEXT)) = (nint)0;
+        nint tail = NativeMemory.AsRef<nint>((g) + (nint)(G_TAIL));
+        if (tail != (nint)0) {
+            NativeMemory.AsRef<nint>((tail) + (nint)(W_NEXT)) = w;
+        } else {
+            NativeMemory.AsRef<nint>((g) + (nint)(G_HEAD)) = w;
+        }
+        NativeMemory.AsRef<nint>((g) + (nint)(G_TAIL)) = w;
+    }
+
+    static void Remove(nint g, nint w) {
+        nint prev = (nint)0;
+        nint p = NativeMemory.AsRef<nint>((g) + (nint)(G_HEAD));
+        while (p != (nint)0) {
+            nint next = NativeMemory.AsRef<nint>((p) + (nint)(W_NEXT));
+            if (p == w) {
+                if (prev != (nint)0) NativeMemory.AsRef<nint>((prev) + (nint)(W_NEXT)) = next;
+                else NativeMemory.AsRef<nint>((g) + (nint)(G_HEAD)) = next;
+                if (NativeMemory.AsRef<nint>((g) + (nint)(G_TAIL)) == p) NativeMemory.AsRef<nint>((g) + (nint)(G_TAIL)) = prev;
+                return;
+            }
+            prev = p;
+            p = next;
+        }
+    }
+
+    static nint Record(nint g, long ticket) {
+        nint w = (nint)ticket;
+        if (w == (nint)0) return (nint)0;
+        return NativeMemory.AsRef<nint>((w) + (nint)(W_GATE)) == g ? w : (nint)0;
+    }
+
+    static void Retire(nint g, nint w) {
+        if (NativeMemory.AsRef<int>((w) + (nint)(W_COMPLETED)) == 0 ||
+            NativeMemory.AsRef<int>((w) + (nint)(W_PARKED)) == 0 ||
+            NativeMemory.AsRef<int>((w) + (nint)(W_TIMER_DONE)) == 0 ||
+            NativeMemory.AsRef<int>((w) + (nint)(W_DISPATCHING)) != 0)
+            return;
+        if (NativeMemory.AsRef<long>((w) + (nint)(W_TICKET)) != 0L) {
+            NativeMemory.AsRef<int>((g) + (nint)(G_REFCNT)) = NativeMemory.AsRef<int>((g) + (nint)(G_REFCNT)) - 1;
+        }
+        NativeMemory.AsRef<nint>((w) + (nint)(W_GATE)) = (nint)0;
+        IoPlat.CFree(w);
+    }
+
+    static void Complete(nint g, nint w, ref nint ready) {
+        NativeMemory.AsRef<int>((w) + (nint)(W_COMPLETED)) = 1;
+        if (NativeMemory.AsRef<int>((w) + (nint)(W_PARKED)) != 0) {
+            NativeMemory.AsRef<int>((w) + (nint)(W_DISPATCHING)) = 1;
+            NativeMemory.AsRef<nint>((w) + (nint)(W_NEXT)) = ready;
+            ready = w;
+        } else {
+            Retire(g, w);
+        }
+    }
+
+    static void Dispatch(nint g, nint ready) {
+        while (ready != (nint)0) {
+            nint w = ready;
+            ready = NativeMemory.AsRef<nint>((w) + (nint)(W_NEXT));
+            nint frame = NativeMemory.AsRef<nint>((w) + (nint)(W_FRAME));
+            nint step = NativeMemory.AsRef<nint>((w) + (nint)(W_STEP));
+            Lock(g);
+            NativeMemory.AsRef<int>((w) + (nint)(W_DISPATCHING)) = 0;
+            Retire(g, w);
+            Unlock(g);
+            IoPlat.WakeCo(frame, step);
+        }
+    }
+
+    [Export("zan_gate_new")]
+    public static long GateNew() {
+        nint g = IoPlat.CCalloc(1UL, G_SIZE);
+        if (g == (nint)0) return 0L;
+        NativeMemory.AsRef<int>((g) + (nint)(G_REFCNT)) = 1;
+        IoPlat.MutexInit(g + (nint)G_LOCK);
+        return (long)g;
+    }
+
+    static long PrepareInternal(long handle, int timed) {
+        nint g = (nint)handle;
+        if (g == (nint)0) return 0L;
+        nint w = IoPlat.CCalloc(1UL, W_SIZE);
+        if (w == (nint)0) return 0L;
+        Lock(g);
+        if (NativeMemory.AsRef<int>((g) + (nint)(G_CLOSED)) != 0) {
+            Unlock(g);
+            IoPlat.CFree(w);
+            return 0L;
+        }
+        NativeMemory.AsRef<nint>((w) + (nint)(W_GATE)) = g;
+        long ticket = (long)w;
+        NativeMemory.AsRef<long>((w) + (nint)(W_TICKET)) = ticket;
+        NativeMemory.AsRef<int>((w) + (nint)(W_TIMER_DONE)) = timed != 0 ? 0 : 1;
+        NativeMemory.AsRef<int>((g) + (nint)(G_REFCNT)) = NativeMemory.AsRef<int>((g) + (nint)(G_REFCNT)) + 1;
+        long surplus = NativeMemory.AsRef<long>((g) + (nint)(G_SURPLUS));
+        if (surplus > 0L) {
+            NativeMemory.AsRef<long>((g) + (nint)(G_SURPLUS)) = surplus - 1L;
+            NativeMemory.AsRef<int>((w) + (nint)(W_COMPLETED)) = 1;
+        } else {
+            Append(g, w);
+        }
+        Unlock(g);
+        return ticket;
+    }
+
+    [Export("zan_gate_arm")]
+    public static long GateArm(long handle) {
+        return PrepareInternal(handle, 1);
+    }
+
+    [Export("zan_gate_prepare")]
+    public static long GatePrepare(long handle) {
+        return PrepareInternal(handle, 0);
+    }
+
+    [Export("__zan_gate_timeout_fired")]
+    [Visibility("hidden")]
+    static void TimeoutFired(nint arg) {
+        if (arg == (nint)0) return;
+        nint g = NativeMemory.AsRef<nint>((arg) + (nint)(W_GATE));
+        GateTicketSignalAndRelease((long)g, (long)arg);
+    }
+
+    [Export("zan_gate_arm_ms")]
+    public static long GateArmMs(long handle, long ms) {
+        if (ms <= 0L) return PrepareInternal(handle, 0);
+        long ticket = PrepareInternal(handle, 1);
+        if (ticket == 0L) return 0L;
+        nint w = (nint)ticket;
+        if (IoPlat.TimerAfterCtx(ms, NativeMemory.FunctionPointer(TimeoutFired), w) == 0UL) {
+            nint g = NativeMemory.AsRef<nint>((w) + (nint)(W_GATE));
+            Lock(g);
+            NativeMemory.AsRef<int>((w) + (nint)(W_TIMER_DONE)) = 1;
+            Retire(g, w);
+            Unlock(g);
+        }
+        return ticket;
+    }
+
+    [Export("zan_gate_park_ticket")]
+    public static void GateParkTicket(long handle, long ticket, nint frame, nint step) {
+        nint g = (nint)handle;
+        if (g == (nint)0 || step == (nint)0) {
+            if (step != (nint)0) IoPlat.WakeCo(frame, step);
+            return;
+        }
+        Lock(g);
+        nint w = Record(g, ticket);
+        if (w == (nint)0 || NativeMemory.AsRef<int>((w) + (nint)(W_PARKED)) != 0) {
+            Unlock(g);
+            IoPlat.WakeCo(frame, step);
+            return;
+        }
+        NativeMemory.AsRef<nint>((w) + (nint)(W_FRAME)) = frame;
+        NativeMemory.AsRef<nint>((w) + (nint)(W_STEP)) = step;
+        NativeMemory.AsRef<int>((w) + (nint)(W_PARKED)) = 1;
+        int completed = NativeMemory.AsRef<int>((w) + (nint)(W_COMPLETED));
+        if (completed != 0) Retire(g, w);
+        bool destroy = NativeMemory.AsRef<int>((g) + (nint)(G_REFCNT)) == 0;
+        Unlock(g);
+        if (destroy) Destroy(g);
+        if (completed != 0) IoPlat.WakeCo(frame, step);
+    }
+
+    [Export("zan_gate_park")]
+    public static void GatePark(long handle, nint frame, nint step) {
+        nint g = (nint)handle;
+        if (g == (nint)0 || step == (nint)0) {
+            if (step != (nint)0) IoPlat.WakeCo(frame, step);
+            return;
+        }
+        Lock(g);
+        int closed = NativeMemory.AsRef<int>((g) + (nint)(G_CLOSED));
+        long surplus = NativeMemory.AsRef<long>((g) + (nint)(G_SURPLUS));
+        if (closed != 0 || surplus > 0L) {
+            if (closed == 0) NativeMemory.AsRef<long>((g) + (nint)(G_SURPLUS)) = surplus - 1L;
+            Unlock(g);
+            IoPlat.WakeCo(frame, step);
+            return;
+        }
+        nint w = IoPlat.CCalloc(1UL, W_SIZE);
+        if (w == (nint)0) {
+            Unlock(g);
+            IoPlat.WakeCo(frame, step);
+            return;
+        }
+        NativeMemory.AsRef<nint>((w) + (nint)(W_FRAME)) = frame;
+        NativeMemory.AsRef<nint>((w) + (nint)(W_STEP)) = step;
+        NativeMemory.AsRef<int>((w) + (nint)(W_PARKED)) = 1;
+        NativeMemory.AsRef<int>((w) + (nint)(W_TIMER_DONE)) = 1;
+        Append(g, w);
+        Unlock(g);
+    }
+
+    static void SignalInternal(long handle, bool all) {
+        nint g = (nint)handle;
+        if (g == (nint)0) return;
+        nint ready = (nint)0;
+        Lock(g);
+        if (NativeMemory.AsRef<int>((g) + (nint)(G_CLOSED)) != 0) {
+            Unlock(g);
+            return;
+        }
+        NativeMemory.AsRef<int>((g) + (nint)(G_REFCNT)) = NativeMemory.AsRef<int>((g) + (nint)(G_REFCNT)) + 1;
+        nint head = NativeMemory.AsRef<nint>((g) + (nint)(G_HEAD));
+        if (head == (nint)0) {
+            NativeMemory.AsRef<long>((g) + (nint)(G_SURPLUS)) = NativeMemory.AsRef<long>((g) + (nint)(G_SURPLUS)) + 1L;
+        } else {
+            for (;;) {
+                nint w = NativeMemory.AsRef<nint>((g) + (nint)(G_HEAD));
+                nint next = NativeMemory.AsRef<nint>((w) + (nint)(W_NEXT));
+                NativeMemory.AsRef<nint>((g) + (nint)(G_HEAD)) = next;
+                Complete(g, w, ref ready);
+                if (!all || next == (nint)0) break;
+            }
+            if (NativeMemory.AsRef<nint>((g) + (nint)(G_HEAD)) == (nint)0) {
+                NativeMemory.AsRef<nint>((g) + (nint)(G_TAIL)) = (nint)0;
+            }
+        }
+        Unlock(g);
+        Dispatch(g, ready);
+        Release(g);
+    }
+
+    [Export("zan_gate_signal")]
+    public static void GateSignal(long handle) {
+        SignalInternal(handle, false);
+    }
+
+    [Export("zan_gate_signal_all")]
+    public static void GateSignalAll(long handle) {
+        SignalInternal(handle, true);
+    }
+
+    [Export("zan_gate_free")]
+    public static void GateFree(long handle) {
+        nint g = (nint)handle;
+        if (g == (nint)0) return;
+        nint ready = (nint)0;
+        Lock(g);
+        if (NativeMemory.AsRef<int>((g) + (nint)(G_CLOSED)) != 0) {
+            Unlock(g);
+            return;
+        }
+        NativeMemory.AsRef<int>((g) + (nint)(G_CLOSED)) = 1;
+        while (NativeMemory.AsRef<nint>((g) + (nint)(G_HEAD)) != (nint)0) {
+            nint w = NativeMemory.AsRef<nint>((g) + (nint)(G_HEAD));
+            NativeMemory.AsRef<nint>((g) + (nint)(G_HEAD)) = NativeMemory.AsRef<nint>((w) + (nint)(W_NEXT));
+            Complete(g, w, ref ready);
+        }
+        NativeMemory.AsRef<nint>((g) + (nint)(G_TAIL)) = (nint)0;
+        NativeMemory.AsRef<long>((g) + (nint)(G_SURPLUS)) = 0L;
+        Unlock(g);
+        Dispatch(g, ready);
+        Release(g);
+    }
+
+    [Export("zan_gate_ticket_signal_and_release")]
+    public static void GateTicketSignalAndRelease(long handle, long ticket) {
+        nint g = (nint)handle;
+        if (g == (nint)0) return;
+        nint ready = (nint)0;
+        Lock(g);
+        nint w = Record(g, ticket);
+        if (w != (nint)0 && NativeMemory.AsRef<int>((w) + (nint)(W_TIMER_DONE)) == 0) {
+            NativeMemory.AsRef<int>((w) + (nint)(W_TIMER_DONE)) = 1;
+            if (NativeMemory.AsRef<int>((w) + (nint)(W_COMPLETED)) == 0) {
+                Remove(g, w);
+                Complete(g, w, ref ready);
+            } else {
+                Retire(g, w);
+            }
+        }
+        NativeMemory.AsRef<int>((g) + (nint)(G_REFCNT)) = NativeMemory.AsRef<int>((g) + (nint)(G_REFCNT)) + 1;
+        Unlock(g);
+        Dispatch(g, ready);
+        Release(g);
+    }
+}

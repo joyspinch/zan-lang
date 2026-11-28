@@ -10,6 +10,12 @@
 #include <stdio.h>
 
 static const char *type_name(zan_type_t *t);
+static bool checker_type_is_ref_struct(const zan_type_t *t);
+static bool checker_type_is_noncopyable(const zan_type_t *t);
+static void checker_check_ownership_type_ref(zan_checker_t *c, zan_type_t *t,
+                                             zan_loc_t loc);
+static bool checker_check_ownership_boxing(zan_checker_t *c, zan_type_t *target,
+                                           zan_type_t *value, zan_loc_t loc);
 
 /* 线程局部存储。LSP 进程里诊断线程与工作线程各跑各的 checker
  * （src/lsp/lsp_main.c），类型名缓冲池不能共用。 */
@@ -42,5 +48,6 @@ static ZAN_TLS int g_type_name_slot;
 #include "checker/checker_expr_adv.c"
 #include "checker/checker_stmt.c"
 #include "checker/checker_decl.c"
+#include "checker/checker_ownership.c"
 #include "checker/checker_cycles.c"
 #include "checker/checker_unit.c"

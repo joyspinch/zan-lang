@@ -6,6 +6,12 @@
  * defines: generated_objects, obj_tmp, obj_path, driver_reg, driver_prefixes,
  * mf （链接与清理阶段在同一 main() 作用域继续消费。） */
 zan_prepare_static_runtime(&irgen, &target, extra_link_input_count > 0);
+if (opts.emit_header_path && opts.emit_header_path[0]) {
+  if (zan_irgen_write_c_header(&irgen, ast, opts.emit_header_path) != ZAN_OK) {
+    zan_irgen_destroy(&irgen);
+    return 1;
+  }
+}
 
 phase("irgen");
 probe_phase_mem("irgen");
@@ -975,6 +981,121 @@ else {
 
   phase("emit obj");
   probe_phase_mem("emit obj");
+  if ((opts.freestanding || opts.emit_obj) &&
+      zan_irgen_audit_freestanding(&irgen) != ZAN_OK) {
+    report_suppressed_errors(irgen.diag);
+    zan_diag_free_buffers(irgen.diag);
+    zan_irgen_destroy(&irgen);
+    zan_arena_free(ir_arena);
+    zan_arena_free(arena);
+    free(source);
+    return 1;
+  }
+  {
+    const char *oext = output_file ? strrchr(output_file, '.') : NULL;
+    bool wants_raw_obj = (oext && (strcmp(oext, ".o") == 0 || strcmp(oext, ".obj") == 0));
+    if (opts.emit_obj ||
+        (opts.freestanding && wants_raw_obj && !opts.linker_script && !opts.entry_symbol)) {
+      if (zan_irgen_write_obj(&irgen, output_file) != ZAN_OK) {
+        fprintf(stderr, "error: failed to emit object '%s'\n",
+                output_file);
+        zan_diag_free_buffers(irgen.diag);
+        zan_irgen_destroy(&irgen);
+        zan_arena_free(ir_arena);
+        zan_arena_free(arena);
+        free(source);
+        return 1;
+      }
+      printf("Compiled object -> '%s'\n", output_file);
+      zan_irgen_destroy(&irgen);
+      zan_arena_free(ir_arena);
+      zan_arena_free(arena);
+      free(source);
+      return 0;
+    }
+    if (opts.freestanding && (opts.linker_script || opts.entry_symbol)) {
+      if (zan_irgen_write_obj(&irgen, obj_tmp) != ZAN_OK) {
+        fprintf(stderr, "error: failed to emit freestanding object '%s'\n", obj_tmp);
+        zan_diag_free_buffers(irgen.diag);
+        zan_irgen_destroy(&irgen);
+        zan_arena_free(ir_arena);
+        zan_arena_free(arena);
+        free(source);
+        return 1;
+      }
+      zan_irgen_destroy(&irgen);
+      zan_arena_free(ir_arena);
+      zan_arena_free(arena);
+      free(source);
+
+      int lrc = 1;
+#ifdef _WIN32
+      char bm_exe_dir[1024];
+      bm_exe_dir[0] = '\0';
+      GetModuleFileNameA(NULL, bm_exe_dir, sizeof(bm_exe_dir));
+      {
+        char *sl = strrchr(bm_exe_dir, '\\');
+        if (sl) *sl = '\0';
+      }
+      char bm_lld[1200];
+      snprintf(bm_lld, sizeof(bm_lld), "%s\\ld.lld.exe", bm_exe_dir);
+      const char *ld_bin = zan_file_exists(bm_lld) ? bm_lld : "ld.lld";
+      const char *largv[1280];
+      char ldir_bufs[128][512];
+      char llib_bufs[128][160];
+      int la = 0;
+      largv[la++] = ld_bin;
+      largv[la++] = "-nostdlib";
+      largv[la++] = "--gc-sections";
+      if (opts.linker_script) {
+        largv[la++] = "-T";
+        largv[la++] = opts.linker_script;
+      }
+      if (opts.entry_symbol) {
+        largv[la++] = "-e";
+        largv[la++] = opts.entry_symbol;
+      }
+      largv[la++] = "-o";
+      largv[la++] = output_file;
+      largv[la++] = obj_tmp;
+      for (int ei = 0; ei < opts.extra_link_input_count && la < 1200; ei++)
+        largv[la++] = opts.extra_link_inputs[ei];
+      for (int di = 0; di < opts.extra_lib_path_count && di < 128 && la < 1240; di++) {
+        snprintf(ldir_bufs[di], sizeof(ldir_bufs[0]), "-L%s", opts.extra_lib_paths[di]);
+        largv[la++] = ldir_bufs[di];
+      }
+      for (int li = 0; li < opts.extra_link_lib_count && li < 128 && la < 1270; li++) {
+        snprintf(llib_bufs[li], sizeof(llib_bufs[0]), "-l%s", opts.extra_link_libs[li]);
+        largv[la++] = llib_bufs[li];
+      }
+      largv[la] = NULL;
+      lrc = (int)zan_utf8_spawnv(_P_WAIT, ld_bin, largv);
+#else
+      char lcmd[4096];
+      size_t lpos = (size_t)snprintf(lcmd, sizeof(lcmd), "ld.lld -nostdlib --gc-sections");
+      if (opts.linker_script && lpos < sizeof(lcmd))
+        lpos += (size_t)snprintf(lcmd + lpos, sizeof(lcmd) - lpos, " -T \"%s\"", opts.linker_script);
+      if (opts.entry_symbol && lpos < sizeof(lcmd))
+        lpos += (size_t)snprintf(lcmd + lpos, sizeof(lcmd) - lpos, " -e \"%s\"", opts.entry_symbol);
+      if (lpos < sizeof(lcmd))
+        lpos += (size_t)snprintf(lcmd + lpos, sizeof(lcmd) - lpos, " -o \"%s\" \"%s\"", output_file, obj_tmp);
+      for (int ei = 0; ei < opts.extra_link_input_count && lpos < sizeof(lcmd); ei++)
+        lpos += (size_t)snprintf(lcmd + lpos, sizeof(lcmd) - lpos, " \"%s\"", opts.extra_link_inputs[ei]);
+      for (int di = 0; di < opts.extra_lib_path_count && lpos < sizeof(lcmd); di++)
+        lpos += (size_t)snprintf(lcmd + lpos, sizeof(lcmd) - lpos, " -L\"%s\"", opts.extra_lib_paths[di]);
+      for (int li = 0; li < opts.extra_link_lib_count && lpos < sizeof(lcmd); li++)
+        lpos += (size_t)snprintf(lcmd + lpos, sizeof(lcmd) - lpos, " -l\"%s\"", opts.extra_link_libs[li]);
+      lrc = system(lcmd);
+#endif
+      remove(obj_tmp);
+      if (lrc != 0) {
+        fprintf(stderr, "error: freestanding bare-metal link failed (exit %d)\n", lrc);
+        return 1;
+      }
+      printf("Compiled freestanding image -> '%s'\n", output_file);
+      return 0;
+    }
+  }
   if (zan_irgen_write_obj(&irgen, obj_tmp) != ZAN_OK) {
     generated_object_vec_remove(&generated_objects, obj_tmp);
     fprintf(stderr, "error: failed to emit object file\n");

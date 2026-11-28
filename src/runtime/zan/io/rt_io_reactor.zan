@@ -1,0 +1,1027 @@
+// rt_io_reactor.zan: Sharded Win64 IOCP & Linux epoll async I/O reactor,
+// lifecycle, wait/recv/recv_to/accept/poll/pump/close_notify, and single-thread
+// zan_co_sync_sleep. 100% pure Zan, zero assembly.
+
+namespace Zan.Runtime.Io;
+
+static partial class IoReactor {
+    internal static int s_ioCount = 0;
+    internal static int s_started = 0;
+    internal static int s_broken = 0;
+    internal static int s_shardsLive = 0;
+
+#if ZAN_CO_DRIVER
+    internal static int s_shards = 1;
+    internal static int s_syncInline = 0;
+#endif
+
+    internal static int ShardCount() {
+#if ZAN_CO_DRIVER
+        int n = Atomic.Load(ref s_shards, MemoryOrder.Acquire);
+        return n < 1 ? 1 : n;
+#else
+        return 1;
+#endif
+    }
+
+#if WINDOWS
+    // ---- Win64 IOCP Backend ----
+    const int OP_READY = 0;
+    const int OP_RECV = 1;
+    const int OP_ACCEPT = 2;
+
+    // IoOp layout (96 bytes; OVERLAPPED at offset 0 so CONTAINING_RECORD == lpOverlapped)
+    const long OP_SOCK = 32L;
+    const long OP_INTEREST = 40L;
+    const long OP_KIND = 44L;
+    const long OP_RTO = 48L;
+    const long OP_SHARD = 52L;
+    const long OP_CO = 56L;
+    const long OP_STEP = 64L;
+    const long OP_OUTN = 72L;
+    const long OP_ACCEPTED = 80L;
+    const long OP_ACCEPT_BUF = 88L;
+    const ulong OP_SIZE = 96UL;
+
+    // WinRto layout (56 bytes)
+    const long RTO_NEXT = 0L;
+    const long RTO_SOCK = 8L;
+    const long RTO_FRAME = 16L;
+    const long RTO_STEP = 24L;
+    const long RTO_OV = 32L;
+    const long RTO_OUTN = 40L;
+    const long RTO_DUE = 48L;
+    const ulong RTO_SIZE = 56UL;
+
+    const uint ASSOC_CACHE_SIZE = 4096U;
+    const uint ASSOC_CACHE_MASK = 4095U;
+
+    internal static nint s_iocp = (nint)0;
+    static nint s_rtoHead = (nint)0;
+    static IoBuf48 s_rtoLock;
+    static int s_rtoLockReady = 0;
+    static ulong s_initSrw = 0UL;
+    static nint s_assocCache = (nint)0;
+    static nint s_cachedAcceptEx = (nint)0;
+
+    static ulong s_opPoolSrw = 0UL;
+    static nint s_opPoolHead = (nint)0;
+
+#if ZAN_CO_DRIVER
+    static int s_syncFast = -1;
+    static nint s_shardHandles = (nint)0; // nint[256]
+    static nint s_shardCnts = (nint)0;    // 256 * 64 bytes (cache-line padded int)
+
+    static int SyncFastOn() {
+        int v = Atomic.Load(ref s_syncFast, MemoryOrder.Acquire);
+        if (v < 0) {
+            int cfg = IoPlat.AsyncCfgSyncFast();
+            if (cfg >= 0) {
+                v = cfg;
+            } else {
+                nint e = IoPlat.CGetEnv((nint)"ZAN_IO_SYNCFAST");
+                if (e != (nint)0 && NativeMemory.AsRef<byte>(e) != 0) {
+                    v = NativeMemory.AsRef<byte>(e) != 48 ? 1 : 0; // '0'
+                } else {
+                    v = 1;
+                }
+            }
+            Atomic.Store(ref s_syncFast, v, MemoryOrder.Release);
+        }
+        return v;
+    }
+
+    internal static nint IoShard(int i) {
+        int n = ShardCount();
+        if (i <= 0 || i >= n || s_shardHandles == (nint)0) return s_iocp;
+        nint h = NativeMemory.AsRef<nint>((s_shardHandles) + (nint)((long)i * 8L));
+        return h != (nint)0 ? h : s_iocp;
+    }
+
+    static int ShardIdxOf(ulong s) {
+        int n = ShardCount();
+        return IoPlat.ShardHash(s, n);
+    }
+
+    static nint ShardOf(ulong s) {
+        return IoShard(ShardIdxOf(s));
+    }
+
+    internal static void ShardsStart(int n) {
+        int cfg = IoPlat.AsyncCfgIoShards();
+        if (cfg > 0 && cfg < n) n = cfg;
+        nint e = IoPlat.CGetEnv((nint)"ZAN_IO_SHARDS");
+        if (e != (nint)0 && NativeMemory.AsRef<byte>(e) != 0) {
+            int v = IoPlat.CAtoi(e);
+            if (v > 0 && v < n) n = v;
+        }
+        if (n > IoConst.ZAN_IO_MAXSHARD) n = IoConst.ZAN_IO_MAXSHARD;
+        if (s_shardHandles == (nint)0) {
+            s_shardHandles = IoPlat.CCalloc((ulong)IoConst.ZAN_IO_MAXSHARD, 8UL);
+        }
+        if (s_shardCnts == (nint)0) {
+            s_shardCnts = IoPlat.CCalloc((ulong)IoConst.ZAN_IO_MAXSHARD, 64UL);
+        }
+        if (s_shardHandles != (nint)0) {
+            for (int i = 1; i < n; i++) {
+                nint h = NativeMemory.AsRef<nint>((s_shardHandles) + (nint)((long)i * 8L));
+                if (h == (nint)0) {
+                    h = IoPlat.WinCreateIoCompletionPort((nint)(-1L), (nint)0, 0UL, 0U);
+                    NativeMemory.AsRef<nint>((s_shardHandles) + (nint)((long)i * 8L)) = h;
+                }
+                if (h == (nint)0) {
+                    n = i;
+                    break;
+                }
+            }
+        } else {
+            n = 1;
+        }
+        Atomic.Store(ref s_shards, n < 1 ? 1 : n, MemoryOrder.Release);
+    }
+
+    internal static void ShardsStop() {
+        Atomic.Store(ref s_shards, 1, MemoryOrder.Release);
+        if (s_shardHandles != (nint)0) {
+            for (int i = 1; i < IoConst.ZAN_IO_MAXSHARD; i++) {
+                nint h = NativeMemory.AsRef<nint>((s_shardHandles) + (nint)((long)i * 8L));
+                if (h != (nint)0) {
+                    IoPlat.WinCloseHandle(h);
+                    NativeMemory.AsRef<nint>((s_shardHandles) + (nint)((long)i * 8L)) = (nint)0;
+                }
+            }
+        }
+    }
+
+    internal static void CntIncShard(int sh) {
+        if (s_shardCnts != (nint)0 && sh >= 0 && sh < IoConst.ZAN_IO_MAXSHARD) {
+            Atomic.FetchAddAt<int>(s_shardCnts + (nint)((long)sh * 64L), 1, MemoryOrder.AcqRel);
+        } else {
+            Atomic.FetchAdd(ref s_ioCount, 1, MemoryOrder.AcqRel);
+        }
+    }
+
+    internal static void CntDecShard(int sh) {
+        if (s_shardCnts != (nint)0 && sh >= 0 && sh < IoConst.ZAN_IO_MAXSHARD) {
+            Atomic.FetchAddAt<int>(s_shardCnts + (nint)((long)sh * 64L), -1, MemoryOrder.AcqRel);
+        } else {
+            Atomic.FetchAdd(ref s_ioCount, -1, MemoryOrder.AcqRel);
+        }
+    }
+
+    internal static bool HasPendingShards() {
+        if (s_shardCnts == (nint)0) return Atomic.Load(ref s_ioCount, MemoryOrder.Acquire) > 0;
+        int n = ShardCount();
+        for (int i = 0; i < n; i++) {
+            if (Atomic.LoadAt<int>(s_shardCnts + (nint)((long)i * 64L), MemoryOrder.Relaxed) > 0)
+                return true;
+        }
+        return false;
+    }
+
+    internal static void OpPoolFlushTls() {
+        nint tls = IoPlat.GetTls(false);
+        if (tls == (nint)0) return;
+        int cnt = NativeMemory.AsRef<int>((tls) + (nint)(IoConst.TLS_OP_CNT));
+        if (cnt <= 0) return;
+        IoPlat.WinAcquireSrw(NativeMemory.AddressOf(ref s_opPoolSrw));
+        for (int i = 0; i < cnt; i++) {
+            nint op = NativeMemory.AsRef<nint>((tls) + (nint)(IoConst.TLS_OP_ITEMS + (long)i * 8L));
+            if (op != (nint)0) {
+                NativeMemory.AsRef<nint>(op) = s_opPoolHead;
+                s_opPoolHead = op;
+            }
+        }
+        IoPlat.WinReleaseSrw(NativeMemory.AddressOf(ref s_opPoolSrw));
+        NativeMemory.AsRef<int>((tls) + (nint)(IoConst.TLS_OP_CNT)) = 0;
+    }
+
+    internal static nint OpAlloc() {
+        nint op = (nint)0;
+        nint tls = IoPlat.GetTls(true);
+        if (tls != (nint)0) {
+            int cnt = NativeMemory.AsRef<int>((tls) + (nint)(IoConst.TLS_OP_CNT));
+            if (cnt > 0) {
+                cnt--;
+                NativeMemory.AsRef<int>((tls) + (nint)(IoConst.TLS_OP_CNT)) = cnt;
+                op = NativeMemory.AsRef<nint>((tls) + (nint)(IoConst.TLS_OP_ITEMS + (long)cnt * 8L));
+            }
+        }
+        if (op == (nint)0) {
+            IoPlat.WinAcquireSrw(NativeMemory.AddressOf(ref s_opPoolSrw));
+            op = s_opPoolHead;
+            if (op != (nint)0) s_opPoolHead = NativeMemory.AsRef<nint>(op);
+            IoPlat.WinReleaseSrw(NativeMemory.AddressOf(ref s_opPoolSrw));
+        }
+        if (op != (nint)0) {
+            IoPlat.CMemset(op, 0, OP_SIZE);
+        } else {
+            op = IoPlat.CCalloc(1UL, OP_SIZE);
+        }
+        return op;
+    }
+
+    internal static void OpFree(nint op) {
+        if (op == (nint)0) return;
+        nint tls = IoPlat.GetTls(false);
+        if (tls != (nint)0) {
+            int cnt = NativeMemory.AsRef<int>((tls) + (nint)(IoConst.TLS_OP_CNT));
+            if (cnt < IoConst.ZAN_OP_TLS_CAP) {
+                NativeMemory.AsRef<nint>((tls) + (nint)(IoConst.TLS_OP_ITEMS + (long)cnt * 8L)) = op;
+                NativeMemory.AsRef<int>((tls) + (nint)(IoConst.TLS_OP_CNT)) = cnt + 1;
+                return;
+            }
+        }
+        IoPlat.WinAcquireSrw(NativeMemory.AddressOf(ref s_opPoolSrw));
+        NativeMemory.AsRef<nint>(op) = s_opPoolHead;
+        s_opPoolHead = op;
+        IoPlat.WinReleaseSrw(NativeMemory.AddressOf(ref s_opPoolSrw));
+    }
+
+    static bool IsListening(ulong s) {
+        int val = 0;
+        int len = 4;
+        if (IoPlat.SockGetOpt(s, IoConst.SOL_SOCKET, IoConst.SO_ACCEPTCONN,
+                              NativeMemory.AddressOf(ref val), NativeMemory.AddressOf(ref len)) == 0)
+            return val != 0;
+        return false;
+    }
+#else
+    internal static void CntIncShard(int sh) { _ = sh; s_ioCount++; }
+    internal static void CntDecShard(int sh) { _ = sh; s_ioCount--; }
+
+    internal static nint OpAlloc() {
+        nint op = s_opPoolHead;
+        if (op != (nint)0) {
+            s_opPoolHead = NativeMemory.AsRef<nint>(op);
+            IoPlat.CMemset(op, 0, OP_SIZE);
+        } else {
+            op = IoPlat.CCalloc(1UL, OP_SIZE);
+        }
+        return op;
+    }
+
+    internal static void OpFree(nint op) {
+        if (op == (nint)0) return;
+        NativeMemory.AsRef<nint>(op) = s_opPoolHead;
+        s_opPoolHead = op;
+    }
+#endif
+
+    internal static void PostDnsWakeAll() {
+        ulong dnsKey = 0xFFFFFFFFFFFFFFFEUL; // (ULONG_PTR)-2
+#if ZAN_CO_DRIVER
+        int n = ShardCount();
+        for (int i = 0; i < n; i++) {
+            if (IoPlat.WinPostQueuedCompletionStatus(IoShard(i), 0U, dnsKey, (nint)0) == 0) {
+                Atomic.Store(ref IoDns.s_wakeLost, 1, MemoryOrder.Release);
+            }
+        }
+#else
+        if (s_iocp != (nint)0) {
+            if (IoPlat.WinPostQueuedCompletionStatus(s_iocp, 0U, dnsKey, (nint)0) == 0) {
+                Atomic.Store(ref IoDns.s_wakeLost, 1, MemoryOrder.Release);
+            }
+        }
+#endif
+    }
+
+    static uint AssocIdx(ulong s) {
+        return (uint)((s >> 2) ^ (s >> 14)) & ASSOC_CACHE_MASK;
+    }
+
+    static void AssocInvalidate(ulong s) {
+        if (s == 0UL || s == 0xFFFFFFFFFFFFFFFFUL || s_assocCache == (nint)0) return;
+        uint idx = AssocIdx(s);
+        nint slot = s_assocCache + (nint)((long)idx * 8L);
+        Atomic.CompareExchangeAt<ulong>(slot, s, 0UL, MemoryOrder.Release, MemoryOrder.Relaxed);
+    }
+
+    static int EnsureAssoc(ulong s) {
+        if (s != 0UL && s != 0xFFFFFFFFFFFFFFFFUL && s_assocCache != (nint)0) {
+            uint idx = AssocIdx(s);
+            nint slot = s_assocCache + (nint)((long)idx * 8L);
+            if (Atomic.LoadAt<ulong>(slot, MemoryOrder.Acquire) == s) {
+#if ZAN_CO_DRIVER
+                return SyncFastOn();
+#else
+                return 0;
+#endif
+            }
+        }
+#if ZAN_CO_DRIVER
+        nint port = ShardOf(s);
+#else
+        nint port = s_iocp;
+#endif
+        nint assoc = IoPlat.WinCreateIoCompletionPort((nint)s, port, s, 0U);
+        if (assoc == (nint)0) {
+            if (IoPlat.WinGetLastError() != IoConst.ERROR_INVALID_PARAMETER) return 0;
+        }
+#if ZAN_CO_DRIVER
+        if (SyncFastOn() == 0) {
+            if (s != 0UL && s != 0xFFFFFFFFFFFFFFFFUL && s_assocCache != (nint)0) {
+                Atomic.StoreAt<ulong>(s_assocCache + (nint)((long)AssocIdx(s) * 8L), s, MemoryOrder.Release);
+            }
+            return 0;
+        }
+        if (IoPlat.WinSetFileCompletionNotificationModes((nint)s, IoConst.FILE_SKIP_COMPLETION_PORT_ON_SUCCESS) != 0 ||
+            IoPlat.WinGetLastError() == IoConst.ERROR_INVALID_PARAMETER) {
+            if (s != 0UL && s != 0xFFFFFFFFFFFFFFFFUL && s_assocCache != (nint)0) {
+                Atomic.StoreAt<ulong>(s_assocCache + (nint)((long)AssocIdx(s) * 8L), s, MemoryOrder.Release);
+            }
+            return 1;
+        }
+        return 0;
+#else
+        if (s != 0UL && s != 0xFFFFFFFFFFFFFFFFUL && s_assocCache != (nint)0) {
+            Atomic.StoreAt<ulong>(s_assocCache + (nint)((long)AssocIdx(s) * 8L), s, MemoryOrder.Release);
+        }
+        return 0;
+#endif
+    }
+
+    static void RtoLock() { IoPlat.WinEnterCs(NativeMemory.AddressOf(ref s_rtoLock)); }
+    static void RtoUnlock() { IoPlat.WinLeaveCs(NativeMemory.AddressOf(ref s_rtoLock)); }
+
+    static bool RtoClaimLocked(nint op) {
+        nint prev = (nint)0;
+        nint cur = s_rtoHead;
+        while (cur != (nint)0) {
+            nint next = NativeMemory.AsRef<nint>((cur) + (nint)(RTO_NEXT));
+            if (NativeMemory.AsRef<nint>((cur) + (nint)(RTO_OV)) == op) {
+                if (prev != (nint)0) NativeMemory.AsRef<nint>((prev) + (nint)(RTO_NEXT)) = next;
+                else s_rtoHead = next;
+                IoPlat.CFree(cur);
+                return true;
+            }
+            prev = cur;
+            cur = next;
+        }
+        return false;
+    }
+
+    internal static long RtoWaitMs(long callerMs) {
+        long now = IoPlat.NowMs();
+        long nearest = -1L;
+        RtoLock();
+        for (nint e = s_rtoHead; e != (nint)0; e = NativeMemory.AsRef<nint>((e) + (nint)(RTO_NEXT))) {
+            long due = NativeMemory.AsRef<long>((e) + (nint)(RTO_DUE));
+            if (nearest < 0L || due < nearest) nearest = due;
+        }
+        RtoUnlock();
+        if (nearest < 0L) return callerMs;
+        long wait = nearest - now;
+        if (wait < 0L) wait = 0L;
+        if (callerMs < 0L) return wait;
+        return wait < callerMs ? wait : callerMs;
+    }
+
+    internal static int RtoTimeoutScan() {
+        long now = IoPlat.NowMs();
+        for (;;) {
+            nint found = (nint)0;
+            RtoLock();
+            nint prev = (nint)0;
+            nint cur = s_rtoHead;
+            while (cur != (nint)0) {
+                nint next = NativeMemory.AsRef<nint>((cur) + (nint)(RTO_NEXT));
+                if (NativeMemory.AsRef<long>((cur) + (nint)(RTO_DUE)) <= now) {
+                    if (prev != (nint)0) NativeMemory.AsRef<nint>((prev) + (nint)(RTO_NEXT)) = next;
+                    else s_rtoHead = next;
+                    found = cur;
+                    break;
+                }
+                prev = cur;
+                cur = next;
+            }
+            if (found != (nint)0) {
+                nint op = NativeMemory.AsRef<nint>((found) + (nint)(RTO_OV));
+                Atomic.StoreAt<int>(op + (nint)OP_RTO, 2, MemoryOrder.Release);
+                ulong sock = NativeMemory.AsRef<ulong>((found) + (nint)(RTO_SOCK));
+                IoPlat.WinCancelIoEx((nint)sock, op);
+                IoPlat.CFree(found);
+            }
+            RtoUnlock();
+            if (found == (nint)0) break;
+        }
+        return 0;
+    }
+
+    internal static void CompleteOp(nint op, uint transferred, ulong status) {
+        int kind = NativeMemory.AsRef<int>((op) + (nint)(OP_KIND));
+        if (kind == OP_ACCEPT) {
+            ulong accepted = NativeMemory.AsRef<ulong>((op) + (nint)(OP_ACCEPTED));
+            ulong listener = NativeMemory.AsRef<ulong>((op) + (nint)(OP_SOCK));
+            long result = -1L;
+            if (status == 0UL &&
+                IoPlat.SockSetOpt(accepted, IoConst.SOL_SOCKET, IoConst.SO_UPDATE_ACCEPT_CONTEXT,
+                                  NativeMemory.AddressOf(ref listener), 8) == 0) {
+                uint mode = 1U;
+                IoPlat.WsaIoctlSocket(accepted, IoConst.FIONBIO, NativeMemory.AddressOf(ref mode));
+                result = (long)accepted;
+            } else {
+                IoPlat.WsaCloseSocket(accepted);
+            }
+            nint outN = NativeMemory.AsRef<nint>((op) + (nint)(OP_OUTN));
+            if (outN != (nint)0) NativeMemory.AsRef<long>(outN) = result;
+            nint abuf = NativeMemory.AsRef<nint>((op) + (nint)(OP_ACCEPT_BUF));
+            if (abuf != (nint)0) IoPlat.CFree(abuf);
+            return;
+        }
+        bool timedOut = false;
+        if (Atomic.LoadAt<int>(op + (nint)OP_RTO, MemoryOrder.Acquire) != 0) {
+            RtoLock();
+            int rv = NativeMemory.AsRef<int>((op) + (nint)(OP_RTO));
+            timedOut = rv == 2;
+            if (rv == 1) RtoClaimLocked(op);
+            RtoUnlock();
+        }
+        nint outPtr = NativeMemory.AsRef<nint>((op) + (nint)(OP_OUTN));
+        if (outPtr != (nint)0) {
+            NativeMemory.AsRef<long>(outPtr) = timedOut ? -1L : (long)transferred;
+        }
+    }
+
+    [Export("zan_io_init")]
+    public static void IoInit() {
+        if (Atomic.Load(ref s_started, MemoryOrder.Acquire) != 0) return;
+        IoPlat.WinAcquireSrw(NativeMemory.AddressOf(ref s_initSrw));
+        if (Atomic.Load(ref s_started, MemoryOrder.Acquire) != 0) {
+            IoPlat.WinReleaseSrw(NativeMemory.AddressOf(ref s_initSrw));
+            return;
+        }
+        IoPlat.CrashInstall();
+        Atomic.Store(ref s_ioCount, 0, MemoryOrder.Release);
+        s_broken = 0;
+        IoBuf512 wsa = new IoBuf512();
+        IoPlat.WsaStartup(0x0202, NativeMemory.AddressOf(ref wsa));
+        s_iocp = IoPlat.WinCreateIoCompletionPort((nint)(-1L), (nint)0, 0UL, 0U);
+        if (s_iocp == (nint)0) s_broken = 1;
+        if (s_rtoLockReady == 0) {
+            IoPlat.WinInitCs(NativeMemory.AddressOf(ref s_rtoLock));
+            s_rtoLockReady = 1;
+        }
+        if (s_assocCache == (nint)0) {
+            s_assocCache = IoPlat.CCalloc((ulong)ASSOC_CACHE_SIZE, 8UL);
+        }
+#if ZAN_CO_DRIVER
+        if (s_shardHandles == (nint)0) {
+            s_shardHandles = IoPlat.CCalloc((ulong)IoConst.ZAN_IO_MAXSHARD, 8UL);
+        }
+        if (s_shardCnts == (nint)0) {
+            s_shardCnts = IoPlat.CCalloc((ulong)IoConst.ZAN_IO_MAXSHARD, 64UL);
+        } else {
+            IoPlat.CMemset(s_shardCnts, 0, (ulong)IoConst.ZAN_IO_MAXSHARD * 64UL);
+        }
+#endif
+        Atomic.Store(ref s_started, 1, MemoryOrder.Release);
+        IoPlat.WinReleaseSrw(NativeMemory.AddressOf(ref s_initSrw));
+    }
+
+    [Export("zan_io_shutdown")]
+    public static void IoShutdown() {
+#if ZAN_CO_DRIVER
+        OpPoolFlushTls();
+        ShardsStop();
+        if (s_shardCnts != (nint)0) {
+            IoPlat.CMemset(s_shardCnts, 0, (ulong)IoConst.ZAN_IO_MAXSHARD * 64UL);
+        }
+#endif
+        if (s_assocCache != (nint)0) {
+            IoPlat.CMemset(s_assocCache, 0, (ulong)ASSOC_CACHE_SIZE * 8UL);
+        }
+        if (s_iocp != (nint)0) {
+            IoPlat.WinCloseHandle(s_iocp);
+            s_iocp = (nint)0;
+        }
+        Atomic.Store(ref s_ioCount, 0, MemoryOrder.Release);
+        IoDns.ShutdownCleanup();
+        while (s_rtoHead != (nint)0) {
+            nint e = s_rtoHead;
+            s_rtoHead = NativeMemory.AsRef<nint>((e) + (nint)(RTO_NEXT));
+            IoPlat.CFree(e);
+        }
+        IoPlat.WinAcquireSrw(NativeMemory.AddressOf(ref s_opPoolSrw));
+        nint op = s_opPoolHead;
+        s_opPoolHead = (nint)0;
+        IoPlat.WinReleaseSrw(NativeMemory.AddressOf(ref s_opPoolSrw));
+        while (op != (nint)0) {
+            nint nx = NativeMemory.AsRef<nint>(op);
+            IoPlat.CFree(op);
+            op = nx;
+        }
+        IoPlat.WsaCleanup();
+#if ZAN_CO_DRIVER
+        int req = Atomic.Exchange(ref IoPlat.s_socketCleanupRequested, 0, MemoryOrder.AcqRel);
+        while (req > 0) {
+            IoPlat.WsaCleanup();
+            req--;
+        }
+#endif
+        Atomic.Store(ref s_started, 0, MemoryOrder.Release);
+    }
+
+    [Export("zan_io_wait_co")]
+    public static void WaitCo(nint fd, int interest, nint frame, nint step) {
+        IoInit();
+        if (s_broken != 0) {
+            if (step != (nint)0) IoPlat.WakeCo(frame, step);
+            return;
+        }
+        ulong s = (ulong)fd;
+#if ZAN_CO_DRIVER
+        if (interest == IoConst.ZAN_IO_READ && step != (nint)0 && IsListening(s)) {
+            IoSched.CoDelay(1L, frame, step);
+            return;
+        }
+#endif
+        int skip = EnsureAssoc(s);
+        nint op = OpAlloc();
+        if (op == (nint)0) {
+            if (step != (nint)0) IoPlat.WakeCo(frame, step);
+            return;
+        }
+        NativeMemory.AsRef<ulong>((op) + (nint)(OP_SOCK)) = s;
+        NativeMemory.AsRef<int>((op) + (nint)(OP_INTEREST)) = interest;
+        NativeMemory.AsRef<int>((op) + (nint)(OP_KIND)) = OP_READY;
+        NativeMemory.AsRef<nint>((op) + (nint)(OP_CO)) = frame;
+        NativeMemory.AsRef<nint>((op) + (nint)(OP_STEP)) = step;
+#if ZAN_CO_DRIVER
+        int sh = ShardIdxOf(s);
+#else
+        int sh = 0;
+#endif
+        NativeMemory.AsRef<short>((op) + (nint)(OP_SHARD)) = (short)sh;
+        CntIncShard(sh);
+
+        IoBuf16 wsaBuf = new IoBuf16(); // { len = 0, buf = 0 }
+        nint bp = NativeMemory.AddressOf(ref wsaBuf);
+        int r = 0;
+        if (interest == IoConst.ZAN_IO_READ) {
+            uint flags = 0U;
+            int sotype = 0;
+            int solen = 4;
+            if (IoPlat.SockGetOpt(s, IoConst.SOL_SOCKET, IoConst.SO_TYPE,
+                                  NativeMemory.AddressOf(ref sotype), NativeMemory.AddressOf(ref solen)) == 0 &&
+                sotype == IoConst.SOCK_DGRAM) {
+                flags = (uint)IoConst.MSG_PEEK;
+            }
+            r = IoPlat.WsaRecv(s, bp, 1U, (nint)0, NativeMemory.AddressOf(ref flags), op, (nint)0);
+        } else {
+            r = IoPlat.WsaSend(s, bp, 1U, (nint)0, 0U, op, (nint)0);
+        }
+        if (r == 0) {
+#if ZAN_CO_DRIVER
+            if (skip != 0) {
+                OpFree(op);
+                Atomic.FetchAdd(ref s_syncInline, 1, MemoryOrder.Relaxed);
+                if (step != (nint)0) IoPlat.WakeCo(frame, step);
+                CntDecShard(sh);
+            }
+#else
+            _ = skip;
+#endif
+            return;
+        }
+        if (IoPlat.WsaGetLastError() == IoConst.WSA_IO_PENDING) return;
+#if ZAN_CO_DRIVER
+        nint port = IoShard(sh);
+#else
+        nint port = s_iocp;
+#endif
+        if (IoPlat.WinPostQueuedCompletionStatus(port, 0U, s, op) == 0) {
+            if (step != (nint)0) IoPlat.WakeCo(frame, step);
+            OpFree(op);
+            CntDecShard(sh);
+        }
+    }
+
+    [Export("zan_io_recv_co")]
+    public static void RecvCo(nint fd, nint buf, int len, nint frame, nint step, nint outN) {
+        IoInit();
+        if (s_broken != 0 || len <= 0 || len > 0x7FFFFFF0) {
+            if (outN != (nint)0) NativeMemory.AsRef<long>(outN) = 0L;
+            if (step != (nint)0) IoPlat.WakeCo(frame, step);
+            return;
+        }
+        ulong s = (ulong)fd;
+        int skip = EnsureAssoc(s);
+        nint op = OpAlloc();
+        if (op == (nint)0) {
+            if (outN != (nint)0) NativeMemory.AsRef<long>(outN) = 0L;
+            if (step != (nint)0) IoPlat.WakeCo(frame, step);
+            return;
+        }
+        NativeMemory.AsRef<ulong>((op) + (nint)(OP_SOCK)) = s;
+        NativeMemory.AsRef<int>((op) + (nint)(OP_INTEREST)) = IoConst.ZAN_IO_READ;
+        NativeMemory.AsRef<int>((op) + (nint)(OP_KIND)) = OP_RECV;
+        NativeMemory.AsRef<nint>((op) + (nint)(OP_CO)) = frame;
+        NativeMemory.AsRef<nint>((op) + (nint)(OP_STEP)) = step;
+        NativeMemory.AsRef<nint>((op) + (nint)(OP_OUTN)) = outN;
+#if ZAN_CO_DRIVER
+        int sh = ShardIdxOf(s);
+#else
+        int sh = 0;
+#endif
+        NativeMemory.AsRef<short>((op) + (nint)(OP_SHARD)) = (short)sh;
+        CntIncShard(sh);
+
+        IoBuf16 wsaBuf = new IoBuf16();
+        nint bp = NativeMemory.AddressOf(ref wsaBuf);
+        NativeMemory.AsRef<uint>(bp) = (uint)len;
+        NativeMemory.AsRef<nint>((bp) + (nint)(8L)) = buf;
+        uint flags = 0U;
+        uint got = 0U;
+        int r = IoPlat.WsaRecv(s, bp, 1U, NativeMemory.AddressOf(ref got),
+                               NativeMemory.AddressOf(ref flags), op, (nint)0);
+        if (r == 0) {
+#if ZAN_CO_DRIVER
+            if (skip != 0) {
+                if (outN != (nint)0) NativeMemory.AsRef<long>(outN) = (long)got;
+                OpFree(op);
+                Atomic.FetchAdd(ref s_syncInline, 1, MemoryOrder.Relaxed);
+                if (step != (nint)0) IoPlat.WakeCo(frame, step);
+                CntDecShard(sh);
+            }
+#else
+            _ = skip;
+#endif
+            return;
+        }
+        if (IoPlat.WsaGetLastError() == IoConst.WSA_IO_PENDING) return;
+        if (outN != (nint)0) NativeMemory.AsRef<long>(outN) = 0L;
+#if ZAN_CO_DRIVER
+        nint port = IoShard(sh);
+#else
+        nint port = s_iocp;
+#endif
+        if (IoPlat.WinPostQueuedCompletionStatus(port, 0U, s, op) == 0) {
+            if (step != (nint)0) IoPlat.WakeCo(frame, step);
+            OpFree(op);
+            CntDecShard(sh);
+        }
+    }
+
+    [Export("zan_io_recv_to_co")]
+    public static void RecvToCo(nint fd, nint buf, int len, long timeoutMs, nint frame, nint step, nint outN) {
+        IoInit();
+        if (s_broken != 0 || len <= 0 || len > 0x7FFFFFF0) {
+            if (outN != (nint)0) NativeMemory.AsRef<long>(outN) = 0L;
+            if (step != (nint)0) IoPlat.WakeCo(frame, step);
+            return;
+        }
+        ulong s = (ulong)fd;
+        int skip = EnsureAssoc(s);
+        nint op = OpAlloc();
+        if (op == (nint)0) {
+            if (outN != (nint)0) NativeMemory.AsRef<long>(outN) = 0L;
+            if (step != (nint)0) IoPlat.WakeCo(frame, step);
+            return;
+        }
+        NativeMemory.AsRef<ulong>((op) + (nint)(OP_SOCK)) = s;
+        NativeMemory.AsRef<int>((op) + (nint)(OP_INTEREST)) = IoConst.ZAN_IO_READ;
+        NativeMemory.AsRef<int>((op) + (nint)(OP_KIND)) = OP_RECV;
+        NativeMemory.AsRef<int>((op) + (nint)(OP_RTO)) = 1;
+        NativeMemory.AsRef<nint>((op) + (nint)(OP_CO)) = frame;
+        NativeMemory.AsRef<nint>((op) + (nint)(OP_STEP)) = step;
+        NativeMemory.AsRef<nint>((op) + (nint)(OP_OUTN)) = outN;
+#if ZAN_CO_DRIVER
+        int sh = ShardIdxOf(s);
+#else
+        int sh = 0;
+#endif
+        NativeMemory.AsRef<short>((op) + (nint)(OP_SHARD)) = (short)sh;
+        CntIncShard(sh);
+
+        RtoLock();
+        nint e = IoPlat.CCalloc(1UL, RTO_SIZE);
+        if (e != (nint)0) {
+            NativeMemory.AsRef<ulong>((e) + (nint)(RTO_SOCK)) = s;
+            NativeMemory.AsRef<nint>((e) + (nint)(RTO_FRAME)) = frame;
+            NativeMemory.AsRef<nint>((e) + (nint)(RTO_STEP)) = step;
+            NativeMemory.AsRef<nint>((e) + (nint)(RTO_OV)) = op;
+            NativeMemory.AsRef<nint>((e) + (nint)(RTO_OUTN)) = outN;
+            NativeMemory.AsRef<long>((e) + (nint)(RTO_DUE)) = IoPlat.NowMs() + (timeoutMs > 0L ? timeoutMs : 0L);
+            NativeMemory.AsRef<nint>((e) + (nint)(RTO_NEXT)) = s_rtoHead;
+            s_rtoHead = e;
+        } else {
+            NativeMemory.AsRef<int>((op) + (nint)(OP_RTO)) = 0;
+        }
+
+        IoBuf16 wsaBuf = new IoBuf16();
+        nint bp = NativeMemory.AddressOf(ref wsaBuf);
+        NativeMemory.AsRef<uint>(bp) = (uint)len;
+        NativeMemory.AsRef<nint>((bp) + (nint)(8L)) = buf;
+        uint flags = 0U;
+        uint got = 0U;
+        int r = IoPlat.WsaRecv(s, bp, 1U, NativeMemory.AddressOf(ref got),
+                               NativeMemory.AddressOf(ref flags), op, (nint)0);
+        if (r == 0) {
+#if ZAN_CO_DRIVER
+            if (skip != 0) {
+                RtoClaimLocked(op);
+                if (outN != (nint)0) NativeMemory.AsRef<long>(outN) = (long)got;
+                OpFree(op);
+                RtoUnlock();
+                Atomic.FetchAdd(ref s_syncInline, 1, MemoryOrder.Relaxed);
+                if (step != (nint)0) IoPlat.WakeCo(frame, step);
+                CntDecShard(sh);
+                return;
+            }
+#else
+            _ = skip;
+#endif
+            RtoUnlock();
+            return;
+        }
+        if (IoPlat.WsaGetLastError() == IoConst.WSA_IO_PENDING) {
+            RtoUnlock();
+            return;
+        }
+        if (outN != (nint)0) NativeMemory.AsRef<long>(outN) = 0L;
+#if ZAN_CO_DRIVER
+        nint port = IoShard(sh);
+#else
+        nint port = s_iocp;
+#endif
+        if (IoPlat.WinPostQueuedCompletionStatus(port, 0U, s, op) == 0) {
+            RtoClaimLocked(op);
+            OpFree(op);
+            RtoUnlock();
+            if (step != (nint)0) IoPlat.WakeCo(frame, step);
+            CntDecShard(sh);
+            return;
+        }
+        RtoUnlock();
+    }
+
+    [Export("zan_io_accept_co")]
+    public static void AcceptCo(nint fd, nint frame, nint step, nint outFd) {
+        IoInit();
+        if (s_broken != 0) {
+            if (outFd != (nint)0) NativeMemory.AsRef<nint>(outFd) = (nint)(-1L);
+            if (step != (nint)0) IoPlat.WakeCo(frame, step);
+            return;
+        }
+        ulong listener = (ulong)fd;
+        int skip = EnsureAssoc(listener);
+
+        nint acceptEx = Atomic.Load(ref s_cachedAcceptEx, MemoryOrder.Acquire);
+        uint got = 0U;
+        if (acceptEx == (nint)0) {
+            IoBuf16 guid = new IoBuf16();
+            nint gp = NativeMemory.AddressOf(ref guid);
+            // WSAID_ACCEPTEX: {0xb5367df1, 0xcbac, 0x11cf, {0x95,0xca,0x00,0x80,0x5f,0x48,0xa1,0x92}}
+            NativeMemory.AsRef<uint>(gp) = 0xB5367DF1U;
+            NativeMemory.AsRef<ushort>((gp) + (nint)(4L)) = 0xCBAC;
+            NativeMemory.AsRef<ushort>((gp) + (nint)(6L)) = 0x11CF;
+            NativeMemory.AsRef<byte>((gp) + (nint)(8L)) = 0x95;
+            NativeMemory.AsRef<byte>((gp) + (nint)(9L)) = 0xCA;
+            NativeMemory.AsRef<byte>((gp) + (nint)(10L)) = 0x00;
+            NativeMemory.AsRef<byte>((gp) + (nint)(11L)) = 0x80;
+            NativeMemory.AsRef<byte>((gp) + (nint)(12L)) = 0x5F;
+            NativeMemory.AsRef<byte>((gp) + (nint)(13L)) = 0x48;
+            NativeMemory.AsRef<byte>((gp) + (nint)(14L)) = 0xA1;
+            NativeMemory.AsRef<byte>((gp) + (nint)(15L)) = 0x92;
+            if (IoPlat.WsaIoctl(listener, IoConst.SIO_GET_EXTENSION_FUNCTION_POINTER,
+                                gp, 16U, NativeMemory.AddressOf(ref acceptEx), 8U,
+                                NativeMemory.AddressOf(ref got), (nint)0, (nint)0) == -1 ||
+                acceptEx == (nint)0) {
+                if (outFd != (nint)0) NativeMemory.AsRef<nint>(outFd) = (nint)(-1L);
+                if (step != (nint)0) IoPlat.WakeCo(frame, step);
+                return;
+            }
+            Atomic.Store(ref s_cachedAcceptEx, acceptEx, MemoryOrder.Release);
+        }
+
+        IoBuf128 lss = new IoBuf128();
+        int llen = 128;
+        int fam = IoConst.AF_INET;
+        if (IoPlat.SockGetSockName(listener, NativeMemory.AddressOf(ref lss), NativeMemory.AddressOf(ref llen)) == 0 &&
+            (int)NativeMemory.AsRef<ushort>(NativeMemory.AddressOf(ref lss)) == IoConst.AF_INET6) {
+            fam = IoConst.AF_INET6;
+        }
+
+        ulong accepted = IoPlat.WsaSocketW(fam, IoConst.SOCK_STREAM, IoConst.IPPROTO_TCP,
+                                           (nint)0, 0U, IoConst.WSA_FLAG_OVERLAPPED);
+        if (accepted == 0xFFFFFFFFFFFFFFFFUL) {
+            if (outFd != (nint)0) NativeMemory.AsRef<nint>(outFd) = (nint)(-1L);
+            if (step != (nint)0) IoPlat.WakeCo(frame, step);
+            return;
+        }
+
+        uint addrLen = (uint)(fam == IoConst.AF_INET6 ? 28 : 16) + 16U;
+        nint op = OpAlloc();
+        if (op == (nint)0) {
+            IoPlat.WsaCloseSocket(accepted);
+            if (outFd != (nint)0) NativeMemory.AsRef<nint>(outFd) = (nint)(-1L);
+            if (step != (nint)0) IoPlat.WakeCo(frame, step);
+            return;
+        }
+        nint abuf = IoPlat.CCalloc(1UL, (ulong)(addrLen * 2U));
+        if (abuf == (nint)0) {
+            IoPlat.WsaCloseSocket(accepted);
+            OpFree(op);
+            if (outFd != (nint)0) NativeMemory.AsRef<nint>(outFd) = (nint)(-1L);
+            if (step != (nint)0) IoPlat.WakeCo(frame, step);
+            return;
+        }
+        NativeMemory.AsRef<ulong>((op) + (nint)(OP_SOCK)) = listener;
+        NativeMemory.AsRef<int>((op) + (nint)(OP_KIND)) = OP_ACCEPT;
+        NativeMemory.AsRef<nint>((op) + (nint)(OP_CO)) = frame;
+        NativeMemory.AsRef<nint>((op) + (nint)(OP_STEP)) = step;
+        NativeMemory.AsRef<nint>((op) + (nint)(OP_OUTN)) = outFd;
+        NativeMemory.AsRef<ulong>((op) + (nint)(OP_ACCEPTED)) = accepted;
+        NativeMemory.AsRef<nint>((op) + (nint)(OP_ACCEPT_BUF)) = abuf;
+#if ZAN_CO_DRIVER
+        int sh = ShardIdxOf(listener);
+#else
+        int sh = 0;
+#endif
+        NativeMemory.AsRef<short>((op) + (nint)(OP_SHARD)) = (short)sh;
+        CntIncShard(sh);
+
+        got = 0U;
+        int ok = NativeMemory.InvokeWithCC<int>("c", acceptEx, listener, accepted, abuf,
+                                                0U, addrLen, addrLen, NativeMemory.AddressOf(ref got), op);
+#if ZAN_CO_DRIVER
+        if (ok != 0 && skip != 0) {
+            CompleteOp(op, got, 0UL);
+            OpFree(op);
+            Atomic.FetchAdd(ref s_syncInline, 1, MemoryOrder.Relaxed);
+            if (step != (nint)0) IoPlat.WakeCo(frame, step);
+            CntDecShard(sh);
+            return;
+        }
+#else
+        _ = skip;
+#endif
+        if (ok != 0 || IoPlat.WsaGetLastError() == IoConst.WSA_IO_PENDING) return;
+
+        IoPlat.WsaCloseSocket(accepted);
+        IoPlat.CFree(abuf);
+        OpFree(op);
+        if (outFd != (nint)0) NativeMemory.AsRef<nint>(outFd) = (nint)(-1L);
+        if (step != (nint)0) IoPlat.WakeCo(frame, step);
+        CntDecShard(sh);
+    }
+
+#if ZAN_CO_DRIVER
+    static int PollAny(nint entries, uint cap, nint removedOut, uint to) {
+        int n = ShardCount();
+        if (n <= 1) {
+            return IoPlat.WinGetQueuedCompletionStatusEx(s_iocp, entries, cap, removedOut, to, 0);
+        }
+        uint slice = (to == IoConst.INFINITE_WAIT || to > 2U) ? 2U : to;
+        for (;;) {
+            for (int i = 0; i < n; i++) {
+                if (IoPlat.WinGetQueuedCompletionStatusEx(IoShard(i), entries, cap, removedOut, slice, 0) != 0)
+                    return 1;
+            }
+            if (to == IoConst.INFINITE_WAIT) continue;
+            uint stepMs = slice * (uint)n;
+            if (to <= stepMs) return 0;
+            to -= stepMs;
+        }
+    }
+#endif
+
+    [Export("zan_io_poll")]
+    public static int IoPoll(long timeoutMs) {
+#if ZAN_CO_DRIVER
+        if (!HasPendingShards() && Atomic.Load(ref IoDns.s_inflight, MemoryOrder.Acquire) == 0)
+            return 0;
+#else
+        if (s_ioCount == 0 && Atomic.Load(ref IoDns.s_inflight, MemoryOrder.Acquire) == 0)
+            return 0;
+#endif
+        RtoTimeoutScan();
+        IoBuf2048 entries = new IoBuf2048(); // 64 * 32 bytes
+        nint ep = NativeMemory.AddressOf(ref entries);
+        uint removed = 0U;
+        long wait = RtoWaitMs(IoDns.WaitMs(timeoutMs));
+        if (wait > 0x7FFFFFFFL) wait = 0x7FFFFFFFL;
+        uint to = wait < 0L ? IoConst.INFINITE_WAIT : (uint)wait;
+        if (Atomic.Load(ref IoDns.s_wakeLost, MemoryOrder.Acquire) != 0 &&
+            Atomic.Exchange(ref IoDns.s_wakeLost, 0, MemoryOrder.AcqRel) != 0) {
+            int wd = IoDns.Drain();
+            if (wd != 0) return wd;
+        }
+#if ZAN_CO_DRIVER
+        int ok = PollAny(ep, 64U, NativeMemory.AddressOf(ref removed), to);
+#else
+        int ok = IoPlat.WinGetQueuedCompletionStatusEx(s_iocp, ep, 64U, NativeMemory.AddressOf(ref removed), to, 0);
+#endif
+        if (ok == 0) {
+            int w = IoDns.TimeoutScan();
+            if (w != 0) return w;
+            int wr = RtoTimeoutScan();
+            if (wr != 0) return wr;
+            return IoDns.Drain();
+        }
+        int woke = 0;
+#if ZAN_CO_DRIVER
+        IoBuf1024 readyBatch = new IoBuf1024(); // 64 * 16 bytes
+        nint rbp = NativeMemory.AddressOf(ref readyBatch);
+        ulong readyCount = 0UL;
+#endif
+        IoBuf128 compShards = new IoBuf128(); // 64 * 2 bytes
+        nint csp = NativeMemory.AddressOf(ref compShards);
+        int compCount = 0;
+        for (uint i = 0U; i < removed; i++) {
+            long off = (long)i * 32L;
+            nint lpOv = NativeMemory.AsRef<nint>((ep) + (nint)(off + 8L));
+            if (lpOv == (nint)0) {
+                woke += IoDns.Drain();
+                continue;
+            }
+            nint op = lpOv;
+            nint co = NativeMemory.AsRef<nint>((op) + (nint)(OP_CO));
+            nint step = NativeMemory.AsRef<nint>((op) + (nint)(OP_STEP));
+            short opShard = NativeMemory.AsRef<short>((op) + (nint)(OP_SHARD));
+            ulong internalSt = NativeMemory.AsRef<ulong>((ep) + (nint)(off + 16L));
+            uint xfer = NativeMemory.AsRef<uint>((ep) + (nint)(off + 24L));
+            CompleteOp(op, xfer, internalSt);
+            OpFree(op);
+            NativeMemory.AsRef<short>((csp) + (nint)((long)compCount * 2L)) = opShard;
+            compCount++;
+#if ZAN_CO_DRIVER
+            if (step != (nint)0 && co != (nint)0) {
+                NativeMemory.AsRef<nint>((rbp) + (nint)((long)readyCount * 16L)) = co;
+                NativeMemory.AsRef<nint>((rbp) + (nint)((long)readyCount * 16L + 8L)) = step;
+                readyCount++;
+            }
+#else
+            if (step != (nint)0 && co != (nint)0) {
+                IoPlat.WakeCo(co, step);
+            }
+#endif
+            woke++;
+        }
+#if ZAN_CO_DRIVER
+        if (readyCount > 0UL) {
+            IoSched.CoReadyBatch(rbp, readyCount);
+        }
+#endif
+        for (int k = 0; k < compCount; k++) {
+            CntDecShard((int)NativeMemory.AsRef<short>((csp) + (nint)((long)k * 2L)));
+        }
+        return woke;
+    }
+
+    [Export("zan_io_close_notify")]
+    public static void CloseNotify(nint fd) {
+        if ((long)fd > 0L) {
+            AssocInvalidate((ulong)fd);
+            IoPlat.WinCancelIoEx(fd, (nint)0);
+        }
+    }
+
+    [Export("zan_io_has_pending")]
+    public static int HasPending() {
+#if ZAN_CO_DRIVER
+        return (HasPendingShards() || Atomic.Load(ref IoDns.s_inflight, MemoryOrder.Acquire) > 0) ? 1 : 0;
+#else
+        return (s_ioCount > 0 || Atomic.Load(ref IoDns.s_inflight, MemoryOrder.Acquire) > 0) ? 1 : 0;
+#endif
+    }
+
+#endif
+
+    // ---- Shared pump / sync sleep ----
+    [Export("zan_io_pump_timeout")]
+    public static int IoPumpTimeout(long timeoutMs) {
+#if !WINDOWS
+        ResetFastBudget();
+#endif
+        if (HasPending() != 0) return IoPoll(timeoutMs);
+        if (timeoutMs <= 0L) return 0;
+        IoPlat.SleepMs(timeoutMs);
+        return 0;
+    }
+
+    [Export("zan_io_pump")]
+    public static int IoPump() {
+        return IoPumpTimeout(-1L);
+    }
+
+#if !ZAN_CO_DRIVER
+    [Export("zan_co_sync_sleep")]
+    public static void CoSyncSleep(long ms) {
+        if (ms <= 0L) return;
+        long deadline = IoPlat.CoPreciseUs() + ms * 1000L;
+        for (;;) {
+            IoPlat.TimerDispatchDueWait();
+            long remainUs = deadline - IoPlat.CoPreciseUs();
+            if (remainUs <= 0L) return;
+            long nextMs = IoPlat.TimerNextTimeout();
+            long sliceMs = (remainUs + 999L) / 1000L;
+            if (nextMs >= 0L && nextMs < sliceMs) sliceMs = nextMs;
+            if (sliceMs <= 0L) sliceMs = 1L;
+            if (sliceMs > 0x7FFFFFFFL) sliceMs = 0x7FFFFFFFL;
+            IoPumpTimeout(sliceMs);
+        }
+    }
+#endif
+}

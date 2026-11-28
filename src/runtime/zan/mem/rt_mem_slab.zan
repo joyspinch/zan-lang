@@ -1,0 +1,883 @@
+using System;
+using System.Numerics;
+using System.Threading;
+
+// Pure-Zan small-object slab allocator (--fast-alloc, replaces target zanrt_mem.obj from src/runtime/rt_mem.c).
+// 100% pure Zan, ZERO assembly. Compiled directly by `zanc -c -O2 --no-runtime-checks` into zanrt_mem.obj/.o.
+//
+// Architecture (exact parity with src/runtime/rt_mem.c):
+// - 1 MiB aligned headerless slabs split into 64 x 16 KiB pages (Page 0 = SlabMeta page table)
+// - 45 size classes: 24 general (16..2048, 16B-aligned) + 7 odd-8 object classes (24..120)
+//                    + 14 skewed-4 string classes (24..128, V = real_start - 4)
+// - Lemire exact 64-bit divisibility check (zero udiv on free)
+// - Address-derived random 64-bit cookie for atomic double-free & realloc-of-freed detection
+// - Per-thread cache (FLS/pthread_key, zero _tls_index) + retirement + 8 cache-line-padded remote free stripes
+// - Lock-free dynamically growing slab hash table + page-level empty-page trim/decommit & cross-class reuse
+
+struct ZanMemStats {
+    public ulong SlabCount;
+    public ulong SlabBytes;
+    public ulong SmallAllocCount;
+    public ulong TrimmedBytes;
+}
+
+struct SlabMeta {
+    public InlineArray<64, nint> Owner;
+    public InlineArray<64, byte> Cls1;
+    public InlineArray<64, ushort> TrimCnt;
+    public ulong TrimTouched;
+    public ulong ReclaimedMask;
+    public nint TrimNext;
+    public nint ReclaimedNext;
+    public byte InReclaimedList;
+}
+
+struct SlabTable {
+    public uint Mask;
+    public uint Cap;
+    public nint Slots;
+    public nint Prev;
+}
+
+struct RemoteStripe {
+    public nint Head;
+    public InlineArray<56, byte> Pad;
+}
+
+struct MemCache {
+    public InlineArray<45, nint> FreeList;
+    public InlineArray<45, nint> PageBump;
+    public InlineArray<45, nint> PageEnd;
+    public nint Bump;
+    public nint BumpEnd;
+    public nint BumpCommitted;
+    public ulong LastSlab;
+    public int BumpDecommitted;
+    public uint AllocBatch;
+    public uint RemoteMask;
+    public InlineArray<8, RemoteStripe> Remote;
+    public nint NextFree;
+}
+
+partial class ZanMemRuntime {
+    const ulong ZAN_MEM_MAX_SMALL = 2048UL;
+    const ulong ZAN_MEM_SLAB = 1048576UL;        // 1 MiB (1 << 20)
+    const int ZAN_MEM_PAGE_SHIFT = 14;
+    const ulong ZAN_MEM_PAGE = 16384UL;          // 16 KiB (1 << 14)
+    const ulong ZAN_MEM_COMMIT_CHUNK = 65536UL;  // 64 KiB (4 * 16 KiB)
+
+    const int ZAN_MEM_NCLASS = 45;
+    const int ZAN_MEM_OBJ_CLS0 = 24;
+    const ulong ZAN_MEM_OBJ_MAX = 120UL;
+    const int ZAN_MEM_STR_CLS0 = 31;
+    const ulong ZAN_MEM_STR_MIN = 24UL;
+    const ulong ZAN_MEM_STR_MAX = 128UL;
+    const ulong ZAN_MEM_STR_SKEW = 4UL;
+
+    const uint ZAN_MEM_INIT_SET_SIZE = 512U;     // 1 << 9
+    const int ZAN_MEM_REMOTE_STRIPES = 8;
+    const uint ZAN_MEM_COUNT_BATCH = 64U;
+
+    // ---- Shared runtime / CRT imports ----
+    [DllImport("crt", EntryPoint = "memcpy")]
+    static extern nint CMemcpy(nint dst, nint src, ulong n);
+
+    [DllImport("crt", EntryPoint = "memset")]
+    static extern nint CMemset(nint dst, int c, ulong n);
+
+    [DllImport("crt", EntryPoint = "zan_rt_fatal")]
+    static extern void ZanRtFatal(nint category, nint message);
+
+#if WINDOWS
+    const uint MEM_COMMIT = 0x1000U;
+    const uint MEM_RESERVE = 0x2000U;
+    const uint MEM_DECOMMIT = 0x4000U;
+    const uint MEM_RELEASE = 0x8000U;
+    const uint PAGE_NOACCESS = 0x01U;
+    const uint PAGE_READWRITE = 0x04U;
+    const uint FLS_OUT_OF_INDEXES = 0xFFFFFFFFU;
+
+    [DllImport("kernel32", EntryPoint = "GetModuleHandleA")]
+    static extern nint WinGetModuleHandleA(nint name);
+
+    [DllImport("kernel32", EntryPoint = "LoadLibraryA")]
+    static extern nint WinLoadLibraryA(nint name);
+
+    [DllImport("kernel32", EntryPoint = "GetProcAddress")]
+    static extern nint WinGetProcAddress(nint module, nint procName);
+
+    [DllImport("kernel32", EntryPoint = "ExitProcess")]
+    static extern void WinExitProcess(uint code);
+
+    [DllImport("kernel32", EntryPoint = "VirtualAlloc")]
+    static extern nint WinVirtualAlloc(nint addr, ulong size, uint allocType, uint protect);
+
+    [DllImport("kernel32", EntryPoint = "VirtualFree")]
+    static extern int WinVirtualFree(nint addr, ulong size, uint freeType);
+
+    [DllImport("kernel32", EntryPoint = "FlsAlloc")]
+    static extern uint WinFlsAlloc(nint callback);
+
+    [DllImport("kernel32", EntryPoint = "FlsGetValue")]
+    static extern nint WinFlsGetValue(uint flsIndex);
+
+    [DllImport("kernel32", EntryPoint = "FlsSetValue")]
+    static extern int WinFlsSetValue(uint flsIndex, nint value);
+
+    [DllImport("kernel32", EntryPoint = "SwitchToThread")]
+    static extern int WinSwitchToThread();
+
+    [DllImport("kernel32", EntryPoint = "QueryPerformanceCounter")]
+    static extern int WinQueryPerformanceCounter(nint counterPtr);
+
+    [DllImport("kernel32", EntryPoint = "GetCurrentProcessId")]
+    static extern uint WinGetCurrentProcessId();
+
+    [DllImport("kernel32", EntryPoint = "GetCurrentThreadId")]
+    static extern uint WinGetCurrentThreadId();
+
+    // Direct CRT function pointers resolved bypassing LLD --wrap thunks
+    static int s_nativeInitState = 0; // 0=uninit, 1=initing, 2=ready, 3=failed
+    static nint s_nativeMalloc = (nint)0;
+    static nint s_nativeFree = (nint)0;
+    static nint s_nativeCalloc = (nint)0;
+    static nint s_nativeRealloc = (nint)0;
+
+    static uint s_fls = FLS_OUT_OF_INDEXES;
+    static int s_flsState = 0; // 0=uninit, 1=initing, 2=ready, 3=failed
+#else
+    const int PROT_READ_WRITE = 3;
+#if MACOS
+    const int MAP_PRIVATE_ANON = 0x1002; // Darwin MAP_PRIVATE(0x0002) | MAP_ANON(0x1000)
+#else
+    const int MAP_PRIVATE_ANON = 0x22;   // Linux MAP_PRIVATE(0x02) | MAP_ANONYMOUS(0x20)
+#endif
+    const int MADV_DONTNEED = 4;
+
+#if MACOS
+    [DllImport("crt", EntryPoint = "malloc")]
+    static extern nint RealMallocRaw(ulong n);
+
+    [DllImport("crt", EntryPoint = "free")]
+    static extern void RealFreeRaw(nint p);
+
+    [DllImport("crt", EntryPoint = "calloc")]
+    static extern nint RealCallocRaw(ulong n, ulong m);
+
+    [DllImport("crt", EntryPoint = "realloc")]
+    static extern nint RealReallocRaw(nint p, ulong n);
+
+    [DllImport("crt", EntryPoint = "valloc")]
+    static extern nint MacValloc(ulong n);
+
+    [DllImport("crt", EntryPoint = "posix_memalign")]
+    static extern int MacPosixMemalign(nint outPtr, ulong align, ulong n);
+
+    [DllImport("crt", EntryPoint = "malloc_zone_register")]
+    static extern void MacMallocZoneRegister(nint zone);
+
+    [DllImport("crt", EntryPoint = "arc4random_buf")]
+    static extern void MacArc4RandomBuf(nint buf, ulong len);
+#else
+    [DllImport("crt", EntryPoint = "__real_malloc")]
+    static extern nint RealMallocRaw(ulong n);
+
+    [DllImport("crt", EntryPoint = "__real_free")]
+    static extern void RealFreeRaw(nint p);
+
+    [DllImport("crt", EntryPoint = "__real_calloc")]
+    static extern nint RealCallocRaw(ulong n, ulong m);
+
+    [DllImport("crt", EntryPoint = "__real_realloc")]
+    static extern nint RealReallocRaw(nint p, ulong n);
+
+    [DllImport("crt", EntryPoint = "getrandom")]
+    static extern long PosixGetRandom(nint buf, ulong buflen, uint flags);
+#endif
+
+    [DllImport("crt", EntryPoint = "mmap")]
+    static extern nint PosixMmap(nint addr, ulong len, int prot, int flags, int fd, long offset);
+
+    [DllImport("crt", EntryPoint = "munmap")]
+    static extern int PosixMunmap(nint addr, ulong len);
+
+    [DllImport("crt", EntryPoint = "madvise")]
+    static extern int PosixMadvise(nint addr, ulong len, int advice);
+
+    [DllImport("crt", EntryPoint = "sched_yield")]
+    static extern int PosixSchedYield();
+
+    [DllImport("crt", EntryPoint = "getpid")]
+    static extern int PosixGetPid();
+
+    [DllImport("crt", EntryPoint = "pthread_key_create")]
+    static extern int PosixPthreadKeyCreate(nint keyPtr, nint dtor);
+
+    [DllImport("crt", EntryPoint = "pthread_self")]
+    static extern ulong PosixPthreadSelf();
+
+#if MACOS
+    [DllImport("crt", EntryPoint = "pthread_getspecific")]
+    static extern nint PosixPthreadGetSpecific(ulong key);
+
+    [DllImport("crt", EntryPoint = "pthread_setspecific")]
+    static extern int PosixPthreadSetSpecific(ulong key, nint val);
+
+    static ulong s_exitKey = 0UL;
+#else
+    [DllImport("crt", EntryPoint = "pthread_getspecific")]
+    static extern nint PosixPthreadGetSpecific(uint key);
+
+    [DllImport("crt", EntryPoint = "pthread_setspecific")]
+    static extern int PosixPthreadSetSpecific(uint key, nint val);
+
+    static uint s_exitKey = 0U;
+#endif
+    static int s_exitKeyState = 0; // 0=uninit, 1=initing, 2=ready, 3=failed
+    static InlineArray<16, ulong> s_initTids;
+    static int s_initTidCount = 0;
+#endif
+
+    // ---- Global allocator state (unmanaged BSS) ----
+    static InlineArray<45, ushort> s_classSize;
+    static InlineArray<45, ulong> s_classDivM;
+    static InlineArray<2049, byte> s_sizeClass;
+    static int s_classReady = 0;
+
+    static InlineArray<512, ulong> s_slabInitSlots;
+    static SlabTable s_slabInitTbl;
+    static nint s_slabTbl = (nint)0;
+
+    static ulong s_memSecret = 0UL;
+    static ulong s_slabCount = 0UL;
+    static ulong s_smallAllocCount = 0UL;
+    static ulong s_trimmedBytes = 0UL;
+
+    static nint s_cachePool = (nint)0;
+    static nint s_reclaimedHead = (nint)0;
+    static int s_slabLock = 0;
+    static int s_trimLock = 0;
+    static int s_cacheInitCount = 0;
+    static int s_multiThread = 0;
+    static uint s_remoteRr = 0U;
+
+    // ---- Per-thread cache TLS (FLS / pthread_key, zero _tls_index) ----
+
+    static nint CacheTlsGet() {
+#if WINDOWS
+        uint fls = Atomic.Load(ref s_fls, MemoryOrder.Acquire);
+        if (fls == FLS_OUT_OF_INDEXES) return (nint)0;
+        return WinFlsGetValue(fls);
+#else
+        if (Atomic.Load(ref s_exitKeyState, MemoryOrder.Acquire) != 2) return (nint)0;
+        return PosixPthreadGetSpecific(s_exitKey);
+#endif
+    }
+
+#if !WINDOWS
+    static bool PosixInSetSpec(ulong tid) {
+        if (Atomic.Load(ref s_initTidCount, MemoryOrder.Acquire) == 0) return false;
+        nint basePtr = NativeMemory.AddressOf(ref s_initTids);
+        for (int i = 0; i < 16; i++) {
+            if (Atomic.LoadAt<ulong>(basePtr + (nint)(i * 8), MemoryOrder.Acquire) == tid) return true;
+        }
+        return false;
+    }
+
+    static int PosixEnterSetSpec(ulong tid) {
+        nint basePtr = NativeMemory.AddressOf(ref s_initTids);
+        for (int i = 0; i < 16; i++) {
+            if (Atomic.CompareExchangeAt<ulong>(basePtr + (nint)(i * 8), 0UL, tid, MemoryOrder.AcqRel, MemoryOrder.Relaxed) == 0UL) {
+                Atomic.FetchAdd(ref s_initTidCount, 1, MemoryOrder.Release);
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    static void PosixLeaveSetSpec(int slot) {
+        if (slot < 0) return;
+        nint basePtr = NativeMemory.AddressOf(ref s_initTids);
+        Atomic.StoreAt<ulong>(basePtr + (nint)(slot * 8), 0UL, MemoryOrder.Release);
+        Atomic.FetchAdd(ref s_initTidCount, -1, MemoryOrder.Release);
+    }
+#endif
+
+    // ---- Low-level helpers ----
+
+    static void Backoff(int spins) {
+        if (spins < 64) {
+            Atomic.Pause();
+            return;
+        }
+#if WINDOWS
+        WinSwitchToThread();
+#else
+        PosixSchedYield();
+#endif
+    }
+
+    static void MemLock() {
+        int spins = 0;
+        while (true) {
+            if (Atomic.Load(ref s_slabLock, MemoryOrder.Relaxed) == 0 &&
+                Atomic.Exchange(ref s_slabLock, 1, MemoryOrder.Acquire) == 0) {
+                return;
+            }
+            Backoff(spins);
+            spins++;
+        }
+    }
+
+    static void MemUnlock() {
+        Atomic.Store(ref s_slabLock, 0, MemoryOrder.Release);
+    }
+
+    static void TrimLock() {
+        int spins = 0;
+        while (true) {
+            if (Atomic.Load(ref s_trimLock, MemoryOrder.Relaxed) == 0 &&
+                Atomic.Exchange(ref s_trimLock, 1, MemoryOrder.Acquire) == 0) {
+                return;
+            }
+            Backoff(spins);
+            spins++;
+        }
+    }
+
+    static void TrimUnlock() {
+        Atomic.Store(ref s_trimLock, 0, MemoryOrder.Release);
+    }
+
+#if WINDOWS
+    static void RequireNativeAlloc() {
+        int st = Atomic.Load(ref s_nativeInitState, MemoryOrder.Acquire);
+        if (st == 2) return;
+        if (st == 0 && Atomic.CompareExchangeBool(ref s_nativeInitState, 0, 1, MemoryOrder.AcqRel, MemoryOrder.Acquire)) {
+            // "msvcrt.dll\0"
+            InlineArray<16, byte> msvcrtName = new InlineArray<16, byte>();
+            nint pM = NativeMemory.AddressOf(ref msvcrtName);
+            NativeMemory.At<byte>(pM, 0) = (byte)109; NativeMemory.At<byte>(pM, 1) = (byte)115;
+            NativeMemory.At<byte>(pM, 2) = (byte)118; NativeMemory.At<byte>(pM, 3) = (byte)99;
+            NativeMemory.At<byte>(pM, 4) = (byte)114; NativeMemory.At<byte>(pM, 5) = (byte)116;
+            NativeMemory.At<byte>(pM, 6) = (byte)46;  NativeMemory.At<byte>(pM, 7) = (byte)100;
+            NativeMemory.At<byte>(pM, 8) = (byte)108; NativeMemory.At<byte>(pM, 9) = (byte)108;
+            NativeMemory.At<byte>(pM, 10) = (byte)0;
+
+            // "ucrtbase.dll\0"
+            InlineArray<16, byte> ucrtName = new InlineArray<16, byte>();
+            nint pU = NativeMemory.AddressOf(ref ucrtName);
+            NativeMemory.At<byte>(pU, 0) = (byte)117;  NativeMemory.At<byte>(pU, 1) = (byte)99;
+            NativeMemory.At<byte>(pU, 2) = (byte)114;  NativeMemory.At<byte>(pU, 3) = (byte)116;
+            NativeMemory.At<byte>(pU, 4) = (byte)98;   NativeMemory.At<byte>(pU, 5) = (byte)97;
+            NativeMemory.At<byte>(pU, 6) = (byte)115;  NativeMemory.At<byte>(pU, 7) = (byte)101;
+            NativeMemory.At<byte>(pU, 8) = (byte)46;   NativeMemory.At<byte>(pU, 9) = (byte)100;
+            NativeMemory.At<byte>(pU, 10) = (byte)108; NativeMemory.At<byte>(pU, 11) = (byte)108;
+            NativeMemory.At<byte>(pU, 12) = (byte)0;
+
+            nint crt = WinGetModuleHandleA(pM);
+            if (crt == (nint)0) crt = WinGetModuleHandleA(pU);
+            if (crt == (nint)0) crt = WinLoadLibraryA(pU);
+            if (crt == (nint)0) {
+                Atomic.Store(ref s_nativeInitState, 3, MemoryOrder.Release);
+                WinExitProcess(127U);
+            }
+
+            // "malloc\0", "free\0", "calloc\0", "realloc\0"
+            InlineArray<16, byte> sym = new InlineArray<16, byte>();
+            nint ps = NativeMemory.AddressOf(ref sym);
+            NativeMemory.At<byte>(ps, 0) = (byte)109; NativeMemory.At<byte>(ps, 1) = (byte)97;
+            NativeMemory.At<byte>(ps, 2) = (byte)108; NativeMemory.At<byte>(ps, 3) = (byte)108;
+            NativeMemory.At<byte>(ps, 4) = (byte)111; NativeMemory.At<byte>(ps, 5) = (byte)99;
+            NativeMemory.At<byte>(ps, 6) = (byte)0;
+            s_nativeMalloc = WinGetProcAddress(crt, ps);
+
+            NativeMemory.At<byte>(ps, 0) = (byte)102; NativeMemory.At<byte>(ps, 1) = (byte)114;
+            NativeMemory.At<byte>(ps, 2) = (byte)101; NativeMemory.At<byte>(ps, 3) = (byte)101;
+            NativeMemory.At<byte>(ps, 4) = (byte)0;
+            s_nativeFree = WinGetProcAddress(crt, ps);
+
+            NativeMemory.At<byte>(ps, 0) = (byte)99;  NativeMemory.At<byte>(ps, 1) = (byte)97;
+            NativeMemory.At<byte>(ps, 2) = (byte)108; NativeMemory.At<byte>(ps, 3) = (byte)108;
+            NativeMemory.At<byte>(ps, 4) = (byte)111; NativeMemory.At<byte>(ps, 5) = (byte)99;
+            NativeMemory.At<byte>(ps, 6) = (byte)0;
+            s_nativeCalloc = WinGetProcAddress(crt, ps);
+
+            NativeMemory.At<byte>(ps, 0) = (byte)114; NativeMemory.At<byte>(ps, 1) = (byte)101;
+            NativeMemory.At<byte>(ps, 2) = (byte)97;  NativeMemory.At<byte>(ps, 3) = (byte)108;
+            NativeMemory.At<byte>(ps, 4) = (byte)108; NativeMemory.At<byte>(ps, 5) = (byte)111;
+            NativeMemory.At<byte>(ps, 6) = (byte)99;  NativeMemory.At<byte>(ps, 7) = (byte)0;
+            s_nativeRealloc = WinGetProcAddress(crt, ps);
+
+            bool ok = s_nativeMalloc != (nint)0 && s_nativeFree != (nint)0 &&
+                      s_nativeCalloc != (nint)0 && s_nativeRealloc != (nint)0;
+            Atomic.Store(ref s_nativeInitState, ok ? 2 : 3, MemoryOrder.Release);
+            if (!ok) WinExitProcess(127U);
+            return;
+        }
+        while (Atomic.Load(ref s_nativeInitState, MemoryOrder.Acquire) == 1) {
+            Atomic.Pause();
+        }
+        if (Atomic.Load(ref s_nativeInitState, MemoryOrder.Acquire) != 2) {
+            WinExitProcess(127U);
+        }
+    }
+
+    static nint RealMalloc(ulong n) {
+        RequireNativeAlloc();
+        return NativeMemory.InvokeWithCC<nint>("c", s_nativeMalloc, n);
+    }
+
+    static void RealFree(nint p) {
+        RequireNativeAlloc();
+        NativeMemory.InvokeVoidWithCC("c", s_nativeFree, p);
+    }
+
+    static nint RealCalloc(ulong n, ulong m) {
+        RequireNativeAlloc();
+        return NativeMemory.InvokeWithCC<nint>("c", s_nativeCalloc, n, m);
+    }
+
+    static nint RealRealloc(nint p, ulong n) {
+        RequireNativeAlloc();
+        return NativeMemory.InvokeWithCC<nint>("c", s_nativeRealloc, p, n);
+    }
+#else
+    static nint RealMalloc(ulong n) { return RealMallocRaw(n); }
+    static void RealFree(nint p) { RealFreeRaw(p); }
+    static nint RealCalloc(ulong n, ulong m) { return RealCallocRaw(n, m); }
+    static nint RealRealloc(nint p, ulong n) { return RealReallocRaw(p, n); }
+#endif
+
+    // ---- Size class tables ----
+
+    static void SetClass(int idx, ushort sz) {
+        nint szPtr = NativeMemory.AddressOf(ref s_classSize);
+        nint dmPtr = NativeMemory.AddressOf(ref s_classDivM);
+        NativeMemory.At<ushort>(szPtr, (long)idx) = sz;
+        NativeMemory.At<ulong>(dmPtr, (long)idx) = (0xFFFFFFFFFFFFFFFFUL / (ulong)sz) + 1UL;
+    }
+
+    static void BuildClassesLocked() {
+        // 24 general classes (16-byte aligned)
+        SetClass(0, (ushort)16);    SetClass(1, (ushort)32);    SetClass(2, (ushort)48);    SetClass(3, (ushort)64);
+        SetClass(4, (ushort)80);    SetClass(5, (ushort)96);    SetClass(6, (ushort)112);   SetClass(7, (ushort)128);
+        SetClass(8, (ushort)160);   SetClass(9, (ushort)192);   SetClass(10, (ushort)224);  SetClass(11, (ushort)256);
+        SetClass(12, (ushort)320);  SetClass(13, (ushort)384);  SetClass(14, (ushort)448);  SetClass(15, (ushort)512);
+        SetClass(16, (ushort)640);  SetClass(17, (ushort)768);  SetClass(18, (ushort)896);  SetClass(19, (ushort)1024);
+        SetClass(20, (ushort)1280); SetClass(21, (ushort)1536); SetClass(22, (ushort)1792); SetClass(23, (ushort)2048);
+        // 7 object-page classes (odd multiples of 8: 24..120)
+        SetClass(24, (ushort)24);   SetClass(25, (ushort)40);   SetClass(26, (ushort)56);   SetClass(27, (ushort)72);
+        SetClass(28, (ushort)88);   SetClass(29, (ushort)104);  SetClass(30, (ushort)120);
+        // 14 string-page classes (8-byte step 24..128, skewed +4)
+        SetClass(31, (ushort)24);   SetClass(32, (ushort)32);   SetClass(33, (ushort)40);   SetClass(34, (ushort)48);
+        SetClass(35, (ushort)56);   SetClass(36, (ushort)64);   SetClass(37, (ushort)72);   SetClass(38, (ushort)80);
+        SetClass(39, (ushort)88);   SetClass(40, (ushort)96);   SetClass(41, (ushort)104);  SetClass(42, (ushort)112);
+        SetClass(43, (ushort)120);  SetClass(44, (ushort)128);
+
+        nint szPtr = NativeMemory.AddressOf(ref s_classSize);
+        nint mapPtr = NativeMemory.AddressOf(ref s_sizeClass);
+        int c = 0;
+        for (ulong s = 0UL; s <= ZAN_MEM_MAX_SMALL; s++) {
+            while (c < ZAN_MEM_OBJ_CLS0 && (ulong)NativeMemory.At<ushort>(szPtr, (long)c) < s) {
+                c++;
+            }
+            int mapped = (c < ZAN_MEM_OBJ_CLS0) ? c : (ZAN_MEM_OBJ_CLS0 - 1);
+            NativeMemory.At<byte>(mapPtr, (long)s) = (byte)mapped;
+        }
+
+        // Also initialize static initial slab hash table descriptor
+        s_slabInitTbl.Mask = ZAN_MEM_INIT_SET_SIZE - 1U;
+        s_slabInitTbl.Cap = ZAN_MEM_INIT_SET_SIZE;
+        s_slabInitTbl.Slots = NativeMemory.AddressOf(ref s_slabInitSlots);
+        s_slabInitTbl.Prev = (nint)0;
+        if (Atomic.Load(ref s_slabTbl, MemoryOrder.Relaxed) == (nint)0) {
+            Atomic.Store(ref s_slabTbl, NativeMemory.AddressOf(ref s_slabInitTbl), MemoryOrder.Release);
+        }
+
+        Atomic.Store(ref s_classReady, 1, MemoryOrder.Release);
+    }
+
+    static void EnsureClasses() {
+        if (Atomic.Load(ref s_classReady, MemoryOrder.Acquire) != 0) return;
+        MemLock();
+        if (Atomic.Load(ref s_classReady, MemoryOrder.Relaxed) == 0) {
+            BuildClassesLocked();
+        }
+        MemUnlock();
+    }
+
+    static ulong ClassSize(int cls) {
+        return (ulong)NativeMemory.At<ushort>(NativeMemory.AddressOf(ref s_classSize), (long)cls);
+    }
+
+    static ulong ClassDivM(int cls) {
+        return NativeMemory.At<ulong>(NativeMemory.AddressOf(ref s_classDivM), (long)cls);
+    }
+
+    static bool IsStrCls(int cls) {
+        return cls >= ZAN_MEM_STR_CLS0;
+    }
+
+    static ulong LinkOff(int cls) {
+        return IsStrCls(cls) ? 8UL : 0UL;
+    }
+
+    static nint LinkAddr(nint p, int cls) {
+        return (nint)((ulong)p + LinkOff(cls));
+    }
+
+    static nint CookieAddr(nint p, int cls) {
+        return (nint)((ulong)p + LinkOff(cls) + 8UL);
+    }
+
+    static ulong PageSpan(int cls) {
+        return IsStrCls(cls) ? (ZAN_MEM_PAGE - 4UL) : ZAN_MEM_PAGE;
+    }
+
+    static ulong ComputeCookie(nint p) {
+        return (((ulong)p) >> 4) ^ Atomic.Load(ref s_memSecret, MemoryOrder.Relaxed);
+    }
+
+    static void CountAlloc(nint cPtr) {
+        ref MemCache c = ref NativeMemory.AsRef<MemCache>(cPtr);
+        uint b = c.AllocBatch + 1U;
+        if (b >= ZAN_MEM_COUNT_BATCH) {
+            Atomic.FetchAdd(ref s_smallAllocCount, (ulong)b, MemoryOrder.Relaxed);
+            c.AllocBatch = 0U;
+        } else {
+            c.AllocBatch = b;
+        }
+    }
+
+    // ---- Slab ownership & page table indexing ----
+
+    static uint SlabHash(ulong baseAddr, uint mask) {
+        ulong h = (baseAddr >> 20) * 0x9E3779B97F4A7C15UL;
+        return (uint)(h >> 40) & mask;
+    }
+
+    static nint AllocSlabTable(uint cap) {
+        ulong bytes = (ulong)sizeof(SlabTable) + (ulong)cap * 8UL;
+        nint tPtr = RealCalloc(1UL, bytes);
+        if (tPtr == (nint)0) return (nint)0;
+        ref SlabTable t = ref NativeMemory.AsRef<SlabTable>(tPtr);
+        t.Mask = cap - 1U;
+        t.Cap = cap;
+        t.Slots = (nint)((ulong)tPtr + (ulong)sizeof(SlabTable));
+        t.Prev = (nint)0;
+        return tPtr;
+    }
+
+    static bool OwnsPtr(nint p) {
+        if (Atomic.Load(ref s_slabCount, MemoryOrder.Acquire) == 0UL) return false;
+        nint tblPtr = Atomic.Load(ref s_slabTbl, MemoryOrder.Acquire);
+        if (tblPtr == (nint)0) return false;
+        ulong baseAddr = (ulong)p & ~(ZAN_MEM_SLAB - 1UL);
+        ref SlabTable tbl = ref NativeMemory.AsRef<SlabTable>(tblPtr);
+        uint mask = tbl.Mask;
+        nint slots = tbl.Slots;
+        uint i = SlabHash(baseAddr, mask);
+        for (uint n = 0U; n < 64U; n++) {
+            uint idx = (i + n) & mask;
+            ulong v = Atomic.LoadAt<ulong>(NativeMemory.Add<ulong>(slots, (long)idx), MemoryOrder.Acquire);
+            if (v == baseAddr) return true;
+            if (v == 0UL) return false;
+        }
+        return false;
+    }
+
+    static nint MetaOf(nint p, ref uint pageOut) {
+        ulong baseAddr = (ulong)p & ~(ZAN_MEM_SLAB - 1UL);
+        pageOut = (uint)(((ulong)p - baseAddr) >> ZAN_MEM_PAGE_SHIFT);
+        return (nint)baseAddr;
+    }
+
+    static nint MetaOwnerAddr(nint metaPtr, uint pi) {
+        ref SlabMeta m = ref NativeMemory.AsRef<SlabMeta>(metaPtr);
+        return NativeMemory.Add<nint>(NativeMemory.AddressOf(ref m.Owner), (long)pi);
+    }
+
+    static nint MetaCls1Addr(nint metaPtr, uint pi) {
+        ref SlabMeta m = ref NativeMemory.AsRef<SlabMeta>(metaPtr);
+        return NativeMemory.Add<byte>(NativeMemory.AddressOf(ref m.Cls1), (long)pi);
+    }
+
+    static nint MetaTrimCntAddr(nint metaPtr, uint pi) {
+        ref SlabMeta m = ref NativeMemory.AsRef<SlabMeta>(metaPtr);
+        return NativeMemory.Add<ushort>(NativeMemory.AddressOf(ref m.TrimCnt), (long)pi);
+    }
+
+    static nint CacheFreeListAddr(nint cPtr, int cls) {
+        ref MemCache c = ref NativeMemory.AsRef<MemCache>(cPtr);
+        return NativeMemory.Add<nint>(NativeMemory.AddressOf(ref c.FreeList), (long)cls);
+    }
+
+    static nint CachePageBumpAddr(nint cPtr, int cls) {
+        ref MemCache c = ref NativeMemory.AsRef<MemCache>(cPtr);
+        return NativeMemory.Add<nint>(NativeMemory.AddressOf(ref c.PageBump), (long)cls);
+    }
+
+    static nint CachePageEndAddr(nint cPtr, int cls) {
+        ref MemCache c = ref NativeMemory.AsRef<MemCache>(cPtr);
+        return NativeMemory.Add<nint>(NativeMemory.AddressOf(ref c.PageEnd), (long)cls);
+    }
+
+    static nint CacheRemoteHeadAddr(nint cPtr, int stripe) {
+        ref MemCache c = ref NativeMemory.AsRef<MemCache>(cPtr);
+        nint baseR = NativeMemory.AddressOf(ref c.Remote);
+        return NativeMemory.Add<RemoteStripe>(baseR, (long)stripe); // Head is at offset 0 of RemoteStripe
+    }
+
+    static int BlockClass(nint p) {
+        uint pi = 0U;
+        nint metaPtr = MetaOf(p, ref pi);
+        if (pi == 0U) return -1;
+        uint c1 = (uint)Atomic.LoadAt<byte>(MetaCls1Addr(metaPtr, pi), MemoryOrder.Acquire);
+        if (c1 == 0U || c1 > (uint)ZAN_MEM_NCLASS) return -1;
+        int cls = (int)c1 - 1;
+        ulong off = (ulong)p & (ZAN_MEM_PAGE - 1UL);
+        ulong sz = ClassSize(cls);
+        ulong dm = ClassDivM(cls);
+        if (off * dm > dm - 1UL || off + sz > PageSpan(cls)) return -1;
+        return cls;
+    }
+
+    // ---- Cold fatal reporting (pure stack formatting, zero snprintf) ----
+
+    static void FatalBlock(int kind, nint p) {
+        // category = "mem\0"
+        InlineArray<8, byte> cat = new InlineArray<8, byte>();
+        nint catPtr = NativeMemory.AddressOf(ref cat);
+        NativeMemory.At<byte>(catPtr, 0) = (byte)109; // m
+        NativeMemory.At<byte>(catPtr, 1) = (byte)101; // e
+        NativeMemory.At<byte>(catPtr, 2) = (byte)109; // m
+        NativeMemory.At<byte>(catPtr, 3) = (byte)0;
+
+        InlineArray<96, byte> msg = new InlineArray<96, byte>();
+        nint mp = NativeMemory.AddressOf(ref msg);
+        long pos = 0L;
+        if (kind == 0) {
+            // "double free"
+            NativeMemory.At<byte>(mp, pos++) = (byte)100; NativeMemory.At<byte>(mp, pos++) = (byte)111;
+            NativeMemory.At<byte>(mp, pos++) = (byte)117; NativeMemory.At<byte>(mp, pos++) = (byte)98;
+            NativeMemory.At<byte>(mp, pos++) = (byte)108; NativeMemory.At<byte>(mp, pos++) = (byte)101;
+            NativeMemory.At<byte>(mp, pos++) = (byte)32;  NativeMemory.At<byte>(mp, pos++) = (byte)102;
+            NativeMemory.At<byte>(mp, pos++) = (byte)114; NativeMemory.At<byte>(mp, pos++) = (byte)101;
+            NativeMemory.At<byte>(mp, pos++) = (byte)101;
+        } else if (kind == 1) {
+            // "invalid free (not a block start)"
+            NativeMemory.At<byte>(mp, pos++) = (byte)105; NativeMemory.At<byte>(mp, pos++) = (byte)110;
+            NativeMemory.At<byte>(mp, pos++) = (byte)118; NativeMemory.At<byte>(mp, pos++) = (byte)97;
+            NativeMemory.At<byte>(mp, pos++) = (byte)108; NativeMemory.At<byte>(mp, pos++) = (byte)105;
+            NativeMemory.At<byte>(mp, pos++) = (byte)100; NativeMemory.At<byte>(mp, pos++) = (byte)32;
+            NativeMemory.At<byte>(mp, pos++) = (byte)102; NativeMemory.At<byte>(mp, pos++) = (byte)114;
+            NativeMemory.At<byte>(mp, pos++) = (byte)101; NativeMemory.At<byte>(mp, pos++) = (byte)101;
+            NativeMemory.At<byte>(mp, pos++) = (byte)32;  NativeMemory.At<byte>(mp, pos++) = (byte)40;
+            NativeMemory.At<byte>(mp, pos++) = (byte)110; NativeMemory.At<byte>(mp, pos++) = (byte)111;
+            NativeMemory.At<byte>(mp, pos++) = (byte)116; NativeMemory.At<byte>(mp, pos++) = (byte)32;
+            NativeMemory.At<byte>(mp, pos++) = (byte)97;  NativeMemory.At<byte>(mp, pos++) = (byte)32;
+            NativeMemory.At<byte>(mp, pos++) = (byte)98;  NativeMemory.At<byte>(mp, pos++) = (byte)108;
+            NativeMemory.At<byte>(mp, pos++) = (byte)111; NativeMemory.At<byte>(mp, pos++) = (byte)99;
+            NativeMemory.At<byte>(mp, pos++) = (byte)107; NativeMemory.At<byte>(mp, pos++) = (byte)32;
+            NativeMemory.At<byte>(mp, pos++) = (byte)115; NativeMemory.At<byte>(mp, pos++) = (byte)116;
+            NativeMemory.At<byte>(mp, pos++) = (byte)97;  NativeMemory.At<byte>(mp, pos++) = (byte)114;
+            NativeMemory.At<byte>(mp, pos++) = (byte)116; NativeMemory.At<byte>(mp, pos++) = (byte)41;
+        } else {
+            // "realloc of freed block"
+            NativeMemory.At<byte>(mp, pos++) = (byte)114; NativeMemory.At<byte>(mp, pos++) = (byte)101;
+            NativeMemory.At<byte>(mp, pos++) = (byte)97;  NativeMemory.At<byte>(mp, pos++) = (byte)108;
+            NativeMemory.At<byte>(mp, pos++) = (byte)108; NativeMemory.At<byte>(mp, pos++) = (byte)111;
+            NativeMemory.At<byte>(mp, pos++) = (byte)99;  NativeMemory.At<byte>(mp, pos++) = (byte)32;
+            NativeMemory.At<byte>(mp, pos++) = (byte)111; NativeMemory.At<byte>(mp, pos++) = (byte)102;
+            NativeMemory.At<byte>(mp, pos++) = (byte)32;  NativeMemory.At<byte>(mp, pos++) = (byte)102;
+            NativeMemory.At<byte>(mp, pos++) = (byte)114; NativeMemory.At<byte>(mp, pos++) = (byte)101;
+            NativeMemory.At<byte>(mp, pos++) = (byte)101; NativeMemory.At<byte>(mp, pos++) = (byte)100;
+            NativeMemory.At<byte>(mp, pos++) = (byte)32;  NativeMemory.At<byte>(mp, pos++) = (byte)98;
+            NativeMemory.At<byte>(mp, pos++) = (byte)108; NativeMemory.At<byte>(mp, pos++) = (byte)111;
+            NativeMemory.At<byte>(mp, pos++) = (byte)99;  NativeMemory.At<byte>(mp, pos++) = (byte)107;
+        }
+        // " of block 0x"
+        NativeMemory.At<byte>(mp, pos++) = (byte)32;  NativeMemory.At<byte>(mp, pos++) = (byte)111;
+        NativeMemory.At<byte>(mp, pos++) = (byte)102; NativeMemory.At<byte>(mp, pos++) = (byte)32;
+        NativeMemory.At<byte>(mp, pos++) = (byte)98;  NativeMemory.At<byte>(mp, pos++) = (byte)108;
+        NativeMemory.At<byte>(mp, pos++) = (byte)111; NativeMemory.At<byte>(mp, pos++) = (byte)99;
+        NativeMemory.At<byte>(mp, pos++) = (byte)107; NativeMemory.At<byte>(mp, pos++) = (byte)32;
+        NativeMemory.At<byte>(mp, pos++) = (byte)48;  NativeMemory.At<byte>(mp, pos++) = (byte)120;
+
+        ulong addr = (ulong)p;
+        for (int shift = 60; shift >= 0; shift -= 4) {
+            uint nib = (uint)((addr >> shift) & 0xFUL);
+            NativeMemory.At<byte>(mp, pos++) = (byte)((nib < 10U) ? (48U + nib) : (87U + nib));
+        }
+        NativeMemory.At<byte>(mp, pos) = (byte)0;
+        ZanRtFatal(catPtr, mp);
+    }
+
+    // ---- Remote free draining & thread retirement ----
+
+    static void DrainStripe(nint cPtr, int s) {
+        nint p = Atomic.ExchangeAt<nint>(CacheRemoteHeadAddr(cPtr, s), (nint)0, MemoryOrder.Acquire);
+        while (p != (nint)0) {
+            int cls = BlockClass(p);
+            if (cls < 0) break;
+            nint linkAddr = LinkAddr(p, cls);
+            nint next = NativeMemory.AsRef<nint>(linkAddr);
+            nint flAddr = CacheFreeListAddr(cPtr, cls);
+            NativeMemory.AsRef<nint>(linkAddr) = NativeMemory.AsRef<nint>(flAddr);
+            NativeMemory.AsRef<nint>(flAddr) = p;
+            p = next;
+        }
+    }
+
+    static void DrainRemote(nint cPtr) {
+        ref MemCache c = ref NativeMemory.AsRef<MemCache>(cPtr);
+        if (Atomic.Load(ref c.RemoteMask, MemoryOrder.Acquire) == 0U) return;
+        uint mask = Atomic.Exchange(ref c.RemoteMask, 0U, MemoryOrder.AcqRel);
+        while (mask != 0U) {
+            int s = BitOperations.TrailingZeroCount(mask);
+            mask &= mask - 1U;
+            DrainStripe(cPtr, s);
+        }
+    }
+
+    static void DrainRemoteAll(nint cPtr) {
+        ref MemCache c = ref NativeMemory.AsRef<MemCache>(cPtr);
+        Atomic.Store(ref c.RemoteMask, 0U, MemoryOrder.Release);
+        for (int s = 0; s < ZAN_MEM_REMOTE_STRIPES; s++) {
+            if (Atomic.LoadAt<nint>(CacheRemoteHeadAddr(cPtr, s), MemoryOrder.Relaxed) == (nint)0) continue;
+            DrainStripe(cPtr, s);
+        }
+    }
+
+    static void RetireCache(nint cPtr) {
+        ref MemCache c = ref NativeMemory.AsRef<MemCache>(cPtr);
+        if (c.AllocBatch != 0U) {
+            Atomic.FetchAdd(ref s_smallAllocCount, (ulong)c.AllocBatch, MemoryOrder.Relaxed);
+            c.AllocBatch = 0U;
+        }
+        DrainRemoteAll(cPtr);
+        if (c.Bump != (nint)0 && c.BumpEnd != (nint)0 && c.BumpDecommitted == 0) {
+            ulong start = ((ulong)c.Bump + 4095UL) & ~4095UL;
+#if WINDOWS
+            ulong end = (ulong)c.BumpCommitted & ~4095UL;
+#else
+            ulong end = (ulong)c.BumpEnd & ~4095UL;
+#endif
+            if (end > start && (end - start) >= 65536UL) {
+                ulong bytes = end - start;
+#if WINDOWS
+                WinVirtualFree((nint)start, bytes, MEM_DECOMMIT);
+                c.BumpCommitted = c.Bump;
+#else
+                PosixMadvise((nint)start, bytes, MADV_DONTNEED);
+#endif
+                c.BumpDecommitted = 1;
+                Atomic.FetchAdd(ref s_trimmedBytes, bytes, MemoryOrder.Relaxed);
+            }
+        }
+        MemLock();
+        c.NextFree = Atomic.Load(ref s_cachePool, MemoryOrder.Relaxed);
+        Atomic.Store(ref s_cachePool, cPtr, MemoryOrder.Release);
+        MemUnlock();
+    }
+
+    [Export("__zan_mem_thread_exit")]
+    [Visibility("hidden")]
+    static void ThreadExitCallback(nint p) {
+        if (p != (nint)0) RetireCache(p);
+    }
+
+#if WINDOWS
+    static uint GetFlsSlot() {
+        uint cur = Atomic.Load(ref s_fls, MemoryOrder.Acquire);
+        if (cur != FLS_OUT_OF_INDEXES) return cur;
+        int st = Atomic.Load(ref s_flsState, MemoryOrder.Acquire);
+        if (st == 0 && Atomic.CompareExchangeBool(ref s_flsState, 0, 1, MemoryOrder.AcqRel, MemoryOrder.Acquire)) {
+            uint idx = WinFlsAlloc(NativeMemory.FunctionPointer(ThreadExitCallback));
+            Atomic.Store(ref s_fls, idx, MemoryOrder.Release);
+            Atomic.Store(ref s_flsState, (idx == FLS_OUT_OF_INDEXES) ? 3 : 2, MemoryOrder.Release);
+            return idx;
+        }
+        while (Atomic.Load(ref s_flsState, MemoryOrder.Acquire) == 1) {
+            Atomic.Pause();
+        }
+        return Atomic.Load(ref s_fls, MemoryOrder.Acquire);
+    }
+#endif
+
+    static nint CacheGetSlow() {
+        nint cPtr = CacheTlsGet();
+        if (cPtr != (nint)0) return cPtr;
+#if WINDOWS
+        uint fls = GetFlsSlot();
+        if (fls == FLS_OUT_OF_INDEXES) return (nint)0;
+#else
+        ulong me = PosixPthreadSelf() | 1UL;
+        if (PosixInSetSpec(me)) return (nint)0;
+        int guardSlot = PosixEnterSetSpec(me);
+        if (guardSlot < 0) return (nint)0;
+        int st = Atomic.Load(ref s_exitKeyState, MemoryOrder.Acquire);
+        if (st == 0 && Atomic.CompareExchangeBool(ref s_exitKeyState, 0, 1, MemoryOrder.AcqRel, MemoryOrder.Acquire)) {
+            bool ok = PosixPthreadKeyCreate(
+                NativeMemory.AddressOf(ref s_exitKey),
+                NativeMemory.FunctionPointer(ThreadExitCallback)) == 0;
+            Atomic.Store(ref s_exitKeyState, ok ? 2 : 3, MemoryOrder.Release);
+            st = ok ? 2 : 3;
+        } else {
+            while ((st = Atomic.Load(ref s_exitKeyState, MemoryOrder.Acquire)) == 1) {
+                Atomic.Pause();
+            }
+        }
+        if (st != 2) {
+            PosixLeaveSetSpec(guardSlot);
+            return (nint)0;
+        }
+#endif
+        MemLock();
+        s_cacheInitCount++;
+        if (s_cacheInitCount > 1) {
+            Atomic.Store(ref s_multiThread, 1, MemoryOrder.Release);
+        }
+        cPtr = Atomic.Load(ref s_cachePool, MemoryOrder.Relaxed);
+        if (cPtr != (nint)0) {
+            Atomic.Store(ref s_cachePool, NativeMemory.AsRef<MemCache>(cPtr).NextFree, MemoryOrder.Release);
+        }
+        MemUnlock();
+
+        if (cPtr == (nint)0) {
+            cPtr = RealMalloc((ulong)sizeof(MemCache));
+            if (cPtr == (nint)0) {
+#if !WINDOWS
+                PosixLeaveSetSpec(guardSlot);
+#endif
+                return (nint)0;
+            }
+            CMemset(cPtr, 0, (ulong)sizeof(MemCache));
+        } else {
+            NativeMemory.AsRef<MemCache>(cPtr).NextFree = (nint)0;
+            DrainRemoteAll(cPtr);
+        }
+#if WINDOWS
+        if (WinFlsSetValue(fls, cPtr) == 0) {
+            RetireCache(cPtr);
+            return (nint)0;
+        }
+#else
+        if (PosixPthreadSetSpecific(s_exitKey, cPtr) != 0) {
+            RetireCache(cPtr);
+            PosixLeaveSetSpec(guardSlot);
+            return (nint)0;
+        }
+        PosixLeaveSetSpec(guardSlot);
+#endif
+        return cPtr;
+    }
+
+    static nint CacheGet() {
+        nint cPtr = CacheTlsGet();
+        if (cPtr != (nint)0) return cPtr;
+        return CacheGetSlow();
+    }
+
+}

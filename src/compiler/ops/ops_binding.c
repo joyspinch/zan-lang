@@ -721,6 +721,30 @@ static void ca_hoist_spine(zan_irgen_t *g, zan_ast_node_t **slot,
       ca_replace_with_temp(g, slot, locals);
     }
     return;
+  case AST_CALL:
+    if (call_returns_ref(g, node, locals)) {
+      zan_type_t *cty = infer_expr_type(g, node, locals);
+      LLVMValueRef ptr = emit_ref_lvalue_ptr(g, node, locals);
+      if (ptr && cty) {
+        LLVMTypeRef elem_ty = map_type(g, cty);
+        if (LLVMTypeOf(ptr) != LLVMPointerType(elem_ty, 0))
+          ptr = LLVMBuildBitCast(g->builder, ptr, LLVMPointerType(elem_ty, 0),
+                                 "ca.ref");
+        char buf[32];
+        int len = snprintf(buf, sizeof(buf), "__ca_ref_%d", g->qdot_counter++);
+        char *nm = (char *)zan_arena_alloc(g->arena, (size_t)len + 1);
+        memcpy(nm, buf, (size_t)len + 1);
+        zan_istr_t name = {nm, (uint32_t)len};
+        local_add(locals, name, ptr, cty);
+        locals->vars[locals->count - 1].byref_slot = 1;
+        zan_ast_node_t *id = zan_ast_new(g->arena, AST_IDENTIFIER, node->loc);
+        id->ident.name = name;
+        *slot = id;
+        return;
+      }
+    }
+    ca_replace_with_temp(g, slot, locals);
+    return;
   case AST_IDENTIFIER:
   case AST_THIS_EXPR:
   case AST_INT_LITERAL:
@@ -804,13 +828,24 @@ LLVMValueRef emit_struct_elem_ptr_ex(zan_irgen_t *g, zan_ast_node_t *expr,
     LLVMValueRef sv = emit_expr(g, base, locals);
     LLVMValueRef sbase = LLVMBuildExtractValue(g->builder, sv, 0, "spb");
     LLVMValueRef slen = LLVMBuildExtractValue(g->builder, sv, 1, "spl");
-    idx = emit_index_safe_bounds(g, idx, slen, expr->loc, "span");
+    if (!irgen_bce_check(g, base, expr->index.index, locals, NULL))
+      idx = emit_index_safe_bounds(g, idx, slen, expr->loc, "span");
     zan_type_t *et = container_elem_type(bt);
     LLVMTypeRef etl = span_elem_storage_type(g, et);
     LLVMValueRef typed =
         LLVMBuildBitCast(g->builder, sbase, LLVMPointerType(etl, 0), "spp");
-    LLVMValueRef ep = LLVMBuildGEP2(g->builder, etl, typed, &idx, 1, "ep");
+    LLVMValueRef ep = LLVMBuildInBoundsGEP2(g->builder, etl, typed, &idx, 1, "ep");
     return LLVMBuildBitCast(g->builder, ep, i8p, "epb");
+  }
+  if (is_inline_array_type(bt)) {
+    LLVMValueRef ap = emit_ref_lvalue_ptr(g, base, locals);
+    if (ap) {
+      LLVMTypeRef arr_ty = map_type(g, bt);
+      LLVMValueRef z = LLVMConstInt(i64, 0, 0);
+      LLVMValueRef gep_idx[] = {z, idx};
+      LLVMValueRef ep = LLVMBuildInBoundsGEP2(g->builder, arr_ty, ap, gep_idx, 2, "ia.ep");
+      return LLVMBuildBitCast(g->builder, ep, i8p, "epb");
+    }
   }
   return NULL;
 }

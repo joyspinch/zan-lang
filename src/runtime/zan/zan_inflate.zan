@@ -1,0 +1,583 @@
+// zan_inflate.zan: Pure-Zan embedded-resource RFC 1951 raw DEFLATE decoder
+// and FNV-1a64/splitmix64 XOR decryptor.
+// Exact C ABI replacement for src/embed/zan_inflate.c + miniz_tinfl.c.
+// 100% pure Zan, zero assembly, zero [ThreadStatic], zero dynamic '/' or '%'.
+
+namespace Zan.Runtime.Embed;
+
+struct InfBuf32 { public ulong A; public ulong B; public ulong C; public ulong D; }
+struct InfBuf64 { public InfBuf32 A; public InfBuf32 B; }
+struct InfBuf128 { public InfBuf64 A; public InfBuf64 B; }
+struct InfBuf256 { public InfBuf128 A; public InfBuf128 B; }
+struct InfBuf512 { public InfBuf256 A; public InfBuf256 B; }
+struct InfBuf1024 { public InfBuf512 A; public InfBuf512 B; }
+struct InfBuf2048 { public InfBuf1024 A; public InfBuf1024 B; }
+
+// Inflate decoder state (allocated on stack, zero static mutable state)
+struct InfState {
+    public nint Src;
+    public ulong SrcLen;
+    public ulong SrcPos;
+    public nint Dst;
+    public ulong DstCap;
+    public ulong DstPos;
+    public ulong BitBuf;
+    public int BitCnt;
+}
+
+// Canonical Huffman table with 9-bit primary LUT + slow canonical fallback.
+// Layout:
+//   Fast[512] (uint, 2048 bytes): bits 0..3 = code length (1..9, 0 = slow/invalid), bits 4..19 = symbol
+//   Count[16] (ushort, 32 bytes): count of codes of each bit length 0..15
+//   Sym[288]  (ushort, 576 bytes): symbols sorted by canonical code order
+// Total size: 2656 bytes (fits cleanly in InfBuf2048 + InfBuf512 + InfBuf128 = 2688 bytes)
+struct InfHuff {
+    public InfBuf2048 Fast;
+    public InfBuf32 Count;
+    public InfBuf512 SymA;
+    public InfBuf64 SymB;
+}
+
+static class ZanInflate {
+    const ulong FLAG_COMPRESSED = 0x4000000000000000UL;
+    const uint ZAN_EMBED_MAX_RAW_LEN = 536870912U; // 512 MiB
+    const int FAST_BITS = 9;
+    const uint FAST_MASK = 511U;
+
+    [DllImport("crt", EntryPoint = "malloc")]
+    static extern nint CMalloc(ulong size);
+
+    [DllImport("crt", EntryPoint = "free")]
+    static extern void CFree(nint ptr);
+
+    [DllImport("crt", EntryPoint = "memcpy")]
+    static extern nint CMemcpy(nint dst, nint src, ulong n);
+
+    [DllImport("crt", EntryPoint = "memset")]
+    static extern nint CMemset(nint dst, int c, ulong n);
+
+    // ---- Bitstream helpers ----
+    static bool FillBits(ref InfState st, int need) {
+        while (st.BitCnt < need) {
+            if (st.SrcPos >= st.SrcLen) return false;
+            byte b = NativeMemory.AsRef<byte>(st.Src + (nint)st.SrcPos);
+            st.SrcPos = st.SrcPos + 1UL;
+            st.BitBuf |= (ulong)b << st.BitCnt;
+            st.BitCnt += 8;
+        }
+        return true;
+    }
+
+    static void FillBitsRelaxed(ref InfState st, int want) {
+        while (st.BitCnt < want && st.SrcPos < st.SrcLen) {
+            byte b = NativeMemory.AsRef<byte>(st.Src + (nint)st.SrcPos);
+            st.SrcPos = st.SrcPos + 1UL;
+            st.BitBuf |= (ulong)b << st.BitCnt;
+            st.BitCnt += 8;
+        }
+    }
+
+    static int ReadBits(ref InfState st, int n) {
+        if (n == 0) return 0;
+        if (!FillBits(ref st, n)) return -1;
+        uint mask = (1U << n) - 1U;
+        int val = (int)((uint)st.BitBuf & mask);
+        st.BitBuf >>= n;
+        st.BitCnt -= n;
+        return val;
+    }
+
+    static void AlignByte(ref InfState st) {
+        int drop = st.BitCnt & 7;
+        st.BitBuf >>= drop;
+        st.BitCnt -= drop;
+        // Return whole buffered bytes back to SrcPos so stored block reads straight from Src
+        ulong wholeBytes = (ulong)(st.BitCnt >> 3);
+        st.SrcPos = st.SrcPos - wholeBytes;
+        st.BitBuf = 0UL;
+        st.BitCnt = 0;
+    }
+
+    static uint BitReverse(uint code, int len) {
+        uint rev = 0U;
+        for (int i = 0; i < len; i++) {
+            rev = (rev << 1) | (code & 1U);
+            code >>= 1;
+        }
+        return rev;
+    }
+
+    // Build canonical Huffman table from byte code lengths lens[0..numSyms-1].
+    // Returns true on valid (complete or allowed incomplete) tree; false if over-subscribed.
+    static bool BuildHuff(ref InfHuff h, nint lens, int numSyms, bool allowIncomplete) {
+        nint fastPtr = NativeMemory.AddressOf(ref h.Fast);
+        nint countPtr = NativeMemory.AddressOf(ref h.Count);
+        nint symPtr = NativeMemory.AddressOf(ref h.SymA);
+
+        CMemset(fastPtr, 0, 2048UL);
+        CMemset(countPtr, 0, 32UL);
+
+        for (int i = 0; i < numSyms; i++) {
+            int l = (int)NativeMemory.AsRef<byte>(lens + (nint)i);
+            if (l > 15) return false;
+            ushort c = NativeMemory.AsRef<ushort>(countPtr + (nint)(l * 2));
+            NativeMemory.AsRef<ushort>(countPtr + (nint)(l * 2)) = (ushort)(c + 1);
+        }
+
+        // All-zero lengths (e.g. empty distance tree in literal-only block)
+        if ((int)NativeMemory.AsRef<ushort>(countPtr) == numSyms) {
+            return allowIncomplete;
+        }
+
+        // Check over-subscribed / incomplete
+        int left = 1;
+        for (int len = 1; len <= 15; len++) {
+            left <<= 1;
+            left -= (int)NativeMemory.AsRef<ushort>(countPtr + (nint)(len * 2));
+            if (left < 0) return false;
+        }
+        if (left > 0 && !allowIncomplete) {
+            // RFC 1951 permits a single-symbol tree of length 1 (left == 1)
+            if (!(left == 1 && (int)NativeMemory.AsRef<ushort>(countPtr + (nint)2) == 1)) {
+                return false;
+            }
+        }
+
+        // Compute starting offsets in Sym[] and starting canonical codes per length
+        InfBuf32 offsBuf = new InfBuf32();
+        nint offsPtr = NativeMemory.AddressOf(ref offsBuf);
+        InfBuf32 nextCodeBuf = new InfBuf32();
+        nint nextCodePtr = NativeMemory.AddressOf(ref nextCodeBuf);
+
+        NativeMemory.AsRef<ushort>(offsPtr + (nint)2) = 0;
+        uint code = 0U;
+        for (int len = 1; len < 15; len++) {
+            ushort cnt = NativeMemory.AsRef<ushort>(countPtr + (nint)(len * 2));
+            ushort prevOff = NativeMemory.AsRef<ushort>(offsPtr + (nint)(len * 2));
+            NativeMemory.AsRef<ushort>(offsPtr + (nint)((len + 1) * 2)) = (ushort)(prevOff + cnt);
+            NativeMemory.AsRef<ushort>(nextCodePtr + (nint)(len * 2)) = (ushort)code;
+            code = (code + (uint)cnt) << 1;
+        }
+        NativeMemory.AsRef<ushort>(nextCodePtr + (nint)30) = (ushort)code;
+
+        for (int sym = 0; sym < numSyms; sym++) {
+            int l = (int)NativeMemory.AsRef<byte>(lens + (nint)sym);
+            if (l == 0) continue;
+            ushort o = NativeMemory.AsRef<ushort>(offsPtr + (nint)(l * 2));
+            NativeMemory.AsRef<ushort>(offsPtr + (nint)(l * 2)) = (ushort)(o + 1);
+            NativeMemory.AsRef<ushort>(symPtr + (nint)((int)o * 2)) = (ushort)sym;
+
+            ushort nc = NativeMemory.AsRef<ushort>(nextCodePtr + (nint)(l * 2));
+            NativeMemory.AsRef<ushort>(nextCodePtr + (nint)(l * 2)) = (ushort)(nc + 1);
+            if (l <= FAST_BITS) {
+                uint rev = BitReverse((uint)nc, l);
+                uint step = 1U << l;
+                uint entry = ((uint)sym << 4) | (uint)l;
+                for (uint idx = rev; idx < 512U; idx += step) {
+                    NativeMemory.AsRef<uint>(fastPtr + (nint)((long)idx * 4L)) = entry;
+                }
+            }
+        }
+        return true;
+    }
+
+    static int DecodeHuff(ref InfState st, ref InfHuff h) {
+        FillBitsRelaxed(ref st, 15);
+        if (st.BitCnt == 0) return -1;
+
+        nint fastPtr = NativeMemory.AddressOf(ref h.Fast);
+        uint peek = (uint)st.BitBuf & FAST_MASK;
+        uint entry = NativeMemory.AsRef<uint>(fastPtr + (nint)((long)peek * 4L));
+        int fastLen = (int)(entry & 15U);
+        if (fastLen != 0 && fastLen <= st.BitCnt) {
+            st.BitBuf >>= fastLen;
+            st.BitCnt -= fastLen;
+            return (int)(entry >> 4);
+        }
+
+        // Canonical slow path (codes 10..15 bits, or near EOF where BitCnt < 9)
+        nint countPtr = NativeMemory.AddressOf(ref h.Count);
+        nint symPtr = NativeMemory.AddressOf(ref h.SymA);
+        int code = 0;
+        int first = 0;
+        int index = 0;
+        for (int len = 1; len <= 15; len++) {
+            if (st.BitCnt < len) {
+                if (!FillBits(ref st, len)) return -1;
+            }
+            int bit = (int)((st.BitBuf >> (len - 1)) & 1UL);
+            code |= bit;
+            int cnt = (int)NativeMemory.AsRef<ushort>(countPtr + (nint)(len * 2));
+            if (code - cnt < first) {
+                st.BitBuf >>= len;
+                st.BitCnt -= len;
+                return (int)NativeMemory.AsRef<ushort>(symPtr + (nint)((index + (code - first)) * 2));
+            }
+            index += cnt;
+            first += cnt;
+            first <<= 1;
+            code <<= 1;
+        }
+        return -1;
+    }
+
+    // ---- RFC 1951 Length & Distance tables ----
+    static int LenBase(int sym) {
+        int i = sym - 257;
+        if (i < 8) return 3 + i;
+        if (i == 8) return 11;
+        if (i == 9) return 13;
+        if (i == 10) return 15;
+        if (i == 11) return 17;
+        if (i == 12) return 19;
+        if (i == 13) return 23;
+        if (i == 14) return 27;
+        if (i == 15) return 31;
+        if (i == 16) return 35;
+        if (i == 17) return 43;
+        if (i == 18) return 51;
+        if (i == 19) return 59;
+        if (i == 20) return 67;
+        if (i == 21) return 83;
+        if (i == 22) return 99;
+        if (i == 23) return 115;
+        if (i == 24) return 131;
+        if (i == 25) return 163;
+        if (i == 26) return 195;
+        if (i == 27) return 227;
+        return 258;
+    }
+
+    static int LenExtra(int sym) {
+        int i = sym - 257;
+        if (i < 8 || i == 28) return 0;
+        return (i - 4) >> 2;
+    }
+
+    static int DistBase(int sym) {
+        if (sym == 0) return 1;
+        if (sym == 1) return 2;
+        if (sym == 2) return 3;
+        if (sym == 3) return 4;
+        if (sym == 4) return 5;
+        if (sym == 5) return 7;
+        if (sym == 6) return 9;
+        if (sym == 7) return 13;
+        if (sym == 8) return 17;
+        if (sym == 9) return 25;
+        if (sym == 10) return 33;
+        if (sym == 11) return 49;
+        if (sym == 12) return 65;
+        if (sym == 13) return 97;
+        if (sym == 14) return 129;
+        if (sym == 15) return 193;
+        if (sym == 16) return 257;
+        if (sym == 17) return 385;
+        if (sym == 18) return 513;
+        if (sym == 19) return 769;
+        if (sym == 20) return 1025;
+        if (sym == 21) return 1537;
+        if (sym == 22) return 2049;
+        if (sym == 23) return 3073;
+        if (sym == 24) return 4097;
+        if (sym == 25) return 6145;
+        if (sym == 26) return 8193;
+        if (sym == 27) return 12289;
+        if (sym == 28) return 16385;
+        return 24577;
+    }
+
+    static int DistExtra(int sym) {
+        if (sym < 4) return 0;
+        return (sym - 2) >> 1;
+    }
+
+    static int ClOrder(int i) {
+        if (i == 0) return 16;
+        if (i == 1) return 17;
+        if (i == 2) return 18;
+        if (i == 3) return 0;
+        if (i == 4) return 8;
+        if (i == 5) return 7;
+        if (i == 6) return 9;
+        if (i == 7) return 6;
+        if (i == 8) return 10;
+        if (i == 9) return 5;
+        if (i == 10) return 11;
+        if (i == 11) return 4;
+        if (i == 12) return 12;
+        if (i == 13) return 3;
+        if (i == 14) return 13;
+        if (i == 15) return 2;
+        if (i == 16) return 14;
+        if (i == 17) return 1;
+        return 15;
+    }
+
+    static bool DecodeCodes(ref InfState st, ref InfHuff litHuff, ref InfHuff distHuff) {
+        for (;;) {
+            int sym = DecodeHuff(ref st, ref litHuff);
+            if (sym < 0) return false;
+            if (sym < 256) {
+                if (st.DstPos >= st.DstCap) return false;
+                NativeMemory.AsRef<byte>(st.Dst + (nint)st.DstPos) = (byte)sym;
+                st.DstPos = st.DstPos + 1UL;
+                continue;
+            }
+            if (sym == 256) return true;
+            if (sym > 285) return false;
+
+            int lex = LenExtra(sym);
+            int extra = lex > 0 ? ReadBits(ref st, lex) : 0;
+            if (extra < 0) return false;
+            ulong matchLen = (ulong)(LenBase(sym) + extra);
+
+            int dsym = DecodeHuff(ref st, ref distHuff);
+            if (dsym < 0 || dsym > 29) return false;
+            int dex = DistExtra(dsym);
+            int dextra = dex > 0 ? ReadBits(ref st, dex) : 0;
+            if (dextra < 0) return false;
+            ulong dist = (ulong)(DistBase(dsym) + dextra);
+
+            if (dist == 0UL || dist > st.DstPos) return false;
+            if (matchLen > st.DstCap - st.DstPos) return false;
+
+            nint dstBase = st.Dst + (nint)st.DstPos;
+            nint srcBase = dstBase - (nint)dist;
+            for (ulong k = 0UL; k < matchLen; k++) {
+                NativeMemory.AsRef<byte>(dstBase + (nint)k) = NativeMemory.AsRef<byte>(srcBase + (nint)k);
+            }
+            st.DstPos = st.DstPos + matchLen;
+        }
+    }
+
+    static bool DecodeStored(ref InfState st) {
+        AlignByte(ref st);
+        if (st.SrcPos + 4UL > st.SrcLen) return false;
+        uint b0 = (uint)NativeMemory.AsRef<byte>(st.Src + (nint)st.SrcPos);
+        uint b1 = (uint)NativeMemory.AsRef<byte>(st.Src + (nint)(st.SrcPos + 1UL));
+        uint b2 = (uint)NativeMemory.AsRef<byte>(st.Src + (nint)(st.SrcPos + 2UL));
+        uint b3 = (uint)NativeMemory.AsRef<byte>(st.Src + (nint)(st.SrcPos + 3UL));
+        st.SrcPos = st.SrcPos + 4UL;
+        uint len = b0 | (b1 << 8);
+        uint nlen = b2 | (b3 << 8);
+        if ((len ^ 0xFFFFU) != nlen) return false;
+        if ((ulong)len > st.SrcLen - st.SrcPos) return false;
+        if ((ulong)len > st.DstCap - st.DstPos) return false;
+        if (len > 0U) {
+            CMemcpy(st.Dst + (nint)st.DstPos, st.Src + (nint)st.SrcPos, (ulong)len);
+            st.SrcPos = st.SrcPos + (ulong)len;
+            st.DstPos = st.DstPos + (ulong)len;
+        }
+        return true;
+    }
+
+    static bool DecodeFixed(ref InfState st) {
+        InfBuf512 lensBuf = new InfBuf512();
+        nint lp = NativeMemory.AddressOf(ref lensBuf);
+        for (int i = 0; i <= 143; i++) NativeMemory.AsRef<byte>(lp + (nint)i) = 8;
+        for (int i = 144; i <= 255; i++) NativeMemory.AsRef<byte>(lp + (nint)i) = 9;
+        for (int i = 256; i <= 279; i++) NativeMemory.AsRef<byte>(lp + (nint)i) = 7;
+        for (int i = 280; i <= 287; i++) NativeMemory.AsRef<byte>(lp + (nint)i) = 8;
+
+        InfHuff litHuff = new InfHuff();
+        if (!BuildHuff(ref litHuff, lp, 288, false)) return false;
+
+        InfBuf32 distLens = new InfBuf32();
+        nint dp = NativeMemory.AddressOf(ref distLens);
+        for (int i = 0; i < 32; i++) NativeMemory.AsRef<byte>(dp + (nint)i) = 5;
+
+        InfHuff distHuff = new InfHuff();
+        if (!BuildHuff(ref distHuff, dp, 32, false)) return false;
+
+        return DecodeCodes(ref st, ref litHuff, ref distHuff);
+    }
+
+    static bool DecodeDynamic(ref InfState st) {
+        int hlitR = ReadBits(ref st, 5);
+        int hdistR = ReadBits(ref st, 5);
+        int hclenR = ReadBits(ref st, 4);
+        if (hlitR < 0 || hdistR < 0 || hclenR < 0) return false;
+        int hlit = hlitR + 257;
+        int hdist = hdistR + 1;
+        int hclen = hclenR + 4;
+        if (hlit > 286 || hdist > 30) return false;
+
+        InfBuf32 clLens = new InfBuf32();
+        nint clp = NativeMemory.AddressOf(ref clLens);
+        CMemset(clp, 0, 32UL);
+        for (int i = 0; i < hclen; i++) {
+            int b = ReadBits(ref st, 3);
+            if (b < 0) return false;
+            NativeMemory.AsRef<byte>(clp + (nint)ClOrder(i)) = (byte)b;
+        }
+
+        InfHuff clHuff = new InfHuff();
+        if (!BuildHuff(ref clHuff, clp, 19, false)) return false;
+
+        InfBuf512 allLens = new InfBuf512(); // need 286 + 30 = 316 bytes
+        nint alp = NativeMemory.AddressOf(ref allLens);
+        int total = hlit + hdist;
+        int idx = 0;
+        while (idx < total) {
+            int sym = DecodeHuff(ref st, ref clHuff);
+            if (sym < 0 || sym > 18) return false;
+            if (sym < 16) {
+                NativeMemory.AsRef<byte>(alp + (nint)idx) = (byte)sym;
+                idx++;
+            } else {
+                byte val = 0;
+                int rep = 0;
+                if (sym == 16) {
+                    if (idx == 0) return false;
+                    val = NativeMemory.AsRef<byte>(alp + (nint)(idx - 1));
+                    int eb = ReadBits(ref st, 2);
+                    if (eb < 0) return false;
+                    rep = 3 + eb;
+                } else if (sym == 17) {
+                    int eb = ReadBits(ref st, 3);
+                    if (eb < 0) return false;
+                    rep = 3 + eb;
+                } else {
+                    int eb = ReadBits(ref st, 7);
+                    if (eb < 0) return false;
+                    rep = 11 + eb;
+                }
+                if (idx + rep > total) return false;
+                for (int r = 0; r < rep; r++) {
+                    NativeMemory.AsRef<byte>(alp + (nint)(idx + r)) = val;
+                }
+                idx += rep;
+            }
+        }
+
+        // RFC 1951: end-of-block symbol (256) must have non-zero code length
+        if (NativeMemory.AsRef<byte>(alp + (nint)256) == 0) return false;
+
+        InfHuff litHuff = new InfHuff();
+        if (!BuildHuff(ref litHuff, alp, hlit, false)) return false;
+
+        InfHuff distHuff = new InfHuff();
+        if (!BuildHuff(ref distHuff, alp + (nint)hlit, hdist, true)) return false;
+
+        return DecodeCodes(ref st, ref litHuff, ref distHuff);
+    }
+
+    static bool InflateRaw(nint dst, ulong dstCap, nint src, ulong srcLen, out ulong outWritten) {
+        InfState st = new InfState();
+        st.Src = src;
+        st.SrcLen = srcLen;
+        st.SrcPos = 0UL;
+        st.Dst = dst;
+        st.DstCap = dstCap;
+        st.DstPos = 0UL;
+        st.BitBuf = 0UL;
+        st.BitCnt = 0;
+
+        for (;;) {
+            int bfinal = ReadBits(ref st, 1);
+            int btype = ReadBits(ref st, 2);
+            if (bfinal < 0 || btype < 0) {
+                outWritten = 0UL;
+                return false;
+            }
+            bool ok = false;
+            if (btype == 0) ok = DecodeStored(ref st);
+            else if (btype == 1) ok = DecodeFixed(ref st);
+            else if (btype == 2) ok = DecodeDynamic(ref st);
+            else ok = false;
+
+            if (!ok) {
+                outWritten = 0UL;
+                return false;
+            }
+            if (bfinal != 0) break;
+        }
+        outWritten = st.DstPos;
+        return true;
+    }
+
+    // ---- Exported C ABI (exact match to src/embed/zan_inflate.c) ----
+
+    [Export("zan_embed_rawlen")]
+    public static uint EmbedRawLen(nint payload, ulong len) {
+        if (payload == (nint)0 || (len & FLAG_COMPRESSED) == 0UL) return 0U;
+        if ((len & ~FLAG_COMPRESSED) < 4UL) return 0U;
+        uint raw = NativeMemory.AsRef<uint>(payload);
+        if (raw > ZAN_EMBED_MAX_RAW_LEN) return 0U;
+        return raw;
+    }
+
+    [Export("zan_embed_decode")]
+    public static nint EmbedDecode(nint payload, ulong len) {
+        if (payload == (nint)0 || (len & FLAG_COMPRESSED) == 0UL) return (nint)0;
+        ulong total = len & ~FLAG_COMPRESSED;
+        if (total < 8UL) return (nint)0;
+        uint rawLen = NativeMemory.AsRef<uint>(payload);
+        uint compLen = NativeMemory.AsRef<uint>(payload + (nint)4);
+        nint src = payload + (nint)8;
+        if ((ulong)compLen > total - 8UL) return (nint)0;
+        if (rawLen > ZAN_EMBED_MAX_RAW_LEN) return (nint)0;
+        nint outBuf = CMalloc((ulong)rawLen + 1UL);
+        if (outBuf == (nint)0) return (nint)0;
+        if (rawLen != 0U) {
+            ulong actual = 0UL;
+            if (!InflateRaw(outBuf, (ulong)rawLen, src, (ulong)compLen, out actual) ||
+                actual != (ulong)rawLen) {
+                CFree(outBuf);
+                return (nint)0;
+            }
+        }
+        NativeMemory.AsRef<byte>(outBuf + (nint)rawLen) = 0;
+        return outBuf;
+    }
+
+    static ulong Mix64(ulong x) {
+        x ^= x >> 30;
+        x *= 0xBF58476D1CE4E5B9UL;
+        x ^= x >> 27;
+        x *= 0x94D049BB133111EBUL;
+        x ^= x >> 31;
+        return x;
+    }
+
+    static void Crypt(nint name, nint buf, long len, ulong seed) {
+        ulong h = 1469598103934665603UL;
+        if (name != (nint)0) {
+            long p = 0L;
+            for (;;) {
+                byte c = NativeMemory.AsRef<byte>(name + (nint)p);
+                if (c == 0) break;
+                h ^= (ulong)c;
+                h *= 1099511628211UL;
+                p++;
+            }
+        }
+        ulong st = seed ^ (h * 0x9E3779B97F4A7C15UL);
+        long i = 0L;
+        while (i < len) {
+            long rem = len - i;
+            int n = rem < 8L ? (int)rem : 8;
+            st += 0x9E3779B97F4A7C15UL;
+            ulong z = Mix64(st);
+            for (int k = 0; k < n; k++) {
+                nint ptr = buf + (nint)(i + (long)k);
+                NativeMemory.AsRef<byte>(ptr) = (byte)(NativeMemory.AsRef<byte>(ptr) ^ (byte)(z >> (8 * k)));
+            }
+            i += (long)n;
+        }
+    }
+
+    [Export("zan_embed_uncrypt")]
+    public static nint EmbedUncrypt(nint name, nint payload, ulong storedLen, ulong seed) {
+        if (payload == (nint)0 || storedLen > 0xFFFFFFFEUL) return (nint)0;
+        nint outBuf = CMalloc(storedLen + 1UL);
+        if (outBuf == (nint)0) return (nint)0;
+        if (storedLen > 0UL) {
+            CMemcpy(outBuf, payload, storedLen);
+        }
+        Crypt(name, outBuf, (long)storedLen, seed);
+        NativeMemory.AsRef<byte>(outBuf + (nint)storedLen) = 0;
+        return outBuf;
+    }
+}

@@ -1,0 +1,44 @@
+using System;
+
+class Program {
+    [NoAlloc]
+    static long RunMmioAndAtomics(nint buf) {
+        NativeMemory.PrefetchWrite(buf, 3);
+        NativeMemory.Fill(buf, 0, 128L);
+
+        // MMIO-style raw-address volatile read/write
+        nint reg0 = buf + (nint)0;
+        nint reg1 = buf + (nint)8;
+        Volatile.WriteAt<uint>(reg0, 0xCAFEBABEu);
+        uint r0 = Volatile.ReadAt<uint>(reg0);
+        Volatile.WriteAt<double>(reg1, 2.5);
+        double r1 = Volatile.ReadAt<double>(reg1);
+
+        // Raw-address atomic ops on shared ring slot
+        nint slot = buf + (nint)64;
+        NativeMemory.PrefetchRead(slot, 3);
+        Atomic.StoreAt<int>(slot, 10, MemoryOrder.Release);
+        int a0 = Atomic.FetchAddAt<int>(slot, 25, MemoryOrder.AcqRel);   // old=10, new=35
+        int a1 = Atomic.FetchSubAt<int>(slot, 5, MemoryOrder.SeqCst);    // old=35, new=30
+        bool okCas = Atomic.CompareExchangeBoolAt<int>(slot, 30, 99, MemoryOrder.AcqRel, MemoryOrder.Acquire);
+        int cur = Atomic.LoadAt<int>(slot, MemoryOrder.Acquire);         // 99
+        int prevEx = Atomic.ExchangeAt<int>(slot, 100, MemoryOrder.SeqCst); // old=99, new=100
+
+        // Copy 16 bytes using LLVM memmove intrinsic
+        nint dst = buf + (nint)96;
+        NativeMemory.Copy(dst, reg0, 16L);
+        uint copied = Volatile.ReadAt<uint>(dst);
+
+        long ok = (r0 == 0xCAFEBABEu && copied == 0xCAFEBABEu && r1 == 2.5 && okCas) ? 1L : 0L;
+        return ok * 100000L + (long)a0 * 1000L + (long)a1 * 10L + (long)(cur == 99 && prevEx == 99 ? 1 : 0) + (long)Atomic.LoadAt<int>(slot);
+    }
+
+    static int Main() {
+        nint buf = NativeMemory.AlignedAlloc(256L, 64L);
+        long res = RunMmioAndAtomics(buf);
+        NativeMemory.AlignedFree(buf);
+        // 100000 + 10000 + 350 + 1 + 100 = 110451
+        Console.WriteLine($"res={res}");
+        return 0;
+    }
+}
