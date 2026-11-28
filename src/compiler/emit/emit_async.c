@@ -1393,10 +1393,12 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
                            strstr(g->target_triple, "mingw") != NULL ||
                            strstr(g->target_triple, "msvc") != NULL);
 #endif
-            if (is_win)
-              LLVMSetDLLStorageClass(fn, LLVMDLLExportStorageClass);
-            else
+            if (is_win) {
+              if (g->emit_lib && g->emit_shared)
+                LLVMSetDLLStorageClass(fn, LLVMDLLExportStorageClass);
+            } else {
               LLVMSetVisibility(fn, LLVMDefaultVisibility);
+            }
           }
           {
             unsigned cc = LLVMCCallConv;

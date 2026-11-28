@@ -165,20 +165,81 @@ LLVMValueRef emit_delegate_equals(zan_irgen_t *g, LLVMValueRef a,
   LLVMAddIncoming(phi, vals, blks, 2);
   return phi;
 }
-void emit_closure_retain(zan_irgen_t *g, LLVMValueRef v) {
-  if (g->current_fn_no_runtime)
-    return;
-  if (!v || LLVMGetTypeKind(LLVMTypeOf(v)) != LLVMPointerTypeKind)
-    return;
-  LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+static LLVMValueRef get_clo_retain_helper(zan_irgen_t *g) {
+  LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_retain_clo");
+  if (fn)
+    return fn;
+  LLVMTypeRef void_ty = LLVMVoidTypeInContext(g->ctx);
+  LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+  LLVMTypeRef fty = LLVMFunctionType(void_ty, &i8ptr, 1, 0);
+  fn = LLVMAddFunction(g->mod, "__zan_retain_clo", fty);
+  LLVMSetLinkage(fn, LLVMInternalLinkage);
+  LLVMSetFunctionCallConv(fn, LLVMFastCallConv);
+  zan_mark_nounwind(g, fn);
+  zan_builder_point_t pt = zan_builder_save(g);
+  LLVMValueRef saved_fn = g->current_fn;
+  g->current_fn = fn;
+  LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
   LLVMBasicBlockRef doit = LLVMAppendBasicBlockInContext(g->ctx, fn, "clo.rt");
-  LLVMBasicBlockRef done =
-      LLVMAppendBasicBlockInContext(g->ctx, fn, "clo.rt.end");
+  LLVMBasicBlockRef done = LLVMAppendBasicBlockInContext(g->ctx, fn, "clo.rt.end");
+  LLVMPositionBuilderAtEnd(g->builder, entry);
+  di_clear(g);
+  LLVMValueRef v = LLVMGetParam(fn, 0);
   LLVMBuildCondBr(g->builder, emit_closure_is_tagged(g, v), doit, done);
   LLVMPositionBuilderAtEnd(g->builder, doit);
   emit_arc_retain(g, emit_closure_untag(g, v));
   LLVMBuildBr(g->builder, done);
   LLVMPositionBuilderAtEnd(g->builder, done);
+  LLVMBuildRetVoid(g->builder);
+  g->current_fn = saved_fn;
+  zan_builder_restore(g, pt);
+  return fn;
+}
+
+static LLVMValueRef get_clo_release_helper(zan_irgen_t *g) {
+  LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_release_clo");
+  if (fn)
+    return fn;
+  LLVMTypeRef void_ty = LLVMVoidTypeInContext(g->ctx);
+  LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+  LLVMTypeRef fty = LLVMFunctionType(void_ty, &i8ptr, 1, 0);
+  fn = LLVMAddFunction(g->mod, "__zan_release_clo", fty);
+  LLVMSetLinkage(fn, LLVMInternalLinkage);
+  LLVMSetFunctionCallConv(fn, LLVMFastCallConv);
+  zan_mark_nounwind(g, fn);
+  zan_builder_point_t pt = zan_builder_save(g);
+  LLVMValueRef saved_fn = g->current_fn;
+  g->current_fn = fn;
+  LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
+  LLVMBasicBlockRef doit = LLVMAppendBasicBlockInContext(g->ctx, fn, "clo.rl");
+  LLVMBasicBlockRef done = LLVMAppendBasicBlockInContext(g->ctx, fn, "clo.rl.end");
+  LLVMPositionBuilderAtEnd(g->builder, entry);
+  di_clear(g);
+  LLVMValueRef v = LLVMGetParam(fn, 0);
+  LLVMBuildCondBr(g->builder, emit_closure_is_tagged(g, v), doit, done);
+  LLVMPositionBuilderAtEnd(g->builder, doit);
+  emit_closure_record_release(g, emit_closure_untag(g, v));
+  LLVMBuildBr(g->builder, done);
+  LLVMPositionBuilderAtEnd(g->builder, done);
+  LLVMBuildRetVoid(g->builder);
+  g->current_fn = saved_fn;
+  zan_builder_restore(g, pt);
+  return fn;
+}
+
+void emit_closure_retain(zan_irgen_t *g, LLVMValueRef v) {
+  if (g->current_fn_no_runtime)
+    return;
+  if (!v || LLVMGetTypeKind(LLVMTypeOf(v)) != LLVMPointerTypeKind)
+    return;
+  LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+  if (LLVMTypeOf(v) != i8ptr)
+    v = LLVMBuildBitCast(g->builder, v, i8ptr, "clo.rt.p");
+  LLVMValueRef helper = get_clo_retain_helper(g);
+  LLVMValueRef call =
+      zan_call2(g->builder, LLVMGlobalGetValueType(helper), helper, &v, 1, "");
+  LLVMSetInstructionCallConv(call, LLVMFastCallConv);
+  zan_mark_nounwind(g, call);
 }
 void emit_closure_record_release(zan_irgen_t *g, LLVMValueRef rec) {
   if (g->current_fn_no_runtime)
@@ -203,15 +264,14 @@ void emit_closure_release(zan_irgen_t *g, LLVMValueRef v) {
     return;
   if (!v || LLVMGetTypeKind(LLVMTypeOf(v)) != LLVMPointerTypeKind)
     return;
-  LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
-  LLVMBasicBlockRef doit = LLVMAppendBasicBlockInContext(g->ctx, fn, "clo.rl");
-  LLVMBasicBlockRef done =
-      LLVMAppendBasicBlockInContext(g->ctx, fn, "clo.rl.end");
-  LLVMBuildCondBr(g->builder, emit_closure_is_tagged(g, v), doit, done);
-  LLVMPositionBuilderAtEnd(g->builder, doit);
-  emit_closure_record_release(g, emit_closure_untag(g, v));
-  LLVMBuildBr(g->builder, done);
-  LLVMPositionBuilderAtEnd(g->builder, done);
+  LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+  if (LLVMTypeOf(v) != i8ptr)
+    v = LLVMBuildBitCast(g->builder, v, i8ptr, "clo.rl.p");
+  LLVMValueRef helper = get_clo_release_helper(g);
+  LLVMValueRef call =
+      zan_call2(g->builder, LLVMGlobalGetValueType(helper), helper, &v, 1, "");
+  LLVMSetInstructionCallConv(call, LLVMFastCallConv);
+  zan_mark_nounwind(g, call);
 }
 LLVMValueRef emit_delegate_invoke(zan_irgen_t *g, LLVMValueRef dv,
                                   LLVMTypeRef fn_type, LLVMTypeRef ret,
@@ -272,24 +332,56 @@ LLVMValueRef emit_delegate_invoke(zan_irgen_t *g, LLVMValueRef dv,
 }
 
 /* Erased delegates keep their low-bit tag; only ordinary object payloads
- * carry an ARC header at the unmodified pointer. */
-void emit_retain_obj_value(zan_irgen_t *g, LLVMValueRef v) {
-  if (g->current_fn_no_runtime || !v ||
-      LLVMGetTypeKind(LLVMTypeOf(v)) != LLVMPointerTypeKind)
-    return;
-  LLVMValueRef fn = LLVMGetBasicBlockParent(LLVMGetInsertBlock(g->builder));
+ * carry an ARC header at the unmodified pointer. Outlined into a tiny
+ * module-local fastcc nounwind helper so sites don't clone 3 BBs each. */
+static LLVMValueRef get_obj_retain_helper(zan_irgen_t *g) {
+  LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_retain_obj");
+  if (fn)
+    return fn;
+  LLVMTypeRef void_ty = LLVMVoidTypeInContext(g->ctx);
+  LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+  LLVMTypeRef fty = LLVMFunctionType(void_ty, &i8ptr, 1, 0);
+  fn = LLVMAddFunction(g->mod, "__zan_retain_obj", fty);
+  LLVMSetLinkage(fn, LLVMInternalLinkage);
+  LLVMSetFunctionCallConv(fn, LLVMFastCallConv);
+  zan_mark_nounwind(g, fn);
+  zan_builder_point_t pt = zan_builder_save(g);
+  LLVMValueRef saved_fn = g->current_fn;
+  g->current_fn = fn;
+  LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
   LLVMBasicBlockRef clo = LLVMAppendBasicBlockInContext(g->ctx, fn, "obj.cref");
   LLVMBasicBlockRef obj = LLVMAppendBasicBlockInContext(g->ctx, fn, "obj.oref");
   LLVMBasicBlockRef done =
       LLVMAppendBasicBlockInContext(g->ctx, fn, "obj.ref.end");
+  LLVMPositionBuilderAtEnd(g->builder, entry);
+  di_clear(g);
+  LLVMValueRef v = LLVMGetParam(fn, 0);
   LLVMBuildCondBr(g->builder, emit_closure_is_tagged(g, v), clo, obj);
   LLVMPositionBuilderAtEnd(g->builder, clo);
-  emit_closure_retain(g, v);
+  emit_arc_retain(g, emit_closure_untag(g, v));
   LLVMBuildBr(g->builder, done);
   LLVMPositionBuilderAtEnd(g->builder, obj);
   emit_arc_retain(g, v);
   LLVMBuildBr(g->builder, done);
   LLVMPositionBuilderAtEnd(g->builder, done);
+  LLVMBuildRetVoid(g->builder);
+  g->current_fn = saved_fn;
+  zan_builder_restore(g, pt);
+  return fn;
+}
+
+void emit_retain_obj_value(zan_irgen_t *g, LLVMValueRef v) {
+  if (g->current_fn_no_runtime || !v ||
+      LLVMGetTypeKind(LLVMTypeOf(v)) != LLVMPointerTypeKind)
+    return;
+  LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+  if (LLVMTypeOf(v) != i8ptr)
+    v = LLVMBuildBitCast(g->builder, v, i8ptr, "obj.rt.p");
+  LLVMValueRef helper = get_obj_retain_helper(g);
+  LLVMValueRef call =
+      zan_call2(g->builder, LLVMGlobalGetValueType(helper), helper, &v, 1, "");
+  LLVMSetInstructionCallConv(call, LLVMFastCallConv);
+  zan_mark_nounwind(g, call);
 }
 
 static void emit_array_retain(zan_irgen_t *g, LLVMValueRef v);

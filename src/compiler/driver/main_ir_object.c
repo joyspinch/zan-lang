@@ -1,4 +1,5 @@
 /* Included by main.c for access to the driver's atomic output helpers. */
+#include "../irgen_compact.h"
 #include <llvm-c/IRReader.h>
 #include <llvm-c/TargetMachine.h>
 
@@ -75,8 +76,10 @@ static int compile_ir_object(int argc, char **argv) {
   zan_irgen_init_llvm_targets();
   if (LLVMGetTargetFromTriple(triple, &target, &error))
     goto done;
-  machine = LLVMCreateTargetMachine(target, triple, "generic", "", codegen,
-                                    LLVMRelocPIC, LLVMCodeModelDefault);
+  machine = zan_create_target_machine_with_options(
+      target, triple, "generic", "", codegen, LLVMRelocPIC,
+      LLVMCodeModelDefault, strstr(triple, "android") != NULL,
+      strncmp(triple, "wasm", 4) == 0, 1, 1);
   if (!machine) {
     fprintf(stderr, "error: failed to create target machine for '%s'\n",
             triple);

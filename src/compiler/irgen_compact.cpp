@@ -2,6 +2,7 @@
 
 #include "irgen_compact.h"
 
+#include <optional>
 #include <llvm/ADT/DenseSet.h>
 #include <llvm/Analysis/CGSCCPassManager.h>
 #include <llvm/Analysis/LoopAnalysisManager.h>
@@ -247,10 +248,35 @@ extern "C" void zan_irgen_compactor_destroy(zan_irgen_compactor_t *compactor) {
 extern "C" LLVMTargetMachineRef zan_create_target_machine_with_options(
     LLVMTargetRef target, const char *triple, const char *cpu,
     const char *features, LLVMCodeGenOptLevel level,
-    LLVMBool emulated_tls, LLVMBool wasm_exceptions) {
+    LLVMRelocMode reloc_mode, LLVMCodeModel code_model,
+    LLVMBool emulated_tls, LLVMBool wasm_exceptions,
+    LLVMBool function_sections, LLVMBool data_sections) {
     llvm::TargetOptions options;
-    options.EmulatedTLS = emulated_tls;
+    options.EmulatedTLS = emulated_tls != 0;
+    options.FunctionSections = function_sections != 0;
+    options.DataSections = data_sections != 0;
+    bool is_apple = triple && (strstr(triple, "apple") != nullptr ||
+                               strstr(triple, "darwin") != nullptr);
+    bool is_wasm = triple && strncmp(triple, "wasm", 4) == 0;
+    options.EmitAddrsig =
+        (function_sections != 0 && !wasm_exceptions && !is_apple && !is_wasm);
     if (wasm_exceptions) options.ExceptionModel = llvm::ExceptionHandling::Wasm;
+    std::optional<llvm::Reloc::Model> rm;
+    switch (reloc_mode) {
+    case LLVMRelocStatic: rm = llvm::Reloc::Static; break;
+    case LLVMRelocPIC: rm = llvm::Reloc::PIC_; break;
+    case LLVMRelocDynamicNoPic: rm = llvm::Reloc::DynamicNoPIC; break;
+    default: break;
+    }
+    std::optional<llvm::CodeModel::Model> cm;
+    switch (code_model) {
+    case LLVMCodeModelTiny: cm = llvm::CodeModel::Tiny; break;
+    case LLVMCodeModelSmall: cm = llvm::CodeModel::Small; break;
+    case LLVMCodeModelKernel: cm = llvm::CodeModel::Kernel; break;
+    case LLVMCodeModelMedium: cm = llvm::CodeModel::Medium; break;
+    case LLVMCodeModelLarge: cm = llvm::CodeModel::Large; break;
+    default: break;
+    }
 #if LLVM_VERSION_MAJOR >= 18
     auto opt_level = static_cast<llvm::CodeGenOptLevel>(level);
 #else
@@ -260,11 +286,10 @@ extern "C" LLVMTargetMachineRef zan_create_target_machine_with_options(
     /* LLVM 21 takes the triple as llvm::Triple; the string overload is gone
      * in later releases. */
     auto *machine = reinterpret_cast<llvm::Target *>(target)->createTargetMachine(
-        llvm::Triple(triple), cpu, features, options, llvm::Reloc::PIC_, {},
-        opt_level);
+        llvm::Triple(triple), cpu, features, options, rm, cm, opt_level);
 #else
     auto *machine = reinterpret_cast<llvm::Target *>(target)->createTargetMachine(
-        triple, cpu, features, options, llvm::Reloc::PIC_, {}, opt_level);
+        triple, cpu, features, options, rm, cm, opt_level);
 #endif
     return reinterpret_cast<LLVMTargetMachineRef>(machine);
 }

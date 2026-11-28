@@ -1476,6 +1476,9 @@ LLVMValueRef refl_meta_for(zan_irgen_t *g, zan_type_t *t, const char *disp,
 LLVMValueRef refl_obj_type_fn(zan_irgen_t *g);
 void refl_reserve_thunk_sites(zan_irgen_t *g);
 bool refl_needs_site_meta(zan_irgen_t *g);
+bool refl_needs_site_meta_for_sym(zan_irgen_t *g, zan_symbol_t *sym);
+bool refl_needs_site_meta_for_list(zan_irgen_t *g);
+void refl_materialize_field_typeinfos(zan_irgen_t *g);
 bool refl_ctor_needs_thunk(zan_irgen_t *g);
 bool refl_owner_can_have_instance(zan_irgen_t *g, zan_symbol_t *owner);
 typedef struct refl_inst_index refl_inst_index_t;

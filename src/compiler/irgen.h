@@ -685,12 +685,29 @@ struct zan_irgen {
                           callable demand */
   bool refl_sfield_used; /* live emitted GetStaticField* / SetStaticField* */
   bool refl_field_rw_used; /* live emitted instance GetField* / SetField* */
+  zan_symbol_t **refl_site_roots; /* static class/interface receivers of
+                                     refl_emit_get_type */
+  int refl_site_root_count;
+  int refl_site_root_cap;
+  bool refl_site_all; /* conservative fallback when receiver is object/unknown */
+  struct zan_refl_field_ti_patch {
+    LLVMValueRef table_gv;
+    unsigned row;
+    zan_type_t *field_type;
+  } *refl_field_tis; /* deferred column-7 field TypeInfo patches */
+  int refl_field_ti_count;
+  int refl_field_ti_cap;
+  bool refl_field_tis_materialized;
   zan_istr_t *refl_invoke_names; /* emitted literal Invoke names; storage
                                     belongs to arena */
   int refl_invoke_name_count;
   int refl_invoke_name_cap;
   bool refl_invoke_unknown; /* computed Invoke name preserves all callable hooks
                              */
+  uint64_t refl_invoke_unknown_arities;  /* bit k = unknown-name instance Invoke
+                                            called with k args (or ~0ULL) */
+  uint64_t refl_sinvoke_unknown_arities; /* bit k = unknown-name static Invoke
+                                            called with k args (or ~0ULL) */
   /* Sorted identifier-shaped string literals of the whole compilation unit:
    * the names a computed Invoke can plausibly produce (closed world only). */
   zan_istr_t *refl_literal_names;

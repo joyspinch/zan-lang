@@ -265,6 +265,7 @@ void hash_tm(llvm::BLAKE3 &h, const llvm::TargetMachine *tm) {
     hash_u64(h, (uint64_t)tm->getCodeModel());
     hash_u64(h, (uint64_t)tm->Options.FunctionSections);
     hash_u64(h, (uint64_t)tm->Options.DataSections);
+    hash_u64(h, (uint64_t)tm->Options.EmitAddrsig);
     hash_u64(h, (uint64_t)tm->Options.EmulatedTLS);
     hash_u64(h, (uint64_t)tm->Options.ExceptionModel);
 }

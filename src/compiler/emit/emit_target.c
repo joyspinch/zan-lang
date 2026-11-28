@@ -548,8 +548,13 @@ done:;
     pending = 0;
     bool ctor_used_before = g->refl_ctor_used;
     const bool sfield_used_before = g->refl_sfield_used;
+    const bool field_rw_before = g->refl_field_rw_used;
     const bool site_meta_before = refl_needs_site_meta(g);
+    const int site_roots_before = g->refl_site_root_count;
+    const bool site_all_before = g->refl_site_all;
     const bool invoke_unknown_before = g->refl_invoke_unknown;
+    const uint64_t invoke_arities_before = g->refl_invoke_unknown_arities;
+    const uint64_t sinvoke_arities_before = g->refl_sinvoke_unknown_arities;
     const int invoke_names_before = g->refl_invoke_name_count;
     const unsigned query_used_before = g->refl_query_used;
     const int vslots_before = g->vslot_demand_count;
@@ -596,7 +601,8 @@ done:;
             }
           }
         }
-        if (!is_refl_root && refl_needs_site_meta(g) && g->site_syms) {
+        if (!is_refl_root && refl_needs_site_meta_for_sym(g, tsym) &&
+            g->site_syms) {
           for (int m = 0; m < g->leak_site_count; m++) {
             if (g->site_syms[m] == tsym) {
               is_refl_root = true;
@@ -685,8 +691,13 @@ done:;
      * body became live. Reach the fixed point before freezing dead stubs. */
     if (ctor_used_before != g->refl_ctor_used ||
         sfield_used_before != g->refl_sfield_used ||
+        field_rw_before != g->refl_field_rw_used ||
         site_meta_before != refl_needs_site_meta(g) ||
+        site_roots_before != g->refl_site_root_count ||
+        site_all_before != g->refl_site_all ||
         invoke_unknown_before != g->refl_invoke_unknown ||
+        invoke_arities_before != g->refl_invoke_unknown_arities ||
+        sinvoke_arities_before != g->refl_sinvoke_unknown_arities ||
         invoke_names_before != g->refl_invoke_name_count ||
         query_used_before != g->refl_query_used ||
         vslots_before != g->vslot_demand_count ||
@@ -1559,14 +1570,14 @@ zan_status_t zan_bind_target_layout(zan_irgen_t *g,
   else if (g->code_model_kind == 3) code_model = LLVMCodeModelMedium;
   else if (g->code_model_kind == 4) code_model = LLVMCodeModelLarge;
   /* Android's API 28 floor predates ELF TLS. Match the NDK's codegen.
-   * Wasm catchpads require the target's native exception model. */
+   * Wasm catchpads require the target's native exception model.
+   * Always emit per-function and per-data sections so linker --gc-sections and
+   * --icf actually dead-strip and fold functions/globals inside Zan objects
+   * (including pure-Zan runtime .obj modules). */
   bool emulated_tls = strstr(triple, "android") != NULL;
-  LLVMTargetMachineRef tm =
-      (emulated_tls || wasm)
-          ? zan_create_target_machine_with_options(
-                target, triple, tm_cpu, tm_features, cg, emulated_tls, wasm)
-          : LLVMCreateTargetMachine(target, triple, tm_cpu, tm_features, cg,
-                                    reloc_mode, code_model);
+  LLVMTargetMachineRef tm = zan_create_target_machine_with_options(
+      target, triple, tm_cpu, tm_features, cg, reloc_mode, code_model,
+      emulated_tls, wasm, 1, 1);
   if (!tm) {
     zan_diag_emit_code(g->diag, DIAG_ERROR, zan_loc(0, 0, 0, 0), 3091,
                        "failed to create target machine for '%s'", triple);

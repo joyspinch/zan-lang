@@ -1,6 +1,7 @@
 
 #include "crosscomp.h"
 #include "irgen.h"
+#include "irgen_compact.h"
 #include <llvm-c/Core.h>
 #include <llvm-c/Target.h>
 #include <llvm-c/TargetMachine.h>
@@ -172,14 +173,18 @@ void *zan_target_create_machine(const zan_target_t *target, int opt_level) {
 
     LLVMRelocMode reloc = target->pic ? LLVMRelocPIC : LLVMRelocDefault;
 
-    LLVMTargetMachineRef tm = LLVMCreateTargetMachine(
+    LLVMTargetMachineRef tm = zan_create_target_machine_with_options(
         llvm_target,
         target->triple,
         target->cpu,
         target->features,
         cgopt,
         reloc,
-        LLVMCodeModelDefault
+        LLVMCodeModelDefault,
+        0,
+        0,
+        1,
+        1
     );
 
     return (void *)tm;

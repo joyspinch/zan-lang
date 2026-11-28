@@ -252,6 +252,71 @@ static LLVMValueRef refl_emit_sorted_index(zan_irgen_t *g,
 }
 
 /* 发射the field-record array for a class/struct, or NULL when it has none */
+static void refl_defer_field_typeinfo(zan_irgen_t *g, LLVMValueRef table_gv,
+                                      unsigned row, zan_type_t *ft) {
+  if (!table_gv || !ft)
+    return;
+  if (g->refl_field_ti_count == g->refl_field_ti_cap) {
+    int ncap = g->refl_field_ti_cap ? g->refl_field_ti_cap * 2 : 64;
+    struct zan_refl_field_ti_patch *nt =
+        (struct zan_refl_field_ti_patch *)realloc(g->refl_field_tis,
+                                                  (size_t)ncap * sizeof(*nt));
+    if (!nt)
+      return;
+    g->refl_field_tis = nt;
+    g->refl_field_ti_cap = ncap;
+  }
+  g->refl_field_tis[g->refl_field_ti_count].table_gv = table_gv;
+  g->refl_field_tis[g->refl_field_ti_count].row = row;
+  g->refl_field_tis[g->refl_field_ti_count].field_type = ft;
+  g->refl_field_ti_count++;
+}
+
+void refl_materialize_field_typeinfos(zan_irgen_t *g) {
+  if (g->refl_field_tis_materialized || g->refl_field_ti_count == 0)
+    return;
+  if (!(g->refl_query_used & ZAN_REFL_QUERY_FIELD_TYPEINFO))
+    return;
+  g->refl_field_tis_materialized = true;
+  LLVMTypeRef frec = refl_field_type(g);
+  int i = 0;
+  while (i < g->refl_field_ti_count) {
+    LLVMValueRef gv = g->refl_field_tis[i].table_gv;
+    int end = i + 1;
+    while (end < g->refl_field_ti_count &&
+           g->refl_field_tis[end].table_gv == gv)
+      end++;
+    LLVMValueRef init = LLVMGetInitializer(gv);
+    LLVMTypeRef ty = LLVMGlobalGetValueType(gv);
+    if (init && LLVMGetTypeKind(ty) == LLVMArrayTypeKind) {
+      unsigned n = LLVMGetArrayLength(ty);
+      LLVMValueRef *rows = (LLVMValueRef *)calloc(n, sizeof(*rows));
+      if (rows) {
+        for (unsigned r = 0; r < n; r++)
+          rows[r] = LLVMGetAggregateElement(init, r);
+        for (int k = i; k < end; k++) {
+          unsigned r = g->refl_field_tis[k].row;
+          if (r >= n || !rows[r] || LLVMIsNull(rows[r]))
+            continue;
+          LLVMValueRef vals[9];
+          for (unsigned c = 0; c < 9; c++)
+            vals[c] = LLVMGetAggregateElement(rows[r], c);
+          vals[7] = refl_meta_for(g, g->refl_field_tis[k].field_type, NULL, 0);
+          rows[r] = LLVMConstNamedStruct(frec, vals, 9);
+        }
+        LLVMSetInitializer(gv, LLVMConstArray(frec, rows, n));
+        free(rows);
+      }
+    }
+    i = end;
+  }
+}
+
+static bool refl_defer_field_ti_wanted(zan_irgen_t *g) {
+  return g->publish_reflect_demand && !g->emit_lib &&
+         !(g->refl_query_used & ZAN_REFL_QUERY_FIELD_TYPEINFO);
+}
+
 static LLVMValueRef refl_emit_fields_class(zan_irgen_t *g, zan_symbol_t *sym,
                                            int *out_count,
                                            LLVMValueRef *out_sort) {
@@ -331,6 +396,10 @@ static LLVMValueRef refl_emit_fields_class(zan_irgen_t *g, zan_symbol_t *sym,
     LLVMValueRef vops = refl_get_vops_fn(g, m->type);
     if (!vops)
       vops = LLVMConstNull(LLVMTypeOf(refl_empty_string(g)));
+    bool defer_ti = refl_defer_field_ti_wanted(g);
+    LLVMValueRef fti =
+        defer_ti ? LLVMConstNull(LLVMTypeOf(refl_empty_string(g)))
+                 : refl_meta_for(g, m->type, NULL, 0);
     fnames[n] = m->name;
     recs[n++] = LLVMConstNamedStruct(
         frec,
@@ -339,8 +408,7 @@ static LLVMValueRef refl_emit_fields_class(zan_irgen_t *g, zan_symbol_t *sym,
             refl_field_type_name(g, m->type),
             LLVMConstInt(i64, (unsigned long long)refl_field_kind(m->type), 0),
             off, refl_declared_attrs(g, m->decl),
-            LLVMConstInt(i64, (unsigned long long)fflags, 0), vops,
-            refl_meta_for(g, m->type, NULL, 0),
+            LLVMConstInt(i64, (unsigned long long)fflags, 0), vops, fti,
             refl_const_string(g, fattrbuf, (int)strlen(fattrbuf))},
         9);
     slot++;
@@ -355,6 +423,18 @@ static LLVMValueRef refl_emit_fields_class(zan_irgen_t *g, zan_symbol_t *sym,
     LLVMSetInitializer(gv, LLVMConstArray(frec, recs, (unsigned)n));
     LLVMSetLinkage(gv, LLVMPrivateLinkage);
     LLVMSetGlobalConstant(gv, 1);
+    if (refl_defer_field_ti_wanted(g)) {
+      unsigned row = 0;
+      for (int i = 0; i < sym->member_count; i++) {
+        zan_symbol_t *m = sym->members[i];
+        if ((m->kind != SYM_FIELD && m->kind != SYM_PROPERTY) ||
+            field_member_is_static(m))
+          continue;
+        if (shadowed && shadowed[i])
+          continue;
+        refl_defer_field_typeinfo(g, gv, row++, m->type);
+      }
+    }
     arr =
         LLVMConstBitCast(gv, LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0));
     *out_count = n;
@@ -435,6 +515,9 @@ static LLVMValueRef refl_emit_static_fields_class(zan_irgen_t *g,
     LLVMValueRef vops = refl_get_vops_fn(g, m->type);
     LLVMValueRef off_val =
         vops ? LLVMConstPtrToInt(vops, i64) : LLVMConstInt(i64, 0, 0);
+    LLVMValueRef fti = refl_defer_field_ti_wanted(g)
+                           ? LLVMConstNull(i8ptr)
+                           : refl_meta_for(g, m->type, NULL, 0);
     recs[n++] = LLVMConstNamedStruct(
         frec,
         (LLVMValueRef[]){
@@ -442,8 +525,7 @@ static LLVMValueRef refl_emit_static_fields_class(zan_irgen_t *g,
             refl_field_type_name(g, m->type),
             LLVMConstInt(i64, (unsigned long long)refl_field_kind(m->type), 0),
             off_val, refl_declared_attrs(g, m->decl),
-            LLVMConstInt(i64, (unsigned long long)fflags, 0), gptr,
-            refl_meta_for(g, m->type, NULL, 0),
+            LLVMConstInt(i64, (unsigned long long)fflags, 0), gptr, fti,
             refl_const_string(g, fattrbuf, (int)strlen(fattrbuf))},
         9);
   }
@@ -457,6 +539,16 @@ static LLVMValueRef refl_emit_static_fields_class(zan_irgen_t *g,
     LLVMSetInitializer(gv, LLVMConstArray(frec, recs, (unsigned)n));
     LLVMSetLinkage(gv, LLVMPrivateLinkage);
     LLVMSetGlobalConstant(gv, 1);
+    if (refl_defer_field_ti_wanted(g)) {
+      unsigned row = 0;
+      for (int i = 0; i < sym->member_count; i++) {
+        zan_symbol_t *m = sym->members[i];
+        if ((m->kind != SYM_FIELD && m->kind != SYM_PROPERTY) ||
+            !field_member_is_static(m) || shadowed[i])
+          continue;
+        refl_defer_field_typeinfo(g, gv, row++, m->type);
+      }
+    }
     arr = LLVMConstBitCast(gv, i8ptr);
     *out_count = n;
   }
@@ -642,6 +734,18 @@ static bool refl_is_framework_hook_name(const char *s, size_t n) {
   /* 符合 OnPascalCase 的方法（如 OnCustomHook）属于可调用钩子候选。 */
   if (s[0] == 'O' && s[1] == 'n' && (s[2] >= 'A' && s[2] <= 'Z'))
     return true;
+  return false;
+}
+
+static bool refl_is_exact_html_handler_name(zan_irgen_t *g, const char *s,
+                                            size_t n) {
+  if (!g || !s || n == 0)
+    return false;
+  for (int i = 0; i < g->html_handler_count; i++) {
+    const char *h = g->html_handlers[i];
+    if (h && strlen(h) == n && memcmp(h, s, n) == 0)
+      return true;
+  }
   return false;
 }
 
@@ -924,6 +1028,41 @@ static bool refl_is_lib_export_owner(zan_irgen_t *g, zan_symbol_t *owner) {
          !is_user_generic_sym(owner);
 }
 
+static bool refl_method_matches_unknown_arity(zan_irgen_t *g,
+                                              zan_ast_node_t *decl) {
+  if (!g->refl_invoke_unknown)
+    return false;
+  bool is_static = (decl->method_decl.modifiers & MOD_STATIC) != 0;
+  uint64_t mask = is_static ? g->refl_sinvoke_unknown_arities
+                            : g->refl_invoke_unknown_arities;
+  if (mask == 0)
+    return false;
+  if (mask == ~0ULL)
+    return true;
+  int max_p = decl->method_decl.params.count;
+  int min_p = 0;
+  for (int i = 0; i < max_p; i++) {
+    zan_ast_node_t *p = decl->method_decl.params.items[i];
+    if (p && p->kind == AST_PARAM) {
+      if (p->param.is_params)
+        return true;
+      if (!p->param.default_val)
+        min_p = i + 1;
+    } else {
+      min_p = i + 1;
+    }
+  }
+  if (min_p >= 63)
+    return false;
+  if (max_p > 62)
+    max_p = 62;
+  for (int k = min_p; k <= max_p; k++) {
+    if (mask & (1ULL << k))
+      return true;
+  }
+  return false;
+}
+
 bool refl_method_needs_thunk(zan_irgen_t *g, zan_symbol_t *owner,
                              zan_ast_node_t *decl) {
   if (!decl || decl->kind != AST_METHOD_DECL) {
@@ -937,12 +1076,23 @@ bool refl_method_needs_thunk(zan_irgen_t *g, zan_symbol_t *owner,
     return false;
   /* Inherited accessors are collected from their declaring base, while this
    * owner is the reflected receiver; its flattened properties retain names. */
-  if (refl_accessor_flag(owner, decl->method_decl.name) != 0) {
+  if (g->refl_field_rw_used &&
+      refl_accessor_flag(owner, decl->method_decl.name) != 0) {
     return true;
   }
   zan_ast_list_t *attrs = zan_ast_attributes(decl);
   if (attrs && attrs->count > 0) {
     return true;
+  }
+  if (refl_is_exact_html_handler_name(g, decl->method_decl.name.str,
+                                      decl->method_decl.name.len)) {
+    return true;
+  }
+  if (refl_invoke_literal_demanded(g, decl->method_decl.name)) {
+    return true;
+  }
+  if (!refl_method_matches_unknown_arity(g, decl)) {
+    return false;
   }
   /* Any other method (framework hooks included) is callable exactly when an
    * emitted Invoke may select it: its literal name was invoked, or some
@@ -960,7 +1110,8 @@ static bool refl_method_should_export(zan_irgen_t *g, zan_symbol_t *sym,
     return false;
   if (!g->closed_world)
     return true;
-  if (refl_is_framework_hook_name(m->name.str, m->name.len))
+  if (refl_is_framework_hook_name(m->name.str, m->name.len) ||
+      refl_is_exact_html_handler_name(g, m->name.str, m->name.len))
     return true;
   /* closed_world（发布与普通构建）下：
    * 1. 属性访问器（get_/set_）必须保留，支持运行期动态数据绑定

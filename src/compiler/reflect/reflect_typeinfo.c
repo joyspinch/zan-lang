@@ -1,3 +1,66 @@
+static void refl_note_site_receiver(zan_irgen_t *g, zan_type_t *st) {
+  if (!st || st->kind == TYPE_OBJECT || !st->sym ||
+      (st->kind != TYPE_CLASS && st->kind != TYPE_INTERFACE)) {
+    g->refl_site_all = true;
+    return;
+  }
+  zan_symbol_t *sym = st->sym;
+  for (int i = 0; i < g->refl_site_root_count; i++) {
+    if (g->refl_site_roots[i] == sym)
+      return;
+  }
+  if (g->refl_site_root_count == g->refl_site_root_cap) {
+    int ncap = g->refl_site_root_cap ? g->refl_site_root_cap * 2 : 16;
+    zan_symbol_t **nr = (zan_symbol_t **)realloc(
+        g->refl_site_roots, (size_t)ncap * sizeof(*nr));
+    if (!nr) {
+      g->refl_site_all = true;
+      return;
+    }
+    g->refl_site_roots = nr;
+    g->refl_site_root_cap = ncap;
+  }
+  g->refl_site_roots[g->refl_site_root_count++] = sym;
+}
+
+static bool refl_iface_matches(zan_symbol_t *iface_sym, zan_symbol_t *root,
+                               int depth) {
+  if (!iface_sym || depth > 32)
+    return false;
+  if (iface_sym == root)
+    return true;
+  if (!iface_sym->type)
+    return false;
+  if (iface_sym->type->base_type && iface_sym->type->base_type->sym &&
+      refl_iface_matches(iface_sym->type->base_type->sym, root, depth + 1))
+    return true;
+  for (int i = 0; i < iface_sym->type->interface_count; i++) {
+    zan_type_t *it = iface_sym->type->interfaces[i];
+    if (it && it->sym && refl_iface_matches(it->sym, root, depth + 1))
+      return true;
+  }
+  return false;
+}
+
+static bool refl_sym_matches_root(zan_symbol_t *sym, zan_symbol_t *root) {
+  int depth = 0;
+  for (zan_symbol_t *cur = sym; cur && depth < 64; depth++) {
+    if (cur == root)
+      return true;
+    if (cur->type) {
+      for (int i = 0; i < cur->type->interface_count; i++) {
+        zan_type_t *it = cur->type->interfaces[i];
+        if (it && it->sym && refl_iface_matches(it->sym, root, 0))
+          return true;
+      }
+      cur = cur->type->base_type ? cur->type->base_type->sym : NULL;
+    } else {
+      break;
+    }
+  }
+  return false;
+}
+
 static LLVMValueRef refl_emit_get_type(zan_irgen_t *g, zan_type_t *st,
                                        LLVMValueRef obj) {
   LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -7,6 +70,7 @@ static LLVMValueRef refl_emit_get_type(zan_irgen_t *g, zan_type_t *st,
     return fallback;
   if (!obj || LLVMGetTypeKind(LLVMTypeOf(obj)) != LLVMPointerTypeKind)
     return fallback;
+  refl_note_site_receiver(g, st);
   obj = LLVMBuildBitCast(g->builder, obj, i8ptr, "refl.obj");
   LLVMValueRef fn = refl_obj_type_fn(g);
   return zan_call2(g->builder,
@@ -267,6 +331,8 @@ void refl_note_invoke_literal(zan_irgen_t *g, zan_ast_node_t *name) {
     zan_istr_t *names = zan_arena_alloc(g->arena, (size_t)cap * sizeof(*names));
     if (!names) {
       g->refl_invoke_unknown = true;
+      g->refl_invoke_unknown_arities = ~0ULL;
+      g->refl_sinvoke_unknown_arities = ~0ULL;
       return;
     }
     if (g->refl_invoke_name_count)
@@ -278,6 +344,8 @@ void refl_note_invoke_literal(zan_irgen_t *g, zan_ast_node_t *name) {
   text.str = zan_arena_strdup(g->arena, text.str, text.len);
   if (!text.str) {
     g->refl_invoke_unknown = true;
+    g->refl_invoke_unknown_arities = ~0ULL;
+    g->refl_sinvoke_unknown_arities = ~0ULL;
     return;
   }
   g->refl_invoke_names[g->refl_invoke_name_count++] = text;
@@ -303,10 +371,22 @@ void refl_note_propspec_accessors(zan_irgen_t *g, zan_symbol_t *method_sym,
   }
 }
 
-static void refl_note_invoke_name(zan_irgen_t *g, zan_ast_node_t *name) {
+static void refl_note_invoke_unknown_arity(zan_irgen_t *g, int arity,
+                                           bool is_static) {
+  g->refl_invoke_unknown = true;
+  uint64_t *mask = is_static ? &g->refl_sinvoke_unknown_arities
+                             : &g->refl_invoke_unknown_arities;
+  if (arity < 0 || arity >= 63)
+    *mask = ~0ULL;
+  else
+    *mask |= (1ULL << arity);
+}
+
+static void refl_note_invoke_name(zan_irgen_t *g, zan_ast_node_t *name,
+                                  int arity, bool is_static) {
   if (name && (name->kind != AST_STRING_LITERAL ||
                memchr(name->str_val.str, '\0', name->str_val.len))) {
-    g->refl_invoke_unknown = true;
+    refl_note_invoke_unknown_arity(g, arity, is_static);
     return;
   }
   refl_note_invoke_literal(g, name);
@@ -740,7 +820,7 @@ bool refl_emit_typeinfo_member(zan_irgen_t *g, LLVMValueRef ti, zan_istr_t name,
   case ZAN_REFL_M_SIOBJECT:
   case ZAN_REFL_M_SITASK: {
     LLVMValueRef nm = refl_arg_str(g, arg0, locals);
-    refl_note_invoke_name(g, arg0);
+    refl_note_invoke_name(g, arg0, argc > 1 ? (argc - 1) : 0, true);
     LLVMValueRef idx = refl_mfind(g, ti, nm, ZAN_REFL_MF_STATIC);
     if (arg0)
       emit_release_owned_call_temp(g, arg0, nm, locals);
@@ -970,9 +1050,10 @@ static bool refl_emit_instance_call_1(zan_irgen_t *g, zan_type_t *rt,
                     code == ZAN_REFL_M_ISTRING || code == ZAN_REFL_M_IOBJECT ||
                     code == ZAN_REFL_M_ITASK);
   if (is_invoke) {
+    int invoke_arity = argc > 1 ? (argc - 1) : 0;
     LLVMValueRef idx = NULL;
     if (is_invoke_at) {
-      g->refl_invoke_unknown = true;
+      refl_note_invoke_unknown_arity(g, invoke_arity, false);
       idx = refl_arg_index(g, arg0, locals);
     } else {
       LLVMValueRef nm =
@@ -980,7 +1061,7 @@ static bool refl_emit_instance_call_1(zan_irgen_t *g, zan_type_t *rt,
       if (arg0)
         *nm_tmp = nm;
       nm = LLVMBuildBitCast(g->builder, nm, i8ptr, "refl.nm");
-      refl_note_invoke_name(g, arg0);
+      refl_note_invoke_name(g, arg0, invoke_arity, false);
       idx = refl_mfind(g, ti, nm, 0);
     }
     refl_arg_temps_t temps;
@@ -1107,6 +1188,32 @@ bool refl_needs_site_meta(zan_irgen_t *g) {
           g->fn_refl_obj_type != NULL);
 }
 
+bool refl_needs_site_meta_for_sym(zan_irgen_t *g, zan_symbol_t *sym) {
+  if (!refl_needs_site_meta(g))
+    return false;
+  if (!g->publish_reflect_demand || g->emit_lib || g->refl_site_all)
+    return true;
+  if (!sym)
+    return false;
+  for (int i = 0; i < g->refl_site_root_count; i++) {
+    if (refl_sym_matches_root(sym, g->refl_site_roots[i]))
+      return true;
+  }
+  return false;
+}
+
+bool refl_needs_site_meta_for_list(zan_irgen_t *g) {
+  if (!refl_needs_site_meta(g))
+    return false;
+  if (!g->publish_reflect_demand || g->emit_lib || g->refl_site_all)
+    return true;
+  for (int i = 0; i < g->refl_site_root_count; i++) {
+    if (g->refl_site_roots[i] && g->refl_site_roots[i]->kind == SYM_INTERFACE)
+      return true;
+  }
+  return false;
+}
+
 void emit_site_meta_table(zan_irgen_t *g) {
   if (!refl_needs_site_meta(g) || !g->g_site_meta || !g->site_syms)
     return;
@@ -1120,7 +1227,7 @@ void emit_site_meta_table(zan_irgen_t *g) {
   for (int i = 0; i < n; i++) {
     elems[i] = LLVMConstNull(i8ptr);
     if (g->site_coll && g->site_coll[i]) {
-      if (g->site_coll[i] == 1) {
+      if (g->site_coll[i] == 1 && refl_needs_site_meta_for_list(g)) {
         zan_type_t *elem_type = g->site_coll_elem ? g->site_coll_elem[i] : NULL;
         zan_type_t *lt = zan_binder_make_list_type(g->binder, elem_type);
         elems[i] = refl_meta_for(g, lt, NULL, 0);
@@ -1128,7 +1235,7 @@ void emit_site_meta_table(zan_irgen_t *g) {
       continue;
     }
     zan_symbol_t *sym = g->site_syms[i];
-    if (!sym || !sym->type)
+    if (!sym || !sym->type || !refl_needs_site_meta_for_sym(g, sym))
       continue;
     zan_type_t *t =
         (g->site_inst && g->site_inst[i]) ? g->site_inst[i] : sym->type;
@@ -1221,7 +1328,7 @@ void zan_irgen_emit_arc_desc_init(zan_irgen_t *g, bool need_field_graph) {
                               LLVMConstNull(i8ptr)};
       tynames = intern_desc_tynames_ptr(g, nptr, 1, i, i8ptr, i64, &tn_cache,
                                         &tn_cnt, &tn_cap);
-      if (refl_needs_site_meta(g) && g->site_coll[i] == 1) {
+      if (refl_needs_site_meta_for_list(g) && g->site_coll[i] == 1) {
         zan_type_t *elem_type = g->site_coll_elem ? g->site_coll_elem[i] : NULL;
         zan_type_t *lt = zan_binder_make_list_type(g->binder, elem_type);
         meta = refl_meta_for(g, lt, NULL, 0);
@@ -1270,7 +1377,7 @@ void zan_irgen_emit_arc_desc_init(zan_irgen_t *g, bool need_field_graph) {
                                           &tn_cnt, &tn_cap);
         free(nptr);
       }
-      if (refl_needs_site_meta(g) && sym->type) {
+      if (refl_needs_site_meta_for_sym(g, sym) && sym->type) {
         zan_type_t *t =
             (g->site_inst && g->site_inst[i]) ? g->site_inst[i] : sym->type;
         meta = refl_meta_for(g, t, NULL, 0);

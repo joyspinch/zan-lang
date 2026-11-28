@@ -512,22 +512,27 @@ void refl_reserve_thunk_sites(zan_irgen_t *g) {
     int sites, metas, mtabs;
     int ctor_cursor = 0;
     bool site_meta_before;
+    int site_roots_before;
+    bool site_all_before;
     do {
+      refl_materialize_field_typeinfos(g);
       site_meta_before = refl_needs_site_meta(g);
+      site_roots_before = g->refl_site_root_count;
+      site_all_before = g->refl_site_all;
       sites = g->leak_site_count;
       metas = g->refl_meta_count;
       mtabs = g->refl_mtab_count;
       if (refl_needs_site_meta(g)) {
         for (int i = 1; i < g->leak_site_count; i++) {
           if (g->site_coll && g->site_coll[i]) {
-            if (g->site_coll[i] == 1) {
+            if (g->site_coll[i] == 1 && refl_needs_site_meta_for_list(g)) {
               zan_type_t *elem = g->site_coll_elem[i];
               refl_meta_for(g, zan_binder_make_list_type(g->binder, elem), NULL,
                             0);
             }
           } else {
             zan_symbol_t *sym = g->site_syms ? g->site_syms[i] : NULL;
-            if (sym && sym->type) {
+            if (sym && sym->type && refl_needs_site_meta_for_sym(g, sym)) {
               zan_type_t *t =
                   g->site_inst && g->site_inst[i] ? g->site_inst[i] : sym->type;
               refl_meta_for(g, t, NULL, 0);
@@ -623,6 +628,8 @@ void refl_reserve_thunk_sites(zan_irgen_t *g) {
           LLVMSetInitializer(g->refl_mtabs[i].gv, init);
       }
     } while (site_meta_before != refl_needs_site_meta(g) ||
+             site_roots_before != g->refl_site_root_count ||
+             site_all_before != g->refl_site_all ||
              sites != g->leak_site_count || metas != g->refl_meta_count ||
              mtabs != g->refl_mtab_count);
   }

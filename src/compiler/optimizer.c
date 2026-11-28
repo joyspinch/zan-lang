@@ -1698,10 +1698,9 @@ zan_inline_stats_t zan_opt_inline(zan_irgen_t *g, zan_opt_level_t level) {
   return stats;
 }
 
-#if ZAN_LLVM_MAJOR >= 23
-/* LLVM 23 删掉了 default<Os>/<Oz> 管线：体积优化改为 O2 管线 + 函数级
- * optsize（Oz 再加 minsize）。按模块打标，分片发布（shard_emit.c）的每个
- * 分片模块也经 zan_opt_run_passes_on_module 走到这里。 */
+/* 为模块内所有定义函数打上 optsize（-Oz 再加 minsize）属性：
+ * 与 clang -Os/-Oz 一致，既让 LLVM 23+ 的 O2 管线按体积优化，也让 LLVM <23
+ * 的后端指令选择/对齐/尾复制/内联成本模型真正按体积模式生成代码。 */
 static void zan_opt_mark_size(LLVMModuleRef mod, bool min_size) {
   LLVMContextRef ctx = LLVMGetModuleContext(mod);
   LLVMAttributeRef opt = LLVMCreateEnumAttribute(
@@ -1719,7 +1718,6 @@ static void zan_opt_mark_size(LLVMModuleRef mod, bool min_size) {
       LLVMAddAttributeAtIndex(fn, (LLVMAttributeIndex)(-1), mins);
   }
 }
-#endif
 
 /* Very large functions are dispatch code (an AST-walking switch over many
  * cases, a giant Main): inlining into them multiplies IR that LLVM's
@@ -2280,7 +2278,8 @@ static bool shrink_is_arc_release_fn(const char *name) {
          strcmp(name, "zan_rt_arr_release") == 0 ||
          strcmp(name, "zan_rt_arr_retain") == 0 ||
          strcmp(name, "__zan_arc_defer_drain") == 0 ||
-         strncmp(name, "__zan_release_", 14) == 0;
+         strncmp(name, "__zan_release_", 14) == 0 ||
+         strncmp(name, "__zan_retain_", 13) == 0;
 }
 
 static int zan_shrink_collapse_invokes_impl(LLVMModuleRef mod, bool verbose) {
@@ -4153,16 +4152,24 @@ static int late_arc_run_passes(LLVMModuleRef mod) {
  * 注意：default<O*> 中的 DeadArgumentElimination/GlobalDCE 可能重建或删除
  * 函数对象，故仅记录布尔标记，管线结束后必须按名称重新查找，禁止缓存 LLVMValueRef。 */
 static const char *const k_rt_defer_inline[] = {
-    "zan_rt_alloc",      "zan_rt_str_alloc",   "__zan_itoa_str",
-    "zan_rt_retain",     "zan_rt_release",     "zan_rt_release_dyn",
-    "zan_rt_str_retain", "zan_rt_str_release", "__zan_str_len",
-    "__zan_str_len_arr", "__zan_eh_state_fast", "__zan_eh_tmp_push",
-    "__zan_eh_tmp_pop",
+    "zan_rt_alloc",      "zan_rt_str_alloc",        "__zan_itoa_str",
+    "zan_rt_retain",     "zan_rt_release",          "zan_rt_release_dyn",
+    "zan_rt_str_retain", "zan_rt_str_release",      "__zan_str_len",
+    "__zan_str_len_arr", "__zan_eh_state_fast",     "__zan_eh_tmp_push",
+    "__zan_eh_tmp_pop",  "__zan_retain_obj",        "__zan_release_obj",
+    "__zan_retain_clo",  "__zan_release_clo",       "__zan_str_eq",
+    "__zan_eh_tmp_unwind", "__zan_dict_find_str",   "__zan_itoa64",
+    "zan_rt_weak_load_retain", "__zan_arc_free_obj",
 };
 enum {
-  k_rt_defer_n = 13,
+  k_rt_defer_n = 23,
+  k_rt_arc_first_idx = 3,
+  k_rt_arc_last_idx = 7,
   k_rt_eh_fast_idx = 10,
-  k_rt_restore_always_from = 10
+  k_rt_eh_last_idx = 12,
+  k_rt_obj_first_idx = 13,
+  k_rt_restore_always_from = 10,
+  k_rt_restore_always_to = 12
 };
 
 typedef struct {
@@ -4237,8 +4244,20 @@ static void rt_defer_restore_guard(LLVMModuleRef mod, rt_defer_state_t *st) {
   st->guard_raise_ext = false;
 }
 
+static bool rt_defer_keep_outlined_for_size(int idx, zan_opt_level_t level) {
+  if (level == ZAN_OPT_SIZE_MIN)
+    return true;
+  if (level == ZAN_OPT_SIZE) {
+    return (idx >= k_rt_arc_first_idx && idx <= k_rt_arc_last_idx) ||
+           (idx >= k_rt_eh_fast_idx && idx <= k_rt_eh_last_idx) ||
+           idx >= k_rt_obj_first_idx;
+  }
+  return false;
+}
+
 static bool rt_defer_restore_attrs(LLVMModuleRef mod, rt_defer_state_t *st,
-                                   bool add_default_always) {
+                                   bool add_default_always,
+                                   zan_opt_level_t level) {
   bool unmarked = false;
   LLVMContextRef ctx = LLVMGetModuleContext(mod);
   for (int i = 0; i < k_rt_defer_n; i++) {
@@ -4246,17 +4265,28 @@ static bool rt_defer_restore_attrs(LLVMModuleRef mod, rt_defer_state_t *st,
       continue;
     LLVMValueRef fn = LLVMGetNamedFunction(mod, k_rt_defer_inline[i]);
     if (fn && !LLVMIsDeclaration(fn)) {
-      LLVMRemoveEnumAttributeAtIndex(
-          fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex,
-          st->noinline_kind);
       if (i == k_rt_eh_fast_idx && st->eh_fast_mem_added &&
           st->memory_kind != 0)
         LLVMRemoveEnumAttributeAtIndex(
             fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex,
             st->memory_kind);
+      if (add_default_always && rt_defer_keep_outlined_for_size(i, level)) {
+        /* -Os/-Oz 下保持运行时 ARC/EH/字符串辅助函数外置（不恢复 alwaysinline、
+         * 摘除 inlinehint 并保留 noinline），避免数千处调用点按体量倍增 .text。 */
+        unsigned ih = LLVMGetEnumAttributeKindForName("inlinehint", 10);
+        if (ih)
+          LLVMRemoveEnumAttributeAtIndex(
+              fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex, ih);
+        st->marked[i] = false;
+        continue;
+      }
+      LLVMRemoveEnumAttributeAtIndex(
+          fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex,
+          st->noinline_kind);
       if (st->alwaysinl_kind != 0 &&
           (st->had_always[i] ||
-           (add_default_always && i >= k_rt_restore_always_from))) {
+           (add_default_always && i >= k_rt_restore_always_from &&
+            i <= k_rt_restore_always_to))) {
         LLVMAddAttributeAtIndex(
             fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex,
             LLVMCreateEnumAttribute(ctx, st->alwaysinl_kind, 0));
@@ -4267,6 +4297,552 @@ static bool rt_defer_restore_attrs(LLVMModuleRef mod, rt_defer_state_t *st,
   }
   st->eh_fast_mem_added = false;
   return unmarked;
+}
+
+/* 将重复的 8 参冷路径 @__zan_guard_raise 调用折叠为 0 参（--publish 全常量）或
+ * 3 参（仅传递 file/line/col）冷跳板，把每处 55-65B 的参数装载/栈溢出缩至 5-18B；
+ * 若紧随 @zan_rt_soft_scratch()（同块或单前驱 soft.null 块），一并融进返回 ptr 的
+ * 冷跳板，消去成千上万个空引用软恢复块与二次调用。
+ * 必须在 guard_version / list_width_hoist 之后执行，保持热循环守卫优化不变。 */
+typedef struct {
+  LLVMValueRef inst;
+  LLVMValueRef a[8];
+  bool full_const;
+  bool pack_loc;
+  uint32_t packed_loc;
+  bool has_soft;
+  bool replaced;
+  LLVMValueRef soft_call;
+  LLVMBasicBlockRef soft_bb;
+  LLVMBasicBlockRef soft_done;
+} guard_site_t;
+
+typedef struct {
+  LLVMValueRef key[8];
+  bool has_soft;
+  unsigned count;
+  LLVMValueRef stub;
+  LLVMTypeRef stub_fty;
+} guard_group_t;
+
+static void guard_stub_add_attrs(LLVMContextRef ctx, LLVMValueRef fn,
+                                 LLVMValueRef gr, zan_opt_level_t level,
+                                 bool has_soft) {
+  static const char *const base_attrs[] = {"cold", "noinline"};
+  for (int i = 0; i < 2; i++) {
+    unsigned k =
+        LLVMGetEnumAttributeKindForName(base_attrs[i], strlen(base_attrs[i]));
+    if (k)
+      LLVMAddAttributeAtIndex(fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex,
+                              LLVMCreateEnumAttribute(ctx, k, 0));
+  }
+  if (level == ZAN_OPT_SIZE || level == ZAN_OPT_SIZE_MIN) {
+    unsigned k = LLVMGetEnumAttributeKindForName("minsize", 7);
+    if (k)
+      LLVMAddAttributeAtIndex(fn, (LLVMAttributeIndex)LLVMAttributeFunctionIndex,
+                              LLVMCreateEnumAttribute(ctx, k, 0));
+  }
+  if (!has_soft) {
+    unsigned nr = LLVMGetEnumAttributeKindForName("noreturn", 8);
+    if (nr && LLVMGetEnumAttributeAtIndex(
+                  gr, (LLVMAttributeIndex)LLVMAttributeFunctionIndex, nr)) {
+      LLVMAddAttributeAtIndex(fn,
+                              (LLVMAttributeIndex)LLVMAttributeFunctionIndex,
+                              LLVMCreateEnumAttribute(ctx, nr, 0));
+    }
+  }
+}
+
+static void guard_detect_soft_chain(LLVMValueRef inst, LLVMValueRef soft_fn,
+                                    guard_site_t *s) {
+  if (!soft_fn)
+    return;
+  if (LLVMIsACallInst(inst)) {
+    LLVMValueRef nxt = LLVMGetNextInstruction(inst);
+    if (nxt && LLVMIsACallInst(nxt) && LLVMGetCalledValue(nxt) == soft_fn &&
+        LLVMGetNumArgOperands(nxt) == 0) {
+      s->has_soft = true;
+      s->soft_call = nxt;
+    }
+    return;
+  }
+  if (!LLVMIsAInvokeInst(inst))
+    return;
+  LLVMBasicBlockRef bb = LLVMGetInstructionParent(inst);
+  LLVMBasicBlockRef norm = LLVMGetNormalDest(inst);
+  LLVMBasicBlockRef unwind = LLVMGetUnwindDest(inst);
+  if (!norm || norm == bb || norm == unwind)
+    return;
+  if (norm == LLVMGetEntryBasicBlock(LLVMGetBasicBlockParent(bb)))
+    return;
+  LLVMValueRef first = LLVMGetFirstInstruction(norm);
+  bool had_phi = false;
+  while (first && LLVMIsAPHINode(first)) {
+    had_phi = true;
+    first = LLVMGetNextInstruction(first);
+  }
+  if (!first || !LLVMIsACallInst(first) ||
+      LLVMGetCalledValue(first) != soft_fn || LLVMGetNumArgOperands(first) != 0)
+    return;
+  /* Case A: norm is an empty soft-scratch trampoline (`soft_scratch; br done`).
+   * Fuse the invoke directly to `done` and delete `norm`. */
+  LLVMValueRef second = LLVMGetNextInstruction(first);
+  if (!had_phi && second && LLVMIsABranchInst(second) &&
+      !LLVMIsConditional(second) && LLVMGetNextInstruction(second) == NULL) {
+    LLVMBasicBlockRef done = LLVMGetSuccessor(second, 0);
+    if (done && done != norm && done != bb && done != unwind) {
+      unsigned term_uses = 0;
+      bool only_done_phis = true;
+      for (LLVMUseRef u = LLVMGetFirstUse(LLVMBasicBlockAsValue(norm)); u;
+           u = LLVMGetNextUse(u)) {
+        LLVMValueRef user = LLVMGetUser(u);
+        if (user == inst) {
+          term_uses++;
+        } else if (LLVMIsAPHINode(user) &&
+                   LLVMGetInstructionParent(user) == done) {
+          continue;
+        } else {
+          only_done_phis = false;
+          break;
+        }
+      }
+      if (only_done_phis && term_uses == 1) {
+        bool dup_edge = false;
+        for (LLVMValueRef pi = LLVMGetFirstInstruction(done);
+             pi && LLVMIsAPHINode(pi); pi = LLVMGetNextInstruction(pi)) {
+          unsigned nc = LLVMCountIncoming(pi);
+          for (unsigned k = 0; k < nc; k++) {
+            if (LLVMGetIncomingBlock(pi, k) == bb) {
+              dup_edge = true;
+              break;
+            }
+          }
+          if (dup_edge)
+            break;
+        }
+        if (!dup_edge) {
+          s->has_soft = true;
+          s->soft_call = first;
+          s->soft_bb = norm;
+          s->soft_done = done;
+          return;
+        }
+      }
+    }
+  }
+  /* Case B: norm has additional instructions (e.g. merged soft.done block),
+   * but inst is still its sole predecessor. Keep norm and fuse soft_scratch
+   * into the invoke result, which strictly dominates norm. */
+  unsigned term_uses = 0;
+  for (LLVMUseRef u = LLVMGetFirstUse(LLVMBasicBlockAsValue(norm)); u;
+       u = LLVMGetNextUse(u)) {
+    LLVMValueRef user = LLVMGetUser(u);
+    if (user == inst) {
+      term_uses++;
+    } else if (LLVMIsAPHINode(user)) {
+      continue;
+    } else {
+      return;
+    }
+  }
+  if (term_uses != 1)
+    return;
+  s->has_soft = true;
+  s->soft_call = first;
+  s->soft_bb = norm;
+  s->soft_done = NULL;
+}
+
+static void guard_replace_site(LLVMBuilderRef b, const guard_site_t *s,
+                               LLVMTypeRef stub_fty, LLVMValueRef stub,
+                               LLVMValueRef *args, unsigned nargs) {
+  LLVMValueRef inst = s->inst;
+  LLVMMetadataRef dloc = LLVMInstructionGetDebugLoc(inst);
+  LLVMPositionBuilderBefore(b, inst);
+  LLVMValueRef repl = NULL;
+  if (s->has_soft) {
+    if (s->soft_bb) {
+      LLVMBasicBlockRef bb = LLVMGetInstructionParent(inst);
+      LLVMBasicBlockRef unwind = LLVMGetUnwindDest(inst);
+      if (s->soft_done) {
+        repl = LLVMBuildInvoke2(b, stub_fty, stub, args, nargs, s->soft_done,
+                                unwind, "soft.s");
+        if (repl && dloc)
+          LLVMInstructionSetDebugLoc(repl, dloc);
+        LLVMReplaceAllUsesWith(s->soft_call, repl);
+        LLVMInstructionEraseFromParent(inst);
+        LLVMReplaceAllUsesWith(LLVMBasicBlockAsValue(s->soft_bb),
+                               LLVMBasicBlockAsValue(bb));
+        LLVMDeleteBasicBlock(s->soft_bb);
+      } else {
+        repl = LLVMBuildInvoke2(b, stub_fty, stub, args, nargs, s->soft_bb,
+                                unwind, "soft.s");
+        if (repl && dloc)
+          LLVMInstructionSetDebugLoc(repl, dloc);
+        LLVMReplaceAllUsesWith(s->soft_call, repl);
+        LLVMInstructionEraseFromParent(s->soft_call);
+        LLVMInstructionEraseFromParent(inst);
+      }
+    } else {
+      repl = LLVMBuildCall2(b, stub_fty, stub, args, nargs, "soft.s");
+      if (repl && dloc)
+        LLVMInstructionSetDebugLoc(repl, dloc);
+      LLVMReplaceAllUsesWith(s->soft_call, repl);
+      LLVMInstructionEraseFromParent(s->soft_call);
+      LLVMInstructionEraseFromParent(inst);
+    }
+    return;
+  }
+  if (LLVMIsAInvokeInst(inst)) {
+    LLVMBasicBlockRef norm = LLVMGetNormalDest(inst);
+    LLVMBasicBlockRef unwind = LLVMGetUnwindDest(inst);
+    repl = LLVMBuildInvoke2(b, stub_fty, stub, args, nargs, norm, unwind, "");
+  } else {
+    repl = LLVMBuildCall2(b, stub_fty, stub, args, nargs, "");
+  }
+  if (repl && dloc)
+    LLVMInstructionSetDebugLoc(repl, dloc);
+  LLVMInstructionEraseFromParent(inst);
+}
+
+static bool zan_opt_outline_guard_raises(LLVMModuleRef mod,
+                                         zan_opt_level_t level) {
+  if (level == ZAN_OPT_NONE || level == ZAN_OPT_BASIC)
+    return false;
+  LLVMValueRef gr = LLVMGetNamedFunction(mod, "__zan_guard_raise");
+  if (!gr || LLVMCountParams(gr) != 8)
+    return false;
+  LLVMTypeRef gr_fty = LLVMGlobalGetValueType(gr);
+  if (LLVMGetTypeKind(LLVMGetReturnType(gr_fty)) != LLVMVoidTypeKind)
+    return false;
+  LLVMValueRef soft_fn = LLVMGetNamedFunction(mod, "zan_rt_soft_scratch");
+  LLVMTypeRef soft_fty = NULL;
+  if (soft_fn) {
+    soft_fty = LLVMGlobalGetValueType(soft_fn);
+    if (LLVMCountParamTypes(soft_fty) != 0 ||
+        LLVMGetTypeKind(LLVMGetReturnType(soft_fty)) != LLVMPointerTypeKind) {
+      soft_fn = NULL;
+      soft_fty = NULL;
+    }
+  }
+
+  LLVMTypeRef param_tys[8];
+  LLVMGetParamTypes(gr_fty, param_tys);
+  bool arg0_unused =
+      !LLVMIsDeclaration(gr) && LLVMGetFirstUse(LLVMGetParam(gr, 0)) == NULL;
+  LLVMValueRef arg0_null = arg0_unused ? LLVMConstNull(param_tys[0]) : NULL;
+
+  size_t cap = 64, n = 0;
+  guard_site_t *sites = (guard_site_t *)malloc(cap * sizeof(guard_site_t));
+  if (!sites)
+    return false;
+
+  for (LLVMValueRef fn = LLVMGetFirstFunction(mod); fn;
+       fn = LLVMGetNextFunction(fn)) {
+    if (LLVMIsDeclaration(fn) || fn == gr)
+      continue;
+    for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn); bb;
+         bb = LLVMGetNextBasicBlock(bb)) {
+      for (LLVMValueRef inst = LLVMGetFirstInstruction(bb); inst;
+           inst = LLVMGetNextInstruction(inst)) {
+        if (!LLVMIsACallInst(inst) && !LLVMIsAInvokeInst(inst))
+          continue;
+        if (LLVMGetCalledValue(inst) != gr)
+          continue;
+        if (LLVMGetNumArgOperands(inst) != 8)
+          continue;
+        guard_site_t s;
+        memset(&s, 0, sizeof(s));
+        s.inst = inst;
+        for (unsigned k = 0; k < 8; k++)
+          s.a[k] = LLVMGetOperand(inst, k);
+        if (arg0_unused)
+          s.a[0] = arg0_null;
+        if (!LLVMIsConstant(s.a[0]) || !LLVMIsConstant(s.a[1]) ||
+            !LLVMIsConstant(s.a[2]) || !LLVMIsConstant(s.a[3]) ||
+            !LLVMIsConstant(s.a[7]))
+          continue;
+        s.full_const = LLVMIsConstant(s.a[4]) && LLVMIsConstant(s.a[5]) &&
+                       LLVMIsConstant(s.a[6]);
+        if (LLVMIsAConstantInt(s.a[5]) && LLVMIsAConstantInt(s.a[6])) {
+          unsigned long long lv = LLVMConstIntGetZExtValue(s.a[5]);
+          unsigned long long cv = LLVMConstIntGetZExtValue(s.a[6]);
+          if (lv <= 0xFFFFu && cv <= 0xFFFFu) {
+            s.pack_loc = true;
+            s.packed_loc = (uint32_t)((lv << 16) | cv);
+          }
+        }
+        guard_detect_soft_chain(inst, soft_fn, &s);
+        if (n == cap) {
+          size_t ncap = cap * 2;
+          guard_site_t *ns =
+              (guard_site_t *)realloc(sites, ncap * sizeof(guard_site_t));
+          if (!ns) {
+            free(sites);
+            return false;
+          }
+          sites = ns;
+          cap = ncap;
+        }
+        sites[n++] = s;
+      }
+    }
+  }
+
+  if (n < 2) {
+    free(sites);
+    return false;
+  }
+
+  LLVMContextRef ctx = LLVMGetModuleContext(mod);
+  LLVMBuilderRef b = LLVMCreateBuilderInContext(ctx);
+  LLVMTypeRef void_ty = LLVMVoidTypeInContext(ctx);
+  LLVMTypeRef ptr_ty = LLVMPointerType(LLVMInt8TypeInContext(ctx), 0);
+  bool changed = false;
+  unsigned stub_id = 0;
+
+  /* Pass 1: 0-arg stubs for exact 8-constant tuples appearing >= 2 times. */
+  guard_group_t *g0 = (guard_group_t *)calloc(n, sizeof(guard_group_t));
+  size_t ng0 = 0;
+  if (g0) {
+    for (size_t i = 0; i < n; i++) {
+      if (!sites[i].full_const)
+        continue;
+      size_t found = ng0;
+      for (size_t j = 0; j < ng0; j++) {
+        if (g0[j].has_soft == sites[i].has_soft &&
+            memcmp(g0[j].key, sites[i].a, sizeof(g0[j].key)) == 0) {
+          found = j;
+          break;
+        }
+      }
+      if (found == ng0) {
+        memcpy(g0[ng0].key, sites[i].a, sizeof(g0[ng0].key));
+        g0[ng0].has_soft = sites[i].has_soft;
+        g0[ng0].count = 1;
+        ng0++;
+      } else {
+        g0[found].count++;
+      }
+    }
+    LLVMTypeRef fty0_void = LLVMFunctionType(void_ty, NULL, 0, 0);
+    LLVMTypeRef fty0_ptr = LLVMFunctionType(ptr_ty, NULL, 0, 0);
+    for (size_t j = 0; j < ng0; j++) {
+      if (g0[j].count < 2)
+        continue;
+      char name[48];
+      snprintf(name, sizeof(name),
+               g0[j].has_soft ? "__zan_guard_soft.%u" : "__zan_guard_stub.%u",
+               stub_id++);
+      LLVMTypeRef fty0 = g0[j].has_soft ? fty0_ptr : fty0_void;
+      LLVMValueRef stub = LLVMAddFunction(mod, name, fty0);
+      LLVMSetLinkage(stub, LLVMInternalLinkage);
+      guard_stub_add_attrs(ctx, stub, gr, level, g0[j].has_soft);
+      LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(ctx, stub, "entry");
+      LLVMPositionBuilderAtEnd(b, entry);
+      LLVMSetCurrentDebugLocation2(b, NULL);
+      LLVMBuildCall2(b, gr_fty, gr, g0[j].key, 8, "");
+      if (g0[j].has_soft) {
+        LLVMValueRef s = LLVMBuildCall2(b, soft_fty, soft_fn, NULL, 0, "soft");
+        LLVMBuildRet(b, s);
+      } else {
+        LLVMBuildRetVoid(b);
+      }
+      g0[j].stub = stub;
+      g0[j].stub_fty = fty0;
+    }
+    for (size_t i = 0; i < n; i++) {
+      if (!sites[i].full_const)
+        continue;
+      for (size_t j = 0; j < ng0; j++) {
+        if (g0[j].stub && g0[j].has_soft == sites[i].has_soft &&
+            memcmp(g0[j].key, sites[i].a, sizeof(g0[j].key)) == 0) {
+          guard_replace_site(b, &sites[i], g0[j].stub_fty, g0[j].stub, NULL, 0);
+          sites[i].replaced = true;
+          changed = true;
+          break;
+        }
+      }
+    }
+    free(g0);
+  }
+
+  /* Pass 2: 2-arg stubs (file, (line << 16) | col) for sites with 16-bit
+   * constant line/col sharing constant (eh, vt, ex_msg, tid, mbuf) >= 2 times;
+   * saves one register setup per guard site while preserving exact file:line:col. */
+  LLVMTypeRef i32_ty = LLVMInt32TypeInContext(ctx);
+  if (param_tys[5] == i32_ty && param_tys[6] == i32_ty) {
+    guard_group_t *g2 = (guard_group_t *)calloc(n, sizeof(guard_group_t));
+    size_t ng2 = 0;
+    if (g2) {
+      for (size_t i = 0; i < n; i++) {
+        if (sites[i].replaced || !sites[i].pack_loc)
+          continue;
+        size_t found = ng2;
+        for (size_t j = 0; j < ng2; j++) {
+          if (g2[j].has_soft == sites[i].has_soft &&
+              g2[j].key[0] == sites[i].a[0] && g2[j].key[1] == sites[i].a[1] &&
+              g2[j].key[2] == sites[i].a[2] && g2[j].key[3] == sites[i].a[3] &&
+              g2[j].key[7] == sites[i].a[7]) {
+            found = j;
+            break;
+          }
+        }
+        if (found == ng2) {
+          g2[ng2].key[0] = sites[i].a[0];
+          g2[ng2].key[1] = sites[i].a[1];
+          g2[ng2].key[2] = sites[i].a[2];
+          g2[ng2].key[3] = sites[i].a[3];
+          g2[ng2].key[7] = sites[i].a[7];
+          g2[ng2].has_soft = sites[i].has_soft;
+          g2[ng2].count = 1;
+          ng2++;
+        } else {
+          g2[found].count++;
+        }
+      }
+      LLVMTypeRef p2[2] = {param_tys[4], i32_ty};
+      LLVMTypeRef fty2_void = LLVMFunctionType(void_ty, p2, 2, 0);
+      LLVMTypeRef fty2_ptr = LLVMFunctionType(ptr_ty, p2, 2, 0);
+      LLVMValueRef c16 = LLVMConstInt(i32_ty, 16, 0);
+      LLVMValueRef cmask = LLVMConstInt(i32_ty, 0xFFFFu, 0);
+      for (size_t j = 0; j < ng2; j++) {
+        if (g2[j].count < 2)
+          continue;
+        char name[48];
+        snprintf(name, sizeof(name),
+                 g2[j].has_soft ? "__zan_guard_soft2.%u" : "__zan_guard_stub2.%u",
+                 stub_id++);
+        LLVMTypeRef fty2 = g2[j].has_soft ? fty2_ptr : fty2_void;
+        LLVMValueRef stub = LLVMAddFunction(mod, name, fty2);
+        LLVMSetLinkage(stub, LLVMInternalLinkage);
+        guard_stub_add_attrs(ctx, stub, gr, level, g2[j].has_soft);
+        LLVMBasicBlockRef entry =
+            LLVMAppendBasicBlockInContext(ctx, stub, "entry");
+        LLVMPositionBuilderAtEnd(b, entry);
+        LLVMSetCurrentDebugLocation2(b, NULL);
+        LLVMValueRef loc = LLVMGetParam(stub, 1);
+        LLVMValueRef ln = LLVMBuildLShr(b, loc, c16, "ln");
+        LLVMValueRef cl = LLVMBuildAnd(b, loc, cmask, "cl");
+        LLVMValueRef args[8] = {g2[j].key[0],        g2[j].key[1],
+                                g2[j].key[2],        g2[j].key[3],
+                                LLVMGetParam(stub, 0), ln,
+                                cl,                  g2[j].key[7]};
+        LLVMBuildCall2(b, gr_fty, gr, args, 8, "");
+        if (g2[j].has_soft) {
+          LLVMValueRef s = LLVMBuildCall2(b, soft_fty, soft_fn, NULL, 0, "soft");
+          LLVMBuildRet(b, s);
+        } else {
+          LLVMBuildRetVoid(b);
+        }
+        g2[j].stub = stub;
+        g2[j].stub_fty = fty2;
+      }
+      for (size_t i = 0; i < n; i++) {
+        if (sites[i].replaced || !sites[i].pack_loc)
+          continue;
+        for (size_t j = 0; j < ng2; j++) {
+          if (g2[j].stub && g2[j].has_soft == sites[i].has_soft &&
+              g2[j].key[0] == sites[i].a[0] && g2[j].key[1] == sites[i].a[1] &&
+              g2[j].key[2] == sites[i].a[2] && g2[j].key[3] == sites[i].a[3] &&
+              g2[j].key[7] == sites[i].a[7]) {
+            LLVMValueRef a2[2] = {sites[i].a[4],
+                                  LLVMConstInt(i32_ty, sites[i].packed_loc, 0)};
+            guard_replace_site(b, &sites[i], g2[j].stub_fty, g2[j].stub, a2, 2);
+            sites[i].replaced = true;
+            changed = true;
+            break;
+          }
+        }
+      }
+      free(g2);
+    }
+  }
+
+  /* Pass 3: 3-arg stubs (file, line, col) for any remaining sites sharing
+   * constant (eh, vt, ex_msg, tid, mbuf) >= 2 times. */
+  guard_group_t *g3 = (guard_group_t *)calloc(n, sizeof(guard_group_t));
+  size_t ng3 = 0;
+  if (g3) {
+    for (size_t i = 0; i < n; i++) {
+      if (sites[i].replaced)
+        continue;
+      size_t found = ng3;
+      for (size_t j = 0; j < ng3; j++) {
+        if (g3[j].has_soft == sites[i].has_soft &&
+            g3[j].key[0] == sites[i].a[0] && g3[j].key[1] == sites[i].a[1] &&
+            g3[j].key[2] == sites[i].a[2] && g3[j].key[3] == sites[i].a[3] &&
+            g3[j].key[7] == sites[i].a[7]) {
+          found = j;
+          break;
+        }
+      }
+      if (found == ng3) {
+        g3[ng3].key[0] = sites[i].a[0];
+        g3[ng3].key[1] = sites[i].a[1];
+        g3[ng3].key[2] = sites[i].a[2];
+        g3[ng3].key[3] = sites[i].a[3];
+        g3[ng3].key[7] = sites[i].a[7];
+        g3[ng3].has_soft = sites[i].has_soft;
+        g3[ng3].count = 1;
+        ng3++;
+      } else {
+        g3[found].count++;
+      }
+    }
+    LLVMTypeRef p3[3] = {param_tys[4], param_tys[5], param_tys[6]};
+    LLVMTypeRef fty3_void = LLVMFunctionType(void_ty, p3, 3, 0);
+    LLVMTypeRef fty3_ptr = LLVMFunctionType(ptr_ty, p3, 3, 0);
+    for (size_t j = 0; j < ng3; j++) {
+      if (g3[j].count < 2)
+        continue;
+      char name[48];
+      snprintf(name, sizeof(name),
+               g3[j].has_soft ? "__zan_guard_soft3.%u" : "__zan_guard_stub3.%u",
+               stub_id++);
+      LLVMTypeRef fty3 = g3[j].has_soft ? fty3_ptr : fty3_void;
+      LLVMValueRef stub = LLVMAddFunction(mod, name, fty3);
+      LLVMSetLinkage(stub, LLVMInternalLinkage);
+      guard_stub_add_attrs(ctx, stub, gr, level, g3[j].has_soft);
+      LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(ctx, stub, "entry");
+      LLVMPositionBuilderAtEnd(b, entry);
+      LLVMSetCurrentDebugLocation2(b, NULL);
+      LLVMValueRef args[8] = {
+          g3[j].key[0], g3[j].key[1], g3[j].key[2], g3[j].key[3],
+          LLVMGetParam(stub, 0), LLVMGetParam(stub, 1), LLVMGetParam(stub, 2),
+          g3[j].key[7]};
+      LLVMBuildCall2(b, gr_fty, gr, args, 8, "");
+      if (g3[j].has_soft) {
+        LLVMValueRef s = LLVMBuildCall2(b, soft_fty, soft_fn, NULL, 0, "soft");
+        LLVMBuildRet(b, s);
+      } else {
+        LLVMBuildRetVoid(b);
+      }
+      g3[j].stub = stub;
+      g3[j].stub_fty = fty3;
+    }
+    for (size_t i = 0; i < n; i++) {
+      if (sites[i].replaced)
+        continue;
+      for (size_t j = 0; j < ng3; j++) {
+        if (g3[j].stub && g3[j].has_soft == sites[i].has_soft &&
+            g3[j].key[0] == sites[i].a[0] && g3[j].key[1] == sites[i].a[1] &&
+            g3[j].key[2] == sites[i].a[2] && g3[j].key[3] == sites[i].a[3] &&
+            g3[j].key[7] == sites[i].a[7]) {
+          LLVMValueRef a3[3] = {sites[i].a[4], sites[i].a[5], sites[i].a[6]};
+          guard_replace_site(b, &sites[i], g3[j].stub_fty, g3[j].stub, a3, 3);
+          sites[i].replaced = true;
+          changed = true;
+          break;
+        }
+      }
+    }
+    free(g3);
+  }
+
+  LLVMDisposeBuilder(b);
+  free(sites);
+  return changed;
 }
 
 /* 外提后清掉死 repack 块、把循环里重读的 Count/数据指针提出去。 */
@@ -4328,9 +4904,11 @@ static const char *zan_opt_prepare_level(LLVMModuleRef mod,
     return "default<O2>,mergefunc,globaldce";
 #else
   case ZAN_OPT_SIZE:
+    zan_opt_mark_size(mod, false);
     *ol = 0;
     return "default<Os>,mergefunc,globaldce";
   case ZAN_OPT_SIZE_MIN:
+    zan_opt_mark_size(mod, true);
     *ol = 0;
     return "default<Oz>,mergefunc,globaldce";
 #endif
@@ -4541,7 +5119,7 @@ static zan_status_t zan_opt_run_passes_ex(LLVMModuleRef mod,
   LLVMDisposePassBuilderOptions(opts);
   rt_defer_restore_guard(mod, &defer);
   if (err) {
-    rt_defer_restore_attrs(mod, &defer, false);
+    rt_defer_restore_attrs(mod, &defer, false, ZAN_OPT_FULL);
     char *msg = LLVMGetErrorMessage(err);
     fprintf(stderr, "error: LLVM pass pipeline '%s' failed: %s\n", passes, msg);
     LLVMDisposeErrorMessage(msg);
@@ -4559,7 +5137,7 @@ static zan_status_t zan_opt_run_passes_ex(LLVMModuleRef mod,
                              ",function(loop-vectorize,"
                              "instcombine<no-verify-fixpoint>,simplifycfg)") !=
           ZAN_OK) {
-        rt_defer_restore_attrs(mod, &defer, false);
+        rt_defer_restore_attrs(mod, &defer, false, ZAN_OPT_FULL);
         return ZAN_ERROR;
       }
     }
@@ -4567,7 +5145,9 @@ static zan_status_t zan_opt_run_passes_ex(LLVMModuleRef mod,
     bool post_changed = zan_opt_run_post_inline_passes(
         mod, level, knobs, g_opt, report_out, shrink,
         late_arc_wanted(level, custom_pipe));
-    bool rt_unmarked = rt_defer_restore_attrs(mod, &defer, true);
+    if (zan_opt_outline_guard_raises(mod, level))
+      post_changed = true;
+    bool rt_unmarked = rt_defer_restore_attrs(mod, &defer, true, level);
 
     const char *cleanup =
         zan_opt_post_cleanup_pipeline(level, rt_unmarked, post_changed);
@@ -4641,13 +5221,13 @@ static zan_status_t zan_opt_configure_llvm_passes_ex(
       bool post_changed = zan_opt_run_post_inline_passes(
           g->mod, level, knobs, g, report_out, true,
           late_arc_wanted(level, false));
-      bool rt_unmarked = rt_defer_restore_attrs(g->mod, &defer, true);
+      bool rt_unmarked = rt_defer_restore_attrs(g->mod, &defer, true, level);
       const char *cleanup =
           zan_opt_post_cleanup_pipeline(level, rt_unmarked, post_changed);
       if (cleanup)
         status = run_checked_passes(g->mod, tm, cleanup);
     } else {
-      rt_defer_restore_attrs(g->mod, &defer, false);
+      rt_defer_restore_attrs(g->mod, &defer, false, ZAN_OPT_FULL);
     }
     /* List 槽宽检查提出循环（见 zan_opt_run_passes_on_module 同名步骤）。
      * 放在两半之间：后半段只有 LICM 没有 GVN，循环里重读的 Count/数据指针
@@ -4656,6 +5236,8 @@ static zan_status_t zan_opt_configure_llvm_passes_ex(
       if (zan_opt_hoist_list_width_checks(g->mod) > 0)
         status = run_checked_passes(g->mod, tm, LIST_HOIST_CLEANUP);
     }
+    if (status == ZAN_OK && zan_opt_outline_guard_raises(g->mod, level))
+      status = run_checked_passes(g->mod, tm, "function(simplifycfg)");
     /* Drop bodies the inliner left dead now, so extern-library pruning
      * between here and object emission sees the final call graph. */
     if (status == ZAN_OK)

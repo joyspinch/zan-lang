@@ -25,8 +25,10 @@ void zan_irgen_compactor_destroy(zan_irgen_compactor_t *compactor);
 /* LLVM's C target-machine API lacks these target options. */
 LLVMTargetMachineRef zan_create_target_machine_with_options(
     LLVMTargetRef target, const char *triple, const char *cpu,
-    const char *features, LLVMCodeGenOptLevel level, LLVMBool emulated_tls,
-    LLVMBool wasm_exceptions);
+    const char *features, LLVMCodeGenOptLevel level,
+    LLVMRelocMode reloc_mode, LLVMCodeModel code_model,
+    LLVMBool emulated_tls, LLVMBool wasm_exceptions,
+    LLVMBool function_sections, LLVMBool data_sections);
 
 /* Drop a function's body, keeping its linkage (Function::deleteBody resets it
  * to external). The function becomes a declaration. */
