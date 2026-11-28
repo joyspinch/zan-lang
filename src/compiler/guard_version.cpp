@@ -607,7 +607,13 @@ struct Versioner {
 
         /* Enter the clone from the ok edge. */
         if (BI) {
-            S->removePredecessor(H);
+            /* Keep S's phis even when one input is left: folding one RAUWs
+             * the phi into that input, and vmap follows RAUW, so the phi's
+             * clone mapping would be lost and fix_exits would hand the clone's
+             * exits the dead failing path's value (a non-dominating incoming
+             * that cleanup turns into poison -- e.g. a release of garbage
+             * after a soft null check merged phi(recv, scratch) in S). */
+            S->removePredecessor(H, /*KeepOneInputPHIs=*/true);
             BI->setSuccessor((unsigned)ok, NS);
         } else {
             Instruction *old = H->getTerminator();
