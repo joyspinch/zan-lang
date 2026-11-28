@@ -1,0 +1,94 @@
+using System;
+using System.Numerics;
+using Gui;
+using Game.Graphics;
+using Game.Render3D;
+
+namespace Conf;
+
+// 物理着色模式（SetPbrShading3D）：默认关闭时与旧着色逐像素一致；开启后正面受光在合理亮度区间、
+// 掠射光按 Lambert 衰减（旧着色的半 Lambert 会把掠射面照亮一半）；关闭后恢复原样；PBR 天空太阳可见。
+class GamePbrShadingTest {
+    [DllImport("zan_gui")]
+    private static extern int zan_gui_read_pixel(int surfaceId, int x, int y);
+
+    private static Mesh3D MakeQuad(float h) {
+        Mesh3D m = new Mesh3D();
+        m.Vertex(-h, -h, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f);
+        m.Vertex( h, -h, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+        m.Vertex( h,  h, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f);
+        m.Vertex(-h,  h, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        m.Triangle(0, 1, 2);
+        m.Triangle(0, 2, 3);
+        return m;
+    }
+    private static int R(int c) { return (c >> 16) & 255; }
+    private static int G(int c) { return (c >> 8) & 255; }
+    private static int B(int c) { return c & 255; }
+    private static int Lum(int c) { return (R(c) + G(c) + B(c)) / 3; }
+
+    static int Shoot(Canvas cv, Renderer3D renderer, RenderPlan plan, SceneNode root, Vector3 lightDir) {
+        plan.Lights.Clear();
+        plan.Lights.Add(Light.DirectionalLight(1.0f, 1.0f, 1.0f, 1.0f, lightDir));
+        plan.Build(root);
+        cv.Clear(unchecked((int)0xFF000000));
+        renderer.Draw(cv, plan);
+        return Lum(zan_gui_read_pixel(cv.SurfaceId(), 64, 64));
+    }
+
+    static void Main() {
+        Canvas.SetBackend(1);
+        Canvas cv = new Canvas(128, 128);
+        Camera3D cam = new Camera3D();
+        cam.Position = new Vector3(0.0f, 0.0f, 4.0f);
+        cam.Target = new Vector3(0.0f, 0.0f, 0.0f);
+        cam.AspectRatio = 1.0f;
+        SceneNode root = new SceneNode("root");
+        SceneNode quad = new SceneNode("quad");
+        quad.MeshKey = cv.MeshUpload(MakeQuad(2.2f));
+        quad.BoundsRadius = 4.0f;
+        quad.Material = Material.Solid(0.7f, 0.7f, 0.7f);
+        quad.Material.Roughness = 0.8f;
+        root.AddChild(quad);
+        RenderPlan plan = new RenderPlan(cam);
+        plan.AmbientRed = 0.1f; plan.AmbientGreen = 0.1f; plan.AmbientBlue = 0.1f;
+        Renderer3D renderer = new Renderer3D(16);
+
+        Vector3 front = new Vector3(0.0f, 0.0f, -1.0f);   // 光线传播方向：射向 -z 照亮朝 +z 的面
+        Vector3 graze = new Vector3(1.0f, 0.0f, 0.0f);
+        int legacyFront = Shoot(cv, renderer, plan, root, front);
+        int legacyGraze = Shoot(cv, renderer, plan, root, graze);
+
+        cv.SetPbrShading3D(true, 1.0f, 1, 1.0f);
+        int pbrFront = Shoot(cv, renderer, plan, root, front);
+        int pbrGraze = Shoot(cv, renderer, plan, root, graze);
+        cv.SetPbrShading3D(false, 1.0f, 1, 1.0f);
+        int backFront = Shoot(cv, renderer, plan, root, front);
+
+        bool restored = Math.Abs(backFront - legacyFront) <= 2;
+        bool frontOk = pbrFront > 60 && pbrFront < 250;
+        bool lambert = pbrGraze + 20 < pbrFront && pbrGraze + 15 < legacyGraze;
+        Console.WriteLine("pbr-off-restores-legacy: " + (restored ? "1" : "0"));
+        Console.WriteLine("pbr-front-lit-in-range: " + (frontOk ? "1" : "0"));
+        Console.WriteLine("pbr-lambert-grazing-falloff: " + (lambert ? "1" : "0"));
+
+        // PBR 天空：顶部偏蓝、太阳方向远亮于顶部、地面暗
+        cv.SetPbrShading3D(true, 1.0f, 1, 1.0f);
+        Camera3D skyCam = new Camera3D();
+        skyCam.Position = new Vector3(0.0f, 0.0f, 0.0f);
+        skyCam.Target = new Vector3(0.0f, 0.0f, -1.0f);
+        skyCam.AspectRatio = 1.0f;
+        skyCam.FieldOfView = 1.04719755f;
+        Skybox3D sky = Skybox3D.Daylight();
+        sky.SunDirection = new Vector3(0.0f, 0.32f, -1.0f);
+        cv.SetLights3D(new float[] { 0.0f, 0.32f, -1.0f }, new float[] { 3.0f, 2.7f, 2.2f }, new float[] { 0.0f, 0.0f, 0.0f });
+        cv.Clear(unchecked((int)0xFF000000));
+        int drawn = cv.DrawSkybox3D(skyCam, sky);
+        int top = zan_gui_read_pixel(cv.SurfaceId(), 64, 6);
+        int sun = zan_gui_read_pixel(cv.SurfaceId(), 64, 28);   // 太阳仰角 17.7°，纵向 FOV 60° → 第 28 行
+        int ground = zan_gui_read_pixel(cv.SurfaceId(), 64, 120);
+        cv.SetPbrShading3D(false, 1.0f, 1, 1.0f);
+        bool skyOk = drawn == 1 && B(top) > R(top) && Lum(sun) > Lum(top) + 40 && Lum(ground) < Lum(top);
+        Console.WriteLine("pbr-sky-sun-visible: " + (skyOk ? "1" : "0"));
+    }
+}
