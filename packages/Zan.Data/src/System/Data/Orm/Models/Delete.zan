@@ -5,10 +5,12 @@ using System.Linq;
 namespace System.Data.Orm;
 
 public class Delete {
+    private static const string IN_MARKS8 = ", ?, ?, ?, ?, ?, ?, ?, ?";
+
     public IDbExecutor db;
     public Meta meta;
     public string tbl;
-    private string w;
+    private StringBuilder wBuf;
     private DbParams ps;
     private bool on;
 
@@ -17,7 +19,7 @@ public class Delete {
         this.db = db;
         this.meta = meta;
         this.tbl = meta.Table;
-        this.w = "";
+        this.wBuf = null;
         this.ps = new DbParams();
         this.on = true;
     }
@@ -27,11 +29,74 @@ public class Delete {
         return new Delete(db, meta);
     }
 
+    private StringBuilder EnsureWhereBuf() {
+        if (this.wBuf == null) { this.wBuf = new StringBuilder(128); }
+        return this.wBuf;
+    }
+
+    private static void AppendQuotedIdent(StringBuilder wb, int prov, string col) {
+        int len = col.Length;
+        if (len > 0 && !(len == 1 && (col[0] & 255) == 42)) {
+            int openCh = 34;
+            int closeCh = 34;
+            string openStr = "\"";
+            string closeStr = "\"";
+            if (prov == DbProvider.MySQL || prov == DbProvider.MariaDB) {
+                openCh = 96; closeCh = 96; openStr = "`"; closeStr = "`";
+            } else if (prov == DbProvider.SqlServer) {
+                openCh = 91; closeCh = 93; openStr = "["; closeStr = "]";
+            }
+            nint cp = (nint)col;
+            if ((col[0] & 255) != openCh && NativeMemory.IndexOfAny(cp, len, 46, (byte)closeCh) < 0) {
+                wb.Append(openStr);
+                wb.Append(col);
+                wb.Append(closeStr);
+                return;
+            }
+        }
+        wb.Append(Dialect.QuoteIdentifier(prov, col));
+    }
+
+    private void AppendWhereRaw(string frag) {
+        if (frag == null || frag.Length == 0) { return; }
+        StringBuilder wb = this.EnsureWhereBuf();
+        if (wb.Length > 0) { wb.Append(" AND "); }
+        wb.Append(frag);
+    }
+
+    private void AppendWhereEqCol(int prov, string col) {
+        StringBuilder wb = this.EnsureWhereBuf();
+        if (wb.Length > 0) { wb.Append(" AND "); }
+        Delete.AppendQuotedIdent(wb, prov, col);
+        wb.Append(" = ?");
+    }
+
+    private void AppendWhereInMarksCol(int prov, string col, int count) {
+        StringBuilder wb = this.EnsureWhereBuf();
+        if (wb.Length > 0) { wb.Append(" AND "); }
+        Delete.AppendQuotedIdent(wb, prov, col);
+        wb.Append(" IN (?");
+        int rem = count - 1;
+        while (rem >= 8) {
+            wb.Append(Delete.IN_MARKS8);
+            rem = rem - 8;
+        }
+        while (rem > 0) {
+            wb.Append(", ?");
+            rem = rem - 1;
+        }
+        wb.Append(")");
+    }
+
     // 参数与 WHERE 属于这次执行，谓词筛选不能污染原构造器。
     public Delete Snapshot() {
         Delete copy = new Delete(this.db, this.meta);
         copy.tbl = this.tbl;
-        copy.w = this.w;
+        if (this.wBuf != null && this.wBuf.Length > 0) {
+            string ws = this.wBuf.ToString();
+            copy.wBuf = new StringBuilder(ws.Length + 32);
+            copy.wBuf.Append(ws);
+        }
         Dialect.CopyInto(this.ps, copy.ps);
         copy.on = this.on;
         return copy;
@@ -39,11 +104,25 @@ public class Delete {
 
     // 保留原 SQL 条件整体，OR 不能绕过委托生成的主键条件。
     public void PredicateCondition(string condition) {
-        if (this.w.Length == 0) { this.w = condition; }
-        else { this.w = "(" + this.w + ") AND (" + condition + ")"; }
+        if (this.wBuf == null || this.wBuf.Length == 0) {
+            StringBuilder wb = this.EnsureWhereBuf();
+            wb.Append(condition);
+            return;
+        }
+        string cur = this.wBuf.ToString();
+        int clen = condition == null ? 0 : condition.Length;
+        StringBuilder nb = new StringBuilder(cur.Length + clen + 9);
+        nb.Append("(");
+        nb.Append(cur);
+        nb.Append(") AND (");
+        nb.Append(condition);
+        nb.Append(")");
+        this.wBuf = nb;
     }
 
-    public string CandidateWhere() { return this.w; }
+    public string CandidateWhere() {
+        return (this.wBuf == null || this.wBuf.Length == 0) ? "" : this.wBuf.ToString();
+    }
     public DbParams CandidateParams() {
         DbParams copy = new DbParams();
         Dialect.CopyInto(this.ps, copy);
@@ -70,9 +149,7 @@ public class Delete {
     // WHERE 片段：多个片段以 AND 连接。
     public void W(string f) {
         if (!this.on) { return; }
-        string u = Dialect.Unalias(f);
-        if (this.w.Length == 0) { this.w = u; }
-        else { this.w = this.w + " AND " + u; }
+        this.AppendWhereRaw(Dialect.Unalias(f));
     }
 
     // 表达式树下推到 DELETE WHERE 条件（编译期降级，零反射零装箱）
@@ -82,7 +159,7 @@ public class Delete {
         this.BindTreeCols(root);
         StringBuilder sb = new StringBuilder();
         ExprSql.Build(root, sb, this.ps);
-        this.W(sb.ToString());
+        this.AppendWhereRaw(Dialect.Unalias(sb.ToString()));
     }
 
     public void BindTreeCols(ExprNode n) {
@@ -93,13 +170,24 @@ public class Delete {
         return Update.FindColByField(this.meta, f);
     }
 
-    // 字典键值批量进 WHERE（等值条件，列名经元数据校验）。
+    // 字典键值批量进 WHERE（等值条件，列名经元数据单次查表校验并直写引号标识符）。
     public void WhereDict(DbValues v) {
         if (!this.on) { return; }
-        for (int i = 0; i < v.Count(); i = i + 1) {
-            string c = this.meta.Require(v.NameAt(i));
-            this.W(this.QuoteCol(c) + " = ?");
-            v.BindAs(this.ps, i, this.meta.KindOf(c));
+        int cnt = v.Count();
+        if (cnt == 0) { return; }
+        int prov = this.Provider();
+        for (int i = 0; i < cnt; i = i + 1) {
+            string raw = v.NameAt(i);
+            string n = raw;
+            if (n.Length > 2 && (n[0] & 255) == 116 && (n[1] & 255) == 46) {
+                n = n.Substring(2);
+            }
+            Col col = this.meta.Find(n);
+            if (col == null) {
+                throw new Exception(this.meta.Entity + " has no column: " + raw);
+            }
+            this.AppendWhereEqCol(prov, n);
+            v.BindAs(this.ps, i, col.PKind());
         }
     }
 
@@ -109,7 +197,9 @@ public class Delete {
     // 校验列名属于本实体（剥掉可选的 "t." 前缀）；未知列抛异常。
     public string RequireCol(string c) {
         string n = c;
-        if (n.Length > 2 && n.IndexOf("t.") == 0) { n = n.Substring(2); }
+        if (n.Length > 2 && (n[0] & 255) == 116 && (n[1] & 255) == 46) {
+            n = n.Substring(2);
+        }
         if (!this.meta.Has(n)) {
             throw new Exception(this.meta.Table + " has no column: " + c);
         }
@@ -119,21 +209,21 @@ public class Delete {
     // column = 文本值。
     public void WhereEq(string c, string v) {
         if (!this.on) { return; }
-        this.W(this.QuoteCol(c) + " = ?");
+        this.AppendWhereEqCol(this.Provider(), this.RequireCol(c));
         this.ps.Add(v);
     }
 
     // column = 整数值。
     public void WhereEq(string c, int v) {
         if (!this.on) { return; }
-        this.W(this.QuoteCol(c) + " = ?");
+        this.AppendWhereEqCol(this.Provider(), this.RequireCol(c));
         this.ps.AddInt(v);
     }
 
     // column = 64 位整数值。
     public void WhereEq(string c, long v) {
         if (!this.on) { return; }
-        this.W(this.QuoteCol(c) + " = ?");
+        this.AppendWhereEqCol(this.Provider(), this.RequireCol(c));
         this.ps.AddLong(v);
     }
 
@@ -159,61 +249,49 @@ public class Delete {
     // column IN (逐个占位符)；空列表按恒假处理，不生成 `IN ()`。带 2000 参数安全防御上限。
     public void WhereIn(string c, List<int> vs) {
         if (!this.on) { return; }
-        if (vs.Count == 0) { this.W("1 = 0"); return; }
-        if (vs.Count > 2000) {
+        int cnt = vs.Count;
+        if (cnt == 0) { this.AppendWhereRaw("1 = 0"); return; }
+        if (cnt > 2000) {
             throw new Exception("WhereIn parameter count exceeds safety limit of 2000");
         }
-        StringBuilder sb = new StringBuilder();
-        sb.Append(this.QuoteCol(c) + " IN (");
-        for (int i = 0; i < vs.Count; i = i + 1) {
-            if (i > 0) { sb.Append(", "); }
-            sb.Append("?");
+        this.AppendWhereInMarksCol(this.Provider(), this.RequireCol(c), cnt);
+        for (int i = 0; i < cnt; i = i + 1) {
             this.ps.AddInt(vs[i]);
         }
-        sb.Append(")");
-        this.W(sb.ToString());
     }
 
     // <see cref="WhereIn"/> 的 long 版本。
     public void WhereIn(string c, List<long> vs) {
         if (!this.on) { return; }
-        if (vs.Count == 0) { this.W("1 = 0"); return; }
-        if (vs.Count > 2000) {
+        int cnt = vs.Count;
+        if (cnt == 0) { this.AppendWhereRaw("1 = 0"); return; }
+        if (cnt > 2000) {
             throw new Exception("WhereIn parameter count exceeds safety limit of 2000");
         }
-        StringBuilder sb = new StringBuilder();
-        sb.Append(this.QuoteCol(c) + " IN (");
-        for (int i = 0; i < vs.Count; i = i + 1) {
-            if (i > 0) { sb.Append(", "); }
-            sb.Append("?");
+        this.AppendWhereInMarksCol(this.Provider(), this.RequireCol(c), cnt);
+        for (int i = 0; i < cnt; i = i + 1) {
             this.ps.AddLong(vs[i]);
         }
-        sb.Append(")");
-        this.W(sb.ToString());
     }
 
     // <see cref="WhereIn"/> 的 string 版本。
     public void WhereIn(string c, List<string> vs) {
         if (!this.on) { return; }
-        if (vs.Count == 0) { this.W("1 = 0"); return; }
-        if (vs.Count > 2000) {
+        int cnt = vs.Count;
+        if (cnt == 0) { this.AppendWhereRaw("1 = 0"); return; }
+        if (cnt > 2000) {
             throw new Exception("WhereIn parameter count exceeds safety limit of 2000");
         }
-        StringBuilder sb = new StringBuilder();
-        sb.Append(this.QuoteCol(c) + " IN (");
-        for (int i = 0; i < vs.Count; i = i + 1) {
-            if (i > 0) { sb.Append(", "); }
-            sb.Append("?");
+        this.AppendWhereInMarksCol(this.Provider(), this.RequireCol(c), cnt);
+        for (int i = 0; i < cnt; i = i + 1) {
             this.ps.Add(vs[i]);
         }
-        sb.Append(")");
-        this.W(sb.ToString());
     }
 
     // 恒假条件：数据边界为空集时用它表达"一行都不许删"。
     public void WhereNone() {
         if (!this.on) { return; }
-        this.W("1 = 0");
+        this.AppendWhereRaw("1 = 0");
     }
 
     // WHERE 参数：与 W 片段中占位符的出现顺序一致。
@@ -228,17 +306,27 @@ public class Delete {
     // 执行 DELETE 并返回受影响行数；无 WHERE 时不执行（不生成
     // 全表删除）。
     public int ExecuteAffrows() {
-        if (this.w.Length == 0) { return 0; }
+        if (this.wBuf == null || this.wBuf.Length == 0) { return 0; }
         string qtbl = Dialect.QuoteIdentifier(this.Provider(), this.tbl);
-        string sql = "DELETE FROM " + qtbl + " WHERE " + this.w;
-        return this.db.Execute(sql, this.ps);
+        string wStr = this.wBuf.ToString();
+        StringBuilder sb = new StringBuilder(19 + qtbl.Length + wStr.Length);
+        sb.Append("DELETE FROM ");
+        sb.Append(qtbl);
+        sb.Append(" WHERE ");
+        sb.Append(wStr);
+        return this.db.Execute(sb.ToString(), this.ps);
     }
 
     // 异步执行 DELETE。
     public async int ExecuteAffrowsAsync() {
-        if (this.w.Length == 0) { return 0; }
+        if (this.wBuf == null || this.wBuf.Length == 0) { return 0; }
         string qtbl = Dialect.QuoteIdentifier(this.Provider(), this.tbl);
-        string sql = "DELETE FROM " + qtbl + " WHERE " + this.w;
-        return await this.db.ExecuteAsync(sql, this.ps);
+        string wStr = this.wBuf.ToString();
+        StringBuilder sb = new StringBuilder(19 + qtbl.Length + wStr.Length);
+        sb.Append("DELETE FROM ");
+        sb.Append(qtbl);
+        sb.Append(" WHERE ");
+        sb.Append(wStr);
+        return await this.db.ExecuteAsync(sb.ToString(), this.ps);
     }
 }

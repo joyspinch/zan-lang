@@ -99,27 +99,51 @@ public class GeoSchema {
         return this;
     }
 
-    private static string HexNibble(int n) {
-        int v = n & 15;
-        if (v < 10) { return Convert.ToString(v); }
-        if (v == 10) { return "a"; }
-        if (v == 11) { return "b"; }
-        if (v == 12) { return "c"; }
-        if (v == 13) { return "d"; }
-        if (v == 14) { return "e"; }
-        return "f";
-    }
+    private static const string HEX_LOWER = "0123456789abcdef";
 
     /* JSON 字符串安全转义（同时转义 < > & 及控制字符，阻断 JSON-LD <script> 逃逸 XSS） */
     public static string JsonEscape(string s) {
-        if (s == null) { return ""; }
-        StringBuilder sb = new StringBuilder();
+        if (s == null || s.Length == 0) { return ""; }
+        int len = s.Length;
+        int first = -1;
+        for (int i = 0; i < len; i = i + 1) {
+            int b = s[i] & 255;
+            if (b < 32 || b == 34 || b == 92 || b == 60 || b == 62 || b == 38) {
+                first = i;
+                break;
+            }
+        }
+        if (first < 0) { return s; }
+        StringBuilder sb = new StringBuilder(len + 16);
+        GeoSchema.JsonEscapeTail(s, first, sb);
+        return sb.ToString();
+    }
+
+    internal static void JsonEscapeInto(string s, StringBuilder sb) {
+        if (s == null || s.Length == 0) { return; }
+        int len = s.Length;
+        int first = -1;
+        for (int i = 0; i < len; i = i + 1) {
+            int b = s[i] & 255;
+            if (b < 32 || b == 34 || b == 92 || b == 60 || b == 62 || b == 38) {
+                first = i;
+                break;
+            }
+        }
+        if (first < 0) {
+            sb.Append(s);
+            return;
+        }
+        GeoSchema.JsonEscapeTail(s, first, sb);
+    }
+
+    private static void JsonEscapeTail(string s, int first, StringBuilder sb) {
         int len = s.Length;
         int start = 0;
         nint basePtr = (nint)s;
-        for (int i = 0; i < len; i = i + 1) {
+        for (int i = first; i < len; i = i + 1) {
             int b = s[i] & 255;
-            if (b == 34 || b == 92 || b == 60 || b == 62 || b == 38 || b < 32) {
+            if (b < 32 || b == 34 || b == 92 || b == 60 || b == 62 || b == 38) {
                 if (i > start) { sb.Append(new StringView(basePtr + (nint)start, i - start)); }
                 if (b == 34) { sb.Append("\\\""); }
                 else if (b == 92) { sb.Append("\\\\"); }
@@ -133,90 +157,85 @@ public class GeoSchema {
                 else if (b == 38) { sb.Append("\\u0026"); }
                 else {
                     sb.Append("\\u00");
-                    sb.Append(GeoSchema.HexNibble(b >> 4));
-                    sb.Append(GeoSchema.HexNibble(b & 15));
+                    sb.Append(GeoSchema.HEX_LOWER[(b >> 4) & 15]);
+                    sb.Append(GeoSchema.HEX_LOWER[b & 15]);
                 }
                 start = i + 1;
             }
         }
         if (len > start) { sb.Append(new StringView(basePtr + (nint)start, len - start)); }
-        return sb.ToString();
     }
 
-    /* 序列化为标准 JSON-LD 字符串 */
-    public string ToJson() {
-        StringBuilder sb = new StringBuilder();
-        sb.Append("{\n");
-        sb.Append("  \"@context\": \"https://schema.org\",\n");
-        sb.Append("  \"@type\": \"");
-        sb.Append(GeoSchema.JsonEscape(this.schemaType));
+    internal void ToJsonInto(StringBuilder sb) {
+        sb.Append("{\n  \"@context\": \"https://schema.org\",\n  \"@type\": \"");
+        GeoSchema.JsonEscapeInto(this.schemaType, sb);
         sb.Append("\"");
 
         /* 渲染主属性 */
-        for (int k = 0; k < this.properties.Count; k = k + 1) {
+        int pCount = this.properties.Count;
+        for (int k = 0; k < pCount; k = k + 1) {
             GeoProp prop = this.properties[k];
             sb.Append(",\n  \"");
-            sb.Append(GeoSchema.JsonEscape(prop.Key()));
+            GeoSchema.JsonEscapeInto(prop.Key(), sb);
             sb.Append("\": \"");
-            sb.Append(GeoSchema.JsonEscape(prop.Val()));
+            GeoSchema.JsonEscapeInto(prop.Val(), sb);
             sb.Append("\"");
         }
 
         /* 针对 FAQPage 渲染 mainEntity 数组 */
-        if (this.schemaType == "FAQPage" && this.items.Count > 0) {
+        int iCount = this.items.Count;
+        if (this.schemaType == "FAQPage" && iCount > 0) {
             sb.Append(",\n  \"mainEntity\": [\n");
-            for (int i = 0; i < this.items.Count; i = i + 1) {
+            for (int i = 0; i < iCount; i = i + 1) {
                 Dictionary<string, string> qa = this.items[i];
-                sb.Append("    {\n");
-                sb.Append("      \"@type\": \"Question\",\n");
-                sb.Append("      \"name\": \"");
-                sb.Append(GeoSchema.JsonEscape(qa["q"]));
-                sb.Append("\",\n");
-                sb.Append("      \"acceptedAnswer\": {\n");
-                sb.Append("        \"@type\": \"Answer\",\n");
-                sb.Append("        \"text\": \"");
-                sb.Append(GeoSchema.JsonEscape(qa["a"]));
-                sb.Append("\"\n");
-                sb.Append("      }\n");
-                sb.Append("    }");
-                if (i < this.items.Count - 1) { sb.Append(","); }
+                sb.Append("    {\n      \"@type\": \"Question\",\n      \"name\": \"");
+                GeoSchema.JsonEscapeInto(qa["q"], sb);
+                sb.Append("\",\n      \"acceptedAnswer\": {\n        \"@type\": \"Answer\",\n        \"text\": \"");
+                GeoSchema.JsonEscapeInto(qa["a"], sb);
+                sb.Append("\"\n      }\n    }");
+                if (i < iCount - 1) { sb.Append(","); }
                 sb.Append("\n");
             }
             sb.Append("  ]");
         }
         /* 针对 BreadcrumbList 渲染 itemListElement 数组 */
-        else if (this.schemaType == "BreadcrumbList" && this.items.Count > 0) {
+        else if (this.schemaType == "BreadcrumbList" && iCount > 0) {
             sb.Append(",\n  \"itemListElement\": [\n");
-            for (int j = 0; j < this.items.Count; j = j + 1) {
+            for (int j = 0; j < iCount; j = j + 1) {
                 Dictionary<string, string> crumb = this.items[j];
-                sb.Append("    {\n");
-                sb.Append("      \"@type\": \"ListItem\",\n");
-                sb.Append("      \"position\": ");
+                sb.Append("    {\n      \"@type\": \"ListItem\",\n      \"position\": ");
                 sb.Append(j + 1);
-                sb.Append(",\n");
-                sb.Append("      \"name\": \"");
-                sb.Append(GeoSchema.JsonEscape(crumb["name"]));
-                sb.Append("\",\n");
-                sb.Append("      \"item\": \"");
-                sb.Append(GeoSchema.JsonEscape(crumb["url"]));
-                sb.Append("\"\n");
-                sb.Append("    }");
-                if (j < this.items.Count - 1) { sb.Append(","); }
+                sb.Append(",\n      \"name\": \"");
+                GeoSchema.JsonEscapeInto(crumb["name"], sb);
+                sb.Append("\",\n      \"item\": \"");
+                GeoSchema.JsonEscapeInto(crumb["url"], sb);
+                sb.Append("\"\n    }");
+                if (j < iCount - 1) { sb.Append(","); }
                 sb.Append("\n");
             }
             sb.Append("  ]");
         }
 
         sb.Append("\n}");
+    }
+
+    internal void ToHtmlTagInto(StringBuilder sb) {
+        sb.Append("<script type=\"application/ld+json\">\n");
+        this.ToJsonInto(sb);
+        sb.Append("\n</script>");
+    }
+
+    /* 序列化为标准 JSON-LD 字符串 */
+    public string ToJson() {
+        StringBuilder sb = new StringBuilder(128 + this.properties.Count * 64 + this.items.Count * 192);
+        this.ToJsonInto(sb);
         return sb.ToString();
     }
 
     /* 渲染为可直接放入 HTML <head> 的 script 标签 */
     public string ToHtmlTag() {
-        StringBuilder sb = new StringBuilder();
-        sb.Append("<script type=\"application/ld+json\">\n");
-        sb.Append(this.ToJson());
-        sb.Append("\n</script>");
+        StringBuilder sb = new StringBuilder(192 + this.properties.Count * 64 + this.items.Count * 192);
+        this.ToHtmlTagInto(sb);
         return sb.ToString();
     }
 }

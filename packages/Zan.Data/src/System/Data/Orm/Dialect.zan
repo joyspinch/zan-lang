@@ -183,19 +183,21 @@ public class Dialect {
     }
 
     // WHERE 片段里的 `t.` 别名在 UPDATE/DELETE 上不成立（仅移除词边界的独立别名 `t.`，跳过字符串字面量及 `account.id` 等）。
+    // 无 '.' 或无独立 `t.` 时零分配直返原串；命中时按 StringView 分段追加，消除逐字节 Substring。
     public static string Unalias(string f) {
         if (f == null || f.Length < 2) { return f == null ? "" : f; }
         int n = f.Length;
-        StringBuilder sb = new StringBuilder();
+        nint fp = (nint)f;
+        if (NativeMemory.Find(fp, 0, 46, n) < 0) { return f; }
+        StringBuilder sb = null;
         bool inStr = false;
+        int segStart = 0;
         int i = 0;
         while (i < n) {
             int c = f[i] & 255;
             if (inStr) {
-                sb.Append(f.Substring(i, 1));
                 if (c == 39) {
                     if (i + 1 < n && (f[i + 1] & 255) == 39) {
-                        sb.Append("'");
                         i = i + 2;
                         continue;
                     }
@@ -206,7 +208,6 @@ public class Dialect {
             }
             if (c == 39) {
                 inStr = true;
-                sb.Append("'");
                 i = i + 1;
                 continue;
             }
@@ -218,12 +219,20 @@ public class Dialect {
                         || (p >= 97 && p <= 122) || p == 95 || p == 46;
                 }
                 if (!prevIdent) {
+                    if (sb == null) { sb = new StringBuilder(n); }
+                    if (i > segStart) {
+                        sb.Append(new StringView(fp + (nint)segStart, i - segStart));
+                    }
                     i = i + 2;
+                    segStart = i;
                     continue;
                 }
             }
-            sb.Append(f.Substring(i, 1));
             i = i + 1;
+        }
+        if (sb == null) { return f; }
+        if (n > segStart) {
+            sb.Append(new StringView(fp + (nint)segStart, n - segStart));
         }
         return sb.ToString();
     }
@@ -238,14 +247,13 @@ public class Dialect {
 
     // 按各自的类型码把参数逐个复制到 dst。
     public static void CopyInto(DbParams src, DbParams dst) {
-        int i = 0;
-        while (i < src.Count()) {
+        int n = src.Count();
+        for (int i = 0; i < n; i = i + 1) {
             int k = src.KindAt(i);
             if (k == DbParams.KindInt) { dst.AddLong(src.IntAt(i)); }
             else if (k == DbParams.KindDouble) { dst.AddDouble(src.DoubleAt(i)); }
             else if (k == DbParams.KindText) { dst.Add(src.TextAt(i)); }
             else { dst.AddNull(); }
-            i = i + 1;
         }
     }
 
