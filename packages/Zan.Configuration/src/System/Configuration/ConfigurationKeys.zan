@@ -20,9 +20,123 @@ public class ConfigurationKeys {
     // 环境变量形式的段分隔符。
     public static string EnvironmentSeparator = "__";
 
+    private static bool IsDefaultSeps() {
+        return SectionSeparator == ":" && EnvironmentSeparator == "__";
+    }
+
+    private static bool IsTrimWs(int c) {
+        return c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12;
+    }
+
+    private static void NormalizePrefixBounds(string prefix, out int ps, out int pe) {
+        ps = 0;
+        pe = 0;
+        if (prefix == null || prefix.Length == 0) { return; }
+        int s = 0;
+        int e = prefix.Length;
+        while (s < e && IsTrimWs(prefix[s] & 255)) { s = s + 1; }
+        while (e > s && IsTrimWs(prefix[e - 1] & 255)) { e = e - 1; }
+        while (e > s && (prefix[e - 1] & 255) == 95) { e = e - 1; }
+        ps = s;
+        pe = e;
+    }
+
+    private static string CanonicalSliceDefault(string key, int start, int end) {
+        int segCount = 0;
+        int charCount = 0;
+        bool exact = (start == 0 && end == key.Length);
+        int i = start;
+        int segStart = start;
+        while (i <= end) {
+            int sepLen = 0;
+            if (i == end) {
+                sepLen = 1;
+            } else {
+                int c = key[i] & 255;
+                if (c == 58) {
+                    sepLen = 1;
+                } else if (c == 95 && i + 1 < end && (key[i + 1] & 255) == 95) {
+                    sepLen = 2;
+                    exact = false;
+                }
+            }
+            if (sepLen > 0) {
+                int slen = i - segStart;
+                if (slen > 0) {
+                    segCount = segCount + 1;
+                    charCount = charCount + slen;
+                    if (exact) {
+                        int c0 = key[segStart] & 255;
+                        if (c0 >= 97 && c0 <= 122) {
+                            exact = false;
+                        } else {
+                            for (int k = segStart + 1; k < i; k = k + 1) {
+                                int ck = key[k] & 255;
+                                if (ck >= 65 && ck <= 90) { exact = false; break; }
+                            }
+                        }
+                    }
+                } else {
+                    exact = false;
+                }
+                i = i + sepLen;
+                segStart = i;
+            } else {
+                i = i + 1;
+            }
+        }
+        if (segCount == 0) { return ""; }
+        if (exact) { return key; }
+        int outLen = charCount + segCount - 1;
+        byte[] buf = new byte[outLen];
+        int di = 0;
+        int writtenSegs = 0;
+        i = start;
+        segStart = start;
+        while (i <= end) {
+            int sepLen = 0;
+            if (i == end) {
+                sepLen = 1;
+            } else {
+                int c = key[i] & 255;
+                if (c == 58) {
+                    sepLen = 1;
+                } else if (c == 95 && i + 1 < end && (key[i + 1] & 255) == 95) {
+                    sepLen = 2;
+                }
+            }
+            if (sepLen > 0) {
+                int slen = i - segStart;
+                if (slen > 0) {
+                    if (writtenSegs > 0) {
+                        buf[di] = 58;
+                        di = di + 1;
+                    }
+                    int c0 = key[segStart] & 255;
+                    buf[di] = (byte)((c0 >= 97 && c0 <= 122) ? c0 - 32 : c0);
+                    di = di + 1;
+                    for (int k = segStart + 1; k < i; k = k + 1) {
+                        int ck = key[k] & 255;
+                        buf[di] = (byte)((ck >= 65 && ck <= 90) ? ck + 32 : ck);
+                        di = di + 1;
+                    }
+                    writtenSegs = writtenSegs + 1;
+                }
+                i = i + sepLen;
+                segStart = i;
+            } else {
+                i = i + 1;
+            }
+        }
+        return NativeMemory.GetString((nint)buf, 0, outLen);
+    }
+
     // 把任意写法的配置键规范化。
     public static string Canonical(string key) {
-        if (key == null) { return ""; }
+        if (key == null || key.Length == 0) { return ""; }
+        if (IsDefaultSeps()) {
+            return CanonicalSliceDefault(key, 0, key.Length);
+        }
         List<string> segs = SplitSegments(key);
         List<string> outSegs = new List<string>();
         for (int i = 0; i < segs.Count; i = i + 1) {
@@ -35,6 +149,28 @@ public class ConfigurationKeys {
     // 按分隔符切段：':' 与 '__' 等价。
     public static List<string> SplitSegments(string key) {
         if (key == null) { return new List<string>(); }
+        if (IsDefaultSeps()) {
+            List<string> outp = new List<string>();
+            int n = key.Length;
+            int segStart = 0;
+            int i = 0;
+            while (i < n) {
+                int c = key[i] & 255;
+                if (c == 58) {
+                    outp.Add(key.Substring(segStart, i - segStart));
+                    i = i + 1;
+                    segStart = i;
+                } else if (c == 95 && i + 1 < n && (key[i + 1] & 255) == 95) {
+                    outp.Add(key.Substring(segStart, i - segStart));
+                    i = i + 2;
+                    segStart = i;
+                } else {
+                    i = i + 1;
+                }
+            }
+            outp.Add(key.Substring(segStart, n - segStart));
+            return outp;
+        }
         string norm = key.Replace(EnvironmentSeparator, SectionSeparator);
         return norm.Split(SectionSeparator);
     }
@@ -42,24 +178,124 @@ public class ConfigurationKeys {
     // 单段规范化：首字母大写、其余小写。
     public static string NormalizeSegment(string seg) {
         if (seg == null || seg.Length == 0) { return ""; }
-        string head = seg.Substring(0, 1).ToUpper();
-        string tail = "";
-        if (seg.Length > 1) { tail = seg.Substring(1).ToLower(); }
-        return head + tail;
+        int n = seg.Length;
+        bool already = true;
+        int c0 = seg[0] & 255;
+        if (c0 >= 97 && c0 <= 122) {
+            already = false;
+        } else {
+            for (int i = 1; i < n; i = i + 1) {
+                int ci = seg[i] & 255;
+                if (ci >= 65 && ci <= 90) { already = false; break; }
+            }
+        }
+        if (already) { return seg; }
+        byte[] buf = new byte[n];
+        buf[0] = (byte)((c0 >= 97 && c0 <= 122) ? c0 - 32 : c0);
+        for (int i = 1; i < n; i = i + 1) {
+            int ci = seg[i] & 255;
+            buf[i] = (byte)((ci >= 65 && ci <= 90) ? ci + 32 : ci);
+        }
+        return NativeMemory.GetString((nint)buf, 0, n);
     }
 
     // 前缀规范化：去掉结尾的下划线，"APP_" / "APP__" / "APP" 等价于 "APP"。
     public static string NormalizePrefix(string prefix) {
-        if (prefix == null) { return ""; }
-        string p = prefix.Trim();
-        int end = p.Length;
-        while (end > 0 && (p[end - 1] & 255) == 95) { end = end - 1; }
-        return p.Substring(0, end);
+        if (prefix == null || prefix.Length == 0) { return ""; }
+        int ps = 0;
+        int pe = 0;
+        NormalizePrefixBounds(prefix, out ps, out pe);
+        if (ps >= pe) { return ""; }
+        if (ps == 0 && pe == prefix.Length) { return prefix; }
+        return prefix.Substring(ps, pe - ps);
     }
 
     // 配置键 → 环境变量名：段全部大写、用 '__' 连接、再加前缀。
     //   "Database:Port" + 前缀 "APP" → "APP__DATABASE__PORT"
     public static string ToEnvironmentName(string key, string prefix) {
+        if (IsDefaultSeps()) {
+            int ps = 0;
+            int pe = 0;
+            NormalizePrefixBounds(prefix, out ps, out pe);
+            int pLen = pe - ps;
+            int n = key == null ? 0 : key.Length;
+            int segCount = 0;
+            int charCount = 0;
+            int i = 0;
+            int segStart = 0;
+            while (i <= n) {
+                int sepLen = 0;
+                if (i == n) {
+                    sepLen = 1;
+                } else {
+                    int c = key[i] & 255;
+                    if (c == 58) {
+                        sepLen = 1;
+                    } else if (c == 95 && i + 1 < n && (key[i + 1] & 255) == 95) {
+                        sepLen = 2;
+                    }
+                }
+                if (sepLen > 0) {
+                    int slen = i - segStart;
+                    if (slen > 0) {
+                        segCount = segCount + 1;
+                        charCount = charCount + slen;
+                    }
+                    i = i + sepLen;
+                    segStart = i;
+                } else {
+                    i = i + 1;
+                }
+            }
+            int bodyLen = segCount == 0 ? 0 : charCount + (segCount - 1) * 2;
+            int totalLen = pLen > 0 ? pLen + 2 + bodyLen : bodyLen;
+            if (totalLen == 0) { return ""; }
+            byte[] buf = new byte[totalLen];
+            int di = 0;
+            if (pLen > 0) {
+                NativeMemory.Copy((nint)buf, (nint)prefix + (nint)ps, pLen);
+                buf[pLen] = 95;
+                buf[pLen + 1] = 95;
+                di = pLen + 2;
+            }
+            int writtenSegs = 0;
+            i = 0;
+            segStart = 0;
+            while (i <= n) {
+                int sepLen = 0;
+                if (i == n) {
+                    sepLen = 1;
+                } else {
+                    int c = key[i] & 255;
+                    if (c == 58) {
+                        sepLen = 1;
+                    } else if (c == 95 && i + 1 < n && (key[i + 1] & 255) == 95) {
+                        sepLen = 2;
+                    }
+                }
+                if (sepLen > 0) {
+                    int slen = i - segStart;
+                    if (slen > 0) {
+                        if (writtenSegs > 0) {
+                            buf[di] = 95;
+                            buf[di + 1] = 95;
+                            di = di + 2;
+                        }
+                        for (int k = segStart; k < i; k = k + 1) {
+                            int ck = key[k] & 255;
+                            buf[di] = (byte)((ck >= 97 && ck <= 122) ? ck - 32 : ck);
+                            di = di + 1;
+                        }
+                        writtenSegs = writtenSegs + 1;
+                    }
+                    i = i + sepLen;
+                    segStart = i;
+                } else {
+                    i = i + 1;
+                }
+            }
+            return NativeMemory.GetString((nint)buf, 0, totalLen);
+        }
         string canonical = Canonical(key);
         List<string> segs = canonical.Split(SectionSeparator);
         List<string> upper = new List<string>();
@@ -75,7 +311,27 @@ public class ConfigurationKeys {
     // 环境变量名 → 配置键：先剥前缀再规范化。
     //   "APP__DATABASE__PORT" + 前缀 "APP" → "Database:Port"
     public static string FromEnvironmentName(string envName, string prefix) {
-        if (envName == null) { return ""; }
+        if (envName == null || envName.Length == 0) { return ""; }
+        if (IsDefaultSeps()) {
+            int ps = 0;
+            int pe = 0;
+            NormalizePrefixBounds(prefix, out ps, out pe);
+            int pLen = pe - ps;
+            int offset = 0;
+            if (pLen > 0 && envName.Length >= pLen + 2
+                && (envName[pLen] & 255) == 95
+                && (envName[pLen + 1] & 255) == 95) {
+                bool match = true;
+                for (int i = 0; i < pLen; i = i + 1) {
+                    if ((envName[i] & 255) != (prefix[ps + i] & 255)) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (match) { offset = pLen + 2; }
+            }
+            return CanonicalSliceDefault(envName, offset, envName.Length);
+        }
         string rest = envName;
         string p = NormalizePrefix(prefix);
         if (p.Length > 0) {

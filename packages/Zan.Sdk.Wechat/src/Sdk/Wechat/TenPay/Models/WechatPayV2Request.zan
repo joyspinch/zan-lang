@@ -45,23 +45,90 @@ public class WechatPayV2Request {
 
     int Count() { return this.fields.Count; }
 
+    private void SiftDownOrder(int[] order, int root, int end) {
+        while (true) {
+            int child = root * 2 + 1;
+            if (child >= end) { break; }
+            int swap = root;
+            if (String.CompareOrdinal(this.fields[order[swap]].name, this.fields[order[child]].name) < 0) {
+                swap = child;
+            }
+            if (child + 1 < end
+                && String.CompareOrdinal(this.fields[order[swap]].name, this.fields[order[child + 1]].name) < 0) {
+                swap = child + 1;
+            }
+            if (swap == root) { break; }
+            int tmp = order[root];
+            order[root] = order[swap];
+            order[swap] = tmp;
+            root = swap;
+        }
+    }
+
     public string Canonical(string merchantKey) {
-        List<string> keys = new List<string>();
-        for (int i = 0; i < this.fields.Count; i = i + 1) {
+        int n = this.fields.Count;
+        int[] order = new int[n];
+        int cnt = 0;
+        int bodyLen = 0;
+        for (int i = 0; i < n; i = i + 1) {
             WechatPayV2Field field = this.fields[i];
-            if (field.name != "sign" && field.value.Length > 0) {
-                keys.Add(field.name);
+            if (field.value.Length > 0 && field.name != "sign") {
+                order[cnt] = i;
+                cnt = cnt + 1;
+                bodyLen = bodyLen + field.name.Length + 1 + field.value.Length;
             }
         }
-        keys.Sort();
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < keys.Count; i = i + 1) {
-            if (i > 0) { sb.Append("&"); }
-            sb.Append(keys[i]); sb.Append("="); sb.Append(this.Get(keys[i], ""));
+        if (cnt > 1) {
+            if (cnt <= 32) {
+                for (int i = 1; i < cnt; i = i + 1) {
+                    int idx = order[i];
+                    string key = this.fields[idx].name;
+                    int j = i - 1;
+                    while (j >= 0 && String.CompareOrdinal(this.fields[order[j]].name, key) > 0) {
+                        order[j + 1] = order[j];
+                        j = j - 1;
+                    }
+                    order[j + 1] = idx;
+                }
+            } else {
+                for (int start = (cnt - 2) / 2; start >= 0; start = start - 1) {
+                    this.SiftDownOrder(order, start, cnt);
+                }
+                for (int end = cnt - 1; end > 0; end = end - 1) {
+                    int tmp = order[end];
+                    order[end] = order[0];
+                    order[0] = tmp;
+                    this.SiftDownOrder(order, 0, end);
+                }
+            }
         }
-        if (sb.Length > 0) { sb.Append("&"); }
-        sb.Append("key="); sb.Append(merchantKey);
-        return sb.ToString();
+        int mkLen = merchantKey == null ? 0 : merchantKey.Length;
+        int totalLen = (cnt > 0 ? bodyLen + cnt : 0) + 4 + mkLen;
+        byte[] buf = new byte[totalLen];
+        nint bp = (nint)buf;
+        int di = 0;
+        for (int i = 0; i < cnt; i = i + 1) {
+            if (i > 0) { buf[di] = 38; di = di + 1; }
+            WechatPayV2Field field = this.fields[order[i]];
+            int klen = field.name.Length;
+            int vlen = field.value.Length;
+            if (klen > 0) {
+                NativeMemory.Copy(bp + (nint)di, (nint)field.name, klen);
+                di = di + klen;
+            }
+            buf[di] = 61; di = di + 1;
+            if (vlen > 0) {
+                NativeMemory.Copy(bp + (nint)di, (nint)field.value, vlen);
+                di = di + vlen;
+            }
+        }
+        if (cnt > 0) { buf[di] = 38; di = di + 1; }
+        buf[di] = 107; buf[di + 1] = 101; buf[di + 2] = 121; buf[di + 3] = 61;
+        di = di + 4;
+        if (mkLen > 0) {
+            NativeMemory.Copy(bp + (nint)di, (nint)merchantKey, mkLen);
+        }
+        return NativeMemory.GetString(bp, 0, totalLen);
     }
 
     public string Sign(string merchantKey, string signType) {
@@ -122,90 +189,163 @@ public class WechatPayV2Request {
         return this.ToXml();
     }
 
+    private void SetValidated(string name, string fieldValue) {
+        int i = this.Index(name);
+        if (i >= 0) { this.fields[i].value = fieldValue; }
+        else { this.fields.Add(new WechatPayV2Field(name, fieldValue)); }
+    }
+
     public string ToXml() {
-        StringBuilder sb = new StringBuilder();
-        sb.Append("<xml>");
-        for (int i = 0; i < this.fields.Count; i = i + 1) {
-            sb.Append("<"); sb.Append(this.fields[i].name); sb.Append("><![CDATA[");
-            string v = this.fields[i].value == null ? "" : this.fields[i].value;
-            int from = 0;
-            int hit = XmlUtil.IndexOf(v, "]]>", from);
-            while (hit >= 0) {
-                sb.Append(v.Substring(from, hit + 2 - from));
-                sb.Append("]]><![CDATA[>");
-                from = hit + 3;
-                hit = XmlUtil.IndexOf(v, "]]>", from);
+        int n = this.fields.Count;
+        int totalLen = 11; // "<xml></xml>"
+        int cdataHits = 0;
+        int firstCdataField = -1;
+        for (int i = 0; i < n; i = i + 1) {
+            WechatPayV2Field f = this.fields[i];
+            string v = f.value == null ? "" : f.value;
+            int vlen = v.Length;
+            totalLen = totalLen + f.name.Length * 2 + vlen + 17;
+            if (vlen >= 3) {
+                int hit = XmlUtil.FindCdataEnd(v, 0, vlen);
+                if (hit >= 0) {
+                    if (firstCdataField < 0) { firstCdataField = i; }
+                    while (hit >= 0) {
+                        cdataHits = cdataHits + 1;
+                        hit = XmlUtil.FindCdataEnd(v, hit + 3, vlen);
+                    }
+                }
             }
-            sb.Append(from == 0 ? v : v.Substring(from, v.Length - from));
-            sb.Append("]]></"); sb.Append(this.fields[i].name); sb.Append(">");
         }
-        sb.Append("</xml>");
-        return sb.ToString();
+        totalLen = totalLen + cdataHits * 12;
+        byte[] buf = new byte[totalLen];
+        nint bp = (nint)buf;
+        NativeMemory.Copy(bp, (nint)"<xml>", 5);
+        int di = 5;
+        for (int i = 0; i < n; i = i + 1) {
+            WechatPayV2Field f = this.fields[i];
+            string fname = f.name;
+            string v = f.value == null ? "" : f.value;
+            int klen = fname.Length;
+            int vlen = v.Length;
+            nint kp = (nint)fname;
+            buf[di] = 60; di = di + 1;
+            if (klen > 0) { NativeMemory.Copy(bp + (nint)di, kp, klen); di = di + klen; }
+            NativeMemory.Copy(bp + (nint)di, (nint)"><![CDATA[", 10); di = di + 10;
+            if (vlen > 0) {
+                if (firstCdataField < 0 || i < firstCdataField || vlen < 3) {
+                    NativeMemory.Copy(bp + (nint)di, (nint)v, vlen);
+                    di = di + vlen;
+                } else {
+                    nint vp = (nint)v;
+                    int from = 0;
+                    int hit = XmlUtil.FindCdataEnd(v, 0, vlen);
+                    while (hit >= 0) {
+                        int seg = hit + 2 - from;
+                        if (seg > 0) { NativeMemory.Copy(bp + (nint)di, vp + (nint)from, seg); di = di + seg; }
+                        NativeMemory.Copy(bp + (nint)di, (nint)"]]><![CDATA[>", 13);
+                        di = di + 13;
+                        from = hit + 3;
+                        hit = XmlUtil.FindCdataEnd(v, from, vlen);
+                    }
+                    int tail = vlen - from;
+                    if (tail > 0) { NativeMemory.Copy(bp + (nint)di, vp + (nint)from, tail); di = di + tail; }
+                }
+            }
+            NativeMemory.Copy(bp + (nint)di, (nint)"]]></", 5); di = di + 5;
+            if (klen > 0) { NativeMemory.Copy(bp + (nint)di, kp, klen); di = di + klen; }
+            buf[di] = 62; di = di + 1;
+        }
+        NativeMemory.Copy(bp + (nint)di, (nint)"</xml>", 6);
+        return NativeMemory.GetString(bp, 0, totalLen);
     }
 
     public static WechatPayV2Request ParseXml(string xml) {
         WechatPayV2Request result = new WechatPayV2Request();
         if (xml == null || xml.Length == 0) { return result; }
-        int pos = XmlUtil.IndexOf(xml, "<xml", 0);
+        int xlen = xml.Length;
+        nint xp = (nint)xml;
+        int pos = xml.IndexOf("<xml", 0);
         if (pos < 0) { return result; }
-        pos = XmlUtil.IndexOf(xml, ">", pos);
-        if (pos < 0) { return result; }
-        pos = pos + 1;
-        int xmlEnd = XmlUtil.IndexOf(xml, "</xml>", pos);
-        if (xmlEnd < 0) { xmlEnd = xml.Length; }
+        int rootGt = NativeMemory.Find(xp, pos + 4, 62, xlen - (pos + 4));
+        if (rootGt < 0) { return result; }
+        pos = rootGt + 1;
+        int xmlEnd = xml.IndexOf("</xml>", pos);
+        if (xmlEnd < 0) { xmlEnd = xlen; }
         while (pos < xmlEnd) {
-            int open = XmlUtil.IndexOf(xml, "<", pos);
-            if (open < 0 || open >= xmlEnd) { break; }
-            if (open + 1 >= xmlEnd) { break; }
+            int open = NativeMemory.Find(xp, pos, 60, xmlEnd - pos);
+            if (open < 0 || open + 1 >= xmlEnd) { break; }
             int nextC = xml[open + 1] & 255;
             if (nextC == 47) { break; } // '</'
             if (nextC == 33) { // '<!' comment or declaration
                 if (open + 3 < xmlEnd && (xml[open + 2] & 255) == 45 && (xml[open + 3] & 255) == 45) {
-                    int cEnd = XmlUtil.IndexOf(xml, "-->", open + 4);
+                    int cEnd = xml.IndexOf("-->", open + 4);
                     if (cEnd < 0 || cEnd >= xmlEnd) { break; }
                     pos = cEnd + 3;
                     continue;
                 }
-                int dEnd = XmlUtil.IndexOf(xml, ">", open + 2);
+                int dEnd = NativeMemory.Find(xp, open + 2, 62, xmlEnd - (open + 2));
                 if (dEnd < 0 || dEnd >= xmlEnd) { break; }
                 pos = dEnd + 1;
                 continue;
             }
             if (nextC == 63) { // '<?' processing instruction
-                int pEnd = XmlUtil.IndexOf(xml, "?>", open + 2);
+                int pEnd = xml.IndexOf("?>", open + 2);
                 if (pEnd < 0 || pEnd >= xmlEnd) { break; }
                 pos = pEnd + 2;
                 continue;
             }
-            int gt = XmlUtil.IndexOf(xml, ">", open + 1);
+            int gt = NativeMemory.Find(xp, open + 1, 62, xmlEnd - (open + 1));
             if (gt < 0 || gt > xmlEnd) { break; }
             bool selfClosing = gt > open + 1 && (xml[gt - 1] & 255) == 47;
             int nameLimit = selfClosing ? gt - 1 : gt;
+            int nameStart = open + 1;
             int nameEnd = nameLimit;
-            int scan = open + 1;
-            while (scan < nameLimit) {
-                int c = xml[scan] & 255;
-                if (c == 32 || c == 9 || c == 13 || c == 10) {
-                    nameEnd = scan; break;
+            bool nameValid = nameStart < nameLimit;
+            if (nameValid) {
+                int c0 = xml[nameStart] & 255;
+                if (c0 == 32 || c0 == 9 || c0 == 13 || c0 == 10) {
+                    nameEnd = nameStart;
+                    nameValid = false;
+                } else {
+                    nameValid = (c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122) || c0 == 95;
+                    int scan = nameStart + 1;
+                    while (scan < nameLimit) {
+                        int c = xml[scan] & 255;
+                        if (c == 32 || c == 9 || c == 13 || c == 10) {
+                            nameEnd = scan; break;
+                        }
+                        if (nameValid && !((c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+                            || (c >= 48 && c <= 57) || c == 95 || c == 45 || c == 46 || c == 58)) {
+                            nameValid = false;
+                        }
+                        scan = scan + 1;
+                    }
                 }
-                scan = scan + 1;
             }
-            string name = xml.Substring(open + 1, nameEnd - open - 1);
+            int nameLen = nameEnd - nameStart;
             if (selfClosing) {
-                if (name.Length > 0) { result.Set(name, ""); }
+                if (nameLen > 0) {
+                    string name = xml.Substring(nameStart, nameLen);
+                    if (!nameValid) {
+                        throw new ArgumentException("微信支付 V2 XML 字段名非法: " + name);
+                    }
+                    result.SetValidated(name, "");
+                }
                 pos = gt + 1;
                 continue;
             }
-            string close = "</" + name + ">";
-            int end = XmlUtil.IndexOf(xml, close, gt + 1);
+            int end = XmlUtil.FindCloseTagSlice(xml, xp, gt + 1, xmlEnd, nameStart, nameLen);
             if (end < 0 || end > xmlEnd) {
                 pos = gt + 1;
                 continue;
             }
-            string fieldValue = XmlUtil.StripCdata(xml.Substring(gt + 1,
-                                                   end - gt - 1));
-            result.Set(name, fieldValue);
-            pos = end + close.Length;
+            string name = xml.Substring(nameStart, nameLen);
+            if (!nameValid) {
+                throw new ArgumentException("微信支付 V2 XML 字段名非法: " + name);
+            }
+            string fieldValue = XmlUtil.StripCdataSlice(xml, gt + 1, end);
+            result.SetValidated(name, fieldValue);
+            pos = end + nameLen + 3;
         }
         return result;
     }

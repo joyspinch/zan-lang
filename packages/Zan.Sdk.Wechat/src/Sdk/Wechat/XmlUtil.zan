@@ -5,56 +5,217 @@ namespace Sdk.Wechat;
 
 // 微信推送/回复 XML 的极简标签读写（微信报文字段普遍包在 CDATA 中）。
 public class XmlUtil {
+    private static bool IsTrimWs(int c) {
+        return c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12;
+    }
+
+    private static int FindOpenTag(string xml, nint xp, int n, string tag, int tlen, int termByte) {
+        int need = tlen + 2;
+        if (need > n) { return -1; }
+        if (tlen == 0) {
+            int pos = 0;
+            while (pos + 2 <= n) {
+                int lt = NativeMemory.Find(xp, pos, 60, n - pos);
+                if (lt < 0 || lt + 2 > n) { return -1; }
+                if ((xml[lt + 1] & 255) == termByte) { return lt; }
+                pos = lt + 1;
+            }
+            return -1;
+        }
+        int t0 = tag[0] & 255;
+        int pos = 1;
+        int maxHit = n - tlen;
+        while (pos < maxHit) {
+            int hit = NativeMemory.Find(xp, pos, (byte)t0, maxHit - pos);
+            if (hit < 0) { return -1; }
+            if ((xml[hit - 1] & 255) == 60 && (xml[hit + tlen] & 255) == termByte) {
+                bool eq = true;
+                for (int i = 1; i < tlen; i = i + 1) {
+                    if ((xml[hit + i] & 255) != (tag[i] & 255)) { eq = false; break; }
+                }
+                if (eq) { return hit - 1; }
+            }
+            pos = hit + 1;
+        }
+        return -1;
+    }
+
+    private static int FindCloseTag(string xml, nint xp, int start, int limit, string tag, int tlen) {
+        int need = tlen + 3;
+        if (start + need > limit) { return -1; }
+        if (tlen == 0) {
+            int pos = start;
+            while (pos + 3 <= limit) {
+                int lt = NativeMemory.Find(xp, pos, 60, limit - pos);
+                if (lt < 0 || lt + 3 > limit) { return -1; }
+                if ((xml[lt + 1] & 255) == 47 && (xml[lt + 2] & 255) == 62) { return lt; }
+                pos = lt + 1;
+            }
+            return -1;
+        }
+        int t0 = tag[0] & 255;
+        int pos = start + 2;
+        int maxHit = limit - tlen;
+        while (pos < maxHit) {
+            int hit = NativeMemory.Find(xp, pos, (byte)t0, maxHit - pos);
+            if (hit < 0) { return -1; }
+            if ((xml[hit - 1] & 255) == 47 && (xml[hit - 2] & 255) == 60 && (xml[hit + tlen] & 255) == 62) {
+                bool eq = true;
+                for (int i = 1; i < tlen; i = i + 1) {
+                    if ((xml[hit + i] & 255) != (tag[i] & 255)) { eq = false; break; }
+                }
+                if (eq) { return hit - 2; }
+            }
+            pos = hit + 1;
+        }
+        return -1;
+    }
+
+    internal static int FindCloseTagSlice(string xml, nint xp, int start, int limit, int nameStart, int nameLen) {
+        int need = nameLen + 3;
+        if (start + need > limit) { return -1; }
+        if (nameLen == 0) {
+            int pos = start;
+            while (pos + 3 <= limit) {
+                int lt = NativeMemory.Find(xp, pos, 60, limit - pos);
+                if (lt < 0 || lt + 3 > limit) { return -1; }
+                if ((xml[lt + 1] & 255) == 47 && (xml[lt + 2] & 255) == 62) { return lt; }
+                pos = lt + 1;
+            }
+            return -1;
+        }
+        int t0 = xml[nameStart] & 255;
+        int pos = start + 2;
+        int maxHit = limit - nameLen;
+        while (pos < maxHit) {
+            int hit = NativeMemory.Find(xp, pos, (byte)t0, maxHit - pos);
+            if (hit < 0) { return -1; }
+            if ((xml[hit - 1] & 255) == 47 && (xml[hit - 2] & 255) == 60 && (xml[hit + nameLen] & 255) == 62) {
+                bool eq = true;
+                for (int i = 1; i < nameLen; i = i + 1) {
+                    if ((xml[hit + i] & 255) != (xml[nameStart + i] & 255)) { eq = false; break; }
+                }
+                if (eq) { return hit - 2; }
+            }
+            pos = hit + 1;
+        }
+        return -1;
+    }
+
+    internal static int FindCdataEnd(string s, int from, int limit) {
+        int maxPos = limit - 3;
+        for (int pos = from; pos <= maxPos; pos = pos + 1) {
+            if ((s[pos] & 255) == 93 && (s[pos + 1] & 255) == 93 && (s[pos + 2] & 255) == 62) {
+                return pos;
+            }
+        }
+        return -1;
+    }
+
+    internal static string StripCdataSlice(string s, int start, int end) {
+        int a = start;
+        int b = end;
+        while (a < b && XmlUtil.IsTrimWs(s[a] & 255)) { a = a + 1; }
+        while (b > a && XmlUtil.IsTrimWs(s[b - 1] & 255)) { b = b - 1; }
+        int len = b - a;
+        if (len == 0) { return ""; }
+        if (len >= 12
+            && (s[a] & 255) == 60
+            && (s[a + 1] & 255) == 33
+            && (s[a + 2] & 255) == 91
+            && (s[a + 3] & 255) == 67
+            && (s[a + 4] & 255) == 68
+            && (s[a + 5] & 255) == 65
+            && (s[a + 6] & 255) == 84
+            && (s[a + 7] & 255) == 65
+            && (s[a + 8] & 255) == 91) {
+            int close = XmlUtil.FindCdataEnd(s, a + 9, b);
+            if (close >= 0) {
+                return s.Substring(a + 9, close - (a + 9));
+            }
+        }
+        if (a == 0 && b == s.Length) { return s; }
+        return s.Substring(a, len);
+    }
+
     public static string GetTag(string xml, string tag) {
-        string open = "<" + tag + ">";
-        string close = "</" + tag + ">";
-        int start = XmlUtil.IndexOf(xml, open, 0);
+        if (xml == null || tag == null) { return ""; }
+        int n = xml.Length;
+        int tlen = tag.Length;
+        if (n == 0) { return ""; }
+        nint xp = (nint)xml;
+        int start = XmlUtil.FindOpenTag(xml, xp, n, tag, tlen, 62);
         if (start < 0) {
-            open = "<" + tag + " ";
-            start = XmlUtil.IndexOf(xml, open, 0);
+            start = XmlUtil.FindOpenTag(xml, xp, n, tag, tlen, 32);
             if (start < 0) { return ""; }
-            int gt = XmlUtil.IndexOf(xml, ">", start);
+            int gt = NativeMemory.Find(xp, start + tlen + 2, 62, n - (start + tlen + 2));
             if (gt < 0) { return ""; }
             start = gt + 1;
         } else {
-            start = start + open.Length;
+            start = start + tlen + 2;
         }
-        int end = XmlUtil.IndexOf(xml, close, start);
+        int end = XmlUtil.FindCloseTag(xml, xp, start, n, tag, tlen);
         if (end < 0) { return ""; }
-        return XmlUtil.StripCdata(xml.Substring(start, end - start));
+        return XmlUtil.StripCdataSlice(xml, start, end);
     }
 
     public static string StripCdata(string s) {
-        string t = s.Trim();
-        if (t.Length >= 12 && t.Substring(0, 9) == "<![CDATA[") {
-            int close = XmlUtil.IndexOf(t, "]]>", 9);
-            if (close >= 0) {
-                return t.Substring(9, close - 9);
-            }
-        }
-        return t;
+        if (s == null || s.Length == 0) { return ""; }
+        return XmlUtil.StripCdataSlice(s, 0, s.Length);
     }
 
     public static string CdataTag(string tag, string text) {
         string safe = text == null ? "" : text;
-        if (safe.IndexOf("]]>") >= 0) {
-            StringBuilder sb = new StringBuilder(safe.Length + 16);
-            int from = 0;
-            int hit = safe.IndexOf("]]>", from);
-            while (hit >= 0) {
-                sb.Append(safe.Substring(from, hit + 2 - from));
-                sb.Append("]]><![CDATA[>");
-                from = hit + 3;
-                hit = safe.IndexOf("]]>", from);
-            }
-            sb.Append(safe.Substring(from, safe.Length - from));
-            safe = sb.ToString();
+        int tlen = tag.Length;
+        int slen = safe.Length;
+        nint sp = (nint)safe;
+        int hit = XmlUtil.FindCdataEnd(safe, 0, slen);
+        if (hit < 0) {
+            int total = tlen * 2 + slen + 17;
+            byte[] buf = new byte[total];
+            nint bp = (nint)buf;
+            nint tp = (nint)tag;
+            int di = 0;
+            buf[di] = 60; di = di + 1;
+            if (tlen > 0) { NativeMemory.Copy(bp + (nint)di, tp, tlen); di = di + tlen; }
+            NativeMemory.Copy(bp + (nint)di, (nint)"><![CDATA[", 10); di = di + 10;
+            if (slen > 0) { NativeMemory.Copy(bp + (nint)di, sp, slen); di = di + slen; }
+            NativeMemory.Copy(bp + (nint)di, (nint)"]]></", 5); di = di + 5;
+            if (tlen > 0) { NativeMemory.Copy(bp + (nint)di, tp, tlen); di = di + tlen; }
+            buf[di] = 62;
+            return NativeMemory.GetString(bp, 0, total);
         }
-        return "<" + tag + "><![CDATA[" + safe + "]]></" + tag + ">";
+        StringBuilder sb = new StringBuilder(tlen * 2 + slen + 32);
+        sb.Append("<"); sb.Append(tag); sb.Append("><![CDATA[");
+        int from = 0;
+        while (hit >= 0) {
+            sb.Append(new StringView(sp + (nint)from, hit + 2 - from));
+            sb.Append("]]><![CDATA[>");
+            from = hit + 3;
+            hit = XmlUtil.FindCdataEnd(safe, from, slen);
+        }
+        if (slen > from) { sb.Append(new StringView(sp + (nint)from, slen - from)); }
+        sb.Append("]]></"); sb.Append(tag); sb.Append(">");
+        return sb.ToString();
     }
 
     public static string TextTag(string tag, string text) {
-        return "<" + tag + ">" + Encoding.XmlEscape(text == null ? "" : text, false, false) + "</" + tag + ">";
+        string esc = Encoding.XmlEscape(text == null ? "" : text, false, false);
+        int tlen = tag.Length;
+        int elen = esc.Length;
+        int total = tlen * 2 + elen + 5;
+        byte[] buf = new byte[total];
+        nint bp = (nint)buf;
+        nint tp = (nint)tag;
+        int di = 0;
+        buf[di] = 60; di = di + 1;
+        if (tlen > 0) { NativeMemory.Copy(bp + (nint)di, tp, tlen); di = di + tlen; }
+        buf[di] = 62; di = di + 1;
+        if (elen > 0) { NativeMemory.Copy(bp + (nint)di, (nint)esc, elen); di = di + elen; }
+        buf[di] = 60; buf[di + 1] = 47; di = di + 2;
+        if (tlen > 0) { NativeMemory.Copy(bp + (nint)di, tp, tlen); di = di + tlen; }
+        buf[di] = 62;
+        return NativeMemory.GetString(bp, 0, total);
     }
 
     public static int IndexOf(string hay, string needle, int from) {
