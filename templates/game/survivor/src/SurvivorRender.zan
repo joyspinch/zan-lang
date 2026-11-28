@@ -1,0 +1,886 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Game.Graphics;
+
+namespace Survivor;
+
+// 世界绘制（只读逻辑状态，不改任何规则）：程序化地面与装饰、地面预警、宝石拖尾、
+// Y 排序的角色/怪物剪影（描边、走路摆动、受击闪白）、武器特效、粒子与暗角。
+// 坐标：世界点 (wx, wy) → 屏幕 (wx - camX + 视口半宽 + 震屏, ...)；HUD 用同一换算。
+public partial class SurvivorGame {
+    int viewOx;     // 本帧世界原点在画布上的偏移
+    int viewOy;
+    int viewW;
+    int viewH;
+    double renderTime;
+
+    static int Outline = unchecked((int)0xFF10140F);
+
+    public int ScreenX(double wx, int width) { return (int)(wx - camX + shake.OffsetX) + width / 2; }
+    public int ScreenY(double wy, int height) { return (int)(wy - camY + shake.OffsetY) + height / 2; }
+
+    int SX(double wx) { return (int)(wx - camX + shake.OffsetX) + viewOx; }
+    int SY(double wy) { return (int)(wy - camY + shake.OffsetY) + viewOy; }
+
+    // 画布整幅绘制；top = 原生标题栏以下的内容起点
+    public void Render(Canvas c, int top, double frameTime) {
+        if (c == null) { return; }
+        renderTime = frameTime;
+        viewW = c.Width();
+        viewH = c.Height() - top;
+        viewOx = viewW / 2;
+        viewOy = top + viewH / 2;
+        c.PushClip(0, top, viewW, viewH);
+        DrawGround(c, top);
+        DrawDecals(c);
+        DrawGems(c);
+        if (HasWeapon(SurvivorData.WAura) && !dead) { DrawAura(c); }
+        DrawActors(c);
+        DrawPlayerFx(c);
+        DrawEnemyShots(c);
+        DrawZaps(c);
+        DrawParticles(c);
+        DrawVignette(c, top);
+        c.PopClip();
+    }
+
+    // ---------------- 地面 ----------------
+
+    static int Hash(int x, int y) {
+        long h = ((long)x * 374761393L + (long)y * 668265263L) & 4294967295L;
+        h = ((h ^ (h >> 13)) * 1274126177L) & 4294967295L;
+        h = h ^ (h >> 16);
+        return (int)(h & 2147483647L);
+    }
+
+    void DrawGround(Canvas c, int top) {
+        c.FillRect(0, top, viewW, viewH, unchecked((int)0xFF26302A));
+        int tile = 160;
+        double left = camX - shake.OffsetX - (double)(viewW / 2);
+        double up = camY - shake.OffsetY - (double)(viewH / 2);
+        int tx0 = (int)Math.Floor(left / (double)tile) - 1;
+        int ty0 = (int)Math.Floor(up / (double)tile) - 1;
+        int tx1 = tx0 + viewW / tile + 3;
+        int ty1 = ty0 + viewH / tile + 3;
+        // 第一层：大块明暗斑（土、苔），打破平铺感
+        for (int ty = ty0; ty <= ty1; ty = ty + 1) {
+            for (int tx = tx0; tx <= tx1; tx = tx + 1) {
+                int h = SurvivorGame.Hash(tx, ty);
+                int cx = SX((double)(tx * tile + 40 + h % 80));
+                int cy = SY((double)(ty * tile + 40 + (h >> 8) % 80));
+                int kind = (h >> 4) % 4;
+                if (kind == 0) { c.FillRadial(cx, cy, 120 + h % 60, unchecked((int)0xFF35482F), 150); }
+                else if (kind == 1) { c.FillRadial(cx, cy, 100 + h % 50, unchecked((int)0xFF181F1C), 140); }
+                else if (kind == 2) { c.FillRadial(cx, cy, 90 + h % 40, unchecked((int)0xFF3D3628), 140); }
+            }
+        }
+        // 第二层：细节（裂缝、草丛、碎石、符文、骸骨）
+        for (int ty = ty0; ty <= ty1; ty = ty + 1) {
+            for (int tx = tx0; tx <= tx1; tx = tx + 1) {
+                int h = SurvivorGame.Hash(tx * 3 + 11, ty * 5 + 7);
+                for (int k = 0; k < 3; k = k + 1) {
+                    int hk = SurvivorGame.Hash(h + k * 97, k * 31 + tx);
+                    int px = SX((double)(tx * tile + hk % tile));
+                    int py = SY((double)(ty * tile + (hk >> 9) % tile));
+                    int pick = (hk >> 3) % 16;
+                    if (pick < 5) { DrawTuft(c, px, py, hk); }
+                    else if (pick < 8) { DrawPebbles(c, px, py, hk); }
+                    else if (pick < 10) { DrawCrack(c, px, py, hk); }
+                    else if (pick == 10 && k == 0) { DrawRune(c, px, py, hk); }
+                    else if (pick == 11 && k == 1) { DrawBones(c, px, py, hk); }
+                }
+            }
+        }
+        DrawWorldEdge(c, top);
+    }
+
+    void DrawTuft(Canvas c, int x, int y, int h) {
+        int sway = (int)(Math.Sin(renderTime * 1.7 + (double)(h % 50)) * 2.0);
+        int dark = unchecked((int)0xFF2F4A31);
+        int lite = unchecked((int)0xFF4F7A46);
+        c.FillRoundRect(x - 8, y - 1, 16, 4, 2, unchecked((int)0x55000000));
+        c.DrawLine(x - 6, y, x - 11 + sway, y - 13, dark, 3);
+        c.DrawLine(x, y, x + sway, y - 18, lite, 3);
+        c.DrawLine(x + 5, y, x + 10 + sway, y - 12, dark, 3);
+        c.DrawLine(x - 2, y, x - 4 + sway, y - 15, unchecked((int)0xFF6E9A55), 2);
+        if (h % 3 == 0) { c.FillCircle(x + sway, y - 19, 2, unchecked((int)0xFFE8D27A)); }
+    }
+
+    void DrawPebbles(Canvas c, int x, int y, int h) {
+        int n = 2 + h % 2;
+        for (int i = 0; i < n; i = i + 1) {
+            int ox = (h >> (i * 3)) % 18 - 9;
+            int oy = (h >> (i * 4 + 2)) % 10 - 5;
+            int s = 3 + (h >> (i + 5)) % 4;
+            c.FillRoundRect(x + ox - s, y + oy - s / 2 + 2, s * 2, s, s / 2, unchecked((int)0x44000000));
+            c.FillRoundRect(x + ox - s, y + oy - s / 2, s * 2, s, s / 2, unchecked((int)0xFF3E4842));
+            c.FillRoundRect(x + ox - s + 1, y + oy - s / 2, s, s / 2, s / 4, unchecked((int)0xFF5A6660));
+        }
+    }
+
+    void DrawCrack(Canvas c, int x, int y, int h) {
+        int col = unchecked((int)0xFF111814);
+        int x1 = x + 14 + h % 10;
+        int y1 = y + (h >> 4) % 12 - 6;
+        int x2 = x1 + 10 + (h >> 7) % 12;
+        int y2 = y1 + (h >> 9) % 14 - 4;
+        c.DrawLine(x, y, x1, y1, col, 2);
+        c.DrawLine(x1, y1, x2, y2, col, 1);
+        c.DrawLine(x1, y1, x1 + 4, y1 + 9, col, 1);
+        c.DrawLine(x, y + 1, x1, y1 + 1, unchecked((int)0x22FFFFFF), 1);
+    }
+
+    void DrawRune(Canvas c, int x, int y, int h) {
+        double pulse = 0.5 + 0.5 * Math.Sin(renderTime * 1.3 + (double)(h % 17));
+        int a = 50 + (int)(pulse * 70.0);
+        int col = SurvivorData.Alpha(unchecked((int)0xFF3FD1C4), a);
+        c.FillRadial(x, y, 34, unchecked((int)0xFF3FD1C4), 18 + (int)(pulse * 20.0));
+        c.DrawCircle(x, y, 22, col, 1);
+        c.DrawCircle(x, y, 15, SurvivorData.Alpha(col, a / 2), 1);
+        for (int k = 0; k < 4; k = k + 1) {
+            double ang = (double)k * SurvivorData.Pi * 0.5 + (double)(h % 7) * 0.3;
+            int ix = x + (int)(Math.Cos(ang) * 15.0);
+            int iy = y + (int)(Math.Sin(ang) * 15.0);
+            int ox = x + (int)(Math.Cos(ang) * 22.0);
+            int oy = y + (int)(Math.Sin(ang) * 22.0);
+            c.DrawLine(ix, iy, ox, oy, col, 2);
+        }
+        c.FillCircle(x, y, 3, col);
+    }
+
+    void DrawBones(Canvas c, int x, int y, int h) {
+        int bone = unchecked((int)0xFFB9B29A);
+        int dark = unchecked((int)0xFF7D7764);
+        c.FillRoundRect(x - 10, y + 2, 22, 5, 2, unchecked((int)0x44000000));
+        c.DrawLine(x - 9, y - 2, x + 9, y + 3, bone, 3);
+        c.FillCircle(x - 9, y - 3, 3, bone);
+        c.FillCircle(x + 9, y + 4, 3, bone);
+        if (h % 2 == 0) {
+            // 小骷髅
+            c.FillCircle(x + 16, y - 4, 6, bone);
+            c.FillRoundRect(x + 12, y, 8, 5, 2, bone);
+            c.FillCircle(x + 14, y - 4, 2, dark);
+            c.FillCircle(x + 18, y - 4, 2, dark);
+        }
+    }
+
+    // 世界边界：外侧深渊 + 一圈石墙立柱
+    void DrawWorldEdge(Canvas c, int top) {
+        int l = SX(0.0);
+        int r = SX(SurvivorData.WorldW);
+        int t = SY(0.0);
+        int b = SY(SurvivorData.WorldH);
+        int abyss = unchecked((int)0xFF0A0D0C);
+        if (l > 0) { c.FillRect(0, top, l, viewH, abyss); }
+        if (r < viewW) { c.FillRect(r, top, viewW - r, viewH, abyss); }
+        if (t > top) { c.FillRect(0, top, viewW, t - top, abyss); }
+        if (b < top + viewH) { c.FillRect(0, b, viewW, top + viewH - b, abyss); }
+        int wall = unchecked((int)0xFF39423D);
+        int cap = unchecked((int)0xFF55605A);
+        if (l > -20 && l < viewW + 20) { c.FillRect(l - 6, t, 12, b - t, wall); }
+        if (r > -20 && r < viewW + 20) { c.FillRect(r - 6, t, 12, b - t, wall); }
+        if (t > top - 20 && t < top + viewH + 20) { c.FillRect(l, t - 6, r - l, 12, wall); }
+        if (b > top - 20 && b < top + viewH + 20) { c.FillRect(l, b - 6, r - l, 12, wall); }
+        for (int k = 0; k <= (int)(SurvivorData.WorldW / 120.0); k = k + 1) {
+            double w = (double)k * 120.0;
+            int px = SX(w);
+            if (px > -30 && px < viewW + 30) {
+                if (t > top - 40 && t < top + viewH + 40) { DrawPillar(c, px, t); }
+                if (b > top - 40 && b < top + viewH + 40) { DrawPillar(c, px, b); }
+            }
+            int py = SY(w);
+            if (py > top - 40 && py < top + viewH + 40) {
+                if (l > -30 && l < viewW + 30) { DrawPillar(c, l, py); }
+                if (r > -30 && r < viewW + 30) { DrawPillar(c, r, py); }
+            }
+        }
+        c.DrawLine(l, t, r, t, cap, 2);
+    }
+
+    void DrawPillar(Canvas c, int x, int y) {
+        c.FillRoundRect(x - 12, y + 4, 24, 8, 4, unchecked((int)0x66000000));
+        c.FillRoundRect(x - 10, y - 26, 20, 32, 3, unchecked((int)0xFF3D4641));
+        c.FillRoundRect(x - 10, y - 26, 7, 32, 3, unchecked((int)0xFF4F5953));
+        c.FillRoundRect(x - 13, y - 31, 26, 8, 2, unchecked((int)0xFF5C6862));
+    }
+
+    // ---------------- 地面预警与爆炸 ----------------
+
+    void DrawDecals(Canvas c) {
+        for (int i = 0; i < blasts.Count; i = i + 1) {
+            Blast b = blasts[i];
+            if (!b.active) { continue; }
+            double k = 1.0 - b.life / 0.4;
+            int r = (int)(b.radius * (0.4 + 0.6 * k));
+            int a = (int)(220.0 * (1.0 - k));
+            c.FillRadial(SX(b.x), SY(b.y), r, b.color, a / 2);
+            c.DrawCircle(SX(b.x), SY(b.y), r, SurvivorData.Alpha(b.color, a), 4);
+            c.FillCircle(SX(b.x), SY(b.y), (int)((double)r * 0.35 * (1.0 - k)), SurvivorData.Alpha(unchecked((int)0xFFFFF3C4), a));
+        }
+        for (int i = 0; i < enemies.Count; i = i + 1) {
+            Enemy e = enemies[i];
+            if (!e.active) { continue; }
+            if (e.kind == SurvivorData.KBoss && e.state == 1) {
+                // 首领砸地预警：红圈由内向外填满
+                double k = 1.0 - e.stateTimer / 1.2;
+                int x = SX(e.telX);
+                int y = SY(e.telY);
+                c.FillRadial(x, y, 118, unchecked((int)0xFFFF3B30), 40 + (int)(k * 60.0));
+                c.FillCircle(x, y, (int)(118.0 * k), unchecked((int)0x40FF3B30));
+                c.DrawCircle(x, y, 118, unchecked((int)0xD0FF5A4F), 3);
+                c.DrawCircle(x, y, (int)(118.0 * k), unchecked((int)0xFFFFB3A8), 2);
+            } else if (e.kind == SurvivorData.KElite && e.state == 1) {
+                // 精英冲锋道预警：一条半透明红色通道 + 箭头
+                double k = 1.0 - e.stateTimer / 0.9;
+                int x0 = SX(e.x);
+                int y0 = SY(e.y);
+                int x1 = SX(e.x + e.dirX * 250.0);
+                int y1 = SY(e.y + e.dirY * 250.0);
+                c.DrawLine(x0, y0, x1, y1, unchecked((int)0x38FF3B30), 44);
+                c.DrawLine(x0, y0, x0 + (int)((double)(x1 - x0) * k), y0 + (int)((double)(y1 - y0) * k), unchecked((int)0x66FF3B30), 44);
+                for (int s = 1; s <= 3; s = s + 1) {
+                    double f = (double)s / 4.0;
+                    int ax = x0 + (int)((double)(x1 - x0) * f);
+                    int ay = y0 + (int)((double)(y1 - y0) * f);
+                    int bx = ax - (int)(e.dirX * 14.0);
+                    int by = ay - (int)(e.dirY * 14.0);
+                    c.DrawLine(bx - (int)(e.dirY * 12.0), by + (int)(e.dirX * 12.0), ax, ay, unchecked((int)0xCCFFD0C8), 3);
+                    c.DrawLine(bx + (int)(e.dirY * 12.0), by - (int)(e.dirX * 12.0), ax, ay, unchecked((int)0xCCFFD0C8), 3);
+                }
+            } else if (e.kind == SurvivorData.KBomber && e.state == 1) {
+                double k = 1.0 - e.stateTimer / 0.75;
+                int x = SX(e.x);
+                int y = SY(e.y);
+                c.FillCircle(x, y, (int)(80.0 * k), unchecked((int)0x30FF6A3D));
+                c.DrawCircle(x, y, 80, unchecked((int)0xB0FF6A3D), 2);
+            }
+        }
+    }
+
+    // ---------------- 掉落物 ----------------
+
+    void DrawGems(Canvas c) {
+        for (int i = 0; i < gems.Count; i = i + 1) {
+            Gem g = gems[i];
+            if (!g.active) { continue; }
+            int x = SX(g.x);
+            int y = SY(g.y);
+            if (x < -30 || y < -30 || x > viewW + 30 || y > viewOy + viewH / 2 + 30) { continue; }
+            double bob = Math.Sin(renderTime * 4.0 + (double)(i % 9)) * 2.0;
+            if (g.kind == 0) {
+                int col = SurvivorData.GemColor(g.value);
+                int s = g.value >= 10 ? 9 : (g.value >= 4 ? 8 : 6);
+                if (g.pulled) {
+                    // 磁吸拖尾：沿运动方向拉一条渐隐光带
+                    double vx = g.x - g.px;
+                    double vy = g.y - g.py;
+                    int tx = x - (int)(vx * 4.0);
+                    int ty = y - (int)(vy * 4.0);
+                    c.DrawLine(tx, ty, x, y, SurvivorData.Alpha(col, 70), s + 2);
+                    c.DrawLine(x - (int)(vx * 2.0), y - (int)(vy * 2.0), x, y, SurvivorData.Alpha(col, 150), s);
+                }
+                int gy = y + (int)bob;
+                c.FillRoundRect(x - s, y + s - 1, s * 2, 4, 2, unchecked((int)0x55000000));
+                c.FillRadial(x, gy, s * 3, col, 70);
+                SurvivorGame.Diamond(c, x, gy, s + 1, SurvivorData.Shade(col, 45));
+                SurvivorGame.Diamond(c, x, gy, s, col);
+                SurvivorGame.Diamond(c, x - 1, gy - 2, s / 2, SurvivorData.Tint(col, 65));
+            } else if (g.kind == 1) {
+                int gy = y + (int)bob - 4;
+                c.FillRoundRect(x - 9, y + 6, 18, 5, 2, unchecked((int)0x55000000));
+                c.FillRadial(x, gy, 22, unchecked((int)0xFFFF4D6A), 60);
+                SurvivorGame.Heart(c, x, gy, 9, unchecked((int)0xFF7A1424));
+                SurvivorGame.Heart(c, x, gy, 7, unchecked((int)0xFFFF4D6A));
+                c.FillCircle(x - 3, gy - 3, 2, unchecked((int)0xFFFFC2CC));
+            } else if (g.kind == 2) {
+                int gy = y + (int)bob - 4;
+                c.FillRoundRect(x - 10, y + 6, 20, 5, 2, unchecked((int)0x55000000));
+                c.FillRadial(x, gy, 26, unchecked((int)0xFF4FC3FF), 70);
+                c.FillCircle(x, gy, 10, unchecked((int)0xFF1C2A4A));
+                c.FillSector(x, gy, 4, 9, 180, 360, unchecked((int)0xFFE53935));
+                c.FillRect(x - 9, gy, 5, 4, unchecked((int)0xFFDDE6F0));
+                c.FillRect(x + 4, gy, 5, 4, unchecked((int)0xFFDDE6F0));
+            } else {
+                // 宝箱
+                int gy = y + (int)(bob * 0.5) - 8;
+                double glow = 0.5 + 0.5 * Math.Sin(renderTime * 5.0);
+                c.FillRadial(x, gy, 50, unchecked((int)0xFFFFD54F), 50 + (int)(glow * 50.0));
+                c.FillRoundRect(x - 18, y + 4, 36, 8, 4, unchecked((int)0x66000000));
+                c.FillRoundRect(x - 17, gy - 8, 34, 22, 3, Outline);
+                c.FillRoundRect(x - 15, gy - 6, 30, 18, 2, unchecked((int)0xFF8A4B22));
+                c.FillRoundRect(x - 15, gy - 12, 30, 9, 4, unchecked((int)0xFFB0652E));
+                c.FillRect(x - 15, gy - 3, 30, 3, unchecked((int)0xFFFFC94A));
+                c.FillRect(x - 3, gy - 6, 6, 9, unchecked((int)0xFFFFE08A));
+            }
+        }
+    }
+
+    // ---------------- 角色与怪物（Y 排序） ----------------
+
+    void DrawActors(Canvas c) {
+        ySorter.Clear();
+        ySorter.Push(0, playerY);
+        int top = viewOy - viewH / 2;
+        for (int i = 0; i < enemies.Count; i = i + 1) {
+            Enemy e = enemies[i];
+            if (!e.active) { continue; }
+            int x = SX(e.x);
+            int y = SY(e.y);
+            int m = (int)e.radius * 3 + 20;
+            if (x < -m || x > viewW + m || y < top - m || y > top + viewH + m * 2) { continue; }
+            ySorter.Push(i + 1, e.y);
+        }
+        ySorter.Sort();
+        for (int k = 0; k < ySorter.Count; k = k + 1) {
+            int id = ySorter.GetEntityId(k);
+            if (id == 0) { DrawPlayer(c); continue; }
+            Enemy e = enemies[id - 1];
+            if (e.kind == SurvivorData.KBat) { DrawBat(c, e); }
+            else if (e.kind == SurvivorData.KBrute) { DrawBrute(c, e); }
+            else if (e.kind == SurvivorData.KSpitter) { DrawSpitter(c, e); }
+            else if (e.kind == SurvivorData.KBomber) { DrawBomber(c, e); }
+            else if (e.kind == SurvivorData.KElite) { DrawElite(c, e); }
+            else if (e.kind == SurvivorData.KBoss) { DrawBoss(c, e); }
+            else { DrawGhoul(c, e); }
+        }
+    }
+
+    static void Shadow(Canvas c, int x, int y, int w) {
+        c.FillRoundRect(x - w / 2, y - w / 7, w, w * 2 / 7, w / 7, unchecked((int)0x5A000000));
+    }
+
+    // 受击闪白：flash 期间填色向白提亮（前半段几乎纯白，后半段回落）
+    static int Fl(Enemy e, int color) { return e.flash > 0.0 ? SurvivorData.Tint(color, e.flash > 0.07 ? 85 : 55) : color; }
+
+    int FaceOf(Enemy e) { return playerX >= e.x ? 1 : -1; }
+
+    void DrawPlayer(Canvas c) {
+        int x = SX(playerX);
+        int y = SY(playerY);
+        double bob = moving ? Math.Abs(Math.Sin(walkPhase)) * 3.0 : Math.Sin(renderTime * 2.2) * 1.0;
+        int by = y - (int)bob;
+        bool blink = hurtTimer > 0.0 && ((int)(hurtTimer * 24.0) % 2 == 0);
+        int f = facing;
+        int cloak = unchecked((int)0xFF2A9D8F);
+        int cloakDark = unchecked((int)0xFF1B6A61);
+        int trim = unchecked((int)0xFFFFC53D);
+        int face = unchecked((int)0xFF0E1714);
+        int eye = unchecked((int)0xFFFFE08A);
+        if (character == 1) { cloak = unchecked((int)0xFF4A6FA5); cloakDark = unchecked((int)0xFF2D4568); trim = unchecked((int)0xFFD8DEE9); eye = unchecked((int)0xFF9FE7FF); }
+        else if (character == 2) { cloak = unchecked((int)0xFF7B4FB8); cloakDark = unchecked((int)0xFF4E2F7A); trim = unchecked((int)0xFF7FF3E6); eye = unchecked((int)0xFFB6FFF6); }
+        if (dead) { cloak = unchecked((int)0xFF5C2A2A); cloakDark = unchecked((int)0xFF3A1616); }
+        if (blink) { cloak = unchecked((int)0xFFFFFFFF); cloakDark = unchecked((int)0xFFFFB4B4); }
+        // 拾取范围提示（很淡）
+        if (!dead) { c.DrawCircle(x, y - 10, (int)MagnetRange(), unchecked((int)0x123FD1C4), 1); }
+        SurvivorGame.Shadow(c, x, y + 2, 30);
+        // 腿：走路交替
+        int step = moving ? (int)(Math.Sin(walkPhase) * 4.0) : 0;
+        c.FillRoundRect(x - 8 + step, by - 6, 6, 9, 3, Outline);
+        c.FillRoundRect(x + 2 - step, by - 6, 6, 9, 3, Outline);
+        c.FillRoundRect(x - 7 + step, by - 5, 4, 7, 2, unchecked((int)0xFF3A2E26));
+        c.FillRoundRect(x + 3 - step, by - 5, 4, 7, 2, unchecked((int)0xFF3A2E26));
+        // 斗篷（下摆宽、上窄），描边
+        c.FillRoundRect(x - 13, by - 27, 26, 25, 9, Outline);
+        c.FillRoundRect(x - 11, by - 25, 22, 21, 8, cloakDark);
+        c.FillRoundRect(x - 11 + (f > 0 ? 0 : 6), by - 25, 16, 19, 7, cloak);
+        c.FillRect(x - 11, by - 9, 22, 3, trim);
+        if (character == 1) {
+            // 守卫：圆盾
+            int sx = x + f * 12;
+            c.FillCircle(sx, by - 15, 9, Outline);
+            c.FillCircle(sx, by - 15, 7, unchecked((int)0xFF8E9AAF));
+            c.FillCircle(sx, by - 15, 3, trim);
+        }
+        // 头 / 兜帽
+        int hx = x + f * 1;
+        if (character == 2) {
+            // 秘术师：尖帽
+            SurvivorGame.Tri(c, hx - 13, by - 34, hx + 13, by - 34, hx - f * 6, by - 58, Outline);
+            SurvivorGame.Tri(c, hx - 11, by - 35, hx + 11, by - 35, hx - f * 6, by - 55, cloakDark);
+        }
+        c.FillCircle(hx, by - 33, 12, Outline);
+        c.FillCircle(hx, by - 33, 10, character == 1 ? unchecked((int)0xFF9AA6B8) : cloak);
+        if (character == 1) { c.FillRect(hx - 2, by - 47, 4, 7, unchecked((int)0xFFE04848)); }
+        c.FillRoundRect(hx - 7 + f * 3, by - 36, 13, 9, 4, face);
+        c.FillCircle(hx - 2 + f * 4, by - 32, 2, eye);
+        c.FillCircle(hx + 3 + f * 4, by - 32, 2, eye);
+        c.FillCircle(hx - 4 - f * 2, by - 39, 3, SurvivorData.Tint(cloak, 30));
+    }
+
+    void DrawGhoul(Canvas c, Enemy e) {
+        int x = SX(e.x);
+        int y = SY(e.y);
+        int f = FaceOf(e);
+        double sw = Math.Sin(e.phase);
+        int by = y - (int)(Math.Abs(sw) * 2.0);
+        int skin = Fl(e, unchecked((int)0xFF7E9C8A));
+        int dark = Fl(e, unchecked((int)0xFF4C6556));
+        int rag = Fl(e, unchecked((int)0xFF4A3F5C));
+        SurvivorGame.Shadow(c, x, y + 1, 24);
+        int st = (int)(sw * 3.0);
+        c.FillRoundRect(x - 7 + st, by - 7, 5, 9, 2, Outline);
+        c.FillRoundRect(x + 2 - st, by - 7, 5, 9, 2, Outline);
+        c.FillRoundRect(x - 6 + st, by - 6, 3, 7, 1, dark);
+        c.FillRoundRect(x + 3 - st, by - 6, 3, 7, 1, dark);
+        // 佝偻上身（向前倾）
+        c.FillRoundRect(x - 10 + f * 2, by - 24, 20, 19, 7, Outline);
+        c.FillRoundRect(x - 8 + f * 2, by - 22, 16, 15, 6, rag);
+        c.FillRect(x - 8 + f * 2, by - 12, 16, 3, Fl(e, unchecked((int)0xFF2E2838)));
+        // 前伸的手臂
+        int ax = x + f * 10;
+        c.FillRoundRect(ax - 5 + f * 3, by - 19 + (int)(sw * 1.5), 12, 5, 2, Outline);
+        c.FillRoundRect(ax - 4 + f * 3, by - 18 + (int)(sw * 1.5), 10, 3, 1, skin);
+        // 头
+        int hx = x + f * 5;
+        c.FillCircle(hx, by - 27, 8, Outline);
+        c.FillCircle(hx, by - 27, 7, skin);
+        c.FillCircle(hx - 2, by - 30, 2, SurvivorData.Tint(skin, 35));
+        c.FillCircle(hx + f * 3, by - 27, 2, unchecked((int)0xFFFFE066));
+        c.FillCircle(hx + f * 3 - f * 4, by - 27, 1, unchecked((int)0xFFFFE066));
+    }
+
+    void DrawBat(Canvas c, Enemy e) {
+        int x = SX(e.x);
+        int y = SY(e.y);
+        double flap = Math.Sin(e.phase);
+        int lift = 20 + (int)(Math.Sin(e.phase * 0.5) * 3.0);
+        int by = y - lift;
+        SurvivorGame.Shadow(c, x, y + 1, 16);
+        int body = Fl(e, unchecked((int)0xFF8E5BD6));
+        int wing = Fl(e, unchecked((int)0xFF5A3596));
+        int span = 16 + (int)(flap * 4.0);
+        int up = (int)(flap * 9.0);
+        // 两翼：三角翼面 + 翼尖下垂的第二片，拍翅时翼尖上下摆
+        for (int side = -1; side <= 1; side = side + 2) {
+            int rx = x + side * 3;
+            int tx = x + side * (3 + span);
+            SurvivorGame.Tri(c, rx, by - 5, tx + side, by - 4 - up - 1, rx, by + 4, Outline);
+            SurvivorGame.Tri(c, tx + side, by - 4 - up - 1, rx, by + 4, x + side * (3 + span * 2 / 3), by + 5 - up / 2, Outline);
+            SurvivorGame.Tri(c, rx, by - 3, tx, by - 4 - up, rx, by + 2, wing);
+            SurvivorGame.Tri(c, tx, by - 4 - up, rx, by + 2, x + side * (3 + span * 2 / 3), by + 3 - up / 2, wing);
+        }
+        c.FillCircle(x, by, 7, Outline);
+        c.FillCircle(x, by, 6, body);
+        c.FillRect(x - 5, by - 8, 3, 4, body);
+        c.FillRect(x + 2, by - 8, 3, 4, body);
+        c.FillCircle(x - 2, by - 1, 1, unchecked((int)0xFFFF4D4F));
+        c.FillCircle(x + 2, by - 1, 1, unchecked((int)0xFFFF4D4F));
+    }
+
+    void DrawBrute(Canvas c, Enemy e) {
+        int x = SX(e.x);
+        int y = SY(e.y);
+        int f = FaceOf(e);
+        double sw = Math.Sin(e.phase * 0.7);
+        int by = y - (int)(Math.Abs(sw) * 3.0);
+        int skin = Fl(e, unchecked((int)0xFFC0703F));
+        int dark = Fl(e, unchecked((int)0xFF7A4224));
+        int belt = Fl(e, unchecked((int)0xFF3B2A20));
+        SurvivorGame.Shadow(c, x, y + 2, 44);
+        int st = (int)(sw * 4.0);
+        c.FillRoundRect(x - 13 + st, by - 10, 10, 12, 4, Outline);
+        c.FillRoundRect(x + 3 - st, by - 10, 10, 12, 4, Outline);
+        c.FillRoundRect(x - 12 + st, by - 9, 8, 10, 3, dark);
+        c.FillRoundRect(x + 4 - st, by - 9, 8, 10, 3, dark);
+        // 宽厚躯干
+        c.FillRoundRect(x - 20, by - 42, 40, 36, 14, Outline);
+        c.FillRoundRect(x - 18, by - 40, 36, 32, 12, skin);
+        c.FillRoundRect(x - 18 + (f > 0 ? 18 : 0), by - 40, 18, 32, 12, SurvivorData.Shade(skin, 85));
+        c.FillRect(x - 18, by - 16, 36, 6, belt);
+        c.FillRect(x - 3, by - 16, 6, 6, Fl(e, unchecked((int)0xFFFFC53D)));
+        // 拳头
+        c.FillCircle(x - f * 20, by - 18 + (int)(sw * 3.0), 8, Outline);
+        c.FillCircle(x - f * 20, by - 18 + (int)(sw * 3.0), 6, dark);
+        c.FillCircle(x + f * 22, by - 20 - (int)(sw * 3.0), 9, Outline);
+        c.FillCircle(x + f * 22, by - 20 - (int)(sw * 3.0), 7, skin);
+        // 小头 + 角
+        int hx = x + f * 6;
+        c.FillCircle(hx, by - 44, 9, Outline);
+        c.FillCircle(hx, by - 44, 7, skin);
+        c.DrawLine(hx - 6, by - 49, hx - 10, by - 57, Fl(e, unchecked((int)0xFFE8DCC0)), 3);
+        c.DrawLine(hx + 6, by - 49, hx + 10, by - 57, Fl(e, unchecked((int)0xFFE8DCC0)), 3);
+        c.FillRect(hx - 4 + f * 2, by - 46, 8, 2, unchecked((int)0xFFFF5A3D));
+    }
+
+    void DrawSpitter(Canvas c, Enemy e) {
+        int x = SX(e.x);
+        int y = SY(e.y);
+        int f = FaceOf(e);
+        double swell = e.state == 1 ? (1.0 - e.stateTimer / 0.45) * 4.0 : Math.Sin(e.phase * 0.6) * 1.0;
+        int s = (int)swell;
+        int body = Fl(e, unchecked((int)0xFF7FC34A));
+        int dark = Fl(e, unchecked((int)0xFF4C7F2A));
+        SurvivorGame.Shadow(c, x, y + 1, 28);
+        // 圆鼓鼓的囊体
+        c.FillRoundRect(x - 13 - s, y - 26 - s, 26 + s * 2, 26 + s, 12, Outline);
+        c.FillRoundRect(x - 11 - s, y - 24 - s, 22 + s * 2, 22 + s, 11, body);
+        c.FillCircle(x - 4 - s / 2, y - 18 - s, 3, Fl(e, unchecked((int)0xFFC8F59A)));
+        c.FillCircle(x + 5, y - 9, 3, dark);
+        c.FillCircle(x - 6, y - 7, 2, dark);
+        // 嘴：蓄力时发光
+        int mouth = e.state == 1 ? unchecked((int)0xFFE7FF6B) : unchecked((int)0xFF213317);
+        c.FillCircle(x + f * 9, y - 16, 5 + s / 2, Outline);
+        c.FillCircle(x + f * 9, y - 16, 3 + s / 2, mouth);
+        if (e.state == 1) { c.FillRadial(x + f * 10, y - 16, 16, unchecked((int)0xFFB8FF5A), 120); }
+        c.FillCircle(x - f * 1, y - 21 - s, 3, unchecked((int)0xFF101010));
+        c.FillCircle(x - f * 1 + f, y - 22 - s, 1, unchecked((int)0xFFFFFFFF));
+    }
+
+    void DrawBomber(Canvas c, Enemy e) {
+        int x = SX(e.x);
+        int y = SY(e.y);
+        bool fuse = e.state == 1;
+        double hop = Math.Abs(Math.Sin(e.phase * 0.9)) * 4.0;
+        int by = y - (int)hop;
+        int swell = fuse ? (int)((1.0 - e.stateTimer / 0.75) * 5.0) : 0;
+        bool blink = fuse && ((int)(e.stateTimer * 16.0) % 2 == 0);
+        int body = blink ? unchecked((int)0xFFFFFFFF) : Fl(e, unchecked((int)0xFFE0573A));
+        SurvivorGame.Shadow(c, x, y + 1, 26);
+        c.FillCircle(x, by - 13, 14 + swell, Outline);
+        c.FillCircle(x, by - 13, 12 + swell, body);
+        c.FillCircle(x - 4, by - 17, 4, SurvivorData.Tint(body, 45));
+        // 引信 + 火花
+        c.DrawLine(x + 3, by - 25 - swell, x + 8, by - 32 - swell, unchecked((int)0xFF3B2A20), 3);
+        double sp = 0.5 + 0.5 * Math.Sin(renderTime * 30.0 + e.phase);
+        c.FillRadial(x + 8, by - 33 - swell, 9, unchecked((int)0xFFFFD54F), 120 + (int)(sp * 100.0));
+        c.FillCircle(x + 8, by - 33 - swell, 2, unchecked((int)0xFFFFFFFF));
+        // 怒眉
+        c.FillRect(x - 7, by - 15, 5, 3, unchecked((int)0xFF2A0E08));
+        c.FillRect(x + 2, by - 15, 5, 3, unchecked((int)0xFF2A0E08));
+        c.DrawLine(x - 8, by - 20, x - 2, by - 17, unchecked((int)0xFF2A0E08), 2);
+        c.DrawLine(x + 8, by - 20, x + 2, by - 17, unchecked((int)0xFF2A0E08), 2);
+    }
+
+    void DrawElite(Canvas c, Enemy e) {
+        int x = SX(e.x);
+        int y = SY(e.y);
+        int f = e.state != 0 ? (e.dirX >= 0.0 ? 1 : -1) : FaceOf(e);
+        double sw = Math.Sin(e.phase * 0.8);
+        int jitter = e.state == 1 ? ((int)(e.stateTimer * 60.0) % 2 == 0 ? 2 : -2) : 0;
+        x = x + jitter;
+        int by = y - (int)(Math.Abs(sw) * 2.0);
+        int armor = Fl(e, unchecked((int)0xFF5C5F8A));
+        int armorLite = Fl(e, unchecked((int)0xFF8C90BD));
+        int cape = Fl(e, unchecked((int)0xFF7A1F3D));
+        if (e.state == 2) { c.FillRadial(x, by - 26, 46, unchecked((int)0xFFFF3B30), 80); }
+        // 精英光环（脚下暗红符环）
+        c.DrawCircle(x, y, 30, unchecked((int)0x70FF3B30), 2);
+        SurvivorGame.Shadow(c, x, y + 2, 46);
+        c.FillRoundRect(x - 18 - f * 4, by - 44, 22, 40, 8, Outline);
+        c.FillRoundRect(x - 16 - f * 4, by - 42, 18, 36, 7, cape);
+        int st = (int)(sw * 4.0);
+        c.FillRoundRect(x - 10 + st, by - 12, 8, 14, 3, Outline);
+        c.FillRoundRect(x + 2 - st, by - 12, 8, 14, 3, Outline);
+        c.FillRoundRect(x - 9 + st, by - 11, 6, 12, 2, armor);
+        c.FillRoundRect(x + 3 - st, by - 11, 6, 12, 2, armor);
+        c.FillRoundRect(x - 15, by - 44, 30, 34, 10, Outline);
+        c.FillRoundRect(x - 13, by - 42, 26, 30, 9, armor);
+        c.FillRoundRect(x - 13 + (f > 0 ? 0 : 13), by - 42, 13, 30, 9, armorLite);
+        // 长枪
+        int lx = x + f * 18;
+        c.DrawLine(lx, by - 6, lx + f * 26, by - 54, Outline, 6);
+        c.DrawLine(lx, by - 6, lx + f * 26, by - 54, Fl(e, unchecked((int)0xFF9C7A4E)), 3);
+        SurvivorGame.Tri(c, lx + f * 22, by - 50, lx + f * 32, by - 56, lx + f * 30, by - 68, Fl(e, unchecked((int)0xFFE0E6F0)));
+        // 头盔 + 红色目缝 + 羽饰
+        c.FillCircle(x + f * 2, by - 50, 12, Outline);
+        c.FillCircle(x + f * 2, by - 50, 10, armorLite);
+        c.FillRect(x + f * 2 - 8, by - 52, 16, 4, unchecked((int)0xFF1A1020));
+        c.FillRect(x + f * 5 - 4, by - 51, 8, 2, unchecked((int)0xFFFF4D4F));
+        c.FillRoundRect(x - f * 6 - 3, by - 66, 7, 16, 3, Fl(e, unchecked((int)0xFFB04BD6)));
+    }
+
+    void DrawBoss(Canvas c, Enemy e) {
+        int x = SX(e.x);
+        int y = SY(e.y);
+        int f = FaceOf(e);
+        double breathe = Math.Sin(renderTime * 2.0) * 3.0;
+        double sw = Math.Sin(e.phase * 0.5);
+        bool slam = e.state == 1;
+        double jump = slam ? SurvivorGame.BossJump(e.stateTimer) : 0.0;
+        int lift = (int)(Math.Sin(jump * SurvivorData.Pi) * 110.0);
+        int crouch = slam && jump <= 0.0 ? (int)((1.2 - e.stateTimer) / 0.4 * 8.0) : 0;
+        int by = y - (int)(Math.Abs(sw) * 4.0) - lift + crouch;
+        int raise = slam ? 20 : 0;
+        SurvivorGame.Shadow(c, x, y + 4, 100 - lift / 3);
+        if (e.variant == 0) {
+            int bone = Fl(e, unchecked((int)0xFFD9CBA8));
+            int boneDark = Fl(e, unchecked((int)0xFF9C8E6E));
+            c.FillRadial(x, by - 60, 110, unchecked((int)0xFFFF8A3D), 40);
+            // 腿
+            int st = (int)(sw * 6.0);
+            c.FillRoundRect(x - 26 + st, by - 26, 16, 28, 6, Outline);
+            c.FillRoundRect(x + 10 - st, by - 26, 16, 28, 6, Outline);
+            c.FillRoundRect(x - 24 + st, by - 24, 12, 24, 5, boneDark);
+            c.FillRoundRect(x + 12 - st, by - 24, 12, 24, 5, boneDark);
+            // 胸腔
+            c.FillRoundRect(x - 40, by - 90, 80, 68, 26, Outline);
+            c.FillRoundRect(x - 37, by - 87, 74, 62, 24, bone);
+            for (int r = 0; r < 4; r = r + 1) {
+                c.FillRoundRect(x - 28, by - 78 + r * 13, 56, 6, 3, boneDark);
+            }
+            c.FillRect(x - 4, by - 84, 8, 56, bone);
+            // 双臂（砸地时高举）
+            int ay = by - 70 - raise * 2;
+            c.FillRoundRect(x - 62, ay, 24, 50, 10, Outline);
+            c.FillRoundRect(x + 38, ay, 24, 50, 10, Outline);
+            c.FillRoundRect(x - 60, ay + 2, 20, 46, 9, boneDark);
+            c.FillRoundRect(x + 40, ay + 2, 20, 46, 9, boneDark);
+            c.FillCircle(x - 50, ay + 50, 15, Outline);
+            c.FillCircle(x + 50, ay + 50, 15, Outline);
+            c.FillCircle(x - 50, ay + 50, 12, bone);
+            c.FillCircle(x + 50, ay + 50, 12, bone);
+            // 头骨
+            int hy = by - 108 + (int)breathe;
+            c.FillCircle(x + f * 4, hy, 28, Outline);
+            c.FillCircle(x + f * 4, hy, 25, bone);
+            c.FillRoundRect(x + f * 4 - 15, hy + 12, 30, 16, 6, bone);
+            c.FillCircle(x + f * 4 - 10, hy - 2, 8, unchecked((int)0xFF1A0F08));
+            c.FillCircle(x + f * 4 + 10, hy - 2, 8, unchecked((int)0xFF1A0F08));
+            c.FillRadial(x + f * 4 - 10, hy - 2, 12, unchecked((int)0xFFFF8A3D), 200);
+            c.FillRadial(x + f * 4 + 10, hy - 2, 12, unchecked((int)0xFFFF8A3D), 200);
+            for (int t = 0; t < 5; t = t + 1) { c.FillRect(x + f * 4 - 12 + t * 5, hy + 18, 3, 7, unchecked((int)0xFF1A0F08)); }
+        } else {
+            int robe = Fl(e, unchecked((int)0xFF4E3290));
+            int robeLite = Fl(e, unchecked((int)0xFF7A55C8));
+            c.FillRadial(x, by - 60, 120, unchecked((int)0xFF8A5CFF), 55);
+            // 漂浮长袍
+            c.FillRoundRect(x - 44, by - 96, 88, 92, 30, Outline);
+            c.FillRoundRect(x - 41, by - 93, 82, 86, 28, robe);
+            c.FillRoundRect(x - 41 + (f > 0 ? 0 : 41), by - 93, 41, 86, 28, robeLite);
+            for (int t = 0; t < 5; t = t + 1) {
+                int tx = x - 36 + t * 18;
+                int wave = (int)(Math.Sin(renderTime * 4.0 + (double)t) * 4.0);
+                SurvivorGame.Tri(c, tx - 8, by - 12, tx + 8, by - 12, tx + wave, by + 6, robe);
+            }
+            // 手中暗球
+            int ay = by - 60 - raise;
+            c.FillRadial(x + f * 52, ay, 26, unchecked((int)0xFFB18CFF), 200);
+            c.FillCircle(x + f * 52, ay, 9, unchecked((int)0xFFF1E8FF));
+            // 头冠与独眼
+            int hy = by - 104 + (int)breathe;
+            c.FillCircle(x, hy, 26, Outline);
+            c.FillCircle(x, hy, 23, unchecked((int)0xFF1B1030));
+            for (int t = 0; t < 5; t = t + 1) {
+                int tx = x - 20 + t * 10;
+                SurvivorGame.Tri(c, tx - 5, hy - 16, tx + 5, hy - 16, tx, hy - 36 - (t == 2 ? 8 : 0), Fl(e, unchecked((int)0xFFFFC53D)));
+            }
+            c.FillRadial(x + f * 3, hy, 20, unchecked((int)0xFFFF3BD5), 220);
+            c.FillCircle(x + f * 3, hy, 7, unchecked((int)0xFFFFE6FA));
+            c.FillCircle(x + f * 5, hy, 3, unchecked((int)0xFF2A0030));
+        }
+    }
+
+    // ---------------- 武器特效 ----------------
+
+    void DrawAura(Canvas c) {
+        int x = SX(playerX);
+        int y = SY(playerY) - 4;
+        int r = (int)AuraRadius();
+        double pulse = 0.5 + 0.5 * Math.Sin(auraPulse * 4.0);
+        c.FillRadial(x, y, r, unchecked((int)0xFFFFE9A0), 40 + (int)(pulse * 25.0));
+        c.DrawCircle(x, y, r, unchecked((int)0x90FFE9A0), 2);
+        c.DrawCircle(x, y, r - 8 - (int)(pulse * 6.0), unchecked((int)0x40FFE9A0), 1);
+        for (int k = 0; k < 8; k = k + 1) {
+            double a = auraPulse * 0.8 + (double)k / 8.0 * SurvivorData.Pi * 2.0;
+            int rx = x + (int)(Math.Cos(a) * (double)(r - 4));
+            int ry = y + (int)(Math.Sin(a) * (double)(r - 4));
+            c.FillCircle(rx, ry, 3, unchecked((int)0xD0FFF4C2));
+        }
+    }
+
+    void DrawPlayerFx(Canvas c) {
+        int px = SX(playerX);
+        int py = SY(playerY);
+        if (levelFlash > 0.0) {
+            double k = 1.0 - levelFlash / 0.7;
+            int a = (int)(220.0 * (1.0 - k));
+            c.DrawCircle(px, py - 18, 20 + (int)(k * 120.0), SurvivorData.Alpha(unchecked((int)0xFFFFD54F), a), 4);
+            c.FillRadial(px, py - 18, 60, unchecked((int)0xFFFFE082), a / 2);
+        }
+        if (HasWeapon(SurvivorData.WBlades) && !dead) {
+            int n = BladeCount();
+            int r = (int)BladeRadius();
+            int cy = py - 14;
+            for (int b = 0; b < n; b = b + 1) {
+                double a = bladeAngle + (double)b / (double)n * SurvivorData.Pi * 2.0;
+                int bx = px + (int)(Math.Cos(a) * (double)r);
+                int by = cy + (int)(Math.Sin(a) * (double)r * 0.85);
+                // 拖尾：沿轨道向后的淡弧
+                int deg = (int)(a * 180.0 / SurvivorData.Pi);
+                c.FillSector(px, cy, r - 6, r + 6, deg - 55, deg, unchecked((int)0x20B8E0FF));
+                c.FillSector(px, cy, r - 4, r + 4, deg - 25, deg, unchecked((int)0x38B8E0FF));
+                double tx = -Math.Sin(a);
+                double ty = Math.Cos(a);
+                int x0 = bx - (int)(tx * 15.0);
+                int y0 = by - (int)(ty * 15.0);
+                int x1 = bx + (int)(tx * 15.0);
+                int y1 = by + (int)(ty * 15.0);
+                c.FillRadial(bx, by, 20, unchecked((int)0xFFB8E0FF), 70);
+                c.DrawLine(x0, y0, x1, y1, Outline, 9);
+                c.DrawLine(x0, y0, x1, y1, unchecked((int)0xFF8FB8DD), 6);
+                c.DrawLine(x0 + (int)(Math.Cos(a) * 2.0), y0, x1, y1, unchecked((int)0xFFF2FAFF), 2);
+            }
+        }
+        for (int i = 0; i < shots.Count; i = i + 1) {
+            Shot s = shots[i];
+            if (!s.active) { continue; }
+            int x = SX(s.x);
+            int y = SY(s.y);
+            if (s.kind == 0) {
+                double vl = Math.Sqrt(s.vx * s.vx + s.vy * s.vy);
+                if (vl < 1.0) { vl = 1.0; }
+                int tx = x - (int)(s.vx / vl * 22.0);
+                int ty = y - (int)(s.vy / vl * 22.0);
+                c.FillRadial(x, y, 16, unchecked((int)0xFFFFD54F), 110);
+                c.DrawLine(tx, ty, x, y, unchecked((int)0x90FFB300), 6);
+                c.DrawLine(tx + (x - tx) / 2, ty + (y - ty) / 2, x, y, unchecked((int)0xFFFFE082), 4);
+                c.FillCircle(x, y, 3, unchecked((int)0xFFFFFFFF));
+            } else {
+                int r = (int)s.size;
+                int deg = (int)(s.spin * 57.3);
+                c.FillRadial(x, y, r + 12, unchecked((int)0xFFFF9E57), 70);
+                for (int k = 0; k < 3; k = k + 1) {
+                    int a0 = deg + k * 120;
+                    c.FillSector(x, y, 3, r + 2, a0 - 4, a0 + 44, Outline);
+                    c.FillSector(x, y, 3, r, a0, a0 + 40, unchecked((int)0xFFFFB27A));
+                    c.FillSector(x, y, 3, r - 3, a0 + 2, a0 + 16, unchecked((int)0xFFFFE6D2));
+                }
+                c.FillCircle(x, y, 5, Outline);
+                c.FillCircle(x, y, 3, unchecked((int)0xFFFFE08A));
+            }
+        }
+    }
+
+    void DrawEnemyShots(Canvas c) {
+        for (int i = 0; i < enemyShots.Count; i = i + 1) {
+            EnemyShot s = enemyShots[i];
+            if (!s.active) { continue; }
+            int x = SX(s.x);
+            int y = SY(s.y);
+            int r = (int)s.radius;
+            bool boss = s.damage >= 12;
+            int col = boss ? unchecked((int)0xFFD36BFF) : unchecked((int)0xFFD4FF3A);
+            // 敌方弹：拖尾 + 暗芯亮边，和经验宝石（菱形）一眼区分
+            c.DrawLine(x - (int)(s.vx * 0.08), y - (int)(s.vy * 0.08), x, y, SurvivorData.Alpha(col, 90), r + 2);
+            c.FillRadial(x, y, r * 3, col, 110);
+            c.FillCircle(x, y, r + 2, Outline);
+            c.FillCircle(x, y, r, col);
+            c.FillCircle(x, y, r / 2, boss ? unchecked((int)0xFF3A0A4A) : unchecked((int)0xFF3D4A00));
+        }
+    }
+
+    void DrawZaps(Canvas c) {
+        for (int i = 0; i < zaps.Count; i = i + 1) {
+            Zap z = zaps[i];
+            if (!z.active) { continue; }
+            double k = z.life / 0.22;
+            int a = (int)(255.0 * k);
+            int x0 = SX(z.x0);
+            int y0 = SY(z.y0);
+            int x1 = SX(z.x1);
+            int y1 = SY(z.y1);
+            double dx = (double)(x1 - x0);
+            double dy = (double)(y1 - y0);
+            double len = Math.Sqrt(dx * dx + dy * dy);
+            if (len < 1.0) { len = 1.0; }
+            double nx = -dy / len;
+            double ny = dx / len;
+            int px = x0;
+            int py = y0;
+            int segs = 7;
+            for (int s = 1; s <= segs; s = s + 1) {
+                double f = (double)s / (double)segs;
+                int jit = s == segs ? 0 : SurvivorGame.Hash(z.seed, s) % 28 - 14;
+                int qx = x0 + (int)(dx * f + nx * (double)jit);
+                int qy = y0 + (int)(dy * f + ny * (double)jit);
+                c.DrawLine(px, py, qx, qy, SurvivorData.Alpha(unchecked((int)0xFF5AB8FF), a * 2 / 3), 7);
+                c.DrawLine(px, py, qx, qy, SurvivorData.Alpha(unchecked((int)0xFFF0FAFF), a), 2);
+                px = qx;
+                py = qy;
+            }
+            c.FillRadial(x1, y1, 26, unchecked((int)0xFF8FD3FF), a * 3 / 4);
+        }
+    }
+
+    void DrawParticles(Canvas c) {
+        for (int i = 0; i < particles.Count; i = i + 1) {
+            Particle p = particles[i];
+            if (!p.active) { continue; }
+            double k = p.life / p.maxLife;
+            int a = (int)(255.0 * (k < 0.5 ? k * 2.0 : 1.0));
+            int x = SX(p.x);
+            int y = SY(p.y);
+            if (p.kind == 0) {
+                int s = (int)(p.size * (0.4 + 0.6 * k));
+                if (s < 1) { s = 1; }
+                c.FillRect(x - s / 2, y - s / 2, s, s, SurvivorData.Alpha(p.color, a));
+            } else if (p.kind == 1) {
+                int tx = x - (int)(p.vx * 0.05);
+                int ty = y - (int)(p.vy * 0.05);
+                c.DrawLine(tx, ty, x, y, SurvivorData.Alpha(p.color, a), (int)p.size);
+            } else {
+                int r = (int)(p.size * (1.0 - k) + 4.0);
+                c.DrawCircle(x, y, r, SurvivorData.Alpha(p.color, (int)(200.0 * k)), 3);
+            }
+        }
+    }
+
+    // 四周暗角；低血量时泛红脉动
+    void DrawVignette(Canvas c, int top) {
+        c.FillVGrad(0, top, viewW, 120, unchecked((int)0x90000000), unchecked((int)0x00000000));
+        c.FillVGrad(0, top + viewH - 140, viewW, 140, unchecked((int)0x00000000), unchecked((int)0xA0000000));
+        if (!dead && playerHp > 0 && HpPercent() <= 30) {
+            double p = 0.5 + 0.5 * Math.Sin(renderTime * 6.0);
+            int a = 40 + (int)(p * 60.0);
+            c.FillVGrad(0, top, viewW, 90, SurvivorData.Alpha(unchecked((int)0xFFB00020), a), unchecked((int)0x00B00020));
+            c.FillVGrad(0, top + viewH - 90, viewW, 90, unchecked((int)0x00B00020), SurvivorData.Alpha(unchecked((int)0xFFB00020), a));
+        }
+    }
+
+    // ---------------- 形状工具 ----------------
+
+    // 扫描线菱形（Canvas 无多边形填充）
+    static void Diamond(Canvas c, int cx, int cy, int r, int color) {
+        for (int dy = -r; dy <= r; dy = dy + 1) {
+            int half = r - (dy < 0 ? -dy : dy);
+            if (half > 0) { c.FillRect(cx - half, cy + dy, half * 2, 1, color); }
+        }
+    }
+
+    static void Heart(Canvas c, int cx, int cy, int r, int color) {
+        c.FillCircle(cx - r / 2, cy - r / 3, r / 2 + 1, color);
+        c.FillCircle(cx + r / 2, cy - r / 3, r / 2 + 1, color);
+        SurvivorGame.Tri(c, cx - r - 1, cy - r / 6, cx + r + 1, cy - r / 6, cx, cy + r, color);
+    }
+
+    // 扫描线三角形
+    static void Tri(Canvas c, int x0, int y0, int x1, int y1, int x2, int y2, int color) {
+        int minY = Math.Min(y0, Math.Min(y1, y2));
+        int maxY = Math.Max(y0, Math.Max(y1, y2));
+        for (int y = minY; y <= maxY; y = y + 1) {
+            double fy = (double)y + 0.5;
+            double lo = 100000.0;
+            double hi = -100000.0;
+            SurvivorGame.EdgeX(x0, y0, x1, y1, fy, ref lo, ref hi);
+            SurvivorGame.EdgeX(x1, y1, x2, y2, fy, ref lo, ref hi);
+            SurvivorGame.EdgeX(x2, y2, x0, y0, fy, ref lo, ref hi);
+            if (hi >= lo) {
+                int a = (int)Math.Round(lo);
+                int b = (int)Math.Round(hi);
+                if (b > a) { c.FillRect(a, y, b - a, 1, color); }
+            }
+        }
+    }
+
+    static void EdgeX(int xa, int ya, int xb, int yb, double fy, ref double lo, ref double hi) {
+        if (ya == yb) { return; }
+        double y0 = (double)Math.Min(ya, yb);
+        double y1 = (double)Math.Max(ya, yb);
+        if (fy < y0 || fy > y1) { return; }
+        double t = (fy - (double)ya) / (double)(yb - ya);
+        double x = (double)xa + t * (double)(xb - xa);
+        if (x < lo) { lo = x; }
+        if (x > hi) { hi = x; }
+    }
+}

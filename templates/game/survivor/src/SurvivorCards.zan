@@ -1,0 +1,240 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget;
+
+namespace Survivor;
+
+// 升级三选一：三张标准控件拼成的卡片（Panel 卡面 + Image 图标 + Label 文案 + 等级刻度），
+// 每张卡上盖一个全尺寸的透明 Button 负责悬停/按下/焦点与点击。卡片依次弹入（缓动），
+// 弹入期间 0.3 秒内不接受选择，防止正在走位时连按的键误选。
+public class SurvivorCards {
+    public Panel root;
+    Label title;
+    Label subtitle;
+    List<Panel> faces;
+    List<Image> icons;
+    List<Label> tags;
+    List<Label> names;
+    List<Label> texts;
+    List<Label> keys;
+    List<Button> hits;
+    List<Panel> pips;       // 每张 5 格
+    public int selected;
+    int clicked;
+    bool open;
+    int shownSerial;
+    double age;
+    int count;
+
+    public SurvivorCards() {
+        this.root = new Panel("survivor-levelup");
+        this.root.Class = "survivor-levelup";
+        this.title = new Label("LEVEL UP!");
+        this.title.Class = "survivor-lu-title";
+        this.root.Add(this.title);
+        this.subtitle = new Label("Choose an upgrade      1 / 2 / 3   or   arrows + ENTER");
+        this.subtitle.Class = "survivor-lu-sub";
+        this.root.Add(this.subtitle);
+        this.faces = new List<Panel>();
+        this.icons = new List<Image>();
+        this.tags = new List<Label>();
+        this.names = new List<Label>();
+        this.texts = new List<Label>();
+        this.keys = new List<Label>();
+        this.hits = new List<Button>();
+        this.pips = new List<Panel>();
+        for (int i = 0; i < 3; i = i + 1) { this.MakeCard(i); }
+        this.clicked = -1;
+        this.root.SetShown(false);
+    }
+
+    void MakeCard(int i) {
+        Panel face = new Panel("survivor-card-face");
+        face.Class = "survivor-cardface";
+        Panel halo = new Panel("survivor-card-halo");
+        halo.Class = "survivor-card-halo";
+        face.Add(halo);
+        Image icon = new Image("");
+        icon.Class = "survivor-card-icon";
+        face.Add(icon);
+        Label tag = new Label("");
+        tag.Class = "survivor-card-tag";
+        face.Add(tag);
+        Label name = new Label("");
+        name.Class = "survivor-card-name";
+        face.Add(name);
+        Label text = new Label("");
+        text.Class = "survivor-card-text";
+        text.wrap = true;
+        face.Add(text);
+        for (int p = 0; p < 5; p = p + 1) {
+            Panel pip = new Panel("survivor-pip");
+            pip.Class = "survivor-pip";
+            pip.SetProp("style", "left:" + Convert.ToString(85 + p * 26) + "dpx");
+            face.Add(pip);
+            this.pips.Add(pip);
+        }
+        Label key = new Label("[" + Convert.ToString(i + 1) + "]");
+        key.Class = "survivor-card-key";
+        face.Add(key);
+        Button hit = new Button("");
+        hit.Class = "survivor-card-hit";
+        int idx = i;
+        hit.OnClick(() => { this.Click(idx); });
+        face.Add(hit);
+        this.root.Add(face);
+        this.faces.Add(face);
+        this.icons.Add(icon);
+        this.tags.Add(tag);
+        this.names.Add(name);
+        this.texts.Add(text);
+        this.keys.Add(key);
+        this.hits.Add(hit);
+    }
+
+    void Click(int i) {
+        if (!this.open || this.age < 0.3 || i >= this.count) { return; }
+        this.clicked = i;
+    }
+
+    // 外壳每帧取一次：返回被点的卡（-1 = 无）
+    public int TakeClick() {
+        int c = this.clicked;
+        this.clicked = -1;
+        return c;
+    }
+
+    public bool IsOpen() { return this.open; }
+    public bool Ready() { return this.open && this.age >= 0.3; }
+
+    public void Move(int delta) {
+        if (!this.open || this.count <= 0) { return; }
+        this.selected = (this.selected + delta + this.count) % this.count;
+    }
+
+    public void Sync(SurvivorGame game, double dt) {
+        if (!game.choosing) {
+            if (this.open) { this.Close(); }
+            return;
+        }
+        int serial = game.chooseCount * 100 + game.level;
+        if (!this.open || serial != this.shownSerial) {
+            this.Fill(game);
+            this.shownSerial = serial;
+            this.open = true;
+            this.age = 0.0;
+            this.selected = 0;
+            this.clicked = -1;
+            this.root.SetShown(true);
+        }
+        this.age = this.age + dt;
+        this.Animate();
+    }
+
+    void Close() {
+        this.open = false;
+        for (int i = 0; i < this.hits.Count; i = i + 1) { this.hits[i].Blur(); }
+        this.root.SetShown(false);
+    }
+
+    void Fill(SurvivorGame game) {
+        this.count = game.optionCount;
+        for (int i = 0; i < 3; i = i + 1) {
+            bool has = i < this.count;
+            this.faces[i].SetShown(has);
+            if (!has) { continue; }
+            int code = game.options[i];
+            int lv = game.OptionNextLevel(code);
+            int max = SurvivorGame.OptionIsWeapon(code) ? SurvivorData.WeaponMaxLevel(code)
+                : (SurvivorGame.OptionIsPassive(code) ? SurvivorData.PassiveMaxLevel(code - 10) : 0);
+            this.icons[i].Src = SurvivorIcons.Option(code);
+            this.names[i].SetProp("text", SurvivorGame.OptionName(code));
+            this.texts[i].SetProp("text", game.OptionText(code));
+            string kind = SurvivorGame.OptionIsWeapon(code) ? "WEAPON" : (SurvivorGame.OptionIsPassive(code) ? "PASSIVE" : "ITEM");
+            if (lv == 1) { this.tags[i].SetProp("text", "NEW " + kind); }
+            else if (max > 0 && lv >= max) { this.tags[i].SetProp("text", "MAX LEVEL"); }
+            else if (max > 0) { this.tags[i].SetProp("text", kind + "  LV " + Convert.ToString(lv)); }
+            else { this.tags[i].SetProp("text", kind); }
+            this.tags[i].Class = lv == 1 ? "survivor-card-tag survivor-card-new" : "survivor-card-tag";
+            string family = SurvivorGame.OptionIsWeapon(code) ? "survivor-cardface survivor-card-weapon"
+                : (SurvivorGame.OptionIsPassive(code) ? "survivor-cardface survivor-card-passive" : "survivor-cardface survivor-card-item");
+            this.faces[i].Class = family;
+            for (int p = 0; p < 5; p = p + 1) {
+                Panel pip = this.pips[i * 5 + p];
+                pip.SetShown(p < max);
+                if (p >= max) { continue; }
+                pip.Class = p < lv - 1 ? "survivor-pip survivor-pip-on" : (p == lv - 1 ? "survivor-pip survivor-pip-next" : "survivor-pip");
+                int left = 150 - max * 13 + p * 26;
+                pip.SetProp("style", "left:" + Convert.ToString(left) + "dpx");
+            }
+        }
+    }
+
+    // 弹入：每张卡错开 0.07 秒，0.32 秒 ease-out-back 从下方 70dpx 升到位
+    void Animate() {
+        int total = this.count * 300 + (this.count - 1) * 30;
+        int left0 = (1280 - total) / 2;
+        for (int i = 0; i < this.count; i = i + 1) {
+            double t = (this.age - (double)i * 0.07) / 0.32;
+            if (t < 0.0) { t = 0.0; }
+            if (t > 1.0) { t = 1.0; }
+            double s = 1.70158;
+            double u = t - 1.0;
+            double ease = 1.0 + (s + 1.0) * u * u * u + s * u * u;
+            int top = 196 + (int)((1.0 - ease) * 70.0);
+            double op = t * 1.6;
+            if (op > 1.0) { op = 1.0; }
+            string sel = i == this.selected ? " survivor-card-sel" : "";
+            string cls = this.faces[i].Class;
+            if (cls.EndsWith(" survivor-card-sel")) { cls = cls.Substring(0, cls.Length - 18); }
+            this.faces[i].Class = cls + sel;
+            this.faces[i].SetProp("style", "left:" + Convert.ToString(left0 + i * 330) + "dpx;top:" + Convert.ToString(top)
+                + "dpx;opacity:" + Convert.ToString(op));
+        }
+        double tt = this.age / 0.25;
+        if (tt > 1.0) { tt = 1.0; }
+        int fs = 46 + (int)((1.0 - tt) * 24.0);
+        this.title.SetProp("style", "font-size:" + Convert.ToString(fs) + "dpx");
+    }
+
+    public static string Css() {
+        return ".survivor-levelup{position:absolute;left:0;top:0;width:1280dpx;height:100%;padding:0;border:0;"
+            + "background:rgba(5,8,7,0.66)}"
+            + ".survivor-levelup label{position:absolute;padding:0;margin:0;border:0;background:transparent;vertical-align:top}"
+            + ".survivor-lu-title{left:0;top:84dpx;width:1280dpx;height:64dpx;font-size:46dpx;font-weight:bold;letter-spacing:4dpx;"
+            + "text-align:center;color:#ffc53d;text-shadow:0 4 0 #5a3a00}"
+            + ".survivor-lu-sub{left:0;top:148dpx;width:1280dpx;height:24dpx;font-size:16dpx;text-align:center;color:#a9b8b0}"
+            + ".survivor-cardface{position:absolute;width:300dpx;height:340dpx;padding:0;margin:0;"
+            + "background:linear-gradient(180deg,#26302b,#151b18);border:3 #6b5a2e;border-radius:10dpx;"
+            + "box-shadow:0 8 0 rgba(0,0,0,0.55)}"
+            + ".survivor-card-passive{border-color:#2f6f66}"
+            + ".survivor-card-item{border-color:#8a2a3a}"
+            + ".survivor-card-sel{border-color:#ffc53d;box-shadow:0 0 22 rgba(255,197,61,0.55)}"
+            + ".survivor-card-passive.survivor-card-sel{border-color:#5ff5e2;box-shadow:0 0 22 rgba(95,245,226,0.5)}"
+            + ".survivor-card-halo{position:absolute;left:100dpx;top:22dpx;width:100dpx;height:100dpx;padding:0;"
+            + "border:2 rgba(255,197,61,0.35);border-radius:50dpx;background:rgba(255,197,61,0.10)}"
+            + ".survivor-card-passive .survivor-card-halo{border-color:rgba(95,245,226,0.35);background:rgba(95,245,226,0.08)}"
+            + "image.survivor-card-icon{position:absolute;left:114dpx;top:36dpx;width:72dpx;height:72dpx;padding:0;border:0;background:transparent}"
+            + ".survivor-cardface label.survivor-card-tag{left:70dpx;top:134dpx;width:160dpx;height:20dpx;font-size:12dpx;"
+            + "font-weight:bold;letter-spacing:2dpx;text-align:center;color:#c9b68a}"
+            + ".survivor-cardface label.survivor-card-new{color:#5ff5e2}"
+            + ".survivor-cardface label.survivor-card-name{left:10dpx;top:158dpx;width:280dpx;height:34dpx;font-size:25dpx;"
+            + "font-weight:bold;text-align:center;color:#f4f1e6;text-shadow:0 2 0 #000}"
+            + ".survivor-cardface label.survivor-card-text{left:26dpx;top:204dpx;width:248dpx;height:70dpx;font-size:16dpx;"
+            + "line-height:22dpx;text-align:center;color:#c8d3cd}"
+            + ".survivor-pip{position:absolute;top:284dpx;width:20dpx;height:8dpx;padding:0;border:1 #10140f;border-radius:2dpx;"
+            + "background:#2c3631}"
+            + ".survivor-pip-on{background:#c9a23a}"
+            + ".survivor-pip-next{background:#ffe27a;box-shadow:0 0 8 rgba(255,226,122,0.8)}"
+            + ".survivor-card-passive .survivor-pip-on{background:#2fa596}"
+            + ".survivor-card-passive .survivor-pip-next{background:#7ffff0;box-shadow:0 0 8 rgba(127,255,240,0.8)}"
+            + ".survivor-cardface label.survivor-card-key{left:0;top:306dpx;width:300dpx;height:20dpx;font-size:13dpx;"
+            + "text-align:center;color:#6f7d76}"
+            + "button.survivor-card-hit{position:absolute;left:0;top:0;width:300dpx;height:340dpx;padding:0;margin:0;"
+            + "background:transparent;border:0;border-radius:8dpx;box-shadow:none;color:transparent}"
+            + "button.survivor-card-hit:hover{background:rgba(255,255,255,0.06);border:2 rgba(255,226,122,0.9)}"
+            + "button.survivor-card-hit:active{background:rgba(0,0,0,0.25);border:2 #ffc53d}"
+            + "button.survivor-card-hit:focus{border:2 #ffffff}";
+    }
+}

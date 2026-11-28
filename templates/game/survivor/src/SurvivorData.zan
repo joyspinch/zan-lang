@@ -1,0 +1,333 @@
+using System;
+
+namespace Survivor;
+
+// 数据层：武器 / 被动 / 角色 / 怪物种类的静态表与实体类。
+// 规则数值全部集中在这里，SurvivorGame 只读表不写死；平衡改动改表即可。
+
+public class Enemy {
+    public int kind;          // SurvivorData.K*
+    public int variant;       // 首领：0 骸骨巨像（3:00）、1 深渊守望（6:00）
+    public double x;
+    public double y;
+    public double kx;         // 击退速度（逐帧衰减）
+    public double ky;
+    public int hp;
+    public int maxHp;
+    public double speed;
+    public double radius;
+    public int damage;
+    public int xp;
+    public bool active;
+    public double flash;      // 受击闪白剩余秒
+    public double phase;      // 动画相位（走路摆动）
+    public int state;         // 精英：0 走 1 蓄力 2 冲锋；自爆怪：0 走 1 引信；首领：0 走 1 砸地
+    public double stateTimer;
+    public double attackTimer;
+    public double ringTimer;
+    public double summonTimer;
+    public double dirX;       // 冲锋方向 / 朝向
+    public double dirY;
+    public double telX;       // 预警落点（首领砸地）
+    public double telY;
+    public double slow;       // 光环减速剩余秒
+    public double bladeCd;    // 回旋刃对同一只的命中间隔
+    public double glaiveCd;   // 飞轮对同一只的命中间隔
+    public int mark;          // 连锁闪电本次已击中的标记（按发射序号）
+
+    public Enemy() { this.active = false; }
+}
+
+// 玩家投射物：kind 0 电弧弹（直线、可穿透）、1 飞轮（掷出后折返）
+public class Shot {
+    public int kind;
+    public double x;
+    public double y;
+    public double vx;
+    public double vy;
+    public double ox;         // 飞轮出手点
+    public double oy;
+    public double life;
+    public double range;
+    public int damage;
+    public int pierce;        // 电弧弹剩余穿透数
+    public bool returning;
+    public double spin;
+    public double size;
+    public int lastHit;       // 电弧弹上一次命中的槽位（防同帧重复）
+    public bool active;
+
+    public Shot() { this.active = false; this.lastHit = -1; }
+}
+
+public class EnemyShot {
+    public double x;
+    public double y;
+    public double vx;
+    public double vy;
+    public double life;
+    public int damage;
+    public double radius;
+    public bool active;
+    public EnemyShot() { this.active = false; }
+}
+
+// 掉落物：kind 0 经验（value 决定蓝/绿/红）、1 回血、2 磁石（吸全图经验）、3 宝箱（首领掉落：额外升级）
+public class Gem {
+    public int kind;
+    public double x;
+    public double y;
+    public double px;         // 上一帧位置（磁吸拖尾）
+    public double py;
+    public int value;
+    public bool active;
+    public bool pulled;       // 进入磁吸后一直被吸到身上
+    public double speed;
+    public Gem() { this.active = false; }
+}
+
+// 纯表现粒子：kind 0 碎块、1 火花（拉线）、2 冲击环
+public class Particle {
+    public int kind;
+    public double x;
+    public double y;
+    public double vx;
+    public double vy;
+    public double life;
+    public double maxLife;
+    public int color;
+    public double size;
+    public bool active;
+    public Particle() { this.active = false; }
+}
+
+// 连锁闪电的一段（表现）
+public class Zap {
+    public double x0;
+    public double y0;
+    public double x1;
+    public double y1;
+    public double life;
+    public int seed;
+    public bool active;
+    public Zap() { this.active = false; }
+}
+
+// 范围爆炸（自爆怪 / 首领砸地落地后的表现环）
+public class Blast {
+    public double x;
+    public double y;
+    public double radius;
+    public double life;
+    public int color;
+    public bool active;
+    public Blast() { this.active = false; }
+}
+
+public class SurvivorData {
+    public const double Pi = 3.14159265358979;
+    public const double WorldW = 3600.0;
+    public const double WorldH = 3600.0;
+
+    // 武器
+    public const int WBolt = 0;
+    public const int WBlades = 1;
+    public const int WAura = 2;
+    public const int WChain = 3;
+    public const int WGlaive = 4;
+    public const int WeaponCount = 5;
+    // 被动
+    public const int PBoots = 0;
+    public const int PMagnet = 1;
+    public const int PHeart = 2;
+    public const int PHourglass = 3;
+    public const int PassiveCount = 4;
+    public const int MaxWeaponSlots = 4;
+    public const int MaxPassiveSlots = 4;
+
+    // 升级选项编码：0..9 武器、10..19 被动、100 回血药（全部满级后的兜底）
+    public const int OptionHeal = 100;
+
+    // 怪物种类
+    public const int KGhoul = 0;
+    public const int KBat = 1;
+    public const int KBrute = 2;
+    public const int KSpitter = 3;
+    public const int KBomber = 4;
+    public const int KElite = 5;
+    public const int KBoss = 6;
+
+    // 角色
+    public const int CharacterCount = 3;
+
+    public static string WeaponName(int id) {
+        if (id == SurvivorData.WBolt) { return "Arc Bolt"; }
+        if (id == SurvivorData.WBlades) { return "Orbit Blades"; }
+        if (id == SurvivorData.WAura) { return "Hallow Aura"; }
+        if (id == SurvivorData.WChain) { return "Storm Chain"; }
+        return "Glaive";
+    }
+
+    public static int WeaponMaxLevel(int id) {
+        if (id == SurvivorData.WAura) { return 4; }
+        return 5;
+    }
+
+    // 拿到第 level 级时卡面上写的效果
+    public static string WeaponText(int id, int level) {
+        if (id == SurvivorData.WBolt) {
+            if (level == 1) { return "Fires a bolt at the nearest enemy."; }
+            if (level == 2) { return "+1 bolt that seeks out elites and bosses."; }
+            if (level == 3) { return "+40% damage. Bolts pierce 1 enemy."; }
+            if (level == 4) { return "+1 bolt, fires 20% faster."; }
+            return "+60% damage. Bolts pierce 3 enemies.";
+        }
+        if (id == SurvivorData.WBlades) {
+            if (level == 1) { return "Two blades orbit you, cutting all they touch."; }
+            if (level == 2) { return "+1 blade."; }
+            if (level == 3) { return "+50% damage, wider orbit."; }
+            if (level == 4) { return "+1 blade, spins faster."; }
+            return "+1 blade, +35% damage, widest orbit.";
+        }
+        if (id == SurvivorData.WAura) {
+            if (level == 1) { return "Holy field burns and slows nearby foes."; }
+            if (level == 2) { return "+20% radius, +40% damage."; }
+            if (level == 3) { return "+20% radius, +30% damage."; }
+            return "+20% radius, burns twice as often.";
+        }
+        if (id == SurvivorData.WChain) {
+            if (level == 1) { return "Lightning strikes and arcs to 3 foes."; }
+            if (level == 2) { return "Arcs to 4 foes, +20% damage."; }
+            if (level == 3) { return "Arcs to 5 foes, strikes faster."; }
+            if (level == 4) { return "Arcs to 6 foes, +25% damage."; }
+            return "Arcs to 8 foes, strikes much faster.";
+        }
+        if (level == 1) { return "Thrown blade returns to you, piercing all."; }
+        if (level == 2) { return "+40% damage, longer throw."; }
+        if (level == 3) { return "+1 glaive."; }
+        if (level == 4) { return "+30% damage, bigger blade."; }
+        return "+1 glaive, flies faster.";
+    }
+
+    public static string PassiveName(int id) {
+        if (id == SurvivorData.PBoots) { return "Swift Boots"; }
+        if (id == SurvivorData.PMagnet) { return "Lodestone"; }
+        if (id == SurvivorData.PHeart) { return "Vital Heart"; }
+        return "Hourglass";
+    }
+
+    public static int PassiveMaxLevel(int id) { return 5; }
+
+    public static string PassiveText(int id, int level) {
+        if (id == SurvivorData.PBoots) { return "+10% movement speed."; }
+        if (id == SurvivorData.PMagnet) { return "+40% gem pickup range."; }
+        if (id == SurvivorData.PHeart) { return "+20 max HP and heal 20."; }
+        return "Weapons recharge 8% faster.";
+    }
+
+    // 主题色（图标、卡片描边、特效共用一套）
+    public static int WeaponColor(int id) {
+        if (id == SurvivorData.WBolt) { return unchecked((int)0xFFFFD54F); }
+        if (id == SurvivorData.WBlades) { return unchecked((int)0xFFB8E0FF); }
+        if (id == SurvivorData.WAura) { return unchecked((int)0xFFFFF1A8); }
+        if (id == SurvivorData.WChain) { return unchecked((int)0xFF8FD3FF); }
+        return unchecked((int)0xFFFF9E57);
+    }
+
+    public static string CharacterName(int id) {
+        if (id == 1) { return "WARDEN"; }
+        if (id == 2) { return "MYSTIC"; }
+        return "RANGER";
+    }
+
+    public static int CharacterWeapon(int id) {
+        if (id == 1) { return SurvivorData.WBlades; }
+        if (id == 2) { return SurvivorData.WChain; }
+        return SurvivorData.WBolt;
+    }
+
+    public static int CharacterHp(int id) {
+        if (id == 1) { return 130; }
+        if (id == 2) { return 85; }
+        return 100;
+    }
+
+    public static double CharacterSpeed(int id) {
+        if (id == 1) { return 138.0; }
+        if (id == 2) { return 158.0; }
+        return 150.0;
+    }
+
+    public static string CharacterBlurb(int id) {
+        if (id == 1) { return "130 HP, slower. Starts with Orbit Blades."; }
+        if (id == 2) { return "85 HP, quick. Starts with Storm Chain."; }
+        return "100 HP. Starts with Arc Bolt.";
+    }
+
+    // 解锁所需的最好存活秒数（0 = 默认可用）
+    public static int CharacterUnlockSeconds(int id) {
+        if (id == 1) { return 180; }
+        if (id == 2) { return 360; }
+        return 0;
+    }
+
+    public static string EnemyName(int kind, int variant) {
+        if (kind == SurvivorData.KBoss) { return variant == 0 ? "BONE COLOSSUS" : "ABYSS WARDEN"; }
+        if (kind == SurvivorData.KElite) { return "DREAD KNIGHT"; }
+        return "";
+    }
+
+    // 升到下一级所需经验：前期很快（第一分钟能升 4-5 级），之后逐级加码
+    public static int ExpForLevel(int level) {
+        int need = 5 + (level - 1) * 3;
+        if (level >= 10) { need = need + (level - 9) * 5; }
+        if (level >= 20) { need = need + (level - 19) * 10; }
+        return need;
+    }
+
+    // 怪物主色（绘制与死亡碎片共用）
+    public static int EnemyColor(int kind, int variant) {
+        if (kind == SurvivorData.KBat) { return unchecked((int)0xFF8E5BD6); }
+        if (kind == SurvivorData.KBrute) { return unchecked((int)0xFFC0703F); }
+        if (kind == SurvivorData.KSpitter) { return unchecked((int)0xFF7FC34A); }
+        if (kind == SurvivorData.KBomber) { return unchecked((int)0xFFE0573A); }
+        if (kind == SurvivorData.KElite) { return unchecked((int)0xFF5C5F8A); }
+        if (kind == SurvivorData.KBoss) { return variant == 0 ? unchecked((int)0xFFD9CBA8) : unchecked((int)0xFF6E4AB8); }
+        return unchecked((int)0xFF7E9C8A);
+    }
+
+    // 经验宝石颜色：小 = 蓝、中 = 绿、大 = 红
+    public static int GemColor(int value) {
+        if (value >= 10) { return unchecked((int)0xFFFF5A6E); }
+        if (value >= 4) { return unchecked((int)0xFF5BE38A); }
+        return unchecked((int)0xFF4FC3FF);
+    }
+
+    // 按百分比压暗（保留 alpha）
+    public static int Shade(int argb, int pct) {
+        int a = (argb >> 24) & 255;
+        int r = ((argb >> 16) & 255) * pct / 100;
+        int g = ((argb >> 8) & 255) * pct / 100;
+        int b = (argb & 255) * pct / 100;
+        return (a << 24) | (r << 16) | (g << 8) | b;
+    }
+
+    // 向白色提亮 pct%
+    public static int Tint(int argb, int pct) {
+        int a = (argb >> 24) & 255;
+        int r = (argb >> 16) & 255;
+        int g = (argb >> 8) & 255;
+        int b = argb & 255;
+        r = r + (255 - r) * pct / 100;
+        g = g + (255 - g) * pct / 100;
+        b = b + (255 - b) * pct / 100;
+        return (a << 24) | (r << 16) | (g << 8) | b;
+    }
+
+    // 替换 alpha
+    public static int Alpha(int argb, int alpha) {
+        if (alpha < 0) { alpha = 0; }
+        if (alpha > 255) { alpha = 255; }
+        return (argb & 0x00FFFFFF) | (alpha << 24);
+    }
+}

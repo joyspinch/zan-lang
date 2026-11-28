@@ -1,0 +1,825 @@
+using System;
+using System.Collections.Generic;
+using Game.Foundation;
+using Game.Kit;
+
+namespace Survivor;
+
+// 战斗：五把武器、怪物 AI（蝙蝠绕飞、蛮兵、吐酸、自爆引信、精英冲锋预警、首领砸地/弹幕/召唤）、
+// 伤害结算、掉落与磁吸、粒子与闪电等表现对象的推进。
+public partial class SurvivorGame {
+
+    // ---------------- 武器数值（按等级） ----------------
+
+    public int BoltCount() { int l = weaponLv[SurvivorData.WBolt]; return 1 + (l >= 2 ? 1 : 0) + (l >= 4 ? 1 : 0); }
+    public int BoltDamage() { int l = weaponLv[SurvivorData.WBolt]; return l >= 5 ? 27 : (l >= 3 ? 17 : 12); }
+    public int BoltPierce() { int l = weaponLv[SurvivorData.WBolt]; return l >= 5 ? 3 : (l >= 3 ? 1 : 0); }
+    public double BoltCooldown() { return (weaponLv[SurvivorData.WBolt] >= 4 ? 0.64 : 0.8) * CooldownMul(); }
+
+    public int BladeCount() { int l = weaponLv[SurvivorData.WBlades]; return l >= 5 ? 5 : (l >= 4 ? 4 : (l >= 2 ? 3 : 2)); }
+    public int BladeDamage() { int l = weaponLv[SurvivorData.WBlades]; return l >= 5 ? 26 : (l >= 3 ? 19 : 13); }
+    public double BladeRadius() { int l = weaponLv[SurvivorData.WBlades]; return l >= 5 ? 96.0 : (l >= 3 ? 80.0 : 66.0); }
+    public double BladeSpin() { return weaponLv[SurvivorData.WBlades] >= 4 ? 4.6 : 3.8; }
+
+    public double AuraRadius() { int l = weaponLv[SurvivorData.WAura]; return l >= 4 ? 124.0 : (l >= 3 ? 104.0 : (l >= 2 ? 86.0 : 72.0)); }
+    public int AuraDamage() { int l = weaponLv[SurvivorData.WAura]; return l >= 3 ? 8 : (l >= 2 ? 6 : 4); }
+    public double AuraTick() { return (weaponLv[SurvivorData.WAura] >= 4 ? 0.25 : 0.5) * CooldownMul(); }
+
+    public int ChainTargets() { int l = weaponLv[SurvivorData.WChain]; return l >= 5 ? 8 : (l >= 4 ? 6 : (l >= 3 ? 5 : (l >= 2 ? 4 : 3))); }
+    public int ChainDamage() { int l = weaponLv[SurvivorData.WChain]; return l >= 4 ? 24 : (l >= 2 ? 19 : 16); }
+    public double ChainCooldown() { int l = weaponLv[SurvivorData.WChain]; return (l >= 5 ? 1.3 : (l >= 3 ? 1.8 : 2.2)) * CooldownMul(); }
+
+    public int GlaiveCount() { int l = weaponLv[SurvivorData.WGlaive]; return l >= 5 ? 3 : (l >= 3 ? 2 : 1); }
+    public int GlaiveDamage() { int l = weaponLv[SurvivorData.WGlaive]; return l >= 4 ? 33 : (l >= 2 ? 25 : 18); }
+    public double GlaiveRange() { int l = weaponLv[SurvivorData.WGlaive]; return l >= 2 ? 270.0 : 230.0; }
+    public double GlaiveSize() { return weaponLv[SurvivorData.WGlaive] >= 4 ? 17.0 : 13.0; }
+    public double GlaiveCooldown() { return 1.8 * CooldownMul(); }
+
+    // ---------------- 武器 ----------------
+
+    void UpdateWeapons(double dt) {
+        if (HasWeapon(SurvivorData.WBolt)) {
+            boltTimer = boltTimer - dt;
+            if (boltTimer <= 0.0 && FireBolts()) { boltTimer = BoltCooldown(); }
+            if (boltTimer < 0.0) { boltTimer = 0.0; }
+        }
+        if (HasWeapon(SurvivorData.WBlades)) { UpdateBlades(dt); }
+        if (HasWeapon(SurvivorData.WAura)) { UpdateAura(dt); }
+        if (HasWeapon(SurvivorData.WChain)) {
+            chainTimer = chainTimer - dt;
+            if (chainTimer <= 0.0 && FireChain()) { chainTimer = ChainCooldown(); }
+            if (chainTimer < 0.0) { chainTimer = 0.0; }
+        }
+        if (HasWeapon(SurvivorData.WGlaive)) {
+            glaiveTimer = glaiveTimer - dt;
+            if (glaiveTimer <= 0.0 && FireGlaives()) { glaiveTimer = GlaiveCooldown(); }
+            if (glaiveTimer < 0.0) { glaiveTimer = 0.0; }
+        }
+    }
+
+    // 距 (x, y) 最近、且 mark != skipMark 的活怪；超出 maxDist 返回 -1
+    int Nearest(double x, double y, double maxDist, int skipMark) {
+        int best = -1;
+        double bestD = maxDist * maxDist;
+        for (int i = 0; i < enemies.Count; i = i + 1) {
+            Enemy e = enemies[i];
+            if (!e.active || (skipMark != 0 && e.mark == skipMark)) { continue; }
+            double dx = e.x - x;
+            double dy = e.y - y;
+            double d = dx * dx + dy * dy;
+            if (d < bestD) { bestD = d; best = i; }
+        }
+        return best;
+    }
+
+    // range 内最近的精英或首领（-1 = 没有）
+    int BigTarget(double range, int skipMark) {
+        int best = -1;
+        double bestD = range * range;
+        for (int i = 0; i < enemies.Count; i = i + 1) {
+            Enemy e = enemies[i];
+            if (!e.active || (e.kind != SurvivorData.KElite && e.kind != SurvivorData.KBoss)) { continue; }
+            if (skipMark != 0 && e.mark == skipMark) { continue; }
+            double dx = e.x - playerX;
+            double dy = e.y - playerY;
+            double d = dx * dx + dy * dy;
+            if (d < bestD) { bestD = d; best = i; }
+        }
+        return best;
+    }
+
+    Shot NewShot() {
+        for (int i = 0; i < shots.Count; i = i + 1) {
+            if (!shots[i].active) { return shots[i]; }
+        }
+        Shot s = new Shot();
+        shots.Add(s);
+        return s;
+    }
+
+    // 一轮电弧弹：每发瞄准不同的近处目标
+    bool FireBolts() {
+        int n = BoltCount();
+        chainSerial = chainSerial + 1;
+        int fired = 0;
+        for (int k = 0; k < n; k = k + 1) {
+            // 第二发起优先打附近的精英/首领，其余打最近的
+            int t = k >= 1 ? BigTarget(420.0, chainSerial) : -1;
+            if (t < 0) { t = Nearest(playerX, playerY - 16.0, 560.0, chainSerial); }
+            if (t < 0 && fired > 0) { t = Nearest(playerX, playerY - 16.0, 560.0, 0); }
+            if (t < 0) { break; }
+            Enemy e = enemies[t];
+            e.mark = chainSerial;
+            double dx = e.x - playerX;
+            double dy = (e.y - 8.0) - (playerY - 16.0);
+            double len = Math.Sqrt(dx * dx + dy * dy);
+            if (len < 1.0) { len = 1.0; }
+            Shot s = NewShot();
+            s.kind = 0;
+            s.active = true;
+            s.x = playerX + (double)facing * 6.0;
+            s.y = playerY - 16.0;
+            s.vx = dx / len * 560.0;
+            s.vy = dy / len * 560.0;
+            s.life = 1.1;
+            s.damage = BoltDamage();
+            s.pierce = BoltPierce();
+            s.lastHit = -1;
+            s.size = 5.0;
+            fired = fired + 1;
+        }
+        if (fired > 0) { shotCount = shotCount + 1; }
+        return fired > 0;
+    }
+
+    bool FireGlaives() {
+        int t = Nearest(playerX, playerY, 420.0, 0);
+        double baseA = 0.0;
+        if (t >= 0) {
+            baseA = Math.Atan2(enemies[t].y - playerY, enemies[t].x - playerX);
+        } else {
+            baseA = facing > 0 ? 0.0 : SurvivorData.Pi;
+        }
+        int n = GlaiveCount();
+        double spd = weaponLv[SurvivorData.WGlaive] >= 5 ? 470.0 : 380.0;
+        for (int k = 0; k < n; k = k + 1) {
+            double a = baseA + ((double)k - (double)(n - 1) * 0.5) * 0.55;
+            Shot s = NewShot();
+            s.kind = 1;
+            s.active = true;
+            s.x = playerX;
+            s.y = playerY - 14.0;
+            s.ox = s.x;
+            s.oy = s.y;
+            s.vx = Math.Cos(a) * spd;
+            s.vy = Math.Sin(a) * spd;
+            s.life = 3.0;
+            s.range = GlaiveRange();
+            s.damage = GlaiveDamage();
+            s.returning = false;
+            s.spin = 0.0;
+            s.size = GlaiveSize();
+        }
+        shotCount = shotCount + 1;
+        return true;
+    }
+
+    void UpdateBlades(double dt) {
+        bladeAngle = bladeAngle + BladeSpin() * dt;
+        if (bladeAngle > SurvivorData.Pi * 2.0) { bladeAngle = bladeAngle - SurvivorData.Pi * 2.0; }
+        int n = BladeCount();
+        double r = BladeRadius();
+        int dmg = BladeDamage();
+        for (int b = 0; b < n; b = b + 1) {
+            double a = bladeAngle + (double)b / (double)n * SurvivorData.Pi * 2.0;
+            double bx = playerX + Math.Cos(a) * r;
+            double by = playerY - 14.0 + Math.Sin(a) * r * 0.85;
+            for (int i = 0; i < enemies.Count; i = i + 1) {
+                Enemy e = enemies[i];
+                if (!e.active || e.bladeCd > 0.0) { continue; }
+                double dx = e.x - bx;
+                double dy = (e.y - e.radius * 0.6) - by;
+                double rr = e.radius + 15.0;
+                if (dx * dx + dy * dy < rr * rr) {
+                    e.bladeCd = 0.35;
+                    double kl = Math.Sqrt((e.x - playerX) * (e.x - playerX) + (e.y - playerY) * (e.y - playerY));
+                    if (kl < 1.0) { kl = 1.0; }
+                    DamageEnemy(i, dmg, SurvivorData.WBlades, (e.x - playerX) / kl * 170.0, (e.y - playerY) / kl * 170.0);
+                }
+            }
+        }
+    }
+
+    void UpdateAura(double dt) {
+        auraPulse = auraPulse + dt;
+        double r = AuraRadius();
+        // 范围内的怪持续减速；每 tick 灼烧一次
+        for (int i = 0; i < enemies.Count; i = i + 1) {
+            Enemy e = enemies[i];
+            if (!e.active) { continue; }
+            double dx = e.x - playerX;
+            double dy = e.y - playerY;
+            double rr = r + e.radius;
+            if (dx * dx + dy * dy < rr * rr) { e.slow = 0.25; }
+        }
+        auraTimer = auraTimer - dt;
+        if (auraTimer > 0.0) { return; }
+        auraTimer = AuraTick();
+        int dmg = AuraDamage();
+        for (int i = 0; i < enemies.Count; i = i + 1) {
+            Enemy e = enemies[i];
+            if (!e.active) { continue; }
+            double dx = e.x - playerX;
+            double dy = e.y - playerY;
+            double rr = r + e.radius;
+            if (dx * dx + dy * dy < rr * rr) { DamageEnemy(i, dmg, SurvivorData.WAura, 0.0, 0.0); }
+        }
+    }
+
+    bool FireChain() {
+        int t = BigTarget(480.0, 0);
+        if (t < 0) { t = Nearest(playerX, playerY, 520.0, 0); }
+        if (t < 0) { return false; }
+        chainSerial = chainSerial + 1;
+        int left = ChainTargets();
+        int dmg = ChainDamage();
+        double fx0 = playerX;
+        double fy0 = playerY - 60.0;
+        bool first = true;
+        while (t >= 0 && left > 0) {
+            Enemy e = enemies[t];
+            e.mark = chainSerial;
+            double tx = e.x;
+            double ty = e.y - e.radius * 0.7;
+            AddZap(first ? tx + 10.0 : fx0, first ? ty - 220.0 : fy0, tx, ty);
+            first = false;
+            for (int k = 0; k < 5; k = k + 1) {
+                double a = fx.NextDouble() * SurvivorData.Pi * 2.0;
+                SpawnParticle(1, tx, ty, Math.Cos(a) * 180.0, Math.Sin(a) * 180.0, 0.25, unchecked((int)0xFFBFE9FF), 2.0);
+            }
+            DamageEnemy(t, dmg, SurvivorData.WChain, 0.0, 0.0);
+            fx0 = tx;
+            fy0 = ty;
+            left = left - 1;
+            t = Nearest(tx, ty, 190.0, chainSerial);
+        }
+        zapCount = zapCount + 1;
+        return true;
+    }
+
+    void AddZap(double x0, double y0, double x1, double y1) {
+        Zap z = null;
+        for (int i = 0; i < zaps.Count; i = i + 1) {
+            if (!zaps[i].active) { z = zaps[i]; break; }
+        }
+        if (z == null) { z = new Zap(); zaps.Add(z); }
+        z.active = true;
+        z.x0 = x0;
+        z.y0 = y0;
+        z.x1 = x1;
+        z.y1 = y1;
+        z.life = 0.22;
+        z.seed = fx.NextBelow(100000);
+    }
+
+    void UpdateShots(double dt) {
+        for (int i = 0; i < shots.Count; i = i + 1) {
+            Shot s = shots[i];
+            if (!s.active) { continue; }
+            s.life = s.life - dt;
+            if (s.life <= 0.0) { s.active = false; continue; }
+            if (s.kind == 1) {
+                s.spin = s.spin + dt * 16.0;
+                if (!s.returning) {
+                    double ox = s.x - s.ox;
+                    double oy = s.y - s.oy;
+                    if (ox * ox + oy * oy >= s.range * s.range) { s.returning = true; }
+                } else {
+                    // 折返：朝玩家当前位置加速飞回
+                    double dx = playerX - s.x;
+                    double dy = (playerY - 14.0) - s.y;
+                    double d = Math.Sqrt(dx * dx + dy * dy);
+                    if (d < 22.0) { s.active = false; continue; }
+                    double sp = Math.Sqrt(s.vx * s.vx + s.vy * s.vy) + 260.0 * dt;
+                    if (sp > 620.0) { sp = 620.0; }
+                    s.vx = dx / d * sp;
+                    s.vy = dy / d * sp;
+                }
+            }
+            s.x = s.x + s.vx * dt;
+            s.y = s.y + s.vy * dt;
+            // 命中
+            for (int j = 0; j < enemies.Count; j = j + 1) {
+                Enemy e = enemies[j];
+                if (!e.active) { continue; }
+                double dx = e.x - s.x;
+                double dy = (e.y - e.radius * 0.6) - s.y;
+                double rr = e.radius + s.size;
+                if (dx * dx + dy * dy >= rr * rr) { continue; }
+                double vl = Math.Sqrt(s.vx * s.vx + s.vy * s.vy);
+                if (vl < 1.0) { vl = 1.0; }
+                if (s.kind == 0) {
+                    if (s.lastHit == j) { continue; }
+                    s.lastHit = j;
+                    DamageEnemy(j, s.damage, SurvivorData.WBolt, s.vx / vl * 120.0, s.vy / vl * 120.0);
+                    if (s.pierce <= 0) { s.active = false; break; }
+                    s.pierce = s.pierce - 1;
+                } else {
+                    if (e.glaiveCd > 0.0) { continue; }
+                    e.glaiveCd = 0.3;
+                    DamageEnemy(j, s.damage, SurvivorData.WGlaive, s.vx / vl * 150.0, s.vy / vl * 150.0);
+                }
+            }
+        }
+    }
+
+    // ---------------- 伤害与死亡 ----------------
+
+    public void DamageEnemy(int idx, int dmg, int weapon, double kbx, double kby) {
+        Enemy e = enemies[idx];
+        if (!e.active) { return; }
+        bool crit = rng.NextBelow(100) < 8;
+        if (crit) { dmg = dmg * 2; }
+        if (dmg > e.hp) { if (weapon >= 0) { weaponDamage[weapon] = weaponDamage[weapon] + e.hp; } }
+        else if (weapon >= 0) { weaponDamage[weapon] = weaponDamage[weapon] + dmg; }
+        e.hp = e.hp - dmg;
+        e.flash = 0.12;
+        hitCount = hitCount + 1;
+        double resist = 1.0;
+        if (e.kind == SurvivorData.KBat) { resist = 1.3; }
+        else if (e.kind == SurvivorData.KBrute) { resist = 0.35; }
+        else if (e.kind == SurvivorData.KElite) { resist = 0.12; }
+        else if (e.kind == SurvivorData.KBoss) { resist = 0.0; }
+        e.kx = e.kx + kbx * resist;
+        e.ky = e.ky + kby * resist;
+        floatingTexts.SpawnDamage(e.x, e.y - e.radius * 2.0 - 6.0, dmg, crit);
+        if (crit) {
+            for (int k = 0; k < 3; k = k + 1) {
+                double a = fx.NextDouble() * SurvivorData.Pi * 2.0;
+                SpawnParticle(1, e.x, e.y - e.radius, Math.Cos(a) * 220.0, Math.Sin(a) * 220.0, 0.2, unchecked((int)0xFFFFE27A), 2.0);
+            }
+        }
+        if (e.hp <= 0) { KillEnemy(idx, true); }
+    }
+
+    void KillEnemy(int idx, bool byPlayer) {
+        Enemy e = enemies[idx];
+        e.active = false;
+        int col = SurvivorData.EnemyColor(e.kind, e.variant);
+        int pieces = e.kind == SurvivorData.KBoss ? 40 : (e.kind == SurvivorData.KElite ? 24 : 10);
+        for (int k = 0; k < pieces; k = k + 1) {
+            double a = fx.NextDouble() * SurvivorData.Pi * 2.0;
+            double sp = 60.0 + fx.NextDouble() * (e.kind == SurvivorData.KBoss ? 320.0 : 170.0);
+            SpawnParticle(0, e.x, e.y - e.radius * 0.6, Math.Cos(a) * sp, Math.Sin(a) * sp - 40.0,
+                0.35 + fx.NextDouble() * 0.35, k % 3 == 0 ? SurvivorData.Shade(col, 55) : col,
+                2.0 + fx.NextDouble() * (e.radius * 0.22));
+        }
+        SpawnParticle(2, e.x, e.y - e.radius * 0.6, 0.0, 0.0, 0.3, unchecked((int)0xFFFFFFFF), e.radius * 1.6);
+        if (!byPlayer) { return; }
+        killCount = killCount + 1;
+        if (e.kind == SurvivorData.KBomber) { Explode(e.x, e.y, 74.0, 30, false); }
+        if (e.kind == SurvivorData.KBoss) {
+            bossKills = bossKills + 1;
+            if (idx == bossIndex) { bossIndex = -1; }
+            SpawnGem(3, e.x, e.y, e.variant == 0 ? 1 : 2);
+            for (int k = 0; k < 12; k = k + 1) {
+                double a = (double)k / 12.0 * SurvivorData.Pi * 2.0;
+                SpawnGem(0, e.x + Math.Cos(a) * 46.0, e.y + Math.Sin(a) * 46.0, 10);
+            }
+            Announce(e.variant == 0 ? "COLOSSUS DESTROYED!" : "THE WARDEN FALLS!");
+            hitStop.Freeze(0.12);
+            shake.AddTrauma(0.8);
+            return;
+        }
+        if (e.kind == SurvivorData.KElite) {
+            eliteKills = eliteKills + 1;
+            SpawnGem(1, e.x - 14.0, e.y, 35);
+            SpawnGem(0, e.x + 12.0, e.y, e.xp);
+            hitStop.Freeze(0.08);
+            shake.AddTrauma(0.45);
+            return;
+        }
+        shake.AddTrauma(0.06);
+        SpawnGem(0, e.x, e.y, e.xp);
+        int roll = rng.NextBelow(1000);
+        if (roll < 6) { SpawnGem(1, e.x + 10.0, e.y + 6.0, 25); }
+        else if (roll < 9) { SpawnGem(2, e.x + 10.0, e.y + 6.0, 0); }
+    }
+
+    // 爆炸：hurtsPlayer = 自爆怪引爆（伤玩家），否则是被击杀的自爆怪殉爆（伤周围怪物）
+    void Explode(double x, double y, double radius, int dmg, bool hurtsPlayer) {
+        blastCount = blastCount + 1;
+        Blast b = null;
+        for (int i = 0; i < blasts.Count; i = i + 1) { if (!blasts[i].active) { b = blasts[i]; break; } }
+        if (b == null) { b = new Blast(); blasts.Add(b); }
+        b.active = true;
+        b.x = x;
+        b.y = y;
+        b.radius = radius;
+        b.life = 0.4;
+        b.color = hurtsPlayer ? unchecked((int)0xFFFF6A3D) : unchecked((int)0xFFFFB03D);
+        for (int k = 0; k < 14; k = k + 1) {
+            double a = fx.NextDouble() * SurvivorData.Pi * 2.0;
+            double sp = 80.0 + fx.NextDouble() * 220.0;
+            SpawnParticle(0, x, y - 8.0, Math.Cos(a) * sp, Math.Sin(a) * sp, 0.4 + fx.NextDouble() * 0.3,
+                k % 2 == 0 ? unchecked((int)0xFFFFC45C) : unchecked((int)0xFFFF5E2B), 3.0 + fx.NextDouble() * 3.0);
+        }
+        shake.AddTrauma(0.22);
+        if (hurtsPlayer) {
+            double dx = playerX - x;
+            double dy = playerY - y;
+            if (dx * dx + dy * dy < (radius + 10.0) * (radius + 10.0)) { HurtPlayer(dmg); }
+            return;
+        }
+        for (int i = 0; i < enemies.Count; i = i + 1) {
+            Enemy e = enemies[i];
+            if (!e.active) { continue; }
+            double dx = e.x - x;
+            double dy = e.y - y;
+            if (dx * dx + dy * dy < (radius + e.radius) * (radius + e.radius)) {
+                DamageEnemy(i, dmg, -1, dx * 2.0, dy * 2.0);
+            }
+        }
+    }
+
+    void HurtPlayer(int dmg) {
+        if (dead || hurtTimer > 0.0) { return; }
+        playerHp = playerHp - dmg;
+        hurtTimer = 0.55;
+        hurtCount = hurtCount + 1;
+        shake.AddTrauma(0.38);
+        hitStop.Freeze(0.04);
+        floatingTexts.Spawn(playerX, playerY - 50.0, "-" + Convert.ToString(dmg), unchecked((int)0xFFFF4D4F), false);
+        for (int k = 0; k < 8; k = k + 1) {
+            double a = fx.NextDouble() * SurvivorData.Pi * 2.0;
+            SpawnParticle(0, playerX, playerY - 18.0, Math.Cos(a) * 150.0, Math.Sin(a) * 150.0, 0.35, unchecked((int)0xFFFF4D4F), 3.0);
+        }
+        if (playerHp <= 0) {
+            playerHp = 0;
+            dead = true;
+            for (int k = 0; k < 30; k = k + 1) {
+                double a = fx.NextDouble() * SurvivorData.Pi * 2.0;
+                double sp = 80.0 + fx.NextDouble() * 200.0;
+                SpawnParticle(0, playerX, playerY - 18.0, Math.Cos(a) * sp, Math.Sin(a) * sp, 0.9, unchecked((int)0xFFE04848), 4.0);
+            }
+            shake.AddTrauma(0.7);
+        }
+    }
+
+    // ---------------- 怪物 AI ----------------
+
+    void UpdateEnemies(double dt) {
+        for (int i = 0; i < enemies.Count; i = i + 1) {
+            Enemy e = enemies[i];
+            if (!e.active) { continue; }
+            if (e.flash > 0.0) { e.flash = e.flash - dt; }
+            if (e.bladeCd > 0.0) { e.bladeCd = e.bladeCd - dt; }
+            if (e.glaiveCd > 0.0) { e.glaiveCd = e.glaiveCd - dt; }
+            double slowMul = 1.0;
+            if (e.slow > 0.0) { e.slow = e.slow - dt; slowMul = 0.65; }
+            e.phase = e.phase + dt * (e.kind == SurvivorData.KBat ? 14.0 : 7.0);
+
+            double dx = playerX - e.x;
+            double dy = playerY - e.y;
+            double dist = Math.Sqrt(dx * dx + dy * dy);
+            if (dist < 0.001) { dist = 0.001; }
+            double ux = dx / dist;
+            double uy = dy / dist;
+            double mvx = 0.0;
+            double mvy = 0.0;
+            double spd = e.speed * slowMul;
+
+            // 掉队太远的普通怪传送回镜头外一圈（保持压力，列表不膨胀）
+            if (dist > 1150.0 && e.kind != SurvivorData.KBoss) {
+                double sx = 0.0;
+                double sy = 0.0;
+                SpawnPoint(out sx, out sy);
+                e.x = sx;
+                e.y = sy;
+                continue;
+            }
+
+            if (e.kind == SurvivorData.KBat) {
+                // 蛇形绕飞
+                double w = Math.Sin(e.phase * 0.45) * 0.8;
+                mvx = (ux - uy * w) * spd;
+                mvy = (uy + ux * w) * spd;
+            } else if (e.kind == SurvivorData.KSpitter) {
+                // 保持中距离游走，定时蓄力吐酸
+                double want = dist > 300.0 ? 1.0 : (dist < 210.0 ? -0.8 : 0.0);
+                double side = Math.Sin(e.phase * 0.2) > 0.0 ? 0.5 : -0.5;
+                mvx = (ux * want - uy * side) * spd;
+                mvy = (uy * want + ux * side) * spd;
+                e.attackTimer = e.attackTimer + dt;
+                if (e.state == 0 && e.attackTimer >= 2.6 && dist < 460.0) { e.state = 1; e.stateTimer = 0.45; }
+                if (e.state == 1) {
+                    mvx = 0.0;
+                    mvy = 0.0;
+                    e.stateTimer = e.stateTimer - dt;
+                    if (e.stateTimer <= 0.0) {
+                        e.state = 0;
+                        e.attackTimer = 0.0;
+                        FireEnemyShot(e.x, e.y - 14.0, ux * 200.0, uy * 200.0, 10, 7.0);
+                    }
+                }
+            } else if (e.kind == SurvivorData.KBomber) {
+                if (e.state == 0) {
+                    mvx = ux * spd;
+                    mvy = uy * spd;
+                    if (dist < 54.0) { e.state = 1; e.stateTimer = 0.75; }
+                } else {
+                    mvx = ux * spd * 0.25;
+                    mvy = uy * spd * 0.25;
+                    e.stateTimer = e.stateTimer - dt;
+                    if (e.stateTimer <= 0.0) {
+                        KillEnemy(i, false);
+                        Explode(e.x, e.y, 80.0, 22, true);
+                        if (dead) { return; }
+                        continue;
+                    }
+                }
+            } else if (e.kind == SurvivorData.KElite) {
+                e.attackTimer = e.attackTimer + dt;
+                if (e.state == 0) {
+                    mvx = ux * spd;
+                    mvy = uy * spd;
+                    if (e.attackTimer >= 3.6 && dist < 430.0) {
+                        e.state = 1;
+                        e.stateTimer = 0.9;
+                        e.dirX = ux;
+                        e.dirY = uy;
+                    }
+                } else if (e.state == 1) {
+                    // 蓄力：原地抖动，方向锁定（地上画出冲锋道预警）
+                    e.stateTimer = e.stateTimer - dt;
+                    if (e.stateTimer <= 0.0) { e.state = 2; e.stateTimer = 0.55; }
+                } else {
+                    mvx = e.dirX * 440.0;
+                    mvy = e.dirY * 440.0;
+                    e.stateTimer = e.stateTimer - dt;
+                    if (fx.NextBelow(2) == 0) {
+                        SpawnParticle(0, e.x, e.y - 4.0, -e.dirX * 60.0, -e.dirY * 60.0, 0.3, unchecked((int)0xFF6B5A7A), 4.0);
+                    }
+                    if (e.stateTimer <= 0.0) { e.state = 0; e.attackTimer = 0.0; }
+                }
+            } else if (e.kind == SurvivorData.KBoss) {
+                UpdateBoss(e, dt, ux, uy, dist);
+                if (dead) { return; }
+                if (e.state == 0) { mvx = ux * spd; mvy = uy * spd; }
+            } else {
+                mvx = ux * spd;
+                mvy = uy * spd;
+            }
+
+            e.x = e.x + (mvx + e.kx) * dt;
+            e.y = e.y + (mvy + e.ky) * dt;
+            double decay = 1.0 - dt * 9.0;
+            if (decay < 0.0) { decay = 0.0; }
+            e.kx = e.kx * decay;
+            e.ky = e.ky * decay;
+            if (e.x < 20.0) { e.x = 20.0; }
+            if (e.y < 20.0) { e.y = 20.0; }
+            if (e.x > SurvivorData.WorldW - 20.0) { e.x = SurvivorData.WorldW - 20.0; }
+            if (e.y > SurvivorData.WorldH - 20.0) { e.y = SurvivorData.WorldH - 20.0; }
+
+            // 接触伤害
+            double cr = e.radius + 12.0;
+            bool airborne = e.kind == SurvivorData.KBoss && e.state == 1 && SurvivorGame.BossJump(e.stateTimer) > 0.0;
+            if (dist < cr && hurtTimer <= 0.0 && !airborne) {
+                HurtPlayer(e.damage);
+                if (dead) { return; }
+                if (e.kind != SurvivorData.KBoss && e.kind != SurvivorData.KElite) {
+                    e.kx = e.kx - ux * 260.0;
+                    e.ky = e.ky - uy * 260.0;
+                }
+            }
+        }
+        Separate();
+    }
+
+    void UpdateBoss(Enemy e, double dt, double ux, double uy, double dist) {
+        e.attackTimer = e.attackTimer + dt;
+        e.ringTimer = e.ringTimer + dt;
+        e.summonTimer = e.summonTimer + dt;
+        if (e.state == 0 && e.attackTimer >= 5.0) {
+            // 跃击：锁定玩家当前位置（地面红圈预警），蹲伏 0.4 秒后腾空 0.8 秒砸下
+            e.state = 1;
+            e.stateTimer = 1.2;
+            e.telX = playerX;
+            e.telY = playerY;
+            e.dirX = e.x;
+            e.dirY = e.y;
+        } else if (e.state == 1) {
+            e.stateTimer = e.stateTimer - dt;
+            double k = SurvivorGame.BossJump(e.stateTimer);
+            if (k > 0.0) {
+                double ease = k * k * (3.0 - 2.0 * k);
+                e.x = e.dirX + (e.telX - e.dirX) * ease;
+                e.y = e.dirY + (e.telY - e.dirY) * ease;
+            }
+            if (e.stateTimer <= 0.0) {
+                e.state = 0;
+                e.attackTimer = 0.0;
+                e.x = e.telX;
+                e.y = e.telY;
+                Explode(e.telX, e.telY, 118.0, 26, true);
+                if (dead) { return; }
+            }
+        }
+        double ringEvery = e.variant == 0 ? 6.5 : 4.4;
+        if (e.ringTimer >= ringEvery) {
+            e.ringTimer = 0.0;
+            int n = e.variant == 0 ? 12 : 18;
+            double off = fx.NextDouble();
+            for (int k = 0; k < n; k = k + 1) {
+                double a = ((double)k + off) / (double)n * SurvivorData.Pi * 2.0;
+                FireEnemyShot(e.x, e.y - 30.0, Math.Cos(a) * 150.0, Math.Sin(a) * 150.0, 12, 8.0);
+            }
+        }
+        if (e.variant == 1 && e.summonTimer >= 9.0) {
+            e.summonTimer = 0.0;
+            for (int k = 0; k < 6 && ActiveEnemies() < 380; k = k + 1) {
+                double a = (double)k / 6.0 * SurvivorData.Pi * 2.0;
+                SpawnEnemy(SurvivorData.KBat, 0, e.x + Math.Cos(a) * 70.0, e.y + Math.Sin(a) * 70.0);
+            }
+        }
+    }
+
+    // 首领跃击的腾空进度 0..1（前 0.4 秒蹲伏为 0）
+    public static double BossJump(double stateTimer) {
+        double k = (0.8 - stateTimer) / 0.8;
+        if (k < 0.0) { return 0.0; }
+        if (k > 1.0) { return 1.0; }
+        return k;
+    }
+
+    // 怪物互相推开，避免叠成一个点
+    void Separate() {
+        int n = enemies.Count;
+        for (int i = 0; i < n; i = i + 1) {
+            Enemy a = enemies[i];
+            if (!a.active) { continue; }
+            for (int j = i + 1; j < n; j = j + 1) {
+                Enemy b = enemies[j];
+                if (!b.active) { continue; }
+                double rr = (a.radius + b.radius) * 0.85;
+                double dx = b.x - a.x;
+                if (dx > rr || dx < -rr) { continue; }
+                double dy = b.y - a.y;
+                if (dy > rr || dy < -rr) { continue; }
+                double d2 = dx * dx + dy * dy;
+                if (d2 >= rr * rr) { continue; }
+                double d = Math.Sqrt(d2);
+                if (d < 0.01) { dx = 0.7; dy = 0.7; d = 1.0; }
+                double push = (rr - d) * 0.5;
+                double wa = a.kind == SurvivorData.KBoss ? 0.0 : (b.kind == SurvivorData.KBoss ? 1.0 : 0.5);
+                double wb = 1.0 - wa;
+                a.x = a.x - dx / d * push * wa * 2.0;
+                a.y = a.y - dy / d * push * wa * 2.0;
+                b.x = b.x + dx / d * push * wb * 2.0;
+                b.y = b.y + dy / d * push * wb * 2.0;
+            }
+        }
+    }
+
+    void FireEnemyShot(double x, double y, double vx, double vy, int dmg, double radius) {
+        EnemyShot s = null;
+        for (int i = 0; i < enemyShots.Count; i = i + 1) { if (!enemyShots[i].active) { s = enemyShots[i]; break; } }
+        if (s == null) { s = new EnemyShot(); enemyShots.Add(s); }
+        s.active = true;
+        s.x = x;
+        s.y = y;
+        s.vx = vx;
+        s.vy = vy;
+        s.life = 4.0;
+        s.damage = dmg;
+        s.radius = radius;
+    }
+
+    void UpdateEnemyShots(double dt) {
+        for (int i = 0; i < enemyShots.Count; i = i + 1) {
+            EnemyShot s = enemyShots[i];
+            if (!s.active) { continue; }
+            s.x = s.x + s.vx * dt;
+            s.y = s.y + s.vy * dt;
+            s.life = s.life - dt;
+            if (s.life <= 0.0) { s.active = false; continue; }
+            double dx = playerX - s.x;
+            double dy = (playerY - 16.0) - s.y;
+            double rr = s.radius + 11.0;
+            if (dx * dx + dy * dy < rr * rr) {
+                s.active = false;
+                for (int k = 0; k < 6; k = k + 1) {
+                    double a = fx.NextDouble() * SurvivorData.Pi * 2.0;
+                    SpawnParticle(0, s.x, s.y, Math.Cos(a) * 110.0, Math.Sin(a) * 110.0, 0.3, unchecked((int)0xFF9BE15D), 2.5);
+                }
+                HurtPlayer(s.damage);
+                if (dead) { return; }
+            }
+        }
+    }
+
+    // ---------------- 掉落与磁吸 ----------------
+
+    void SpawnGem(int kind, double x, double y, int value) {
+        Gem g = null;
+        int live = 0;
+        for (int i = 0; i < gems.Count; i = i + 1) {
+            if (!gems[i].active) { if (g == null) { g = gems[i]; } }
+            else { live = live + 1; }
+        }
+        if (g == null) {
+            if (gems.Count >= 400) {
+                // 池满：经验并进一颗现有的经验宝石，不丢经验也不再扩容
+                if (kind == 0) {
+                    for (int i = 0; i < gems.Count; i = i + 1) {
+                        if (gems[i].active && gems[i].kind == 0) { gems[i].value = gems[i].value + value; return; }
+                    }
+                }
+                return;
+            }
+            g = new Gem();
+            gems.Add(g);
+        }
+        g.active = true;
+        g.kind = kind;
+        g.x = x;
+        g.y = y;
+        g.px = x;
+        g.py = y;
+        g.value = value;
+        g.pulled = false;
+        g.speed = 0.0;
+    }
+
+    void UpdateGems(double dt) {
+        double mr = MagnetRange();
+        double chase = MoveSpeed() * 1.6 + 160.0;
+        for (int i = 0; i < gems.Count; i = i + 1) {
+            Gem g = gems[i];
+            if (!g.active) { continue; }
+            g.px = g.x;
+            g.py = g.y;
+            double dx = playerX - g.x;
+            double dy = (playerY - 12.0) - g.y;
+            double d = Math.Sqrt(dx * dx + dy * dy);
+            if (!g.pulled && d < mr) {
+                g.pulled = true;
+                g.speed = -110.0;   // 先轻轻弹开再被吸回（磁吸的“吸气”手感）
+            }
+            if (!g.pulled) { continue; }
+            g.speed = g.speed + 1500.0 * dt;
+            if (g.speed > chase + 400.0) { g.speed = chase + 400.0; }
+            double sp = g.speed < 0.0 ? g.speed : (g.speed < chase ? chase : g.speed);
+            if (d > 0.5) {
+                g.x = g.x + dx / d * sp * dt;
+                g.y = g.y + dy / d * sp * dt;
+            }
+            if (d < 18.0) {
+                g.active = false;
+                if (g.kind == 0) {
+                    gemCount = gemCount + 1;
+                    GainExp(g.value);
+                    SpawnParticle(1, playerX, playerY - 20.0, 0.0, -90.0, 0.25, SurvivorData.GemColor(g.value), 2.0);
+                } else if (g.kind == 1) {
+                    pickupCount = pickupCount + 1;
+                    Heal(30);
+                } else if (g.kind == 2) {
+                    pickupCount = pickupCount + 1;
+                    for (int k = 0; k < gems.Count; k = k + 1) {
+                        if (gems[k].active && gems[k].kind == 0 && !gems[k].pulled) { gems[k].pulled = true; gems[k].speed = 0.0; }
+                    }
+                    Announce("LODESTONE: ALL GEMS INBOUND");
+                } else {
+                    pickupCount = pickupCount + 1;
+                    pendingLevels = pendingLevels + g.value;
+                    Heal(playerMaxHp);
+                    Announce("TREASURE! +" + Convert.ToString(g.value) + " UPGRADE" + (g.value > 1 ? "S" : ""));
+                }
+            }
+        }
+    }
+
+    // ---------------- 表现对象 ----------------
+
+    void SpawnParticle(int kind, double x, double y, double vx, double vy, double life, int color, double size) {
+        Particle p = particles[particleCursor];
+        particleCursor = particleCursor + 1;
+        if (particleCursor >= particles.Count) { particleCursor = 0; }
+        p.active = true;
+        p.kind = kind;
+        p.x = x;
+        p.y = y;
+        p.vx = vx;
+        p.vy = vy;
+        p.life = life;
+        p.maxLife = life;
+        p.color = color;
+        p.size = size;
+    }
+
+    void UpdateFx(double dt) {
+        for (int i = 0; i < particles.Count; i = i + 1) {
+            Particle p = particles[i];
+            if (!p.active) { continue; }
+            p.life = p.life - dt;
+            if (p.life <= 0.0) { p.active = false; continue; }
+            p.x = p.x + p.vx * dt;
+            p.y = p.y + p.vy * dt;
+            double drag = 1.0 - dt * 4.0;
+            if (drag < 0.0) { drag = 0.0; }
+            p.vx = p.vx * drag;
+            p.vy = p.vy * drag + (p.kind == 0 ? 260.0 * dt : 0.0);
+        }
+        for (int i = 0; i < zaps.Count; i = i + 1) {
+            if (!zaps[i].active) { continue; }
+            zaps[i].life = zaps[i].life - dt;
+            if (zaps[i].life <= 0.0) { zaps[i].active = false; }
+        }
+        for (int i = 0; i < blasts.Count; i = i + 1) {
+            if (!blasts[i].active) { continue; }
+            blasts[i].life = blasts[i].life - dt;
+            if (blasts[i].life <= 0.0) { blasts[i].active = false; }
+        }
+    }
+}

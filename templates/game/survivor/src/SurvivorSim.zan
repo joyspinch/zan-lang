@@ -2,45 +2,66 @@ using System;
 using Game.Foundation;
 
 // 回放与回归（docs/ZAN_STANDARD.md S26/S27）：SurvivorGame 以固定 1/60 秒一帧无头推进。
-// 刷怪方位由游戏时间公式决定，种子不参与。怪物贴身造成接触伤害，血量归零即阵亡、世界冻结。replays/ 下的回放由 `zan-check` 重放、逐校验点
+// 刷怪方位、暴击、掉落与升级抽卡都来自种子。replays/ 下的回放由 `zan-check` 重放、逐校验点
 // 比对；Bot 是模糊测试用的机器人。改了数值或刷怪后回放分叉，就重新录制（见 README）。
 //
-// 输入编码：0 保持上一帧的按键；1 + 按键位（1 上、2 下、4 左、8 右）= 本帧按住的方向键。
+// 种子决定开局场景（让 2000 帧的模糊测试也能摸到后期机制）：
+//   seed % 4 == 2 → 快进到 2:50、12 级（10 秒后首领骸骨巨像登场）
+//   seed % 4 == 3 → 快进到 5:50、20 级（深渊守望与后期怪潮）
+//   其余          → 正常开局；角色 = seed % 3
+//
+// 输入编码：0 保持上一帧的按键；1 + 按键位（1 上、2 下、4 左、8 右）= 本帧按住的方向键；
+// 17/18/19 = 升级时选第 1/2/3 张卡（不在选卡时忽略）。
 public class SurvivorSim : IReplaySim {
     SurvivorGame game;
 
-    public void Reset(long seed) { game = SurvivorGame.Create(); }
+    // 测试 / 探针读取当前对局
+    public SurvivorGame Game() { return game; }
+
+    public void Reset(long seed) {
+        game = SurvivorGame.Create(seed, (int)(seed % 3));
+        long scenario = seed % 4;
+        if (scenario == 2) { game.DebugWarp(170.0, 12); }
+        else if (scenario == 3) { game.DebugWarp(350.0, 20); }
+    }
 
     public void Step(int frame, int input) {
         if (input >= 1 && input <= 16) {
             int keys = input - 1;
             game.moveX = (keys & 4) != 0 ? -1.0 : ((keys & 8) != 0 ? 1.0 : 0.0);
             game.moveY = (keys & 1) != 0 ? -1.0 : ((keys & 2) != 0 ? 1.0 : 0.0);
+        } else if (input >= 17 && input <= 19) {
+            game.Choose(input - 17);
         }
         game.Tick(1.0 / 60.0);
     }
 
     public int StateChecksum() {
         StateHasher h = new StateHasher();
-        h.Real(game.playerX).Real(game.playerY).Int(game.playerHp).Int(game.level).Int(game.exp)
-         .Int(game.killCount).Real(game.gameTime).Int(game.hurtCount);
+        h.Real(game.playerX).Real(game.playerY).Int(game.playerHp).Int(game.playerMaxHp).Int(game.level).Int(game.exp)
+         .Int(game.killCount).Real(game.gameTime).Int(game.hurtCount).Int(game.pendingLevels).Int(game.choosing ? 1 : 0);
+        for (int w = 0; w < SurvivorData.WeaponCount; w = w + 1) { h.Int(game.weaponLv[w]).Int(game.weaponDamage[w]); }
+        for (int p = 0; p < SurvivorData.PassiveCount; p = p + 1) { h.Int(game.passiveLv[p]); }
         int alive = 0;
         for (int i = 0; i < game.enemies.Count; i = i + 1) {
             Enemy e = game.enemies[i];
-            if (e.active) { alive = alive + 1; h.Real(e.x).Real(e.y).Int(e.hp); }
+            if (e.active) { alive = alive + 1; h.Int(e.kind).Real(e.x).Real(e.y).Int(e.hp).Int(e.state); }
         }
-        return h.Int(alive).Value();
+        int gems = 0;
+        for (int i = 0; i < game.gems.Count; i = i + 1) { if (game.gems[i].active) { gems = gems + 1; } }
+        return h.Int(alive).Int(gems).Value();
     }
 
     [Invariant]
-    public bool PlayerInArena() {
-        return game.playerX >= 30 && game.playerX <= 1250 && game.playerY >= 80 && game.playerY <= 690;
+    public bool PlayerInWorld() {
+        return game.playerX >= 40.0 && game.playerX <= SurvivorData.WorldW - 40.0
+            && game.playerY >= 40.0 && game.playerY <= SurvivorData.WorldH - 40.0;
     }
 
     [Invariant]
     public bool HpWithinMax() { return game.playerHp >= 0 && game.playerHp <= game.playerMaxHp; }
 
-    // 阵亡当且仅当血量归零（阵亡帧不再拾取宝石回血）
+    // 阵亡当且仅当血量归零
     [Invariant]
     public bool DeadIffNoHp() { return game.dead == (game.playerHp == 0); }
 
@@ -48,13 +69,59 @@ public class SurvivorSim : IReplaySim {
     [Invariant]
     public bool ExpBelowNextLevel() { return game.exp >= 0 && game.exp < game.expToNext; }
 
-    // 阵亡的怪物槽位被复用：列表大小有上界（同屏存活数 + 少量余量）
+    // 选卡状态自洽：选卡时一定有待领的等级和 1..3 张卡；不选卡时没有积压
+    // （积压的升级在同一帧末尾就会打开选卡）
     [Invariant]
-    public bool EnemyPoolBounded() { return game.enemies.Count <= 400; }
+    public bool ChoiceConsistent() {
+        if (game.choosing) { return game.pendingLevels >= 1 && game.optionCount >= 1 && game.optionCount <= 3; }
+        return game.pendingLevels == 0 || game.dead;
+    }
 
-    // 机器人：随机按方向键走位，隔一阵换一次
+    // 武器 / 被动等级在 0..满级，且槽位上限 4 + 4；开局武器一定在手
+    [Invariant]
+    public bool BuildValid() {
+        if (game.weaponOrder.Count > SurvivorData.MaxWeaponSlots || game.passiveOrder.Count > SurvivorData.MaxPassiveSlots) { return false; }
+        for (int w = 0; w < SurvivorData.WeaponCount; w = w + 1) {
+            if (game.weaponLv[w] < 0 || game.weaponLv[w] > SurvivorData.WeaponMaxLevel(w)) { return false; }
+        }
+        for (int p = 0; p < SurvivorData.PassiveCount; p = p + 1) {
+            if (game.passiveLv[p] < 0 || game.passiveLv[p] > SurvivorData.PassiveMaxLevel(p)) { return false; }
+        }
+        return game.weaponLv[SurvivorData.CharacterWeapon(game.character)] >= 1;
+    }
+
+    // 卡面上不会出现满级的武器 / 被动，也不会重复
+    [Invariant]
+    public bool OptionsOffered() {
+        if (!game.choosing) { return true; }
+        for (int i = 0; i < game.optionCount; i = i + 1) {
+            int code = game.options[i];
+            if (SurvivorGame.OptionIsWeapon(code) && game.weaponLv[code] >= SurvivorData.WeaponMaxLevel(code)) { return false; }
+            if (SurvivorGame.OptionIsPassive(code) && game.passiveLv[code - 10] >= SurvivorData.PassiveMaxLevel(code - 10)) { return false; }
+            for (int j = 0; j < i; j = j + 1) { if (game.options[j] == code) { return false; } }
+        }
+        return true;
+    }
+
+    // 死槽复用：怪物（常规上限 280/340，合围与召唤另有 380 的硬顶）、掉落、投射物列表都有上界
+    [Invariant]
+    public bool PoolsBounded() {
+        return game.enemies.Count <= 400 && game.gems.Count <= 400 && game.shots.Count <= 64 && game.enemyShots.Count <= 200;
+    }
+
+    // 首领槽位指向一只活着的首领
+    [Invariant]
+    public bool BossTracked() {
+        if (game.bossIndex < 0) { return true; }
+        Enemy b = game.enemies[game.bossIndex];
+        return b.active && b.kind == SurvivorData.KBoss;
+    }
+
+    // 机器人：随机按方向键走位（隔一阵换一次），升级时过一会儿随机选一张卡
     public static int Bot(DeterministicRandom rng, int frame) {
-        if (rng.NextBelow(30) != 0) { return 0; }
-        return 1 + rng.NextBelow(16);
+        int r = rng.NextBelow(60);
+        if (r < 2) { return 1 + rng.NextBelow(16); }
+        if (r < 6) { return 17 + rng.NextBelow(3); }
+        return 0;
     }
 }
