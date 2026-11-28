@@ -56,9 +56,29 @@ public class TDengineConnection : IDbConnection {
             if (this.waiters == null) { this.waiters = new Queue<AsyncGate>(); }
             this.waiters.Enqueue(g);
         }
-        await g.Wait();
-        g.Close();
-        return true;
+        bool acquired = false;
+        try {
+            await g.Wait();
+            acquired = true;
+            return true;
+        } finally {
+            g.Close();
+            if (!acquired) {
+                // 等待被取消/异常中断：从队列中摘除自身；若已被 ReleaseLock 摘除并移交所有权，则立即转交锁。
+                bool foundInQueue = false;
+                lock (this) {
+                    if (this.waiters != null) {
+                        int n = this.waiters.Count();
+                        for (int i = 0; i < n; i = i + 1) {
+                            AsyncGate cur = this.waiters.Dequeue();
+                            if (cur == g) { foundInQueue = true; }
+                            else { this.waiters.Enqueue(cur); }
+                        }
+                    }
+                }
+                if (!foundInQueue) { this.ReleaseLock(); }
+            }
+        }
     }
 
     void ReleaseLock() {
@@ -124,20 +144,32 @@ public class TDengineConnection : IDbConnection {
         return true;
     }
 
+    private static bool IsSafeUser(string s) {
+        if (s == null) { return true; }
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i] & 255;
+            if (c < 32 || c == 127 || c == 58) { return false; }  // forbid control chars and ':'
+        }
+        return true;
+    }
+
     // 使用 HTTP Basic 凭据打开连接，并指定默认
     // 数据库（语句随后可直接使用不带库名的表名）。
     // 连接时会先与服务器通信一次以校验凭据，可检查 IsConnected()。
     public static TDengineConnection Open(string host, int port, string user, string password,
                                    string database) {
         TDengineConnection conn = new TDengineConnection();
-        if (!TDengineConnection.IsSafeHost(host) || !TDengineConnection.IsSafeDatabase(database)) {
-            conn.lastError = "invalid TDengine host or database name";
+        if (!TDengineConnection.IsSafeHost(host) || !TDengineConnection.IsSafeDatabase(database)
+                || !TDengineConnection.IsSafeUser(user)) {
+            conn.lastError = "invalid TDengine host, user, or database name";
             return conn;
         }
         conn.host = host;
         conn.port = port;
         conn.database = database != null ? database : "";
-        string cred = user + ":" + password;
+        string safeUser = user != null ? user : "";
+        string safePass = password != null ? password : "";
+        string cred = safeUser + ":" + safePass;
         conn.auth = "Basic " + Base64.Encode(cred, cred.Length);
         conn.connected = conn.Ping();
         return conn;
@@ -166,14 +198,17 @@ public class TDengineConnection : IDbConnection {
     public static async TDengineConnection OpenAsync(string host, int port, string user,
                                               string password, string database) {
         TDengineConnection conn = new TDengineConnection();
-        if (!TDengineConnection.IsSafeHost(host) || !TDengineConnection.IsSafeDatabase(database)) {
-            conn.lastError = "invalid TDengine host or database name";
+        if (!TDengineConnection.IsSafeHost(host) || !TDengineConnection.IsSafeDatabase(database)
+                || !TDengineConnection.IsSafeUser(user)) {
+            conn.lastError = "invalid TDengine host, user, or database name";
             return conn;
         }
         conn.host = host;
         conn.port = port;
         conn.database = database != null ? database : "";
-        string cred = user + ":" + password;
+        string safeUser = user != null ? user : "";
+        string safePass = password != null ? password : "";
+        string cred = safeUser + ":" + safePass;
         conn.auth = "Basic " + Base64.Encode(cred, cred.Length);
         conn.connected = await conn.PingAsync();
         return conn;
@@ -235,10 +270,15 @@ public class TDengineConnection : IDbConnection {
     // 这两个字符。
     static string EscapeText(string val) {
         if (val == null || val.Length == 0) { return ""; }
-        if (val.IndexOf("\\") < 0 && val.IndexOf("'") < 0) { return val; }
+        int len = val.Length;
+        bool needsEscape = false;
+        for (int k = 0; k < len; k = k + 1) {
+            int ch = val[k] & 255;
+            if (ch == 92 || ch == 39 || ch == 0) { needsEscape = true; break; }
+        }
+        if (!needsEscape) { return val; }
         StringBuilder sb = new StringBuilder();
         int start = 0;
-        int len = val.Length;
         for (int i = 0; i < len; i = i + 1) {
             int c = val[i] & 255;
             if (c == 92 || c == 39) {
@@ -247,6 +287,12 @@ public class TDengineConnection : IDbConnection {
                 }
                 sb.Append("\\");
                 start = i;
+            } else if (c == 0) {
+                if (i > start) {
+                    sb.Append(val.Substring(start, i - start));
+                }
+                sb.Append("\\0");
+                start = i + 1;
             }
         }
         if (len > start) {
@@ -259,7 +305,11 @@ public class TDengineConnection : IDbConnection {
     static string Literal(DbParams prms, int i) {
         int kind = prms.KindAt(i);
         if (kind == DbParams.KindInt) { return Convert.ToString(prms.IntAt(i)); }
-        if (kind == DbParams.KindDouble) { return Convert.ToString(prms.DoubleAt(i)); }
+        if (kind == DbParams.KindDouble) {
+            double d = prms.DoubleAt(i);
+            if (d - d != 0.0) { return "NULL"; }
+            return Convert.ToString(d);
+        }
         if (kind == DbParams.KindText) {
             return "'" + TDengineConnection.EscapeText(prms.TextAt(i)) + "'";
         }
@@ -274,6 +324,7 @@ public class TDengineConnection : IDbConnection {
     // 避免不匹配时发送半绑定的语句。
     static string RenderSql(string sql, DbParams prms) {
         if (sql == null) { return ""; }
+        int paramCount = prms != null ? prms.Count() : 0;
         StringBuilder sb = new StringBuilder();
         int quote = 0;  // 0 = 在字面量之外，否则为引号字节
         int used = 0;
@@ -308,7 +359,7 @@ public class TDengineConnection : IDbConnection {
                 quote = c;
                 i = i + 1;
             } else if (c == 63) {  // '?'
-                if (used >= prms.Count()) { return ""; }
+                if (used >= paramCount) { return ""; }
                 if (i > start) {
                     sb.Append(sql.Substring(start, i - start));
                 }
@@ -323,7 +374,7 @@ public class TDengineConnection : IDbConnection {
         if (start < len) {
             sb.Append(sql.Substring(start, len - start));
         }
-        if (used != prms.Count()) { return ""; }
+        if (used != paramCount) { return ""; }
         return sb.ToString();
     }
 
@@ -438,26 +489,26 @@ public class TDengineConnection : IDbConnection {
     string Post(string sql) {
         this.lastError = "";
         this.lastCode = 0;
+        if (sql == null) {
+            this.lastError = "sql is null";
+            return "";
+        }
         Socket.Initialize();
         nint sock = Socket.CreateTcp();
         if (sock < 0) {
             this.lastError = "socket creation failed";
             return "";
         }
-        if (Socket.Connect(sock, this.host, this.port) != 0) {
-            Socket.Close(sock);
-            this.lastError = Unreachable();
-            return "";
-        }
-
-        if (Socket.SendString(sock, Request(sql)) < 0) {
-            Socket.Close(sock);
-            this.lastError = "sending the statement failed";
-            return "";
-        }
-
         string rawStr = "";
         try {
+            if (Socket.Connect(sock, this.host, this.port) != 0) {
+                this.lastError = Unreachable();
+                return "";
+            }
+            if (Socket.SendString(sock, Request(sql)) < 0) {
+                this.lastError = "sending the statement failed";
+                return "";
+            }
             StringBuilder raw = new StringBuilder();
             int totalBytes = 0;
             bool reading = true;
@@ -487,29 +538,29 @@ public class TDengineConnection : IDbConnection {
     async string PostAsync(string sql) {
         this.lastError = "";
         this.lastCode = 0;
+        if (sql == null) {
+            this.lastError = "sql is null";
+            return "";
+        }
         Socket.Initialize();
         nint sock = Socket.CreateTcp();
         if (sock < 0) {
             this.lastError = "socket creation failed";
             return "";
         }
-        Socket.SetNonBlocking(sock);
-        int rc = await Socket.ConnectAsync(sock, this.host, this.port, IO_TIMEOUT_MS);
-        if (rc != 0) {
-            Socket.Close(sock);
-            this.lastError = Unreachable();
-            return "";
-        }
-
-        int sent = await AsyncSocket.SendString(sock, Request(sql));
-        if (sent < 0) {
-            Socket.Close(sock);
-            this.lastError = "sending the statement failed";
-            return "";
-        }
-
         string rawStr = "";
         try {
+            Socket.SetNonBlocking(sock);
+            int rc = await Socket.ConnectAsync(sock, this.host, this.port, IO_TIMEOUT_MS);
+            if (rc != 0) {
+                this.lastError = Unreachable();
+                return "";
+            }
+            int sent = await AsyncSocket.SendString(sock, Request(sql));
+            if (sent < 0) {
+                this.lastError = "sending the statement failed";
+                return "";
+            }
             StringBuilder raw = new StringBuilder();
             int totalBytes = 0;
             bool reading = true;

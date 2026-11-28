@@ -27,6 +27,7 @@ public partial class RedisPool : IDisposable {
 
     // 通过配置项构造连接池。
     public RedisPool(RedisOptions options) {
+        if (options == null) { options = new RedisOptions(); }
         this.options = options;
         this.host = options.host;
         this.port = options.port;
@@ -127,8 +128,8 @@ public partial class RedisPool : IDisposable {
         return await this.core.AcquireAsync(open, connected, close, failed);
     }
 
-    static bool IsUsable(RedisClient c) { return c.IsConnected(); }
-    static void CloseConnection(RedisClient c) { c.Close(); }
+    static bool IsUsable(RedisClient c) { return c != null && c.IsConnected(); }
+    static void CloseConnection(RedisClient c) { if (c != null) { c.Close(); } }
 
     void ReportOpenFailure(RedisClient c, Exception error) {
         if (error != null) { this.WriteOpenError("open error: " + error.Message); }
@@ -138,8 +139,8 @@ public partial class RedisPool : IDisposable {
     public void Release(RedisClient client) {
         if (client == null) { return; }
         if (this.core.IsClosed() || !client.IsConnected()) {
-            client.Close();
-            this.core.Drop(client);
+            try { client.Close(); }
+            finally { this.core.Drop(client); }
             return;
         }
         if (!this.core.Pool(client)) { client.Close(); }
@@ -154,13 +155,16 @@ public partial class RedisPool : IDisposable {
     // 关闭池：关闭所有连接并唤醒等待者。
     public void Close() {
         this.core.MarkClosed();
-        RedisClient client = this.core.TakeClosing();
-        while (client != null) {
-            client.Close();
-            this.core.Drop(client);
-            client = this.core.TakeClosing();
+        try {
+            RedisClient client = this.core.TakeClosing();
+            while (client != null) {
+                try { client.Close(); }
+                finally { this.core.Drop(client); }
+                client = this.core.TakeClosing();
+            }
+        } finally {
+            this.core.WakeAll();
         }
-        this.core.WakeAll();
     }
 
     public void Dispose() {

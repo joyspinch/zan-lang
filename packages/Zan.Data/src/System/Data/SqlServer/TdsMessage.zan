@@ -23,6 +23,7 @@ public class TdsMessage {
 
     // 取服务器 PRELOGIN 应答的 ENCRYPTION 字节（0 关、1 开、2 不支持、3 必须）。
     public static int PreloginEncryption(TdsBytes payload) {
+        if (payload == null) { return 2; }
         TdsReader r = TdsReader.Over(payload);
         while (!r.Eof()) {
             int token = r.U8();
@@ -39,6 +40,12 @@ public class TdsMessage {
     // LOGIN7：固定 94 字节偏移/长度头 + UCS-2 字符串载荷。
     public static TdsBytes Login7(string host, string user, string password,
             string appName, string server, string database, int packetSize) {
+        if (host == null) { host = ""; }
+        if (user == null) { user = ""; }
+        if (password == null) { password = ""; }
+        if (appName == null) { appName = ""; }
+        if (server == null) { server = ""; }
+        if (database == null) { database = ""; }
         string libName = "zan";
         int dataStart = 94;
         int hostLen = host.Length;
@@ -49,15 +56,25 @@ public class TdsMessage {
         int libLen = libName.Length;
         int dbLen = database.Length;
 
-        int off = dataStart;
-        int hostOff = off; off = off + hostLen * 2;
-        int userOff = off; off = off + userLen * 2;
-        int passOff = off; off = off + passLen * 2;
-        int appOff = off;  off = off + appLen * 2;
-        int srvOff = off;  off = off + srvLen * 2;
-        int libOff = off;  off = off + libLen * 2;
-        int dbOff = off;   off = off + dbLen * 2;
-        int total = off;
+        long offL = (long)dataStart;
+        long hostOffL = offL; offL = offL + (long)hostLen * 2L;
+        long userOffL = offL; offL = offL + (long)userLen * 2L;
+        long passOffL = offL; offL = offL + (long)passLen * 2L;
+        long appOffL = offL;  offL = offL + (long)appLen * 2L;
+        long srvOffL = offL;  offL = offL + (long)srvLen * 2L;
+        long libOffL = offL;  offL = offL + (long)libLen * 2L;
+        long dbOffL = offL;   offL = offL + (long)dbLen * 2L;
+        if (offL > 65535L) {
+            throw new DbException("TDS LOGIN7 payload exceeds 65535 bytes", 0, DbProvider.SqlServer);
+        }
+        int hostOff = (int)hostOffL;
+        int userOff = (int)userOffL;
+        int passOff = (int)passOffL;
+        int appOff = (int)appOffL;
+        int srvOff = (int)srvOffL;
+        int libOff = (int)libOffL;
+        int dbOff = (int)dbOffL;
+        int total = (int)offL;
 
         TdsBuf b = new TdsBuf();
         b.U32LE(total);
@@ -111,6 +128,7 @@ public class TdsMessage {
 
     // SQLBatch 载荷：头部加 UCS-2 编码的语句。
     public static TdsBytes SqlBatch(string sql) {
+        if (sql == null) { sql = ""; }
         TdsBuf b = new TdsBuf();
         TdsMessage.AllHeaders(b);
         b.Ucs2(sql);
@@ -119,6 +137,7 @@ public class TdsMessage {
 
     // 调用 sp_executesql（参数带外绑定，不拼入 SQL 文本）。
     public static TdsBytes RpcExecuteSql(string sql, DbParams prms) {
+        if (sql == null) { sql = ""; }
         TdsBuf b = new TdsBuf();
         TdsMessage.AllHeaders(b);
         b.U16LE(65535);  // 后跟 ID 而非名称
@@ -127,7 +146,8 @@ public class TdsMessage {
 
         TdsMessage.NVarcharParam(b, "", sql);
         TdsMessage.NVarcharParam(b, "", TdsMessage.Declaration(prms));
-        for (int i = 0; i < prms.Count(); i = i + 1) {
+        int count = prms != null ? prms.Count() : 0;
+        for (int i = 0; i < count; i = i + 1) {
             string name = "@P" + Convert.ToString(i + 1);
             int kind = prms.KindAt(i);
             if (kind == DbParams.KindInt) {
@@ -145,6 +165,7 @@ public class TdsMessage {
 
     // sp_executesql 所需的 "@P1 bigint, @P2 float" 声明串。
     public static string Declaration(DbParams prms) {
+        if (prms == null) { return ""; }
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < prms.Count(); i = i + 1) {
             if (i > 0) { sb.Append(", "); }
@@ -164,6 +185,8 @@ public class TdsMessage {
 
     // RPC 参数公共头：参数名 + 输入参数状态字节。
     public static void ParamHeader(TdsBuf b, string name) {
+        if (name == null) { name = ""; }
+        if (name.Length > 255) { name = name.Substring(0, 255); }
         b.U8(name.Length);
         b.Ucs2(name);
         b.U8(0);  // 状态：输入参数
@@ -171,19 +194,24 @@ public class TdsMessage {
 
     // NVARCHAR 参数（超过 4000 字符改为 PLP 分块按 NVARCHAR(MAX) 发送）。
     public static void NVarcharParam(TdsBuf b, string name, string val) {
+        if (val == null) { val = ""; }
         TdsMessage.ParamHeader(b, name);
         b.U8(TdsType.NVARCHAR);
-        int bytes = val.Length * 2;
+        long bytesL = (long)val.Length * 2L;
         if (val.Length <= 4000) {
             b.U16LE(8000);
             b.U32LE(0); b.U8(0);  // 排序规则：服务器默认
-            b.U16LE(bytes);
+            b.U16LE((int)bytesL);
             b.Ucs2(val);
             return;
         }
+        if (bytesL > 2147483647L) {
+            throw new DbException("TDS NVARCHAR parameter exceeds maximum PLP chunk size", 0, DbProvider.SqlServer);
+        }
+        int bytes = (int)bytesL;
         b.U16LE(65535);  // MAX
         b.U32LE(0); b.U8(0);
-        b.U64LE(bytes);  // PLP 总长度
+        b.U64LE(bytesL);  // PLP 总长度
         b.U32LE(bytes);  // 单个分块
         b.Ucs2(val);
         b.U32LE(0);  // 终止符
@@ -320,6 +348,7 @@ public class TdsMessage {
         int count = r.U16LE();
         if (count == 65535) { return cols; }  // 该批次无元数据
         for (int i = 0; i < count; i = i + 1) {
+            if (r.Eof()) { break; }
             r.Skip(4);  // 用户类型
             r.Skip(2);  // 标志
             TdsColumn c = new TdsColumn();
@@ -362,7 +391,8 @@ public class TdsMessage {
                 if (bitmap == null) {
                     if (((nbcBits >> c) & 1L) == 1L) { isNull = true; }
                 } else {
-                    if (((bitmap[c / 8] >> (c % 8)) & 1) == 1) { isNull = true; }
+                    int bi = c / 8;
+                    if (bi < bitmap.Count && ((bitmap[bi] >> (c % 8)) & 1) == 1) { isNull = true; }
                 }
             }
             if (isNull) {

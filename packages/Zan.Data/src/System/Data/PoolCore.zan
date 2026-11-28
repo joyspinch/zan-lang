@@ -34,6 +34,7 @@ public class PoolCore<T> {
     // 回调按次传入而非长期持有，避免实例打开器与连接池形成 ARC 环。
     public async T AcquireAsync(PoolOpenAsync<T> open, Predicate<T> connected,
                                 Action<T> close, PoolOpenFailure<T> failed) {
+        if (open == null) { return null; }
         PoolWait wait = null;
         while (!this.IsClosed()) {
             T pooled = this.TryAcquireIdle(connected, close);
@@ -49,21 +50,21 @@ public class PoolCore<T> {
                         this.ReportOpenFailure(opened, error, failed);
                         return null;
                     }
-                    if (opened == null || !connected(opened)) {
+                    if (opened == null || (connected != null && !connected(opened))) {
                         this.ReportOpenFailure(opened, null, failed);
                         return null;
                     }
                     bool borrowed = this.CompleteReserve(opened, true);
                     pending = false;
                     if (!borrowed) {
-                        close(opened);
+                        if (close != null) { close(opened); }
                         return null;
                     }
                     return opened;
                 } finally {
                     if (pending) {
                         try {
-                            if (opened != null) { close(opened); }
+                            if (opened != null && close != null) { close(opened); }
                         } finally {
                             this.UndoReserve();
                         }
@@ -82,12 +83,12 @@ public class PoolCore<T> {
         while (pooled != null) {
             bool usable = false;
             try {
-                usable = connected(pooled);
+                usable = connected == null || connected(pooled);
                 if (usable) { return pooled; }
             } finally {
                 if (!usable) {
                     try {
-                        close(pooled);
+                        if (close != null) { close(pooled); }
                     } finally {
                         this.Drop(pooled);
                     }
@@ -254,6 +255,7 @@ public class PoolCore<T> {
 
     // 先在锁内复查再入 Gate 停泊以防丢唤醒；门等耗尽后切短轮询直至预算用完。
     public async bool WaitForRelease(PoolWait w) {
+        if (w == null) { return false; }
         if (w.gated < PoolWait.MaxGateWaits) {
             lock (this) {
                 if (this.closed || this.idle.Count > 0 || this.liveCount < this.maxSize) {

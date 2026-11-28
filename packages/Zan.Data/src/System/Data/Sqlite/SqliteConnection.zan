@@ -115,12 +115,14 @@ public class SqliteConnection : IDbConnection {
     // 已释放的内存（垃圾行）。与 "" 拼接会分配一份新的
     // 托管副本，而此时源指针仍有效。
     public static string CopyText(string s) {
+        if (s == null) { return ""; }
         return "" + s;
     }
 
     // 从 8 字节缓冲区按小端重组出指针值（sqlite3_open/prepare_v2
     // 的句柄出参经此取回）。
     public static nint HandleFromBuf(string p) {
+        if (p == null || p.Length < 8) { return 0; }
         long v = 0;
         v = v + (p[0] & 255);
         v = v + ((long)(p[1] & 255) << 8);
@@ -140,6 +142,12 @@ public class SqliteConnection : IDbConnection {
     // 连接池每个请求都会尝试打开一次，泄漏便随请求线性增长。
     public static SqliteConnection Open(string filename) {
         SqliteConnection conn = new SqliteConnection();
+        if (filename == null || filename.Length == 0) {
+            return conn;
+        }
+        for (int i = 0; i < filename.Length; i = i + 1) {
+            if ((filename[i] & 255) == 0) { return conn; }
+        }
         byte[] ppDb = new byte[8];
         int rc = sqlite3_open(filename, ppDb);
         nint h = HandleFromBuf(ppDb);
@@ -160,6 +168,7 @@ public class SqliteConnection : IDbConnection {
     // sqlite3 立即复制文本，这样 Zan 字符串可随时被回收。
     // 返回 0，或首个绑定失败的驱动返回码。
     static int BindAll(nint stmt, DbParams prms) {
+        if (prms == null) { return 0; }
         int n = prms.Count();
         for (int i = 0; i < n; i = i + 1) {
             int rc = 0;
@@ -200,8 +209,11 @@ public class SqliteConnection : IDbConnection {
     // 执行非查询语句（INSERT/UPDATE/DELETE/DDL）。
     // 失败时抛出 <see cref="DbException"/>。
     int Execute(string sql) {
-        if (!this.connected) {
+        if (!this.connected || this.handle == 0) {
             throw new DbException("not connected", 0, DbProvider.SQLite);
+        }
+        if (sql == null) {
+            throw new DbException("sql is null", 0, DbProvider.SQLite);
         }
         byte[] errmsg = new byte[8];
         int rc = sqlite3_exec(this.handle, sql, 0, 0, errmsg);
@@ -224,22 +236,34 @@ public class SqliteConnection : IDbConnection {
     // 空/纯注释 SQL 返回 0（不入缓存）；多语句或已满缓存按一次性语句处理。
     private nint PrepareOrReuseStmt(string sql, out bool cached) {
         cached = false;
+        if (sql == null) {
+            throw new DbException("sql is null", 0, DbProvider.SQLite);
+        }
         nint hit = 0;
-        if (this.stmtCache.TryGetValue(sql, out hit)) {
-            bool busy = false;
-            if (!this.stmtBusy.TryGetValue(sql, out busy) || !busy) {
-                cached = true;
-                sqlite3_reset(hit);
-                sqlite3_clear_bindings(hit);
-                this.stmtBusy[sql] = true;
-                return hit;
+        lock (this) {
+            if (this.stmtCache != null && this.stmtCache.TryGetValue(sql, out hit)) {
+                bool busy = false;
+                if (!this.stmtBusy.TryGetValue(sql, out busy) || !busy) {
+                    cached = true;
+                    this.stmtBusy[sql] = true;
+                } else {
+                    hit = 0;
+                }
             }
+        }
+        if (cached && hit != 0) {
+            sqlite3_reset(hit);
+            sqlite3_clear_bindings(hit);
+            return hit;
         }
         byte[] ppStmt = new byte[8];
         byte[] pzTail = new byte[8];
         int rc = sqlite3_prepare_v2(this.handle, sql, sql.Length, ppStmt, pzTail);
-        if (rc != 0) { this.Fail(rc); }
         nint stmt = HandleFromBuf(ppStmt);
+        if (rc != 0) {
+            if (stmt != 0) { sqlite3_finalize(stmt); }
+            this.Fail(rc);
+        }
         if (stmt == 0) { return 0; }
         // pzTail 指向 sql 中未被消耗的首字节（单条语句通常指向 NUL 终止符）；
         // 仅当剩余尾部存在非空白字符（第二条语句）时才视为多语句不缓存。
@@ -256,13 +280,17 @@ public class SqliteConnection : IDbConnection {
                 }
             }
         }
-        nint ignore = 0;
-        if (!hasTrailing
-            && this.stmtCache.Count < SqliteConnection.MaxStmtCache
-            && !this.stmtCache.TryGetValue(sql, out ignore)) {
-            this.stmtCache.Add(sql, stmt);
-            this.stmtBusy[sql] = true;
-            cached = true;
+        if (!hasTrailing) {
+            lock (this) {
+                nint ignore = 0;
+                if (this.connected && this.stmtCache != null
+                    && this.stmtCache.Count < SqliteConnection.MaxStmtCache
+                    && !this.stmtCache.TryGetValue(sql, out ignore)) {
+                    this.stmtCache.Add(sql, stmt);
+                    this.stmtBusy[sql] = true;
+                    cached = true;
+                }
+            }
         }
         return stmt;
     }
@@ -407,11 +435,13 @@ public class SqliteConnection : IDbConnection {
 
     // 获取最后插入行的 ID。
     long LastInsertId() {
+        if (!this.connected || this.handle == 0) { return 0; }
         return sqlite3_last_insert_rowid(this.handle);
     }
 
     // 获取最后一条错误消息。
     string GetError() {
+        if (this.handle == 0) { return ""; }
         return CopyText(sqlite3_errmsg(this.handle));
     }
 
@@ -514,8 +544,11 @@ public class SqliteConnection : IDbConnection {
     // 参数只绑定到第一条语句。失败时抛出
     // <see cref="DbException"/>，停在首条失败的语句上。
     async int ExecuteAsync(string sql, DbParams prms) {
-        if (!this.connected) {
+        if (!this.connected || this.handle == 0) {
             throw new DbException("not connected", 0, DbProvider.SQLite);
+        }
+        if (sql == null) {
+            throw new DbException("sql is null", 0, DbProvider.SQLite);
         }
         string remaining = sql;
         int affected = 0;
@@ -526,18 +559,22 @@ public class SqliteConnection : IDbConnection {
             int rc = sqlite3_prepare_v2(this.handle, remaining, remaining.Length,
                 ppStmt, pzTail);
             nint stmt = HandleFromBuf(ppStmt);
-            if (rc != 0) { this.Fail(rc); }
+            if (rc != 0) {
+                if (stmt != 0) { sqlite3_finalize(stmt); }
+                this.Fail(rc);
+            }
             if (stmt == 0) { break; }  // whitespace/comments after the last statement
 
-            if (firstStatement) {
-                int brc = BindAll(stmt, prms);
-                if (brc != 0) {
-                    sqlite3_finalize(stmt);
-                    this.Fail(brc);
+            int step = 0;
+            try {
+                if (firstStatement) {
+                    int brc = BindAll(stmt, prms);
+                    if (brc != 0) { this.Fail(brc); }
                 }
+                step = await sqlite3_step(stmt);
+            } finally {
+                sqlite3_finalize(stmt);
             }
-            int step = await sqlite3_step(stmt);
-            sqlite3_finalize(stmt);
             if (step != 101) {  // SQLITE_DONE = 101
                 if (step == 100) {
                     throw new DbException(
@@ -550,9 +587,9 @@ public class SqliteConnection : IDbConnection {
             firstStatement = false;
 
             nint tail = HandleFromBuf(pzTail);
-            int offset = (int)(tail - (nint)remaining);
-            if (offset <= 0 || offset >= remaining.Length) { break; }
-            remaining = remaining.Substring(offset, remaining.Length - offset);
+            long offset = (long)(tail - (nint)remaining);
+            if (offset <= 0L || offset >= (long)remaining.Length) { break; }
+            remaining = remaining.Substring((int)offset, remaining.Length - (int)offset);
         }
         return affected;
     }
@@ -611,9 +648,21 @@ public class SqliteConnection : IDbConnection {
     // 标志；一次性语句立即 finalize。所有退出路径（绑定失败、step
     // 失败、成功）都必须先走这里再抛错/返回。
     public void ReleaseStmt(string sql, nint stmt, bool cached) {
+        if (stmt == 0) { return; }
         if (cached) {
-            sqlite3_reset(stmt);
-            this.stmtBusy[sql] = false;
+            bool stillCached = false;
+            lock (this) {
+                nint cur = 0;
+                if (this.stmtCache != null && sql != null
+                    && this.stmtCache.TryGetValue(sql, out cur) && cur == stmt) {
+                    stillCached = true;
+                    sqlite3_reset(stmt);
+                    this.stmtBusy[sql] = false;
+                }
+            }
+            if (!stillCached) {
+                sqlite3_finalize(stmt);
+            }
         } else {
             sqlite3_finalize(stmt);
         }
@@ -622,24 +671,30 @@ public class SqliteConnection : IDbConnection {
     // 关闭连接：先 finalize 全部缓存语句（否则 sqlite3_close 返回
     // SQLITE_BUSY），再关闭连接句柄。
     public void Close() {
+        Dict<string, nint> oldCache = null;
+        nint h = 0;
+        lock (this) {
+            oldCache = this.stmtCache;
+            this.stmtCache = new Dict<string, nint>();
+            this.stmtBusy = new Dict<string, bool>();
+            h = this.handle;
+            this.connected = false;
+            this.handle = 0;
+        }
         // 缓存的语句句柄必须先于连接句柄销毁，否则 sqlite3_close
         // 对未 finalize 的语句返回 SQLITE_BUSY，连接就关不上了。
-        if (this.stmtCache != null) {
-            foreach (string k in this.stmtCache.Keys) {
+        if (oldCache != null) {
+            foreach (string k in oldCache.Keys) {
                 nint cachedStmt = 0;
-                if (this.stmtCache.TryGetValue(k, out cachedStmt)
+                if (oldCache.TryGetValue(k, out cachedStmt)
                     && cachedStmt != 0) {
                     sqlite3_finalize(cachedStmt);
                 }
             }
-            this.stmtCache = new Dict<string, nint>();
-            this.stmtBusy = new Dict<string, bool>();
         }
         // 同 Postgres：句柄在就释放，不依赖 connected 标志。
-        if (this.connected || this.handle != 0) {
-            sqlite3_close(this.handle);
-            this.connected = false;
-            this.handle = 0;
+        if (h != 0) {
+            sqlite3_close(h);
         }
     }
 

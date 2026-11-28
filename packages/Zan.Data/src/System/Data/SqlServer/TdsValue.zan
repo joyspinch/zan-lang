@@ -154,6 +154,7 @@ public class TdsValue {
     // 包剩余字节校验每个分块声明（分块不会横跨包边界），
     // 并给单值设 64 MiB 硬上限；违规一律按 NULL 收场。
     public static TdsCell ReadPlp(TdsReader r, int t) {
+        if (r.Left() < 8) { return TdsCell.Null(); }
         int hi = r.U32LE();
         int lo = r.U32LE();
         if (hi == 0 - 1 && lo == 0 - 1) { return TdsCell.Null(); }
@@ -161,6 +162,7 @@ public class TdsValue {
         TdsBuf acc = new TdsBuf();
         bool more = true;
         while (more) {
+            if (r.Left() < 4) { return TdsCell.Null(); }
             int chunk = r.U32LE();
             if (chunk < 0) { return TdsCell.Null(); }
             if (chunk == 0) {
@@ -173,10 +175,12 @@ public class TdsValue {
             }
         }
         TdsBytes all = acc.ToBytes();
-        TdsReader rr = TdsReader.Over(all);
-        TdsCell cell = TdsValue.Text(rr, all.Len(), t);
-        all.Release();
-        return cell;
+        try {
+            TdsReader rr = TdsReader.Over(all);
+            return TdsValue.Text(rr, all.Len(), t);
+        } finally {
+            all.Release();
+        }
     }
 
     // 按列类型家族渲染接下来的 <paramref name="n"/> 个字节：
@@ -222,6 +226,7 @@ public class TdsValue {
         if (t == TdsType.INT1) { return TdsCell.Of(Convert.ToString(r.U8())); }
         if (t == TdsType.INT2 || t == TdsType.INT4 || t == TdsType.INT8
                 || t == TdsType.INTN) {
+            if (n <= 0 || n > 8) { return TdsCell.Null(); }
             return TdsCell.OfInt(r.IntLE(n));
         }
         if (t == TdsType.FLT4 || t == TdsType.FLT8 || t == TdsType.FLTN) {
@@ -232,6 +237,7 @@ public class TdsValue {
         }
         if (t == TdsType.DECIMAL || t == TdsType.NUMERIC
                 || t == TdsType.DECIMALN || t == TdsType.NUMERICN) {
+            if (n < 1) { return TdsCell.Null(); }
             return TdsCell.Of(TdsValue.Numeric(r, n, col.scale));
         }
         if (t == TdsType.DATETIME || t == TdsType.DATETIM4
@@ -245,12 +251,14 @@ public class TdsValue {
             return TdsCell.Of(TdsValue.TimeOfDay(r.UIntLE(n), col.scale));
         }
         if (t == TdsType.DATETIME2N) {
+            if (n < 3 || n > 8) { r.Skip(n); return TdsCell.Null(); }
             int timeLen = n - 3;
             string tod = TdsValue.TimeOfDay(r.UIntLE(timeLen), col.scale);
             string day = TdsValue.CivilDate((int)r.UIntLE(3) - 719162);
             return TdsCell.Of(day + " " + tod);
         }
         if (t == TdsType.DTOFFSETN) {
+            if (n < 5 || n > 10) { r.Skip(n); return TdsCell.Null(); }
             int timeLen = n - 5;
             string tod = TdsValue.TimeOfDay(r.UIntLE(timeLen), col.scale);
             string day = TdsValue.CivilDate((int)r.UIntLE(3) - 719162);
@@ -277,16 +285,14 @@ public class TdsValue {
 
     // 以 double 表示的 2^e（e 可为负）。
     public static double Pow2(int e) {
+        if (e > 1023) { return 1.0 / 0.0; }
+        if (e < -1075) { return 0.0; }
         if (e >= -1022 && e <= 1023) {
             return NativeMemory.AsF64((long)(e + 1023) << 52);
         }
         double v = 1.0;
         int i = 0;
-        if (e >= 0) {
-            while (i < e) { v = v * 2.0; i = i + 1; }
-        } else {
-            while (i > e) { v = v / 2.0; i = i - 1; }
-        }
+        while (i > e) { v = v / 2.0; i = i - 1; }
         return v;
     }
 
@@ -330,6 +336,8 @@ public class TdsValue {
     // 幅值，最多十六字节，因此通过反复
     // 对 32 位 limb 做除法来生成各位数字，而非直接整数运算。
     public static string Numeric(TdsReader r, int n, int scale) {
+        if (n < 1) { return "0"; }
+        if (scale < 0) { scale = 0; }
         int sign = r.U8();
         int mlen = n - 1;
         List<int> limbs = new List<int>();  // 小端 32 位 limb
@@ -440,12 +448,13 @@ public class TdsValue {
                 + TdsValue.Pad2(mins / 60) + ":" + TdsValue.Pad2(mins % 60) + ":00";
         }
         int days = (int)r.IntLE(4);
-        int ticks = (int)r.UIntLE(4);
-        int ms = (ticks * 10 + 1) / 3;  // 1/300 秒 -> 毫秒
-        int secs = ms / 1000;
+        long ticks = r.UIntLE(4);
+        if (ticks < 0L) { ticks = 0L; }
+        long ms = (ticks * 10L + 1L) / 3L;  // 1/300 秒 -> 毫秒
+        int secs = (int)(ms / 1000L);
         return TdsValue.CivilDate(days - 25567) + " "
             + TdsValue.Pad2(secs / 3600) + ":" + TdsValue.Pad2((secs / 60) % 60)
-            + ":" + TdsValue.Pad2(secs % 60) + "." + TdsValue.Pad3(ms % 1000);
+            + ":" + TdsValue.Pad2(secs % 60) + "." + TdsValue.Pad3((int)(ms % 1000L));
     }
 
     // TIME/DATETIME2 保存 10^-scale 秒的计数。scale 为 7 时，
@@ -475,11 +484,12 @@ public class TdsValue {
     // 渲染 UTC 偏移："+HH:MM" / "-HH:MM"。
     public static string Offset(int minutes) {
         string sign = "+";
-        if (minutes < 0) {
+        long m = (long)minutes;
+        if (m < 0L) {
             sign = "-";
-            minutes = 0 - minutes;
+            m = 0L - m;
         }
-        return sign + TdsValue.Pad2(minutes / 60) + ":" + TdsValue.Pad2(minutes % 60);
+        return sign + TdsValue.Pad2((int)(m / 60L)) + ":" + TdsValue.Pad2((int)(m % 60L));
     }
 
     // 相对于 1970-01-01 的天数对应的公历日期。
@@ -544,6 +554,7 @@ public class TdsValue {
 
     // 取 raw[i] 的两个十六进制字符。
     public static string HexAt(List<int> raw, int i) {
+        if (raw == null || i < 0 || i >= raw.Count) { return "00"; }
         int v = raw[i] & 255;
         int hi = (v >> 4) & 15;
         int lo = v & 15;
@@ -555,7 +566,7 @@ public class TdsValue {
 
     // 两位零填充十进制。
     public static string Pad2(int v) {
-        if (v < 10) { return "0" + Convert.ToString(v); }
+        if (v >= 0 && v < 10) { return "0" + Convert.ToString(v); }
         return Convert.ToString(v);
     }
 

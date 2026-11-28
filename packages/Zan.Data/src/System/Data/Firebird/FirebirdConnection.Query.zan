@@ -63,9 +63,15 @@ public partial class FirebirdConnection : IDbConnection {
     public void Rollback() { throw FirebirdConnection.Sync(); }
 
     public async bool BeginTransactionAsync() {
-        bool ok = await this.beginTransaction();
-        if (ok) { this.inTxn = true; }
-        return ok;
+        await this.AcquireLock();
+        try {
+            if (!this.connected) { return false; }
+            bool ok = await this.beginTransaction();
+            if (ok) { this.inTxn = true; }
+            return ok;
+        } finally {
+            this.ReleaseLock();
+        }
     }
 
     // 提交或回滚当前事务并开启新事务（通过 AsyncGate 门控保证单连接事务互斥）。
@@ -179,7 +185,11 @@ public partial class FirebirdConnection : IDbConnection {
             }
             int again = xs.Parse(more.Buf());
             more.Release();
-            if (again == next) {
+            if (again == -2) {
+                this.lastError = "malformed statement description";
+                return null;
+            }
+            if (again > 0 && again <= next) {
                 this.lastError = "the server keeps truncating the description";
                 return null;
             }
@@ -250,7 +260,7 @@ public partial class FirebirdConnection : IDbConnection {
         }
         int total = 0;
         FbReader r = FbReader.Over(resp.Buf());
-        if (r.U8() == FbType.INFO_RECORDS) {
+        if (r.Left() >= 3 && r.U8() == FbType.INFO_RECORDS) {
             r.U16LE();  // 计数器组的长度
             bool more = true;
             while (more && r.Left() > 0) {
@@ -258,7 +268,9 @@ public partial class FirebirdConnection : IDbConnection {
                 if (item == FbType.INFO_END) {
                     more = false;
                 } else {
+                    if (r.Left() < 2) { break; }
                     int ln = r.U16LE();
+                    if (ln > r.Left()) { break; }
                     int v = r.IntLE(ln);
                     if (select) {
                         if (item == FbType.REQ_SELECT_COUNT) { total = v; }
@@ -302,83 +314,93 @@ public partial class FirebirdConnection : IDbConnection {
         FbBytes blr = xs.CalcBlr();
         int nullBytes = cols / 8;
         if ((cols % 8) != 0) { nullBytes = nullBytes + 1; }
+        int blobsReleased = 0;
 
-        bool more = true;
-        while (more) {
-            FbBuf p = new FbBuf();
-            p.Int(FbOp.FETCH);
-            p.Int(stmt);
-            p.Block(blr);
-            p.Int(0);
-            p.Int(FirebirdConnection.FETCH_ROWS);
-            bool sent = await this.sendPacket(p.ToBytes());
-            if (!sent) {
-                blr.Release();
-                return res;
-            }
-            int op = await this.recvInt();
-            while (op == FbOp.DUMMY) {
-                op = await this.recvInt();
-            }
-            if (op == FbOp.RESPONSE) {
-                FbResponse r = await this.recvResponse4();
-                if (r != null) {
-                    if (r.Failed()) { this.lastError = r.Err().Message(); }
-                    r.Release();
+        try {
+            bool more = true;
+            while (more) {
+                FbBuf p = new FbBuf();
+                p.Int(FbOp.FETCH);
+                p.Int(stmt);
+                p.Block(blr);
+                p.Int(0);
+                p.Int(FirebirdConnection.FETCH_ROWS);
+                bool sent = await this.sendPacket(p.ToBytes());
+                if (!sent) { return res; }
+                int op = await this.recvInt();
+                while (op == FbOp.DUMMY) {
+                    op = await this.recvInt();
                 }
-                blr.Release();
-                return res;
-            }
-            if (op != FbOp.FETCH_RESPONSE) {
-                this.lastError = "unexpected fetch response "
-                    + Convert.ToString(op);
-                this.connected = false;
-                blr.Release();
-                return res;
-            }
-            int status = await this.recvInt();
-            int count = await this.recvInt();
-            while (count != 0) {
-                FbBytes flags = await this.recvAligned(nullBytes);
-                if (flags == null) {
-                    blr.Release();
+                if (op == FbOp.RESPONSE) {
+                    FbResponse r = await this.recvResponse4();
+                    if (r != null) {
+                        if (r.Failed()) { this.lastError = r.Err().Message(); }
+                        r.Release();
+                    }
                     return res;
                 }
-                FbRow row = new FbRow(cols);
-                for (int i = 0; i < cols; i = i + 1) {
-                    bool isNull = ((flags.At(i / 8) >> (i % 8)) & 1) != 0;
-                    if (!isNull) {
-                        FbColumn col = xs.At(i);
-                        FbBytes raw = await this.fetchValue(col);
-                        if (raw == null) {
-                            flags.Release();
-                            blr.Release();
-                            return res;
-                        }
-                        if (col.SqlType() == FbType.BLOB) {
-                            blobs.Add(FbBlobRef.Of(row, i, raw, col.SubType()));
-                            row.Set(i, "");
-                        } else {
-                            row.Set(i, FbValue.Decode(col, raw));
-                            raw.Release();
-                        }
-                    }
+                if (op != FbOp.FETCH_RESPONSE) {
+                    this.lastError = "unexpected fetch response "
+                        + Convert.ToString(op);
+                    this.connected = false;
+                    return res;
                 }
-                flags.Release();
-                rows.Add(row);
-                op = await this.recvInt();
-                status = await this.recvInt();
-                count = await this.recvInt();
+                int status = await this.recvInt();
+                int count = await this.recvInt();
+                if (!this.connected || count < 0) { return res; }
+                while (count > 0) {
+                    FbBytes flags = await this.recvAligned(nullBytes);
+                    if (flags == null) { return res; }
+                    FbRow row = new FbRow(cols);
+                    try {
+                        for (int i = 0; i < cols; i = i + 1) {
+                            bool isNull = ((flags.At(i / 8) >> (i % 8)) & 1) != 0;
+                            if (!isNull) {
+                                FbColumn col = xs.At(i);
+                                FbBytes raw = await this.fetchValue(col);
+                                if (raw == null) { return res; }
+                                if (col.SqlType() == FbType.BLOB) {
+                                    blobs.Add(FbBlobRef.Of(row, i, raw, col.SubType()));
+                                    row.Set(i, "");
+                                } else {
+                                    try {
+                                        row.Set(i, FbValue.Decode(col, raw));
+                                    } finally {
+                                        raw.Release();
+                                    }
+                                }
+                            }
+                        }
+                    } finally {
+                        flags.Release();
+                    }
+                    rows.Add(row);
+                    op = await this.recvInt();
+                    while (op == FbOp.DUMMY) { op = await this.recvInt(); }
+                    if (op != FbOp.FETCH_RESPONSE) {
+                        this.lastError = "unexpected fetch response " + Convert.ToString(op);
+                        this.connected = false;
+                        return res;
+                    }
+                    status = await this.recvInt();
+                    count = await this.recvInt();
+                    if (!this.connected || count < 0) { return res; }
+                }
+                if (status == 100) { more = false; }
             }
-            if (status == 100) { more = false; }
-        }
-        blr.Release();
 
-        for (int b = 0; b < blobs.Count; b = b + 1) {
-            FbBlobRef br = blobs[b];
-            string text = await this.readBlob(br.id, br.subtype);
-            br.row.Set(br.col, text);
-            br.id.Release();
+            for (int b = 0; b < blobs.Count; b = b + 1) {
+                FbBlobRef br = blobs[b];
+                string text = await this.readBlob(br.id, br.subtype);
+                br.row.Set(br.col, text);
+                br.id.Release();
+                blobsReleased = b + 1;
+            }
+        } finally {
+            blr.Release();
+            for (int b = blobsReleased; b < blobs.Count; b = b + 1) {
+                if (blobs[b].id != null) { blobs[b].id.Release(); }
+            }
         }
 
         for (int k = 0; k < rows.Count; k = k + 1) {
@@ -431,6 +453,7 @@ public partial class FirebirdConnection : IDbConnection {
                 FbReader r = FbReader.Over(seg.Buf());
                 while (r.Left() >= 2) {
                     int ln = r.U16LE();
+                    if (ln <= 0 || ln > r.Left()) { break; }
                     FbBytes part = r.Raw(ln);
                     all.RawBlock(part);
                     part.Release();
@@ -447,14 +470,14 @@ public partial class FirebirdConnection : IDbConnection {
         if (close != null) { close.Release(); }
 
         FbBytes data = all.ToBytes();
-        string outp;
-        if (subtype == 1) {
-            outp = FbReader.Over(data).Text(data.Len());
-        } else {
-            outp = "0x" + data.Hex();
+        try {
+            if (subtype == 1) {
+                return FbReader.Over(data).Text(data.Len());
+            }
+            return "0x" + data.Hex();
+        } finally {
+            data.Release();
         }
-        data.Release();
-        return outp;
     }
 
     // 运行语句并返回其行（不产生行返回空）；失败抛出 DbException。
@@ -468,6 +491,10 @@ public partial class FirebirdConnection : IDbConnection {
         try {
             this.lastError = "";
             this.lastStatus = new FbError();
+            if (sql == null) {
+                this.lastError = "sql is null";
+                this.fail();
+            }
             if (!this.connected) {
                 this.lastError = "not connected";
                 this.fail();
@@ -476,30 +503,34 @@ public partial class FirebirdConnection : IDbConnection {
             if (stmt < 0) { this.fail(); }
             FbXsqlda xs = await this.prepare(stmt, sql);
             if (xs == null) {
-                await this.freeStatement(stmt);
+                if (this.connected) { await this.freeStatement(stmt); }
                 this.fail();
             }
             if (xs.StmtType() == FbType.STMT_EXEC_PROCEDURE && xs.Count() > 0) {
                 // 带输出参数的过程走 op_sql_response 而非游标，改用 SELECT 调用。
-                await this.freeStatement(stmt);
+                if (this.connected) { await this.freeStatement(stmt); }
                 this.lastError = "EXECUTE PROCEDURE with output parameters is not"
                     + " supported; select from the procedure instead";
                 this.fail();
             }
             bool ok = await this.execute(stmt, prms);
             if (!ok) {
-                await this.freeStatement(stmt);
+                if (this.connected) { await this.freeStatement(stmt); }
                 this.fail();
             }
             DbResult res = DbResult.Empty();
             if (xs.IsSelect() && xs.Count() > 0) {
                 res = await this.fetchAll(stmt, xs);
+                if (this.lastError.Length > 0) {
+                    if (this.connected) { await this.freeStatement(stmt); }
+                    this.fail();
+                }
                 this.lastAffected = res.RowCount();
             } else {
                 this.lastAffected = await this.affectedRows(stmt, false);
             }
-            await this.freeStatement(stmt);
-            if (!xs.IsSelect()) {
+            if (this.connected) { await this.freeStatement(stmt); }
+            if (!xs.IsSelect() && this.connected) {
                 await this.commitRetaining();
             }
             return res;
@@ -565,50 +596,47 @@ public partial class FirebirdConnection : IDbConnection {
 
     // 礼貌分离（回滚未结束事务）并关闭套接字。
     public async void CloseAsync() {
-        if (this.connected && this.transHandle >= 0) {
-            FbBuf p = new FbBuf();
-            p.Int(FbOp.ROLLBACK);
-            p.Int(this.transHandle);
-            FbResponse r = await this.roundTrip(p.ToBytes());
-            if (r != null) { r.Release(); }
-            this.transHandle = -1;
+        await this.AcquireLock();
+        try {
+            if (this.connected && this.transHandle >= 0) {
+                FbBuf p = new FbBuf();
+                p.Int(FbOp.ROLLBACK);
+                p.Int(this.transHandle);
+                FbResponse r = await this.roundTrip(p.ToBytes());
+                if (r != null) { r.Release(); }
+                this.transHandle = -1;
+            }
+            if (this.connected && this.dbHandle >= 0) {
+                FbBuf p = new FbBuf();
+                p.Int(FbOp.DETACH);
+                p.Int(this.dbHandle);
+                FbResponse r = await this.roundTrip(p.ToBytes());
+                if (r != null) { r.Release(); }
+                this.dbHandle = -1;
+            }
+        } finally {
+            this.Close();
+            this.ReleaseLock();
         }
-        if (this.connected && this.dbHandle >= 0) {
-            FbBuf p = new FbBuf();
-            p.Int(FbOp.DETACH);
-            p.Int(this.dbHandle);
-            FbResponse r = await this.roundTrip(p.ToBytes());
-            if (r != null) { r.Release(); }
-            this.dbHandle = -1;
-        }
-        this.Close();
     }
 
-    // 直接关闭连接，释放互斥门控并唤醒等待者。
+    // 直接关闭连接并释放底层套接字与原生缓冲。
     public void Close() {
-        List<AsyncGate> toWake = null;
+        nint s = -1;
+        FbBytes ad = null;
         lock (this) {
-            if (this.waiters != null && this.waiters.Count() > 0) {
-                toWake = new List<AsyncGate>();
-                while (this.waiters.Count() > 0) {
-                    toWake.Add(this.waiters.Dequeue());
-                }
-            }
-            this.busy = false;
-        }
-        if (toWake != null) {
-            for (int i = 0; i < toWake.Count; i = i + 1) { toWake[i].Signal(); }
-        }
-        if (this.sock >= 0) {
-            Socket.Close(this.sock);
+            this.connected = false;
+            s = this.sock;
             this.sock = -1;
-        }
-        this.connected = false;
-        this.encIn = null;
-        this.encOut = null;
-        if (this.authData != null) {
-            this.authData.Release();
+            this.encIn = null;
+            this.encOut = null;
+            ad = this.authData;
             this.authData = null;
+        }
+        try {
+            if (s >= 0) { Socket.Close(s); }
+        } finally {
+            if (ad != null) { ad.Release(); }
         }
     }
 

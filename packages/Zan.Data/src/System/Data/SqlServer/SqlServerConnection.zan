@@ -34,29 +34,59 @@ public class SqlServerConnection : IDbConnection {
             if (this.waiters == null) { this.waiters = new Queue<AsyncGate>(); }
             this.waiters.Enqueue(g);
         }
-        await g.Wait();
-        g.Close();
-        return true;
-    }
-
-    void ReleaseLock() {
-        lock (this) {
-            if (this.waiters != null && this.waiters.Count() > 0) {
-                AsyncGate g = this.waiters.Dequeue();
-                g.Signal();
-            } else { this.busy = false; }
+        bool acquired = false;
+        try {
+            await g.Wait();
+            acquired = true;
+            return true;
+        } finally {
+            g.Close();
+            if (!acquired) {
+                bool handoff = false;
+                lock (this) {
+                    if (this.waiters != null) {
+                        int n = this.waiters.Count();
+                        bool removed = false;
+                        for (int i = 0; i < n; i = i + 1) {
+                            AsyncGate item = this.waiters.Dequeue();
+                            if (!removed && item == g) {
+                                removed = true;
+                            } else {
+                                this.waiters.Enqueue(item);
+                            }
+                        }
+                        if (!removed) { handoff = true; }
+                    } else {
+                        handoff = true;
+                    }
+                }
+                if (handoff) { this.ReleaseLock(); }
+            }
         }
     }
 
+    void ReleaseLock() {
+        AsyncGate g = null;
+        lock (this) {
+            if (this.waiters != null && this.waiters.Count() > 0) {
+                g = this.waiters.Dequeue();
+            } else { this.busy = false; }
+        }
+        if (g != null) { g.Signal(); }
+    }
+
+    private static string stateLock = "System.Data.SqlServer.SqlServerConnection.stateLock";
     private static bool defaultVerifyTls = true;
     public static bool verifyTls {
-        get { return SqlServerConnection.defaultVerifyTls; }
-        set { SqlServerConnection.defaultVerifyTls = value; }
+        get { lock (SqlServerConnection.stateLock) { return SqlServerConnection.defaultVerifyTls; } }
+        set { lock (SqlServerConnection.stateLock) { SqlServerConnection.defaultVerifyTls = value; } }
     }
 
     // 切换后续 OpenSecureAsync 的证书链与主机名校验（仅自签测试关闭，生产保持开启）。
     public static void SetTlsVerify(bool verify) {
-        SqlServerConnection.defaultVerifyTls = verify;
+        lock (SqlServerConnection.stateLock) {
+            SqlServerConnection.defaultVerifyTls = verify;
+        }
     }
 
     public bool tlsVerify = true;
@@ -75,6 +105,8 @@ public class SqlServerConnection : IDbConnection {
     }
 
     async int recvExact(byte[] dst, int off, int need) {
+        if (need <= 0) { return 0; }
+        if (dst == null || off < 0) { return 0; }
         if (this.tls == null) {
             return await this.recvExactRaw(dst, off, need);
         }
@@ -89,6 +121,8 @@ public class SqlServerConnection : IDbConnection {
 
     // 握手阶段专用裸读取（0x12 封装的 TLS 密文，此时尚不能走隧道）。
     async int recvExactRaw(byte[] dst, int off, int need) {
+        if (need <= 0) { return 0; }
+        if (dst == null || off < 0) { return 0; }
         int got = 0;
         byte[] tmp = new byte[need + 1];
         while (got < need) {
@@ -101,7 +135,12 @@ public class SqlServerConnection : IDbConnection {
     }
 
     async bool sendMessage(int type, TdsBytes payload) {
+        if (payload == null) {
+            this.lastError = "null payload";
+            return false;
+        }
         int max = this.packetSize - TdsPacket.HEADER_LEN;
+        if (max <= 0) { max = TdsPacket.DEFAULT_SIZE - TdsPacket.HEADER_LEN; }
         int off = 0;
         int total = payload.Len();
         bool first = true;
@@ -117,20 +156,23 @@ public class SqlServerConnection : IDbConnection {
             this.packetId = this.packetId + 1;
             if (this.packetId > 255) { this.packetId = 1; }
             int sent = 0;
-            if (this.tls != null) {
-                sent = await this.tls.SendBytesAsync(pkt.Data(), 0, pkt.Len());
-            } else {
-                byte[] raw = pkt.Data();
-                int plen = pkt.Len();
-                int soff = 0;
-                while (soff < plen) {
-                    int n = await Socket.SendBytesAsync(this.sock, raw, soff, plen - soff);
-                    if (n <= 0) { sent = -1; break; }
-                    soff = soff + n;
+            try {
+                if (this.tls != null) {
+                    sent = await this.tls.SendBytesAsync(pkt.Data(), 0, pkt.Len());
+                } else {
+                    byte[] raw = pkt.Data();
+                    int plen = pkt.Len();
+                    int soff = 0;
+                    while (soff < plen) {
+                        int n = await Socket.SendBytesAsync(this.sock, raw, soff, plen - soff);
+                        if (n <= 0) { sent = -1; break; }
+                        soff = soff + n;
+                    }
+                    if (sent >= 0) { sent = soff; }
                 }
-                if (sent >= 0) { sent = soff; }
+            } finally {
+                pkt.Release();
             }
-            pkt.Release();
             if (sent < 0) {
                 this.lastError = "send failed";
                 return false;
@@ -180,7 +222,16 @@ public class SqlServerConnection : IDbConnection {
             string database, string user, string password, bool secure) {
         Socket.Initialize();
         SqlServerConnection conn = new SqlServerConnection();
+        if (host == null) { host = ""; }
+        if (database == null) { database = ""; }
+        if (user == null) { user = ""; }
+        if (password == null) { password = ""; }
         conn.database = database;
+        if (host.Length == 0 || port <= 0 || port > 65535) {
+            conn.lastError = "invalid host or port";
+            conn.connected = false;
+            return conn;
+        }
         bool ok = await conn.handshake(host, port, database, user, password, secure);
         conn.connected = ok;
         if (!ok) {
@@ -210,13 +261,21 @@ public class SqlServerConnection : IDbConnection {
         }
 
         TdsBytes preloginMsg = TdsMessage.Prelogin(secure ? 1 : 2);
-        bool sent = await this.sendMessage(TdsPacket.PRELOGIN, preloginMsg);
-        preloginMsg.Release();
+        bool sent = false;
+        try {
+            sent = await this.sendMessage(TdsPacket.PRELOGIN, preloginMsg);
+        } finally {
+            preloginMsg.Release();
+        }
         if (!sent) { return false; }
         TdsBytes pre = await this.recvMessage();
         if (pre == null) { return false; }
-        int enc = TdsMessage.PreloginEncryption(pre);
-        pre.Release();
+        int enc = 2;
+        try {
+            enc = TdsMessage.PreloginEncryption(pre);
+        } finally {
+            pre.Release();
+        }
         if (secure) {
             if (enc != 1 && enc != 3) {
                 this.lastError = "server refused TDS encryption (no TLS)";
@@ -230,13 +289,20 @@ public class SqlServerConnection : IDbConnection {
 
         this.packetId = 1;
         TdsBytes login = TdsMessage.Login7(host, user, pw, this.appName, host, db, this.packetSize);
-        sent = await this.sendMessage(TdsPacket.LOGIN7, login);
-        login.Release();
+        try {
+            sent = await this.sendMessage(TdsPacket.LOGIN7, login);
+        } finally {
+            login.Release();
+        }
         if (!sent) { return false; }
         TdsBytes ack = await this.recvMessage();
         if (ack == null) { return false; }
-        TdsResponse resp = TdsMessage.Decode(ack);
-        ack.Release();
+        TdsResponse resp = null;
+        try {
+            resp = TdsMessage.Decode(ack);
+        } finally {
+            ack.Release();
+        }
         if (resp.Failed()) {
             this.lastError = "login failed: " + resp.Error();
             return false;
@@ -253,7 +319,7 @@ public class SqlServerConnection : IDbConnection {
             this.lastError = "TLS init failed: " + TlsStream.LastError();
             return false;
         }
-        if (!this.tlsVerify || !SqlServerConnection.defaultVerifyTls) { tlsCtx.DisableVerify(); }
+        if (!this.tlsVerify || !SqlServerConnection.verifyTls) { tlsCtx.DisableVerify(); }
         // 压制 TLS 1.3：1.3 握手后仍会发 post-handshake 记录，会污染已停止 0x12 封装的裸流。
         tlsCtx.DisableTls13();
         this.tls = TlsStream.ConnectStepped(tlsCtx, this.sock, host);
@@ -264,6 +330,7 @@ public class SqlServerConnection : IDbConnection {
         while (true) {
             int st = this.tls.HandshakePump();
             string out1 = this.tls.HandshakeDrain();
+            if (out1 == null) { out1 = ""; }
             int off = 0;
             while (off < out1.Length) {
                 int chunk = out1.Length - off;
@@ -280,9 +347,15 @@ public class SqlServerConnection : IDbConnection {
                 for (int i = 0; i < chunk; i = i + 1) { frame[8 + i] = (byte)(out1[off + i] & 255); }
                 this.packetId = this.packetId + 1;
                 if (this.packetId > 255) { this.packetId = 1; }
-                if (await Socket.SendAsync(this.sock, frame, chunk + 8) < 0) {
-                    this.lastError = "TLS handshake send failed";
-                    return false;
+                int soff = 0;
+                int flen = chunk + 8;
+                while (soff < flen) {
+                    int n = await Socket.SendBytesAsync(this.sock, frame, soff, flen - soff);
+                    if (n <= 0) {
+                        this.lastError = "TLS handshake send failed";
+                        return false;
+                    }
+                    soff = soff + n;
                 }
                 off = off + chunk;
             }
@@ -297,6 +370,10 @@ public class SqlServerConnection : IDbConnection {
                 return false;
             }
             int payLen = (((hdr[2] & 255) << 8) | (hdr[3] & 255)) - 8;
+            if (payLen < 0) {
+                this.lastError = "TLS handshake: malformed packet header";
+                return false;
+            }
             if (payLen > 0) {
                 byte[] pay = new byte[payLen + 1];
                 if (await this.recvExactRaw(pay, 0, payLen) < payLen) {
@@ -310,18 +387,27 @@ public class SqlServerConnection : IDbConnection {
     }
 
     async TdsResponse roundTrip(int type, TdsBytes payload) {
-        await this.AcquireLock();
+        try {
+            await this.AcquireLock();
+        } catch (Exception _ex) {
+            if (payload != null) { payload.Release(); }
+            throw;
+        }
         try {
             this.lastError = "";
             if (!this.connected) {
-                payload.Release();
+                if (payload != null) { payload.Release(); payload = null; }
                 this.lastError = "not connected";
                 this.fail();
                 return new TdsResponse();
             }
             this.packetId = 1;
-            bool sent = await this.sendMessage(type, payload);
-            payload.Release();
+            bool sent = false;
+            try {
+                sent = await this.sendMessage(type, payload);
+            } finally {
+                if (payload != null) { payload.Release(); payload = null; }
+            }
             if (!sent) {
                 this.connected = false;
                 this.fail();
@@ -333,8 +419,12 @@ public class SqlServerConnection : IDbConnection {
                 this.fail();
                 return new TdsResponse();
             }
-            TdsResponse resp = TdsMessage.Decode(body);
-            body.Release();
+            TdsResponse resp = null;
+            try {
+                resp = TdsMessage.Decode(body);
+            } finally {
+                body.Release();
+            }
             this.lastAffected = resp.Affected();
             if (resp.Failed()) {
                 this.lastError = resp.Error();
@@ -342,11 +432,19 @@ public class SqlServerConnection : IDbConnection {
                 this.fail();
             }
             return resp;
-        } finally { this.ReleaseLock(); }
+        } finally {
+            if (payload != null) { payload.Release(); }
+            this.ReleaseLock();
+        }
     }
 
     TdsBytes buildRpcParams(string sql, DbParams prms) {
-        string text = SqlServerConnection.Renumber(sql, prms.Count());
+        if (sql == null) {
+            this.lastError = "sql is null";
+            this.fail();
+        }
+        int count = prms != null ? prms.Count() : 0;
+        string text = SqlServerConnection.Renumber(sql, count);
         if (text.Length == 0 && sql.Length > 0) {
             this.lastError = "parameter count does not match the placeholders";
             this.fail();
@@ -355,21 +453,27 @@ public class SqlServerConnection : IDbConnection {
     }
 
     public async DbResult QueryAsync(string sql) {
+        if (sql == null) { this.lastError = "sql is null"; this.fail(); }
         TdsResponse resp = await this.roundTrip(TdsPacket.SQLBATCH, TdsMessage.SqlBatch(sql));
         return resp.Rows();
     }
 
     public async DbResult QueryAsync(string sql, DbParams prms) {
+        if (sql == null) { this.lastError = "sql is null"; this.fail(); }
+        if (prms == null) { return await this.QueryAsync(sql); }
         TdsResponse resp = await this.roundTrip(TdsPacket.RPC, this.buildRpcParams(sql, prms));
         return resp.Rows();
     }
 
     public async int ExecuteAsync(string sql) {
+        if (sql == null) { this.lastError = "sql is null"; this.fail(); }
         TdsResponse resp = await this.roundTrip(TdsPacket.SQLBATCH, TdsMessage.SqlBatch(sql));
         return resp.Affected();
     }
 
     public async int ExecuteAsync(string sql, DbParams prms) {
+        if (sql == null) { this.lastError = "sql is null"; this.fail(); }
+        if (prms == null) { return await this.ExecuteAsync(sql); }
         TdsResponse resp = await this.roundTrip(TdsPacket.RPC, this.buildRpcParams(sql, prms));
         return resp.Affected();
     }
@@ -421,10 +525,11 @@ public class SqlServerConnection : IDbConnection {
         return (r == null || r.RowCount() == 0 || r.ColumnCount() == 0) ? "" : r.GetString(0, 0);
     }
 
-    // 将 `?` 占位符改写为 @P1..，保留引号/方括号字面量；占位符数不匹配时返回 ""。
+    // 将 `?` 占位符改写为 @P1..，保留引号/方括号字面量及注释；占位符数不匹配时返回 ""。
     public static string Renumber(string sql, int count) {
         if (sql == null) { return ""; }
-        if (count == 0) { return sql; }
+        if (count < 0) { return ""; }
+        if (count == 0 && sql.IndexOf("?") < 0) { return sql; }
         StringBuilder outp = new StringBuilder();
         int i = 0;
         int start = 0;
@@ -434,6 +539,17 @@ public class SqlServerConnection : IDbConnection {
         while (i < len) {
             int c = sql[i] & 255;
             if (quote == 0) {
+                if (c == 45 && i + 1 < len && (sql[i + 1] & 255) == 45) {
+                    i = i + 2;
+                    while (i < len && (sql[i] & 255) != 10) { i = i + 1; }
+                    continue;
+                }
+                if (c == 47 && i + 1 < len && (sql[i + 1] & 255) == 42) {
+                    i = i + 2;
+                    while (i + 1 < len && !((sql[i] & 255) == 42 && (sql[i + 1] & 255) == 47)) { i = i + 1; }
+                    i = i + 1 < len ? i + 2 : len;
+                    continue;
+                }
                 if (c == 39) { quote = 1; }
                 else if (c == 34) { quote = 2; }
                 else if (c == 91) { quote = 3; }
@@ -447,6 +563,10 @@ public class SqlServerConnection : IDbConnection {
                     continue;
                 }
             } else if ((quote == 1 && c == 39) || (quote == 2 && c == 34) || (quote == 3 && c == 93)) {
+                if (i + 1 < len && (sql[i + 1] & 255) == c) {
+                    i = i + 2;
+                    continue;
+                }
                 quote = 0;
             }
             i = i + 1;
@@ -463,20 +583,19 @@ public class SqlServerConnection : IDbConnection {
     public int GetProvider() { return DbProvider.SqlServer; }
 
     public void Close() {
-        this.connected = false;
+        TlsStream t = null;
+        nint s = -1;
         lock (this) {
-            while (this.waiters != null && this.waiters.Count() > 0) {
-                AsyncGate g = this.waiters.Dequeue();
-                g.Signal();
-            }
-        }
-        if (this.tls != null) {
-            this.tls.Close();
+            this.connected = false;
+            t = this.tls;
             this.tls = null;
-        }
-        if (this.sock >= 0) {
-            Socket.Close(this.sock);
+            s = this.sock;
             this.sock = -1;
+        }
+        try {
+            if (t != null) { t.Close(); }
+        } finally {
+            if (s >= 0) { Socket.Close(s); }
         }
     }
 

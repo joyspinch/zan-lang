@@ -36,14 +36,17 @@ public partial class RedisClient {
     public RedisDeserializer Deserialize;
     public NoticeEventHandler Notice;
 
+    private static string stateLock = "System.Data.Redis.RedisClient.stateLock";
     private static bool defaultVerifyTls = true;
     public static bool verifyTls {
-        get { return RedisClient.defaultVerifyTls; }
-        set { RedisClient.defaultVerifyTls = value; }
+        get { lock (RedisClient.stateLock) { return RedisClient.defaultVerifyTls; } }
+        set { lock (RedisClient.stateLock) { RedisClient.defaultVerifyTls = value; } }
     }
 
     public static void SetTlsVerify(bool verify) {
-        RedisClient.defaultVerifyTls = verify;
+        lock (RedisClient.stateLock) {
+            RedisClient.defaultVerifyTls = verify;
+        }
     }
 
     public bool tlsVerify = true;
@@ -106,7 +109,7 @@ public partial class RedisClient {
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < args.Count; i = i + 1) {
             if (i > 0) { sb.Append(" "); }
-            string a = args[i];
+            string a = args[i] != null ? args[i] : "";
             sb.Append(a.Length > 80 ? a.Substring(0, 77) + "..." : a);
         }
         return sb.ToString();
@@ -127,6 +130,7 @@ public partial class RedisClient {
     }
 
     void initPool(RedisOptions opt) {
+        if (opt == null) { opt = new RedisOptions(); }
         this.initMembers();
         this.host = opt.host;
         this.port = opt.port;
@@ -150,6 +154,7 @@ public partial class RedisClient {
     }
 
     public static async RedisClient ConnectAsync(RedisOptions opt) {
+        if (opt == null) { opt = new RedisOptions(); }
         RedisClient c = await RedisClient.doConnect(opt.host, opt.port, opt.connectTimeoutMs, opt.ssl);
         if (c == null) { return null; }
         if (opt.password != null && opt.password.Length > 0) {
@@ -173,11 +178,15 @@ public partial class RedisClient {
     }
 
     static async RedisClient doConnect(string host, int port, int timeoutMs, bool secure) {
+        if (host == null || host.Length == 0 || port <= 0 || port > 65535) {
+            return null;
+        }
         Socket.Initialize();
         RedisClient c = new RedisClient();
         c.host = host;
         c.port = port;
         c.sock = Socket.CreateTcp();
+        if (c.sock < 0) { return null; }
         Socket.SetNonBlocking(c.sock);
         int err = await Socket.ConnectAsync(c.sock, host, port, timeoutMs);
         if (err != 0) {
@@ -192,7 +201,7 @@ public partial class RedisClient {
                 c.sock = -1;
                 return null;
             }
-            if (!c.tlsVerify || !RedisClient.defaultVerifyTls) { tlsCtx.DisableVerify(); }
+            if (!c.tlsVerify || !RedisClient.verifyTls) { tlsCtx.DisableVerify(); }
             int hsTimeout = timeoutMs > 0 ? timeoutMs : 15000;
             c.tls = await TlsStream.ConnectAsync(tlsCtx, c.sock, host, hsTimeout);
             if (c.tls == null) {
@@ -221,9 +230,35 @@ public partial class RedisClient {
             if (this.waiters == null) { this.waiters = new Queue<AsyncGate>(); }
             this.waiters.Enqueue(g);
         }
-        await g.Wait();
-        g.Close();
-        return true;
+        bool acquired = false;
+        try {
+            await g.Wait();
+            acquired = true;
+            return true;
+        } finally {
+            g.Close();
+            if (!acquired) {
+                bool handoff = false;
+                lock (this) {
+                    if (this.waiters != null) {
+                        int n = this.waiters.Count();
+                        bool removed = false;
+                        for (int i = 0; i < n; i = i + 1) {
+                            AsyncGate item = this.waiters.Dequeue();
+                            if (!removed && item == g) {
+                                removed = true;
+                            } else {
+                                this.waiters.Enqueue(item);
+                            }
+                        }
+                        if (!removed) { handoff = true; }
+                    } else {
+                        handoff = true;
+                    }
+                }
+                if (handoff) { this.ReleaseLock(); }
+            }
+        }
     }
 
     void ReleaseLock() {
@@ -239,37 +274,32 @@ public partial class RedisClient {
     }
 
     public void Close() {
-        if (this.pool != null) {
-            this.pool.Close();
-            this.pool = null;
-        }
-        List<AsyncGate> toWake = null;
+        RedisPool p = null;
+        TlsStream t = null;
+        nint s = -1;
         lock (this) {
-            if (this.waiters != null && this.waiters.Count() > 0) {
-                toWake = new List<AsyncGate>();
-                while (this.waiters.Count() > 0) {
-                    toWake.Add(this.waiters.Dequeue());
-                }
-            }
-            this.busy = false;
-        }
-        if (toWake != null) {
-            for (int i = 0; i < toWake.Count; i = i + 1) { toWake[i].Signal(); }
-        }
-        if (this.tls != null) {
-            this.tls.Close();
+            p = this.pool;
+            this.pool = null;
+            t = this.tls;
             this.tls = null;
-        }
-        if (this.connected || this.sock >= 0) {
-            Socket.Close(this.sock);
-            this.connected = false;
+            s = this.sock;
             this.sock = -1;
+            this.connected = false;
+            this.inbuf = null;
+            this.tmp = null;
+            this.inhead = 0;
+            this.intail = 0;
+            this.incap = 0;
         }
-        this.inbuf = null;
-        this.tmp = null;
-        this.inhead = 0;
-        this.intail = 0;
-        this.incap = 0;
+        try {
+            if (p != null) { p.Close(); }
+        } finally {
+            try {
+                if (t != null) { t.Close(); }
+            } finally {
+                if (s >= 0) { Socket.Close(s); }
+            }
+        }
     }
 
     void failProtocol(string detail) {
@@ -290,6 +320,7 @@ public partial class RedisClient {
     }
 
     string sliceBytes(int start, int len) {
+        if (this.inbuf == null || start < 0 || len <= 0) { return ""; }
         return this.inbuf.ToStr(start, len);
     }
 
@@ -327,7 +358,7 @@ public partial class RedisClient {
     }
 
     async int fillMore(int maxBytes) {
-        if (!this.connected) { return 0; }
+        if (!this.connected || maxBytes <= 0 || this.tmp == null) { return 0; }
         int take = maxBytes < this.tmpcap ? maxBytes : this.tmpcap;
         int n = this.tls != null
             ? await this.tls.RecvBytesAsync(this.tmp, 0, take)
@@ -400,6 +431,10 @@ public partial class RedisClient {
     }
 
     async string readBulk(int n) {
+        if (n < 0) {
+            this.failProtocol("negative bulk string length");
+            return null;
+        }
         if (!await this.ensureAvailable(n + 2)) { return null; }
         if (this.inbuf[this.inhead + n] != 13 || this.inbuf[this.inhead + n + 1] != 10) {
             this.failProtocol("invalid bulk string trailer");
@@ -535,19 +570,37 @@ public partial class RedisClient {
     }
 
     async int sendStringExact(string data, int len) {
-        int sent = this.tls != null
-            ? await this.tls.SendAsync(data, len)
-            : await Socket.SendAsync(this.sock, data, len);
-        if (sent != len) { this.Close(); }
-        return sent;
+        if (len <= 0) { return 0; }
+        int off = 0;
+        while (off < len) {
+            string chunk = off == 0 ? data : data.Substring(off, len - off);
+            int rem = len - off;
+            int sent = this.tls != null
+                ? await this.tls.SendAsync(chunk, rem)
+                : await Socket.SendAsync(this.sock, chunk, rem);
+            if (sent <= 0) {
+                this.Close();
+                return -1;
+            }
+            off = off + sent;
+        }
+        return off;
     }
 
     async int sendBytesExact(byte[] data, int len) {
-        int sent = this.tls != null
-            ? await this.tls.SendBytesAsync(data, 0, len)
-            : await Socket.SendBytesAsync(this.sock, data, 0, len);
-        if (sent != len) { this.Close(); }
-        return sent;
+        if (len <= 0) { return 0; }
+        int off = 0;
+        while (off < len) {
+            int sent = this.tls != null
+                ? await this.tls.SendBytesAsync(data, off, len - off)
+                : await Socket.SendBytesAsync(this.sock, data, off, len - off);
+            if (sent <= 0) {
+                this.Close();
+                return -1;
+            }
+            off = off + sent;
+        }
+        return off;
     }
 
     void emitNoticeIfSubscribed(long startTicks, string logText, Exception errEx) {
@@ -590,6 +643,10 @@ public partial class RedisClient {
     }
 
     async RedisReply CommandInternalAsync(List<string> args) {
+        if (args == null || args.Count == 0) {
+            this.lastError = "empty redis command";
+            return RedisClient.makeErrorReply("empty redis command");
+        }
         if (!this.connected && this.protocolError.Length > 0) { return this.protocolFailure(); }
         if (!this.connected) {
             this.lastError = "connection closed";
@@ -644,6 +701,7 @@ public partial class RedisClient {
     }
 
     async RedisReply CommandBytesInternalAsync(List<string> prefixArgs, byte[] binaryArg) {
+        if (prefixArgs == null) { prefixArgs = new List<string>(); }
         if (!this.connected && this.protocolError.Length > 0) { return this.protocolFailure(); }
         if (!this.connected) {
             this.lastError = "connection closed";

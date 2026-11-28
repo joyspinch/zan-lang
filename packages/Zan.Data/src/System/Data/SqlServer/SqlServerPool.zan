@@ -39,18 +39,18 @@ public class SqlServerPool : IDisposable {
         return await this.core.AcquireAsync(open, connected, close, failed);
     }
 
-    static bool IsUsable(SqlServerConnection c) { return c.IsConnected(); }
-    static void CloseConnection(SqlServerConnection c) { c.Close(); }
+    static bool IsUsable(SqlServerConnection c) { return c != null && c.IsConnected(); }
+    static void CloseConnection(SqlServerConnection c) { if (c != null) { c.Close(); } }
 
     static void ReportOpenFailure(SqlServerConnection c, Exception error) {
         string why = error != null ? error.Message : (c != null ? c.lastError : "");
         Console.WriteLine("[mssqlpool] connect failed: "
-            + (why.Length > 0 ? why : "refused, timeout, or auth rejected"));
+            + (why != null && why.Length > 0 ? why : "refused, timeout, or auth rejected"));
     }
 
     private void Discard(SqlServerConnection c) {
-        c.Close();
-        this.core.Drop(c);
+        try { c.Close(); }
+        finally { this.core.Drop(c); }
     }
 
     private void ReturnToPool(SqlServerConnection c) {
@@ -113,12 +113,15 @@ public class SqlServerPool : IDisposable {
     // 关闭所有空闲连接并将连接池标记为已关闭（借出连接在归还时关闭）。
     public void Close() {
         this.core.MarkClosed();
-        SqlServerConnection c = this.core.TakeClosing();
-        while (c != null) {
-            this.Discard(c);
-            c = this.core.TakeClosing();
+        try {
+            SqlServerConnection c = this.core.TakeClosing();
+            while (c != null) {
+                this.Discard(c);
+                c = this.core.TakeClosing();
+            }
+        } finally {
+            this.core.WakeAll();
         }
-        this.core.WakeAll();
     }
 
     public void Dispose() {
