@@ -8,9 +8,31 @@ namespace Cloud.Oss;
 /// <summary>腾讯云 COS XML API 签名（q-sign-algorithm=sha1）。签名字符串
 /// q-sign-algorithm=q-ak=q-sign-time=q-key-time=q-header-list=q-url-param-list=q-signature。</summary>
 public class TencentCosSigner {
+    private static byte[] cosLut;
+
+    private static byte[] EnsureCosLut() {
+        if (TencentCosSigner.cosLut == null) {
+            byte[] t = new byte[256];
+            for (int c = 97; c <= 122; c = c + 1) { t[c] = 1; }  // a-z
+            for (int c = 48; c <= 57; c = c + 1) { t[c] = 1; }   // 0-9
+            t[45] = 1;   // '-'
+            t[95] = 1;   // '_'
+            t[46] = 1;   // '.'
+            t[126] = 1;  // '~'
+            for (int c = 65; c <= 90; c = c + 1) { t[c] = 2; }   // A-Z (unreserved, needs lowercase)
+            TencentCosSigner.cosLut = t;
+        }
+        return TencentCosSigner.cosLut;
+    }
+
     private static string AsciiLower(string s) {
         if (s == null || s.Length == 0) { return ""; }
         int n = s.Length;
+        if (n == 3 && s == "GET") { return "get"; }
+        if (n == 3 && s == "PUT") { return "put"; }
+        if (n == 4 && s == "POST") { return "post"; }
+        if (n == 4 && s == "HEAD") { return "head"; }
+        if (n == 6 && s == "DELETE") { return "delete"; }
         bool hasUpper = false;
         for (int i = 0; i < n; i = i + 1) {
             int c = s[i] & 255;
@@ -23,25 +45,67 @@ public class TencentCosSigner {
             if (c >= 65 && c <= 90) { c = c + 32; }
             buf[i] = (byte)c;
         }
-        return buf.ToStr(0, n);
+        return NativeMemory.GetString((nint)buf, 0, n);
     }
 
-    private static int CompareAscii(string a, string b) {
-        int la = a == null ? 0 : a.Length;
-        int lb = b == null ? 0 : b.Length;
-        int min = la < lb ? la : lb;
-        for (int i = 0; i < min; i = i + 1) {
-            int ca = a[i] & 255;
-            int cb = b[i] & 255;
-            if (ca != cb) { return ca < cb ? -1 : 1; }
+    // 单遍融合 RFC3986 编码 + 小写化（含 %xx 小写十六进制），消除 Substring + Rfc3986 + AsciiLower 三重分配。
+    private static string Rfc3986LowerSlice(string s, int start, int end) {
+        int len = end - start;
+        if (len <= 0) { return ""; }
+        byte[] lut = TencentCosSigner.EnsureCosLut();
+        int escCount = 0;
+        bool hasUpper = false;
+        for (int i = start; i < end; i = i + 1) {
+            int cls = lut[s[i] & 255] & 255;
+            if (cls == 0) { escCount = escCount + 1; }
+            else if (cls == 2) { hasUpper = true; }
         }
-        return la < lb ? -1 : (la > lb ? 1 : 0);
+        if (escCount == 0 && !hasUpper) {
+            if (start == 0 && end == s.Length) { return s; }
+            return s.Substring(start, len);
+        }
+        int outLen = len + escCount * 2;
+        byte[] buf = new byte[outLen];
+        int di = 0;
+        for (int i = start; i < end; i = i + 1) {
+            int c = s[i] & 255;
+            int cls = lut[c] & 255;
+            if (cls == 1) {
+                buf[di] = (byte)c;
+                di = di + 1;
+            } else if (cls == 2) {
+                buf[di] = (byte)(c + 32);
+                di = di + 1;
+            } else {
+                int h = (c >> 4) & 15;
+                int l = c & 15;
+                buf[di] = 37;
+                buf[di + 1] = (byte)(h < 10 ? h + 48 : h + 87);
+                buf[di + 2] = (byte)(l < 10 ? l + 48 : l + 87);
+                di = di + 3;
+            }
+        }
+        return NativeMemory.GetString((nint)buf, 0, outLen);
     }
 
     /// <summary>HttpString = 小写方法 + "\n/" + 键 + "\n" + 参数 + "\n" + 头 + "\n"。
     /// 本实现用于无查询参数、无签名头的对象级请求。</summary>
     public static string HttpString(string verb, string key) {
-        return TencentCosSigner.AsciiLower(verb) + "\n/" + (key == null ? "" : key) + "\n\n\n";
+        string v = TencentCosSigner.AsciiLower(verb);
+        string k = key == null ? "" : key;
+        int vl = v.Length;
+        int kl = k.Length;
+        int total = vl + 2 + kl + 3;
+        byte[] buf = new byte[total];
+        nint bp = (nint)buf;
+        if (vl > 0) { NativeMemory.Copy(bp, (nint)v, vl); }
+        buf[vl] = 10;
+        buf[vl + 1] = 47;
+        if (kl > 0) { NativeMemory.Copy(bp + (nint)(vl + 2), (nint)k, kl); }
+        buf[vl + 2 + kl] = 10;
+        buf[vl + 3 + kl] = 10;
+        buf[vl + 4 + kl] = 10;
+        return NativeMemory.GetString(bp, 0, total);
     }
 
     /// <summary>带查询参数的 HttpString（按 COS 规范对参数名小写并按字典序排列）。</summary>
@@ -51,26 +115,37 @@ public class TencentCosSigner {
         if (queryPairs == null || queryPairs.Count == 0) {
             return TencentCosSigner.HttpString(verb, key);
         }
+        int qCount = queryPairs.Count;
         List<string> keys = new List<string>();
         List<string> vals = new List<string>();
-        for (int i = 0; i < queryPairs.Count; i = i + 1) {
+        keys.Reserve(qCount);
+        vals.Reserve(qCount);
+        int kTotal = 0;
+        int pTotal = 0;
+        for (int i = 0; i < qCount; i = i + 1) {
             string p = queryPairs[i];
             if (p == null || p.Length == 0) { continue; }
-            int eq = p.IndexOf("=");
-            string rawK = eq < 0 ? p : p.Substring(0, eq);
-            string rawV = eq < 0 ? "" : p.Substring(eq + 1);
-            string encK = TencentCosSigner.AsciiLower(OssSigner.Rfc3986(rawK));
-            string encV = OssSigner.Rfc3986(rawV);
+            int plen = p.Length;
+            int eq = NativeMemory.Find((nint)p, 0, 61, plen);
+            string encK = eq < 0
+                ? TencentCosSigner.Rfc3986LowerSlice(p, 0, plen)
+                : TencentCosSigner.Rfc3986LowerSlice(p, 0, eq);
+            string encV = eq < 0 ? "" : OssSigner.Rfc3986Slice(p, eq + 1, plen, false);
             keys.Add(encK);
             vals.Add(encV);
+            kTotal = kTotal + encK.Length;
+            pTotal = pTotal + encK.Length + 1 + encV.Length;
         }
         int n = keys.Count;
-        // 插入排序按编码后小写参数名升序排列
+        if (n == 0) {
+            return TencentCosSigner.HttpString(verb, key);
+        }
+        // 插入排序按编码后小写参数名升序排列（Ordinal 字节序直比）
         for (int i = 1; i < n; i = i + 1) {
             string ck = keys[i];
             string cv = vals[i];
             int j = i - 1;
-            while (j >= 0 && TencentCosSigner.CompareAscii(keys[j], ck) > 0) {
+            while (j >= 0 && String.CompareOrdinal(keys[j], ck) > 0) {
                 keys[j + 1] = keys[j];
                 vals[j + 1] = vals[j];
                 j = j - 1;
@@ -78,27 +153,70 @@ public class TencentCosSigner {
             keys[j + 1] = ck;
             vals[j + 1] = cv;
         }
-        StringBuilder ksb = new StringBuilder();
-        StringBuilder psb = new StringBuilder();
+        int kBufLen = kTotal + (n - 1);
+        byte[] kBuf = new byte[kBufLen];
+        nint kbp = (nint)kBuf;
+        string v = TencentCosSigner.AsciiLower(verb);
+        string k = key == null ? "" : key;
+        int vl = v.Length;
+        int kl = k.Length;
+        int pBufLen = pTotal + (n - 1);
+        int hBufLen = vl + 2 + kl + 1 + pBufLen + 2;
+        byte[] hBuf = new byte[hBufLen];
+        nint hbp = (nint)hBuf;
+        if (vl > 0) { NativeMemory.Copy(hbp, (nint)v, vl); }
+        hBuf[vl] = 10;
+        hBuf[vl + 1] = 47;
+        if (kl > 0) { NativeMemory.Copy(hbp + (nint)(vl + 2), (nint)k, kl); }
+        hBuf[vl + 2 + kl] = 10;
+        int ko = 0;
+        int ho = vl + 3 + kl;
         for (int i = 0; i < n; i = i + 1) {
             if (i > 0) {
-                ksb.Append(";");
-                psb.Append("&");
+                kBuf[ko] = 59;  // ';'
+                ko = ko + 1;
+                hBuf[ho] = 38;  // '&'
+                ho = ho + 1;
             }
-            ksb.Append(keys[i]);
-            psb.Append(keys[i]);
-            psb.Append("=");
-            psb.Append(vals[i]);
+            string ki = keys[i];
+            int kil = ki.Length;
+            if (kil > 0) {
+                NativeMemory.Copy(kbp + (nint)ko, (nint)ki, kil);
+                ko = ko + kil;
+                NativeMemory.Copy(hbp + (nint)ho, (nint)ki, kil);
+                ho = ho + kil;
+            }
+            hBuf[ho] = 61;  // '='
+            ho = ho + 1;
+            string vi = vals[i];
+            int vil = vi.Length;
+            if (vil > 0) {
+                NativeMemory.Copy(hbp + (nint)ho, (nint)vi, vil);
+                ho = ho + vil;
+            }
         }
-        urlParamList = ksb.ToString();
-        return TencentCosSigner.AsciiLower(verb) + "\n/" + (key == null ? "" : key)
-            + "\n" + psb.ToString() + "\n\n";
+        hBuf[ho] = 10;
+        hBuf[ho + 1] = 10;
+        urlParamList = NativeMemory.GetString(kbp, 0, kBufLen);
+        return NativeMemory.GetString(hbp, 0, hBufLen);
     }
 
     /// <summary>待签串：sha1\nkeyTime\nHex(SHA1(HttpString))\n。</summary>
     public static string StringToSign(string keyTime, string httpString) {
         byte[] h = Sha1Hash(httpString);
-        return "sha1\n" + keyTime + "\n" + OssSigner.Hex(h) + "\n";
+        string kt = keyTime == null ? "" : keyTime;
+        string hx = OssSigner.Hex(h);
+        int ktl = kt.Length;
+        int hxl = hx.Length;
+        int total = 5 + ktl + 1 + hxl + 1;
+        byte[] buf = new byte[total];
+        nint bp = (nint)buf;
+        NativeMemory.Copy(bp, (nint)"sha1\n", 5);
+        if (ktl > 0) { NativeMemory.Copy(bp + (nint)5, (nint)kt, ktl); }
+        buf[5 + ktl] = 10;
+        if (hxl > 0) { NativeMemory.Copy(bp + (nint)(6 + ktl), (nint)hx, hxl); }
+        buf[6 + ktl + hxl] = 10;
+        return NativeMemory.GetString(bp, 0, total);
     }
 
     /// <summary>签名字符串：Hex(HMAC-SHA1(Hex(HMAC-SHA1(密钥, keyTime)), 待签串))。</summary>
@@ -124,15 +242,42 @@ public class TencentCosSigner {
         string urlParamList = "";
         string httpString = TencentCosSigner.HttpStringWithQuery(verb, key, queryPairs, out urlParamList);
         string sig = TencentCosSigner.Sign(secretKey, keyTime, httpString);
-        return "q-sign-algorithm=sha1&q-ak=" + (accessKey == null ? "" : accessKey)
-            + "&q-sign-time=" + keyTime + "&q-key-time=" + keyTime
-            + "&q-header-list=&q-url-param-list=" + urlParamList + "&q-signature=" + sig;
+        string ak = accessKey == null ? "" : accessKey;
+        string kt = keyTime == null ? "" : keyTime;
+        string upl = urlParamList == null ? "" : urlParamList;
+        return TencentCosSigner.FormatAuth(ak, kt, upl, sig);
+    }
+
+    private static string FormatAuth(string ak, string kt, string upl, string sig) {
+        int akl = ak.Length;
+        int ktl = kt.Length;
+        int upll = upl.Length;
+        int sigl = sig.Length;
+        int total = 27 + akl + 13 + ktl + 12 + ktl + 33 + upll + 13 + sigl;
+        byte[] buf = new byte[total];
+        nint bp = (nint)buf;
+        int pos = 0;
+        NativeMemory.Copy(bp, (nint)"q-sign-algorithm=sha1&q-ak=", 27); pos = 27;
+        if (akl > 0) { NativeMemory.Copy(bp + (nint)pos, (nint)ak, akl); pos = pos + akl; }
+        NativeMemory.Copy(bp + (nint)pos, (nint)"&q-sign-time=", 13); pos = pos + 13;
+        if (ktl > 0) { NativeMemory.Copy(bp + (nint)pos, (nint)kt, ktl); pos = pos + ktl; }
+        NativeMemory.Copy(bp + (nint)pos, (nint)"&q-key-time=", 12); pos = pos + 12;
+        if (ktl > 0) { NativeMemory.Copy(bp + (nint)pos, (nint)kt, ktl); pos = pos + ktl; }
+        NativeMemory.Copy(bp + (nint)pos, (nint)"&q-header-list=&q-url-param-list=", 33); pos = pos + 33;
+        if (upll > 0) { NativeMemory.Copy(bp + (nint)pos, (nint)upl, upll); pos = pos + upll; }
+        NativeMemory.Copy(bp + (nint)pos, (nint)"&q-signature=", 13); pos = pos + 13;
+        if (sigl > 0) { NativeMemory.Copy(bp + (nint)pos, (nint)sig, sigl); }
+        return NativeMemory.GetString(bp, 0, total);
     }
 
     /// <summary>签名有效期窗口（秒）：返回 "起始;结束"。</summary>
     public static string KeyTime(long nowSeconds, int expireSeconds) {
         if (expireSeconds <= 0) { expireSeconds = 900; }
-        return Convert.ToString(nowSeconds) + ";" + Convert.ToString(nowSeconds + expireSeconds);
+        StringBuilder sb = new StringBuilder(24);
+        sb.Append(nowSeconds);
+        sb.Append(";");
+        sb.Append(nowSeconds + (long)expireSeconds);
+        return sb.ToString();
     }
 
     static byte[] Sha1Hash(string data) {
