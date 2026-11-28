@@ -519,6 +519,49 @@ public static class CanvasGameExtensions {
         GameGpuState.SetNormalMap3D(key, scale);
     }
 
+    // 屏幕空间光照：SSAO（墙角/接触处变暗）+ 体积光（阳光穿过遮挡物形成光柱）。
+    // 在世界几何画完、第一人称层（会清深度）之前调用；viewProj 与绘制用的相同。
+    // aoRadius 米（0 关）、aoStrength 0..2、aoMaxDist 米；volDensity 每米（0.01~0.05）、volStrength（0 关）、volMaxDist 米、volSteps 8..64。
+    public static int ScreenLighting3D(this Canvas c, Mat4 viewProj, float camX, float camY, float camZ,
+                                       float aoRadius, float aoStrength, float aoMaxDist,
+                                       float volDensity, float volStrength, float volMaxDist, int volSteps) {
+        if (c == null || viewProj == null || viewProj.m == null) { return 0; }
+        float[] inv = Invert4x4(viewProj.m);
+        if (inv == null) { return 0; }
+        EnsureMatBuffers();
+        WriteMat4ColumnMajor(cachedMvpPtr, viewProj);
+        Mat4 invM = new Mat4(); invM.m = inv;
+        WriteMat4ColumnMajor(cachedModelPtr, invM);
+        return GameGpuRenderer.ScreenLighting3D(c.SurfaceId(), cachedMvpPtr, cachedModelPtr, camX, camY, camZ,
+            aoRadius, aoStrength, aoMaxDist, volDensity, volStrength, volMaxDist, volSteps < 1 ? 1 : (volSteps > 64 ? 64 : volSteps));
+    }
+
+    // 行主序 4x4 求逆（不可逆返回 null）。
+    public static float[] Invert4x4(float[] a) {
+        float[] inv = new float[16];
+        inv[0] = a[5]*a[10]*a[15] - a[5]*a[11]*a[14] - a[9]*a[6]*a[15] + a[9]*a[7]*a[14] + a[13]*a[6]*a[11] - a[13]*a[7]*a[10];
+        inv[4] = -a[4]*a[10]*a[15] + a[4]*a[11]*a[14] + a[8]*a[6]*a[15] - a[8]*a[7]*a[14] - a[12]*a[6]*a[11] + a[12]*a[7]*a[10];
+        inv[8] = a[4]*a[9]*a[15] - a[4]*a[11]*a[13] - a[8]*a[5]*a[15] + a[8]*a[7]*a[13] + a[12]*a[5]*a[11] - a[12]*a[7]*a[9];
+        inv[12] = -a[4]*a[9]*a[14] + a[4]*a[10]*a[13] + a[8]*a[5]*a[14] - a[8]*a[6]*a[13] - a[12]*a[5]*a[10] + a[12]*a[6]*a[9];
+        inv[1] = -a[1]*a[10]*a[15] + a[1]*a[11]*a[14] + a[9]*a[2]*a[15] - a[9]*a[3]*a[14] - a[13]*a[2]*a[11] + a[13]*a[3]*a[10];
+        inv[5] = a[0]*a[10]*a[15] - a[0]*a[11]*a[14] - a[8]*a[2]*a[15] + a[8]*a[3]*a[14] + a[12]*a[2]*a[11] - a[12]*a[3]*a[10];
+        inv[9] = -a[0]*a[9]*a[15] + a[0]*a[11]*a[13] + a[8]*a[1]*a[15] - a[8]*a[3]*a[13] - a[12]*a[1]*a[11] + a[12]*a[3]*a[9];
+        inv[13] = a[0]*a[9]*a[14] - a[0]*a[10]*a[13] - a[8]*a[1]*a[14] + a[8]*a[2]*a[13] + a[12]*a[1]*a[10] - a[12]*a[2]*a[9];
+        inv[2] = a[1]*a[6]*a[15] - a[1]*a[7]*a[14] - a[5]*a[2]*a[15] + a[5]*a[3]*a[14] + a[13]*a[2]*a[7] - a[13]*a[3]*a[6];
+        inv[6] = -a[0]*a[6]*a[15] + a[0]*a[7]*a[14] + a[4]*a[2]*a[15] - a[4]*a[3]*a[14] - a[12]*a[2]*a[7] + a[12]*a[3]*a[6];
+        inv[10] = a[0]*a[5]*a[15] - a[0]*a[7]*a[13] - a[4]*a[1]*a[15] + a[4]*a[3]*a[13] + a[12]*a[1]*a[7] - a[12]*a[3]*a[5];
+        inv[14] = -a[0]*a[5]*a[14] + a[0]*a[6]*a[13] + a[4]*a[1]*a[14] - a[4]*a[2]*a[13] - a[12]*a[1]*a[6] + a[12]*a[2]*a[5];
+        inv[3] = -a[1]*a[6]*a[11] + a[1]*a[7]*a[10] + a[5]*a[2]*a[11] - a[5]*a[3]*a[10] - a[9]*a[2]*a[7] + a[9]*a[3]*a[6];
+        inv[7] = a[0]*a[6]*a[11] - a[0]*a[7]*a[10] - a[4]*a[2]*a[11] + a[4]*a[3]*a[10] + a[8]*a[2]*a[7] - a[8]*a[3]*a[6];
+        inv[11] = -a[0]*a[5]*a[11] + a[0]*a[7]*a[9] + a[4]*a[1]*a[11] - a[4]*a[3]*a[9] - a[8]*a[1]*a[7] + a[8]*a[3]*a[5];
+        inv[15] = a[0]*a[5]*a[10] - a[0]*a[6]*a[9] - a[4]*a[1]*a[10] + a[4]*a[2]*a[9] + a[8]*a[1]*a[6] - a[8]*a[2]*a[5];
+        float det = a[0]*inv[0] + a[1]*inv[4] + a[2]*inv[8] + a[3]*inv[12];
+        if (det > -1e-12f && det < 1e-12f) { return null; }
+        float id = 1.0f / det;
+        for (int i = 0; i < 16; i = i + 1) { inv[i] = inv[i] * id; }
+        return inv;
+    }
+
     // 天空盒（自带相机基向量的版本）：right/up/forward 为世界空间单位向量，tanHalfFov 为纵向半角正切。
     public static int DrawSkyboxBasis3D(this Canvas c, Vector3 right, Vector3 up, Vector3 forward, float tanHalfFov, float aspect, Skybox3D skybox) {
         if (c == null || skybox == null) { return 0; }

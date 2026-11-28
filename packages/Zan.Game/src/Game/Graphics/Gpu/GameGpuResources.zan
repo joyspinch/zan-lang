@@ -113,6 +113,14 @@ internal sealed class GpuShadowProgram {
     public int UWindParams = -1;
 }
 
+internal sealed class GpuScreenLightProgram {
+    public uint Program;
+    public int UScene = -1; public int UDepth = -1; public int UShadowMap = -1;
+    public int UInvVP = -1; public int UVP = -1; public int ULightVP = -1;
+    public int UCamPos = -1; public int USunDir = -1; public int USunColor = -1;
+    public int UVol = -1; public int UAo = -1; public int UShadowOn = -1;
+}
+
 internal sealed class GpuPostProgram {
     public uint Program;
     public int UScene = -1;
@@ -209,6 +217,11 @@ internal static class GameGpuResources {
     private static GpuShadowProgram shadowSkinProg;
     private static GpuPostProgram postProg;
     private static GpuSkyboxProgram skyboxProg;
+    private static GpuScreenLightProgram screenLightProg;
+    public static uint PostDepthTex;
+    public static uint PostDepthFbo;
+    public static int PostDepthW;
+    public static int PostDepthH;
 
     public static uint PostFbo;
     public static uint PostTex;
@@ -636,6 +649,64 @@ internal static class GameGpuResources {
         }
         shadowSkinProg = p;
         return p;
+    }
+
+    public static GpuScreenLightProgram GetScreenLightProgram() {
+        EnsureResInit();
+        if (screenLightProg != null && screenLightProg.Program != 0u) { return screenLightProg; }
+        GlApi gl = GameGpuState.Gl;
+        string head = GameGpuShaders.GlslHeader(gl);
+        uint prog = GlBridge.GpuProgram(head + GameGpuPostShaders.PostVs(), head + GameGpuPostShaders.ScreenLightFs());
+        if (prog == 0u) { return null; }
+        GpuScreenLightProgram p = new GpuScreenLightProgram();
+        p.Program = prog;
+        p.UScene = GlBridge.UniformLoc(gl, prog, "uScene");
+        p.UDepth = GlBridge.UniformLoc(gl, prog, "uDepth");
+        p.UShadowMap = GlBridge.UniformLoc(gl, prog, "uShadowMap");
+        p.UInvVP = GlBridge.UniformLoc(gl, prog, "uInvVP");
+        p.UVP = GlBridge.UniformLoc(gl, prog, "uVP");
+        p.ULightVP = GlBridge.UniformLoc(gl, prog, "uLightVP");
+        p.UCamPos = GlBridge.UniformLoc(gl, prog, "uCamPos");
+        p.USunDir = GlBridge.UniformLoc(gl, prog, "uSunDir");
+        p.USunColor = GlBridge.UniformLoc(gl, prog, "uSunColor");
+        p.UVol = GlBridge.UniformLoc(gl, prog, "uVol");
+        p.UAo = GlBridge.UniformLoc(gl, prog, "uAo");
+        p.UShadowOn = GlBridge.UniformLoc(gl, prog, "uShadowOn");
+        screenLightProg = p;
+        return p;
+    }
+
+    // 深度副本：主帧深度是渲染缓冲（不可采样），这里建同尺寸深度纹理并用 Blit 拷过去。
+    public static bool PostDepthReady(GpuFrameInfo frame) {
+        GlApi gl = GameGpuState.Gl;
+        if (!gl.HasBlitFramebuffer) { return false; }
+        if (PostDepthFbo != 0u && (PostDepthW != frame.Width || PostDepthH != frame.Height)) {
+            GlBridge.DeleteOne(gl.DeleteFramebuffers, PostDepthFbo);
+            GlBridge.DeleteOne(gl.DeleteTextures, PostDepthTex);
+            PostDepthFbo = 0u; PostDepthTex = 0u;
+        }
+        if (PostDepthFbo == 0u) {
+            PostDepthTex = GlBridge.GenOne(gl.GenTextures);
+            if (PostDepthTex == 0u) { return false; }
+            gl.BindTexture(GlBridge.TEXTURE_2D, PostDepthTex);
+            gl.TexImage2D(GlBridge.TEXTURE_2D, 0, (int)GlBridge.DEPTH_COMPONENT24, frame.Width, frame.Height, 0, GlBridge.DEPTH_COMPONENT, GlBridge.UNSIGNED_INT, 0);
+            gl.TexParameteri(GlBridge.TEXTURE_2D, GlBridge.TEXTURE_MIN_FILTER, (int)GlBridge.NEAREST);
+            gl.TexParameteri(GlBridge.TEXTURE_2D, GlBridge.TEXTURE_MAG_FILTER, (int)GlBridge.NEAREST);
+            gl.TexParameteri(GlBridge.TEXTURE_2D, GlBridge.TEXTURE_WRAP_S, (int)GlBridge.CLAMP_TO_EDGE);
+            gl.TexParameteri(GlBridge.TEXTURE_2D, GlBridge.TEXTURE_WRAP_T, (int)GlBridge.CLAMP_TO_EDGE);
+            PostDepthFbo = GlBridge.GenOne(gl.GenFramebuffers);
+            if (PostDepthFbo == 0u) { GlBridge.DeleteOne(gl.DeleteTextures, PostDepthTex); PostDepthTex = 0u; return false; }
+            gl.BindFramebuffer(GlBridge.FRAMEBUFFER, PostDepthFbo);
+            gl.FramebufferTexture2D(GlBridge.FRAMEBUFFER, GlBridge.DEPTH_ATTACHMENT, GlBridge.TEXTURE_2D, PostDepthTex, 0);
+            if (gl.CheckFramebufferStatus(GlBridge.FRAMEBUFFER) != GlBridge.FRAMEBUFFER_COMPLETE || gl.GetError() != 0u) {
+                GlBridge.DeleteOne(gl.DeleteFramebuffers, PostDepthFbo);
+                GlBridge.DeleteOne(gl.DeleteTextures, PostDepthTex);
+                PostDepthFbo = 0u; PostDepthTex = 0u;
+                return false;
+            }
+            PostDepthW = frame.Width; PostDepthH = frame.Height;
+        }
+        return true;
     }
 
     public static GpuPostProgram GetPostProgram() {

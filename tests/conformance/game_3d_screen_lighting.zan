@@ -1,0 +1,81 @@
+using System;
+using System.Numerics;
+using Gui;
+using Game.Graphics;
+using Game.Render3D;
+
+namespace Conf;
+
+// 屏幕空间光照 ScreenLighting3D：SSAO 让墙角（地面与墙交线）变暗、开阔地面基本不变；
+// 体积光让朝向太阳的视线变亮；Invert4x4 与原矩阵相乘为单位阵。
+class GameScreenLightingTest {
+    [DllImport("zan_gui")]
+    private static extern int zan_gui_read_pixel(int surfaceId, int x, int y);
+
+    private static int Lum(int c) { return (((c >> 16) & 255) + ((c >> 8) & 255) + (c & 255)) / 3; }
+
+    private static Mesh3D Box(float x0, float y0, float z0, float x1, float y1, float z1) {
+        Mesh3D m = new Mesh3D();
+        // 只做朝 +y 的顶面与朝 +z 的正面，够构成 L 形墙角
+        int a = m.Vertex(x0, y1, z1, 0, 1, 0, 0, 0); int b = m.Vertex(x1, y1, z1, 0, 1, 0, 1, 0);
+        int c = m.Vertex(x1, y1, z0, 0, 1, 0, 1, 1); int d = m.Vertex(x0, y1, z0, 0, 1, 0, 0, 1);
+        m.Triangle(a, b, c); m.Triangle(a, c, d);
+        int e = m.Vertex(x0, y0, z1, 0, 0, 1, 0, 0); int f = m.Vertex(x1, y0, z1, 0, 0, 1, 1, 0);
+        int g = m.Vertex(x1, y1, z1, 0, 0, 1, 1, 1); int h = m.Vertex(x0, y1, z1, 0, 0, 1, 0, 1);
+        m.Triangle(e, f, g); m.Triangle(e, g, h);
+        return m;
+    }
+
+    static void Draw(Canvas cv, int floor, int wall, Mat4 vp) {
+        cv.Clear(unchecked((int)0xFF000000));
+        cv.SetLights3D(new float[] { 0.3f, 0.8f, 0.5f }, new float[] { 0.6f, 0.6f, 0.6f }, new float[] { 0.5f, 0.5f, 0.5f });
+        cv.SetCamera3D(0.0f, 2.0f, 5.0f);
+        cv.BeginFrame3D();
+        Mat4 id = Mat4.Identity();
+        cv.DrawMesh3DEx(floor, vp, id, unchecked((int)0xFFB0B0B0), "");
+        cv.DrawMesh3DEx(wall, vp, id, unchecked((int)0xFFB0B0B0), "");
+        cv.EndFrame3D();
+    }
+
+    static void Main() {
+        Canvas.SetBackend(1);
+        Canvas cv = new Canvas(128, 128);
+        int floor = cv.MeshUpload(Box(-4.0f, -0.1f, -4.0f, 4.0f, 0.0f, 4.0f));
+        int wall = cv.MeshUpload(Box(-4.0f, 0.0f, -4.0f, 4.0f, 3.0f, -1.0f));
+        Mat4 proj = Mat4.Perspective(1.0f, 1.0f, 0.1f, 50.0f);
+        Mat4 view = Mat4.LookAt(0.0f, 2.0f, 5.0f, 0.0f, 0.5f, -1.0f, 0.0f, 1.0f, 0.0f);
+        Mat4 vp = Mat4.Mul(proj, view);
+
+        // 求逆正确性
+        float[] inv = CanvasGameExtensions.Invert4x4(vp.m);
+        Mat4 im = new Mat4(); im.m = inv;
+        Mat4 prod = Mat4.Mul(vp, im);
+        float err = 0.0f;
+        for (int i = 0; i < 16; i = i + 1) { float want = (i % 5 == 0) ? 1.0f : 0.0f; err = err + MathF.Abs(prod.m[i] - want); }
+        Console.WriteLine("invert4x4-identity: " + (err < 0.001f ? "1" : "0"));
+
+        // 墙角：从底部（开阔地面）往上扫，亮度第一次明显变化处即地面与墙的交线
+        Draw(cv, floor, wall, vp);
+        int floorLum = Lum(zan_gui_read_pixel(cv.SurfaceId(), 64, 124));
+        int cornerY = 0;
+        for (int y = 124; y > 4; y = y - 1) {
+            if (Math.Abs(Lum(zan_gui_read_pixel(cv.SurfaceId(), 64, y)) - floorLum) > 6) { cornerY = y; break; }
+        }
+        int cornerBefore = Lum(zan_gui_read_pixel(cv.SurfaceId(), 64, cornerY + 3));
+        int openBefore = Lum(zan_gui_read_pixel(cv.SurfaceId(), 64, 124));
+        int done = cv.ScreenLighting3D(vp, 0.0f, 2.0f, 5.0f, 0.8f, 1.5f, 40.0f, 0.0f, 0.0f, 0.0f, 1);
+        int cornerAfter = Lum(zan_gui_read_pixel(cv.SurfaceId(), 64, cornerY + 3));
+        int openAfter = Lum(zan_gui_read_pixel(cv.SurfaceId(), 64, 124));
+        bool aoOk = done == 1 && cornerY > 0 && cornerAfter + 8 < cornerBefore && Math.Abs(openAfter - openBefore) <= 6;
+        Console.WriteLine("ssao-darkens-corner: " + (aoOk ? "1" : "0"));
+
+        // 体积光：太阳在视线前上方，开启后画面上部变亮（无阴影贴图时全程受光）
+        cv.SetLights3D(new float[] { 0.0f, 0.3f, -1.0f }, new float[] { 3.0f, 2.8f, 2.4f }, new float[] { 0.5f, 0.5f, 0.5f });
+        Draw(cv, floor, wall, vp);
+        cv.SetLights3D(new float[] { 0.0f, 0.3f, -1.0f }, new float[] { 3.0f, 2.8f, 2.4f }, new float[] { 0.5f, 0.5f, 0.5f });
+        int skyBefore = Lum(zan_gui_read_pixel(cv.SurfaceId(), 64, 4));
+        cv.ScreenLighting3D(vp, 0.0f, 2.0f, 5.0f, 0.0f, 0.0f, 0.0f, 0.03f, 3.0f, 40.0f, 16);
+        int skyAfter = Lum(zan_gui_read_pixel(cv.SurfaceId(), 64, 4));
+        Console.WriteLine("volumetric-brightens-toward-sun: " + (skyAfter > skyBefore + 15 ? "1" : "0"));
+    }
+}
