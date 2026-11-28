@@ -149,7 +149,7 @@ typedef struct {
     zgl_int u_triplanar, u_height_fog_params, u_height_fog_color, u_hit_flash;
     zgl_int u_holo_scan_params, u_holo_scan_color;
     zgl_int u_top_cover_params, u_top_cover_color;
-    zgl_int u_wind_params;
+    zgl_int u_wind_params, u_dist_fade;
     zgl_int u_light_dir, u_light_color, u_light_count, u_ambient;
     zgl_int u_cam_pos, u_cam_valid, u_material, u_emissive;
     zgl_int u_point_pos, u_point_color, u_point_count;
@@ -229,6 +229,7 @@ static float g_game_holo_scan_color[3] = { 0.0f, 0.9f, 1.0f };
 static float g_game_top_cover_params[4] = { 0.0f, 0.5f, 0.25f, 0.0f }; /* enabled, threshold, sharpness, amount */
 static float g_game_top_cover_color[3] = { 0.95f, 0.97f, 1.0f };
 static float g_game_wind_params[4] = { 0.0f, 1.5f, 0.0f, 1.0f }; /* amplitude, freq, phase, height_scale */
+static float g_game_dist_fade[3] = { 0.0f, 0.5f, 2.0f }; /* enabled, start_dist, end_dist */
 static float g_game_color_grade[2] = { 1.0f, 1.0f }; /* saturation, contrast */
 static float g_game_color_tint[3] = { 1.0f, 1.0f, 1.0f };
 static float g_game_post_lens[2] = { 0.0f, 0.0f }; /* fxaa, chromatic */
@@ -236,6 +237,8 @@ static float g_game_post_film[3] = { 0.0f, 0.0f, 0.0f }; /* sharpen, grain, seed
 static float g_game_post_cinema[4] = { 0.0f, 0.0f, 16.0f, 0.0f }; /* letterbox, amp, freq, phase */
 static float g_game_post_radial_blur[3] = { 0.0f, 0.5f, 0.5f }; /* strength, cx, cy */
 static float g_game_post_pixelate[2] = { 0.0f, 0.0f }; /* pixel_size, posterize_levels */
+static float g_game_post_duotone_dark[4] = { 0.0f, 0.05f, 0.0f, 0.0f }; /* dark_r, g, b, strength */
+static float g_game_post_duotone_light[3] = { 0.2f, 1.0f, 0.35f }; /* light_r, g, b */
 static uint32_t g_game_light_version = 1;
 
 static zan_game_mesh *g_game_meshes = NULL;
@@ -531,6 +534,7 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
 "uniform vec3 uHoloScanColor;\n" \
 "uniform vec4 uTopCoverParams;\n" \
 "uniform vec3 uTopCoverColor;\n" \
+"uniform vec3 uDistFade;\n" \
 "uniform vec3 uCamPos;\n" \
 "uniform int uCamValid;\n" \
 "uniform vec2 uMaterial;\n" \
@@ -663,6 +667,19 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
 
 #define ZAN_GAME_3D_FINAL_COMPOSE(BASE_EXPR, ALPHA_EXPR) \
 "    if (uClipOn != 0 && (dot(v_world_pos, uClipPlane.xyz) + uClipPlane.w) < 0.0) discard;\n" \
+"    if (uDistFade.x > 0.5 && uCamValid != 0) {\n" \
+"        float cd = length(v_world_pos - uCamPos);\n" \
+"        float fSpan = uDistFade.z - uDistFade.y;\n" \
+"        float fVis = (abs(fSpan) > 0.0001) ? clamp((cd - uDistFade.y) / fSpan, 0.0, 1.0) : 1.0;\n" \
+"        if (fVis <= 0.001) discard;\n" \
+"        if (fVis < 0.999) {\n" \
+"            vec2 bp = mod(floor(gl_FragCoord.xy), 4.0);\n" \
+"            vec2 bp0 = mod(bp, 2.0);\n" \
+"            vec2 bp1 = floor(bp * 0.5);\n" \
+"            float bVal = 4.0 * (2.0 * abs(bp0.x - bp0.y) + bp0.y) + (2.0 * abs(bp1.x - bp1.y) + bp1.y);\n" \
+"            if (fVis * 16.0 <= bVal + 0.5) discard;\n" \
+"        }\n" \
+"    }\n" \
 "    float outAlpha = " ALPHA_EXPR ";\n" \
 "    if (uAlphaCutoff > 0.0001 && outAlpha < uAlphaCutoff) discard;\n" \
 "    float dissEdgeBoost = 0.0;\n" \
@@ -835,6 +852,8 @@ static const char *const ZAN_GAME_POST_FS =
 "uniform vec4 uPostCinema;\n"
 "uniform vec3 uPostRadialBlur;\n"
 "uniform vec2 uPostPixelate;\n"
+"uniform vec4 uPostDuotoneDark;\n"
+"uniform vec3 uPostDuotoneLight;\n"
 "in vec2 v_uv;\n"
 "out vec4 frag;\n"
 "vec3 brightPass(vec3 c, float th) {\n"
@@ -929,6 +948,11 @@ static const char *const ZAN_GAME_POST_FS =
     "    col = mix(vec3(luma), col, uColorGrade.x);\n"
     "    col = (col - vec3(0.5)) * uColorGrade.y + vec3(0.5);\n"
     "    col *= uColorTint;\n"
+    "    if (uPostDuotoneDark.w > 0.0005) {\n"
+    "        float dLum = clamp(dot(col, vec3(0.2126, 0.7152, 0.0722)), 0.0, 1.0);\n"
+    "        vec3 duo = mix(uPostDuotoneDark.rgb, uPostDuotoneLight, dLum);\n"
+    "        col = mix(col, duo, clamp(uPostDuotoneDark.w, 0.0, 1.0));\n"
+    "    }\n"
     "    if (uVignette > 0.001) {\n"
     "        vec2 d = (v_uv - vec2(0.5)) * 2.0;\n"
     "        float vig = clamp(1.0 - uVignette * dot(d, d) * 0.5, 0.0, 1.0);\n"
@@ -965,6 +989,8 @@ typedef struct {
     zgl_int u_post_cinema;
     zgl_int u_post_radial_blur;
     zgl_int u_post_pixelate;
+    zgl_int u_post_duotone_dark;
+    zgl_int u_post_duotone_light;
 } zan_game_post_program;
 
 static const char *const ZAN_GAME_SKYBOX_FS =
@@ -1214,6 +1240,8 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
         : g_game_gl->GetUniformLocation(program, "uTopCoverColor");
     zgl_int wind_params = instanced ? -1
         : g_game_gl->GetUniformLocation(program, "uWindParams");
+    zgl_int dist_fade = instanced ? -1
+        : g_game_gl->GetUniformLocation(program, "uDistFade");
     zgl_int color = instanced ? 0
         : g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
@@ -1289,6 +1317,7 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
     prog->u_top_cover_params = top_cover_params;
     prog->u_top_cover_color = top_cover_color;
     prog->u_wind_params = wind_params;
+    prog->u_dist_fade = dist_fade;
     prog->u_color = color;
     prog->u_light_dir = light_dir;
     prog->u_light_color = light_color;
@@ -1361,6 +1390,7 @@ static zan_game_program *zan_game_skin_program_get(void) {
     zgl_int top_cover_params = g_game_gl->GetUniformLocation(program, "uTopCoverParams");
     zgl_int top_cover_color = g_game_gl->GetUniformLocation(program, "uTopCoverColor");
     zgl_int wind_params = g_game_gl->GetUniformLocation(program, "uWindParams");
+    zgl_int dist_fade = g_game_gl->GetUniformLocation(program, "uDistFade");
     zgl_int color = g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int light_dir = g_game_gl->GetUniformLocation(program, "uLightDir[0]");
     zgl_int light_color = g_game_gl->GetUniformLocation(program, "uLightColor[0]");
@@ -1424,6 +1454,7 @@ static zan_game_program *zan_game_skin_program_get(void) {
     g_game_skin_prog.u_top_cover_params = top_cover_params;
     g_game_skin_prog.u_top_cover_color = top_cover_color;
     g_game_skin_prog.u_wind_params = wind_params;
+    g_game_skin_prog.u_dist_fade = dist_fade;
     g_game_skin_prog.u_color = color;
     g_game_skin_prog.u_light_dir = light_dir;
     g_game_skin_prog.u_light_color = light_color;
@@ -1899,6 +1930,9 @@ static void zan_game_bind_shadow_uniforms(const zan_gl_api *gl, zan_game_program
         gl->Uniform4f(prog->u_wind_params,
             g_game_wind_params[0], g_game_wind_params[1],
             g_game_wind_params[2], g_game_wind_params[3]);
+    }
+    if (prog->u_dist_fade >= 0) {
+        gl->Uniform3fv(prog->u_dist_fade, 1, g_game_dist_fade);
     }
 }
 
@@ -2474,6 +2508,8 @@ static zan_game_post_program *zan_game_post_program_get(void) {
     g_game_post_prog.u_post_cinema = g_game_gl->GetUniformLocation(prog, "uPostCinema");
     g_game_post_prog.u_post_radial_blur = g_game_gl->GetUniformLocation(prog, "uPostRadialBlur");
     g_game_post_prog.u_post_pixelate = g_game_gl->GetUniformLocation(prog, "uPostPixelate");
+    g_game_post_prog.u_post_duotone_dark = g_game_gl->GetUniformLocation(prog, "uPostDuotoneDark");
+    g_game_post_prog.u_post_duotone_light = g_game_gl->GetUniformLocation(prog, "uPostDuotoneLight");
     return &g_game_post_prog;
 }
 
@@ -2590,6 +2626,14 @@ ZAN_GAME_API int32_t zan_game_postprocess3d(int32_t surface_id, float exposure,
     }
     if (prog->u_post_pixelate >= 0) {
         gl->Uniform2f(prog->u_post_pixelate, g_game_post_pixelate[0], g_game_post_pixelate[1]);
+    }
+    if (prog->u_post_duotone_dark >= 0) {
+        gl->Uniform4f(prog->u_post_duotone_dark,
+            g_game_post_duotone_dark[0], g_game_post_duotone_dark[1],
+            g_game_post_duotone_dark[2], g_game_post_duotone_dark[3]);
+    }
+    if (prog->u_post_duotone_light >= 0) {
+        gl->Uniform3fv(prog->u_post_duotone_light, 1, g_game_post_duotone_light);
     }
     gl->BindVertexArray(g_game_post_vao);
     gl->DrawArrays(ZGL_TRIANGLES, 0, 3);
@@ -2939,4 +2983,25 @@ ZAN_GAME_API void zan_game_set_post_pixelate3d(float pixel_size,
     if (posterize_levels > 64.0f) posterize_levels = 64.0f;
     g_game_post_pixelate[0] = pixel_size;
     g_game_post_pixelate[1] = posterize_levels;
+}
+
+ZAN_GAME_API void zan_game_set_distance_fade3d(int32_t enabled,
+    float start_dist, float end_dist) {
+    g_game_dist_fade[0] = enabled ? 1.0f : 0.0f;
+    g_game_dist_fade[1] = start_dist;
+    g_game_dist_fade[2] = end_dist;
+}
+
+ZAN_GAME_API void zan_game_set_post_duotone3d(float strength,
+    float dark_r, float dark_g, float dark_b,
+    float light_r, float light_g, float light_b) {
+    if (strength < 0.0f) strength = 0.0f;
+    if (strength > 1.0f) strength = 1.0f;
+    g_game_post_duotone_dark[0] = dark_r > 0.0f ? dark_r : 0.0f;
+    g_game_post_duotone_dark[1] = dark_g > 0.0f ? dark_g : 0.0f;
+    g_game_post_duotone_dark[2] = dark_b > 0.0f ? dark_b : 0.0f;
+    g_game_post_duotone_dark[3] = strength;
+    g_game_post_duotone_light[0] = light_r > 0.0f ? light_r : 0.0f;
+    g_game_post_duotone_light[1] = light_g > 0.0f ? light_g : 0.0f;
+    g_game_post_duotone_light[2] = light_b > 0.0f ? light_b : 0.0f;
 }

@@ -245,6 +245,18 @@ ZAN_GAME_API void zan_game_set_wind_sway3d(int32_t enabled, float amplitude,
 ZAN_GAME_API void zan_game_set_post_pixelate3d(float pixel_size,
     float posterize_levels);
 
+/* GPU 屏幕空间 Bayer 4x4 抖动距离淡出（Screen-Door Dithered Alpha Fade，零透明排序开销）：
+ * enabled != 0 时按相机距离在 [start_dist, end_dist] 间做 4x4 有序抖动剔除；
+ * start_dist < end_dist 用于近距相机防遮挡淡出，start_dist > end_dist 用于远距 LOD 淡出。 */
+ZAN_GAME_API void zan_game_set_distance_fade3d(int32_t enabled,
+    float start_dist, float end_dist);
+
+/* GPU 后处理双色调渐变映射（Duotone / Night-Vision / Thermal / Sepia Gradient Map，零额外 Pass）：
+ * strength [0..1] 按屏幕亮度在 (dark_r,g,b) 与 (light_r,g,b) 间线性插值并混入原画面。 */
+ZAN_GAME_API void zan_game_set_post_duotone3d(float strength,
+    float dark_r, float dark_g, float dark_b,
+    float light_r, float light_g, float light_b);
+
 #ifdef __cplusplus
 }
 #endif

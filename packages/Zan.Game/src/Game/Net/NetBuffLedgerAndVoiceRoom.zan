@@ -1,0 +1,251 @@
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+
+namespace Game.Net;
+
+// 服务端权威状态效果（Buff/Debuff）实例。
+public class StatusEffectInstance {
+    public string EffectId;
+    public int DispelCategory; // 1=Magic, 2=Poison, 3=Curse, 0=Undispellable
+    public int Stacks;
+    public int MaxStacks;
+    public long ExpireAtMs;
+    public long TickIntervalMs;
+    public long NextTickMs;
+    public int PowerPerStack;
+
+    public StatusEffectInstance(string effectId, int dispelCategory, int maxStacks,
+                                long expireAtMs, long tickIntervalMs, long firstTickMs, int powerPerStack) {
+        this.EffectId = effectId != null ? effectId : "";
+        this.DispelCategory = dispelCategory;
+        this.Stacks = 1;
+        this.MaxStacks = maxStacks > 0 ? maxStacks : 1;
+        this.ExpireAtMs = expireAtMs;
+        this.TickIntervalMs = tickIntervalMs > 0L ? tickIntervalMs : 0L;
+        this.NextTickMs = firstTickMs;
+        this.PowerPerStack = powerPerStack;
+    }
+}
+
+// 商业 MOBA/MMO 服务端权威 Buff/Debuff 叠加与周期结算器：
+// - 同 ID 效果支持层数叠加至上限并刷新持续时间
+// - 按时间步进结算周期 DOT/HOT 总数值并自动清理过期效果
+// - 支持按类别精确驱散（DispelCategory > 0）
+public class NetStatusEffectTracker {
+    private List<StatusEffectInstance> effects;
+
+    public NetStatusEffectTracker() {
+        this.effects = new List<StatusEffectInstance>();
+    }
+
+    public int ActiveEffectCount() {
+        return this.effects.Count;
+    }
+
+    public int GetStacks(string effectId) {
+        for (int i = 0; i < this.effects.Count; i = i + 1) {
+            if (this.effects[i].EffectId == effectId) { return this.effects[i].Stacks; }
+        }
+        return 0;
+    }
+
+    public void ApplyEffect(string effectId, int dispelCategory, int maxStacks,
+                            long nowMs, long durationMs, long tickIntervalMs, int powerPerStack) {
+        if (effectId == null || effectId == "" || durationMs <= 0L) { return; }
+        for (int i = 0; i < this.effects.Count; i = i + 1) {
+            StatusEffectInstance cur = this.effects[i];
+            if (cur.EffectId == effectId) {
+                if (cur.Stacks < cur.MaxStacks) { cur.Stacks = cur.Stacks + 1; }
+                long newExp = nowMs + durationMs;
+                if (newExp > cur.ExpireAtMs) { cur.ExpireAtMs = newExp; }
+                return;
+            }
+        }
+        long firstTick = tickIntervalMs > 0L ? (nowMs + tickIntervalMs) : 0L;
+        this.effects.Add(new StatusEffectInstance(
+            effectId, dispelCategory, maxStacks, nowMs + durationMs,
+            tickIntervalMs, firstTick, powerPerStack));
+    }
+
+    // 推进至 nowMs，结算所有到期周期跳字（正数代表治疗、负数代表伤害）并移除过期效果。
+    public int TickAndPurge(long nowMs) {
+        int totalDelta = 0;
+        int i = 0;
+        while (i < this.effects.Count) {
+            StatusEffectInstance e = this.effects[i];
+            if (e.TickIntervalMs > 0L) {
+                long capMs = nowMs < e.ExpireAtMs ? nowMs : e.ExpireAtMs;
+                while (e.NextTickMs <= capMs) {
+                    totalDelta = totalDelta + e.PowerPerStack * e.Stacks;
+                    e.NextTickMs = e.NextTickMs + e.TickIntervalMs;
+                }
+            }
+            if (nowMs >= e.ExpireAtMs) {
+                this.effects.RemoveAt(i);
+            } else {
+                i = i + 1;
+            }
+        }
+        return totalDelta;
+    }
+
+    // 按驱散类型清理效果（category <= 0 不驱散任何不可驱散光环），返回移除数量。
+    public int DispelByCategory(int category) {
+        if (category <= 0) { return 0; }
+        int removed = 0;
+        int i = 0;
+        while (i < this.effects.Count) {
+            if (this.effects[i].DispelCategory == category) {
+                this.effects.RemoveAt(i);
+                removed = removed + 1;
+            } else {
+                i = i + 1;
+            }
+        }
+        return removed;
+    }
+}
+
+// 幂等交易订单状态机。
+public enum OrderTxState {
+    Pending = 0,
+    Committed = 1,
+    Refunded = 2
+}
+
+// 幂等订单流水记录。
+public class OrderTransactionRecord {
+    public string IdempotencyKey;
+    public int PlayerId;
+    public int AmountCents;
+    public OrderTxState State;
+
+    public OrderTransactionRecord(string key, int playerId, int amountCents) {
+        this.IdempotencyKey = key != null ? key : "";
+        this.PlayerId = playerId;
+        this.AmountCents = amountCents;
+        this.State = OrderTxState.Pending;
+    }
+}
+
+// 商业联机充值/交易服务端幂等去重账本（Idempotent Order State Machine）：
+// - 相同 IdempotencyKey 重放提交只返回既有记录不重复扣款
+// - 严格单向终态守卫：Pending -> Committed -> Refunded，禁止 Refunded 逆转回 Committed
+public class NetIdempotentOrderLedger {
+    private List<OrderTransactionRecord> records;
+
+    public NetIdempotentOrderLedger() {
+        this.records = new List<OrderTransactionRecord>();
+    }
+
+    public int RecordCount() {
+        return this.records.Count;
+    }
+
+    public OrderTransactionRecord FindOrder(string key) {
+        if (key == null || key == "") { return null; }
+        for (int i = 0; i < this.records.Count; i = i + 1) {
+            if (this.records[i].IdempotencyKey == key) { return this.records[i]; }
+        }
+        return null;
+    }
+
+    // 幂等开单：首次创建返回 true，重复 key 幂等拦截返回 false。
+    public bool BeginOrder(string key, int playerId, int amountCents) {
+        if (key == null || key == "" || amountCents <= 0) { return false; }
+        if (this.FindOrder(key) != null) { return false; }
+        this.records.Add(new OrderTransactionRecord(key, playerId, amountCents));
+        return true;
+    }
+
+    public bool CommitOrder(string key) {
+        OrderTransactionRecord r = this.FindOrder(key);
+        if (r == null || r.State != OrderTxState.Pending) { return false; }
+        r.State = OrderTxState.Committed;
+        return true;
+    }
+
+    public bool RefundOrder(string key) {
+        OrderTransactionRecord r = this.FindOrder(key);
+        if (r == null || r.State != OrderTxState.Committed) { return false; }
+        r.State = OrderTxState.Refunded;
+        return true;
+    }
+}
+
+// 空间语音成员坐标与小队信息。
+public class VoicePeerPosition {
+    public int PlayerId;
+    public int SquadId;
+    public Vector3 Position;
+    public bool Muted;
+
+    public VoicePeerPosition(int playerId, int squadId, Vector3 position) {
+        this.PlayerId = playerId;
+        this.SquadId = squadId;
+        this.Position = position;
+        this.Muted = false;
+    }
+}
+
+// 商业 3D 联机空间近距离语音衰减与小队直通路由器（Proximity + Squad Voice Router）：
+// - 静音成员增益恒为 0
+// - 同小队成员（squadId > 0）不受距离限制固定满增益 1.0
+// - 非小队公共空间按 [NearDist, FarDist] 线性平滑衰减至 0
+public class NetProximityVoiceRouter {
+    public float NearDist;
+    public float FarDist;
+    private List<VoicePeerPosition> peers;
+
+    public NetProximityVoiceRouter(float nearDist, float farDist) {
+        this.NearDist = nearDist >= 0.0f ? nearDist : 3.0f;
+        this.FarDist = farDist > this.NearDist ? farDist : (this.NearDist + 20.0f);
+        this.peers = new List<VoicePeerPosition>();
+    }
+
+    public void UpsertPeer(int playerId, int squadId, Vector3 pos) {
+        for (int i = 0; i < this.peers.Count; i = i + 1) {
+            if (this.peers[i].PlayerId == playerId) {
+                this.peers[i].SquadId = squadId;
+                this.peers[i].Position = pos;
+                return;
+            }
+        }
+        this.peers.Add(new VoicePeerPosition(playerId, squadId, pos));
+    }
+
+    public bool SetMuted(int playerId, bool muted) {
+        for (int i = 0; i < this.peers.Count; i = i + 1) {
+            if (this.peers[i].PlayerId == playerId) {
+                this.peers[i].Muted = muted;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private VoicePeerPosition FindPeer(int playerId) {
+        for (int i = 0; i < this.peers.Count; i = i + 1) {
+            if (this.peers[i].PlayerId == playerId) { return this.peers[i]; }
+        }
+        return null;
+    }
+
+    public float ComputeListenGain(int listenerId, int speakerId) {
+        if (listenerId == speakerId) { return 0.0f; }
+        VoicePeerPosition listener = this.FindPeer(listenerId);
+        VoicePeerPosition speaker = this.FindPeer(speakerId);
+        if (listener == null || speaker == null || speaker.Muted) { return 0.0f; }
+        if (listener.SquadId > 0 && listener.SquadId == speaker.SquadId) {
+            return 1.0f;
+        }
+        float dx = listener.Position.X - speaker.Position.X;
+        float dy = listener.Position.Y - speaker.Position.Y;
+        float dz = listener.Position.Z - speaker.Position.Z;
+        float dist = (float)Math.Sqrt((double)(dx * dx + dy * dy + dz * dz));
+        if (dist <= this.NearDist) { return 1.0f; }
+        if (dist >= this.FarDist) { return 0.0f; }
+        return 1.0f - (dist - this.NearDist) / (this.FarDist - this.NearDist);
+    }
+}

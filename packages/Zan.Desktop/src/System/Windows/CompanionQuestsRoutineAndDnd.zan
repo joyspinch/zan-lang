@@ -1,0 +1,198 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Windows;
+
+// 桌宠每日互动任务槽位。
+public class CompanionQuestSlot {
+    public string QuestId;
+    public int TargetCount;
+    public int Progress;
+    public int RewardCoins;
+    public bool Claimed;
+
+    public CompanionQuestSlot(string questId, int targetCount, int rewardCoins) {
+        this.QuestId = questId != null ? questId : "";
+        this.TargetCount = targetCount > 0 ? targetCount : 1;
+        this.Progress = 0;
+        this.RewardCoins = rewardCoins > 0 ? rewardCoins : 0;
+        this.Claimed = false;
+    }
+
+    public bool IsCompleted() {
+        return this.Progress >= this.TargetCount;
+    }
+}
+
+// 商业桌面陪伴每日互动任务板（跨日自动重置 + 全勤额外奖励 + 防重复领奖）：
+public class CompanionDailyQuestBoard {
+    public int ActiveDayNumber;
+    public int AllCompleteBonusCoins;
+    public bool BonusClaimed;
+    private List<CompanionQuestSlot> quests;
+
+    public CompanionDailyQuestBoard(int dayNumber, int allCompleteBonusCoins) {
+        this.ActiveDayNumber = dayNumber;
+        this.AllCompleteBonusCoins = allCompleteBonusCoins > 0 ? allCompleteBonusCoins : 0;
+        this.BonusClaimed = false;
+        this.quests = new List<CompanionQuestSlot>();
+    }
+
+    public void AddQuest(string questId, int targetCount, int rewardCoins) {
+        this.quests.Add(new CompanionQuestSlot(questId, targetCount, rewardCoins));
+    }
+
+    // 日期前进时自动清零全部任务进度与领奖状态。
+    public bool RolloverIfNewDay(int currentDayNumber) {
+        if (currentDayNumber <= this.ActiveDayNumber) { return false; }
+        this.ActiveDayNumber = currentDayNumber;
+        this.BonusClaimed = false;
+        for (int i = 0; i < this.quests.Count; i = i + 1) {
+            this.quests[i].Progress = 0;
+            this.quests[i].Claimed = false;
+        }
+        return true;
+    }
+
+    public bool AdvanceQuest(string questId, int delta) {
+        if (delta <= 0) { return false; }
+        for (int i = 0; i < this.quests.Count; i = i + 1) {
+            if (this.quests[i].QuestId == questId) {
+                this.quests[i].Progress = this.quests[i].Progress + delta;
+                if (this.quests[i].Progress > this.quests[i].TargetCount) {
+                    this.quests[i].Progress = this.quests[i].TargetCount;
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public int ClaimQuestReward(string questId) {
+        for (int i = 0; i < this.quests.Count; i = i + 1) {
+            CompanionQuestSlot q = this.quests[i];
+            if (q.QuestId == questId) {
+                if (!q.IsCompleted() || q.Claimed) { return 0; }
+                q.Claimed = true;
+                return q.RewardCoins;
+            }
+        }
+        return 0;
+    }
+
+    public int ClaimAllCompleteBonus() {
+        if (this.BonusClaimed || this.quests.Count == 0) { return 0; }
+        for (int i = 0; i < this.quests.Count; i = i + 1) {
+            if (!this.quests[i].IsCompleted()) { return 0; }
+        }
+        this.BonusClaimed = true;
+        return this.AllCompleteBonusCoins;
+    }
+}
+
+// 24 小时作息生物钟单个时段定义（支持跨午夜区间，例如 23:00..07:00 即 1380..420）。
+public class CompanionRoutineSlot {
+    public string ActivityName;
+    public int StartMinute; // 0..1439
+    public int EndMinute;   // 0..1439
+
+    public CompanionRoutineSlot(string activityName, int startMinute, int endMinute) {
+        this.ActivityName = activityName != null ? activityName : "";
+        this.StartMinute = startMinute;
+        this.EndMinute = endMinute;
+    }
+
+    public bool ContainsMinute(int minuteOfDay) {
+        if (this.StartMinute <= this.EndMinute) {
+            return minuteOfDay >= this.StartMinute && minuteOfDay < this.EndMinute;
+        }
+        // 跨午夜区间（如 1380..420）
+        return minuteOfDay >= this.StartMinute || minuteOfDay < this.EndMinute;
+    }
+}
+
+// 商业桌面陪伴 24 小时作息状态解析器。
+public class CompanionCircadianRoutine {
+    private List<CompanionRoutineSlot> slots;
+
+    public CompanionCircadianRoutine() {
+        this.slots = new List<CompanionRoutineSlot>();
+    }
+
+    public void AddSlot(string activityName, int startMinute, int endMinute) {
+        this.slots.Add(new CompanionRoutineSlot(activityName, startMinute, endMinute));
+    }
+
+    public string ResolveActivity(int minuteOfDay) {
+        int m = minuteOfDay % 1440;
+        if (m < 0) { m = m + 1440; }
+        for (int i = 0; i < this.slots.Count; i = i + 1) {
+            if (this.slots[i].ContainsMinute(m)) {
+                return this.slots[i].ActivityName;
+            }
+        }
+        return "Idle";
+    }
+}
+
+// 桌宠提醒紧急度分级。
+public enum DndAlertLevel {
+    Casual = 0,
+    Important = 1,
+    Critical = 2
+}
+
+// 静默勿扰策略裁决结果。
+public enum DndDeliveryAction {
+    PopupWithSound = 0,
+    SilentToast = 1,
+    SuppressToTray = 2
+}
+
+// 商业桌面陪伴勿扰/专注防打扰策略引擎：
+// - 综合全屏游戏/演示、会议状态、定时勿扰窗（支持跨午夜）与提醒紧急度决定送达方式
+public class CompanionDndFocusPolicy {
+    public bool QuietHoursEnabled;
+    public int QuietStartMinute;
+    public int QuietEndMinute;
+    public bool FullscreenAppActive;
+    public bool MeetingModeActive;
+
+    public CompanionDndFocusPolicy(bool quietHoursEnabled, int quietStartMinute, int quietEndMinute) {
+        this.QuietHoursEnabled = quietHoursEnabled;
+        this.QuietStartMinute = quietStartMinute;
+        this.QuietEndMinute = quietEndMinute;
+        this.FullscreenAppActive = false;
+        this.MeetingModeActive = false;
+    }
+
+    public bool IsInQuietHours(int minuteOfDay) {
+        if (!this.QuietHoursEnabled) { return false; }
+        int m = minuteOfDay % 1440;
+        if (m < 0) { m = m + 1440; }
+        if (this.QuietStartMinute <= this.QuietEndMinute) {
+            return m >= this.QuietStartMinute && m < this.QuietEndMinute;
+        }
+        return m >= this.QuietStartMinute || m < this.QuietEndMinute;
+    }
+
+    public DndDeliveryAction EvaluateDelivery(int minuteOfDay, DndAlertLevel level) {
+        if (level == DndAlertLevel.Critical) {
+            // 关键告警（如低电/日程紧急）：会议或全屏下静音弹窗，其余完整提示
+            if (this.FullscreenAppActive || this.MeetingModeActive) {
+                return DndDeliveryAction.SilentToast;
+            }
+            return DndDeliveryAction.PopupWithSound;
+        }
+        if (this.FullscreenAppActive || this.MeetingModeActive) {
+            return DndDeliveryAction.SuppressToTray;
+        }
+        if (this.IsInQuietHours(minuteOfDay)) {
+            if (level == DndAlertLevel.Important) {
+                return DndDeliveryAction.SilentToast;
+            }
+            return DndDeliveryAction.SuppressToTray;
+        }
+        return DndDeliveryAction.PopupWithSound;
+    }
+}

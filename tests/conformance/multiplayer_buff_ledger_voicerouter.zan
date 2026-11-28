@@ -1,0 +1,56 @@
+using System;
+using System.Numerics;
+using Game.Net;
+
+namespace Conf;
+
+class MultiplayerBuffLedgerVoiceRouterTest {
+    static void Main() {
+        // 1. 权威状态效果叠加、DOT/HOT 周期结算与按类别驱散
+        NetStatusEffectTracker tracker = new NetStatusEffectTracker();
+        tracker.ApplyEffect("poison", 2, 3, 1000L, 2000L, 500L, -10); // 1 层毒，每 500ms -10
+        tracker.ApplyEffect("poison", 2, 3, 1200L, 2000L, 500L, -10); // 叠到 2 层，延长至 3200
+        tracker.ApplyEffect("aura", 0, 1, 1000L, 5000L, 0L, 0);       // 不可驱散光环 (category=0)
+
+        int tick1 = tracker.TickAndPurge(2000L); // 1500ms & 2000ms 共 2 次 * 2 层 * -10 = -40
+        int dispelled = tracker.DispelByCategory(2); // 驱散毒，保留不可驱散光环
+        int undead = tracker.DispelByCategory(0);    // 类别 0 不允许驱散
+
+        bool buffOk = tick1 == -40 && dispelled == 1 && undead == 0
+            && tracker.GetStacks("poison") == 0 && tracker.ActiveEffectCount() == 1;
+        Console.WriteLine("net-status-effect-tracker: " + Convert.ToString(buffOk ? 1 : 0));
+
+        // 2. 幂等订单账本：重放拦截、单向状态机与防终态逆转
+        NetIdempotentOrderLedger ledger = new NetIdempotentOrderLedger();
+        bool b1 = ledger.BeginOrder("ord-1001", 7, 6800);
+        bool dupBlocked = !ledger.BeginOrder("ord-1001", 7, 6800); // 幂等拦截
+        bool refundEarlyBlocked = !ledger.RefundOrder("ord-1001"); // Pending 不可退款
+        bool committed = ledger.CommitOrder("ord-1001");
+        bool doubleCommitBlocked = !ledger.CommitOrder("ord-1001");
+        bool refunded = ledger.RefundOrder("ord-1001");
+        bool revertBlocked = !ledger.CommitOrder("ord-1001");      // Refunded 不可逆转
+
+        OrderTransactionRecord rec = ledger.FindOrder("ord-1001");
+        bool ledgerOk = b1 && dupBlocked && refundEarlyBlocked && committed
+            && doubleCommitBlocked && refunded && revertBlocked
+            && rec != null && rec.State == OrderTxState.Refunded && ledger.RecordCount() == 1;
+        Console.WriteLine("net-idempotent-order-ledger: " + Convert.ToString(ledgerOk ? 1 : 0));
+
+        // 3. 3D 空间语音路由：同小队跨距直通、公频线性衰减与静音拦截
+        NetProximityVoiceRouter voice = new NetProximityVoiceRouter(4.0f, 24.0f);
+        voice.UpsertPeer(1, 10, new Vector3(0.0f, 0.0f, 0.0f));
+        voice.UpsertPeer(2, 10, new Vector3(100.0f, 0.0f, 0.0f)); // 同小队 100m 远 -> 满增益 1.0
+        voice.UpsertPeer(3, 20, new Vector3(14.0f, 0.0f, 0.0f));  // 异队 14m -> (14-4)/(24-4)=0.5 -> gain=0.5
+        voice.UpsertPeer(4, 20, new Vector3(30.0f, 0.0f, 0.0f));  // 超出 24m -> gain=0.0
+
+        float gSquad = voice.ComputeListenGain(1, 2);
+        float gMid = voice.ComputeListenGain(1, 3);
+        float gFar = voice.ComputeListenGain(1, 4);
+        voice.SetMuted(2, true);
+        float gMuted = voice.ComputeListenGain(1, 2);
+
+        bool voiceOk = gSquad > 0.99f && gMid > 0.49f && gMid < 0.51f
+            && gFar <= 0.001f && gMuted <= 0.001f;
+        Console.WriteLine("net-proximity-voice-router: " + Convert.ToString(voiceOk ? 1 : 0));
+    }
+}
