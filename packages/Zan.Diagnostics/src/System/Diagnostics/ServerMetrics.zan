@@ -684,14 +684,10 @@ public class ServerMetrics {
         }
     }
 
-    private static bool IsAllDigits(string s) {
-        return ServerMetrics.RangeIsDigits(s, 0, s.Length);
-    }
-
-    private static bool RangeIsDigits(string s, int start, int end) {
+    private static bool RangeIsDigitsSpan(Span<byte> sp, int start, int end) {
         if (end <= start) { return false; }
         for (int i = start; i < end; i = i + 1) {
-            int c = s[i];
+            int c = sp[i] & 255;
             if (c < 48 || c > 57) { return false; }
         }
         return true;
@@ -704,22 +700,55 @@ public class ServerMetrics {
     private static string FoldPath(string path) {
         if (path == null) { return ""; }
         int n = path.Length;
-        int q = 0;
-        while (q < n && path[q] != '?') { q = q + 1; }
-        StringBuilder outp = new StringBuilder();
+        if (n == 0) { return ""; }
+        nint pp = (nint)path;
+        Span<byte> sp = new Span<byte>(pp, n);
+        int q = NativeMemory.Find(pp, 0, 63, n);
+        if (q < 0) { q = n; }
+
+        int outLen = 0;
+        bool hasDigitSeg = false;
         int i = 0;
         bool first = true;
         while (true) {
             int st = i;
-            while (i < q && path[i] != '/') { i = i + 1; }
-            if (!first) { outp.Append("/"); }
+            while (i < q && (sp[i] & 255) != 47) { i = i + 1; }
+            if (!first) { outLen = outLen + 1; }
             first = false;
-            if (ServerMetrics.RangeIsDigits(path, st, i)) { outp.Append(":id"); }
-            else if (i > st) { outp.Append(path.Substring(st, i - st)); }
+            if (ServerMetrics.RangeIsDigitsSpan(sp, st, i)) {
+                outLen = outLen + 3;
+                hasDigitSeg = true;
+            } else {
+                outLen = outLen + (i - st);
+            }
             if (i >= q) { break; }
             i = i + 1;
         }
-        return outp.ToString();
+        if (!hasDigitSeg) {
+            return q == n ? path : path.Substring(0, q);
+        }
+        byte[] buf = new byte[outLen];
+        nint bp = (nint)buf;
+        Span<byte> dst = new Span<byte>(bp, outLen);
+        int w = 0;
+        i = 0;
+        first = true;
+        while (true) {
+            int st = i;
+            while (i < q && (sp[i] & 255) != 47) { i = i + 1; }
+            if (!first) { dst[w] = 47; w = w + 1; }
+            first = false;
+            if (ServerMetrics.RangeIsDigitsSpan(sp, st, i)) {
+                dst[w] = 58; dst[w + 1] = 105; dst[w + 2] = 100;
+                w = w + 3;
+            } else if (i > st) {
+                NativeMemory.Copy(bp + (nint)w, pp + (nint)st, i - st);
+                w = w + (i - st);
+            }
+            if (i >= q) { break; }
+            i = i + 1;
+        }
+        return NativeMemory.GetString(bp, 0, w);
     }
 
     void RecordQuery(string sql, long us) {
@@ -735,74 +764,98 @@ public class ServerMetrics {
 
     public static string NormalizeSql(string sql) {
         if (sql == null) { return ""; }
-        StringBuilder sb = new StringBuilder();
         int n = sql.Length;
+        if (n == 0) { return ""; }
+        nint spPtr = (nint)sql;
+        Span<byte> src = new Span<byte>(spPtr, n);
+        byte[] buf = new byte[n];
+        nint bp = (nint)buf;
+        Span<byte> dst = new Span<byte>(bp, n);
+        int w = 0;
         int i = 0;
         int holes = 0;
         bool lastSpace = false;
         while (i < n) {
-            int c = sql[i];
-            if (c == '\'') {
+            int c = src[i] & 255;
+            if (c == 39) {
                 i = i + 1;
                 while (i < n) {
-                    if (sql[i] == '\'') {
-                        if (i + 1 < n && sql[i + 1] == '\'') {
+                    if ((src[i] & 255) == 39) {
+                        if (i + 1 < n && (src[i + 1] & 255) == 39) {
                             i = i + 2; continue;
                         }
                         i = i + 1; break;
                     }
                     i = i + 1;
                 }
-                sb.Append("?"); holes = holes + 1; lastSpace = false; continue;
+                dst[w] = 63; w = w + 1;
+                holes = holes + 1; lastSpace = false; continue;
             }
             if (c >= 48 && c <= 57) {
                 while (i < n) {
-                    int d = sql[i];
-                    if ((d >= 48 && d <= 57) || d == '.' || d == 'e'
-                        || d == 'E' || d == 'x' || d == 'X') { i = i + 1; }
+                    int d = src[i] & 255;
+                    if ((d >= 48 && d <= 57) || d == 46 || d == 101
+                        || d == 69 || d == 120 || d == 88) { i = i + 1; }
                     else { break; }
                 }
-                sb.Append("?"); holes = holes + 1; lastSpace = false; continue;
+                dst[w] = 63; w = w + 1;
+                holes = holes + 1; lastSpace = false; continue;
             }
-            if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
-                if (!lastSpace) { sb.Append(" "); lastSpace = true; }
+            if (c == 32 || c == 9 || c == 10 || c == 13) {
+                if (!lastSpace) { dst[w] = 32; w = w + 1; lastSpace = true; }
                 i = i + 1; continue;
             }
-            if (c == '?') {
-                sb.Append("?"); holes = holes + 1; lastSpace = false;
+            if (c == 63) {
+                dst[w] = 63; w = w + 1;
+                holes = holes + 1; lastSpace = false;
                 i = i + 1; continue;
             }
-            // cost of recording a query.
             int st = i;
+            i = i + 1;
             while (i < n) {
-                int d = sql[i];
-                if (d == '\'' || d == '?' || (d >= 48 && d <= 57) || d == ' '
-                    || d == '\t' || d == '\n' || d == '\r') { break; }
+                int d = src[i] & 255;
+                if (d == 39 || d == 63 || (d >= 48 && d <= 57) || d == 32
+                    || d == 9 || d == 10 || d == 13) { break; }
                 i = i + 1;
             }
-            sb.Append(sql.Substring(st, i - st)); lastSpace = false;
+            int seg = i - st;
+            NativeMemory.Copy(bp + (nint)w, spPtr + (nint)st, seg);
+            w = w + seg;
+            lastSpace = false;
         }
-        string flat = sb.ToString();
-        if (holes < 2) { return flat.Trim(); }
-        return ServerMetrics.CollapsePlaceholders(flat).Trim();
+        if (holes >= 2) {
+            w = ServerMetrics.CollapsePlaceholdersInPlace(dst, w);
+        }
+        int start = 0;
+        int end = w;
+        while (start < end) {
+            int c = dst[start] & 255;
+            if (c != 32 && c != 9 && c != 10 && c != 13) { break; }
+            start = start + 1;
+        }
+        while (end > start) {
+            int c = dst[end - 1] & 255;
+            if (c != 32 && c != 9 && c != 10 && c != 13) { break; }
+            end = end - 1;
+        }
+        return start < end ? NativeMemory.GetString(bp, start, end - start) : "";
     }
 
-    private static string CollapsePlaceholders(string s) {
-        StringBuilder sb = new StringBuilder();
-        int n = s.Length;
+    private static int CollapsePlaceholdersInPlace(Span<byte> dst, int len) {
+        int outPos = 0;
         int i = 0;
-        while (i < n) {
-            if (s[i] == '?') {
+        while (i < len) {
+            if ((dst[i] & 255) == 63) {
                 int j = i;
                 int cnt = 0;
                 bool more = true;
                 while (more) {
-                    if (j < n && s[j] == '?') {
+                    if (j < len && (dst[j] & 255) == 63) {
                         cnt = cnt + 1; j = j + 1;
-                        while (j < n && s[j] == ' ') { j = j + 1; }
-                        if (j < n && s[j] == ',') {
+                        while (j < len && (dst[j] & 255) == 32) { j = j + 1; }
+                        if (j < len && (dst[j] & 255) == 44) {
                             j = j + 1;
-                            while (j < n && s[j] == ' ') { j = j + 1; }
+                            while (j < len && (dst[j] & 255) == 32) { j = j + 1; }
                         } else {
                             more = false;
                         }
@@ -810,15 +863,25 @@ public class ServerMetrics {
                         more = false;
                     }
                 }
-                sb.Append("?");
+                dst[outPos] = 63;
+                outPos = outPos + 1;
                 if (cnt >= 2) { i = j; } else { i = i + 1; }
                 continue;
             }
             int st = i;
-            while (i < n && s[i] != '?') { i = i + 1; }
-            sb.Append(s.Substring(st, i - st));
+            i = i + 1;
+            while (i < len && (dst[i] & 255) != 63) { i = i + 1; }
+            int seg = i - st;
+            if (outPos != st) {
+                for (int k = st; k < i; k = k + 1) {
+                    dst[outPos] = dst[k];
+                    outPos = outPos + 1;
+                }
+            } else {
+                outPos = outPos + seg;
+            }
         }
-        return sb.ToString();
+        return outPos;
     }
 
     public JsonValue TopSqlJson(int limit) {

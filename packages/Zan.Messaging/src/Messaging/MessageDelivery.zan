@@ -15,45 +15,42 @@ public class MessageDelivery {
     private List<MessageChannelBase> channels;
     // 消息。
     private MessageHolder holder;
-    // 各通道投出去的数量。
-    private List<int> counts;
+    // 累计投出去的数量。
+    private int deliveredCount;
 
     public MessageDelivery(MessageBus bus, List<MessageChannelBase> channels, MessageHolder holder) {
         this.bus = bus;
         this.channels = channels;
         this.holder = holder;
-        this.counts = new List<int>();
+        this.deliveredCount = 0;
     }
 
     // 投递（返回被调用的订阅者数量）。
     public int Run() {
         int channelCount = this.channels.Count;
+        object msg = this.holder.Value;
         for (int i = 0; i < channelCount && i < this.channels.Count; i = i + 1) {
             MessageChannelBase channel = this.channels[i];
-            if (channel == null || !channel.Accepts(this.holder.Value)) { continue; }
+            if (channel == null) { continue; }
             if (this.bus.HasErrorHandler()) {
                 // 登记了错误处理器：按订阅者粒度隔离异常，不影响同通道后续订阅者与成功计数。
                 MessageBus b = this.bus;
-                object msg = this.holder.Value;
-                int okCount = channel.Dispatch(msg, (Exception ex) => {
+                int okCount = channel.TryDispatch(msg, (Exception ex) => {
                     b.ReportError(ex, msg);
                 });
-                this.counts.Add(okCount);
+                if (okCount >= 0) { this.deliveredCount = this.deliveredCount + okCount; }
             } else {
                 // 没登记：订阅者的异常原样抛出（总线里的异常多半是处理逻辑的
                 // bug，吞掉会让问题变成"消息莫名其妙没到"）。
-                this.counts.Add(channel.Dispatch(this.holder.Value));
+                int okCount = channel.TryDispatch(msg);
+                if (okCount >= 0) { this.deliveredCount = this.deliveredCount + okCount; }
             }
         }
-        return this.Delivered();
+        return this.deliveredCount;
     }
 
     // 被调用的订阅者数量。
     public int Delivered() {
-        int called = 0;
-        for (int i = 0; i < this.counts.Count; i = i + 1) {
-            called = called + this.counts[i];
-        }
-        return called;
+        return this.deliveredCount;
     }
 }

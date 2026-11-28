@@ -86,12 +86,34 @@ public class MessageBus {
 
     private int CountHandlers(object message) {
         int handlers = 0;
-        for (int i = 0; i < this.channels.Count; i = i + 1) {
+        int n = this.channels.Count;
+        for (int i = 0; i < n; i = i + 1) {
             MessageChannelBase channel = this.channels[i];
-            if (channel == null || !channel.Accepts(message)) { continue; }
-            handlers = handlers + channel.SubscriberCount();
+            if (channel == null) { continue; }
+            int c = channel.CountIfAccepts(message);
+            if (c > 0) { handlers = handlers + c; }
         }
         return handlers;
+    }
+
+    private int DeliverDirect(object message) {
+        int called = 0;
+        int channelCount = this.channels.Count;
+        for (int i = 0; i < channelCount && i < this.channels.Count; i = i + 1) {
+            MessageChannelBase channel = this.channels[i];
+            if (channel == null) { continue; }
+            if (this.errorHandler != null) {
+                MessageBus b = this;
+                int okCount = channel.TryDispatch(message, (Exception ex) => {
+                    b.ReportError(ex, message);
+                });
+                if (okCount >= 0) { called = called + okCount; }
+            } else {
+                int okCount = channel.TryDispatch(message);
+                if (okCount >= 0) { called = called + okCount; }
+            }
+        }
+        return called;
     }
 
     // 命令：恰好一个订阅者，零个或多个都报错。
@@ -109,6 +131,11 @@ public class MessageBus {
             throw new MessageException(MessageError.TooManyHandlers, command,
                 "MessageBus.Send: expected exactly one handler, got " + handlers.ToString());
         }
+        if (this.middleware.Count == 0) {
+            int called = this.DeliverDirect(command);
+            this.delivered = this.delivered + called;
+            return;
+        }
         MessageBus self = this;
         MessageHolder holder = new MessageHolder(command);
         MessageDelivery delivery = new MessageDelivery(this, this.channels, holder);
@@ -124,14 +151,20 @@ public class MessageBus {
             }
             delivery.Run();
         };
-        this.RunPipeline(command, finalAction);
+        this.RunMiddleware(0, this.middleware.Count, holder, finalAction);
         this.delivered = this.delivered + delivery.Delivered();
     }
 
     private int DispatchDelivery(object message) {
-        MessageDelivery delivery = new MessageDelivery(this, this.channels, new MessageHolder(message));
+        if (this.middleware.Count == 0) {
+            int called = this.DeliverDirect(message);
+            this.delivered = this.delivered + called;
+            return called;
+        }
+        MessageHolder holder = new MessageHolder(message);
+        MessageDelivery delivery = new MessageDelivery(this, this.channels, holder);
         Action finalAction = () => { delivery.Run(); };
-        this.RunPipeline(message, finalAction);
+        this.RunMiddleware(0, this.middleware.Count, holder, finalAction);
         int called = delivery.Delivered();
         this.delivered = this.delivered + called;
         return called;
@@ -139,7 +172,12 @@ public class MessageBus {
 
     // 跑中间件链（公开给查询端点用）。
     public void RunPipeline(object message, Action finalAction) {
-        this.RunMiddleware(0, this.middleware.Count, new MessageHolder(message), finalAction);
+        int mc = this.middleware.Count;
+        if (mc == 0) {
+            if (finalAction != null) { finalAction(); }
+            return;
+        }
+        this.RunMiddleware(0, mc, new MessageHolder(message), finalAction);
     }
 
     // 报告订阅者的异常（登记了错误处理器时用）。

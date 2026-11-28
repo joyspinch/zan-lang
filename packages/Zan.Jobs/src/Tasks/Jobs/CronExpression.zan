@@ -16,11 +16,49 @@ public class CronExpression {
     private int dayMask;
     private int monthMask;
     private int dowMask;
-    public List<bool> minutes;
-    public List<bool> hours;
-    public List<bool> days;
-    public List<bool> months;
-    public List<bool> weekdays;
+    private int firstHour;
+    private int firstMin;
+    private List<bool> minutesCache;
+    private List<bool> hoursCache;
+    private List<bool> daysCache;
+    private List<bool> monthsCache;
+    private List<bool> weekdaysCache;
+
+    public List<bool> minutes {
+        get {
+            if (this.minutesCache == null) { this.minutesCache = CronExpression.MaskToList64(this.minMask, 60); }
+            return this.minutesCache;
+        }
+        set { this.minutesCache = value; }
+    }
+    public List<bool> hours {
+        get {
+            if (this.hoursCache == null) { this.hoursCache = CronExpression.MaskToList32(this.hourMask, 24); }
+            return this.hoursCache;
+        }
+        set { this.hoursCache = value; }
+    }
+    public List<bool> days {
+        get {
+            if (this.daysCache == null) { this.daysCache = CronExpression.MaskToList32(this.dayMask, 32); }
+            return this.daysCache;
+        }
+        set { this.daysCache = value; }
+    }
+    public List<bool> months {
+        get {
+            if (this.monthsCache == null) { this.monthsCache = CronExpression.MaskToList32(this.monthMask, 13); }
+            return this.monthsCache;
+        }
+        set { this.monthsCache = value; }
+    }
+    public List<bool> weekdays {
+        get {
+            if (this.weekdaysCache == null) { this.weekdaysCache = CronExpression.MaskToList32(this.dowMask, 7); }
+            return this.weekdaysCache;
+        }
+        set { this.weekdaysCache = value; }
+    }
 
     public string RawExpression { get { return this.raw; } }
 
@@ -28,10 +66,19 @@ public class CronExpression {
         if (expr == null) {
             throw new ArgumentException("Cron expression cannot be empty");
         }
-        string trimmed = expr.Trim();
-        if (trimmed.Length == 0) {
+        int len = expr.Length;
+        if (len == 0) {
             throw new ArgumentException("Cron expression cannot be empty");
         }
+        Span<byte> sp = new Span<byte>((nint)expr, len);
+        int st = 0;
+        int en = len;
+        while (st < en && CronExpression.IsTrimSpace(sp[st] & 255)) { st = st + 1; }
+        while (en > st && CronExpression.IsTrimSpace(sp[en - 1] & 255)) { en = en - 1; }
+        if (st >= en) {
+            throw new ArgumentException("Cron expression cannot be empty");
+        }
+        string trimmed = (st == 0 && en == len) ? expr : expr.Substring(st, en - st);
         this.Initialize(trimmed, false);
     }
 
@@ -63,6 +110,7 @@ public class CronExpression {
         this.hostingDays = hostingDays;
 
         int n = expr.Length;
+        Span<byte> sp = new Span<byte>((nint)expr, n);
         int s0 = 0; int e0 = 0;
         int s1 = 0; int e1 = 0;
         int s2 = 0; int e2 = 0;
@@ -73,12 +121,16 @@ public class CronExpression {
         int pos = 0;
         if (hostingDays) {
             while (pos < n) {
-                while (pos < n && ((expr[pos] & 255) == 32 || (expr[pos] & 255) == 9)) {
+                while (pos < n) {
+                    int b = sp[pos] & 255;
+                    if (b != 32 && b != 9) { break; }
                     pos = pos + 1;
                 }
                 if (pos >= n) { break; }
                 int st = pos;
-                while (pos < n && (expr[pos] & 255) != 32 && (expr[pos] & 255) != 9) {
+                while (pos < n) {
+                    int b = sp[pos] & 255;
+                    if (b == 32 || b == 9) { break; }
                     pos = pos + 1;
                 }
                 if (count == 0) { s0 = st; e0 = pos; }
@@ -90,13 +142,13 @@ public class CronExpression {
             }
         } else {
             while (pos < n) {
-                while (pos < n && (expr[pos] & 255) == 32) { pos = pos + 1; }
+                while (pos < n && (sp[pos] & 255) == 32) { pos = pos + 1; }
                 if (pos >= n) { break; }
                 int st = pos;
-                while (pos < n && (expr[pos] & 255) != 32) { pos = pos + 1; }
+                while (pos < n && (sp[pos] & 255) != 32) { pos = pos + 1; }
                 int en = pos;
-                while (st < en && CronExpression.IsTrimSpace(expr[st] & 255)) { st = st + 1; }
-                while (en > st && CronExpression.IsTrimSpace(expr[en - 1] & 255)) { en = en - 1; }
+                while (st < en && CronExpression.IsTrimSpace(sp[st] & 255)) { st = st + 1; }
+                while (en > st && CronExpression.IsTrimSpace(sp[en - 1] & 255)) { en = en - 1; }
                 if (st < en) {
                     if (count == 0) { s0 = st; e0 = en; }
                     else if (count == 1) { s1 = st; e1 = en; }
@@ -110,24 +162,26 @@ public class CronExpression {
         if (count != 5) {
             throw new FormatException("Expected 5 fields in cron expression, got " + count.ToString());
         }
-        this.dayStar = (e2 - s2 == 1 && (expr[s2] & 255) == 42);
-        this.weekdayStar = (e4 - s4 == 1 && (expr[s4] & 255) == 42);
+        this.dayStar = (e2 - s2 == 1 && (sp[s2] & 255) == 42);
+        this.weekdayStar = (e4 - s4 == 1 && (sp[s4] & 255) == 42);
 
-        this.minMask = this.ParseFieldSlice(expr, s0, e0, 0, 59, false);
-        this.hourMask = (int)this.ParseFieldSlice(expr, s1, e1, 0, 23, false);
-        this.dayMask = (int)this.ParseFieldSlice(expr, s2, e2, 1, 31, false);
-        this.monthMask = (int)this.ParseFieldSlice(expr, s3, e3, 1, 12, false);
-        this.dowMask = (int)this.ParseFieldSlice(expr, s4, e4, 0, 6, true);
-
-        this.minutes = CronExpression.MaskToList64(this.minMask, 60);
-        this.hours = CronExpression.MaskToList32(this.hourMask, 24);
-        this.days = CronExpression.MaskToList32(this.dayMask, 32);
-        this.months = CronExpression.MaskToList32(this.monthMask, 13);
-        this.weekdays = CronExpression.MaskToList32(this.dowMask, 7);
+        this.minMask = this.ParseFieldSlice(expr, sp, s0, e0, 0, 59, false);
+        this.hourMask = (int)this.ParseFieldSlice(expr, sp, s1, e1, 0, 23, false);
+        this.dayMask = (int)this.ParseFieldSlice(expr, sp, s2, e2, 1, 31, false);
+        this.monthMask = (int)this.ParseFieldSlice(expr, sp, s3, e3, 1, 12, false);
+        this.dowMask = (int)this.ParseFieldSlice(expr, sp, s4, e4, 0, 6, true);
+        this.firstHour = CronExpression.NextBit32(this.hourMask, 0, 23);
+        this.firstMin = CronExpression.NextBit64(this.minMask, 0, 59);
+        this.minutesCache = null;
+        this.hoursCache = null;
+        this.daysCache = null;
+        this.monthsCache = null;
+        this.weekdaysCache = null;
     }
 
     private static List<bool> MaskToList64(long mask, int size) {
         List<bool> list = new List<bool>();
+        list.Reserve(size);
         for (int i = 0; i < size; i = i + 1) {
             list.Add(((mask >> i) & 1L) != 0L);
         }
@@ -136,17 +190,18 @@ public class CronExpression {
 
     private static List<bool> MaskToList32(int mask, int size) {
         List<bool> list = new List<bool>();
+        list.Reserve(size);
         for (int i = 0; i < size; i = i + 1) {
             list.Add(((mask >> i) & 1) != 0);
         }
         return list;
     }
 
-    private static int ReadNumberSlice(string text, int start, int end) {
+    private static int ReadNumberSlice(string text, Span<byte> sp, int start, int end) {
         if (start >= end) { throw new FormatException("Missing cron number"); }
         long acc = 0L;
         for (int i = start; i < end; i = i + 1) {
-            int c = text[i] & 255;
+            int c = sp[i] & 255;
             if (c < 48 || c > 57) {
                 throw new FormatException("Invalid cron number: " + text.Substring(start, end - start));
             }
@@ -158,21 +213,21 @@ public class CronExpression {
         return (int)acc;
     }
 
-    private long ParseFieldSlice(string expr, int fStart, int fEnd, int min, int max, bool isWeekday) {
+    private long ParseFieldSlice(string expr, Span<byte> sp, int fStart, int fEnd, int min, int max, bool isWeekday) {
         int top = this.hostingDays && isWeekday ? 7 : max;
         long mask = 0L;
         int itemIdx = 0;
         int pos = fStart;
         while (true) {
             int comma = pos;
-            while (comma < fEnd && (expr[comma] & 255) != 44) { comma = comma + 1; }
+            while (comma < fEnd && (sp[comma] & 255) != 44) { comma = comma + 1; }
             bool hasMore = comma < fEnd;
 
             int iStart = pos;
             int iEnd = comma;
             if (!this.hostingDays && iStart < iEnd) {
-                while (iStart < iEnd && CronExpression.IsTrimSpace(expr[iStart] & 255)) { iStart = iStart + 1; }
-                while (iEnd > iStart && CronExpression.IsTrimSpace(expr[iEnd - 1] & 255)) { iEnd = iEnd - 1; }
+                while (iStart < iEnd && CronExpression.IsTrimSpace(sp[iStart] & 255)) { iStart = iStart + 1; }
+                while (iEnd > iStart && CronExpression.IsTrimSpace(sp[iEnd - 1] & 255)) { iEnd = iEnd - 1; }
             }
 
             if (iStart >= iEnd) {
@@ -183,28 +238,28 @@ public class CronExpression {
                 int step = 1;
                 int slash = -1;
                 for (int k = iStart; k < iEnd; k = k + 1) {
-                    if ((expr[k] & 255) == 47) { slash = k; break; }
+                    if ((sp[k] & 255) == 47) { slash = k; break; }
                 }
                 int rStart = iStart;
                 int rEnd = slash >= 0 ? slash : iEnd;
                 if (slash >= 0) {
-                    step = CronExpression.ReadNumberSlice(expr, slash + 1, iEnd);
+                    step = CronExpression.ReadNumberSlice(expr, sp, slash + 1, iEnd);
                     if (step <= 0) {
                         throw new FormatException("Invalid step in cron: " + expr.Substring(iStart, iEnd - iStart));
                     }
                 }
                 int start = min;
                 int end = top;
-                if (!(rEnd - rStart == 1 && (expr[rStart] & 255) == 42)) {
+                if (!(rEnd - rStart == 1 && (sp[rStart] & 255) == 42)) {
                     int dash = -1;
                     for (int k = rStart; k < rEnd; k = k + 1) {
-                        if ((expr[k] & 255) == 45) { dash = k; break; }
+                        if ((sp[k] & 255) == 45) { dash = k; break; }
                     }
                     if (dash >= 0) {
-                        start = CronExpression.ReadNumberSlice(expr, rStart, dash);
-                        end = CronExpression.ReadNumberSlice(expr, dash + 1, rEnd);
+                        start = CronExpression.ReadNumberSlice(expr, sp, rStart, dash);
+                        end = CronExpression.ReadNumberSlice(expr, sp, dash + 1, rEnd);
                     } else {
-                        start = CronExpression.ReadNumberSlice(expr, rStart, rEnd);
+                        start = CronExpression.ReadNumberSlice(expr, sp, rStart, rEnd);
                         end = slash >= 0 ? top : start;
                     }
                 }
@@ -263,27 +318,32 @@ public class CronExpression {
     }
 
     private static int NextBit32(int mask, int fromBit, int maxBit) {
+        if (fromBit > maxBit) { return -1; }
         int shifted = mask >> fromBit;
         if (shifted == 0) { return -1; }
-        int b = fromBit;
-        while (b <= maxBit) {
-            if ((shifted & 1) != 0) { return b; }
-            shifted = shifted >> 1;
-            b = b + 1;
-        }
-        return -1;
+        int tz = 0;
+        if ((shifted & 0xFFFF) == 0) { tz = tz + 16; shifted = shifted >> 16; }
+        if ((shifted & 0xFF) == 0) { tz = tz + 8; shifted = shifted >> 8; }
+        if ((shifted & 0xF) == 0) { tz = tz + 4; shifted = shifted >> 4; }
+        if ((shifted & 0x3) == 0) { tz = tz + 2; shifted = shifted >> 2; }
+        if ((shifted & 0x1) == 0) { tz = tz + 1; }
+        int b = fromBit + tz;
+        return b <= maxBit ? b : -1;
     }
 
     private static int NextBit64(long mask, int fromBit, int maxBit) {
+        if (fromBit > maxBit) { return -1; }
         long shifted = mask >> fromBit;
         if (shifted == 0L) { return -1; }
-        int b = fromBit;
-        while (b <= maxBit) {
-            if ((shifted & 1L) != 0L) { return b; }
-            shifted = shifted >> 1;
-            b = b + 1;
-        }
-        return -1;
+        int tz = 0;
+        if ((shifted & 0xFFFFFFFFL) == 0L) { tz = tz + 32; shifted = shifted >> 32; }
+        if ((shifted & 0xFFFFL) == 0L) { tz = tz + 16; shifted = shifted >> 16; }
+        if ((shifted & 0xFFL) == 0L) { tz = tz + 8; shifted = shifted >> 8; }
+        if ((shifted & 0xFL) == 0L) { tz = tz + 4; shifted = shifted >> 4; }
+        if ((shifted & 0x3L) == 0L) { tz = tz + 2; shifted = shifted >> 2; }
+        if ((shifted & 0x1L) == 0L) { tz = tz + 1; }
+        int b = fromBit + tz;
+        return b <= maxBit ? b : -1;
     }
 
     public bool IsMatching(DateTime dt) {
@@ -312,17 +372,37 @@ public class CronExpression {
             return null;
         }
         long startMs = CronExpression.FloorToUnit(fromTime.epochMs, 60000L) + 60000L;
-        DateTime cur = DateTime.FromUnixMilliseconds(startMs);
-        int y = cur.year;
-        int mo = cur.month;
-        int d = cur.day;
-        int h = cur.hour;
-        int m = cur.minute;
-        int dow = cur.dayOfWeek;
+        int y;
+        int mo;
+        int d;
+        int h;
+        int m;
+        int dow;
+        if (fromTime.hour < 23 || fromTime.minute < 59) {
+            y = fromTime.year;
+            mo = fromTime.month;
+            d = fromTime.day;
+            dow = fromTime.dayOfWeek;
+            if (fromTime.minute < 59) {
+                h = fromTime.hour;
+                m = fromTime.minute + 1;
+            } else {
+                h = fromTime.hour + 1;
+                m = 0;
+            }
+        } else {
+            DateTime cur = DateTime.FromUnixMilliseconds(startMs);
+            y = cur.year;
+            mo = cur.month;
+            d = cur.day;
+            h = cur.hour;
+            m = cur.minute;
+            dow = cur.dayOfWeek;
+        }
         long dayStartMs = CronExpression.FloorToUnit(startMs, 86400000L);
 
-        int firstHour = CronExpression.NextBit32(this.hourMask, 0, 23);
-        int firstMin = CronExpression.NextBit64(this.minMask, 0, 59);
+        int firstHour = this.firstHour;
+        int firstMin = this.firstMin;
 
         while (y <= 9999) {
             if (((this.monthMask >> mo) & 1) == 0) {
@@ -402,17 +482,28 @@ public class CronExpression {
         if (this.minMask == 0L || this.hourMask == 0 || this.monthMask == 0) {
             return null;
         }
-        DateTime cur = fromTime.AddMilliseconds(0 - fromTime.Millisecond()).AddSeconds(60);
-        int y = cur.year;
-        int mo = cur.month;
-        int d = cur.day;
-        int dow = cur.dayOfWeek;
         long fromMs = fromTime.epochMs;
         long minCandidateMs = CronExpression.FloorToUnit(fromMs, 60000L) + 60000L;
-        long dayStartMs = DateTime.FromParts(y, mo, d, 0, 0, 0).epochMs;
+        int y;
+        int mo;
+        int d;
+        int dow;
+        long dayStartMs = CronExpression.FloorToUnit(minCandidateMs, 86400000L);
+        if (fromTime.hour < 23 || fromTime.minute < 59) {
+            y = fromTime.year;
+            mo = fromTime.month;
+            d = fromTime.day;
+            dow = fromTime.dayOfWeek;
+        } else {
+            DateTime cur = DateTime.FromUnixMilliseconds(minCandidateMs);
+            y = cur.year;
+            mo = cur.month;
+            d = cur.day;
+            dow = cur.dayOfWeek;
+        }
 
-        int firstHour = CronExpression.NextBit32(this.hourMask, 0, 23);
-        int firstMin = CronExpression.NextBit64(this.minMask, 0, 59);
+        int firstHour = this.firstHour;
+        int firstMin = this.firstMin;
 
         for (int day = 0; day < 366; day = day + 1) {
             if (((this.monthMask >> mo) & 1) != 0 && this.DayMatchesBits(d, dow)) {

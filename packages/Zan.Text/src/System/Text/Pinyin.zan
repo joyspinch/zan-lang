@@ -6,36 +6,48 @@ namespace System.Text;
 // string ab = Pinyin.Initials("中文");     // "ZW"
 // string py = Pinyin.ToPinyin("Zan 语言"); // "Zan  yuyan"
 // "汉字拼音" line per GB2312 hanzi), not in compiled code — like the Gui
+internal class PinyinTables {
+    public string[] bmpTable;
+    public byte[] bmpInitial;
+    public byte[] bmpBlob;
+    public int[] bmpOffLen;
+    public Dictionary<string, string> extraCache;
+}
+
 public class Pinyin {
     public static Dictionary<string, string> cache;
-    private static string[] bmpTable;
-    private static byte[] bmpInitial;
-    private static Dictionary<string, string> extraCache;
-    private static string[] upperLetters;
+    private static PinyinTables s_tables;
     private static string initLock = "Zan.Pinyin.Init";
 
-    private static void EnsureBmp() {
-        if (bmpTable != null) { return; }
+    private static PinyinTables EnsureTables() {
+        PinyinTables cached = Pinyin.s_tables;
+        if (cached != null) { return cached; }
         lock (Pinyin.initLock) {
-            if (bmpTable != null) { return; }
+            if (Pinyin.s_tables != null) { return Pinyin.s_tables; }
             string[] tbl = new string[20992];
             byte[] ini = new byte[20992];
+            int[] offLen = new int[20992];
+            byte[] blob = new byte[4096];
+            nint blobPtr = (nint)blob;
+            int blobLen = 0;
+            Dictionary<string, int> blobOffs = new Dictionary<string, int>();
             Dictionary<string, string> extra = null;
             Dictionary<string, string> intern = new Dictionary<string, string>();
             string data = Pinyin.LoadData();
             int dataLen = data.Length;
             nint dPtr = dataLen > 0 ? (nint)data : 0;
+            Span<byte> dsp = new Span<byte>(dPtr, dataLen);
             int pos = 0;
             while (pos < dataLen) {
                 int nl = NativeMemory.Find(dPtr, pos, 10, dataLen - pos);
                 int lineEnd = nl >= 0 ? nl : dataLen;
                 int contentEnd = lineEnd;
                 // CRLF 检出的工作区里 data 文件每行尾带 \r，剥除尾 \r
-                if (contentEnd > pos && (data[contentEnd - 1] & 255) == 13) {
+                if (contentEnd > pos && (dsp[contentEnd - 1] & 255) == 13) {
                     contentEnd = contentEnd - 1;
                 }
                 if (contentEnd - pos >= 4) {
-                    int c0 = data[pos] & 255;
+                    int c0 = dsp[pos] & 255;
                     int pyLen = contentEnd - pos - 3;
                     string rawPy = data.Substring(pos + 3, pyLen);
                     string py = "";
@@ -44,12 +56,25 @@ public class Pinyin {
                         py = rawPy;
                     }
                     if ((c0 & 0xF0) == 0xE0) {
-                        int cp = ((c0 & 0x0F) << 12) | ((data[pos + 1] & 0x3F) << 6) | (data[pos + 2] & 0x3F);
+                        int cp = ((c0 & 0x0F) << 12) | ((dsp[pos + 1] & 0x3F) << 6) | (dsp[pos + 2] & 0x3F);
                         if (cp >= 0x4E00 && cp <= 0x9FFF) {
                             int idx = cp - 0x4E00;
                             tbl[idx] = py;
                             int ch0 = py[0] & 255;
                             ini[idx] = (ch0 >= 97 && ch0 <= 122) ? (byte)(ch0 - 96) : (byte)255;
+                            if (pyLen > 0 && pyLen <= 15) {
+                                int bo = 0;
+                                if (!blobOffs.TryGetValue(py, out bo)) {
+                                    if (blobLen + pyLen > blob.Length) {
+                                        blob = Pinyin.GrowBuf(blob, blobLen, blobLen + pyLen, out blobPtr);
+                                    }
+                                    bo = blobLen;
+                                    NativeMemory.Copy(blobPtr + (nint)bo, (nint)py, pyLen);
+                                    blobLen = blobLen + pyLen;
+                                    blobOffs[py] = bo;
+                                }
+                                offLen[idx] = (bo << 4) | pyLen;
+                            }
                         } else {
                             if (extra == null) { extra = new Dictionary<string, string>(); }
                             extra[data.Substring(pos, 3)] = py;
@@ -61,54 +86,147 @@ public class Pinyin {
                 }
                 pos = nl >= 0 ? nl + 1 : dataLen;
             }
-            upperLetters = new string[] {
-                "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M",
-                "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z"
-            };
-            extraCache = extra;
-            bmpInitial = ini;
-            bmpTable = tbl;
+            byte[] finalBlob = new byte[blobLen > 0 ? blobLen : 1];
+            if (blobLen > 0) { NativeMemory.Copy((nint)finalBlob, blobPtr, blobLen); }
+            PinyinTables built = new PinyinTables();
+            built.bmpTable = tbl;
+            built.bmpInitial = ini;
+            built.bmpBlob = finalBlob;
+            built.bmpOffLen = offLen;
+            built.extraCache = extra;
+            Pinyin.s_tables = built;
+            return built;
         }
+    }
+
+    private static byte[] GrowBuf(byte[] buf, int used, int need, out nint bp) {
+        int cap = buf.Length * 2;
+        if (cap < 64) { cap = 64; }
+        while (cap < need) { cap = cap * 2; }
+        byte[] grown = new byte[cap];
+        nint gp = (nint)grown;
+        if (used > 0) { NativeMemory.Copy(gp, (nint)buf, used); }
+        bp = gp;
+        return grown;
     }
 
     public static string ToPinyin(string text) {
         if (text == null || text.Length == 0) { return ""; }
-        string[] tbl = null;
-        Dictionary<string, string> extra = null;
-        lock (Pinyin.initLock) {
-            Pinyin.EnsureBmp();
-            tbl = bmpTable;
-            extra = extraCache;
-        }
-        StringBuilder sb = null;
-        nint tPtr = (nint)text;
-        int i = 0;
+        PinyinTables tables = Pinyin.s_tables;
+        if (tables == null) { tables = Pinyin.EnsureTables(); }
+        byte[] blob = tables.bmpBlob;
+        int[] offLen = tables.bmpOffLen;
+        string[] tbl = tables.bmpTable;
+        Dictionary<string, string> extra = tables.extraCache;
+
         int len = text.Length;
+        nint tPtr = (nint)text;
+        Span<byte> tsp = new Span<byte>(tPtr, len);
+        Span<byte> blobSp = new Span<byte>((nint)blob, blob.Length);
+        Span<int> offSp = new Span<int>((nint)offLen, offLen.Length);
+        byte[] outBuf = null;
+        nint outPtr = (nint)0;
+        Span<byte> outSp = new Span<byte>((nint)0, 0);
+        int outCap = 0;
+        int di = 0;
+        int i = 0;
         int nonHanStart = 0;
         while (i < len) {
-            int c0 = text[i] & 255;
+            int c0 = tsp[i] & 255;
             if ((c0 & 0x80) == 0) {
                 i = i + 1;
                 continue;
             }
             if ((c0 & 0xF0) == 0xE0 && i + 3 <= len) {
-                int cp = ((c0 & 0x0F) << 12) | ((text[i + 1] & 0x3F) << 6) | (text[i + 2] & 0x3F);
-                string py = null;
+                int cp = ((c0 & 0x0F) << 12) | ((tsp[i + 1] & 0x3F) << 6) | (tsp[i + 2] & 0x3F);
                 if (cp >= 0x4E00 && cp <= 0x9FFF) {
-                    py = tbl[cp - 0x4E00];
-                } else if (extra != null) {
-                    string ev = "";
-                    if (extra.TryGetValue(text.Substring(i, 3), out ev)) { py = ev; }
-                }
-                if (py != null && py.Length > 0) {
-                    if (sb == null) { sb = new StringBuilder(); }
-                    if (i > nonHanStart) {
-                        sb.Append(new StringView(tPtr + (nint)nonHanStart, i - nonHanStart));
+                    int entry = offSp[cp - 0x4E00];
+                    if (entry != 0) {
+                        int pyLen = entry & 15;
+                        int pyOff = entry >> 4;
+                        int segLen = i - nonHanStart;
+                        if (outBuf == null) {
+                            outCap = len * 2 + 16;
+                            if (outCap < segLen + pyLen) { outCap = segLen + pyLen + 16; }
+                            outBuf = new byte[outCap];
+                            outPtr = (nint)outBuf;
+                            outSp = new Span<byte>(outPtr, outCap);
+                        } else if (di + segLen + pyLen > outCap) {
+                            outBuf = Pinyin.GrowBuf(outBuf, di, di + segLen + pyLen, out outPtr);
+                            outCap = outBuf.Length;
+                            outSp = new Span<byte>(outPtr, outCap);
+                        }
+                        if (segLen > 0) {
+                            if (segLen <= 8) {
+                                for (int k = 0; k < segLen; k = k + 1) {
+                                    outSp[di + k] = tsp[nonHanStart + k];
+                                }
+                            } else {
+                                NativeMemory.Copy(outPtr + (nint)di, tPtr + (nint)nonHanStart, segLen);
+                            }
+                            di = di + segLen;
+                        }
+                        for (int k = 0; k < pyLen; k = k + 1) {
+                            outSp[di + k] = blobSp[pyOff + k];
+                        }
+                        di = di + pyLen;
+                        i = i + 3;
+                        nonHanStart = i;
+                        continue;
                     }
-                    sb.Append(py);
+                    string py = tbl[cp - 0x4E00];
+                    if (py != null && py.Length > 0) {
+                        int segLen = i - nonHanStart;
+                        int pyLen = py.Length;
+                        if (outBuf == null) {
+                            outCap = len * 2 + 16;
+                            if (outCap < segLen + pyLen) { outCap = segLen + pyLen + 16; }
+                            outBuf = new byte[outCap];
+                            outPtr = (nint)outBuf;
+                            outSp = new Span<byte>(outPtr, outCap);
+                        } else if (di + segLen + pyLen > outCap) {
+                            outBuf = Pinyin.GrowBuf(outBuf, di, di + segLen + pyLen, out outPtr);
+                            outCap = outBuf.Length;
+                            outSp = new Span<byte>(outPtr, outCap);
+                        }
+                        if (segLen > 0) {
+                            NativeMemory.Copy(outPtr + (nint)di, tPtr + (nint)nonHanStart, segLen);
+                            di = di + segLen;
+                        }
+                        NativeMemory.Copy(outPtr + (nint)di, (nint)py, pyLen);
+                        di = di + pyLen;
+                        i = i + 3;
+                        nonHanStart = i;
+                        continue;
+                    }
                     i = i + 3;
-                    nonHanStart = i;
                     continue;
+                } else if (extra != null) {
+                    string py = "";
+                    if (extra.TryGetValue(text.Substring(i, 3), out py) && py.Length > 0) {
+                        int segLen = i - nonHanStart;
+                        int pyLen = py.Length;
+                        if (outBuf == null) {
+                            outCap = len * 2 + 16;
+                            if (outCap < segLen + pyLen) { outCap = segLen + pyLen + 16; }
+                            outBuf = new byte[outCap];
+                            outPtr = (nint)outBuf;
+                            outSp = new Span<byte>(outPtr, outCap);
+                        } else if (di + segLen + pyLen > outCap) {
+                            outBuf = Pinyin.GrowBuf(outBuf, di, di + segLen + pyLen, out outPtr);
+                            outCap = outBuf.Length;
+                            outSp = new Span<byte>(outPtr, outCap);
+                        }
+                        if (segLen > 0) {
+                            NativeMemory.Copy(outPtr + (nint)di, tPtr + (nint)nonHanStart, segLen);
+                            di = di + segLen;
+                        }
+                        NativeMemory.Copy(outPtr + (nint)di, (nint)py, pyLen);
+                        di = di + pyLen;
+                        i = i + 3;
+                        nonHanStart = i;
+                        continue;
+                    }
                 }
                 i = i + 3;
                 continue;
@@ -117,53 +235,71 @@ public class Pinyin {
             if (step > len - i) { step = len - i; }
             i = i + step;
         }
-        if (sb == null) { return text; }
-        if (len > nonHanStart) {
-            sb.Append(new StringView(tPtr + (nint)nonHanStart, len - nonHanStart));
+        if (outBuf == null) { return text; }
+        int tail = len - nonHanStart;
+        if (tail > 0) {
+            if (di + tail > outCap) {
+                outBuf = Pinyin.GrowBuf(outBuf, di, di + tail, out outPtr);
+            }
+            NativeMemory.Copy(outPtr + (nint)di, tPtr + (nint)nonHanStart, tail);
+            di = di + tail;
         }
-        return sb.ToString();
+        return NativeMemory.GetString(outPtr, 0, di);
     }
 
     // characters pass through. "中文" -> "ZW", "hello 世界" -> "hello SJ".
     public static string Initials(string text) {
         if (text == null || text.Length == 0) { return ""; }
-        byte[] ini = null;
-        string[] tbl = null;
-        string[] letters = null;
-        Dictionary<string, string> extra = null;
-        lock (Pinyin.initLock) {
-            Pinyin.EnsureBmp();
-            ini = bmpInitial;
-            tbl = bmpTable;
-            letters = upperLetters;
-            extra = extraCache;
-        }
-        StringBuilder sb = null;
-        nint tPtr = (nint)text;
-        int i = 0;
+        PinyinTables tables = Pinyin.s_tables;
+        if (tables == null) { tables = Pinyin.EnsureTables(); }
+        byte[] ini = tables.bmpInitial;
+        string[] tbl = tables.bmpTable;
+        Dictionary<string, string> extra = tables.extraCache;
+
         int len = text.Length;
+        nint tPtr = (nint)text;
+        Span<byte> tsp = new Span<byte>(tPtr, len);
+        Span<byte> iniSp = new Span<byte>((nint)ini, ini.Length);
+        byte[] outBuf = null;
+        nint outPtr = (nint)0;
+        Span<byte> outSp = new Span<byte>((nint)0, 0);
+        int di = 0;
+        int i = 0;
         int nonHanStart = 0;
         while (i < len) {
-            int c0 = text[i] & 255;
+            int c0 = tsp[i] & 255;
             if ((c0 & 0x80) == 0) {
                 i = i + 1;
                 continue;
             }
             if ((c0 & 0xF0) == 0xE0 && i + 3 <= len) {
-                int cp = ((c0 & 0x0F) << 12) | ((text[i + 1] & 0x3F) << 6) | (text[i + 2] & 0x3F);
+                int cp = ((c0 & 0x0F) << 12) | ((tsp[i + 1] & 0x3F) << 6) | (tsp[i + 2] & 0x3F);
                 if (cp >= 0x4E00 && cp <= 0x9FFF) {
                     int idx = cp - 0x4E00;
-                    int code = ini[idx] & 255;
+                    int code = iniSp[idx] & 255;
                     if (code != 0) {
-                        if (sb == null) { sb = new StringBuilder(); }
-                        if (i > nonHanStart) {
-                            sb.Append(new StringView(tPtr + (nint)nonHanStart, i - nonHanStart));
+                        if (outBuf == null) {
+                            outBuf = new byte[len];
+                            outPtr = (nint)outBuf;
+                            outSp = new Span<byte>(outPtr, len);
+                        }
+                        int segLen = i - nonHanStart;
+                        if (segLen > 0) {
+                            if (segLen <= 8) {
+                                for (int k = 0; k < segLen; k = k + 1) {
+                                    outSp[di + k] = tsp[nonHanStart + k];
+                                }
+                            } else {
+                                NativeMemory.Copy(outPtr + (nint)di, tPtr + (nint)nonHanStart, segLen);
+                            }
+                            di = di + segLen;
                         }
                         if (code <= 26) {
-                            sb.Append(letters[code - 1]);
+                            outSp[di] = (byte)(64 + code);
                         } else {
-                            sb.Append(tbl[idx].Substring(0, 1));
+                            outSp[di] = (byte)(tbl[idx][0] & 255);
                         }
+                        di = di + 1;
                         i = i + 3;
                         nonHanStart = i;
                         continue;
@@ -171,16 +307,19 @@ public class Pinyin {
                 } else if (extra != null) {
                     string py = "";
                     if (extra.TryGetValue(text.Substring(i, 3), out py) && py.Length > 0) {
-                        if (sb == null) { sb = new StringBuilder(); }
-                        if (i > nonHanStart) {
-                            sb.Append(new StringView(tPtr + (nint)nonHanStart, i - nonHanStart));
+                        if (outBuf == null) {
+                            outBuf = new byte[len];
+                            outPtr = (nint)outBuf;
+                            outSp = new Span<byte>(outPtr, len);
+                        }
+                        int segLen = i - nonHanStart;
+                        if (segLen > 0) {
+                            NativeMemory.Copy(outPtr + (nint)di, tPtr + (nint)nonHanStart, segLen);
+                            di = di + segLen;
                         }
                         int ch0 = py[0] & 255;
-                        if (ch0 >= 97 && ch0 <= 122) {
-                            sb.Append(letters[ch0 - 97]);
-                        } else {
-                            sb.Append(py.Substring(0, 1));
-                        }
+                        outSp[di] = (byte)((ch0 >= 97 && ch0 <= 122) ? (ch0 - 32) : ch0);
+                        di = di + 1;
                         i = i + 3;
                         nonHanStart = i;
                         continue;
@@ -193,11 +332,13 @@ public class Pinyin {
             if (step > len - i) { step = len - i; }
             i = i + step;
         }
-        if (sb == null) { return text; }
-        if (len > nonHanStart) {
-            sb.Append(new StringView(tPtr + (nint)nonHanStart, len - nonHanStart));
+        if (outBuf == null) { return text; }
+        int tail = len - nonHanStart;
+        if (tail > 0) {
+            NativeMemory.Copy(outPtr + (nint)di, tPtr + (nint)nonHanStart, tail);
+            di = di + tail;
         }
-        return sb.ToString();
+        return NativeMemory.GetString(outPtr, 0, di);
     }
 
     public static string ToPinyinChar(string ch) {
@@ -237,23 +378,20 @@ public class Pinyin {
 
     public static string Lookup(string han) {
         if (han == null || han.Length == 0) { return ""; }
-        string[] tbl = null;
-        Dictionary<string, string> extra = null;
-        lock (Pinyin.initLock) {
-            Pinyin.EnsureBmp();
-            tbl = bmpTable;
-            extra = extraCache;
-        }
+        PinyinTables tables = Pinyin.s_tables;
+        if (tables == null) { tables = Pinyin.EnsureTables(); }
         if (han.Length == 3) {
-            int c0 = han[0] & 255;
+            Span<byte> sp = new Span<byte>((nint)han, 3);
+            int c0 = sp[0] & 255;
             if ((c0 & 0xF0) == 0xE0) {
-                int cp = ((c0 & 0x0F) << 12) | ((han[1] & 0x3F) << 6) | (han[2] & 0x3F);
+                int cp = ((c0 & 0x0F) << 12) | ((sp[1] & 0x3F) << 6) | (sp[2] & 0x3F);
                 if (cp >= 0x4E00 && cp <= 0x9FFF) {
-                    string py = tbl[cp - 0x4E00];
+                    string py = tables.bmpTable[cp - 0x4E00];
                     return py != null ? py : "";
                 }
             }
         }
+        Dictionary<string, string> extra = tables.extraCache;
         if (extra != null) {
             string v = "";
             if (extra.TryGetValue(han, out v)) { return v; }
@@ -264,13 +402,7 @@ public class Pinyin {
     // 拆卸拼音静态缓存表，便于泄漏检查与按需释放。
     public static void Teardown() {
         lock (Pinyin.initLock) {
-            bmpTable = null;
-            bmpInitial = null;
-            upperLetters = null;
-            if (extraCache != null) {
-                extraCache.Clear();
-                extraCache = null;
-            }
+            Pinyin.s_tables = null;
             if (Pinyin.cache != null) {
                 Pinyin.cache.Clear();
                 Pinyin.cache = null;

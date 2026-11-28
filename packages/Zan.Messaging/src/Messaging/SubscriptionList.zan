@@ -96,11 +96,7 @@ public class SubscriptionList<T> {
 
     // 广播：所有有效订阅者都收到（返回被调用的数量）。
     public int Publish(T message) {
-        return this.Publish(message, null);
-    }
-
-    // 广播（带单订阅者异常隔离：onError 非空时逐个捕获异常并继续投递后续订阅者）。
-    public int Publish(T message, Action<Exception> onError) {
+        if (this.activeCount == 0) { return 0; }
         int called = 0;
         int n = this.handlers.Count;
         this.publishDepth = this.publishDepth + 1;
@@ -109,16 +105,36 @@ public class SubscriptionList<T> {
                 if (i >= this.handlers.Count) { break; }
                 Action<T> h = this.handlers[i];
                 if (h == null) { continue; }
-                if (onError != null) {
-                    try {
-                        h(message);
-                        called = called + 1;
-                    } catch (Exception ex) {
-                        onError(ex);
-                    }
-                } else {
+                h(message);
+                called = called + 1;
+            }
+        } finally {
+            this.publishDepth = this.publishDepth - 1;
+            if (this.publishDepth == 0 && this.needsCompact) {
+                this.needsCompact = false;
+                this.Compact();
+            }
+        }
+        return called;
+    }
+
+    // 广播（带单订阅者异常隔离：onError 非空时逐个捕获异常并继续投递后续订阅者）。
+    public int Publish(T message, Action<Exception> onError) {
+        if (onError == null) { return this.Publish(message); }
+        if (this.activeCount == 0) { return 0; }
+        int called = 0;
+        int n = this.handlers.Count;
+        this.publishDepth = this.publishDepth + 1;
+        try {
+            for (int i = 0; i < n; i = i + 1) {
+                if (i >= this.handlers.Count) { break; }
+                Action<T> h = this.handlers[i];
+                if (h == null) { continue; }
+                try {
                     h(message);
                     called = called + 1;
+                } catch (Exception ex) {
+                    onError(ex);
                 }
             }
         } finally {

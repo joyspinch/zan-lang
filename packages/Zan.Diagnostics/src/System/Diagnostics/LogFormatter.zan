@@ -19,44 +19,171 @@ public class LogFormatter {
         return LogFormatter.Text(e);
     }
 
+    private static byte[] EnsureCap(byte[] buf, int used, int need, out nint bp) {
+        if (need <= buf.Length) {
+            bp = (nint)buf;
+            return buf;
+        }
+        int cap = buf.Length * 2;
+        if (cap < 128) { cap = 128; }
+        while (cap < need) { cap = cap * 2; }
+        byte[] grown = new byte[cap];
+        nint gp = (nint)grown;
+        if (used > 0) { NativeMemory.Copy(gp, (nint)buf, used); }
+        bp = gp;
+        return grown;
+    }
+
+    private static int WriteInt(Span<byte> dst, int pos, int v) {
+        if (v == 0) {
+            dst[pos] = 48;
+            return pos + 1;
+        }
+        long lv = (long)v;
+        if (lv < 0L) {
+            dst[pos] = 45;
+            pos = pos + 1;
+            lv = -lv;
+        }
+        int start = pos;
+        while (lv > 0L) {
+            long q = lv / 10L;
+            dst[pos] = (byte)(48 + (int)(lv - q * 10L));
+            pos = pos + 1;
+            lv = q;
+        }
+        int l = start;
+        int r = pos - 1;
+        while (l < r) {
+            byte tmp = dst[l];
+            dst[l] = dst[r];
+            dst[r] = tmp;
+            l = l + 1;
+            r = r - 1;
+        }
+        return pos;
+    }
+
     // 文本形态：`时间 [级别] wid [分类] 正文 [=> 作用域…] 键=值 …`
-    // 无分类、无作用域、无字段时与历史 `Log.Write` 的输出逐字节一致。
+    // 无分类、无作用域、无字段时与历史 `Log.Write` 的输出逐字节一致（单缓冲写出，零 StringBuilder / DateTime.ToString 分配）。
     public static string Text(LogEvent e) {
         if (e == null) { return ""; }
-        StringBuilder sb = new StringBuilder();
-        sb.Append(e.timestamp != null ? e.timestamp.ToString() : "");
-        sb.Append(" [");
-        sb.Append(Log.LevelName(e.level));
-        sb.Append("] ");
-        sb.Append(Convert.ToString(ProcessHost.WorkerId()));
-        if (e.category != null && e.category.Length > 0) {
-            sb.Append(" [");
-            sb.Append(e.category);
-            sb.Append("]");
+        string lvl = Log.LevelName(e.level);
+        int wid = ProcessHost.WorkerId();
+        string cat = e.category;
+        int catLen = cat != null ? cat.Length : 0;
+        string msg = e.message != null ? e.message : "";
+        int msgLen = msg.Length;
+        int est = 64 + catLen + msgLen;
+        if (e.scopes != null) { est = est + e.scopes.Count * 24; }
+        if (e.fields != null) { est = est + e.fields.Count * 32; }
+
+        byte[] buf = new byte[est];
+        nint bp = (nint)buf;
+        int cap = est;
+        int pos = 0;
+
+        DateTime ts = e.timestamp;
+        if (ts != null) {
+            Span<byte> dst = new Span<byte>(bp, cap);
+            int y = ts.year < 0 ? (0 - ts.year) : ts.year;
+            dst[0] = (byte)(48 + (y / 1000) % 10);
+            dst[1] = (byte)(48 + (y / 100) % 10);
+            dst[2] = (byte)(48 + (y / 10) % 10);
+            dst[3] = (byte)(48 + y % 10);
+            dst[4] = 45;
+            dst[5] = (byte)(48 + (ts.month / 10));
+            dst[6] = (byte)(48 + (ts.month % 10));
+            dst[7] = 45;
+            dst[8] = (byte)(48 + (ts.day / 10));
+            dst[9] = (byte)(48 + (ts.day % 10));
+            dst[10] = 32;
+            dst[11] = (byte)(48 + (ts.hour / 10));
+            dst[12] = (byte)(48 + (ts.hour % 10));
+            dst[13] = 58;
+            dst[14] = (byte)(48 + (ts.minute / 10));
+            dst[15] = (byte)(48 + (ts.minute % 10));
+            dst[16] = 58;
+            dst[17] = (byte)(48 + (ts.second / 10));
+            dst[18] = (byte)(48 + (ts.second % 10));
+            pos = 19;
         }
-        sb.Append(" ");
-        sb.Append(e.message != null ? e.message : "");
+        {
+            Span<byte> dst = new Span<byte>(bp, cap);
+            dst[pos] = 32;
+            dst[pos + 1] = 91;
+            pos = pos + 2;
+            NativeMemory.Copy(bp + (nint)pos, (nint)lvl, lvl.Length);
+            pos = pos + lvl.Length;
+            dst[pos] = 93;
+            dst[pos + 1] = 32;
+            pos = pos + 2;
+            pos = LogFormatter.WriteInt(dst, pos, wid);
+            if (catLen > 0) {
+                dst[pos] = 32;
+                dst[pos + 1] = 91;
+                pos = pos + 2;
+                NativeMemory.Copy(bp + (nint)pos, (nint)cat, catLen);
+                pos = pos + catLen;
+                dst[pos] = 93;
+                pos = pos + 1;
+            }
+            dst[pos] = 32;
+            pos = pos + 1;
+            if (msgLen > 0) {
+                NativeMemory.Copy(bp + (nint)pos, (nint)msg, msgLen);
+                pos = pos + msgLen;
+            }
+        }
         if (e.scopes != null) {
             int sn = e.scopes.Count;
             for (int i = 0; i < sn; i = i + 1) {
-                sb.Append(" => ");
-                sb.Append(e.scopes[i] != null ? e.scopes[i] : "");
+                string sc = e.scopes[i];
+                int sl = sc != null ? sc.Length : 0;
+                if (pos + 4 + sl > cap) {
+                    buf = LogFormatter.EnsureCap(buf, pos, pos + 4 + sl, out bp);
+                    cap = buf.Length;
+                }
+                buf[pos] = 32; buf[pos + 1] = 61; buf[pos + 2] = 62; buf[pos + 3] = 32;
+                pos = pos + 4;
+                if (sl > 0) {
+                    NativeMemory.Copy(bp + (nint)pos, (nint)sc, sl);
+                    pos = pos + sl;
+                }
             }
         }
-        if (e.fields != null) {
+        if (e.fields != null && e.fields.Count > 0) {
             List<string> keys = e.fields.Keys;
             int n = keys.Count;
             for (int i = 0; i < n; i = i + 1) {
+                string k = keys[i];
                 string v = "";
-                if (!e.fields.TryGetValue(keys[i], out v)) { continue; }
-                sb.Append(" ");
-                sb.Append(keys[i]);
-                sb.Append("=");
-                sb.Append(v != null ? v : "");
+                if (!e.fields.TryGetValue(k, out v)) { continue; }
+                int kl = k.Length;
+                int vl = v != null ? v.Length : 0;
+                if (pos + 2 + kl + vl > cap) {
+                    buf = LogFormatter.EnsureCap(buf, pos, pos + 2 + kl + vl, out bp);
+                    cap = buf.Length;
+                }
+                buf[pos] = 32;
+                pos = pos + 1;
+                if (kl > 0) {
+                    NativeMemory.Copy(bp + (nint)pos, (nint)k, kl);
+                    pos = pos + kl;
+                }
+                buf[pos] = 61;
+                pos = pos + 1;
+                if (vl > 0) {
+                    NativeMemory.Copy(bp + (nint)pos, (nint)v, vl);
+                    pos = pos + vl;
+                }
             }
         }
-        sb.Append("\n");
-        return sb.ToString();
+        if (pos + 1 > cap) {
+            buf = LogFormatter.EnsureCap(buf, pos, pos + 1, out bp);
+        }
+        buf[pos] = 10;
+        return NativeMemory.GetString(bp, 0, pos + 1);
     }
 
     // JSON 形态：time/level/pid/wid/[traceId]/[spanId]/[category]/msg/[scopes]/[fields]

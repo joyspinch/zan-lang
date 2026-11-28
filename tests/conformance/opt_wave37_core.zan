@@ -1,0 +1,216 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Text;
+using Tasks.Jobs;
+using Messaging;
+
+class Wave37Event {
+    public int value;
+    public Wave37Event(int v) { this.value = v; }
+}
+
+class Wave37Cmd {
+    public int id;
+    public Wave37Cmd(int id) { this.id = id; }
+}
+
+class FallbackCounter {
+    public int seen;
+    public FallbackCounter() { this.seen = 0; }
+}
+
+class CustomFallbackChannel : MessageChannelBase {
+    public FallbackCounter counter;
+    public CustomFallbackChannel() {
+        FallbackCounter c = new FallbackCounter();
+        this.counter = c;
+        // Intentionally leave tryDispatchField/countIfAcceptsField null to test base fallback path
+        this.acceptsField = (object m) => { return m is Wave37Event; };
+        this.dispatchField = (object m) => {
+            Wave37Event e = (Wave37Event)m;
+            c.seen = c.seen + e.value;
+            return 1;
+        };
+        this.handlerCountField = () => { return 1; };
+    }
+}
+
+class Program {
+    static void Check(string name, bool ok) {
+        Console.WriteLine(name + "=" + (ok ? "PASS" : "FAIL"));
+    }
+
+    static void TestCron() {
+        CronExpression c1 = CronExpression.Parse("  */15 9-17 * * 1-5  ");
+        Check("cron_raw_trim", c1.RawExpression == "*/15 9-17 * * 1-5");
+        Check("cron_lazy_min", c1.minutes[0] && c1.minutes[15] && !c1.minutes[14] && c1.minutes[45]);
+        Check("cron_lazy_hr", !c1.hours[8] && c1.hours[9] && c1.hours[17] && !c1.hours[18]);
+        Check("cron_lazy_dow", !c1.weekdays[0] && c1.weekdays[1] && c1.weekdays[5] && !c1.weekdays[6]);
+
+        DateTime dt = DateTime.FromParts(2026, 3, 16, 10, 23, 45);
+        DateTime n1 = c1.GetNext(dt);
+        Check("cron_next_same_day", n1 != null && n1.year == 2026 && n1.month == 3 && n1.day == 16 && n1.hour == 10 && n1.minute == 30 && c1.IsMatching(n1));
+
+        // Midnight rollover at 23:59:30
+        CronExpression cMin = CronExpression.Parse("* * * * *");
+        DateTime endOfDay = DateTime.FromParts(2026, 3, 31, 23, 59, 30);
+        DateTime nRoll = cMin.GetNext(endOfDay);
+        Check("cron_rollover_month", nRoll != null && nRoll.year == 2026 && nRoll.month == 4 && nRoll.day == 1 && nRoll.hour == 0 && nRoll.minute == 0);
+
+        // Leap day
+        CronExpression cLeap = CronExpression.Parse("0 0 29 2 *");
+        DateTime nLeap = cLeap.GetNext(DateTime.FromParts(2026, 3, 1, 0, 0, 0));
+        Check("cron_leap_day", nLeap != null && nLeap.year == 2028 && nLeap.month == 2 && nLeap.day == 29 && nLeap.hour == 0 && nLeap.minute == 0);
+
+        // Hosting grammar: Sunday = 7, 23:59 rollover, invalid -> null
+        CronExpression ch = CronExpression.ParseHosting("0 0 * * 7");
+        Check("cron_host_sun7", ch != null && ch.weekdays[0] && !ch.weekdays[1]);
+        DateTime nh = ch.GetNext(DateTime.FromParts(2026, 3, 14, 23, 59, 10));
+        Check("cron_host_rollover", nh != null && nh.year == 2026 && nh.month == 3 && nh.day == 15 && nh.hour == 0 && nh.minute == 0);
+        Check("cron_host_invalid", CronExpression.ParseHosting("bad cron") == null);
+    }
+
+    static void TestFuzzy() {
+        Check("fuzzy_match_empty", Fuzzy.Matches("", "Anything"));
+        Check("fuzzy_match_subseq", Fuzzy.Matches("flst", "FileListRenderer"));
+        Check("fuzzy_match_case", Fuzzy.Matches("HTTPREQ", "httpRequestPipeline"));
+        Check("fuzzy_match_longer", !Fuzzy.Matches("VeryLongQuery", "Short"));
+        Check("fuzzy_match_no", !Fuzzy.Matches("xyz", "abcdef"));
+
+        double sExact = Fuzzy.Score("cron", "Cron");
+        double sBound = Fuzzy.Score("fl", "FileList");
+        double sLoose = Fuzzy.Score("fl", "afoxl");
+        double sMiss = Fuzzy.Score("zz", "FileList");
+        Check("fuzzy_score_order", sMiss == 0.0 && sExact > sBound && sBound > sLoose && sLoose > 0.0);
+
+        string same = "CronExpression";
+        Check("fuzzy_same_ref", Fuzzy.SameStrIgnoreCase(same, same));
+        Check("fuzzy_same_icase", Fuzzy.SameStrIgnoreCase("CronExpression", "cronexpression"));
+        Check("fuzzy_same_diff", !Fuzzy.SameStrIgnoreCase("CronExpression", "CronExpr"));
+    }
+
+    static void TestMarkdown() {
+        string md = "# Title\n\nPara line1\nline2 with **bold**, _em_, `a < b`, \\*esc\\*, [ok](https://ex.com/a?x=1&y=2) & [bad](javascript:alert(1)).\n\n- u1\n- u2\n\n1. o1\n2. o2\n\n> q1\n>q2\n\n```\nx < y & \"z\"\n```\n";
+        string expected = "<h1>Title</h1>\n"
+            + "<p>Para line1 line2 with <strong>bold</strong>, <em>em</em>, <code>a &lt; b</code>, *esc*, <a href=\"https://ex.com/a?x=1&amp;y=2\">ok</a> &amp; bad).</p>\n"
+            + "<ul><li>u1</li><li>u2</li></ul>\n"
+            + "<ol><li>o1</li><li>o2</li></ol>\n"
+            + "<blockquote><p>q1 q2</p></blockquote>\n"
+            + "<pre><code>x &lt; y &amp; &quot;z&quot;</code></pre>";
+        Check("md_full_html", Markdown.ToHtml(md) == expected);
+
+        // CRLF, CR-only, unclosed fence trailing newline, unmatched delimiters
+        Check("md_crlf", Markdown.ToHtml("## H2\r\n\r\na\r\nb") == "<h2>H2</h2>\n<p>a b</p>");
+        Check("md_cr_only", Markdown.ToHtml("a\rb") == "<p>a b</p>");
+        Check("md_unclosed_fence", Markdown.ToHtml("```\ncode\n") == "<pre><code>code\n</code></pre>");
+        Check("md_unmatched", Markdown.Inline("a *b _c `d [e") == "a *b _c `d [e"
+            && Markdown.Inline("open **bold and __strong") == "open **bold and __strong");
+        Check("md_safe_url", Markdown.SafeUrl("HTTPS://a.b") && Markdown.SafeUrl("mailto:a@b") && Markdown.SafeUrl("/rel/path") && !Markdown.SafeUrl("javascript:1") && !Markdown.SafeUrl("http://a\nb"));
+        Check("md_escape", Markdown.EscapeHtml("plain") == "plain" && Markdown.EscapeHtml("<a&\"'>") == "&lt;a&amp;&quot;&#39;&gt;");
+    }
+
+    static void TestPinyin() {
+        Check("py_lookup", Pinyin.Lookup("中") == "zhong" && Pinyin.ToPinyinChar("文") == "wen" && Pinyin.Lookup("A") == "");
+        Check("py_full", Pinyin.ToPinyin("中文") == "zhongwen");
+        Check("py_mixed", Pinyin.ToPinyin("Zan 语言 37!") == "Zan yuyan 37!");
+        string ascii = "Pure ASCII 12345";
+        Check("py_ascii", Pinyin.ToPinyin(ascii) == ascii && Pinyin.Initials(ascii) == ascii);
+        Check("py_initials", Pinyin.Initials("中华人民共和国") == "ZHRMGHG" && Pinyin.Initials("hello 世界") == "hello SJ");
+
+        // Teardown + re-init + final Teardown (ensures leak-free lifecycle)
+        Pinyin.Teardown();
+        Check("py_reinit", Pinyin.ToPinyin("测试") == "ceshi" && Pinyin.Initials("测试") == "CS");
+        Pinyin.Teardown();
+    }
+
+    static void TestDiagnostics() {
+        Check("diag_levels", Log.LevelName(Log.TRACE) == "TRACE" && Log.LevelName(Log.DEBUG) == "DEBUG"
+            && Log.LevelName(Log.INFO) == "INFO " && Log.LevelName(Log.WARN) == "WARN "
+            && Log.LevelName(Log.ERROR) == "ERROR" && Log.LevelName(Log.FATAL) == "FATAL"
+            && Log.LevelName(-5) == "TRACE" && Log.LevelName(99) == "FATAL");
+
+        Check("diag_worker", ProcessHost.WorkerId() == 0 && !ProcessHost.IsWorker());
+
+        DateTime ts = DateTime.FromParts(2026, 11, 28, 9, 5, 7);
+        LogEvent e1 = new LogEvent(Log.INFO, "http", "ok");
+        e1.timestamp = ts;
+        e1.scopes = new List<string>();
+        e1.scopes.Add("s1");
+        e1.fields = new Dictionary<string, string>();
+        e1.fields["k"] = "v";
+        Check("diag_log_full", LogFormatter.Text(e1) == "2026-11-28 09:05:07 [INFO ] 0 [http] ok => s1 k=v\n");
+
+        LogEvent e2 = new LogEvent(Log.WARN, "", "bare");
+        e2.timestamp = ts;
+        Check("diag_log_bare", LogFormatter.Text(e2) == "2026-11-28 09:05:07 [WARN ] 0 bare\n");
+
+        string sql1 = "  SELECT id FROM orders WHERE id IN (101, 102, 103) AND name = 'a''b' AND amt = 12.5  ";
+        Check("diag_norm_sql1", ServerMetrics.NormalizeSql(sql1) == "SELECT id FROM orders WHERE id IN (?) AND name = ? AND amt = ?");
+        Check("diag_norm_sql2", ServerMetrics.NormalizeSql("SELECT * FROM t WHERE x = ?") == "SELECT * FROM t WHERE x = ?");
+
+        ServerMetrics sm = new ServerMetrics();
+        sm.RecordRequest("GET", "/api/users/42/orders/999?foo=bar", 200, 1200L);
+        sm.RecordRequest("GET", "/health", 200, 500L);
+        string snap = sm.SnapshotJson();
+        Check("diag_fold_path", snap.Contains("GET /api/users/:id/orders/:id") && snap.Contains("GET /health"));
+    }
+
+    static void TestMessaging() {
+        int sum = 0;
+        MessageChannel<Wave37Event> evCh = new MessageChannel<Wave37Event>();
+        int s1 = evCh.Subscribe((Wave37Event e) => { sum = sum + e.value; });
+        int s2 = evCh.Subscribe((Wave37Event e) => { sum = sum + e.value * 10; });
+
+        MessageChannel<Wave37Cmd> cmdCh = new MessageChannel<Wave37Cmd>();
+        int cmdSeen = 0;
+        cmdCh.Subscribe((Wave37Cmd c) => { cmdSeen = cmdSeen + c.id; });
+
+        // No-middleware fast path
+        MessageBus bus = new MessageBus();
+        bus.Register(evCh).Register(cmdCh);
+        int c1 = bus.Publish(new Wave37Event(3));
+        bus.Send(new Wave37Cmd(7));
+        Check("msg_fast_pub_send", c1 == 2 && sum == 33 && cmdSeen == 7 && bus.DeliveredCount() == 3);
+
+        // Unsubscribe & verify
+        Check("msg_unsub", evCh.Unsubscribe(s1) && !evCh.Unsubscribe(s1));
+        int c2 = bus.Publish(new Wave37Event(2));
+        Check("msg_after_unsub", c2 == 1 && sum == 53);
+
+        // Middleware path
+        int mwHits = 0;
+        bus.Use((object msg, Action next) => { mwHits = mwHits + 1; next(); });
+        int c3 = bus.Publish(new Wave37Event(1));
+        bus.Send(new Wave37Cmd(5));
+        Check("msg_mw_path", c3 == 1 && mwHits == 2 && sum == 63 && cmdSeen == 12);
+
+        // OnError isolation (no-middleware fast path)
+        int errCount = 0;
+        int okAfterErr = 0;
+        MessageChannel<Wave37Event> errCh = new MessageChannel<Wave37Event>();
+        errCh.Subscribe((Wave37Event e) => { throw new Exception("boom"); });
+        errCh.Subscribe((Wave37Event e) => { okAfterErr = okAfterErr + e.value; });
+        MessageBus errBus = new MessageBus();
+        errBus.Register(errCh).OnError((Exception ex, object m) => { errCount = errCount + 1; });
+        int c4 = errBus.Publish(new Wave37Event(9));
+        Check("msg_err_isolation", c4 == 1 && errCount == 1 && okAfterErr == 9);
+
+        // Custom MessageChannelBase fallback (tryDispatchField == null)
+        CustomFallbackChannel fb = new CustomFallbackChannel();
+        MessageBus fbBus = new MessageBus();
+        fbBus.Register(fb);
+        int c5 = fbBus.Publish(new Wave37Event(11));
+        Check("msg_custom_fallback", c5 == 1 && fb.counter.seen == 11);
+        evCh.Unsubscribe(s2);
+    }
+
+    static void Main() {
+        TestCron();
+        TestFuzzy();
+        TestMarkdown();
+        TestPinyin();
+        TestDiagnostics();
+        TestMessaging();
+    }
+}

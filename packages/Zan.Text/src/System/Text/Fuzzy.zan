@@ -18,15 +18,27 @@ public class Fuzzy {
         if (candidate == null) { return false; }
         int qlen = query.Length;
         int clen = candidate.Length;
+        if (qlen > clen) { return false; }
+        Span<byte> qsp = new Span<byte>((nint)query, qlen);
+        Span<byte> csp = new Span<byte>((nint)candidate, clen);
         int qi = 0;
-        for (int ci = 0; ci < clen && qi < qlen; ci = ci + 1) {
-            int qa = query[qi] & 255;
-            int ca = candidate[ci] & 255;
-            if (Fuzzy.SameByte(qa, ca)) {
+        int qa = qsp[0] & 255;
+        if (qa >= 65 && qa <= 90) { qa = qa + 32; }
+        int slack = clen - qlen;
+        for (int ci = 0; ci < clen; ci = ci + 1) {
+            int ca = csp[ci] & 255;
+            if (ca >= 65 && ca <= 90) { ca = ca + 32; }
+            if (qa == ca) {
                 qi = qi + 1;
+                if (qi == qlen) { return true; }
+                qa = qsp[qi] & 255;
+                if (qa >= 65 && qa <= 90) { qa = qa + 32; }
+            } else {
+                slack = slack - 1;
+                if (slack < 0) { return false; }
             }
         }
-        return qi == qlen;
+        return false;
     }
 
     // [0,1] 的相似度：完全匹配（忽略大小写）为 1.0，
@@ -40,14 +52,16 @@ public class Fuzzy {
         int clen = candidate.Length;
         if (qlen > clen) { return 0.0; }
 
+        Span<byte> qsp = new Span<byte>((nint)query, qlen);
+        Span<byte> csp = new Span<byte>((nint)candidate, clen);
         int score = 0;
         int qi = 0;
         int run = 0;
-        int qa = query[0] & 255;
+        int qa = qsp[0] & 255;
         if (qa >= 65 && qa <= 90) { qa = qa + 32; }
-        int prevC = 0;
+        int slack = clen - qlen;
         for (int ci = 0; ci < clen; ci = ci + 1) {
-            int rawC = candidate[ci] & 255;
+            int rawC = csp[ci] & 255;
             int ca = (rawC >= 65 && rawC <= 90) ? (rawC + 32) : rawC;
             if (qa == ca) {
                 run = run + 1;
@@ -56,8 +70,11 @@ public class Fuzzy {
                     if (ci == 0) {
                         gain = 3;
                     } else {
-                        bool prevAlpha = (prevC >= 65 && prevC <= 90) || (prevC >= 97 && prevC <= 122);
-                        bool curAlpha = (rawC >= 65 && rawC <= 90) || (rawC >= 97 && rawC <= 122);
+                        int prevC = csp[ci - 1] & 255;
+                        int pLow = prevC | 32;
+                        int cLow = rawC | 32;
+                        bool prevAlpha = (pLow >= 97 && pLow <= 122);
+                        bool curAlpha = (cLow >= 97 && cLow <= 122);
                         if ((!prevAlpha && curAlpha) || ((prevC >= 97 && prevC <= 122) && (rawC >= 65 && rawC <= 90))) {
                             gain = 3;
                         }
@@ -69,14 +86,13 @@ public class Fuzzy {
                     if (qlen == clen) { return 1.0; }
                     return (double)score / (double)(qlen * 3);
                 }
-                qa = query[qi] & 255;
+                qa = qsp[qi] & 255;
                 if (qa >= 65 && qa <= 90) { qa = qa + 32; }
             } else {
                 run = 0;
-                // 剩余字符数已不足匹配剩余 query，提前剪枝退出
-                if (clen - ci - 1 < qlen - qi) { return 0.0; }
+                slack = slack - 1;
+                if (slack < 0) { return 0.0; }
             }
-            prevC = rawC;
         }
         return 0.0;
     }
@@ -132,9 +148,21 @@ public class Fuzzy {
     // 忽略大小写的相等（与 Matches 一样不区分大小写）。
     public static bool SameStrIgnoreCase(string a, string b) {
         if (a == null || b == null) { return a == b; }
-        if (a.Length != b.Length) { return false; }
-        for (int i = 0; i < a.Length; i = i + 1) {
-            if (!Fuzzy.SameByte(a[i] & 255, b[i] & 255)) { return false; }
+        int len = a.Length;
+        if (len != b.Length) { return false; }
+        nint ap = (nint)a;
+        nint bp = (nint)b;
+        if (ap == bp) { return true; }
+        Span<byte> asp = new Span<byte>(ap, len);
+        Span<byte> bsp = new Span<byte>(bp, len);
+        for (int i = 0; i < len; i = i + 1) {
+            int ca = asp[i] & 255;
+            int cb = bsp[i] & 255;
+            if (ca != cb) {
+                if (ca >= 65 && ca <= 90) { ca = ca + 32; }
+                if (cb >= 65 && cb <= 90) { cb = cb + 32; }
+                if (ca != cb) { return false; }
+            }
         }
         return true;
     }
